@@ -1,0 +1,72 @@
+---
+"$comment": Central provider/model registry. Roles reference model KEYS here; model
+  ids are never hardcoded in orchestration logic, so a model swap is a one-line change.
+  'variants' lists the real reasoning variants the provider exposes for that model
+  and is used for config validation only. Add a provider or model here (or in your
+  user/project override) to extend the system.
+providers:
+  openai:
+    label: OpenAI
+    note: Lead models (Sol/Astra) for the Execution Tier. Configure with `opencode auth login openai`.
+  volcengine-coding-plan:
+    label: Volcano Coding Plan Pro
+    note: EXPLORE models (Kimi). Native provider in OpenCode 2.0.11+. Configure with `opencode
+      auth login volcengine-coding-plan`.
+  opencode-go:
+    label: OpenCode Go
+    note: BUILD / VERIFY / DEBUG models (DeepSeek, GLM). Configure with `opencode
+      auth login opencode-go`.
+models:
+  sol:
+    provider: openai
+    id: gpt-5.6-sol
+    label: GPT-5.6 Sol
+    variants:
+    - none
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+  astra:
+    provider: openai
+    id: gpt-6-astra
+    label: GPT-6 Astra
+    variants:
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+  kimi-k2.7:
+    provider: volcengine-coding-plan
+    id: kimi-k2.7-code
+    label: Kimi K2.7
+  kimi-k3:
+    provider: volcengine-coding-plan
+    id: kimi-k3
+    label: Kimi K3
+  deepseek-v4.1-flash:
+    provider: opencode-go
+    id: deepseek-v4.1-flash
+    label: DeepSeek V4.1 Flash
+    variants:
+    - low
+    - high
+    - max
+  glm-5.3-flash:
+    provider: opencode-go
+    id: glm-5.3-flash
+    label: GLM-5.3 Flash
+    variants:
+    - low
+    - high
+    - max
+  glm-5.3:
+    provider: opencode-go
+    id: glm-5.3
+    label: GLM-5.3
+    variants:
+    - low
+    - high
+    - max

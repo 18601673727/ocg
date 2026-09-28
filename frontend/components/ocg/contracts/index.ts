@@ -1,0 +1,72 @@
+/**
+ * The generated wire contract and its runtime decoders.
+ *
+ * Rust owns the control protocol: `src/contracts.rs` declares every struct
+ * that crosses the loopback boundary and `cargo run --bin ocg-rs-ts` projects
+ * it into `./generated`. Nothing in the PWA hand-maintains a mirror of a Rust
+ * struct, and `tests/contracts.rs` fails if the projection drifts.
+ *
+ * Frontend code should import from here rather than from `./generated`
+ * directly, so the types and the decoders that check them stay together.
+ */
+
+export type {
+  ApiErrorBody,
+  ApiErrorEnvelope,
+  CanonicalApiVersion,
+  CanonicalConfigurationEnvelope,
+  CanonicalConfigurationResponse,
+  CanonicalDashboardResponse,
+  CanonicalEventsEnvelope,
+  CanonicalMissionConfigEnvelope,
+  CanonicalMissionResponse,
+  CanonicalProjectResponse,
+  CanonicalProjectsResponse,
+  CanonicalWorkEvent,
+  CanonicalWorkSnapshot,
+  Candidate,
+  DispatchWitness,
+  GlobalConfiguration,
+  JsonValue,
+  Model,
+  Origin,
+  Profile,
+  ProfileApiVersion,
+  ProfileBootstrapRequest,
+  ProfileReplaceRequest,
+  ProfileView,
+  ProjectConfiguration,
+  ProjectConfigurationView,
+  ProjectRecord,
+  Provider,
+} from "./generated";
+
+export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./generated";
+
+export { ContractError, decode } from "./decode";
+export type { DecodeResult, Decoder } from "./decode";
+
+export {
+  decodeCandidate,
+  decodeProfile,
+  decodeProfileView,
+  decodeProvider,
+  tryProfileView,
+} from "./profile-decode";
+
+export {
+  decodeConfigurationAck,
+  decodeConfigurationEnvelope,
+  decodeConfigurationView,
+  decodeDashboardResponse,
+  decodeEventsEnvelope,
+  decodeMissionConfigEnvelope,
+  decodeMissionResponse,
+  decodeProjectRecord,
+  decodeProjectResponse,
+  decodeProjectsResponse,
+  decodeWitness,
+  decodeWorkSnapshot,
+  tryEventsEnvelope,
+} from "./canonical-decode";
+export type { ConfigurationAck } from "./canonical-decode";

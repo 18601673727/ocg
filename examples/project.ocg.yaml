@@ -1,0 +1,45 @@
+---
+"$comment": Example user-global OCG configuration. Copy to
+  ~/.config/ocg/config.yaml and keep only the keys you need. This is the OCG
+  Profile: the canonical, OCG-owned provider/model authority, shared by the
+  PWA, `ocg config` and direct editing. It applies to every project.
+  Replace the example provider/model ids with the real ones your runtime exposes.
+profile:
+  origin: new
+  defaultModel: my-lead
+models:
+  providers:
+    my-provider:
+      label: My Provider
+      placeholder: false
+  models:
+    my-lead:
+      provider: my-provider
+      id: real-provider-model-id
+      placeholder: false
+      # Optional selected reasoning variant. Omit it to run at the provider
+      # default; OCG never fabricates one.
+      # variant: medium
+      # Optional: what the provider really exposes, used by `ocg validate`.
+      # variants: [low, medium, high]
+routing:
+  roles:
+    build:
+      model: my-build-model
+      variant: max
+    verify:
+      model: my-verify-model
+      variant: high
+prompts:
+  lead:
+    append:
+    - ".ocg/lead-policy.md"
+telemetry:
+  enabled: true
+  localOnly: true
+orchestration:
+  enabled: true
+  maxBuildRetries: 2
+  maxDebugRetries: 1
+  maxHandoffBytes: 4096
+  maxHandoffRatioPercent: 40

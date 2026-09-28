@@ -1,0 +1,34 @@
+---
+"$comment": 'Worker Router. Maps durable ROLE -> replaceable provider/model. The
+  Lead provider/model does not belong here in the baseline architecture: the Lead is
+  not a worker. Set an optional `fallback` on a role to make an explicit, visible
+  secondary model available; a fallback is never normal routing and must never become
+  the silent default.'
+small_model: deepseek-v4.1-flash
+roles:
+  explore:
+    model: kimi-k2.7
+    description: Repository reconnaissance, call paths, data flow, impact mapping.
+      Read-only.
+  explore-deep:
+    model: kimi-k3
+    description: Deep exploration, very large context or whole-repository reasoning.
+      Read-only.
+  build:
+    model: deepseek-v4.1-flash
+    variant: high
+    description: Normal high-throughput implementation of approved, bounded work.
+  verify:
+    model: glm-5.3-flash
+    variant: high
+    description: Routine independent review of a completed diff against acceptance
+      criteria.
+  debug:
+    model: glm-5.3
+    variant: high
+    description: Hard verification, difficult debugging, root-cause analysis and escalation
+      target.
+  docs:
+    model: deepseek-v4.1-flash
+    variant: high
+    description: Factual closeout reports and handoff documents after work is verified.

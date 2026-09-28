@@ -1,0 +1,84 @@
+---
+"$comment": 'Agent isolation / least-privilege rules, applied by the Rust configuration
+  engine to the generated worker agents. Permission rules are last-match-wins: a
+  key with a string value applies to resource ''*''; an object maps a resource pattern
+  to an effect. ''task'' resources are subagent names. Profiles are named bundles;
+  role_profiles binds a role to a profile. Override any of this in your user/project
+  config.'
+profiles:
+  read_only:
+    "*": deny
+    read: allow
+    glob: allow
+    grep: allow
+    list: allow
+    lsp: allow
+    edit: deny
+    bash: deny
+    external_directory: deny
+    webfetch: deny
+    websearch: deny
+    task: deny
+  review:
+    "*": deny
+    read: allow
+    glob: allow
+    grep: allow
+    list: allow
+    edit: deny
+    external_directory: deny
+    webfetch: deny
+    websearch: deny
+    task: deny
+    bash:
+      "*": deny
+      git status*: allow
+      git diff*: allow
+      git log*: allow
+      git show*: allow
+      git remote -v*: allow
+      git branch --show-current*: allow
+      git branch --list*: allow
+      git branch -a*: allow
+      npm test*: allow
+      npm run test*: allow
+      npm run typecheck*: allow
+      npm run lint*: allow
+      npm run build*: allow
+      pnpm test*: allow
+      pnpm run test*: allow
+      pnpm run typecheck*: allow
+      yarn test*: allow
+      yarn typecheck*: allow
+      pytest*: allow
+      python -m pytest*: allow
+      go test*: allow
+      go vet*: allow
+      cargo check*: allow
+      cargo fmt --check*: allow
+      cargo test*: allow
+      cargo clippy*: allow
+      gradle test*: allow
+      mvn test*: allow
+      ls*: allow
+      cat*: allow
+      rg*: allow
+      wc*: allow
+      git commit*: deny
+      git push*: deny
+  write:
+    task: deny
+role_profiles:
+  explore: read_only
+  explore-deep: read_only
+  build: write
+  verify: review
+  debug: review
+  docs: write
+subagent:
+  hidden: true
+  permission:
+    task: deny
+lead:
+  temperature: 0.1
+  task_default: deny

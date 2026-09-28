@@ -1,0 +1,7 @@
+---
+"$comment": Example user-global OCG configuration. Copy to
+  ~/.config/ocg/config.yaml. Deep-merged over the OCG defaults. This is the
+  canonical global OCG Profile and policy; no project-local OCG profile exists.
+observability:
+  enabled: false
+  path: "~/state/ocg/events.jsonl"

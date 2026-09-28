@@ -1,0 +1,19 @@
+# Rust
+/target/
+
+# Local release packaging output
+/dist/
+
+# Local OCG state and per-project overrides
+.ocg.json
+*.events.jsonl
+
+# Conversation buffer for an external assistant (never committed)
+forward_to_gpt.md
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.ocg/
