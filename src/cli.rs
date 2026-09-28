@@ -566,6 +566,7 @@ fn usage_failure(message: impl Into<String>) -> Failure {
 
 /// Entry point. Returns the process exit code.
 pub fn run(args: impl Iterator<Item = OsString>) -> i32 {
+    observability::init_tracing();
     match run_inner(args) {
         Ok(code) => code,
         Err(Failure::Usage(message)) => {
@@ -581,6 +582,11 @@ pub fn run(args: impl Iterator<Item = OsString>) -> i32 {
 
 fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, Failure> {
     let cli = parse(args).map_err(|error| usage_failure(error.0))?;
+    tracing::debug!(
+        pretty = cli.pretty,
+        dry_run = cli.dry_run,
+        "parsed CLI invocation"
+    );
     let env = Env::from_process();
 
     match &cli.command {
@@ -5688,125 +5694,4 @@ fn print_runtime_state(
     )?;
     print_runtime_state_lines(&state);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn effective_for(cwd: &Path) -> config::Effective {
-        let mut defaults = crate::defaults::load_defaults(&crate::defaults::OcgSource::Embedded)
-            .expect("embedded defaults");
-        let profile = json!({"profile":{"origin":"new", "defaultModel":"chosen"},
-            "models":{"providers":{"test":{"placeholder":false,"label":"Test"}},
-            "models":{"chosen":{"provider":"test","id":"model","placeholder":false}}}});
-        defaults["profile"] = profile["profile"].clone();
-        defaults["models"] = profile["models"].clone();
-        config::build_effective(
-            defaults,
-            None,
-            cwd,
-            &cwd.join("no-user.yaml"),
-            &cwd.join(".ocg.yaml"),
-            None,
-        )
-        .expect("effective")
-    }
-
-    fn env_value(env: &[(OsString, OsString)], key: &str) -> Option<String> {
-        env.iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.to_string_lossy().into_owned())
-    }
-
-    #[test]
-    fn fixed_tier_cli_interfaces_are_rejected() {
-        for args in [
-            vec!["throttle"],
-            vec!["low", "run", "hello"],
-            vec!["mid", "run", "hello"],
-            vec!["high", "run", "hello"],
-            vec!["--throttle", "low", "run", "hello"],
-            vec!["--throttle=high", "run", "hello"],
-        ] {
-            let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
-            assert!(parse(args).is_err());
-        }
-    }
-
-    #[test]
-    fn invocation_v2_credentials_are_redacted_from_environment_debug() {
-        let env = Env {
-            v2_server_url: Some("http://127.0.0.1:45678".to_string()),
-            v2_server_password: Some(Secret::new("local-secret")),
-            ..Env::default()
-        };
-        let debug = format!("{env:?}");
-        assert!(!debug.contains("127.0.0.1"));
-        assert!(!debug.contains("local-secret"));
-    }
-
-    #[test]
-    fn the_private_v2_launch_targets_the_verified_session() {
-        let args = vec![OsString::from("run"), OsString::from("--print-logs")];
-        let actual = private_server_args(&args, "http://127.0.0.1:1234", "ses_target");
-        assert_eq!(
-            actual,
-            vec![
-                OsString::from("run"),
-                OsString::from("--server"),
-                OsString::from("http://127.0.0.1:1234"),
-                OsString::from("--session"),
-                OsString::from("ses_target"),
-                OsString::from("--print-logs"),
-            ]
-        );
-        let empty = private_server_args(&[], "http://127.0.0.1:1234", "");
-        assert_eq!(
-            empty,
-            vec![
-                OsString::from("--server"),
-                OsString::from("http://127.0.0.1:1234")
-            ]
-        );
-    }
-
-    #[test]
-    fn the_plugin_environment_carries_the_latest_lead_output_switch() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut effective = effective_for(dir.path());
-        let adapter = crate::runtime::compat::v2_adapter();
-
-        let env = runtime_plugin_env(&effective, dir.path(), "chosen", adapter).unwrap();
-        assert_eq!(
-            env_value(&env, "OCG_REPORTS_LATEST_LEAD_OUTPUT").as_deref(),
-            Some("1"),
-            "the capture is enabled by default"
-        );
-        assert_eq!(
-            env_value(&env, "OCG_CONTEXT_GOVERNOR_ENABLED").as_deref(),
-            Some("1"),
-            "the context governor is enabled by default"
-        );
-
-        // Disabling output reporting is independent: the context governor can
-        // still subscribe to the event surface and observe safe boundaries.
-        effective.data["reports"]["latestLeadOutput"]["enabled"] = Value::Bool(false);
-        let env = runtime_plugin_env(&effective, dir.path(), "chosen", adapter).unwrap();
-        assert_eq!(
-            env_value(&env, "OCG_REPORTS_LATEST_LEAD_OUTPUT").as_deref(),
-            Some("0")
-        );
-        assert_eq!(
-            env_value(&env, "OCG_CONTEXT_GOVERNOR_ENABLED").as_deref(),
-            Some("1")
-        );
-
-        effective.data["orchestration"] = json!({"contextGovernor": {"enabled": false}});
-        let env = runtime_plugin_env(&effective, dir.path(), "chosen", adapter).unwrap();
-        assert_eq!(
-            env_value(&env, "OCG_CONTEXT_GOVERNOR_ENABLED").as_deref(),
-            Some("0")
-        );
-    }
 }

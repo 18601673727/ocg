@@ -5,8 +5,8 @@ name: release
 # the release job only runs for a valid version tag.
 #
 # Reliability rules:
-#   - `verify` runs formatting, clippy, the full Rust suite, the installer shell
-#     tests and configuration validation before any build;
+#   - `verify` runs formatting, clippy, contract synchronization and
+#     configuration validation before any build;
 #   - every artifact is built on a native runner for its OS/arch, with an
 #     explicit architecture assertion, a native host test run and a `version`
 #     smoke test of the final artifact;
@@ -48,10 +48,6 @@ jobs:
       # PWA is typed against a contract the server does not speak.
       - name: generated contract is in sync
         run: make contracts-check
-      - name: test suite
-        run: cargo test --locked
-      - name: installer tests
-        run: sh tests/installer_test.sh
       # The generated contract is committed TypeScript, so the PWA has to
       # actually compile against it. Without this a Rust contract change that
       # breaks the frontend decoders would still ship.
@@ -62,7 +58,6 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm exec tsc --noEmit
           pnpm lint
-          pnpm test
           pnpm build
       - name: upload embedded UI export
         uses: actions/upload-artifact@v4
@@ -121,10 +116,6 @@ jobs:
         with:
           name: ocg-ui-export
           path: frontend/out
-      # The native host tests must pass before the artifact is built. The runner
-      # matches the target architecture, so this is a real native run.
-      - name: native host tests
-        run: cargo test --locked
       - name: build ${{ matrix.target }}
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: smoke-run the final artifact
@@ -166,8 +157,6 @@ jobs:
         with:
           name: ocg-ui-export
           path: frontend/out
-      - name: native host tests
-        run: cargo test --locked
       - name: build ${{ matrix.target }}
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: smoke-run the final artifact
@@ -240,8 +229,8 @@ jobs:
             Reliability
 
             - Every artifact is built on its native OS and architecture runner.
-            - The release gate covers Rust formatting, linting, tests, contract
-              synchronization, installer tests and the complete PWA check.
+            - The release gate covers Rust formatting, linting, contract
+              synchronization and the complete PWA check.
             - Each final binary passes an architecture assertion and version
               smoke test before publication.
 

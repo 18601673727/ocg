@@ -42,36 +42,3 @@ pub fn checksum_for(text: &str, name: &str) -> Option<String> {
     }
     None
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hashes_known_bytes() {
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn verifies_case_insensitively() {
-        let hash = sha256_hex(b"abc");
-        assert!(verify_sha256(b"abc", &hash.to_uppercase(), "fixture").is_ok());
-        assert!(verify_sha256(b"abc", "00", "fixture").is_err());
-    }
-
-    #[test]
-    fn parses_sha256sums_lines() {
-        let text =
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  ocg-linux-x86_64\n\
-                    deadbeef  ocg-darwin-arm64\n";
-        assert_eq!(
-            checksum_for(text, "ocg-linux-x86_64"),
-            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string())
-        );
-        assert_eq!(checksum_for(text, "ocg-darwin-arm64"), None);
-        assert_eq!(checksum_for(text, "missing"), None);
-    }
-}

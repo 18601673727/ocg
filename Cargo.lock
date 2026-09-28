@@ -120,6 +120,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "apple-native-keyring-store"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1459,6 +1465,7 @@ dependencies = [
  "aimux-core",
  "aimux-provider-utils",
  "aimux-providers",
+ "anyhow",
  "base64",
  "directories",
  "flate2",
@@ -1473,13 +1480,20 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
+ "serde_path_to_error",
  "serde_yaml_ng",
  "sha2 0.10.9",
  "tar",
  "tempfile",
+ "thiserror",
  "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
  "ts-rs",
  "typed-index-collections",
+ "uuid",
  "zip",
 ]
 
@@ -2072,6 +2086,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2373,6 +2398,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -2617,6 +2643,7 @@ version = "1.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "serde_core",
  "wasm-bindgen",

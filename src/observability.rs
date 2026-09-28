@@ -7,6 +7,50 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TracingInitStatus {
+    Initialized,
+    InvalidFilter,
+    AlreadyInitialized,
+}
+
+/// Initialize the process-wide diagnostics subscriber once.
+///
+/// Logging is intentionally opt-in: without `RUST_LOG`, the subscriber uses
+/// an `off` filter, so existing command output remains unchanged. An embedding
+/// application may install its own subscriber first; in that case OCG keeps
+/// using the existing one.
+pub fn init_tracing() {
+    static STATUS: OnceLock<TracingInitStatus> = OnceLock::new();
+
+    match STATUS.get_or_init(|| {
+        let (filter, invalid_filter) = match EnvFilter::try_from_default_env() {
+            Ok(filter) => (filter, false),
+            Err(_) => (EnvFilter::new("off"), true),
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .with_ansi(false);
+        match subscriber.try_init() {
+            Ok(()) if invalid_filter => TracingInitStatus::InvalidFilter,
+            Ok(()) => TracingInitStatus::Initialized,
+            Err(_) => TracingInitStatus::AlreadyInitialized,
+        }
+    }) {
+        TracingInitStatus::Initialized => tracing::debug!("tracing subscriber initialized"),
+        TracingInitStatus::InvalidFilter => {
+            tracing::warn!("invalid RUST_LOG filter; tracing has been disabled")
+        }
+        TracingInitStatus::AlreadyInitialized => {
+            tracing::debug!("using the existing tracing subscriber")
+        }
+    }
+}
 
 /// Resolve the trace path, or `None` when observability is disabled.
 pub fn trace_path(effective: &Effective, env_trace: Option<&Path>) -> Option<PathBuf> {
@@ -54,6 +98,7 @@ pub fn record_event(
     env_trace: Option<&Path>,
 ) -> Option<PathBuf> {
     let path = trace_path(effective, env_trace)?;
+    tracing::debug!(event, level, "recording routing event");
     let data = &effective.data;
     crate::profile::Profile::from_ocg_config(data)
         .ok()?

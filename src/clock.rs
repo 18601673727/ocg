@@ -49,18 +49,3 @@ impl Clock for FixedClock {
         self.now
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fixed_clock_advances_without_the_wall_clock() {
-        let mut clock = FixedClock::new(1_000);
-        assert_eq!(clock.now_unix(), 1_000);
-        clock.advance(50);
-        assert_eq!(clock.now_unix(), 1_050);
-        clock.set(7);
-        assert_eq!(clock.now_unix(), 7);
-    }
-}

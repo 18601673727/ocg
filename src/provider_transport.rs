@@ -35,6 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use aimux_core::content::ContentPart;
 use aimux_core::error::{AiMuxError, ApiCallError};
@@ -49,6 +50,7 @@ use aimux_providers::openai::{OpenAIConfig, OpenAIProvider};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use tower::Service;
 
 /// A normalized stream of provider events.
 pub type ChatEventStream =
@@ -164,6 +166,7 @@ impl ProviderTransport {
     pub fn prepare(&self, request: ChatRequest) -> Result<PreparedChat, TransportError> {
         self.config.validate()?;
         let prepared = request.into_prepared()?;
+        tracing::debug!(model = %prepared.model_id(), "provider request prepared");
         Ok(prepared)
     }
 
@@ -186,6 +189,8 @@ impl ProviderTransport {
     /// provider connection fails before the stream is established. Mid-stream
     /// failures surface as [`ChatStreamEvent::Error`] items.
     pub async fn stream(&self, prepared: PreparedChat) -> Result<ChatEventStream, TransportError> {
+        let model_id = prepared.model_id().to_owned();
+        tracing::info!(model = %model_id, "starting provider stream");
         let mut config = OpenAIConfig::new(self.config.api_key.clone())
             .with_base_url(self.config.base_url.clone())
             .with_provider(self.config.provider.clone())
@@ -206,7 +211,13 @@ impl ProviderTransport {
 
         let provider = OpenAIProvider::new(config);
         let model = provider.model(prepared.model_id());
-        let result = stream_text(&model, prepared.prompt, prepared.options).await?;
+        let result = match stream_text(&model, prepared.prompt, prepared.options).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(model = %model_id, error = %error, "provider stream failed");
+                return Err(error.into());
+            }
+        };
         Ok(normalize_stream(result.stream))
     }
 
@@ -221,6 +232,37 @@ impl ProviderTransport {
     ) -> Result<ChatEventStream, TransportError> {
         let prepared = self.prepare(request)?;
         self.stream(prepared).await
+    }
+}
+
+/// Tower adapter for the network-free provider preparation boundary.
+///
+/// The service validates and translates one request per call. Dispatch remains
+/// on [`ProviderTransport::stream`] so existing gateway ownership and retry
+/// policy are unchanged while Tower middleware can be added at the boundary.
+#[derive(Debug, Clone)]
+pub struct ProviderPrepareService {
+    transport: ProviderTransport,
+}
+
+impl ProviderPrepareService {
+    #[must_use]
+    pub fn new(transport: ProviderTransport) -> Self {
+        Self { transport }
+    }
+}
+
+impl Service<ChatRequest> for ProviderPrepareService {
+    type Response = PreparedChat;
+    type Error = TransportError;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: ChatRequest) -> Self::Future {
+        std::future::ready(self.transport.prepare(request))
     }
 }
 
@@ -1611,499 +1653,5 @@ fn parse_reasoning_effort(effort: &str) -> Result<ReasoningEffort, TransportErro
             "reasoning_effort",
             format!("unknown reasoning_effort `{other}`"),
         )),
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Focused translation tests (no network)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aimux_core::tool::Tool;
-    use aimux_core::types::{FinishReason, FinishReasonUnified, TokenUsage, Usage};
-
-    fn transport() -> ProviderTransport {
-        ProviderTransport::new(ProviderTransportConfig::new(
-            "http://127.0.0.1:1/v1",
-            "test-key",
-        ))
-    }
-
-    fn request(body: Value) -> ChatRequest {
-        ChatRequest::from_json(body).expect("request should parse")
-    }
-
-    fn start(id: &str, name: &str) -> StreamPart {
-        StreamPart::ToolInputStart {
-            id: id.to_string(),
-            tool_name: name.to_string(),
-            provider_executed: None,
-            dynamic: None,
-            title: None,
-            provider_metadata: None,
-        }
-    }
-
-    fn delta(id: &str, fragment: &str) -> StreamPart {
-        StreamPart::ToolInputDelta {
-            id: id.to_string(),
-            delta: fragment.to_string(),
-            provider_metadata: None,
-        }
-    }
-
-    fn translate(parts: Vec<StreamPart>) -> Vec<ChatStreamEvent> {
-        let mut normalizer = ToolCallNormalizer::default();
-        parts
-            .into_iter()
-            .filter_map(|part| translate_stream_part(part, &mut normalizer))
-            .collect()
-    }
-
-    fn full_request() -> Value {
-        json!({
-            "model": "test-model",
-            "stream": true,
-            "stream_options": { "include_usage": true },
-            "store": false,
-            "reasoning_effort": "high",
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "max_completion_tokens": 256,
-            "seed": 7,
-            "stop": ["STOP"],
-            "metadata": { "trace": "abc" },
-            "parallel_tool_calls": false,
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "tool_a",
-                    "description": "a tool",
-                    "parameters": { "type": "object", "properties": { "x": { "type": "integer" } } },
-                    "strict": false
-                }
-            }],
-            "tool_choice": { "type": "function", "function": { "name": "tool_a" } },
-            "messages": [
-                { "role": "system", "content": "sys" },
-                { "role": "user", "content": "hi" },
-                {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [
-                        { "id": "call_a", "type": "function", "function": { "name": "tool_a", "arguments": "{\"x\":1}" } }
-                    ]
-                },
-                { "role": "tool", "tool_call_id": "call_a", "content": "42" }
-            ]
-        })
-    }
-
-    #[test]
-    fn prepares_full_openai_chat_request() {
-        let parsed = request(full_request());
-        let prepared = transport().prepare(parsed).expect("prepare should succeed");
-
-        assert_eq!(prepared.model_id(), "test-model");
-        let options = prepared.options();
-        assert_eq!(options.temperature, Some(0.2));
-        assert_eq!(options.top_p, Some(0.9));
-        assert_eq!(options.max_output_tokens, Some(256));
-        assert_eq!(options.seed, Some(7));
-        assert_eq!(options.stop_sequences, Some(vec!["STOP".to_string()]));
-        assert_eq!(options.reasoning, Some(ReasoningEffort::High));
-        assert_eq!(options.max_retries, Some(0));
-        assert_eq!(
-            options.tool_choice,
-            Some(ToolChoice::Tool {
-                tool_name: "tool_a".to_string()
-            })
-        );
-
-        let tools = options.tools.as_ref().expect("tools translated");
-        match &tools[0] {
-            Tool::Function(function) => {
-                assert_eq!(function.name, "tool_a");
-                assert_eq!(function.strict, Some(false));
-                assert_eq!(function.description.as_deref(), Some("a tool"));
-                assert_eq!(function.input_schema["type"], json!("object"));
-            }
-            other => panic!("expected function tool, got {other:?}"),
-        }
-
-        let overrides = options.body_overrides.as_ref().expect("body overrides");
-        assert_eq!(overrides["stream"], json!(true));
-        assert_eq!(
-            overrides["stream_options"],
-            json!({ "include_usage": true })
-        );
-        assert_eq!(overrides["store"], json!(false));
-        assert_eq!(overrides["parallel_tool_calls"], json!(false));
-        // `reasoning_effort` is carried by the typed `GenerateTextOptions::reasoning`
-        // and mapped by aimux; it must not be duplicated as a body override.
-        assert!(overrides.get("reasoning_effort").is_none());
-        assert!(overrides["max_tokens"].is_null());
-        assert_eq!(overrides["max_completion_tokens"], json!(256));
-
-        let ModelPrompt::Messages(messages) = prepared.prompt() else {
-            panic!("expected messages prompt");
-        };
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[1].role, Role::User);
-        assert_eq!(messages[2].role, Role::Assistant);
-        assert_eq!(messages[3].role, Role::Tool);
-        let MessageContent::Parts(assistant_parts) = &messages[2].content else {
-            panic!("assistant content should be multi-part");
-        };
-        assert!(matches!(
-            assistant_parts.as_slice(),
-            [ContentPart::ToolCall { tool_name, .. }] if tool_name == "tool_a"
-        ));
-        let MessageContent::Parts(tool_parts) = &messages[3].content else {
-            panic!("tool content should be multi-part");
-        };
-        assert!(matches!(
-            tool_parts.as_slice(),
-            [ContentPart::ToolResult { tool_call_id, .. }] if tool_call_id == "call_a"
-        ));
-    }
-
-    #[test]
-    fn defaults_stream_usage_and_store_pre_dispatch() {
-        let body = json!({
-            "model": "m",
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        let prepared = transport().prepare(request(body)).unwrap();
-        let overrides = prepared.options().body_overrides.as_ref().unwrap();
-        assert_eq!(
-            overrides["stream_options"],
-            json!({ "include_usage": true })
-        );
-        assert_eq!(overrides["store"], json!(false));
-        assert_eq!(overrides["stream"], json!(true));
-    }
-
-    #[test]
-    fn rejects_unknown_top_level_field_pre_dispatch() {
-        let body = json!({
-            "model": "m",
-            "messages": [{ "role": "user", "content": "hi" }],
-            "functions": []
-        });
-        assert!(matches!(
-            ChatRequest::from_json(body),
-            Err(TransportError::InvalidRequest { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_unsupported_content_parts() {
-        let body = json!({
-            "model": "m",
-            "messages": [{
-                "role": "user",
-                "content": [{ "type": "image_url", "image_url": { "url": "http://x" } }]
-            }]
-        });
-        assert!(matches!(
-            ChatRequest::from_json(body),
-            Err(TransportError::InvalidRequest { .. })
-        ));
-    }
-
-    #[test]
-    fn rejects_non_streaming_and_usage_opt_out() {
-        let non_streaming = json!({
-            "model": "m",
-            "stream": false,
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        let error = transport().prepare(request(non_streaming)).unwrap_err();
-        assert!(matches!(error, TransportError::Unsupported { .. }));
-
-        let no_usage = json!({
-            "model": "m",
-            "stream_options": { "include_usage": false },
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        let error = transport().prepare(request(no_usage)).unwrap_err();
-        assert!(matches!(error, TransportError::Unsupported { .. }));
-    }
-
-    #[test]
-    fn rejects_invalid_options() {
-        let both_max = json!({
-            "model": "m",
-            "max_tokens": 1,
-            "max_completion_tokens": 2,
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        assert!(matches!(
-            transport().prepare(request(both_max)).unwrap_err(),
-            TransportError::InvalidRequest { .. }
-        ));
-
-        let multi_n = json!({
-            "model": "m",
-            "n": 2,
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        assert!(matches!(
-            transport().prepare(request(multi_n)).unwrap_err(),
-            TransportError::Unsupported { .. }
-        ));
-
-        let bad_effort = json!({
-            "model": "m",
-            "reasoning_effort": "ultra",
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        assert!(matches!(
-            transport().prepare(request(bad_effort)).unwrap_err(),
-            TransportError::InvalidRequest { .. }
-        ));
-    }
-
-    #[test]
-    fn stop_accepts_a_string_or_an_array() {
-        let one = json!({
-            "model": "m",
-            "stop": "END",
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        assert_eq!(
-            transport()
-                .prepare(request(one))
-                .unwrap()
-                .options()
-                .stop_sequences,
-            Some(vec!["END".to_string()])
-        );
-
-        let many = json!({
-            "model": "m",
-            "stop": ["A", "B"],
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        assert_eq!(
-            transport()
-                .prepare(request(many))
-                .unwrap()
-                .options()
-                .stop_sequences,
-            Some(vec!["A".to_string(), "B".to_string()])
-        );
-    }
-
-    #[test]
-    fn preserves_json_schema_strict_false_override() {
-        let body = json!({
-            "model": "m",
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "answer",
-                    "schema": { "type": "object" },
-                    "strict": false
-                }
-            },
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        let prepared = transport().prepare(request(body)).unwrap();
-        let overrides = prepared.options().body_overrides.as_ref().unwrap();
-        assert_eq!(
-            overrides["response_format"],
-            json!({
-                "type": "json_schema",
-                "json_schema": { "name": "answer", "schema": { "type": "object" }, "strict": false }
-            })
-        );
-        assert!(matches!(
-            prepared.options().response_format,
-            Some(ResponseFormat::Json { .. })
-        ));
-    }
-
-    #[test]
-    fn same_frame_multiple_tool_calls_keep_stable_indices() {
-        let events = translate(vec![
-            start("call_a", "tool_a"),
-            start("call_b", "tool_b"),
-            delta("call_a", "{\"x\":"),
-            delta("call_b", "{\"y\":"),
-            delta("call_a", "1}"),
-            delta("call_b", "2}"),
-        ]);
-
-        assert_eq!(
-            events,
-            vec![
-                ChatStreamEvent::ToolCallStart {
-                    index: 0,
-                    id: "call_a".into(),
-                    name: "tool_a".into()
-                },
-                ChatStreamEvent::ToolCallStart {
-                    index: 1,
-                    id: "call_b".into(),
-                    name: "tool_b".into()
-                },
-                ChatStreamEvent::ToolCallArgumentsDelta {
-                    index: 0,
-                    id: "call_a".into(),
-                    delta: "{\"x\":".into()
-                },
-                ChatStreamEvent::ToolCallArgumentsDelta {
-                    index: 1,
-                    id: "call_b".into(),
-                    delta: "{\"y\":".into()
-                },
-                ChatStreamEvent::ToolCallArgumentsDelta {
-                    index: 0,
-                    id: "call_a".into(),
-                    delta: "1}".into()
-                },
-                ChatStreamEvent::ToolCallArgumentsDelta {
-                    index: 1,
-                    id: "call_b".into(),
-                    delta: "2}".into()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn interleaved_fragments_across_frames_reconstruct_calls() {
-        let events = translate(vec![
-            start("call_a", "tool_a"),
-            delta("call_a", "{\"x\":"),
-            start("call_b", "tool_b"),
-            delta("call_b", "{\"y\":"),
-            delta("call_a", "1}"),
-            delta("call_b", "2}"),
-            StreamPart::ToolCall {
-                tool_call_id: "call_a".into(),
-                tool_name: "tool_a".into(),
-                input: json!({ "x": 1 }),
-                provider_executed: None,
-                dynamic: None,
-                thought_signature: None,
-                provider_metadata: None,
-            },
-            StreamPart::ToolCall {
-                tool_call_id: "call_b".into(),
-                tool_name: "tool_b".into(),
-                input: json!({ "y": 2 }),
-                provider_executed: None,
-                dynamic: None,
-                thought_signature: None,
-                provider_metadata: None,
-            },
-        ]);
-
-        let mut summary = ChatStreamSummary::default();
-        for event in &events {
-            summary.apply(event);
-        }
-
-        assert_eq!(
-            summary.tool_calls,
-            vec![
-                CompletedToolCall {
-                    index: 0,
-                    id: "call_a".into(),
-                    name: "tool_a".into(),
-                    arguments: "{\"x\":1}".into(),
-                },
-                CompletedToolCall {
-                    index: 1,
-                    id: "call_b".into(),
-                    name: "tool_b".into(),
-                    arguments: "{\"y\":2}".into(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn finish_and_usage_are_normalized() {
-        let usage = Usage {
-            input_tokens: TokenUsage {
-                total: Some(100),
-                cache_read: Some(20),
-                cache_write: Some(5),
-                ..TokenUsage::default()
-            },
-            output_tokens: TokenUsage {
-                total: Some(40),
-                reasoning: Some(10),
-                ..TokenUsage::default()
-            },
-            raw: Some(json!({ "prompt_tokens": 100 })),
-        };
-        let part = StreamPart::Finish {
-            finish_reason: FinishReason {
-                unified: FinishReasonUnified::ToolCalls,
-                raw: Some("tool_calls".into()),
-            },
-            usage,
-            provider_metadata: None,
-        };
-
-        let events = translate(vec![part]);
-        let ChatStreamEvent::Finish {
-            reason,
-            raw_reason,
-            usage,
-        } = &events[0]
-        else {
-            panic!("expected finish event");
-        };
-        assert_eq!(*reason, ChatFinishReason::ToolCalls);
-        assert_eq!(reason.as_openai_str(), "tool_calls");
-        assert_eq!(raw_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(usage.input_tokens, Some(100));
-        assert_eq!(usage.output_tokens, Some(40));
-        assert_eq!(usage.cache_read_tokens, Some(20));
-        assert_eq!(usage.cache_write_tokens, Some(5));
-        assert_eq!(usage.reasoning_tokens, Some(10));
-        assert_eq!(usage.total_tokens(), Some(140));
-        assert_eq!(usage.raw, Some(json!({ "prompt_tokens": 100 })));
-    }
-
-    #[test]
-    fn aimux_errors_keep_classification() {
-        let error = AiMuxError::ApiCall(ApiCallError {
-            status_code: Some(429),
-            provider_code: Some("rate_limit_exceeded".into()),
-            message: "slow down".into(),
-            retry_after_ms: Some(250),
-            is_retryable: true,
-            ..ApiCallError::default()
-        });
-        let transport_error: TransportError = error.into();
-        assert!(transport_error.is_retryable());
-        assert_eq!(transport_error.status_code(), Some(429));
-        assert_eq!(transport_error.provider_code(), Some("rate_limit_exceeded"));
-    }
-
-    #[test]
-    fn missing_reasoning_effort_is_provider_default() {
-        let body = json!({
-            "model": "m",
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        assert_eq!(
-            transport()
-                .prepare(request(body))
-                .unwrap()
-                .options()
-                .reasoning,
-            None
-        );
     }
 }

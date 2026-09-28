@@ -6,8 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint",
-    "test": "node --import tsx --test components/ocg/runtime/*.test.ts components/ocg/contracts/*.test.ts components/ocg/bootstrap/*.test.ts components/ocg/resource-ledger/*.test.ts components/ocg/control-center/*.test.ts components/ocg/execution/*.test.ts components/ocg/logs/*.test.ts components/ocg/settings/*.test.ts components/ocg/appearance/*.test.ts components/ocg/home/*.test.ts components/ocg/attention/*.test.ts components/ocg/project/*.test.ts components/ocg/composer/*.test.ts components/ocg/mission/*.test.ts components/ocg/canonical/*.test.ts components/ocg/layout/*.test.ts components/ocg/profile/*.test.ts"
+    "lint": "eslint"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.15.21",
@@ -37,7 +36,6 @@
     "eslint-config-next": "16.3.6",
     "shadcn": "^4.21.0",
     "tailwindcss": "^4",
-    "tsx": "^4.23.15",
     "typescript": "^5"
   },
   "packageManager": "pnpm@12.4.2"

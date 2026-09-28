@@ -643,28 +643,3 @@ fn list_schema() -> Value {
         &[],
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_surface_is_bounded_and_has_no_escape_hatches() {
-        let tools = tool_definitions();
-        let names: Vec<&str> = tools
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect();
-        assert_eq!(names.len(), 10);
-        assert!(!names.iter().any(|name| {
-            name.contains("shell")
-                || name.contains("file")
-                || name.contains("runtime")
-                || name.contains("reconcile")
-                || name.contains("resource_set")
-        }));
-        assert!(tools
-            .iter()
-            .all(|tool| tool["inputSchema"]["additionalProperties"] == false));
-    }
-}

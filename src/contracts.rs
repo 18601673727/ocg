@@ -9,7 +9,7 @@
 //! The generated TypeScript lives in
 //! `frontend/components/ocg/contracts/generated.ts` and is produced by
 //! `cargo run --bin ocg-rs-ts`. It is committed, reviewed like any other
-//! artifact, and `tests/contracts.rs` fails if it drifts from these
+//! artifact, and `make contracts-check` fails if it drifts from these
 //! definitions.
 
 use serde::{Deserialize, Serialize};
@@ -384,7 +384,7 @@ fn header() -> &'static str {
  * no build step and reviewers see contract changes in the diff.
  *
  * If you change a Rust contract, run `make contracts` and commit the result.
- * `cargo test --test contracts` fails when this file drifts.
+ * `make contracts-check` fails when this file drifts.
  */"#
 }
 
@@ -413,7 +413,7 @@ export type ProfileApiVersion = "ocg.profile.v1";
 fn footer() -> &'static str {
     r#"/**
  * The protocol versions this file was generated from. They are asserted equal to
- * the Rust constants by `tests/contracts.rs`, so a version bump cannot silently
+ * the Rust constants by `make contracts-check`, so a version bump cannot silently
  * desynchronise the two sides.
  */
 export const CANONICAL_API_VERSION: CanonicalApiVersion = "ocg.canonical.v1";

@@ -51,6 +51,17 @@ aimux-providers = { version = "=0.3.0", default-features = false }
 aimux-provider-utils = "=0.3.0"
 futures = "0.3"
 tokio = { version = "1", features = ["rt", "time", "net", "signal"] }
+anyhow = "1"
+tower = { version = "0.5", features = ["util"] }
+# Incremental architecture dependencies. Keep features narrow until the
+# corresponding runtime, diagnostics, error, parsing, and identifier layers
+# are migrated in later steps.
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+serde_path_to_error = "0.1"
+uuid = { version = "1", features = ["serde", "v7"] }
 
 [profile.release]
 lto = true

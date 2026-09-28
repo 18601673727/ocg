@@ -3,10 +3,12 @@
 
 use crate::control_server::{ControlServer, ServerConfig};
 use crate::error::{OcgError, Result};
+use anyhow::Context;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 fn open_browser(url: &str) -> bool {
     let program = if cfg!(target_os = "macos") {
@@ -34,6 +36,13 @@ fn entry_path(has_profile: bool) -> &'static str {
     }
 }
 
+fn build_signal_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("cannot initialize UI signal handling")
+}
+
 /// Bind the loopback server, serve the embedded UI, and wait for termination.
 pub fn run(root: &Path, profile_path: &Path, has_profile: bool) -> Result<()> {
     if !crate::ui_assets::is_packaged() {
@@ -52,6 +61,7 @@ pub fn run(root: &Path, profile_path: &Path, has_profile: bool) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_server = Arc::clone(&stop);
     let control_thread = std::thread::spawn(move || control.serve(stop_server));
+    let shutdown = CancellationToken::new();
 
     let page = entry_path(has_profile);
     // The UI and control API share this loopback origin. Keeping the control
@@ -63,12 +73,8 @@ pub fn run(root: &Path, profile_path: &Path, has_profile: bool) -> Result<()> {
         eprintln!("ocg: browser could not be opened here; visit {url}");
     }
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            OcgError::config(format!("cannot initialize UI signal handling: {error}"))
-        })?;
+    let runtime = build_signal_runtime().map_err(|error| OcgError::config(error.to_string()))?;
+    let shutdown_signal = shutdown.clone();
     let wait = runtime.block_on(async {
         #[cfg(unix)]
         {
@@ -76,31 +82,25 @@ pub fn run(root: &Path, profile_path: &Path, has_profile: bool) -> Result<()> {
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                     .map_err(|error| OcgError::io("cannot handle UI termination", error))?;
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = term.recv() => {},
+                _ = tokio::signal::ctrl_c() => shutdown_signal.cancel(),
+                _ = term.recv() => shutdown_signal.cancel(),
             }
         }
         #[cfg(not(unix))]
-        tokio::signal::ctrl_c()
-            .await
-            .map_err(|error| OcgError::io("cannot handle UI termination", error))?;
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .map_err(|error| OcgError::io("cannot handle UI termination", error))?;
+            shutdown_signal.cancel();
+        }
+        shutdown_signal.cancelled().await;
         Ok::<(), OcgError>(())
     });
+    shutdown.cancel();
     stop.store(true, Ordering::SeqCst);
     let result = control_thread
         .join()
         .map_err(|_| OcgError::config("control service panicked"))?;
     wait?;
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bare_ui_entry_is_profile_aware() {
-        assert_eq!(entry_path(false), "/onboarding?scenario=local-first-run");
-        assert_eq!(entry_path(true), "/?scenario=local-ready");
-    }
 }

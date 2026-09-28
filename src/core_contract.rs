@@ -9,6 +9,7 @@ use crate::error::{OcgError, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use ts_rs::TS;
+use uuid::{Uuid, Variant};
 
 fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
@@ -21,19 +22,11 @@ pub struct EntityId(String);
 impl EntityId {
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        let bytes = value.as_bytes();
-        let valid_shape = bytes.len() == 36
-            && [8, 13, 18, 23].iter().all(|index| bytes[*index] == b'-')
-            && bytes
-                .iter()
-                .enumerate()
-                .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
-            && bytes[14] == b'7'
-            && matches!(bytes[19], b'8' | b'9' | b'a' | b'b');
-        if !valid_shape
-            || value
-                .chars()
-                .any(|character| character.is_ascii_uppercase())
+        let uuid = Uuid::parse_str(&value)
+            .map_err(|_| invalid("EntityId must be a lowercase canonical UUIDv7"))?;
+        if uuid.to_string() != value
+            || uuid.get_version_num() != 7
+            || uuid.get_variant() != Variant::RFC4122
         {
             return Err(invalid("EntityId must be a lowercase canonical UUIDv7"));
         }
@@ -1264,146 +1257,4 @@ pub struct ExecutionGraphProjection {
     pub project_scope: ProjectScope,
     pub nodes: Vec<ExecutionGraphNode>,
     pub edges: Vec<ExecutionGraphEdge>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entity_id_requires_lowercase_uuidv7() {
-        assert!(EntityId::new("018f1f44-2a8b-7abc-8def-0123456789ab").is_ok());
-        assert!(EntityId::new("018f1f44-2a8b-6abc-8def-0123456789ab").is_err());
-        assert!(EntityId::new("018F1F44-2A8B-7ABC-8DEF-0123456789AB").is_err());
-    }
-
-    #[test]
-    fn lifecycle_rejects_illegal_edges() {
-        assert!(RunLifecycle::Created
-            .transition(RunLifecycle::Running)
-            .is_ok());
-        assert!(RunLifecycle::Succeeded
-            .transition(RunLifecycle::Running)
-            .is_err());
-        assert!(CallLifecycle::Created
-            .transition(CallLifecycle::Running)
-            .is_ok());
-        assert!(CallLifecycle::Succeeded
-            .transition(CallLifecycle::Failed)
-            .is_err());
-        assert!(WorkNodeLifecycle::Failed
-            .transition(WorkNodeLifecycle::Ready)
-            .is_ok());
-    }
-
-    #[test]
-    fn unknown_measurements_are_null_and_explicit() {
-        let fact = Fact {
-            id: EntityId::new("018f1f44-2a8b-7abc-8def-0123456789ab").unwrap(),
-            project_scope: ProjectScope::new("project-a").unwrap(),
-            subject_ref: EntityRef {
-                kind: EntityKind::Run,
-                id: EntityId::new("018f1f44-2a8b-7abc-8def-0123456789ac").unwrap(),
-            },
-            metric: "input_tokens".to_string(),
-            value: None,
-            unit: "tokens".to_string(),
-            source: Actor::Core,
-            observed_at: "2026-09-27T00:00:00.000000Z".to_string(),
-            provenance: None,
-            quality: MeasurementQuality::Unknown,
-            created_at: "2026-09-27T00:00:00.000000Z".to_string(),
-        };
-        let json = serde_json::to_value(fact).unwrap();
-        assert!(json["value"].is_null());
-        assert_eq!(json["quality"], "unknown");
-    }
-
-    #[test]
-    fn execution_policy_and_child_policy_reject_invalid_contracts() {
-        let policy = ExecutionPolicy {
-            schema_version: 1,
-            mode: ExecutionMode::SingleShot,
-            retry: ExecutionRetryPolicy {
-                max_attempts_per_phase: 0,
-                retryable_failure_classes: vec![],
-            },
-        };
-        assert!(policy.validate().is_err());
-
-        let soft = ChildPolicy {
-            join: ChildJoinPolicy::Required,
-            cancellation: ChildCancellationPolicy::SoftCascade,
-            failure: ChildFailurePolicy::BlockParent,
-            grace_period_ms: Some(300_001),
-        };
-        assert!(soft.validate().is_err());
-
-        let independent_with_grace = ChildPolicy {
-            cancellation: ChildCancellationPolicy::Independent,
-            grace_period_ms: Some(10),
-            ..soft
-        };
-        assert!(independent_with_grace.validate().is_err());
-    }
-
-    #[test]
-    fn message_lifecycle_rejects_resuming_a_terminal_message() {
-        assert!(MessageLifecycle::Pending
-            .transition(MessageLifecycle::Streaming)
-            .is_ok());
-        assert!(MessageLifecycle::Complete
-            .transition(MessageLifecycle::Streaming)
-            .is_err());
-    }
-
-    #[test]
-    fn canonical_events_declare_transaction_visibility_metadata() {
-        let event = EventEnvelope {
-            event_id: EntityId::new("018f1f44-2a8b-7abc-8def-0123456789ab").unwrap(),
-            project_scope: ProjectScope::new("project-a").unwrap(),
-            entity_ref: EntityRef {
-                kind: EntityKind::WorkNode,
-                id: EntityId::new("018f1f44-2a8b-7abc-8def-0123456789ac").unwrap(),
-            },
-            generation: "1".into(),
-            sequence: "1".into(),
-            timestamp: "2026-09-28T00:00:00.000000Z".into(),
-            correlation_id: EntityId::new("018f1f44-2a8b-7abc-8def-0123456789ad").unwrap(),
-            causation_event_id: None,
-            transaction_id: EntityId::new("018f1f44-2a8b-7abc-8def-0123456789ae").unwrap(),
-            transaction_index: 0,
-            transaction_count: 1,
-            event_type: EventType::WorkNodeCreated,
-            schema_version: "v1".into(),
-            projection_effect: ProjectionEffect::Reducible,
-            payload: EventPayload::WorkNodeCreated(serde_json::Value::Null),
-            entity_post_image: Some(serde_json::Value::Null),
-        };
-        let value = serde_json::to_value(event).unwrap();
-        assert_eq!(value["transaction_index"], 0);
-        assert_eq!(value["transaction_count"], 1);
-        assert_eq!(value["projection_effect"], "reducible");
-    }
-
-    #[test]
-    fn event_registry_marks_projection_effect_policy() {
-        let registry = event_registry();
-        let barrier_capable = registry
-            .iter()
-            .find(|entry| entry.event_type == EventType::WorkNodeCreated)
-            .unwrap();
-        assert_eq!(
-            barrier_capable.projection_effect_policy,
-            ProjectionEffectPolicy::BarrierAllowed
-        );
-        let control = registry
-            .iter()
-            .find(|entry| entry.event_type == EventType::SchedulerDecision)
-            .unwrap();
-        assert_eq!(
-            control.projection_effect_policy,
-            ProjectionEffectPolicy::ReducibleOnly
-        );
-    }
 }

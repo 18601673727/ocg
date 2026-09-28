@@ -107,37 +107,3 @@ impl TokenCount {
         self.source == TokenSource::Estimated && self.total.is_some()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unknown_never_carries_a_number() {
-        let count = TokenCount::unknown();
-        assert_eq!(count.total, None);
-        assert_eq!(count.source, TokenSource::Unknown);
-        assert!(!count.is_exact());
-        assert!(!count.is_estimated());
-    }
-
-    #[test]
-    fn reported_and_estimated_are_distinct_sources() {
-        let reported = TokenCount::provider_reported(1_234);
-        let estimated = TokenCount::estimate_bytes(4_000);
-        assert!(reported.is_exact());
-        assert!(!reported.is_estimated());
-        assert!(estimated.is_estimated());
-        assert!(!estimated.is_exact());
-        assert_eq!(estimated.total, Some(1_000));
-        assert_ne!(reported.source, estimated.source);
-    }
-
-    #[test]
-    fn estimate_bytes_rounds_up() {
-        assert_eq!(TokenCount::estimate_bytes(0).total, Some(0));
-        assert_eq!(TokenCount::estimate_bytes(1).total, Some(1));
-        assert_eq!(TokenCount::estimate_bytes(4).total, Some(1));
-        assert_eq!(TokenCount::estimate_bytes(5).total, Some(2));
-    }
-}

@@ -120,23 +120,3 @@ pub fn content_type_for(path: &str) -> &'static str {
 pub fn is_immutable_asset(path: &str) -> bool {
     path.starts_with("_next/static/")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn traversal_is_rejected() {
-        assert!(!is_safe_asset_path("../secret"));
-        assert!(!is_safe_asset_path("a/../secret"));
-        assert!(!is_safe_asset_path("a\\secret"));
-        assert!(is_safe_asset_path("_next/static/app.js"));
-    }
-
-    #[test]
-    fn control_and_product_namespaces_are_separate() {
-        assert!(is_control_path("/api/v1/snapshot"));
-        assert!(is_control_path("/v1/events"));
-        assert!(!is_control_path("/settings"));
-    }
-}

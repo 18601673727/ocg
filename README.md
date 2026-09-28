@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # OCG
 
 OCG is a project-agnostic orchestration Core with a PWA control surface.
