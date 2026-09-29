@@ -19,6 +19,14 @@ import { Button } from "@/components/ui/button";
 import type { ChatSession, RuntimeStatus } from "../types";
 import { WORK_TYPE_LABEL } from "../types";
 import { isDegradedSyncStatus, type RuntimeSyncStatus } from "../runtime/reconciler";
+import {
+  RUNTIME_CONNECTION,
+  StatusDot,
+  SURFACE_TONE,
+  SYNC_STATUS,
+  TEXT_TONE,
+  syncStatusLabel,
+} from "@/components/ocg/primitives";
 import type { WorkspaceView } from "../layout/view-domain";
 
 type OcgTopbarProps = {
@@ -113,6 +121,10 @@ export function OcgTopbar({
   runtimeStatus,
   syncStatus,
 }: OcgTopbarProps) {
+  const connection = RUNTIME_CONNECTION[runtimeStatus.state];
+  // Degraded sync states are the only ones the bar surfaces; the visual comes
+  // from the shared scale so it matches the inspector and the ledger.
+  const sync = syncStatus ? SYNC_STATUS[syncStatus] : null;
   return (
     <header className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border bg-background px-2 sm:px-3">
       {/* Mobile sidebar toggle */}
@@ -158,36 +170,23 @@ export function OcgTopbar({
         className="hidden shrink-0 items-center gap-1.5 rounded-full border border-border bg-muted/40 px-2.5 py-1 text-[11px] text-muted-foreground md:flex"
         title={runtimeStatus.detail ?? "Local mock runtime"}
       >
-        <span
-          className={cn(
-            "size-1.5 rounded-full",
-            runtimeStatus.state === "connected" && "bg-emerald-500",
-            runtimeStatus.state === "connecting" && "animate-pulse bg-amber-500",
-            runtimeStatus.state === "disconnected" && "bg-muted-foreground/50",
-            runtimeStatus.state === "failed" && "bg-red-500",
-          )}
-          aria-hidden="true"
-        />
+        <StatusDot tone={connection.tone} pulse={connection.pulse} />
         <span className="font-medium">local mock</span>
         <span aria-hidden="true">·</span>
         <span>{runtimeStatus.state}</span>
       </div>
 
-      {syncStatus && isDegradedSyncStatus(syncStatus) && (
+      {syncStatus && sync && isDegradedSyncStatus(syncStatus) && (
         <div
-          className="hidden shrink-0 items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-700 md:flex dark:text-amber-300"
+          className={cn(
+            "hidden shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] md:flex",
+            SURFACE_TONE[sync.tone],
+            TEXT_TONE[sync.tone],
+          )}
           title={`Runtime synchronization: ${syncStatus}`}
         >
-          <span
-            className={cn(
-              "size-1.5 rounded-full",
-              syncStatus === "error" ? "bg-red-500" : "animate-pulse bg-amber-500",
-            )}
-            aria-hidden="true"
-          />
-          <span className="font-medium">
-            {syncStatus === "stale" ? "resync needed" : syncStatus === "error" ? "sync error" : "syncing"}
-          </span>
+          <StatusDot tone={sync.tone} pulse={sync.pulse} />
+          <span className="font-medium">{syncStatusLabel(syncStatus)}</span>
         </div>
       )}
 

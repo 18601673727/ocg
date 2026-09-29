@@ -9,15 +9,30 @@
 
 export type Tone = "emerald" | "sky" | "amber" | "red" | "violet" | "slate";
 
-/** Tinted border + background, no text colour. Use when the text must stay neutral. */
-export const SURFACE_TONE: Record<Tone, string> = {
-  emerald: "border-emerald-500/30 bg-emerald-500/10",
-  sky: "border-sky-500/30 bg-sky-500/10",
-  amber: "border-amber-500/30 bg-amber-500/10",
-  red: "border-red-500/30 bg-red-500/10",
-  violet: "border-violet-500/30 bg-violet-500/10",
-  slate: "border-border bg-muted/50",
+/** Tinted border on its own, for a badge that keeps a neutral background. */
+export const BORDER_TONE: Record<Tone, string> = {
+  emerald: "border-emerald-500/30",
+  sky: "border-sky-500/30",
+  amber: "border-amber-500/30",
+  red: "border-red-500/30",
+  violet: "border-violet-500/30",
+  slate: "border-border",
 };
+
+/** Tinted background on its own, for a row that already has a border. */
+export const FILL_TONE: Record<Tone, string> = {
+  emerald: "bg-emerald-500/10",
+  sky: "bg-sky-500/10",
+  amber: "bg-amber-500/10",
+  red: "bg-red-500/10",
+  violet: "bg-violet-500/10",
+  slate: "bg-muted/50",
+};
+
+/** Tinted border + background, no text colour. Use when the text must stay neutral. */
+export const SURFACE_TONE: Record<Tone, string> = Object.fromEntries(
+  (Object.keys(BORDER_TONE) as Tone[]).map((tone) => [tone, `${BORDER_TONE[tone]} ${FILL_TONE[tone]}`]),
+) as Record<Tone, string>;
 
 /** Readable foreground for a tone, in both themes. */
 export const TEXT_TONE: Record<Tone, string> = {
@@ -43,8 +58,3 @@ export const DOT_TONE: Record<Tone, string> = {
 export const TONE_CLASS: Record<Tone, string> = Object.fromEntries(
   (Object.keys(SURFACE_TONE) as Tone[]).map((tone) => [tone, `${SURFACE_TONE[tone]} ${TEXT_TONE[tone]}`]),
 ) as Record<Tone, string>;
-
-/** Text-only emphasis for a tone, used by the quiet pill variant. */
-export function textTone(tone: Tone): string {
-  return TEXT_TONE[tone];
-}

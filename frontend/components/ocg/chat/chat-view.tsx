@@ -23,6 +23,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { BORDER_TONE, StatusDot, TEXT_TONE, TOOL_STATUS } from "@/components/ocg/primitives";
 import { ActivityPulse } from "../activity-pulse";
 import type { ChatMessage, ChatSession, Mission, RuntimeStatus } from "../types";
 import {
@@ -166,6 +167,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
   const tool = message.tool;
   const [open, setOpen] = useState(true);
   if (!tool) return null;
+  const tone = TOOL_STATUS[tool.status].tone;
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
       <div className="overflow-hidden rounded-md border border-border bg-muted/30">
@@ -187,21 +189,14 @@ function ToolBlock({ message }: { message: ChatMessage }) {
           <span
            className={cn(
               "flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[11px]",
-              (tool.status === "success" || tool.status === "pending") && "border-border text-muted-foreground",
-              tool.status === "running" && "border-amber-500/30 text-amber-600 dark:text-amber-400",
-              tool.status === "retrying" && "border-sky-500/30 text-sky-600 dark:text-sky-400",
-              tool.status === "waiting-approval" && "border-violet-500/30 text-violet-600 dark:text-violet-400",
-              tool.status === "failure" && "border-red-500/30 text-red-600 dark:text-red-400",
+              BORDER_TONE[tone],
+              TEXT_TONE[tone],
             )}
           >
             {tool.status === "running" || tool.status === "retrying" ? (
               <Loader2 className="size-3 animate-spin" aria-hidden="true" />
-            ) : tool.status === "failure" ? (
-              <span className="size-1.5 rounded-full bg-red-500" aria-hidden="true" />
-            ) : tool.status === "waiting-approval" ? (
-              <span className="size-1.5 rounded-full bg-violet-500" aria-hidden="true" />
             ) : (
-              <span className="size-1.5 rounded-full bg-emerald-500" aria-hidden="true" />
+              <StatusDot tone={tone} />
             )}
             {tool.status === "success" ? "success" : tool.status} · {tool.durationMs}ms
           </span>

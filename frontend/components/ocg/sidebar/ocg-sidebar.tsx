@@ -32,6 +32,11 @@ import { WORK_TYPE_LABEL } from "../types";
 import { ProjectSwitcher } from "../project/project-switcher";
 import type { ProjectId, ProjectSummary } from "../project/domain";
 import { DEFAULT_PROJECT_ID, PROJECTS } from "../project/domain";
+import {
+  RUNTIME_CONNECTION,
+  RUNTIME_CONNECTION_LABEL,
+  StatusDot,
+} from "@/components/ocg/primitives";
 import type { WorkspaceView } from "../layout/view-domain";
 
 const GROUP_ORDER: WorkType[] = ["research", "coding", "design", "devops"];
@@ -76,13 +81,6 @@ type OcgSidebarProps = {
    * how a page renders the sidebar without shell navigation.
    */
   onNavigate?: (view: WorkspaceView) => void;
-};
-
-const RUNTIME_LABEL: Record<RuntimeStatus["state"], string> = {
-  connected: "Runtime ready · local mock",
-  connecting: "Runtime connecting · local mock",
-  disconnected: "Runtime disconnected · local mock",
-  failed: "Runtime failed · local mock",
 };
 
 function RailButton({
@@ -135,6 +133,7 @@ export function OcgSidebar({
   onNavigate,
 }: OcgSidebarProps) {
   const hasNav = Boolean(onNavigate);
+  const connection = RUNTIME_CONNECTION[runtimeStatus.state];
 
   if (collapsed) {
     return (
@@ -371,17 +370,8 @@ export function OcgSidebar({
 
         <div className="border-t border-border px-3 py-2.5">
           <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
-             <span
-               className={cn(
-                 "size-1.5 rounded-full",
-                 runtimeStatus.state === "connected" && "bg-emerald-500",
-                 runtimeStatus.state === "connecting" && "animate-pulse bg-amber-500",
-                 runtimeStatus.state === "disconnected" && "bg-muted-foreground",
-                 runtimeStatus.state === "failed" && "bg-red-500",
-               )}
-               aria-hidden="true"
-             />
-             <span className="truncate">{RUNTIME_LABEL[runtimeStatus.state]}</span>
+             <StatusDot tone={connection.tone} pulse={connection.pulse} />
+             <span className="truncate">Runtime {RUNTIME_CONNECTION_LABEL[runtimeStatus.state]} · local mock</span>
           </div>
           <div className="mt-2 flex items-center gap-2">
             <Avatar size="sm">
