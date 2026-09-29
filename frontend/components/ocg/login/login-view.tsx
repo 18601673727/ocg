@@ -4,6 +4,7 @@ import { Cloud, Loader2, TriangleAlert } from "lucide-react";
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
+import { TONE_CLASS } from "@/components/ocg/primitives";
 import { cn } from "@/lib/utils";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { ACCESS_STATE_COPY } from "../bootstrap/presentation";
@@ -60,7 +61,7 @@ export function LoginView() {
           role="status"
           className={cn(
             "mt-4 flex items-center gap-2 rounded-md border px-2.5 py-2 text-[11px]",
-            failed ? "border-red-500/40 bg-red-500/5 text-red-700 dark:text-red-300" : "border-border bg-background text-muted-foreground",
+            failed ? TONE_CLASS.red : "bg-background text-muted-foreground",
           )}
         >
           {pending ? (

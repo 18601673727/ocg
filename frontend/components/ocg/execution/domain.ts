@@ -77,11 +77,15 @@ export type ExecutionEdge = {
   status?: "pending" | "active" | "completed" | "blocked";
 };
 
+/** How the execution read model describes a Worker. It is not the runtime's
+ * `WorkerStatus`: this one is per-Mission and can be `blocked`. */
+export type WorkerExecutionStatus = "queued" | "active" | "waiting" | "idle" | "completed" | "blocked";
+
 export type WorkerExecution = {
   id: string;
   role: "lead" | "worker";
   label: string;
-  status: "queued" | "active" | "waiting" | "idle" | "completed" | "blocked";
+  status: WorkerExecutionStatus;
   provider?: string;
   model?: string;
   variant?: string;
