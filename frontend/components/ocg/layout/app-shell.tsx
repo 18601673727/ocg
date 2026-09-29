@@ -16,15 +16,14 @@ import { SettingsSurface } from "../settings/settings-surface";
 import { CanonicalControlSurface } from "../canonical/canonical-control-surface";
 import { useOcgControlUrl } from "../profile/control-url";
 import type { ControlCenterView } from "../control-center/domain";
-import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
-import type { ScenarioId } from "../runtime/runtime-types";
+import { useOcgRuntime } from "../runtime/runtime-context";
 import type { InspectorMode } from "../observability/inspector-state";
 import { HomeSurface } from "../home/home-surface";
 import { AttentionSurface } from "../attention/attention-surface";
 import { createAttentionQueue } from "../attention/fixtures";
 import { isUnresolved } from "../attention/domain";
 import { selectAttentionItems } from "../attention/selectors";
-import { ProjectProvider, useProject } from "../project/project-context";
+import { useProject } from "../project/project-context";
 import {
   selectProjectAttentionQueue,
   resolveSelectedSessionId,
@@ -47,26 +46,6 @@ import type { MissionLaunchResult } from "../runtime/runtime-types";
 import { workspaceViewHref, type WorkspaceView } from "./view-domain";
 
 export type { WorkspaceView } from "./view-domain";
-
-export function AppShell({
-  scenario,
-  view = "chat",
-  controlCenterView = "profiles",
-  initialProjectId,
-}: {
-  scenario: ScenarioId;
-  view?: WorkspaceView;
-  controlCenterView?: ControlCenterView;
-  initialProjectId?: ProjectId;
-}) {
-  return (
-    <OcgRuntimeProvider scenario={scenario}>
-      <ProjectProvider initialProjectId={initialProjectId}>
-        <RuntimeWorkspace view={view} controlCenterView={controlCenterView} />
-      </ProjectProvider>
-    </OcgRuntimeProvider>
-  );
-}
 
 export function RuntimeWorkspace({
   view = "chat",

@@ -3,10 +3,11 @@
 import { Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import { OcgEntryGate } from "./entry-gate";
-import { resolveWorkspaceView } from "../layout/view-domain";
+import { resolveWorkspaceView, type WorkspaceView } from "../layout/view-domain";
 import { resolveControlCenterView } from "../control-center/domain";
 import { resolveProjectParam } from "../project/domain";
 import { resolveScenario } from "../runtime/scenarios";
+import type { ScenarioId } from "../runtime/runtime-types";
 
 export type StaticEntryRoute =
   | "home"
@@ -16,6 +17,29 @@ export type StaticEntryRoute =
   | "resource-ledger"
   | "settings"
   | "canonical";
+
+/** What a route opens when the query string does not say otherwise. */
+type RouteEntry = {
+  scenario: ScenarioId;
+  /** View to open; omitted where the entry gate decides (login, onboarding). */
+  view?: WorkspaceView;
+  /** Whether the route hands the `project` parameter to the workspace. */
+  forwardsProject?: true;
+};
+
+/**
+ * The entry of every route but the root. A route missing from this table is the
+ * root itself, which derives its scenario and view from the query string so
+ * that one in-memory runtime instance survives a switch between views.
+ */
+const ROUTE_ENTRY: Partial<Record<StaticEntryRoute, RouteEntry>> = {
+  onboarding: { scenario: "local-first-run" },
+  login: { scenario: "remote-unauthenticated" },
+  logs: { scenario: "logs-live", view: "logs", forwardsProject: true },
+  "resource-ledger": { scenario: "resource-ledger", view: "ledger", forwardsProject: true },
+  settings: { scenario: "local-ready", view: "settings", forwardsProject: true },
+  canonical: { scenario: "local-ready", view: "canonical", forwardsProject: true },
+};
 
 /**
  * Static-export entrypoint. Query parameters are browser state, so they must
@@ -35,32 +59,25 @@ function StaticEntryContent({ route }: { route: StaticEntryRoute }) {
   const requestedView = params.get("view") ?? undefined;
   const project = resolveProjectParam(params.get("project"));
 
-  if (route === "onboarding") {
-    return <OcgEntryGate scenario={resolveScenario(requestedScenario ?? "local-first-run")} />;
-  }
-  if (route === "login") {
-    return <OcgEntryGate scenario={resolveScenario(requestedScenario ?? "remote-unauthenticated")} />;
-  }
-  if (route === "logs") {
-    return <OcgEntryGate scenario={resolveScenario(requestedScenario ?? "logs-live")} view="logs" initialProjectId={project} />;
-  }
-  if (route === "resource-ledger") {
-    return <OcgEntryGate scenario={resolveScenario(requestedScenario ?? "resource-ledger")} view="ledger" initialProjectId={project} />;
-  }
-  if (route === "settings") {
-    return <OcgEntryGate scenario={resolveScenario(requestedScenario ?? "local-ready")} view="settings" initialProjectId={project} />;
-  }
-  if (route === "canonical") {
-    return <OcgEntryGate scenario={resolveScenario(requestedScenario ?? "local-ready")} view="canonical" initialProjectId={project} />;
+  const entry = ROUTE_ENTRY[route];
+
+  if (entry === undefined) {
+    const scenario = resolveScenario(requestedScenario);
+    return (
+      <OcgEntryGate
+        scenario={scenario}
+        view={resolveWorkspaceView(scenario, requestedView)}
+        controlCenterView={resolveControlCenterView(requestedView)}
+        initialProjectId={project}
+      />
+    );
   }
 
-  const scenario = resolveScenario(requestedScenario);
   return (
     <OcgEntryGate
-      scenario={scenario}
-      view={resolveWorkspaceView(scenario, requestedView)}
-      controlCenterView={resolveControlCenterView(requestedView)}
-      initialProjectId={project}
+      scenario={resolveScenario(requestedScenario ?? entry.scenario)}
+      view={entry.view}
+      initialProjectId={entry.forwardsProject ? project : undefined}
     />
   );
 }
