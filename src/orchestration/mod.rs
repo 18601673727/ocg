@@ -33,6 +33,7 @@ pub mod dispatch;
 pub mod domain;
 pub mod execution_dispatch;
 pub mod handoff;
+pub mod journal;
 pub mod mcp_glue;
 pub mod mission;
 pub mod plugin;
@@ -42,16 +43,19 @@ pub mod replay;
 pub mod state;
 
 pub use budget::{
-    admit as admit_spend, reservation_id, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
-    MissionBudget, MissionBudgetReceipt, Money, QuotaFacts, QuotaState, Reservation,
-    ReservationState, SpendAction, SpendAssessment, SpendBlock, SpendDecision, SpendRequest,
-    MAX_RESERVATIONS,
+    admit as admit_spend, conflict_settlement_id, reservation_id, settlement_id,
+    settlement_payload_digest, BillableUsage, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
+    MissionBudget, MissionBudgetReceipt, Money, PriceOutcome, PriceRefusal, PricingBasis,
+    QuotaFacts, QuotaState, Reservation, ReservationState, Settlement, SettlementDisposition,
+    SettlementEffect, SettlementVariance, SpendAction, SpendAssessment, SpendBlock, SpendDecision,
+    SpendRequest, TokenPrice, UsageRecord, UsageSource, MAX_RATE_MICROS_PER_MILLION,
+    MAX_RESERVATIONS, MAX_SETTLEMENTS, PRICE_WILDCARD, TOKENS_PER_PRICE_UNIT,
 };
 pub use canonical_control::{
     CanonicalConfigurationResponse, CanonicalControlService, CanonicalDashboardResponse,
-    CanonicalMissionResponse, CanonicalProjectResponse, CanonicalWorkEvent, CanonicalWorkSnapshot,
-    GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView, ProjectRecord,
-    CANONICAL_CONTROL_API_VERSION,
+    CanonicalEventTail, CanonicalMissionResponse, CanonicalProjectResponse, CanonicalWorkEvent,
+    CanonicalWorkSnapshot, GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView,
+    ProjectRecord, CANONICAL_CONTROL_API_VERSION,
 };
 pub use checkpoint::{Checkpoint, CheckpointSummary, LoadedCheckpoint, Phase, Staleness};
 pub use config::OrchestrationConfig;
@@ -72,6 +76,13 @@ pub use controller::{
 pub use handoff::{
     HandoffFinding, HandoffVerification, ModelHandoffCapsule, ProjectionInput, Role, Severity,
     Transition,
+};
+pub use journal::{
+    replay as replay_execution_events, ApplyOutcome, BudgetLimitFact, DependencyEdge,
+    EventAuthority, EventDelta, EventKind, ExecutionEvent, ExecutionProjection, ExecutionSnapshot,
+    JobBinding, JournalBoundary, JournalPrune, ProjectAccounting, ReplayStatus, ReservationFact,
+    ResultEvidence, StoredJobConfiguration, StoredVerification, UsageEvidence, AUTHORITY_ACTOR,
+    INITIAL_CURSOR, JOURNAL_SCHEMA_VERSION, MAX_EVENT_READ,
 };
 pub use mission::{
     Mission, MissionEvent, MissionEventKind, MissionPolicyReceipt, MissionReconcileReceipt,

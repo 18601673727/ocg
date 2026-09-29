@@ -659,7 +659,7 @@ fn handle_canonical(
     request: &Request,
 ) -> Option<std::io::Result<()>> {
     use crate::orchestration::canonical_control::{
-        GlobalConfiguration, CANONICAL_CONTROL_API_VERSION,
+        CanonicalEventTail, GlobalConfiguration, CANONICAL_CONTROL_API_VERSION,
     };
     let allowed_origin = allowed_cors_origin(request);
     let respond = |stream: &mut TcpStream, result: Result<Value>| match result {
@@ -777,21 +777,6 @@ fn handle_canonical(
                 let mission = query("mission_id")?;
                 answer!(service.canonical_snapshot(&project, &mission)?)
             }
-            Route::CanonicalEvents => {
-                let project = query("project_id")?;
-                let mission = query("mission_id")?;
-                let after = request
-                    .query
-                    .get("after")
-                    .and_then(|raw| raw.parse::<u64>().ok())
-                    .unwrap_or(0);
-                answer!(CanonicalEventsEnvelope {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    events: service.canonical_event_tail(&project, &mission, after)?,
-                    project_id: project,
-                    mission_id: mission,
-                })
-            }
             Route::CanonicalDashboard => {
                 let project = query("project_id")?;
                 let mission = request.query.get("mission_id").map(String::as_str);
@@ -815,6 +800,90 @@ fn handle_canonical(
             | Route::CanonicalDashboard
     ) {
         return None;
+    }
+    // The event tail is answered outside the generic operation above, because a
+    // resume position the journal can no longer serve is not a bad request. It
+    // gets its own status and code so the client can distinguish "refetch the
+    // snapshot" from "your request was malformed" and from "nothing is new".
+    if let Route::CanonicalEvents = route {
+        let (project, mission, after) = match (
+            request.query.get("project_id").cloned(),
+            request.query.get("mission_id").cloned(),
+            request
+                .query
+                .get("after")
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .unwrap_or(0),
+        ) {
+            (Some(project), Some(mission), after) if !project.is_empty() && !mission.is_empty() => {
+                (project, mission, after)
+            }
+            _ => {
+                return Some(write_api_error(
+                    stream,
+                    &ApiError::new(
+                        400,
+                        "invalid_request",
+                        "project_id and mission_id are required",
+                    ),
+                ))
+            }
+        };
+        let outcome = match service.canonical_event_tail(&project, &mission, after) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Some(write_api_error(
+                    stream,
+                    &ApiError::new(400, "invalid_request", error.to_string()),
+                ))
+            }
+        };
+        let answer = match outcome {
+            CanonicalEventTail::Events(events) => CanonicalEventsEnvelope {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                project_id: project,
+                mission_id: mission,
+                events,
+            },
+            CanonicalEventTail::ResyncRequired {
+                requested,
+                floor_cursor,
+                head_cursor,
+            } => {
+                return Some(write_api_error(
+                    stream,
+                    &ApiError::new(
+                        409,
+                        "resync_required",
+                        format!(
+                            "cursor {requested} is below the retained execution journal floor \
+                             {floor_cursor} (head {head_cursor}); refetch the canonical snapshot \
+                             and continue from its cursor"
+                        ),
+                    ),
+                ))
+            }
+            CanonicalEventTail::InvalidCursor {
+                requested,
+                head_cursor,
+            } => {
+                return Some(write_api_error(
+                    stream,
+                    &ApiError::new(
+                        400,
+                        "invalid_cursor",
+                        format!(
+                            "cursor {requested} is ahead of the execution journal head \
+                             {head_cursor}"
+                        ),
+                    ),
+                ))
+            }
+        };
+        return Some(respond(
+            stream,
+            serde_json::to_value(answer).map_err(|error| OcgError::config(error.to_string())),
+        ));
     }
     Some(respond(stream, operation()))
 }

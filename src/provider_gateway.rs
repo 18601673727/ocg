@@ -1,7 +1,7 @@
 //! Invocation-scoped OpenAI Chat Completions gateway for explicitly migrated routes.
 use crate::error::{OcgError, Result};
-use crate::orchestration::budget::{BudgetConfig, QuotaFacts};
-use crate::orchestration::domain::{DomainRepository, EffectIntentState};
+use crate::orchestration::budget::{self, BudgetConfig, QuotaFacts};
+use crate::orchestration::domain::{DispatchAccounting, DomainRepository, EffectIntentState};
 use crate::orchestration::execution_dispatch::{
     BoundedDispatcher, CompioCallHandler, CompioExecutor, ExecutionEnvelope, ExecutionEvent,
 };
@@ -60,6 +60,83 @@ struct ProviderCallHandler {
     route: GatewayRoute,
 }
 
+/// The provider-reported token counters, as a canonical usage record.
+///
+/// Every counter the provider omitted stays `None`. OCG never fills one in,
+/// because an unreported counter is not the same fact as a reported zero.
+fn usage_record(usage: &NormalizedUsage) -> budget::UsageRecord {
+    budget::UsageRecord {
+        input_tokens: usage.input_tokens.map(u64::from),
+        output_tokens: usage.output_tokens.map(u64::from),
+        cache_read_tokens: usage.cache_read_tokens.map(u64::from),
+        cache_write_tokens: usage.cache_write_tokens.map(u64::from),
+        reasoning_tokens: usage.reasoning_tokens.map(u64::from),
+        source: budget::UsageSource::ProviderReported,
+    }
+}
+
+/// Normalize this route's provider-reported counters into the non-overlapping
+/// quantities a price may bill.
+///
+/// This is the provider adapter's boundary, and the only place that knows what
+/// the transport's counters mean. The transport reports an **inclusive** input
+/// total — OpenAI's `prompt_tokens` folds `prompt_tokens_details.cached_tokens`
+/// and `cache_write_tokens` into it — and an inclusive output total, which folds
+/// `completion_tokens_details.reasoning_tokens` into it. Pricing those totals
+/// alongside the cache counters would bill a cached token at the input rate *and*
+/// at the cache rate, so a billed cache counter is carved out of the input total
+/// here instead of being added to it.
+///
+/// The carving follows the frozen price, because the price is what declares
+/// which components are billed at all:
+///
+/// - a cache counter the price bills is carved out of the input total, so it is
+///   billed exactly once. If the provider did not state it, the billable input
+///   cannot be established and stays `None` — the price then refuses to value
+///   the usage rather than guessing.
+/// - a cache counter the price does not bill is left in the input total, where
+///   the price bills it at the input rate. Carving it out would under-charge.
+/// - a provider that states no cache counters needs no carving: its input total
+///   is already disjoint, and a price that bills a cache component the provider
+///   omitted is refused on that component.
+///
+/// Nothing is invented either way: an unstated counter is never treated as zero.
+/// `output_tokens` is passed through as the inclusive total it is — reasoning is
+/// a subset of it and is never added on top — so one output rate over the
+/// inclusive total is the whole output cost.
+fn billable_usage(
+    usage: &NormalizedUsage,
+    price: Option<&budget::TokenPrice>,
+) -> budget::BillableUsage {
+    let cache_read = usage.cache_read_tokens.map(u64::from);
+    let cache_write = usage.cache_write_tokens.map(u64::from);
+    let bills_read = price.is_some_and(|price| price.cache_read_micros_per_million != 0);
+    let bills_write = price.is_some_and(|price| price.cache_write_micros_per_million != 0);
+    let input_tokens = match usage.input_tokens.map(u64::from) {
+        Some(total) => {
+            let mut uncached = total;
+            let mut established = true;
+            for (billed, counter) in [(bills_read, cache_read), (bills_write, cache_write)] {
+                if !billed {
+                    continue;
+                }
+                match counter {
+                    Some(counter) => uncached = uncached.saturating_sub(counter),
+                    None => established = false,
+                }
+            }
+            established.then_some(uncached)
+        }
+        None => None,
+    };
+    budget::BillableUsage {
+        input_tokens,
+        output_tokens: usage.output_tokens.map(u64::from),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+    }
+}
+
 impl CompioCallHandler for ProviderCallHandler {
     fn execute(
         &self,
@@ -67,10 +144,20 @@ impl CompioCallHandler for ProviderCallHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             let mut domain = DomainRepository::open(&self.project)?;
-            let authority = crate::orchestration::domain::AttemptAuthority {
+            let authority = crate::orchestration::domain::AccountingAuthority {
                 attempt_id: envelope.attempt_id.clone(),
-                job_id: envelope.job_id.clone(),
                 generation: envelope.generation,
+            };
+            // Every terminal shape of this dispatch reaches the same accounting
+            // entry point, so `reserved`, `actual`, `released` and `unresolved`
+            // keep exactly one meaning across the gateway.
+            //
+            // No pricing configuration is passed in: the settlement values the
+            // usage against the basis frozen for this dispatch before the
+            // provider ran, so a later pricing revision cannot reprice it.
+            let account = |domain: &mut DomainRepository, accounting: DispatchAccounting| {
+                let _ =
+                    domain.settle_dispatch_accounting(&envelope.call_id, &authority, &accounting);
             };
             match domain.claim_call(
                 &envelope.call_id,
@@ -121,7 +208,9 @@ impl CompioCallHandler for ProviderCallHandler {
                         EffectIntentState::NotStarted,
                         Some("provider_prepare"),
                     );
-                    let _ = domain.settle_dispatch_budget(&envelope.call_id, "not_dispatched");
+                    // Preparation failed before anything was sent, so the whole
+                    // reservation is released rather than retained.
+                    account(&mut domain, DispatchAccounting::NotDispatched);
                     let _ = envelope.events.send(ExecutionEvent::Failed(reason));
                     return Ok(());
                 }
@@ -143,7 +232,7 @@ impl CompioCallHandler for ProviderCallHandler {
                         EffectIntentState::Unknown,
                         Some("provider_start"),
                     );
-                    let _ = domain.settle_dispatch_budget(&envelope.call_id, "failed");
+                    account(&mut domain, DispatchAccounting::Failed);
                     let _ = envelope.events.send(ExecutionEvent::Failed(reason));
                     return Ok(());
                 }
@@ -181,7 +270,7 @@ impl CompioCallHandler for ProviderCallHandler {
                             EffectIntentState::Unknown,
                             Some("provider_stream"),
                         );
-                        let _ = domain.settle_dispatch_budget(&envelope.call_id, "failed");
+                        account(&mut domain, DispatchAccounting::Failed);
                         let _ = envelope.events.send(ExecutionEvent::Failed(reason));
                         return Ok(());
                     }
@@ -202,7 +291,7 @@ impl CompioCallHandler for ProviderCallHandler {
                             EffectIntentState::Unknown,
                             Some("provider_stream"),
                         );
-                        let _ = domain.settle_dispatch_budget(&envelope.call_id, "failed");
+                        account(&mut domain, DispatchAccounting::Failed);
                         let _ = envelope.events.send(ExecutionEvent::Failed(reason));
                         return Ok(());
                     }
@@ -210,31 +299,45 @@ impl CompioCallHandler for ProviderCallHandler {
             }
             if finished {
                 let response =
-                    json!({"usage": usage.map(|value| value.raw), "provider": self.route.provider})
+                    json!({"usage": usage.as_ref().and_then(|value| value.raw.clone()), "provider": self.route.provider})
                         .to_string();
-                if domain
-                    .finish_call(
-                        &envelope.call_id,
-                        &authority.attempt_id,
-                        authority.generation,
-                        &response,
-                    )
-                    .is_ok()
-                {
-                    let _ = domain.finish_dispatch_intent(
-                        &envelope.call_id,
-                        "completed",
-                        EffectIntentState::Settled,
-                        None,
+                // The Call's canonical completion, the intent's terminal state
+                // and the Money settlement are one commit, so there is no window
+                // in which a Call is durably complete but its spend is neither
+                // reserved nor settled. A stale Attempt cannot complete the
+                // Call at all, so it can never book an actual.
+                //
+                // The usage is normalized against the price frozen for this
+                // dispatch, which is the only pricing the settlement may consult.
+                let frozen = domain.dispatch_pricing_basis(&envelope.call_id)?;
+                let settled = domain.complete_provider_dispatch(
+                    &envelope.call_id,
+                    &authority,
+                    &response,
+                    &crate::orchestration::domain::ProviderSettlement {
+                        usage: usage.as_ref().map(usage_record),
+                        billable: usage.as_ref().map(|reported| {
+                            billable_usage(
+                                reported,
+                                frozen.as_ref().and_then(|basis| basis.price.as_ref()),
+                            )
+                        }),
+                    },
+                );
+                if let Ok(outcome) = settled {
+                    tracing::debug!(
+                        call_id = %envelope.call_id,
+                        recorded = outcome.recorded,
+                        disposition = outcome.disposition.as_str(),
+                        reason = %outcome.reason_code,
+                        "canonical provider settlement applied"
                     );
-                    let _ = domain.settle_dispatch_budget(&envelope.call_id, "completed");
                     if let Some(event) = finish_event {
                         let _ = envelope.events.send(ExecutionEvent::Provider(event));
                     }
                     let _ = envelope.events.send(ExecutionEvent::Finished);
                 } else {
                     let _ = domain.fence_dispatch_intent(&envelope.call_id, "late_result");
-                    let _ = domain.settle_dispatch_budget(&envelope.call_id, "fenced");
                     let _ = envelope
                         .events
                         .send(ExecutionEvent::Failed("late_result".into()));
@@ -242,8 +345,8 @@ impl CompioCallHandler for ProviderCallHandler {
             } else {
                 let _ = domain.fail_call(
                     &envelope.call_id,
-                    &authority.attempt_id,
-                    authority.generation,
+                    &envelope.attempt_id,
+                    envelope.generation,
                     "provider_disconnect",
                 );
                 let _ = domain.finish_dispatch_intent(
@@ -252,7 +355,10 @@ impl CompioCallHandler for ProviderCallHandler {
                     EffectIntentState::Unknown,
                     Some("provider_disconnect"),
                 );
-                let _ = domain.settle_dispatch_budget(&envelope.call_id, "failed");
+                // The provider may already have billed this request before the
+                // stream dropped, so the reservation is retained: never released,
+                // and never settled at a number nobody reported.
+                account(&mut domain, DispatchAccounting::Failed);
                 let _ = envelope
                     .events
                     .send(ExecutionEvent::Failed("provider_disconnect".into()));
@@ -714,11 +820,55 @@ fn handle(mut socket: TcpStream, ctx: &GatewayContext) {
             authority.generation,
             "dispatch_reservation_attach",
         );
-        let _ = domain.settle_dispatch_budget(&call.id, "not_dispatched");
+        let _ = domain.settle_dispatch_accounting(
+            &call.id,
+            &crate::orchestration::domain::AccountingAuthority {
+                attempt_id: authority.attempt_id.clone(),
+                generation: authority.generation,
+            },
+            &DispatchAccounting::NotDispatched,
+        );
         respond(
             &mut socket,
             503,
             "canonical dispatch reservation could not be attached",
+        );
+        return;
+    }
+    // Freeze the pricing basis now, while the dispatch is still only queued and
+    // before the provider can be asked for anything. From here on the Call
+    // settles against this basis and against nothing else: a pricing revision
+    // that lands after this point cannot reprice a dispatch that already
+    // happened.
+    let frozen = match domain.freeze_dispatch_pricing(
+        &call.id,
+        &budget::PricingBasis::resolve(&ctx.budget, &ctx.route.provider, &ctx.route.model),
+    ) {
+        Ok(frozen) => frozen,
+        Err(error) => {
+            tracing::error!(%error, call_id = %call.id, "canonical dispatch pricing freeze failed");
+            false
+        }
+    };
+    if !frozen {
+        let _ = domain.fail_call(
+            &call.id,
+            &authority.attempt_id,
+            authority.generation,
+            "dispatch_pricing_freeze",
+        );
+        let _ = domain.settle_dispatch_accounting(
+            &call.id,
+            &crate::orchestration::domain::AccountingAuthority {
+                attempt_id: authority.attempt_id.clone(),
+                generation: authority.generation,
+            },
+            &DispatchAccounting::NotDispatched,
+        );
+        respond(
+            &mut socket,
+            503,
+            "canonical dispatch pricing could not be frozen",
         );
         return;
     }
@@ -738,7 +888,14 @@ fn handle(mut socket: TcpStream, ctx: &GatewayContext) {
                 authority.generation,
                 "bounded_dispatch",
             );
-            let _ = domain.settle_dispatch_budget(&call.id, "not_dispatched");
+            let _ = domain.settle_dispatch_accounting(
+                &call.id,
+                &crate::orchestration::domain::AccountingAuthority {
+                    attempt_id: authority.attempt_id.clone(),
+                    generation: authority.generation,
+                },
+                &DispatchAccounting::NotDispatched,
+            );
             respond(&mut socket, 503, "canonical bounded dispatcher unavailable");
             return;
         }
