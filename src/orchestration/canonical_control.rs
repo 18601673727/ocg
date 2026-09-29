@@ -6,7 +6,8 @@
 //! canonical Mission snapshot needed to reconcile a reconnect.
 
 use crate::error::{OcgError, Result};
-use crate::orchestration::domain::DomainRepository;
+use crate::orchestration::domain::{Attempt, Call, DomainRepository};
+use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
 use crate::project::{self, ProjectBoundary};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -136,10 +137,35 @@ pub struct CanonicalWorkEvent {
     pub api_version: String,
     pub project_id: String,
     pub mission_id: String,
+    /// The canonical execution journal cursor this event occupies.
     pub sequence: u64,
     pub event_id: String,
     pub kind: String,
     pub payload: Value,
+}
+
+/// The outcome of asking for the canonical event tail after a cursor.
+///
+/// This is transport-side control state, not a declared wire type: the three
+/// outcomes differ in *what the consumer must do next*, which is exactly what
+/// must not be flattened into a list of events.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanonicalEventTail {
+    /// The complete delta after the requested cursor, in cursor order. May be
+    /// empty when the cursor is already at the head.
+    Events(Vec<CanonicalWorkEvent>),
+    /// The requested cursor is below the journal's retained floor, so its delta
+    /// can no longer be produced. The consumer must refetch
+    /// [`CanonicalControlService::canonical_snapshot`] and resume from the
+    /// cursor that snapshot reports. No partial suffix is returned.
+    ResyncRequired {
+        requested: u64,
+        floor_cursor: u64,
+        head_cursor: u64,
+    },
+    /// The requested cursor is ahead of the durable head and cannot name a real
+    /// position.
+    InvalidCursor { requested: u64, head_cursor: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -437,6 +463,12 @@ impl CanonicalControlService {
         DomainRepository::open(&self.root)?.job_configuration(mission_id)
     }
 
+    /// The canonical snapshot of one Job, taken at the real journal cursor.
+    ///
+    /// The read model is the `ExecutionProjection` built from
+    /// [`DomainRepository::execution_snapshot`], so the rows and the cursor come
+    /// from one read transaction. The cursor is the journal head — a real
+    /// `domain_events.seq` position — never a count of entities.
     pub fn canonical_snapshot(
         &self,
         project_id: &str,
@@ -451,63 +483,98 @@ impl CanonicalControlService {
             return Err(invalid("Project identity does not own this boundary"));
         }
         let repository = DomainRepository::open(&self.root)?;
-        let job = repository
-            .job(mission_id)?
+        let snapshot = repository.execution_snapshot()?;
+        let projection = ExecutionProjection::from(snapshot);
+        let job = projection
+            .jobs
+            .get(mission_id)
+            .cloned()
             .ok_or_else(|| invalid("unknown canonical Job"))?;
-        let attempts = repository.attempts_for_job(mission_id)?;
-        let calls = attempts
-            .iter()
-            .map(|attempt| repository.calls_for_attempt(&attempt.id))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let attempts: Vec<Attempt> = projection
+            .attempts
+            .values()
+            .filter(|attempt| attempt.job_id == job.id)
+            .cloned()
+            .collect();
+        let calls: Vec<Call> = projection
+            .calls
+            .values()
+            .filter(|call| attempts.iter().any(|attempt| attempt.id == call.attempt_id))
+            .cloned()
+            .collect();
         let value = json!({
             "job":job,
             "attempts":attempts,
             "calls":calls,
             "execution_graph":"canonical state projection"
         });
-        let cursor = calls.len() as u64 + attempts.len() as u64;
         Ok(CanonicalWorkSnapshot {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             project_id: project_id.to_string(),
             mission: value,
-            cursor,
+            cursor: projection.cursor,
         })
     }
 
+    /// The incremental event tail for one Job, taken from the real journal.
+    ///
+    /// Every event carries its own `domain_events.seq` as `sequence`, so the
+    /// consumer's resume cursor is a position in the canonical execution stream
+    /// and nothing else. The outcome is explicit: a complete delta, or a
+    /// `ResyncRequired` telling the consumer to refetch
+    /// [`CanonicalControlService::canonical_snapshot`] and continue from the
+    /// cursor that snapshot reports. A pruned prefix is never served as a
+    /// partial suffix and never disguised as a gap.
     pub fn canonical_event_tail(
         &self,
         project_id: &str,
         mission_id: &str,
         after: u64,
-    ) -> Result<Vec<CanonicalWorkEvent>> {
-        let snapshot = self.canonical_snapshot(project_id, mission_id)?;
-        let events = snapshot
-            .mission
-            .get("attempts")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid("invalid canonical Attempt projection"))?;
-        Ok(events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, attempt)| {
-                let sequence = index as u64 + 1;
-                if sequence <= after {
-                    return None;
-                }
-                Some(CanonicalWorkEvent {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    project_id: project_id.to_string(),
-                    mission_id: mission_id.to_string(),
-                    sequence,
-                    event_id: format!("{mission_id}:{sequence}"),
-                    kind: "attempt_projection".to_string(),
-                    payload: attempt.clone(),
-                })
-            })
-            .collect())
+    ) -> Result<CanonicalEventTail> {
+        let project = self
+            .read_projects()?
+            .into_iter()
+            .find(|project| project.project_id == project_id)
+            .ok_or_else(|| invalid("unknown Project identity"))?;
+        if project.root != self.root.to_string_lossy() {
+            return Err(invalid("Project identity does not own this boundary"));
+        }
+        let repository = DomainRepository::open(&self.root)?;
+        match repository.journal_delta_for_job(mission_id, after, MAX_EVENT_READ)? {
+            EventDelta::Available { events, .. } => Ok(CanonicalEventTail::Events(
+                events
+                    .into_iter()
+                    .map(|event| CanonicalWorkEvent {
+                        api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                        project_id: project.project_id.clone(),
+                        mission_id: mission_id.to_string(),
+                        sequence: event.seq,
+                        event_id: event.event_id,
+                        kind: event.kind.to_string(),
+                        payload: event.payload,
+                    })
+                    .collect(),
+            )),
+            // At the head there is nothing to apply; an empty tail is a
+            // complete, honest delta rather than a gap.
+            EventDelta::Empty { head_cursor: _ } => Ok(CanonicalEventTail::Events(Vec::new())),
+            EventDelta::ResyncRequired {
+                requested,
+                floor_cursor,
+                head_cursor,
+            } => Ok(CanonicalEventTail::ResyncRequired {
+                requested,
+                floor_cursor,
+                head_cursor,
+            }),
+            EventDelta::AheadOfHead {
+                requested,
+                head_cursor,
+            } => Ok(CanonicalEventTail::InvalidCursor {
+                requested,
+                head_cursor,
+            }),
+        }
     }
 
     pub fn dashboard(

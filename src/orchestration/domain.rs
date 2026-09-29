@@ -2,13 +2,24 @@
 
 use crate::error::{OcgError, Result};
 use crate::orchestration::budget::{self, BudgetConfig, QuotaFacts, SpendAction, SpendAssessment};
+use crate::orchestration::journal::{
+    self, EventDelta, EventDraft, EventKind, ExecutionEvent, ExecutionSnapshot, JournalBoundary,
+    JournalPrune,
+};
 use petgraph::algo::is_cyclic_directed;
 use petgraph::graph::{DiGraph, NodeIndex};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use strum::{Display, EnumString};
+
+/// Call states that are still unsettled. The fencing cascades and the journal
+/// use exactly the same live set, so a record is emitted for every row the SQL
+/// actually changed.
+const LIVE_CALL_STATES: &[&str] = &["created", "running"];
+/// DispatchIntent states that are not terminally settled.
+const LIVE_INTENT_STATES: &[&str] = &["pending", "queued", "running"];
 
 fn invalid(message: &str) -> OcgError {
     OcgError::config(message)
@@ -394,6 +405,11 @@ impl DomainRepository {
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(sql)?;
         connection.execute_batch(DOMAIN_SCHEMA).map_err(sql)?;
+        // The durable execution event journal shares this database so a state
+        // change and its event commit in one transaction. It is evidence, never
+        // a decision input: nothing in this file reads it back to choose an
+        // execution outcome.
+        journal::ensure_schema(&connection)?;
         ensure_column(
             &connection,
             "domain_dispatch_intents",
@@ -424,6 +440,109 @@ impl DomainRepository {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Begin the canonical writer transaction.
+    ///
+    /// Every lifecycle mutation runs inside one such transaction together with
+    /// its journal appends, so a canonical change and its event are atomic.
+    /// It is taken on `&self` so an immutable mutation method can still commit
+    /// state and evidence together.
+    fn begin(&self) -> Result<rusqlite::Transaction<'_>> {
+        journal::begin(&self.connection)
+    }
+
+    // ---------------------------------------------------------------------
+    // Durable execution event journal (read side)
+    // ---------------------------------------------------------------------
+
+    /// The journal head: the cursor of the most recent committed event, or
+    /// [`journal::INITIAL_CURSOR`] when nothing has been journalized.
+    pub fn journal_head(&self) -> Result<u64> {
+        journal::head(&self.connection)
+    }
+
+    /// The durable retention boundary: head, floor and anchor.
+    pub fn journal_boundary(&self) -> Result<JournalBoundary> {
+        journal::boundary(&self.connection)
+    }
+
+    /// The lowest cursor still retained. `0` means nothing has been pruned.
+    pub fn journal_floor(&self) -> Result<u64> {
+        Ok(journal::boundary(&self.connection)?.floor_cursor)
+    }
+
+    /// Read the committed events strictly after `after`, in cursor order.
+    pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<ExecutionEvent>> {
+        journal::read_after(&self.connection, after, limit)
+    }
+
+    /// Read one Job's event stream strictly after `after`, in cursor order.
+    pub fn events_for_job(
+        &self,
+        job_id: &str,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<ExecutionEvent>> {
+        journal::read_for_job(&self.connection, job_id, after, limit)
+    }
+
+    /// Ask for the complete delta after `cursor`.
+    ///
+    /// The outcome is always explicit: the complete delta, an empty delta at
+    /// the head, [`EventDelta::ResyncRequired`] when the cursor fell below the
+    /// retained floor, or [`EventDelta::AheadOfHead`] when the cursor cannot
+    /// name a real position. A partial suffix is never returned.
+    pub fn journal_delta(&self, cursor: u64, limit: usize) -> Result<EventDelta> {
+        journal::delta_after(&self.connection, cursor, limit)
+    }
+
+    /// The same boundary-checked delta, filtered to one Job.
+    pub fn journal_delta_for_job(
+        &self,
+        job_id: &str,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<EventDelta> {
+        journal::delta_for_job(&self.connection, job_id, cursor, limit)
+    }
+
+    /// Explicitly drop retained events below `keep_from` and move the floor.
+    ///
+    /// This is the only way the journal loses an event. It changes no canonical
+    /// state, never moves the head, and never re-issues a cursor: the numbering
+    /// comes from the durable boundary counter, which pruning does not touch.
+    pub fn prune_journal(&mut self, keep_from: u64) -> Result<JournalPrune> {
+        journal::prune(&self.connection, keep_from)
+    }
+
+    /// Capture the canonical rows and the journal head in one read transaction.
+    ///
+    /// This is the base a projection rebuild starts from: the cursor, the floor
+    /// and the rows are read together, so a consumer can never pair pre-commit
+    /// rows with a post-commit cursor.
+    pub fn execution_snapshot(&self) -> Result<ExecutionSnapshot> {
+        let transaction = journal::begin_read(&self.connection)?;
+        let view: &Connection = &transaction;
+        let boundary = journal::boundary(view)?;
+        let snapshot = ExecutionSnapshot {
+            cursor: boundary.head_cursor,
+            floor_cursor: boundary.floor_cursor,
+            anchor_digest: boundary.anchor_digest,
+            projects: all_projects(view)?,
+            jobs: all_jobs(view)?,
+            attempts: all_attempts(view)?,
+            executors: all_executors(view)?,
+            calls: all_calls(view)?,
+            dispatch_intents: all_dispatch_intents(view)?,
+            dependencies: all_dependencies(view)?,
+            bindings: all_bindings(view)?,
+            job_configurations: all_job_configurations(view)?,
+            result_evidence: all_result_evidence(view)?,
+            verifications: all_verifications(view)?,
+        };
+        transaction.commit().map_err(sql)?;
+        Ok(snapshot)
     }
 
     pub fn project_budget(&self, project_id: &str) -> Result<budget::MissionBudgetReceipt> {
@@ -537,10 +656,35 @@ impl DomainRepository {
         ).map_err(sql)?;
         let duplicate = state == "completed" && stored_response.as_deref() == Some(response);
         if !duplicate && (!current || state != "running") {
-            transaction.execute(
+            let recorded = transaction.execute(
                 "INSERT OR IGNORE INTO domain_result_evidence(call_id,attempt_id,generation,response,disposition,created_at) VALUES(?1,?2,?3,?4,'late',?5)",
                 params![witness.call_id,witness.attempt_id,generation,response,now()],
             ).map_err(sql)?;
+            // A late result is durable evidence, not canonical state. It is
+            // journalized as evidence so the rejection itself is auditable,
+            // naming the fenced authority it was refused under. Redelivering
+            // the same result retains the existing evidence and records nothing.
+            if recorded == 1 {
+                let stored: i64 = transaction
+                    .query_row(
+                        "SELECT created_at FROM domain_result_evidence WHERE call_id=?1 AND attempt_id=?2 AND generation=?3 AND response=?4 AND disposition='late'",
+                        params![witness.call_id, witness.attempt_id, generation, response],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)?;
+                emit_result_evidence(
+                    &transaction,
+                    &journal::ResultEvidence {
+                        call_id: witness.call_id.clone(),
+                        attempt_id: witness.attempt_id.clone(),
+                        generation: witness.generation,
+                        disposition: "late".to_string(),
+                        created_at: stored,
+                    },
+                    &witness.job_id,
+                    &witness.executor_id,
+                )?;
+            }
             transaction.commit().map_err(sql)?;
             return Ok("late_evidence");
         }
@@ -575,13 +719,33 @@ impl DomainRepository {
     ) -> Result<()> {
         self.validate_execution_witness(witness)?;
         let report = serde_json::to_string(report).map_err(|error| invalid(&error.to_string()))?;
-        let changed = self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let changed = transaction.execute(
             "INSERT INTO domain_verifications(call_id,passed,report,created_at) SELECT ?1,?2,?3,?4 WHERE EXISTS(SELECT 1 FROM domain_calls c JOIN domain_attempts a ON a.id=c.attempt_id JOIN domain_jobs j ON j.id=a.job_id WHERE c.id=?1 AND c.state='running' AND a.authoritative=1 AND j.authoritative_attempt_id=a.id) ON CONFLICT(call_id) DO NOTHING",
             params![witness.call_id,passed,report,now()],
         ).map_err(sql)?;
-        if changed == 0 && self.verification(&witness.call_id)?.is_none() {
-            return Err(invalid("verification rejected: Attempt authority is stale"));
+        if changed == 0 {
+            if read_verification(&transaction, &witness.call_id)?.is_none() {
+                return Err(invalid("verification rejected: Attempt authority is stale"));
+            }
+            // Already recorded: the fact is unchanged, so it records nothing.
+            transaction.commit().map_err(sql)?;
+            return Ok(());
         }
+        let verification = read_verification(&transaction, &witness.call_id)?
+            .ok_or_else(|| invalid("recorded verification disappeared"))?;
+        emit_verification(
+            &transaction,
+            &verification,
+            &witness.job_id,
+            &witness.attempt_id,
+            witness.generation,
+            &witness.executor_id,
+        )?;
+        transaction.commit().map_err(sql)?;
         Ok(())
     }
 
@@ -921,6 +1085,17 @@ impl DomainRepository {
                 |row| row.get(0),
             )
             .map_err(sql)?;
+        // The frozen configuration a future Attempt will be admitted against is
+        // canonical state, so each revision is reconstructable from the journal.
+        emit_job_configuration(
+            &transaction,
+            &journal::StoredJobConfiguration {
+                job_id: job_id.to_string(),
+                configuration: configuration.clone(),
+                revision: u64::try_from(revision)
+                    .map_err(|_| invalid("negative Job configuration revision"))?,
+            },
+        )?;
         transaction.commit().map_err(sql)?;
         u64::try_from(revision).map_err(|_| invalid("negative Job configuration revision"))
     }
@@ -1011,6 +1186,8 @@ impl DomainRepository {
             )
             .map_err(sql)?;
         if inserted == 0 {
+            // The edge already exists, so no canonical change occurred and no
+            // event is written for it.
             let revision: i64 = transaction
                 .query_row(
                     "SELECT revision FROM domain_dependency_revisions WHERE project_id=?1",
@@ -1021,6 +1198,16 @@ impl DomainRepository {
             transaction.commit().map_err(sql)?;
             return u64::try_from(revision).map_err(|_| invalid("negative dependency revision"));
         }
+        emit_dependency(
+            &transaction,
+            EventKind::DependencyAdded,
+            &journal::DependencyEdge {
+                project_id: project_id.to_string(),
+                job_id: job_id.to_string(),
+                prerequisite_job_id: prerequisite_job_id.to_string(),
+            },
+            None,
+        )?;
         let revision: i64 = transaction
             .query_row(
                 "UPDATE domain_dependency_revisions SET revision=revision+1 WHERE project_id=?1 RETURNING revision",
@@ -1052,6 +1239,16 @@ impl DomainRepository {
             transaction.commit().map_err(sql)?;
             return self.dependency_revision(project_id);
         }
+        emit_dependency(
+            &transaction,
+            EventKind::DependencyRemoved,
+            &journal::DependencyEdge {
+                project_id: project_id.to_string(),
+                job_id: job_id.to_string(),
+                prerequisite_job_id: prerequisite_job_id.to_string(),
+            },
+            None,
+        )?;
         let revision: i64 = transaction
             .query_row(
                 "UPDATE domain_dependency_revisions SET revision=revision+1 WHERE project_id=?1 RETURNING revision",
@@ -1178,14 +1375,26 @@ impl DomainRepository {
         validate_id(project_id)?;
         let id = new_id("job");
         let timestamp = now();
-        self.connection
+        let transaction = self.begin()?;
+        transaction
             .execute(
                 "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?4)",
                 params![id, project_id, payload, timestamp],
             )
             .map_err(sql)?;
-        self.job(&id)?
-            .ok_or_else(|| invalid("created Job disappeared"))
+        let job = Job {
+            id: id.clone(),
+            project_id: project_id.to_string(),
+            state: JobState::Pending,
+            generation: 0,
+            authoritative_attempt_id: None,
+            payload: payload.to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        emit_job(&transaction, EventKind::JobCreated, &job, None)?;
+        transaction.commit().map_err(sql)?;
+        Ok(job)
     }
 
     /// Create a child Job while requiring the current parent Attempt authority.
@@ -1277,9 +1486,41 @@ impl DomainRepository {
                 )
                 .map_err(sql)?;
         }
+        let job = Job {
+            id: job_id.clone(),
+            project_id: project_id.clone(),
+            state: JobState::Pending,
+            generation: 0,
+            authoritative_attempt_id: None,
+            payload: payload.to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        // The spawned Job is the root fact; its prerequisite edges are caused
+        // by the same spawn, and the parent Attempt that authorized it is the
+        // event's authority identity.
+        let root = journal::append(
+            &transaction,
+            EventDraft::new(EventKind::JobCreated, "job", &job.id, journal::value(&job)?)
+                .project(&project_id)
+                .job(&job.id)
+                .authority(&parent_authority.attempt_id, parent_authority.generation)
+                .causation_key(&parent_authority.attempt_id),
+        )?;
+        for prerequisite in prerequisite_job_ids {
+            emit_dependency(
+                &transaction,
+                EventKind::DependencyAdded,
+                &journal::DependencyEdge {
+                    project_id: project_id.clone(),
+                    job_id: job_id.clone(),
+                    prerequisite_job_id: (*prerequisite).to_string(),
+                },
+                Some(root),
+            )?;
+        }
         transaction.commit().map_err(sql)?;
-        self.job(&job_id)?
-            .ok_or_else(|| invalid("created child Job disappeared"))
+        Ok(job)
     }
 
     /// Admit a child execution in one canonical transaction. The parent
@@ -1412,6 +1653,68 @@ impl DomainRepository {
                 params![executor_id, attempt_id, executor_kind, timestamp],
             )
             .map_err(sql)?;
+
+        let job = Job {
+            id: job_id.clone(),
+            project_id: project_id.clone(),
+            state: JobState::Running,
+            generation: 1,
+            authoritative_attempt_id: Some(attempt_id.clone()),
+            payload: payload.to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let attempt = Attempt {
+            id: attempt_id.clone(),
+            job_id: job_id.clone(),
+            generation: 1,
+            state: AttemptState::Queued,
+            authoritative: true,
+            created_at: timestamp,
+            finished_at: None,
+        };
+        let executor = Executor {
+            id: executor_id.clone(),
+            attempt_id: attempt_id.clone(),
+            kind: executor_kind.to_string(),
+            state: "ready".to_string(),
+            created_at: timestamp,
+        };
+        // A spawn is one causal fact committed under the parent Attempt's
+        // authority: the child Job, its prerequisite edges, its first Attempt
+        // and its Executor all become canonical together.
+        let root = journal::append(
+            &transaction,
+            EventDraft::new(EventKind::JobCreated, "job", &job.id, journal::value(&job)?)
+                .project(&project_id)
+                .job(&job.id)
+                .authority(&parent_authority.attempt_id, parent_authority.generation)
+                .causation_key(&parent_authority.attempt_id),
+        )?;
+        for prerequisite in prerequisite_job_ids {
+            emit_dependency(
+                &transaction,
+                EventKind::DependencyAdded,
+                &journal::DependencyEdge {
+                    project_id: project_id.clone(),
+                    job_id: job_id.clone(),
+                    prerequisite_job_id: (*prerequisite).to_string(),
+                },
+                Some(root),
+            )?;
+        }
+        emit_attempt(
+            &transaction,
+            EventKind::AttemptCreated,
+            &attempt,
+            Some(root),
+        )?;
+        emit_executor(
+            &transaction,
+            EventKind::ExecutorCreated,
+            &executor,
+            Some(root),
+        )?;
         transaction.commit().map_err(sql)?;
 
         Ok(CanonicalAdmission {
@@ -1429,15 +1732,9 @@ impl DomainRepository {
                     },
                 )
                 .map_err(sql)?,
-            job: self
-                .job(&job_id)?
-                .ok_or_else(|| invalid("created child Job disappeared"))?,
-            attempt: self
-                .attempt(&attempt_id)?
-                .ok_or_else(|| invalid("created child Attempt disappeared"))?,
-            executor: self
-                .executor(&executor_id)?
-                .ok_or_else(|| invalid("created child Executor disappeared"))?,
+            job,
+            attempt,
+            executor,
         })
     }
 
@@ -1518,37 +1815,73 @@ impl DomainRepository {
             "INSERT INTO domain_job_bindings(binding_key,project_id,job_id,created_at,attempt_id) VALUES(?1,?2,?3,?4,?5)",
             params![binding_key, project.id, job_id, timestamp, attempt_id],
         ).map_err(sql)?;
+
+        // One admission is one causal fact. The Job record is the root; the
+        // Attempt, the Executor and the session binding are recorded as caused
+        // by it inside the same commit, so a reader can never see a bound
+        // session whose Attempt is not journalized yet.
+        let job = Job {
+            id: job_id.clone(),
+            project_id: project.id.clone(),
+            state: JobState::Running,
+            generation: 1,
+            authoritative_attempt_id: Some(attempt_id.clone()),
+            payload: payload.to_string(),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let attempt = Attempt {
+            id: attempt_id.clone(),
+            job_id: job_id.clone(),
+            generation: 1,
+            state: AttemptState::Queued,
+            authoritative: true,
+            created_at: timestamp,
+            finished_at: None,
+        };
+        let executor = Executor {
+            id: executor_id.clone(),
+            attempt_id: attempt_id.clone(),
+            kind: executor_kind.to_string(),
+            state: "ready".to_string(),
+            created_at: timestamp,
+        };
+        let root = journal::append(
+            &transaction,
+            EventDraft::new(EventKind::JobCreated, "job", &job.id, journal::value(&job)?)
+                .project(&project.id)
+                .job(&job.id)
+                .causation_key(binding_key),
+        )?;
+        emit_attempt(
+            &transaction,
+            EventKind::AttemptCreated,
+            &attempt,
+            Some(root),
+        )?;
+        emit_executor(
+            &transaction,
+            EventKind::ExecutorCreated,
+            &executor,
+            Some(root),
+        )?;
+        emit_binding(
+            &transaction,
+            &journal::JobBinding {
+                binding_key: binding_key.to_string(),
+                project_id: project.id.clone(),
+                job_id: job_id.clone(),
+                attempt_id: Some(attempt_id.clone()),
+            },
+            Some(root),
+        )?;
         transaction.commit().map_err(sql)?;
 
-        let project_id = project.id.clone();
         Ok(CanonicalAdmission {
             project: project.clone(),
-            job: Job {
-                id: job_id.clone(),
-                project_id,
-                state: JobState::Running,
-                generation: 1,
-                authoritative_attempt_id: Some(attempt_id.clone()),
-                payload: payload.to_string(),
-                created_at: timestamp,
-                updated_at: timestamp,
-            },
-            attempt: Attempt {
-                id: attempt_id.clone(),
-                job_id,
-                generation: 1,
-                state: AttemptState::Queued,
-                authoritative: true,
-                created_at: timestamp,
-                finished_at: None,
-            },
-            executor: Executor {
-                id: executor_id,
-                attempt_id: attempt_id.clone(),
-                kind: executor_kind.to_string(),
-                state: "ready".to_string(),
-                created_at: timestamp,
-            },
+            job,
+            attempt,
+            executor,
         })
     }
 
@@ -1627,6 +1960,16 @@ impl DomainRepository {
                 params![binding_key, project_id, job_id, now(), authority.attempt_id],
             )
             .map_err(sql)?;
+        emit_binding(
+            &transaction,
+            &journal::JobBinding {
+                binding_key: binding_key.to_string(),
+                project_id: project_id.clone(),
+                job_id: job_id.clone(),
+                attempt_id: Some(authority.attempt_id.clone()),
+            },
+            None,
+        )?;
         transaction.commit().map_err(sql)?;
         Ok(())
     }
@@ -1661,15 +2004,22 @@ impl DomainRepository {
 
     pub fn set_job_eligible(&self, job_id: &str) -> Result<()> {
         validate_id(job_id)?;
-        let changed = self.connection.execute(
+        let timestamp = now();
+        let transaction = self.begin()?;
+        let changed = transaction.execute(
             "UPDATE domain_jobs SET state='eligible',updated_at=?2 WHERE id=?1 AND state='pending' AND authoritative_attempt_id IS NULL",
-            params![job_id, now()],
+            params![job_id, timestamp],
         ).map_err(sql)?;
         if changed != 1 {
             return Err(invalid(
                 "Job is not pending or already has an authoritative Attempt",
             ));
         }
+        let job = self
+            .job(job_id)?
+            .ok_or_else(|| invalid("Job disappeared while becoming eligible"))?;
+        emit_job(&transaction, EventKind::JobUpdated, &job, None)?;
+        transaction.commit().map_err(sql)?;
         Ok(())
     }
 
@@ -1691,7 +2041,7 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let attempt = create_attempt_in(&transaction, job_id)?;
+        let (attempt, _root) = create_attempt_in(&transaction, job_id)?;
         transaction.commit().map_err(sql)?;
         Ok(attempt)
     }
@@ -1707,7 +2057,7 @@ impl DomainRepository {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
         transaction.execute("UPDATE domain_jobs SET state='eligible',updated_at=?2 WHERE id=?1 AND state='pending' AND authoritative_attempt_id IS NULL", params![job_id,now()]).map_err(sql)?;
-        let attempt = create_attempt_in(&transaction, job_id)?;
+        let (attempt, root) = create_attempt_in(&transaction, job_id)?;
         let executor = Executor {
             id: new_id("exec"),
             attempt_id: attempt.id.clone(),
@@ -1716,6 +2066,12 @@ impl DomainRepository {
             created_at: now(),
         };
         transaction.execute("INSERT INTO domain_executors(id,attempt_id,kind,state,created_at) VALUES(?1,?2,?3,?4,?5)", params![executor.id,executor.attempt_id,executor.kind,executor.state,executor.created_at]).map_err(sql)?;
+        emit_executor(
+            &transaction,
+            EventKind::ExecutorCreated,
+            &executor,
+            Some(root),
+        )?;
         transaction.commit().map_err(sql)?;
         Ok((attempt, executor))
     }
@@ -1778,11 +2134,17 @@ impl DomainRepository {
         let next_generation = generation
             .checked_add(1)
             .ok_or_else(|| invalid("Job generation overflow"))?;
-        if let Some(old_attempt) = old_attempt {
+        if let Some(old_attempt) = &old_attempt {
+            // Capture exactly the rows the fence will change, so the journal
+            // records each one that actually moved rather than the whole
+            // Attempt's history.
+            let fenced_executors = attempt_executors(&transaction, old_attempt)?;
+            let fenced_intents = attempt_intents(&transaction, old_attempt)?;
+            let fenced_calls = attempt_calls(&transaction, old_attempt)?;
             transaction
                 .execute(
                     "UPDATE domain_executors SET state='fenced' WHERE attempt_id=?1",
-                    [&old_attempt],
+                    [old_attempt],
                 )
                 .map_err(sql)?;
             transaction.execute(
@@ -1799,6 +2161,18 @@ impl DomainRepository {
                     params![old_attempt, now()],
                 )
                 .map_err(sql)?;
+            // The revocation is the causal root: the replaced Attempt stops
+            // being authoritative first, and every cascade it forces is
+            // recorded as caused by it in this same commit.
+            let root = emit_attempt(
+                &transaction,
+                EventKind::AttemptUpdated,
+                &read_attempt(&transaction, old_attempt)?,
+                None,
+            )?;
+            emit_changed_executors(&transaction, &fenced_executors, Some(root))?;
+            emit_changed_intents(&transaction, &fenced_intents, Some(root))?;
+            emit_changed_calls(&transaction, &fenced_calls, Some(root))?;
         }
         let attempt_id = new_id("att");
         let executor_id = new_id("exec");
@@ -1821,6 +2195,22 @@ impl DomainRepository {
                 params![executor_id, attempt_id, executor_kind, timestamp],
             )
             .map_err(sql)?;
+        // The replacement generation becomes canonical here, still inside the
+        // commit that revoked the previous one: there is no observable instant
+        // in which two Attempts share authority.
+        let attempt = read_attempt(&transaction, &attempt_id)?;
+        let executor = read_executor(&transaction, &executor_id)?
+            .ok_or_else(|| invalid("replacement Executor disappeared"))?;
+        let job =
+            read_job(&transaction, job_id)?.ok_or_else(|| invalid("replaced Job disappeared"))?;
+        let root = emit_attempt(&transaction, EventKind::AttemptCreated, &attempt, None)?;
+        emit_executor(
+            &transaction,
+            EventKind::ExecutorCreated,
+            &executor,
+            Some(root),
+        )?;
+        emit_job(&transaction, EventKind::JobUpdated, &job, Some(root))?;
         transaction.commit().map_err(sql)?;
         let project = self
             .connection
@@ -1838,15 +2228,9 @@ impl DomainRepository {
             .map_err(sql)?;
         Ok(CanonicalAdmission {
             project,
-            job: self
-                .job(job_id)?
-                .ok_or_else(|| invalid("replaced Job disappeared"))?,
-            attempt: self
-                .attempt(&attempt_id)?
-                .ok_or_else(|| invalid("replacement Attempt disappeared"))?,
-            executor: self
-                .executor(&executor_id)?
-                .ok_or_else(|| invalid("replacement Executor disappeared"))?,
+            job,
+            attempt,
+            executor,
         })
     }
 
@@ -1855,21 +2239,28 @@ impl DomainRepository {
         if kind.is_empty() || kind.len() > 120 {
             return Err(invalid("invalid Executor kind"));
         }
-        self.attempt(attempt_id)?
-            .ok_or_else(|| invalid("unknown Attempt"))?;
         let id = new_id("exe");
         let timestamp = now();
-        self.connection.execute(
-            "INSERT INTO domain_executors(id,attempt_id,kind,state,created_at) VALUES(?1,?2,?3,'created',?4)",
-            params![id, attempt_id, kind, timestamp],
-        ).map_err(sql)?;
-        Ok(Executor {
+        let transaction = self.begin()?;
+        if read_attempt(&transaction, attempt_id).is_err() {
+            return Err(invalid("unknown Attempt"));
+        }
+        transaction
+            .execute(
+                "INSERT INTO domain_executors(id,attempt_id,kind,state,created_at) VALUES(?1,?2,?3,'created',?4)",
+                params![id, attempt_id, kind, timestamp],
+            )
+            .map_err(sql)?;
+        let executor = Executor {
             id,
             attempt_id: attempt_id.to_string(),
             kind: kind.to_string(),
             state: "created".to_string(),
             created_at: timestamp,
-        })
+        };
+        emit_executor(&transaction, EventKind::ExecutorCreated, &executor, None)?;
+        transaction.commit().map_err(sql)?;
+        Ok(executor)
     }
 
     pub fn executor(&self, executor_id: &str) -> Result<Option<Executor>> {
@@ -1934,8 +2325,8 @@ impl DomainRepository {
     pub fn mark_attempt_running(&self, authority: &AttemptAuthority) -> Result<()> {
         let generation = i64::try_from(authority.generation)
             .map_err(|_| invalid("Attempt generation exceeds SQLite range"))?;
-        let changed = self
-            .connection
+        let transaction = self.begin()?;
+        let changed = transaction
             .execute(
                 "UPDATE domain_attempts SET state='running' WHERE id=?1 AND generation=?2 AND authoritative=1 AND state IN ('queued','running')",
                 params![authority.attempt_id, generation],
@@ -1944,6 +2335,11 @@ impl DomainRepository {
         if changed != 1 {
             return Err(invalid("Attempt is no longer authoritative"));
         }
+        let attempt = read_attempt(&transaction, &authority.attempt_id)?;
+        // Already running is still a canonical claim of execution, and the
+        // state it asserts has to be reconstructable from the journal alone.
+        emit_attempt(&transaction, EventKind::AttemptUpdated, &attempt, None)?;
+        transaction.commit().map_err(sql)?;
         Ok(())
     }
 
@@ -2028,14 +2424,14 @@ impl DomainRepository {
                 return Err(invalid("Executor does not belong to the named Attempt"));
             }
         }
-        let generation = i64::try_from(generation)
+        let generation_i64 = i64::try_from(generation)
             .map_err(|_| invalid("Call generation exceeds SQLite range"))?;
         let id = new_id("call");
         let intent_id = new_id("intent");
         let timestamp = now();
         transaction.execute(
             "INSERT INTO domain_calls(id,attempt_id,executor_id,generation,side_effect,state,request,response,created_at,finished_at) VALUES(?1,?2,?3,?4,?5,'created',?6,NULL,?7,NULL)",
-            params![id, attempt_id, executor_id, generation, side_effect, request, timestamp],
+            params![id, attempt_id, executor_id, generation_i64, side_effect, request, timestamp],
         ).map_err(sql)?;
         let job_id: String = transaction
             .query_row(
@@ -2046,14 +2442,13 @@ impl DomainRepository {
             .map_err(sql)?;
         transaction.execute(
             "INSERT INTO domain_dispatch_intents(id,call_id,job_id,attempt_id,executor_id,generation,state,effect_kind,effect_state,request,reservation_id,failure,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,'not_started',?8,NULL,NULL,?9,?9)",
-            params![intent_id, id, job_id, attempt_id, executor_id, generation, effect_kind.to_string(), request, timestamp],
+            params![intent_id, id, job_id, attempt_id, executor_id, generation_i64, effect_kind.to_string(), request, timestamp],
         ).map_err(sql)?;
-        transaction.commit().map_err(sql)?;
-        Ok(Call {
-            id,
+        let call = Call {
+            id: id.clone(),
             attempt_id: attempt_id.to_string(),
             executor_id: executor_id.map(str::to_string),
-            generation: generation as u64,
+            generation,
             side_effect,
             effect_kind,
             state: "created".to_string(),
@@ -2061,7 +2456,21 @@ impl DomainRepository {
             response: None,
             created_at: timestamp,
             finished_at: None,
-        })
+        };
+        let intent = read_dispatch_intent(&transaction, &intent_id)?
+            .ok_or_else(|| invalid("created dispatch intent disappeared"))?;
+        // The Call and its durable dispatch intent are one admission fact. The
+        // intent is the recovery fact, so it is recorded as caused by the Call
+        // in the same commit and can never exist without one.
+        let root = emit_call(&transaction, EventKind::CallCreated, &call, None)?;
+        emit_dispatch_intent(
+            &transaction,
+            EventKind::DispatchIntentCreated,
+            &intent,
+            Some(root),
+        )?;
+        transaction.commit().map_err(sql)?;
+        Ok(call)
     }
 
     /// Claim an admitted Call immediately before its side effect starts. The
@@ -2078,7 +2487,7 @@ impl DomainRepository {
     pub fn claim_call(&mut self, call_id: &str, attempt_id: &str, generation: u64) -> Result<bool> {
         validate_id(call_id)?;
         validate_id(attempt_id)?;
-        let generation = i64::try_from(generation)
+        let generation_i64 = i64::try_from(generation)
             .map_err(|_| invalid("Call generation exceeds SQLite range"))?;
         let transaction = self
             .connection
@@ -2086,23 +2495,43 @@ impl DomainRepository {
             .map_err(sql)?;
         let changed = transaction.execute(
             "UPDATE domain_calls SET state='running' WHERE id=?1 AND attempt_id=?2 AND generation=?3 AND state='created' AND EXISTS(SELECT 1 FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE a.id=?2 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.generation=?3 AND a.state IN ('queued','running'))",
-            params![call_id, attempt_id, generation],
+            params![call_id, attempt_id, generation_i64],
         ).map_err(sql)?;
         if changed != 1 {
             let duplicate: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM domain_calls WHERE id=?1 AND attempt_id=?2 AND generation=?3 AND state IN ('running','completed','failed','unknown'))",
-                params![call_id,attempt_id,generation], |row| row.get(0)
+                params![call_id,attempt_id,generation_i64], |row| row.get(0)
             ).map_err(sql)?;
             if duplicate {
+                // A duplicate claim changed nothing, so it records nothing.
                 transaction.commit().map_err(sql)?;
                 return Ok(false);
             }
             return Err(invalid("Call start rejected: Attempt authority is stale"));
         }
-        transaction.execute(
+        let intent_moved = transaction.execute(
             "UPDATE domain_dispatch_intents SET state='running',effect_state=CASE WHEN effect_kind='idempotent' THEN 'started' ELSE 'started' END,updated_at=?2 WHERE call_id=?1 AND state IN ('queued','pending')",
             params![call_id, now()],
         ).map_err(sql)?;
+        // Claiming the Call is the fact that the external effect may now start.
+        // The intent reaching `running` is caused by it, not an independent fact.
+        let root = emit_call(
+            &transaction,
+            EventKind::CallUpdated,
+            &read_call(&transaction, call_id)?
+                .ok_or_else(|| invalid("claimed Call disappeared"))?,
+            None,
+        )?;
+        if intent_moved == 1 {
+            if let Some(intent) = read_dispatch_intent_by_call(&transaction, call_id)? {
+                emit_dispatch_intent(
+                    &transaction,
+                    EventKind::DispatchIntentUpdated,
+                    &intent,
+                    Some(root),
+                )?;
+            }
+        }
         transaction.commit().map_err(sql)?;
         Ok(true)
     }
@@ -2154,13 +2583,26 @@ impl DomainRepository {
     /// execution authority.
     pub fn mark_dispatch_queued(&mut self, call_id: &str) -> Result<()> {
         validate_id(call_id)?;
-        let changed = self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let changed = transaction.execute(
             "UPDATE domain_dispatch_intents SET state='queued',updated_at=?2 WHERE call_id=?1 AND state IN ('pending','queued')",
             params![call_id, now()],
         ).map_err(sql)?;
         if changed != 1 {
             return Err(invalid("dispatch intent is no longer pending"));
         }
+        let intent = read_dispatch_intent_by_call(&transaction, call_id)?
+            .ok_or_else(|| invalid("queued dispatch intent disappeared"))?;
+        emit_dispatch_intent(
+            &transaction,
+            EventKind::DispatchIntentUpdated,
+            &intent,
+            None,
+        )?;
+        transaction.commit().map_err(sql)?;
         Ok(())
     }
 
@@ -2212,13 +2654,26 @@ impl DomainRepository {
         if !matches!(state, "completed" | "failed" | "fenced") {
             return Err(invalid("invalid canonical dispatch intent state"));
         }
-        let changed = self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let changed = transaction.execute(
             "UPDATE domain_dispatch_intents SET state=?2,effect_state=?3,failure=?4,updated_at=?5 WHERE call_id=?1 AND state IN ('pending','queued','running')",
             params![call_id, state, effect_state.to_string(), failure, now()],
         ).map_err(sql)?;
         if changed != 1 {
             return Err(invalid("dispatch intent is already terminal"));
         }
+        let intent = read_dispatch_intent_by_call(&transaction, call_id)?
+            .ok_or_else(|| invalid("finished dispatch intent disappeared"))?;
+        emit_dispatch_intent(
+            &transaction,
+            EventKind::DispatchIntentUpdated,
+            &intent,
+            None,
+        )?;
+        transaction.commit().map_err(sql)?;
         Ok(())
     }
 
@@ -2230,14 +2685,35 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        transaction.execute(
+        let intent_moved = transaction.execute(
             "UPDATE domain_dispatch_intents SET state='fenced',effect_state='unknown',failure=?2,updated_at=?3 WHERE call_id=?1 AND state IN ('pending','queued','running')",
             params![call_id, failure, now()],
         ).map_err(sql)?;
-        transaction.execute(
+        let call_moved = transaction.execute(
             "UPDATE domain_calls SET state='unknown',response=?2,finished_at=?3 WHERE id=?1 AND state IN ('created','running')",
             params![call_id, failure, now()],
         ).map_err(sql)?;
+        // Fencing the intent is the root fact: the Call it belongs to becomes
+        // indeterminate because that intent is gone, not the other way around.
+        if intent_moved == 1 {
+            let intent = read_dispatch_intent_by_call(&transaction, call_id)?
+                .ok_or_else(|| invalid("fenced dispatch intent disappeared"))?;
+            let root = emit_dispatch_intent(
+                &transaction,
+                EventKind::DispatchIntentUpdated,
+                &intent,
+                None,
+            )?;
+            if call_moved == 1 {
+                emit_call(
+                    &transaction,
+                    EventKind::CallUpdated,
+                    &read_call(&transaction, call_id)?
+                        .ok_or_else(|| invalid("fenced Call disappeared"))?,
+                    Some(root),
+                )?;
+            }
+        }
         transaction.commit().map_err(sql)
     }
 
@@ -2299,12 +2775,25 @@ impl DomainRepository {
         if changed != 1 {
             return Err(invalid("Call is already terminal"));
         }
-        transaction.execute(
+        let intent_moved = transaction.execute(
             "UPDATE domain_dispatch_intents SET state='failed',effect_state=CASE WHEN effect_state='started' THEN 'unknown' ELSE 'not_started' END,failure=?2,updated_at=?3 WHERE call_id=?1 AND state IN ('pending','queued','running')",
             params![call_id, failure, now()],
         ).map_err(sql)?;
+        let call =
+            read_call(&transaction, call_id)?.ok_or_else(|| invalid("failed Call disappeared"))?;
+        let root = emit_call(&transaction, EventKind::CallUpdated, &call, None)?;
+        if intent_moved == 1 {
+            if let Some(intent) = read_dispatch_intent_by_call(&transaction, call_id)? {
+                emit_dispatch_intent(
+                    &transaction,
+                    EventKind::DispatchIntentUpdated,
+                    &intent,
+                    Some(root),
+                )?;
+            }
+        }
         transaction.commit().map_err(sql)?;
-        self.call(call_id)
+        Ok(call)
     }
 
     /// Revoke authority before asking any Executor to stop.
@@ -2407,6 +2896,723 @@ impl DomainRepository {
     }
 }
 
+// -------------------------------------------------------------------------
+// Journal emitters
+//
+// Each helper records one entity's committed post-state. They are called only
+// from inside the same transaction that produced that post-state, so an event
+// can never describe a fact that was rolled back, and a committed fact always
+// has its event. The `caused_by` cursor links cascade records to the single
+// causal fact in the same commit.
+// -------------------------------------------------------------------------
+
+fn emit_job(
+    transaction: &rusqlite::Transaction<'_>,
+    kind: EventKind,
+    job: &Job,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(kind, "job", &job.id, journal::value(job)?)
+            .project(&job.project_id)
+            .job(&job.id)
+            .generation(job.generation)
+            .caused_by_opt(caused_by),
+    )
+}
+
+/// A Job event that must keep naming the authority it completed or revoked.
+/// After a terminal transition the Job no longer points at an Attempt, so
+/// resolving authority from state alone would silently drop the fence value.
+fn emit_job_under(
+    transaction: &rusqlite::Transaction<'_>,
+    kind: EventKind,
+    job: &Job,
+    attempt_id: &str,
+    generation: u64,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(kind, "job", &job.id, journal::value(job)?)
+            .project(&job.project_id)
+            .job(&job.id)
+            .generation(job.generation)
+            .authority(attempt_id, generation)
+            .caused_by_opt(caused_by),
+    )
+}
+
+fn emit_attempt(
+    transaction: &rusqlite::Transaction<'_>,
+    kind: EventKind,
+    attempt: &Attempt,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(kind, "attempt", &attempt.id, journal::value(attempt)?)
+            .job(&attempt.job_id)
+            .attempt_scope(&attempt.id, &attempt.job_id, attempt.generation)
+            .caused_by_opt(caused_by),
+    )
+}
+
+fn emit_executor(
+    transaction: &rusqlite::Transaction<'_>,
+    kind: EventKind,
+    executor: &Executor,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    let (job_id, generation) = journal::attempt_scope(transaction, &executor.attempt_id)?
+        .ok_or_else(|| invalid("Executor refers to an Attempt that does not exist"))?;
+    journal::append(
+        transaction,
+        EventDraft::new(kind, "executor", &executor.id, journal::value(executor)?)
+            .job(&job_id)
+            .attempt_scope(&executor.attempt_id, &job_id, generation)
+            .executor(Some(&executor.id))
+            .caused_by_opt(caused_by),
+    )
+}
+
+fn emit_call(
+    transaction: &rusqlite::Transaction<'_>,
+    kind: EventKind,
+    call: &Call,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    let (job_id, generation) = journal::attempt_scope(transaction, &call.attempt_id)?
+        .ok_or_else(|| invalid("Call refers to an Attempt that does not exist"))?;
+    journal::append(
+        transaction,
+        EventDraft::new(kind, "call", &call.id, journal::value(call)?)
+            .job(&job_id)
+            .attempt_scope(&call.attempt_id, &job_id, generation)
+            .executor(call.executor_id.as_deref())
+            .call(Some(&call.id))
+            .caused_by_opt(caused_by),
+    )
+}
+
+fn emit_dispatch_intent(
+    transaction: &rusqlite::Transaction<'_>,
+    kind: EventKind,
+    intent: &DispatchIntent,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(kind, "dispatch_intent", &intent.id, journal::value(intent)?)
+            .job(&intent.job_id)
+            .attempt_scope(&intent.attempt_id, &intent.job_id, intent.generation)
+            .executor(intent.executor_id.as_deref())
+            .call(Some(&intent.call_id))
+            .dispatch_intent(Some(&intent.id))
+            .caused_by_opt(caused_by),
+    )
+}
+
+fn emit_dependency(
+    transaction: &rusqlite::Transaction<'_>,
+    kind: EventKind,
+    edge: &journal::DependencyEdge,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(kind, "dependency", &edge.job_id, journal::value(edge)?)
+            .project(&edge.project_id)
+            .job(&edge.job_id)
+            .caused_by_opt(caused_by),
+    )
+}
+
+fn emit_binding(
+    transaction: &rusqlite::Transaction<'_>,
+    binding: &journal::JobBinding,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    let mut draft = EventDraft::new(
+        EventKind::BindingSet,
+        "binding",
+        &binding.binding_key,
+        journal::value(binding)?,
+    )
+    .project(&binding.project_id)
+    .job(&binding.job_id)
+    .causation_key(&binding.binding_key)
+    .caused_by_opt(caused_by);
+    if let Some(attempt_id) = &binding.attempt_id {
+        // The binding pins the exact Attempt, so the event names the authority
+        // a returning session may still act under.
+        if let Ok(Some((_, generation))) = journal::attempt_scope(transaction, attempt_id) {
+            draft = draft.attempt_scope(attempt_id, &binding.job_id, generation);
+        }
+    }
+    journal::append(transaction, draft)
+}
+
+fn emit_job_configuration(
+    transaction: &rusqlite::Transaction<'_>,
+    configuration: &journal::StoredJobConfiguration,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(
+            EventKind::JobConfigurationSet,
+            "job_configuration",
+            &configuration.job_id,
+            journal::value(configuration)?,
+        )
+        .job(&configuration.job_id)
+        .causation_key(&configuration.job_id),
+    )
+}
+
+fn emit_result_evidence(
+    transaction: &rusqlite::Transaction<'_>,
+    evidence: &journal::ResultEvidence,
+    job_id: &str,
+    actor: &str,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(
+            EventKind::ResultEvidenceRecorded,
+            "result_evidence",
+            &evidence.call_id,
+            journal::value(evidence)?,
+        )
+        .job(job_id)
+        .attempt_scope(&evidence.attempt_id, job_id, evidence.generation)
+        .call(Some(&evidence.call_id))
+        .causation_key(&evidence.call_id)
+        .actor(actor),
+    )
+}
+
+fn emit_verification(
+    transaction: &rusqlite::Transaction<'_>,
+    verification: &journal::StoredVerification,
+    job_id: &str,
+    attempt_id: &str,
+    generation: u64,
+    actor: &str,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(
+            EventKind::VerificationRecorded,
+            "verification",
+            &verification.call_id,
+            journal::value(verification)?,
+        )
+        .job(job_id)
+        .attempt_scope(attempt_id, job_id, generation)
+        .call(Some(&verification.call_id))
+        .causation_key(&verification.call_id)
+        .actor(actor),
+    )
+}
+
+// -------------------------------------------------------------------------
+// Row mapping and bulk readers
+//
+// These take `&Connection` so the same definitions serve both the public read
+// API and the writer transaction (which derefs to a connection), and so the
+// journal always records exactly what a reader would observe.
+// -------------------------------------------------------------------------
+
+fn executor_from_row(row: &Row<'_>) -> rusqlite::Result<Executor> {
+    Ok(Executor {
+        id: row.get(0)?,
+        attempt_id: row.get(1)?,
+        kind: row.get(2)?,
+        state: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+const EXECUTOR_COLUMNS: &str = "id,attempt_id,kind,state,created_at";
+
+fn call_from_row(row: &Row<'_>) -> rusqlite::Result<Call> {
+    Ok(Call {
+        id: row.get(0)?,
+        attempt_id: row.get(1)?,
+        executor_id: row.get(2)?,
+        generation: u64::try_from(row.get::<_, i64>(3)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        side_effect: row.get(4)?,
+        state: row.get(5)?,
+        request: row.get(6)?,
+        response: row.get(7)?,
+        created_at: row.get(8)?,
+        finished_at: row.get(9)?,
+        effect_kind: row
+            .get::<_, String>(10)?
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+    })
+}
+
+/// `Call` needs its `effect_kind`, which lives on the durable DispatchIntent.
+const CALL_COLUMNS: &str = "c.id,c.attempt_id,c.executor_id,c.generation,c.side_effect,c.state,\
+c.request,c.response,c.created_at,c.finished_at,i.effect_kind";
+
+fn dispatch_intent_from_row(row: &Row<'_>) -> rusqlite::Result<DispatchIntent> {
+    Ok(DispatchIntent {
+        id: row.get(0)?,
+        call_id: row.get(1)?,
+        job_id: row.get(2)?,
+        attempt_id: row.get(3)?,
+        executor_id: row.get(4)?,
+        generation: u64::try_from(row.get::<_, i64>(5)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        state: row.get(6)?,
+        effect_kind: row
+            .get::<_, String>(7)?
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        effect_state: row
+            .get::<_, String>(8)?
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        request: row.get(9)?,
+        reservation_id: row.get(10)?,
+        budget_admitted: row.get(11)?,
+        failure: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    })
+}
+
+const DISPATCH_INTENT_COLUMNS: &str = "id,call_id,job_id,attempt_id,executor_id,generation,state,\
+effect_kind,effect_state,request,reservation_id,budget_admitted,failure,created_at,updated_at";
+
+fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
+    let state: String = row.get(3)?;
+    let state = match state.as_str() {
+        "queued" => AttemptState::Queued,
+        "running" => AttemptState::Running,
+        "cancelling" => AttemptState::Cancelling,
+        "completed" => AttemptState::Completed,
+        "failed" => AttemptState::Failed,
+        "cancelled" => AttemptState::Cancelled,
+        "unknown" => AttemptState::Unknown,
+        "orphaned" => AttemptState::Orphaned,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(Attempt {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        generation: u64::try_from(row.get::<_, i64>(2)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        state,
+        authoritative: row.get(4)?,
+        created_at: row.get(5)?,
+        finished_at: row.get(6)?,
+    })
+}
+
+fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
+    let state: String = row.get(2)?;
+    let state: JobState = state.parse().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(Job {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        state,
+        generation: u64::try_from(row.get::<_, i64>(3)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        authoritative_attempt_id: row.get(4)?,
+        payload: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+const JOB_COLUMNS: &str =
+    "id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at";
+
+fn query_all<T>(
+    connection: &Connection,
+    statement: &str,
+    bind: &[&dyn rusqlite::ToSql],
+    map: fn(&Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>> {
+    let mut prepared = connection.prepare(statement).map_err(sql)?;
+    let rows = prepared.query_map(bind, map).map_err(sql)?;
+    rows.map(|row| row.map_err(sql)).collect()
+}
+
+/// Record every Executor whose state actually moved.
+///
+/// The fencing `UPDATE` is not restricted by state, so comparing the before and
+/// after rows is what keeps the journal to real changes instead of restating
+/// rows that were already in their final state.
+fn emit_changed_executors(
+    transaction: &rusqlite::Transaction<'_>,
+    before: &[Executor],
+    caused_by: Option<u64>,
+) -> Result<()> {
+    for previous in before {
+        let Some(current) = read_executor(transaction, &previous.id)? else {
+            continue;
+        };
+        if current.state != previous.state {
+            emit_executor(transaction, EventKind::ExecutorUpdated, &current, caused_by)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_changed_calls(
+    transaction: &rusqlite::Transaction<'_>,
+    before: &[Call],
+    caused_by: Option<u64>,
+) -> Result<()> {
+    for previous in before {
+        let Some(current) = read_call(transaction, &previous.id)? else {
+            continue;
+        };
+        if current.state != previous.state {
+            emit_call(transaction, EventKind::CallUpdated, &current, caused_by)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_changed_intents(
+    transaction: &rusqlite::Transaction<'_>,
+    before: &[DispatchIntent],
+    caused_by: Option<u64>,
+) -> Result<()> {
+    for previous in before {
+        let Some(current) = read_dispatch_intent(transaction, &previous.id)? else {
+            continue;
+        };
+        if current.state != previous.state || current.effect_state != previous.effect_state {
+            emit_dispatch_intent(
+                transaction,
+                EventKind::DispatchIntentUpdated,
+                &current,
+                caused_by,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn read_job(connection: &Connection, job_id: &str) -> Result<Option<Job>> {
+    connection
+        .query_row(
+            &format!("SELECT {JOB_COLUMNS} FROM domain_jobs WHERE id=?1"),
+            [job_id],
+            job_from_row,
+        )
+        .optional()
+        .map_err(sql)
+}
+
+fn read_attempt(connection: &Connection, attempt_id: &str) -> Result<Attempt> {
+    connection
+        .query_row(
+            "SELECT id,job_id,generation,state,authoritative,created_at,finished_at FROM domain_attempts WHERE id=?1",
+            [attempt_id],
+            attempt_from_row,
+        )
+        .optional()
+        .map_err(sql)?
+        .ok_or_else(|| invalid("Attempt disappeared while journaling its transition"))
+}
+
+fn read_executor(connection: &Connection, executor_id: &str) -> Result<Option<Executor>> {
+    connection
+        .query_row(
+            &format!("SELECT {EXECUTOR_COLUMNS} FROM domain_executors WHERE id=?1"),
+            [executor_id],
+            executor_from_row,
+        )
+        .optional()
+        .map_err(sql)
+}
+
+fn read_call(connection: &Connection, call_id: &str) -> Result<Option<Call>> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT {CALL_COLUMNS} FROM domain_calls c JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.id=?1"
+            ),
+            [call_id],
+            call_from_row,
+        )
+        .optional()
+        .map_err(sql)
+}
+
+fn read_dispatch_intent(
+    connection: &Connection,
+    intent_id: &str,
+) -> Result<Option<DispatchIntent>> {
+    connection
+        .query_row(
+            &format!("SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents WHERE id=?1"),
+            [intent_id],
+            dispatch_intent_from_row,
+        )
+        .optional()
+        .map_err(sql)
+}
+
+/// A Call owns at most one durable dispatch intent, so the intent is reachable
+/// from the Call id that caused it.
+fn read_dispatch_intent_by_call(
+    connection: &Connection,
+    call_id: &str,
+) -> Result<Option<DispatchIntent>> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents WHERE call_id=?1"
+            ),
+            [call_id],
+            dispatch_intent_from_row,
+        )
+        .optional()
+        .map_err(sql)
+}
+
+fn read_verification(
+    connection: &Connection,
+    call_id: &str,
+) -> Result<Option<journal::StoredVerification>> {
+    let row: Option<(bool, String, i64)> = connection
+        .query_row(
+            "SELECT passed,report,created_at FROM domain_verifications WHERE call_id=?1",
+            [call_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql)?;
+    row.map(|(passed, report, created_at)| {
+        Ok(journal::StoredVerification {
+            call_id: call_id.to_string(),
+            passed,
+            report: serde_json::from_str(&report)
+                .map_err(|error| invalid(&format!("invalid verification report: {error}")))?,
+            created_at,
+        })
+    })
+    .transpose()
+}
+
+fn all_projects(connection: &Connection) -> Result<Vec<Project>> {
+    query_all(
+        connection,
+        "SELECT id,root,created_at FROM domain_projects ORDER BY created_at,id",
+        &[],
+        |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                root: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        },
+    )
+}
+
+fn all_jobs(connection: &Connection) -> Result<Vec<Job>> {
+    query_all(
+        connection,
+        &format!("SELECT {JOB_COLUMNS} FROM domain_jobs ORDER BY created_at,id"),
+        &[],
+        job_from_row,
+    )
+}
+
+fn all_attempts(connection: &Connection) -> Result<Vec<Attempt>> {
+    query_all(
+        connection,
+        "SELECT id,job_id,generation,state,authoritative,created_at,finished_at FROM domain_attempts ORDER BY created_at,id",
+        &[],
+        attempt_from_row,
+    )
+}
+
+fn all_executors(connection: &Connection) -> Result<Vec<Executor>> {
+    query_all(
+        connection,
+        &format!("SELECT {EXECUTOR_COLUMNS} FROM domain_executors ORDER BY created_at,id"),
+        &[],
+        executor_from_row,
+    )
+}
+
+/// Every Executor row owned by an Attempt, unfiltered: callers compare the
+/// before/after state to decide what actually changed.
+fn attempt_executors(connection: &Connection, attempt_id: &str) -> Result<Vec<Executor>> {
+    query_all(
+        connection,
+        &format!(
+            "SELECT {EXECUTOR_COLUMNS} FROM domain_executors WHERE attempt_id=?1 ORDER BY created_at,id"
+        ),
+        &[&attempt_id],
+        executor_from_row,
+    )
+}
+
+fn all_calls(connection: &Connection) -> Result<Vec<Call>> {
+    query_all(
+        connection,
+        &format!(
+            "SELECT {CALL_COLUMNS} FROM domain_calls c JOIN domain_dispatch_intents i ON i.call_id=c.id ORDER BY c.created_at,c.id"
+        ),
+        &[],
+        call_from_row,
+    )
+}
+
+fn attempt_calls(connection: &Connection, attempt_id: &str) -> Result<Vec<Call>> {
+    query_all(
+        connection,
+        &format!(
+            "SELECT {CALL_COLUMNS} FROM domain_calls c JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.attempt_id=?1 ORDER BY c.created_at,c.id"
+        ),
+        &[&attempt_id],
+        call_from_row,
+    )
+    .map(|mut calls| {
+        calls.retain(|call| LIVE_CALL_STATES.contains(&call.state.as_str()));
+        calls
+    })
+}
+
+fn all_dispatch_intents(connection: &Connection) -> Result<Vec<DispatchIntent>> {
+    query_all(
+        connection,
+        &format!(
+            "SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents ORDER BY created_at,id"
+        ),
+        &[],
+        dispatch_intent_from_row,
+    )
+}
+
+fn attempt_intents(connection: &Connection, attempt_id: &str) -> Result<Vec<DispatchIntent>> {
+    query_all(
+        connection,
+        &format!(
+            "SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents WHERE attempt_id=?1 ORDER BY created_at,id"
+        ),
+        &[&attempt_id],
+        dispatch_intent_from_row,
+    )
+    .map(|mut intents| {
+        intents.retain(|intent| LIVE_INTENT_STATES.contains(&intent.state.as_str()));
+        intents
+    })
+}
+
+fn all_dependencies(connection: &Connection) -> Result<Vec<journal::DependencyEdge>> {
+    query_all(
+        connection,
+        "SELECT project_id,job_id,prerequisite_job_id FROM domain_job_dependencies ORDER BY project_id,job_id,prerequisite_job_id",
+        &[],
+        |row| {
+            Ok(journal::DependencyEdge {
+                project_id: row.get(0)?,
+                job_id: row.get(1)?,
+                prerequisite_job_id: row.get(2)?,
+            })
+        },
+    )
+}
+
+fn all_bindings(connection: &Connection) -> Result<Vec<journal::JobBinding>> {
+    query_all(
+        connection,
+        "SELECT binding_key,project_id,job_id,attempt_id FROM domain_job_bindings ORDER BY binding_key",
+        &[],
+        |row| {
+            Ok(journal::JobBinding {
+                binding_key: row.get(0)?,
+                project_id: row.get(1)?,
+                job_id: row.get(2)?,
+                attempt_id: row.get(3)?,
+            })
+        },
+    )
+}
+
+fn all_job_configurations(connection: &Connection) -> Result<Vec<journal::StoredJobConfiguration>> {
+    query_all(
+        connection,
+        "SELECT job_id,configuration,revision FROM domain_job_configs ORDER BY job_id",
+        &[],
+        |row| {
+            let configuration: String = row.get(1)?;
+            let configuration: serde_json::Value =
+                serde_json::from_str(&configuration).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        configuration.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let revision =
+                u64::try_from(row.get::<_, i64>(2)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(journal::StoredJobConfiguration {
+                job_id: row.get(0)?,
+                configuration,
+                revision,
+            })
+        },
+    )
+}
+
+fn all_result_evidence(connection: &Connection) -> Result<Vec<journal::ResultEvidence>> {
+    query_all(
+        connection,
+        "SELECT call_id,attempt_id,generation,disposition,created_at FROM domain_result_evidence ORDER BY created_at,call_id,attempt_id,generation",
+        &[],
+        |row| {
+            Ok(journal::ResultEvidence {
+                call_id: row.get(0)?,
+                attempt_id: row.get(1)?,
+                generation: u64::try_from(row.get::<_, i64>(2)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                disposition: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        },
+    )
+}
+
+fn all_verifications(connection: &Connection) -> Result<Vec<journal::StoredVerification>> {
+    query_all(
+        connection,
+        "SELECT call_id,passed,report,created_at FROM domain_verifications ORDER BY created_at,call_id",
+        &[],
+        |row| {
+            let report: String = row.get(2)?;
+            let report: serde_json::Value = serde_json::from_str(&report).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    report.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(journal::StoredVerification {
+                call_id: row.get(0)?,
+                passed: row.get(1)?,
+                report,
+                created_at: row.get(3)?,
+            })
+        },
+    )
+}
+
 fn finish_call_in(
     transaction: &rusqlite::Transaction<'_>,
     call_id: &str,
@@ -2452,10 +3658,28 @@ fn finish_call_in(
     if changed != 1 {
         return Err(invalid("Call is already terminal"));
     }
-    transaction.execute(
+    let intent_moved = transaction.execute(
             "UPDATE domain_dispatch_intents SET state='completed',effect_state='settled',updated_at=?2 WHERE call_id=?1 AND state IN ('pending','queued','running')",
             params![call_id, now()],
         ).map_err(sql)?;
+    // The Call completing is the root fact; settling the external effect it was
+    // admitted for is caused by it, and is recorded only when it really moved.
+    let root = emit_call(
+        transaction,
+        EventKind::CallUpdated,
+        &read_call(transaction, call_id)?.ok_or_else(|| invalid("completed Call disappeared"))?,
+        None,
+    )?;
+    if intent_moved == 1 {
+        if let Some(intent) = read_dispatch_intent_by_call(transaction, call_id)? {
+            emit_dispatch_intent(
+                transaction,
+                EventKind::DispatchIntentUpdated,
+                &intent,
+                Some(root),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -2466,16 +3690,21 @@ fn finish_attempt_in(
     require_cancelling: bool,
 ) -> Result<()> {
     validate_id(attempt_id)?;
-    let row: Option<(String, String, bool)> = transaction
+    let row: Option<(String, String, bool, i64)> = transaction
             .query_row(
-                "SELECT a.job_id,a.state,a.authoritative=1 AND EXISTS(SELECT 1 FROM domain_jobs j WHERE j.id=a.job_id AND j.authoritative_attempt_id=a.id) FROM domain_attempts a WHERE a.id=?1",
+                "SELECT a.job_id,a.state,a.authoritative=1 AND EXISTS(SELECT 1 FROM domain_jobs j WHERE j.id=a.job_id AND j.authoritative_attempt_id=a.id),a.generation FROM domain_attempts a WHERE a.id=?1",
                 [attempt_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(sql)?;
-    let (job_id, current, is_authoritative) = row.ok_or_else(|| invalid("unknown Attempt"))?;
+    let (job_id, current, is_authoritative, generation) =
+        row.ok_or_else(|| invalid("unknown Attempt"))?;
+    let generation = u64::try_from(generation)
+        .map_err(|_| invalid("Attempt generation exceeds SQLite range"))?;
     if current == state && !matches!(state, "queued" | "running") {
+        // The Attempt already holds exactly this terminal state, so the fact is
+        // unchanged and nothing is journalized.
         return Ok(());
     }
     if !matches!(current.as_str(), "queued" | "running" | "cancelling") {
@@ -2490,8 +3719,30 @@ fn finish_attempt_in(
     }
     let timestamp = now();
     if state == "cancelling" {
-        transaction.execute("UPDATE domain_attempts SET authoritative=0,state='cancelling' WHERE id=?1 AND authoritative=1", [attempt_id]).map_err(sql)?;
-        transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state='cancelling',updated_at=?2 WHERE id=?1 AND authoritative_attempt_id=?3", params![job_id,timestamp,attempt_id]).map_err(sql)?;
+        let attempt_moved = transaction.execute("UPDATE domain_attempts SET authoritative=0,state='cancelling' WHERE id=?1 AND authoritative=1", [attempt_id]).map_err(sql)?;
+        let job_moved = transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state='cancelling',updated_at=?2 WHERE id=?1 AND authoritative_attempt_id=?3", params![job_id,timestamp,attempt_id]).map_err(sql)?;
+        // Authority is revoked here, so every record that moved must keep
+        // naming the authority it is revoking; the Job would otherwise lose it.
+        if attempt_moved == 1 {
+            emit_attempt(
+                transaction,
+                EventKind::AttemptUpdated,
+                &read_attempt(transaction, attempt_id)?,
+                None,
+            )?;
+        }
+        if job_moved == 1 {
+            let job = read_job(transaction, &job_id)?
+                .ok_or_else(|| invalid("cancelling Job disappeared"))?;
+            emit_job_under(
+                transaction,
+                EventKind::JobUpdated,
+                &job,
+                attempt_id,
+                generation,
+                None,
+            )?;
+        }
     } else {
         if state == "completed" {
             let unfinished: bool = transaction.query_row(
@@ -2502,6 +3753,11 @@ fn finish_attempt_in(
                 return Err(invalid("Attempt still has unsettled or unsuccessful Calls"));
             }
         }
+        // Capture the rows this terminal transition settles before it moves
+        // them, so each one that actually changed gets exactly one record.
+        let fenced_executors = attempt_executors(transaction, attempt_id)?;
+        let fenced_intents = attempt_intents(transaction, attempt_id)?;
+        let fenced_calls = attempt_calls(transaction, attempt_id)?;
         transaction.execute(
                 "UPDATE domain_dispatch_intents SET state='fenced',failure='attempt_terminal',effect_state=CASE WHEN effect_state='started' THEN 'unknown' ELSE effect_state END,updated_at=?2 WHERE attempt_id=?1 AND state IN ('pending','queued','running')",
                 params![attempt_id, timestamp],
@@ -2523,11 +3779,39 @@ fn finish_attempt_in(
             )
             .map_err(sql)?;
         transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state=?2,updated_at=?3 WHERE id=?1 AND authoritative_attempt_id=?4", params![job_id,state,timestamp,attempt_id]).map_err(sql)?;
+        // The Attempt leaving authority is the single causal fact for this
+        // transition; everything it settles hangs off it in the same commit.
+        let root = emit_attempt(
+            transaction,
+            EventKind::AttemptUpdated,
+            &read_attempt(transaction, attempt_id)?,
+            None,
+        )?;
+        emit_changed_intents(transaction, &fenced_intents, Some(root))?;
+        emit_changed_calls(transaction, &fenced_calls, Some(root))?;
+        emit_changed_executors(transaction, &fenced_executors, Some(root))?;
+        let job =
+            read_job(transaction, &job_id)?.ok_or_else(|| invalid("terminal Job disappeared"))?;
+        emit_job_under(
+            transaction,
+            EventKind::JobUpdated,
+            &job,
+            attempt_id,
+            generation,
+            Some(root),
+        )?;
     }
     Ok(())
 }
 
-fn create_attempt_in(transaction: &rusqlite::Transaction<'_>, job_id: &str) -> Result<Attempt> {
+/// Claim an eligible Job and establish its authoritative Attempt atomically.
+/// Returns the Attempt and the cursor of its `AttemptCreated` event, so a
+/// caller that also publishes an Executor can record it as caused by the same
+/// fact.
+fn create_attempt_in(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &str,
+) -> Result<(Attempt, u64)> {
     validate_id(job_id)?;
     let (state, generation): (String, i64) = transaction
         .query_row(
@@ -2567,13 +3851,13 @@ fn create_attempt_in(transaction: &rusqlite::Transaction<'_>, job_id: &str) -> R
     if changed != 1 {
         return Err(invalid("Job eligibility changed while creating Attempt"));
     }
-    Ok(Attempt {
-        id: attempt_id,
-        job_id: job_id.to_string(),
-        generation: generation as u64,
-        state: AttemptState::Queued,
-        authoritative: true,
-        created_at: timestamp,
-        finished_at: None,
-    })
+    let attempt = read_attempt(transaction, &attempt_id)?;
+    let job =
+        read_job(transaction, job_id)?.ok_or_else(|| invalid("dispatched Job disappeared"))?;
+    // Establishing the Attempt is the root fact; the Job acquiring that
+    // authority is caused by it in the same commit, so no reader can observe a
+    // running Job without a journaled Attempt behind it.
+    let root = emit_attempt(transaction, EventKind::AttemptCreated, &attempt, None)?;
+    emit_job(transaction, EventKind::JobUpdated, &job, Some(root))?;
+    Ok((attempt, root))
 }

@@ -33,6 +33,7 @@ pub mod dispatch;
 pub mod domain;
 pub mod execution_dispatch;
 pub mod handoff;
+pub mod journal;
 pub mod mcp_glue;
 pub mod mission;
 pub mod plugin;
@@ -49,9 +50,9 @@ pub use budget::{
 };
 pub use canonical_control::{
     CanonicalConfigurationResponse, CanonicalControlService, CanonicalDashboardResponse,
-    CanonicalMissionResponse, CanonicalProjectResponse, CanonicalWorkEvent, CanonicalWorkSnapshot,
-    GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView, ProjectRecord,
-    CANONICAL_CONTROL_API_VERSION,
+    CanonicalEventTail, CanonicalMissionResponse, CanonicalProjectResponse, CanonicalWorkEvent,
+    CanonicalWorkSnapshot, GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView,
+    ProjectRecord, CANONICAL_CONTROL_API_VERSION,
 };
 pub use checkpoint::{Checkpoint, CheckpointSummary, LoadedCheckpoint, Phase, Staleness};
 pub use config::OrchestrationConfig;
@@ -72,6 +73,12 @@ pub use controller::{
 pub use handoff::{
     HandoffFinding, HandoffVerification, ModelHandoffCapsule, ProjectionInput, Role, Severity,
     Transition,
+};
+pub use journal::{
+    replay as replay_execution_events, ApplyOutcome, DependencyEdge, EventAuthority, EventDelta,
+    EventKind, ExecutionEvent, ExecutionProjection, ExecutionSnapshot, JobBinding, JournalBoundary,
+    JournalPrune, ReplayStatus, ResultEvidence, StoredJobConfiguration, StoredVerification,
+    AUTHORITY_ACTOR, INITIAL_CURSOR, JOURNAL_SCHEMA_VERSION, MAX_EVENT_READ,
 };
 pub use mission::{
     Mission, MissionEvent, MissionEventKind, MissionPolicyReceipt, MissionReconcileReceipt,
