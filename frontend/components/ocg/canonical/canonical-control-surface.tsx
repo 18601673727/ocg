@@ -5,6 +5,7 @@ import { FolderGit2, GitCommitHorizontal, Lock, Save, ShieldCheck, Upload } from
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
+import { Panel } from "@/components/ocg/primitives";
 import {
   createHttpCanonicalControlClient,
   isCanonicalRejection,
@@ -51,26 +52,6 @@ export type CanonicalControlSurfaceProps = {
   initialRoot?: string;
 };
 
-function SectionCard({
-  title,
-  detail,
-  children,
-}: {
-  title: string;
-  detail?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="rounded-md border border-border bg-background p-3">
-      <div className="flex items-baseline justify-between gap-2">
-        <h2 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">{title}</h2>
-        {detail ? <span className="text-[10px] text-muted-foreground">{detail}</span> : null}
-      </div>
-      <div className="mt-2">{children}</div>
-    </section>
-  );
-}
-
 function IssueList({ issues }: { issues: readonly DraftIssue[] }) {
   if (issues.length === 0) return null;
   return (
@@ -110,7 +91,10 @@ export function CanonicalControlSurface({
   const [error, setError] = useState<string | null>(null);
 
   const activeProjectId = state.projectId;
-  const selected = selectCanonical(state, missionId || "Canonical Mission");
+  const selected = useMemo(
+    () => selectCanonical(state, missionId || "Canonical Mission"),
+    [state, missionId],
+  );
   const preRun = preRunConfigurationState(state);
   const draftIssues = validateConfigurationDraft(draft);
   const importIssues = validateImportRoot(root);
@@ -118,8 +102,8 @@ export function CanonicalControlSurface({
   const refresh = useCallback(
     async (project: CanonicalProjectRecord, mission: string) => {
       const snapshot = await client.readWorkSnapshot(project.project_id, mission);
-      if (isCanonicalRejection(snapshot as never)) {
-        setError((snapshot as { message: string }).message);
+      if (isCanonicalRejection(snapshot)) {
+        setError(snapshot.message);
         return;
       }
       const generation = store.getCanonical().generation + 1;
@@ -130,13 +114,8 @@ export function CanonicalControlSurface({
       });
       setState(next);
       const events = await client.readWorkEvents(project.project_id, mission, next.cursor);
-      if (!isCanonicalRejection(events as never)) {
-        setState(
-          store.applyCanonicalEvents(events as never, {
-            projectId: scopeIdFor(project),
-            generation,
-          }),
-        );
+      if (!isCanonicalRejection(events)) {
+        setState(store.applyCanonicalEvents(events, { projectId: scopeIdFor(project), generation }));
       }
     },
     [client, store],
@@ -173,12 +152,11 @@ export function CanonicalControlSurface({
   const importProject = () =>
     run(async () => {
       const result = await client.importProject(projectImportCommandId(root.trim()), root.trim());
-      setAck(describeAcknowledgement(result as never));
-      if (isCanonicalRejection(result as never)) return;
-      const ackOk = result as { ok: true; commandId: string };
+      setAck(describeAcknowledgement(result));
+      if (isCanonicalRejection(result)) return;
       setState(
         store.applyCanonicalCommandAck({
-          commandId: ackOk.commandId,
+          commandId: result.commandId,
           kind: "project-import",
           accepted: true,
           message: "Project registered",
@@ -186,10 +164,10 @@ export function CanonicalControlSurface({
       );
       const registered = await client.listProjects();
       setProjects(registered);
-      const view = await client.readConfiguration((result as { project: CanonicalProjectRecord }).project.project_id);
-      if (!isCanonicalRejection(view as never)) {
-        setConfiguration(view as CanonicalConfigurationView);
-        setDraft(draftFromConfiguration(view as CanonicalConfigurationView));
+      const view = await client.readConfiguration(result.project.project_id);
+      if (!isCanonicalRejection(view)) {
+        setConfiguration(view);
+        setDraft(draftFromConfiguration(view));
       }
     });
 
@@ -202,16 +180,15 @@ export function CanonicalControlSurface({
       }
       const commandId = globalConfigurationCommandId(configurationRevision(configuration) + 1);
       const result = await client.writeGlobalConfiguration(commandId, toGlobalConfiguration(draft));
-      setAck(describeAcknowledgement(result as never));
-      if (isCanonicalRejection(result as never)) return;
-      const ok = result as { ok: true; commandId: string; configuration: CanonicalConfigurationView };
-      setConfiguration(ok.configuration);
+      setAck(describeAcknowledgement(result));
+      if (isCanonicalRejection(result)) return;
+      setConfiguration(result.configuration);
       setState(
         store.applyCanonicalCommandAck({
-          commandId: ok.commandId,
+          commandId: result.commandId,
           kind: "global-config",
           accepted: true,
-          revision: (result as { revision?: number }).revision,
+          revision: result.revision,
           message: "Global configuration persisted",
         }),
       );
@@ -229,9 +206,9 @@ export function CanonicalControlSurface({
         project.project_id,
         { profile: draft.profile, routing: draft.routing, hard_budget: draft.hardBudget },
       );
-      setAck(describeAcknowledgement(result as never));
-      if (!isCanonicalRejection(result as never)) {
-        setConfiguration((result as { configuration: CanonicalConfigurationView }).configuration);
+      setAck(describeAcknowledgement(result));
+      if (!isCanonicalRejection(result)) {
+        setConfiguration(result.configuration);
       }
     });
 
@@ -243,11 +220,11 @@ export function CanonicalControlSurface({
         preRun.missionId,
         { profile: draft.profile, routing: draft.routing, hard_budget: draft.hardBudget },
       );
-      setAck(describeAcknowledgement(result as never));
-      if (!isCanonicalRejection(result as never)) {
+      setAck(describeAcknowledgement(result));
+      if (!isCanonicalRejection(result)) {
         setState(
-        store.applyCanonicalCommandAck({
-            commandId: (result as { commandId: string }).commandId,
+          store.applyCanonicalCommandAck({
+            commandId: result.commandId,
             kind: "mission-config",
             accepted: true,
             message: "Pre-run Mission configuration persisted",
@@ -277,7 +254,7 @@ export function CanonicalControlSurface({
         {ack ? <p className="text-[10px] text-muted-foreground">{ack}</p> : null}
 
         <div className="grid gap-3 xl:grid-cols-2">
-          <SectionCard title="Project Manager" detail="backend identity">
+          <Panel className="bg-background p-3" title="Project Manager" detail="backend identity">
             <div className="flex flex-wrap items-end gap-2">
               <label className="flex-1 text-[10px] text-muted-foreground">
                 Repository root
@@ -321,9 +298,9 @@ export function CanonicalControlSurface({
                 </li>
               ))}
             </ul>
-          </SectionCard>
+          </Panel>
 
-          <SectionCard title="Global Configurator" detail="persisted OCG configuration">
+          <Panel className="bg-background p-3" title="Global Configurator" detail="persisted OCG configuration">
             <div className="grid gap-2 sm:grid-cols-2">
               <label className="text-[10px] text-muted-foreground">
                 Provider
@@ -388,9 +365,10 @@ export function CanonicalControlSurface({
                 Save project defaults
               </Button>
             </div>
-          </SectionCard>
+          </Panel>
 
-          <SectionCard
+          <Panel
+            className="bg-background p-3"
             title="Mission pre-run configuration"
             detail={preRun.missionId ? `mission ${preRun.missionId}` : "no Mission selected"}
           >
@@ -433,9 +411,9 @@ export function CanonicalControlSurface({
               <dt className="text-muted-foreground">Canonical cursor</dt>
               <dd>{state.cursor}</dd>
             </dl>
-          </SectionCard>
+          </Panel>
 
-          <SectionCard title="Running Mission" detail="canonical projection">
+          <Panel className="bg-background p-3" title="Running Mission" detail="canonical projection">
             {selected.execution ? (
               <div className="h-[420px] overflow-hidden rounded border border-border">
                 <MissionControlSurface execution={selected.execution} />
@@ -446,7 +424,7 @@ export function CanonicalControlSurface({
                 contracts, and verification evidence.
               </p>
             )}
-          </SectionCard>
+          </Panel>
         </div>
       </div>
     </div>
