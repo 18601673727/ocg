@@ -38,16 +38,30 @@ import {
   toLedgerTimeSeries,
   UNKNOWN_MISSION_KEY,
 } from "./selectors";
-import { formatCostMicros, formatCount, formatPercent, formatRatio, formatTimestamp, formatTokens } from "./format";
 import {
-  ATTRIBUTION_TONE,
-  CostsMix,
-  DefinitionsDetails,
+  formatCostMicros,
+  formatCount,
+  formatPercent,
+  formatRatio,
+  formatTimestamp,
+  formatTokens,
+} from "@/lib/format";
+import {
+  EmptyState,
   Metric,
   Pill,
-  ReconciliationIndicator,
   SectionTitle,
+  SegmentedTabs,
+  TONE_CLASS,
+  type TabItem,
+  type Tone,
+} from "@/components/ocg/primitives";
+import {
+  ATTRIBUTION_TONE,
   AUTHORITY_TONE,
+  CostsMix,
+  DefinitionsDetails,
+  ReconciliationIndicator,
 } from "./ledger-primitives";
 import { CompositionSection, TrafficChart } from "./ledger-charts";
 import { LedgerFilters } from "./ledger-filters";
@@ -59,7 +73,7 @@ import {
 } from "./ledger-tables";
 import { CallDetail } from "./ledger-detail";
 
-const TABS = LEDGER_TABS;
+const TABS: TabItem<LedgerTab>[] = LEDGER_TABS.map((id) => ({ id, label: LEDGER_TAB_LABEL[id] }));
 
 function EmptyLedger() {
   return (
@@ -74,21 +88,51 @@ function EmptyLedger() {
   );
 }
 
-function ProvenanceMix({ authority, cost, attribution }: { authority: Record<string, number>; cost: Record<string, number>; attribution: Record<string, number> }) {
+/**
+ * One provenance family as count chips.
+ *
+ * The chips are tinted by the same tone the pills use, so a `fallback` number
+ * looks the same here as it does on a row.
+ */
+function ProvenanceChips({
+  counts,
+  tones,
+}: {
+  counts: Record<string, number>;
+  tones: Record<string, Tone>;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1">
+      {Object.entries(counts).map(([key, count]) => (
+        <span
+          key={key}
+          className={cn(
+            "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] capitalize",
+            TONE_CLASS[tones[key] ?? "slate"],
+            count === 0 && "opacity-50",
+          )}
+        >
+          {key} <strong className="font-semibold tabular-nums">{count}</strong>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function ProvenanceMix({
+  authority,
+  cost,
+  attribution,
+}: {
+  authority: Record<string, number>;
+  cost: Record<string, number>;
+  attribution: Record<string, number>;
+}) {
   return (
     <div className="grid gap-2 sm:grid-cols-3">
       <div>
         <SectionTitle>Usage authority</SectionTitle>
-        <div className="flex flex-wrap gap-1">
-          {Object.entries(authority).map(([key, count]) => (
-            <span
-              key={key}
-              className={cn("inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] capitalize", AUTHORITY_TONE[key as keyof typeof AUTHORITY_TONE], count === 0 && "opacity-50")}
-            >
-              {key} <strong className="font-semibold tabular-nums">{count}</strong>
-            </span>
-          ))}
-        </div>
+        <ProvenanceChips counts={authority} tones={AUTHORITY_TONE} />
       </div>
       <div>
         <SectionTitle>Cost provenance</SectionTitle>
@@ -98,16 +142,7 @@ function ProvenanceMix({ authority, cost, attribution }: { authority: Record<str
       </div>
       <div>
         <SectionTitle>Attribution confidence</SectionTitle>
-        <div className="flex flex-wrap gap-1">
-          {Object.entries(attribution).map(([key, count]) => (
-            <span
-              key={key}
-              className={cn("inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] capitalize", ATTRIBUTION_TONE[key as keyof typeof ATTRIBUTION_TONE], count === 0 && "opacity-50")}
-            >
-              {key} <strong className="font-semibold tabular-nums">{count}</strong>
-            </span>
-          ))}
-        </div>
+        <ProvenanceChips counts={attribution} tones={ATTRIBUTION_TONE} />
       </div>
     </div>
   );
@@ -163,29 +198,16 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
         </div>
       </header>
 
-      <nav
-        aria-label="Resource ledger surfaces"
-        role="tablist"
-        className="shrink-0 border-b border-border px-3 py-1.5"
-      >
-        <div className="grid grid-cols-5 gap-1 rounded-md bg-muted/50 p-0.5">
-          {TABS.map((item) => (
-            <button
-              key={item}
-              type="button"
-              role="tab"
-              aria-selected={tab === item}
-              aria-controls={`resource-ledger-${item}`}
-              onClick={() => setTab(item)}
-              className={cn(
-                "rounded px-1 py-1.5 text-[11px] font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
-                tab === item ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {LEDGER_TAB_LABEL[item]}
-            </button>
-          ))}
-        </div>
+      <nav className="shrink-0 border-b border-border px-3 py-1.5">
+        <SegmentedTabs
+          tabs={TABS}
+          value={tab}
+          onSelect={setTab}
+          ariaLabel="Resource ledger surfaces"
+          panelIdBase="resource-ledger"
+          className="grid-cols-5"
+          size="sm"
+        />
       </nav>
 
       <LedgerFilters
@@ -282,9 +304,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
               tabs share this same filtered dataset.
             </p>
             {filtered.length === 0 ? (
-              <p className="rounded-md border border-dashed border-border px-2 py-4 text-[11px] text-muted-foreground">
-                No calls match the current filters.
-              </p>
+              <EmptyState className="px-2 py-4">No calls match the current filters.</EmptyState>
             ) : (
               <ul className="flex flex-col gap-1.5">
                 {filtered.map((entry) => (

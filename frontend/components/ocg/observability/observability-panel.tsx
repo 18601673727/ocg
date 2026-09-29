@@ -27,8 +27,27 @@ import {
   Zap,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import {
+  UNKNOWN,
+  formatCompactTokens,
+  formatCostMicros,
+  formatDollars,
+  formatDuration,
+  formatNumber,
+  humanizeStatus,
+  withApproximation,
+} from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { Mission, MissionTask, WorkerStatus } from "../types";
+import {
+  EmptyState,
+  Metric,
+  Pill,
+  ProgressBar,
+  SectionTitle,
+  StatusDot,
+  WORKER_STATUS,
+} from "@/components/ocg/primitives";
+import type { Mission, MissionTask } from "../types";
 import {
   aggregateModelStats,
   aggregateProviderStats,
@@ -41,8 +60,7 @@ import {
   type UsageValue,
   type WorkerRuntimeStats,
 } from "../runtime/observability";
-import type { InspectorMode, InspectorTab } from "./inspector-state";
-import { restoreWorkerSelection } from "./inspector-state";
+import { restoreWorkerSelection, type InspectorTab } from "./inspector-state";
 
 const CHART_ESTIMATED = "var(--chart-4)";
 const CHART_REPORTED = "var(--chart-2)";
@@ -50,106 +68,37 @@ const CHART_BAR = "var(--chart-3)";
 const CHART_SELECTED = "var(--primary)";
 const CHART_GRID = "var(--border)";
 
-export type MissionInspectorProps = {
-  mission: Mission;
-  observability: RuntimeObservability;
-  mode: InspectorMode;
-  tab: InspectorTab;
-  onTabChange: (tab: InspectorTab) => void;
-};
-
-function formatTokens(value?: UsageValue): string {
-  if (!value) return "—";
-  const amount = value.value >= 1000
-    ? `${(value.value / 1000).toFixed(value.value >= 10000 ? 1 : 2)}K`
-    : String(value.value);
-  return value.provenance === "estimated" ? `≈ ${amount}` : amount;
+/**
+ * A usage figure carries its own provenance, so the `≈` marker for a modelled
+ * number is added here rather than in a second formatter per surface.
+ */
+function formatTokenUsage(value?: UsageValue): string {
+  return value
+    ? withApproximation(formatCompactTokens(value.value), value.provenance === "estimated")
+    : UNKNOWN;
 }
 
-function formatCostMicros(value?: UsageValue): string {
-  if (!value) return "—";
-  const amount = `$${(value.value / 1_000_000).toFixed(3)}`;
-  return value.provenance === "estimated" ? `≈ ${amount}` : amount;
+function formatCostUsage(value?: UsageValue): string {
+  return value
+    ? withApproximation(formatCostMicros(value.value), value.provenance === "estimated")
+    : UNKNOWN;
 }
 
-function formatDollars(value?: UsageValue): string {
-  if (!value) return "—";
-  const amount = `$${value.value.toFixed(2)}`;
-  return value.provenance === "estimated" ? `≈ ${amount}` : amount;
-}
-
-function formatDuration(milliseconds?: number): string {
-  if (milliseconds === undefined) return "—";
-  if (milliseconds < 1000) return `${milliseconds}ms`;
-  const seconds = milliseconds / 1000;
-  return seconds < 60
-    ? `${seconds.toFixed(1)}s`
-    : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-}
-
-function formatNumber(value?: number): string {
-  return value === undefined
-    ? "—"
-    : new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 }).format(value);
-}
-
-function formatStatus(status: WorkerStatus): string {
-  return status.replace("-", " ");
-}
-
-function statusTone(status: WorkerStatus): string {
-  switch (status) {
-    case "active": return "bg-amber-500";
-    case "starting": return "bg-sky-500";
-    case "queued": return "bg-slate-400";
-    case "waiting": return "bg-violet-500";
-    case "completed": return "bg-emerald-500";
-    case "failed": return "bg-red-500";
-    case "cancelled": return "bg-slate-500";
-    default: return "bg-muted-foreground/40";
-  }
-}
-
-function StatusPill({ status }: { status: WorkerStatus }) {
-  return (
-    <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/40 px-1.5 py-0.5 text-[10px] capitalize text-muted-foreground">
-      <span className={cn("size-1.5 rounded-full", statusTone(status), status === "active" && "animate-pulse")} aria-hidden="true" />
-      {formatStatus(status)}
-    </span>
-  );
-}
-
-function Metric({ label, value, icon: Icon, detail }: { label: string; value: string; icon: typeof Activity; detail?: string }) {
-  return (
-    <div className="min-w-0 rounded-md border border-border bg-background px-2 py-1.5">
-      <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
-        <Icon className="size-3" aria-hidden="true" />
-        <span className="truncate">{label}</span>
-      </div>
-      <p className="mt-0.5 truncate text-[13px] font-semibold tabular-nums">{value}</p>
-      {detail && <p className="truncate text-[10px] text-muted-foreground">{detail}</p>}
-    </div>
-  );
-}
-
-function SectionTitle({ children, detail }: { children: React.ReactNode; detail?: string }) {
-  return (
-    <div className="mb-1.5 flex items-center gap-1.5">
-      <h3 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{children}</h3>
-      {detail && <span className="text-[10px] text-muted-foreground">{detail}</span>}
-    </div>
-  );
+function formatDollarUsage(value?: UsageValue): string {
+  return value
+    ? withApproximation(formatDollars(value.value), value.provenance === "estimated")
+    : UNKNOWN;
 }
 
 function TokenMetrics({ tokenUsage }: { tokenUsage: RuntimeObservability["mission"]["tokenUsage"] }) {
   return (
     <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-2 2xl:grid-cols-3">
-      <Metric label="Total tokens" value={formatTokens(tokenUsage.total)} icon={Gauge} />
-      <Metric label="Input" value={formatTokens(tokenUsage.input)} icon={Activity} />
-      <Metric label="Output" value={formatTokens(tokenUsage.output)} icon={Activity} />
-      <Metric label="Reasoning" value={formatTokens(tokenUsage.reasoning)} icon={GitBranch} />
-      <Metric label="Cache read" value={formatTokens(tokenUsage.cacheRead)} icon={Zap} />
-      <Metric label="Cache write" value={formatTokens(tokenUsage.cacheWrite)} icon={Zap} />
+      <Metric label="Total tokens" value={formatTokenUsage(tokenUsage.total)} icon={Gauge} />
+      <Metric label="Input" value={formatTokenUsage(tokenUsage.input)} icon={Activity} />
+      <Metric label="Output" value={formatTokenUsage(tokenUsage.output)} icon={Activity} />
+      <Metric label="Reasoning" value={formatTokenUsage(tokenUsage.reasoning)} icon={GitBranch} />
+      <Metric label="Cache read" value={formatTokenUsage(tokenUsage.cacheRead)} icon={Zap} />
+      <Metric label="Cache write" value={formatTokenUsage(tokenUsage.cacheWrite)} icon={Zap} />
     </div>
   );
 }
@@ -168,17 +117,15 @@ function BudgetSection({ mission, observability }: { mission: Mission; observabi
         <span className="ml-auto text-[10px] text-muted-foreground">hard limit</span>
       </div>
       <div className="mt-2 flex items-baseline justify-between gap-2">
-        <span className="text-[16px] font-semibold tabular-nums">${budget.spent.toFixed(2)}</span>
-        <span className="text-[11px] text-muted-foreground">of ${budget.limit.toFixed(2)}</span>
+        <span className="text-[16px] font-semibold tabular-nums">{formatDollars(budget.spent)}</span>
+        <span className="text-[11px] text-muted-foreground">of {formatDollars(budget.limit)}</span>
         <span className="ml-auto text-[11px] font-medium tabular-nums">{budget.percent.toFixed(0)}%</span>
       </div>
-      <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Budget consumed" aria-valuemin={0} aria-valuemax={100} aria-valuenow={budget.percent}>
-        <div className={cn("h-full rounded-full transition-[width] duration-300", budget.percent >= 90 ? "bg-red-500" : "bg-foreground")} style={{ width: `${budget.percent}%` }} />
-      </div>
+      <ProgressBar value={budget.percent} max={100} ariaLabel="Budget consumed" tone={budget.percent >= 90 ? "bg-red-500" : "bg-foreground"} className="mt-1.5" />
       <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-muted-foreground">
-        <span>remaining <strong className="font-medium text-foreground">${budget.remaining.toFixed(2)}</strong></span>
-        <span className="text-right">burn <strong className="font-medium text-foreground">{budget.burnRatePerMinute === undefined ? "—" : `$${budget.burnRatePerMinute.toFixed(2)}/min`}</strong></span>
-        <span>forecast <strong className="font-medium text-foreground">{formatDollars(budget.estimatedFinalSpend)}</strong></span>
+        <span>remaining <strong className="font-medium text-foreground">{formatDollars(budget.remaining)}</strong></span>
+        <span className="text-right">burn <strong className="font-medium text-foreground">{budget.burnRatePerMinute === undefined ? UNKNOWN : `${formatDollars(budget.burnRatePerMinute)}/min`}</strong></span>
+        <span>forecast <strong className="font-medium text-foreground">{formatDollarUsage(budget.estimatedFinalSpend)}</strong></span>
         <span className="text-right">commitment <strong className="font-medium text-foreground">{mission.commitment.workers} {mission.commitment.mode}</strong></span>
       </div>
       {budget.estimatedFinalSpend && <p className="mt-1 text-[10px] text-muted-foreground">Forecast is {budget.estimatedFinalSpend.provenance}; hard budget remains authoritative.</p>}
@@ -226,7 +173,7 @@ function ActivityRow({ item }: { item: RuntimeActivityItem }) {
         <p className="text-[11px] leading-4"><strong className="font-medium">{item.workerLabel ?? (item.role === "lead" ? "Lead" : "Mission")}</strong> {item.summary}</p>
         {(item.provider || item.model) && <p className="break-words text-[10px] text-muted-foreground">{item.provider}{item.provider && item.model ? " · " : ""}{item.model}</p>}
       </div>
-      {item.status && <StatusPill status={item.status} />}
+      {item.status && <Pill tone={WORKER_STATUS[item.status].tone} variant="quiet" dot pulse={WORKER_STATUS[item.status].pulse}>{humanizeStatus(item.status)}</Pill>}
     </li>
   );
 }
@@ -237,7 +184,7 @@ function WorkerRow({ worker, selected, onSelect }: { worker: WorkerRuntimeStats;
     <li>
       <button type="button" onClick={onSelect} aria-pressed={selected} className={cn("w-full rounded-md border px-2.5 py-2 text-left transition-colors", selected ? "border-foreground/40 bg-muted" : "border-border hover:bg-muted/50")}>
         <div className="flex items-start gap-2">
-          <span className={cn("mt-1 size-1.5 shrink-0 rounded-full", statusTone(worker.status), worker.status === "active" && "animate-pulse")} aria-hidden="true" />
+          <StatusDot tone={WORKER_STATUS[worker.status].tone} pulse={WORKER_STATUS[worker.status].pulse} className="mt-1" />
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-1.5">
               <p className="truncate text-[12px] font-medium">{worker.label}</p>
@@ -245,10 +192,10 @@ function WorkerRow({ worker, selected, onSelect }: { worker: WorkerRuntimeStats;
             </div>
             <p className="break-words text-[10px] text-muted-foreground">{worker.provider} · {worker.model}{worker.variant ? ` · ${worker.variant}` : ""}</p>
           </div>
-          <StatusPill status={worker.status} />
+          <Pill tone={WORKER_STATUS[worker.status].tone} variant="quiet" dot pulse={WORKER_STATUS[worker.status].pulse}>{humanizeStatus(worker.status)}</Pill>
         </div>
         <div className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1 pl-3.5 text-[10px] text-muted-foreground sm:grid-cols-4 lg:grid-cols-2 2xl:grid-cols-4">
-          <span>tokens <strong className="font-medium text-foreground" title={total ? `${total.provenance} usage` : "Unavailable"}>{formatTokens(total)}</strong></span>
+          <span>tokens <strong className="font-medium text-foreground" title={total ? `${total.provenance} usage` : "Unavailable"}>{formatTokenUsage(total)}</strong></span>
           <span>calls <strong className="font-medium text-foreground">{worker.invocationCount}</strong>{worker.retryCount ? ` · ${worker.retryCount} retry` : ""}</span>
           <span>elapsed <strong className="font-medium text-foreground">{formatDuration(worker.elapsedMs)}</strong></span>
           <span>throughput <strong className="font-medium text-foreground">{worker.tokensPerSecond === undefined ? "—" : `${formatNumber(worker.tokensPerSecond)}/s`}</strong></span>
@@ -266,19 +213,19 @@ function WorkerDetail({ worker }: { worker: WorkerRuntimeStats }) {
           <p className="text-[13px] font-semibold">{worker.label}</p>
           <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{worker.role} participant</p>
         </div>
-        <StatusPill status={worker.status} />
+        <Pill tone={WORKER_STATUS[worker.status].tone} variant="quiet" dot pulse={WORKER_STATUS[worker.status].pulse}>{humanizeStatus(worker.status)}</Pill>
       </div>
       <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2 text-[11px]">
         <div className="col-span-2"><dt className="text-muted-foreground">Provider</dt><dd className="break-words font-medium">{worker.provider}</dd></div>
         <div className="col-span-2"><dt className="text-muted-foreground">Model</dt><dd className="break-words font-medium">{worker.model}</dd></div>
-        <div><dt className="text-muted-foreground">Variant / effort</dt><dd className="font-medium">{worker.variant ?? "—"}</dd></div>
+        <div><dt className="text-muted-foreground">Variant / effort</dt><dd className="font-medium">{worker.variant ?? UNKNOWN}</dd></div>
         <div><dt className="text-muted-foreground">Elapsed</dt><dd className="font-medium">{formatDuration(worker.elapsedMs)}</dd></div>
-        <div><dt className="text-muted-foreground">Started</dt><dd className="font-medium">{worker.startedAt ?? "—"}</dd></div>
-        <div><dt className="text-muted-foreground">Finished</dt><dd className="font-medium">{worker.finishedAt ?? "—"}</dd></div>
+        <div><dt className="text-muted-foreground">Started</dt><dd className="font-medium">{worker.startedAt ?? UNKNOWN}</dd></div>
+        <div><dt className="text-muted-foreground">Finished</dt><dd className="font-medium">{worker.finishedAt ?? UNKNOWN}</dd></div>
         <div><dt className="text-muted-foreground">Invocations</dt><dd className="font-medium">{worker.invocationCount}</dd></div>
         <div><dt className="text-muted-foreground">Retries</dt><dd className="font-medium">{worker.retryCount}</dd></div>
-        <div><dt className="text-muted-foreground">Success / failure</dt><dd className="font-medium">{worker.successCount ?? "—"} / {worker.failureCount ?? "—"}</dd></div>
-        <div><dt className="text-muted-foreground">Cost</dt><dd className="font-medium">{formatCostMicros(worker.costMicros)}</dd></div>
+        <div><dt className="text-muted-foreground">Success / failure</dt><dd className="font-medium">{worker.successCount ?? UNKNOWN} / {worker.failureCount ?? UNKNOWN}</dd></div>
+        <div><dt className="text-muted-foreground">Cost</dt><dd className="font-medium">{formatCostUsage(worker.costMicros)}</dd></div>
         <div><dt className="text-muted-foreground">Latency / TTFT</dt><dd className="font-medium">{formatDuration(worker.latencyMs)} / {formatDuration(worker.ttftMs)}</dd></div>
         <div><dt className="text-muted-foreground">Throughput</dt><dd className="font-medium">{worker.tokensPerSecond === undefined ? "—" : `${formatNumber(worker.tokensPerSecond)}/s`}</dd></div>
       </dl>
@@ -294,7 +241,7 @@ function ChartFrame({ label, children }: { label: string; children: React.ReactN
 function TimelineChart({ observability }: { observability: RuntimeObservability }) {
   const data = useMemo(() => toChartableTimeline(observability.timeline), [observability.timeline]);
   const latest = data.at(-1);
-  if (data.length === 0 || data.every((point) => point.total === null)) return <p className="rounded-md border border-dashed border-border px-2 py-4 text-[11px] text-muted-foreground">Cumulative token usage is not available yet.</p>;
+  if (data.length === 0 || data.every((point) => point.total === null)) return <EmptyState className="px-2 py-4">Cumulative token usage is not available yet.</EmptyState>;
   return (
     <>
       <ChartFrame label={`Mission cumulative token usage, ${data.length} points; latest ${latest?.total ?? "unavailable"} tokens`}>
@@ -302,22 +249,22 @@ function TimelineChart({ observability }: { observability: RuntimeObservability 
           <LineChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={CHART_GRID} vertical={false} />
             <XAxis dataKey="timestamp" tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} interval="preserveStartEnd" minTickGap={20} />
-            <YAxis domain={[0, "auto"]} tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={38} tickFormatter={(value) => formatTokens({ value: Number(value), provenance: "reported" })} />
-            <Tooltip formatter={(value, name) => [`${value ?? "—"} tokens`, name === "estimatedTotal" ? "Estimated" : name === "reportedTotal" ? "Reported" : "Cumulative"]} labelFormatter={(label) => `Elapsed ${label}`} />
+            <YAxis domain={[0, "auto"]} tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} width={38} tickFormatter={(value) => formatCompactTokens(Number(value))} />
+            <Tooltip formatter={(value, name) => [`${value ?? UNKNOWN} tokens`, name === "estimatedTotal" ? "Estimated" : name === "reportedTotal" ? "Reported" : "Cumulative"]} labelFormatter={(label) => `Elapsed ${label}`} />
             <Line type="monotone" dataKey="total" name="Cumulative" stroke={CHART_REPORTED} strokeWidth={2} dot={{ r: 2, fill: CHART_REPORTED }} activeDot={{ r: 4 }} connectNulls={false} isAnimationActive={false} />
             <Line type="monotone" dataKey="estimatedTotal" name="Estimated" stroke={CHART_ESTIMATED} strokeWidth={2} strokeDasharray="5 4" dot={false} connectNulls={false} isAnimationActive={false} />
             <Line type="monotone" dataKey="reportedTotal" name="Reported" stroke={CHART_REPORTED} strokeWidth={2} dot={false} connectNulls={false} isAnimationActive={false} />
           </LineChart>
         </ResponsiveContainer>
       </ChartFrame>
-      <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground"><span>{data.length} bounded points · latest {formatTokens(latest?.total === null || latest?.total === undefined ? undefined : { value: latest.total, provenance: latest.provenance ?? "reported" })}</span><span>— estimated · — reported</span></div>
+      <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground"><span>{data.length} bounded points · latest {formatTokenUsage(latest?.total === null || latest?.total === undefined ? undefined : { value: latest.total, provenance: latest.provenance ?? "reported" })}</span><span>— estimated · — reported</span></div>
     </>
   );
 }
 
 function WorkerBreakdown({ workers, selectedWorkerId }: { workers: WorkerRuntimeStats[]; selectedWorkerId: string | null }) {
   const data = workers.map((worker) => ({ name: worker.label, workerId: worker.workerId, tokens: worker.tokenUsage.total?.value ?? null })).filter((worker): worker is { name: string; workerId: string; tokens: number } => worker.tokens !== null);
-  if (data.length === 0) return <p className="rounded-md border border-dashed border-border px-2 py-4 text-[11px] text-muted-foreground">Worker token totals are unavailable.</p>;
+  if (data.length === 0) return <EmptyState className="px-2 py-4">Worker token totals are unavailable.</EmptyState>;
   return (
     <>
       <ChartFrame label={`Worker resource comparison for ${data.length} participants`}>
@@ -326,7 +273,7 @@ function WorkerBreakdown({ workers, selectedWorkerId }: { workers: WorkerRuntime
             <CartesianGrid strokeDasharray="3 3" stroke={CHART_GRID} horizontal={false} />
             <XAxis type="number" tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} />
             <YAxis type="category" dataKey="name" width={76} tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} axisLine={false} tickLine={false} />
-            <Tooltip formatter={(value) => [`${value ?? "—"} tokens`, "Total"]} />
+            <Tooltip formatter={(value) => [`${value ?? UNKNOWN} tokens`, "Total"]} />
             <Bar dataKey="tokens" radius={[0, 3, 3, 0]} barSize={12} isAnimationActive={false}>
               {data.map((item) => <Cell key={item.workerId} fill={item.workerId === selectedWorkerId ? CHART_SELECTED : CHART_BAR} />)}
             </Bar>
@@ -345,11 +292,11 @@ function AggregateRow({ name, detail, tokens, calls, active, cost, success, fail
     <li>
       <button type="button" onClick={onSelect} aria-pressed={selected} className={cn("flex w-full items-start gap-2 border-b border-border/70 px-1 py-2 text-left last:border-0", selected && "bg-muted/60")}>
         <div className="min-w-0 flex-1"><p className="break-words text-[11px] font-medium">{name}</p>{detail && <p className="break-words text-[10px] text-muted-foreground">{detail}</p>}</div>
-        <span className="w-20 shrink-0 text-right text-[10px] text-muted-foreground" title={tokens ? `${tokens.provenance} usage` : "Unavailable"}>{formatTokens(tokens)} · {calls} calls</span>
+        <span className="w-20 shrink-0 text-right text-[10px] text-muted-foreground" title={tokens ? `${tokens.provenance} usage` : "Unavailable"}>{formatTokenUsage(tokens)} · {calls} calls</span>
         <span className="w-14 shrink-0 text-right text-[10px] text-muted-foreground">{active} active</span>
-        <span className="w-14 shrink-0 text-right text-[10px] text-muted-foreground">{formatCostMicros(cost)}</span>
+        <span className="w-14 shrink-0 text-right text-[10px] text-muted-foreground">{formatCostUsage(cost)}</span>
       </button>
-      {selected && <div className="border-b border-border/70 bg-muted/30 px-1 pb-2 text-[10px] text-muted-foreground">{success === undefined && failure === undefined ? "Success / failure unavailable" : `${success ?? "—"} successful · ${failure ?? "—"} failed`} · {latency === undefined ? "latency unavailable" : `${formatDuration(latency)} average latency`}</div>}
+      {selected && <div className="border-b border-border/70 bg-muted/30 px-1 pb-2 text-[10px] text-muted-foreground">{success === undefined && failure === undefined ? "Success / failure unavailable" : `${success ?? UNKNOWN} successful · ${failure ?? UNKNOWN} failed`} · {latency === undefined ? "latency unavailable" : `${formatDuration(latency)} average latency`}</div>}
     </li>
   );
 }
@@ -359,14 +306,14 @@ function AggregateDetail({ selection, providers, models }: { selection: Aggregat
   const item = selection.kind === "provider" ? providers.find((provider) => provider.provider === selection.key) : models.find((model) => `${model.provider}\u0000${model.model}` === selection.key);
   if (!item) return null;
   const name = "model" in item ? `${item.provider} · ${item.model}` : item.provider;
-  return <div className="mt-2 rounded-md border border-border bg-muted/20 p-2 text-[11px]" aria-label="Selected aggregate detail"><p className="break-words font-medium">{name}</p><div className="mt-1.5 grid grid-cols-2 gap-1.5 text-muted-foreground"><span>workers <strong className="text-foreground">{item.workerCount}</strong></span><span>active <strong className="text-foreground">{item.activeWorkers}</strong></span><span>calls <strong className="text-foreground">{item.invocationCount}</strong></span><span>retries <strong className="text-foreground">{item.retryCount}</strong></span><span>tokens <strong className="text-foreground">{formatTokens(item.tokenUsage.total)}</strong></span><span>cost <strong className="text-foreground">{formatCostMicros(item.costMicros)}</strong></span><span>latency <strong className="text-foreground">{formatDuration(item.latencyMs)}</strong></span></div></div>;
+  return <div className="mt-2 rounded-md border border-border bg-muted/20 p-2 text-[11px]" aria-label="Selected aggregate detail"><p className="break-words font-medium">{name}</p><div className="mt-1.5 grid grid-cols-2 gap-1.5 text-muted-foreground"><span>workers <strong className="text-foreground">{item.workerCount}</strong></span><span>active <strong className="text-foreground">{item.activeWorkers}</strong></span><span>calls <strong className="text-foreground">{item.invocationCount}</strong></span><span>retries <strong className="text-foreground">{item.retryCount}</strong></span><span>tokens <strong className="text-foreground">{formatTokenUsage(item.tokenUsage.total)}</strong></span><span>cost <strong className="text-foreground">{formatCostUsage(item.costMicros)}</strong></span><span>latency <strong className="text-foreground">{formatDuration(item.latencyMs)}</strong></span></div></div>;
 }
 
 function OverviewSurface({ mission, observability }: { mission: Mission; observability: RuntimeObservability }) {
   const latestActivity = observability.activities.at(-1);
   return (
     <div className="flex flex-col gap-3">
-      <div className="grid grid-cols-2 gap-1.5"><Metric label="Tokens" value={formatTokens(observability.mission.tokenUsage.total)} icon={Gauge} /><Metric label="Cost" value={formatCostMicros(observability.mission.costMicros)} icon={Coins} /><Metric label="Elapsed" value={formatDuration(observability.mission.elapsedMs)} icon={Clock3} /><Metric label="Active workers" value={`${observability.mission.activeWorkerCount}`} icon={Users} /></div>
+      <div className="grid grid-cols-2 gap-1.5"><Metric label="Tokens" value={formatTokenUsage(observability.mission.tokenUsage.total)} icon={Gauge} /><Metric label="Cost" value={formatCostUsage(observability.mission.costMicros)} icon={Coins} /><Metric label="Elapsed" value={formatDuration(observability.mission.elapsedMs)} icon={Clock3} /><Metric label="Active workers" value={`${observability.mission.activeWorkerCount}`} icon={Users} /></div>
       <p className="text-[12px] leading-5 text-muted-foreground">{mission.goal}</p>
       <CurrentRuntimeSummary observability={observability} />
       <BudgetSection mission={mission} observability={observability} />

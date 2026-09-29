@@ -56,8 +56,8 @@ import {
   type ResolvedRoute,
   type RouteStatus,
 } from "./domain";
+import { formatCostMicros, formatCount } from "@/lib/format";
 import { summarize } from "../resource-ledger/selectors";
-import { formatCostMicros, formatCount } from "../resource-ledger/format";
 import type { ResourceLedger } from "../resource-ledger/types";
 
 type Tone = "emerald" | "sky" | "amber" | "red" | "violet" | "slate";

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { BadgeCheck, Boxes, Cpu, Plug, Plus, Sparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { humanizeStatus } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { BootstrapResource, BootstrapState, OnboardingStageId } from "../bootstrap/types";
 import {
@@ -12,7 +13,6 @@ import {
   MODEL_STATUS_TONE,
   ONBOARDING_STAGE_LABEL,
   RESOURCE_STATUS_TONE,
-  titleCaseStatus,
 } from "../bootstrap/presentation";
 import {
   normalizeOnboardingMode,
@@ -120,7 +120,7 @@ function ResourcesPanel({ bootstrap }: { bootstrap: BootstrapState }) {
             <div className="min-w-0 flex-1">
               <p className="text-[12px] font-medium">{resource.label}</p>
               <p className="text-[11px] text-muted-foreground">
-                {titleCaseStatus(resource.kind)} · {resource.source}
+                {humanizeStatus(resource.kind)} · {resource.source}
                 {resource.required ? " · required" : ""}
               </p>
               {(resource.provider || resource.plan) && (
@@ -131,7 +131,7 @@ function ResourcesPanel({ bootstrap }: { bootstrap: BootstrapState }) {
               {resource.detail && <p className="mt-0.5 text-[11px] text-muted-foreground">{resource.detail}</p>}
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
-              <StatusPill label={titleCaseStatus(resource.status)} tone={RESOURCE_STATUS_TONE[resource.status]} />
+              <StatusPill label={humanizeStatus(resource.status)} tone={RESOURCE_STATUS_TONE[resource.status]} />
               {resource.id.startsWith("review-resource-") && (
                 <Button
                   size="icon-xs"
@@ -168,13 +168,13 @@ function ConnectionsPanel({ bootstrap, onRequestHandoff }: StagePanelProps) {
                 )}
               </p>
               <p className="text-[11px] text-muted-foreground">
-                {titleCaseStatus(connection.kind)}
+                {humanizeStatus(connection.kind)}
                 {connection.required ? " · required" : ""}
               </p>
               {connection.detail && <p className="mt-0.5 text-[11px] text-muted-foreground">{connection.detail}</p>}
             </div>
             <div className="flex shrink-0 flex-col items-end gap-1.5">
-              <StatusPill label={titleCaseStatus(connection.state)} tone={CONNECTION_STATE_TONE[connection.state]} />
+              <StatusPill label={humanizeStatus(connection.state)} tone={CONNECTION_STATE_TONE[connection.state]} />
               {connection.requiresHandoff && connection.state !== "connected" && (
                 <Button
                   size="xs"
@@ -212,7 +212,7 @@ function DiscoveryPanel({ bootstrap }: { bootstrap: BootstrapState }) {
                   <p className="truncate text-[12px] font-medium">{model.model}</p>
                   <p className="text-[11px] text-muted-foreground">{model.provider}</p>
                 </div>
-                <StatusPill label={titleCaseStatus(model.status)} tone={MODEL_STATUS_TONE[model.status]} />
+                <StatusPill label={humanizeStatus(model.status)} tone={MODEL_STATUS_TONE[model.status]} />
               </li>
             ))}
           </ul>
@@ -232,7 +232,7 @@ function DiscoveryPanel({ bootstrap }: { bootstrap: BootstrapState }) {
                 <Sparkles className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
                 <span className="min-w-0 flex-1 truncate text-[12px]">{capability.label}</span>
                 <StatusPill
-                  label={titleCaseStatus(capability.status)}
+                  label={humanizeStatus(capability.status)}
                   tone={capability.status === "available" ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}
                 />
               </li>
@@ -265,11 +265,11 @@ function OverviewPanel({ bootstrap }: { bootstrap: BootstrapState }) {
             <li key={resource.id} className="flex items-center gap-2 px-3 py-2">
               <span className="min-w-0 flex-1 truncate text-[12px]">{resource.label}</span>
               <span className="max-w-[45%] truncate text-right text-[11px] text-muted-foreground">
-                {resource.economics.kind === "unknown" ? "Pricing unknown" : titleCaseStatus(resource.economics.kind)}
+                {resource.economics.kind === "unknown" ? "Pricing unknown" : humanizeStatus(resource.economics.kind)}
                 {" · "}
                 {resource.capacity.status === "unknown" ? "Capacity unknown" : resource.capacity.detail ?? "Capacity known"}
               </span>
-              <StatusPill label={titleCaseStatus(resource.status)} tone={RESOURCE_STATUS_TONE[resource.status]} />
+              <StatusPill label={humanizeStatus(resource.status)} tone={RESOURCE_STATUS_TONE[resource.status]} />
             </li>
           ))}
         </ul>
@@ -280,7 +280,7 @@ function OverviewPanel({ bootstrap }: { bootstrap: BootstrapState }) {
           {bootstrap.models.map((model) => (
             <li key={model.id} className="flex items-center gap-2 px-3 py-2">
               <span className="min-w-0 flex-1 truncate text-[12px]">{model.provider} · {model.model}</span>
-              <StatusPill label={titleCaseStatus(model.status)} tone={MODEL_STATUS_TONE[model.status]} />
+              <StatusPill label={humanizeStatus(model.status)} tone={MODEL_STATUS_TONE[model.status]} />
             </li>
           ))}
         </ul>
@@ -339,7 +339,7 @@ function ReadyPanel({ bootstrap }: { bootstrap: BootstrapState }) {
         <Fact label="Resources" value={String(selectAvailableResources(bootstrap).length)} />
         <Fact label="Models" value={String(selectAvailableModels(bootstrap).length)} />
         <Fact label="Profile" value={profile?.label ?? "Not selected"} />
-        <Fact label="Access" value={titleCaseStatus(bootstrap.access.state)} />
+        <Fact label="Access" value={humanizeStatus(bootstrap.access.state)} />
       </dl>
       <div className="rounded-md border border-border bg-muted/20 px-2.5 py-2 text-[11px] text-muted-foreground">
         <p className="font-medium text-foreground">Capability coverage</p>

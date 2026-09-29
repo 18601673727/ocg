@@ -3,26 +3,26 @@
 import {
   USAGE_COMPONENT_LABEL,
   USAGE_COMPONENTS,
-  type LedgerCallStatus,
   type ResourceLedgerEntry,
 } from "./types";
-import { formatCostMicros, formatDuration, formatTimestamp, UNKNOWN } from "./format";
+import {
+  formatCostMicros,
+  formatDuration,
+  formatPercent,
+  formatRatio,
+  formatTimestamp,
+  UNKNOWN,
+} from "@/lib/format";
+import { Pill, SectionTitle } from "@/components/ocg/primitives";
 import { cacheLeverage, cacheShare, componentTraffic } from "./selectors";
 import {
   AttributionPill,
   AuthorityPill,
+  CALL_STATUS_TONE,
   CostPill,
-  Pill,
   ReconciliationPill,
-  SectionTitle,
   Unknown,
 } from "./ledger-primitives";
-
-const STATUS_TONE: Record<LedgerCallStatus, "emerald" | "red" | "amber"> = {
-  success: "emerald",
-  failure: "red",
-  retrying: "amber",
-};
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -41,7 +41,7 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
   return (
     <div className="flex min-w-0 flex-col gap-3">
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <Pill tone={STATUS_TONE[entry.status]} title={`Call status: ${entry.status}`}>
+        <Pill tone={CALL_STATUS_TONE[entry.status]} title={`Call status: ${entry.status}`}>
           {entry.status}
         </Pill>
         <Pill tone={entry.role === "lead" ? "violet" : "slate"} title={`Role: ${entry.role}`}>
@@ -116,11 +116,11 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
           </div>
           <div>
             <dt className="text-muted-foreground">Cache share</dt>
-            <dd className="font-semibold tabular-nums">{share === null ? UNKNOWN : `${(share * 100).toFixed(1)}%`}</dd>
+            <dd className="font-semibold tabular-nums">{formatPercent(share)}</dd>
           </div>
           <div>
             <dt className="text-muted-foreground">Cache leverage</dt>
-            <dd className="font-semibold tabular-nums">{leverage === null ? UNKNOWN : `${leverage.toFixed(2)}×`}</dd>
+            <dd className="font-semibold tabular-nums">{formatRatio(leverage)}</dd>
           </div>
         </dl>
       </section>

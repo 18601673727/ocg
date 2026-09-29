@@ -11,35 +11,37 @@ import {
   YAxis,
 } from "recharts";
 import { cn } from "@/lib/utils";
+import { formatTokens, UNKNOWN } from "@/lib/format";
+import { EmptyState, SectionTitle } from "@/components/ocg/primitives";
 import {
   LEDGER_SERIES,
   USAGE_COMPONENT_LABEL,
   USAGE_COMPONENTS,
   type LedgerSeriesKey,
 } from "./types";
-import { formatTokens } from "./format";
 import { describeTimeSeries, type ComponentTraffic, type LedgerTimePoint } from "./selectors";
-import { SectionTitle } from "./ledger-primitives";
 
 const CHART_GRID = "var(--border)";
+
+const FALLBACK_COLOR = "var(--chart-3)";
+
+function seriesColor(key: LedgerSeriesKey): string {
+  return LEDGER_SERIES.find((series) => series.key === key)?.color ?? FALLBACK_COLOR;
+}
 
 /** Horizontal stacked composition of the filtered token traffic. */
 export function StackedCompositionBar({ traffic }: { traffic: ComponentTraffic }) {
   const segments = USAGE_COMPONENTS.map((component) => ({
     component,
     value: traffic[component],
-    color: LEDGER_SERIES.find((series) => series.key === component)?.color ?? "var(--chart-3)",
+    color: seriesColor(component),
   })).filter((segment): segment is { component: typeof segment.component; value: number; color: string } =>
     segment.value !== null && segment.value > 0,
   );
   const total = traffic.total;
 
   if (total === null || total <= 0) {
-    return (
-      <p className="rounded-md border border-dashed border-border px-2 py-4 text-[11px] text-muted-foreground">
-        Component traffic is unavailable for this selection.
-      </p>
-    );
+    return <EmptyState className="px-2 py-4">Component traffic is unavailable for this selection.</EmptyState>;
   }
 
   return (
@@ -163,7 +165,7 @@ export function TrafficChart({ points }: { points: LedgerTimePoint[] }) {
             />
             <Tooltip
               formatter={(value, name) => [
-                value === null || value === undefined ? "—" : `${formatTokens(Number(value))} tokens`,
+                value === null || value === undefined ? UNKNOWN : `${formatTokens(Number(value))} tokens`,
                 LEDGER_SERIES.find((series) => series.key === name)?.label ?? String(name),
               ]}
               labelFormatter={(label) => `${String(label).slice(11, 16)}Z`}

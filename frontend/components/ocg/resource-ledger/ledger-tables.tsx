@@ -7,17 +7,23 @@ import {
   type ResourceLedgerEntry,
   type LedgerRole,
 } from "./types";
-import { formatCostMicros, formatPercent, formatRatio, formatTimestamp, formatTokens } from "./format";
+import {
+  formatCostMicros,
+  formatPercent,
+  formatRatio,
+  formatTimestamp,
+  formatTokens,
+  UNKNOWN,
+} from "@/lib/format";
+import { EmptyState, Pill, SectionTitle, TONE_CLASS } from "@/components/ocg/primitives";
 import { groupEntries, usageTotal, type LedgerGroup, type LedgerSummary } from "./selectors";
 import {
   ATTRIBUTION_TONE,
   AttributionPill,
   AuthorityPill,
   CostPill,
-  Pill,
   ReconciliationIndicator,
   ReconciliationPill,
-  SectionTitle,
 } from "./ledger-primitives";
 
 function rolePill(role: LedgerRole) {
@@ -88,7 +94,9 @@ function CompactMetrics({ summary }: { summary: LedgerSummary }) {
       </div>
       <div>
         <dt className="text-[10px] text-muted-foreground">Avg latency</dt>
-        <dd className="font-medium tabular-nums">{summary.averageLatencyMs === null ? "—" : `${Math.round(summary.averageLatencyMs)}ms`}</dd>
+        <dd className="font-medium tabular-nums">
+          {summary.averageLatencyMs === null ? UNKNOWN : `${Math.round(summary.averageLatencyMs)}ms`}
+        </dd>
       </div>
       <div className="col-span-2 sm:col-span-3">
         <dt className="mb-0.5 text-[10px] text-muted-foreground">Reconciliation</dt>
@@ -109,11 +117,7 @@ export function AggregateGroupList({
   emptyLabel: string;
 }) {
   if (groups.length === 0) {
-    return (
-      <p className="rounded-md border border-dashed border-border px-2 py-4 text-[11px] text-muted-foreground">
-        {emptyLabel}
-      </p>
-    );
+    return <EmptyState className="px-2 py-4">{emptyLabel}</EmptyState>;
   }
   return (
     <ul className="flex flex-col gap-1.5">
@@ -230,7 +234,7 @@ export function AttributionSummary({ summary }: { summary: LedgerSummary }) {
             key={confidence}
             className={cn(
               "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px]",
-              ATTRIBUTION_TONE[confidence],
+              TONE_CLASS[ATTRIBUTION_TONE[confidence]],
               summary.byAttribution[confidence] === 0 && "opacity-50",
             )}
             title={`${ATTRIBUTION_CONFIDENCE_LABEL[confidence]} attribution`}
@@ -260,11 +264,7 @@ export function AttributionBreakdown({
   onSelectEntry: (entry: ResourceLedgerEntry) => void;
 }) {
   if (missions.length === 0 && unknownEntries.length === 0) {
-    return (
-      <p className="rounded-md border border-dashed border-border px-2 py-4 text-[11px] text-muted-foreground">
-        No attributed calls match the current filters.
-      </p>
-    );
+    return <EmptyState className="px-2 py-4">No attributed calls match the current filters.</EmptyState>;
   }
   return (
     <div className="flex min-w-0 flex-col gap-2">
@@ -287,10 +287,7 @@ export function AttributionBreakdown({
                 return (
                   <span
                     key={confidence}
-                    className={cn(
-                      "rounded-full border px-1.5 py-0.5 text-[9px] capitalize",
-                      ATTRIBUTION_TONE[confidence],
-                    )}
+                    className={cn("rounded-full border px-1.5 py-0.5 text-[9px] capitalize", TONE_CLASS[ATTRIBUTION_TONE[confidence]])}
                     title={`${ATTRIBUTION_CONFIDENCE_LABEL[confidence]} attribution: ${count}`}
                   >
                     {confidence} {count}

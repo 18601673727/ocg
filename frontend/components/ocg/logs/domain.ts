@@ -52,6 +52,9 @@ export type LogFilters = {
 
 export const LOG_LEVELS: readonly LogLevel[] = ["trace", "debug", "info", "warn", "error"];
 
+/** How many tail entries a surface keeps. The renderer shows this bound. */
+export const LOG_HISTORY_LIMIT = 120;
+
 const SENSITIVE_FIELD = /api[-_ ]?key|authorization|auth[-_ ]?header|bearer|cookie|credential|jwt|password|secret|token/i;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -112,7 +115,7 @@ export function normalizeLogEntry(entry: LogEntry): LogEntry {
   };
 }
 
-export function boundLogEntries(entries: LogEntry[], limit = 120): LogEntry[] {
+export function boundLogEntries(entries: LogEntry[], limit = LOG_HISTORY_LIMIT): LogEntry[] {
   if (limit <= 0) return [];
   return entries.slice(Math.max(0, entries.length - limit));
 }

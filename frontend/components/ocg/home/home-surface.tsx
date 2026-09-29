@@ -23,7 +23,7 @@ import {
   selectRecentProductActivity,
 } from "./selectors";
 import type { AttentionItem, ActiveMissionProjection, ContinueWorkingEntry, ResourceHealthSummary, UsageSummary, RecentActivityItem } from "./domain";
-import { formatCostMicros, formatPercent, formatTokens } from "../resource-ledger/format";
+import { formatCostMicros, formatPercent, formatTokens } from "@/lib/format";
 import type { RuntimeSnapshot } from "../runtime/runtime-types";
 
 type HomeSurfaceProps = {

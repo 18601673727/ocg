@@ -15,6 +15,14 @@ import {
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  EmptyPanel,
+  Pill,
+  SegmentedTabs,
+  StatusDot,
+  TEXT_TONE,
+  type Tone,
+} from "@/components/ocg/primitives";
 import type { RuntimeSnapshot } from "../runtime/runtime-types";
 import type {
   AttentionDestination,
@@ -74,31 +82,29 @@ const TAB_LABELS: Record<AttentionTab, string> = {
   resolved: "Resolved",
 };
 
-const SEVERITY_DOT: Record<AttentionSeverity, string> = {
-  info: "bg-sky-500",
-  warning: "bg-amber-500",
-  high: "bg-orange-500",
-  critical: "bg-red-500",
+/**
+ * Attention's own scales, expressed in the shared tone vocabulary. There is no
+ * orange tone, so `high` and `critical` share red; the severity word beside the
+ * dot keeps them distinguishable.
+ */
+const SEVERITY_TONE: Record<AttentionSeverity, Tone> = {
+  info: "sky",
+  warning: "amber",
+  high: "red",
+  critical: "red",
 };
 
-const SEVERITY_TEXT: Record<AttentionSeverity, string> = {
-  info: "text-sky-700 dark:text-sky-400",
-  warning: "text-amber-700 dark:text-amber-400",
-  high: "text-orange-700 dark:text-orange-400",
-  critical: "text-red-700 dark:text-red-400",
-};
-
-const KIND_TONE: Record<AttentionKind, string> = {
-  approval: "bg-violet-500/10 text-violet-700 dark:text-violet-400",
-  budget: "bg-amber-500/10 text-amber-700 dark:text-amber-400",
-  policy: "bg-slate-500/10 text-slate-600 dark:text-slate-300",
-  permission: "bg-sky-500/10 text-sky-700 dark:text-sky-400",
-  blocked: "bg-orange-500/10 text-orange-700 dark:text-orange-400",
-  "runtime-failure": "bg-red-500/10 text-red-700 dark:text-red-400",
-  "resource-degraded": "bg-amber-500/10 text-amber-700 dark:text-amber-400",
-  configuration: "bg-slate-500/10 text-slate-600 dark:text-slate-300",
-  retry: "bg-sky-500/10 text-sky-700 dark:text-sky-400",
-  escalation: "bg-violet-500/10 text-violet-700 dark:text-violet-400",
+const KIND_TONE: Record<AttentionKind, Tone> = {
+  approval: "violet",
+  budget: "amber",
+  policy: "slate",
+  permission: "sky",
+  blocked: "amber",
+  "runtime-failure": "red",
+  "resource-degraded": "amber",
+  configuration: "slate",
+  retry: "sky",
+  escalation: "violet",
 };
 
 const DESTINATION_LABELS: Record<AttentionDestination, string> = {
@@ -204,37 +210,17 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
             Items that need your decision or intervention.
           </p>
           <SummaryStrip summary={summary} />
-          <div
-            role="tablist"
-            aria-label="Attention views"
-            className="mt-3 flex items-center gap-1 rounded-lg border border-border bg-muted/30 p-1"
-          >
-            {ATTENTION_TABS.map((tab) => {
-              const active = filters.tab === tab;
-              return (
-                <button
-                  key={tab}
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  aria-controls="attention-panel"
-                  onClick={() => { setFilters((f) => ({ ...f, tab })); setSelectedId(null); }}
-                  className={cn(
-                    "flex min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] font-medium transition-colors",
-                    active ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  <span className="truncate">{TAB_LABELS[tab]}</span>
-                  <span className={cn(
-                    "rounded-full px-1.5 text-[10px] tabular-nums",
-                    active ? "bg-muted text-foreground" : "bg-muted/60 text-muted-foreground",
-                  )}>
-                    {tabbed[tab]}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
+          <SegmentedTabs
+            tabs={ATTENTION_TABS.map((tab) => ({ id: tab, label: TAB_LABELS[tab], count: tabbed[tab] }))}
+            value={filters.tab}
+            onSelect={(tab) => {
+              setFilters((f) => ({ ...f, tab }));
+              setSelectedId(null);
+            }}
+            ariaLabel="Attention views"
+            panelId="attention-panel"
+            className="mt-3 grid-cols-4 border border-border bg-muted/30 p-1"
+          />
           <div className="mt-3 flex flex-col gap-2">
             <div className="relative">
               <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
@@ -390,14 +376,12 @@ function AttentionRow({ item, selected, onSelect }: { item: AttentionItem; selec
           : "border-border bg-card hover:bg-muted/30",
       )}
     >
-      <span className={cn("mt-1.5 size-2 shrink-0 rounded-full", SEVERITY_DOT[item.severity])} aria-hidden="true" />
+      <StatusDot tone={SEVERITY_TONE[item.severity]} size="md" className="mt-1.5" />
       <span className="min-w-0 flex-1">
         <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <span className="text-[13px] font-semibold">{item.title}</span>
-          <span className={cn("rounded-full px-1.5 py-0.5 text-[10px] font-medium", KIND_TONE[item.kind])}>
-            {ATTENTION_KIND_LABELS[item.kind]}
-          </span>
-          <span className={cn("text-[10px] font-semibold uppercase", SEVERITY_TEXT[item.severity])}>
+          <Pill tone={KIND_TONE[item.kind]}>{ATTENTION_KIND_LABELS[item.kind]}</Pill>
+          <span className={cn("text-[10px] font-semibold uppercase", TEXT_TONE[SEVERITY_TONE[item.severity]])}>
             {ATTENTION_SEVERITY_LABELS[item.severity]}
           </span>
         </span>
@@ -418,25 +402,22 @@ function AttentionRow({ item, selected, onSelect }: { item: AttentionItem; selec
 function EmptyState({ tab, hasItems }: { tab: AttentionTab; hasItems: boolean }) {
   if (!hasItems) {
     return (
-      <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/10 px-6 py-12 text-center">
-        <ShieldCheck className="mb-2 size-6 text-emerald-500" aria-hidden="true" />
-        <p className="text-sm font-medium">All clear</p>
-        <p className="mt-1 max-w-[280px] text-[12px] text-muted-foreground">
-          OCG has progressed as far as it safely can and nothing needs your judgment right now.
-        </p>
-      </div>
+      <EmptyPanel
+        icon={ShieldCheck}
+        iconClassName="text-emerald-500"
+        title="All clear"
+        hint="OCG has progressed as far as it safely can and nothing needs your judgment right now."
+        className="px-6 py-12"
+      />
     );
   }
   return (
-    <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border bg-muted/10 px-6 py-12 text-center">
-      <Inbox className="mb-2 size-6 text-muted-foreground" aria-hidden="true" />
-      <p className="text-sm font-medium">
-        {tab === "resolved" ? "No resolved history yet" : `Nothing in ${TAB_LABELS[tab].toLowerCase()}`}
-      </p>
-      <p className="mt-1 max-w-[280px] text-[12px] text-muted-foreground">
-        Try a different tab or clear the filters.
-      </p>
-    </div>
+    <EmptyPanel
+      icon={Inbox}
+      title={tab === "resolved" ? "No resolved history yet" : `Nothing in ${TAB_LABELS[tab].toLowerCase()}`}
+      hint="Try a different tab or clear the filters."
+      className="px-6 py-12"
+    />
   );
 }
 
@@ -464,10 +445,8 @@ function AttentionInspector({
       <div className="flex shrink-0 items-start gap-2 border-b border-border px-4 py-3">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className={cn("rounded-full px-1.5 py-0.5 text-[10px] font-medium", KIND_TONE[item.kind])}>
-              {ATTENTION_KIND_LABELS[item.kind]}
-            </span>
-            <span className={cn("text-[10px] font-semibold uppercase", SEVERITY_TEXT[item.severity])}>
+            <Pill tone={KIND_TONE[item.kind]}>{ATTENTION_KIND_LABELS[item.kind]}</Pill>
+            <span className={cn("text-[10px] font-semibold uppercase", TEXT_TONE[SEVERITY_TONE[item.severity]])}>
               {ATTENTION_SEVERITY_LABELS[item.severity]}
             </span>
             <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">

@@ -1,3 +1,4 @@
+import type { Tone } from "../primitives/tone";
 import type {
   BootstrapAccessState,
   BootstrapMode,
@@ -84,31 +85,29 @@ export const ACCESS_STATE_COPY: Record<BootstrapAccessState, AccessCopy> = {
   },
 };
 
-export function titleCaseStatus(value: string): string {
-  return value.replace(/-/g, " ");
-}
+/** Status colours come from the shared tone vocabulary, not local class strings. */
 
-export const RESOURCE_STATUS_TONE: Record<BootstrapResourceStatus, string> = {
-  available: "text-emerald-600 dark:text-emerald-400",
-  pending: "text-amber-600 dark:text-amber-400",
-  unavailable: "text-red-600 dark:text-red-400",
-  denied: "text-red-600 dark:text-red-400",
-  unknown: "text-muted-foreground",
+export const RESOURCE_STATUS_TONE: Record<BootstrapResourceStatus, Tone> = {
+  available: "emerald",
+  pending: "amber",
+  unavailable: "red",
+  denied: "red",
+  unknown: "slate",
 };
 
-export const CONNECTION_STATE_TONE: Record<BootstrapConnectionState, string> = {
-  connected: "text-emerald-600 dark:text-emerald-400",
-  pending: "text-amber-600 dark:text-amber-400",
-  unconfigured: "text-muted-foreground",
-  "auth-required": "text-amber-600 dark:text-amber-400",
-  failed: "text-red-600 dark:text-red-400",
-  denied: "text-red-600 dark:text-red-400",
-  unknown: "text-muted-foreground",
+export const CONNECTION_STATE_TONE: Record<BootstrapConnectionState, Tone> = {
+  connected: "emerald",
+  pending: "amber",
+  unconfigured: "slate",
+  "auth-required": "amber",
+  failed: "red",
+  denied: "red",
+  unknown: "slate",
 };
 
-export const MODEL_STATUS_TONE: Record<BootstrapModelStatus, string> = {
-  available: "text-emerald-600 dark:text-emerald-400",
-  pending: "text-amber-600 dark:text-amber-400",
-  unavailable: "text-red-600 dark:text-red-400",
-  unknown: "text-muted-foreground",
+export const MODEL_STATUS_TONE: Record<BootstrapModelStatus, Tone> = {
+  available: "emerald",
+  pending: "amber",
+  unavailable: "red",
+  unknown: "slate",
 };

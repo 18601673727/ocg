@@ -1,7 +1,8 @@
 "use client";
 
-import type { ComponentType, ReactNode } from "react";
+import { UNKNOWN } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { Pill, TONE_CLASS, type Tone } from "@/components/ocg/primitives";
 import {
   ATTRIBUTION_CONFIDENCE_DEFINITION,
   ATTRIBUTION_CONFIDENCE_LABEL,
@@ -17,68 +18,24 @@ import {
   USAGE_COMPONENTS,
   type AttributionConfidence,
   type CostProvenance,
+  type LedgerCallStatus,
   type ReconciliationStatus,
   type UsageAuthority,
 } from "./types";
-import { UNKNOWN } from "./format";
 
-export function SectionTitle({ children, detail }: { children: ReactNode; detail?: ReactNode }) {
-  return (
-    <div className="mb-1.5 flex min-w-0 items-center gap-1.5">
-      <h3 className="truncate text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
-        {children}
-      </h3>
-      {detail !== undefined && (
-        <span className="min-w-0 truncate text-[10px] text-muted-foreground">{detail}</span>
-      )}
-    </div>
-  );
-}
+export { Metric, SectionTitle } from "@/components/ocg/primitives";
 
 /** Renders the canonical unknown glyph. */
 export function Unknown() {
   return <span title="Unavailable">{UNKNOWN}</span>;
 }
 
-export function Metric({
-  label,
-  value,
-  detail,
-  title,
-  icon: Icon,
-}: {
-  label: string;
-  value: string;
-  detail?: string;
-  title?: string;
-  icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
-}) {
-  return (
-    <div
-      className="min-w-0 rounded-md border border-border bg-background px-2 py-1.5"
-      title={title}
-    >
-      <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
-        {Icon && <Icon className="size-3 shrink-0" aria-hidden />}
-        <span className="truncate">{label}</span>
-      </div>
-      <p className="mt-0.5 truncate text-[13px] font-semibold tabular-nums">{value}</p>
-      {detail && <p className="truncate text-[10px] text-muted-foreground">{detail}</p>}
-    </div>
-  );
-}
-
-type Tone = "emerald" | "sky" | "amber" | "red" | "violet" | "slate";
-
-const TONE_CLASS: Record<Tone, string> = {
-  emerald: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400",
-  sky: "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-400",
-  amber: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400",
-  red: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-400",
-  violet: "border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-400",
-  slate: "border-border bg-muted/50 text-muted-foreground",
-};
-
+/**
+ * Provenance tones for the ledger.
+ *
+ * These say how much to trust a number, which is a ledger idea rather than a
+ * runtime status, so they live here instead of in the shared status maps.
+ */
 export const AUTHORITY_TONE: Record<UsageAuthority, Tone> = {
   reportedCall: "emerald",
   reconciled: "sky",
@@ -109,27 +66,12 @@ export const RECONCILIATION_TONE: Record<ReconciliationStatus, Tone> = {
   unknown: "slate",
 };
 
-export function Pill({
-  children,
-  tone = "slate",
-  title,
-}: {
-  children: ReactNode;
-  tone?: Tone;
-  title?: string;
-}) {
-  return (
-    <span
-      title={title}
-      className={cn(
-        "inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium capitalize",
-        TONE_CLASS[tone],
-      )}
-    >
-      {children}
-    </span>
-  );
-}
+/** A single provider call either worked, failed, or is being retried. */
+export const CALL_STATUS_TONE: Record<LedgerCallStatus, Tone> = {
+  success: "emerald",
+  failure: "red",
+  retrying: "amber",
+};
 
 export function AuthorityPill({ value }: { value: UsageAuthority }) {
   return (
@@ -203,15 +145,14 @@ export function ReconciliationIndicator({
   className?: string;
 }) {
   return (
-    <div className={cn("flex min-w-0 flex-wrap items-center gap-1", className)} aria-label="Reconciliation status">
+    <div
+      className={cn("flex min-w-0 flex-wrap items-center gap-1", className)}
+      aria-label="Reconciliation status"
+    >
       {RECONCILIATION_ORDER.map((status) => (
         <span
           key={status}
-          className={cn(
-            "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px]",
-            RECONCILIATION_TONE[status],
-            counts[status] === 0 && "opacity-50",
-          )}
+          className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] ${TONE_CLASS[RECONCILIATION_TONE[status]]}${counts[status] === 0 ? " opacity-50" : ""}`}
           title={`${RECONCILIATION_LABEL[status]}: ${counts[status]} call(s). ${RECONCILIATION_DEFINITION[status]}`}
         >
           <span className="capitalize">{RECONCILIATION_LABEL[status]}</span>
@@ -242,45 +183,19 @@ export function DefinitionsDetails() {
           </ul>
         </div>
         <div className="space-y-2">
-          <div>
-            <p className="font-semibold">Usage authority</p>
-            <ul className="text-muted-foreground">
-              {(Object.keys(USAGE_AUTHORITY_LABEL) as UsageAuthority[]).map((key) => (
-                <li key={key}>
-                  <strong className="font-medium text-foreground">{USAGE_AUTHORITY_LABEL[key]}:</strong>{" "}
-                  {USAGE_AUTHORITY_DEFINITION[key]}
-                </li>
-              ))}
-            </ul>
-          </div>
-          <div>
-            <p className="font-semibold">Cost provenance</p>
-            <ul className="text-muted-foreground">
-              {(Object.keys(COST_PROVENANCE_LABEL) as CostProvenance[]).map((key) => (
-                <li key={key}>
-                  <strong className="font-medium text-foreground">{COST_PROVENANCE_LABEL[key]}:</strong>{" "}
-                  {COST_PROVENANCE_DEFINITION[key]}
-                </li>
-              ))}
-            </ul>
-          </div>
-          <div>
-            <p className="font-semibold">Attribution confidence</p>
-            <ul className="text-muted-foreground">
-              {(Object.keys(ATTRIBUTION_CONFIDENCE_LABEL) as AttributionConfidence[]).map((key) => (
-                <li key={key}>
-                  <strong className="font-medium text-foreground">{ATTRIBUTION_CONFIDENCE_LABEL[key]}:</strong>{" "}
-                  {ATTRIBUTION_CONFIDENCE_DEFINITION[key]}
-                </li>
-              ))}
-            </ul>
-          </div>
+          <DefinitionList title="Usage authority" labels={USAGE_AUTHORITY_LABEL} definitions={USAGE_AUTHORITY_DEFINITION} />
+          <DefinitionList title="Cost provenance" labels={COST_PROVENANCE_LABEL} definitions={COST_PROVENANCE_DEFINITION} />
+          <DefinitionList
+            title="Attribution confidence"
+            labels={ATTRIBUTION_CONFIDENCE_LABEL}
+            definitions={ATTRIBUTION_CONFIDENCE_DEFINITION}
+          />
           <div>
             <p className="font-semibold">Derived metrics</p>
             <ul className="text-muted-foreground">
               <li>
-                 <strong className="font-medium text-foreground">Cache share:</strong> cache read ÷ component
-                 traffic. Unavailable when cache read or component traffic is unknown, or the denominator is zero.
+                <strong className="font-medium text-foreground">Cache share:</strong> cache read ÷ component traffic.
+                Unavailable when cache read or component traffic is unknown, or the denominator is zero.
               </li>
               <li>
                 <strong className="font-medium text-foreground">Cache leverage:</strong> cache read ÷ fresh input.
@@ -295,5 +210,28 @@ export function DefinitionsDetails() {
         </div>
       </div>
     </details>
+  );
+}
+
+function DefinitionList({
+  title,
+  labels,
+  definitions,
+}: {
+  title: string;
+  labels: Record<string, string>;
+  definitions: Record<string, string>;
+}) {
+  return (
+    <div>
+      <p className="font-semibold">{title}</p>
+      <ul className="text-muted-foreground">
+        {Object.keys(labels).map((key) => (
+          <li key={key}>
+            <strong className="font-medium text-foreground">{labels[key]}:</strong> {definitions[key]}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
