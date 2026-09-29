@@ -289,7 +289,7 @@ function OverviewPanel({ bootstrap }: { bootstrap: BootstrapState }) {
   );
 }
 
-function ProfilePanel({ bootstrap }: { bootstrap: BootstrapState }) {
+function ProfileStagePanel({ bootstrap }: { bootstrap: BootstrapState }) {
   return (
     <div className="flex flex-col gap-2">
       <p className="text-[12px] leading-5 text-muted-foreground">
@@ -369,7 +369,7 @@ export function StagePanel({ bootstrap, onRequestHandoff }: StagePanelProps) {
     case "overview":
       return <OverviewPanel bootstrap={bootstrap} />;
     case "profile":
-      return <ProfilePanel bootstrap={bootstrap} />;
+      return <ProfileStagePanel bootstrap={bootstrap} />;
     case "ready":
       return <ReadyPanel bootstrap={bootstrap} />;
   }
