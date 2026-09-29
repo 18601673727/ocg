@@ -167,10 +167,6 @@ export function preRunConfigurationState(state: CanonicalState): {
   return { missionId, editable: true, reason: null };
 }
 
-export function missionConfigurationCommandId(missionId: string, revision: number): string {
-  return canonicalCommandId("mission-config", `${missionId}-${revision}`);
-}
-
 export function globalConfigurationCommandId(revision: number): string {
   return canonicalCommandId("global-config", String(revision));
 }

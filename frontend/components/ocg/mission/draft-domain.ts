@@ -75,7 +75,7 @@ export type MissionDraft = {
  * recommendation for the local mock runtime, not a production policy.
  */
 export const FIXTURE_RECOMMENDED_BUDGET_MICROS = 25_000_000;
-export const FIXTURE_RECOMMENDED_BUDGET_USD = 25;
+
 export const FIXTURE_RECOMMENDED_BUDGET_NOTE =
   "Fixture-recommended $25.00 hard cap — mock local policy, not a production default.";
 

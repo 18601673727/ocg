@@ -24,7 +24,6 @@ import {
   type LedgerDimension,
   type LedgerFilter,
   type LedgerFilterOptions,
-  type LedgerSeriesKey,
   type LedgerUsage,
   type ReconciliationStatus,
   type ResourceLedgerEntry,
@@ -410,10 +409,6 @@ export function describeTimeSeries(points: readonly LedgerTimePoint[]): string {
   return `${points.length} buckets · latest ${latest.total} tokens at ${clock(latest)}Z · peak ${peak.total} tokens at ${clock(peak)}Z`;
 }
 
-/** Reads a component series value from a chart point without leaking `undefined`. */
-export function seriesValue(point: LedgerTimePoint, key: LedgerSeriesKey): number | null {
-  return point[key];
-}
 
 /** Aggregate a usage map into a single observed total (or `null`). */
 export function usageTotal(usage: LedgerUsage | null): number | null {

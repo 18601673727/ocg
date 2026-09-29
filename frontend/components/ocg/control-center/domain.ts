@@ -20,7 +20,6 @@ import {
   type BootstrapProfile,
   type BootstrapProfileRoute,
   type BootstrapProvider,
-  type BootstrapProviderState,
   type BootstrapState,
 } from "../bootstrap/types";
 
@@ -41,14 +40,6 @@ export function resolveControlCenterView(value: unknown): ControlCenterView {
 
 export type ProfileHealth = "healthy" | "degraded" | "unavailable" | "incomplete" | "unknown";
 
-export const PROFILE_HEALTHS: readonly ProfileHealth[] = [
-  "healthy",
-  "degraded",
-  "unavailable",
-  "incomplete",
-  "unknown",
-];
-
 export type RouteStatus =
   | "ready"
   | "degraded"
@@ -58,17 +49,6 @@ export type RouteStatus =
   | "unknown"
   | "unassigned"
   | "auth-required";
-
-export const ROUTE_STATUSES: readonly RouteStatus[] = [
-  "ready",
-  "degraded",
-  "fallback",
-  "unavailable",
-  "pending",
-  "unknown",
-  "unassigned",
-  "auth-required",
-];
 
 export type ResolvedRoute = {
   route: BootstrapProfileRoute;
@@ -82,19 +62,11 @@ export function isUnavailableProvider(provider: BootstrapProvider | null | undef
   return provider?.state === "unavailable";
 }
 
-/** An unknown provider was not reported; it is not offline. */
-export function isUnknownProvider(provider: BootstrapProvider | null | undefined): boolean {
-  return provider === null || provider === undefined || provider.state === "unknown";
-}
 
 export function isUnavailableModel(model: BootstrapModel | null | undefined): boolean {
   return model?.status === "unavailable";
 }
 
-/** An unknown model was not reported; it is not unavailable. */
-export function isUnknownModel(model: BootstrapModel | null | undefined): boolean {
-  return model === null || model === undefined || model.status === "unknown";
-}
 
 /** Provider-distinct model key so the same model name on two providers stays distinct. */
 export function controlModelKey(provider: string, model: string): string {
@@ -103,11 +75,6 @@ export function controlModelKey(provider: string, model: string): string {
 
 export function selectProviders(state: BootstrapState): BootstrapProvider[] {
   return state.providers ?? [];
-}
-
-export function selectProvider(state: BootstrapState, providerId: string | null | undefined): BootstrapProvider | null {
-  if (!providerId) return null;
-  return selectProviders(state).find((provider) => provider.id === providerId) ?? null;
 }
 
 export function selectModel(state: BootstrapState, modelId: string | null | undefined): BootstrapModel | null {
@@ -192,18 +159,6 @@ export function selectModelStatusCounts(state: BootstrapState): Record<Bootstrap
   return counts;
 }
 
-export function selectProviderStateCounts(state: BootstrapState): Record<BootstrapProviderState, number> {
-  const counts: Record<BootstrapProviderState, number> = {
-    connected: 0,
-    "auth-required": 0,
-    degraded: 0,
-    unavailable: 0,
-    unknown: 0,
-  };
-  for (const provider of selectProviders(state)) counts[provider.state] += 1;
-  return counts;
-}
-
 /**
  * The active profile. An explicit `activeProfileId` wins; otherwise the
  * recommended profile; otherwise the first profile; otherwise none.
@@ -259,10 +214,6 @@ export function selectProfileRoutes(state: BootstrapState, profile: BootstrapPro
       status: selectRouteStatus(state, route),
     };
   });
-}
-
-export function selectActiveProfileRoutes(state: BootstrapState): ResolvedRoute[] {
-  return selectProfileRoutes(state, selectActiveProfile(state));
 }
 
 export function selectLeadRoutes(routes: readonly ResolvedRoute[]): ResolvedRoute[] {
@@ -374,10 +325,6 @@ export function selectModelCapabilities(model: BootstrapModel | null | undefined
   return [...ids].map((id) => ({ id, support: selectModelCapabilitySupport(model, id) }));
 }
 
-export function selectModelVariants(model: BootstrapModel | null | undefined): string[] {
-  return model?.variants ? [...model.variants] : [];
-}
-
 export function filterProviders(
   providers: readonly BootstrapProvider[],
   query: string,
@@ -388,10 +335,6 @@ export function filterProviders(
     [provider.label, provider.id, provider.detail ?? "", provider.endpointLabel ?? ""]
       .some((value) => value.toLowerCase().includes(needle)),
   );
-}
-
-export function selectFilteredProviders(state: BootstrapState, query: string): BootstrapProvider[] {
-  return filterProviders(selectProviders(state), query);
 }
 
 export type ModelFilter = {
@@ -437,15 +380,6 @@ export function filterModels(
       .toLowerCase()
       .includes(needle);
   });
-}
-
-export function selectFilteredModels(state: BootstrapState, filter: ModelFilter = {}): BootstrapModel[] {
-  const assignedModelIds = new Set(
-    state.profiles.flatMap((profile) => (profile.routes ?? [])
-      .filter((route) => route.modelId !== null)
-      .map((route) => route.modelId as string)),
-  );
-  return filterModels(state.models, { ...filter, assignedModelIds: filter.assignedModelIds ?? assignedModelIds });
 }
 
 export type ControlCenterSummary = {

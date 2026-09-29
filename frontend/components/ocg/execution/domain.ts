@@ -246,12 +246,6 @@ export function currentWave(execution: MissionExecution): number | undefined {
   return executionWaves(execution).find((wave) => wave.status === "active")?.index;
 }
 
-export function parallelTasks(execution: MissionExecution, waveIndex?: number): ExecutionTask[] {
-  const index = waveIndex ?? currentWave(execution);
-  if (index === undefined) return [];
-  return execution.tasks.filter((task) => task.wave === index && ["starting", "running", "verifying", "retrying"].includes(task.status));
-}
-
 export function dependencyClosure(execution: MissionExecution, taskId: string): Set<string> {
   const byId = new Map(execution.tasks.map((task) => [task.id, task]));
   const found = new Set<string>();
@@ -309,20 +303,3 @@ export function deriveExecutionGraph(execution: MissionExecution): ExecutionGrap
   };
 }
 
-export function hasDependencyCycle(execution: MissionExecution): boolean {
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const byId = new Map(execution.tasks.map((task) => [task.id, task]));
-  const visit = (id: string): boolean => {
-    if (visiting.has(id)) return true;
-    if (visited.has(id)) return false;
-    visiting.add(id);
-    for (const dependency of byId.get(id)?.dependencies ?? []) {
-      if (visit(dependency)) return true;
-    }
-    visiting.delete(id);
-    visited.add(id);
-    return false;
-  };
-  return execution.tasks.some((task) => visit(task.id));
-}

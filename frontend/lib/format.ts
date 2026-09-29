@@ -68,10 +68,6 @@ export function formatPercent(value: number | null | undefined): string {
   return `${((value as number) * 100).toFixed(1)}%`;
 }
 
-/** Whole-percent share, for a glanceable tile rather than a report. */
-export function formatWholePercent(share: number | null | undefined): string {
-  return share === null || share === undefined || !Number.isFinite(share) ? UNKNOWN : `${Math.round(share * 100)}%`;
-}
 
 /** Formats a leverage ratio such as cached-per-fresh tokens. */
 export function formatRatio(value: number | null | undefined): string {

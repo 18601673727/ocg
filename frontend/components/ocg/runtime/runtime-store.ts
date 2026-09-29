@@ -198,9 +198,4 @@ export class RuntimeStore {
   }
 }
 
-/** Convenience constructor for a store that owns one baseline. */
-export function createRuntimeStore(envelope: RuntimeSnapshotEnvelope): RuntimeStore {
-  const store = new RuntimeStore(createUninitializedRuntimeState(envelope.snapshot.scenario));
-  store.installSnapshot(envelope);
-  return store;
-}
+

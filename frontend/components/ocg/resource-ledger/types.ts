@@ -285,28 +285,6 @@ export type LedgerDimension =
   | "attribution"
   | "reconciliation";
 
-export const LEDGER_DIMENSIONS: readonly LedgerDimension[] = [
-  "mission",
-  "task",
-  "worker",
-  "provider",
-  "model",
-  "modelVariant",
-  "attribution",
-  "reconciliation",
-];
-
-export const LEDGER_DIMENSION_LABEL: Record<LedgerDimension, string> = {
-  mission: "Mission",
-  task: "Task",
-  worker: "Worker",
-  provider: "Provider",
-  model: "Model",
-  modelVariant: "Model + variant",
-  attribution: "Attribution confidence",
-  reconciliation: "Reconciliation",
-};
-
 export type LedgerSeriesKey = UsageComponent | "total";
 
 export type LedgerSeriesDefinition = {

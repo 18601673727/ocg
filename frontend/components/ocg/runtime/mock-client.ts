@@ -5,7 +5,6 @@ import type {
   OcgRuntimeEvent,
   RuntimeStatus,
   SendMessageInput,
-  WorkType,
 } from "../types";
 import { createScenarioFixture } from "./scenarios";
 import {
@@ -440,8 +439,3 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   }
 }
 
-export function createMockOcgRuntimeClient(scenario: ScenarioId): OcgRuntimeClient {
-  return new MockOcgRuntimeClient(scenario);
-}
-
-export type MockWorkType = WorkType;

@@ -184,10 +184,6 @@ export function isBlockedItem(item: AttentionItem): boolean {
   return item.kind === "blocked" || item.blocked !== null;
 }
 
-export function isResolvedHistory(item: AttentionItem): boolean {
-  return !isUnresolved(item);
-}
-
 /** Display labels kept next to the domain so list + inspector agree. */
 export const ATTENTION_KIND_LABELS: Record<AttentionKind, string> = {
   approval: "Approval",

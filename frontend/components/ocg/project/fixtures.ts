@@ -11,7 +11,6 @@ import {
   PROJECTS,
   type KnownProjectId,
   type ProjectId,
-  type ProjectSummary,
   selectProject,
 } from "./domain";
 
@@ -54,10 +53,6 @@ export const PROJECT_FIXTURES: Record<ProjectId, ProjectFixture> = {
   },
 };
 
-/** Canonical project lookup. Unknown values fall back to Zhuju. */
-export function findProject(value: unknown): ProjectSummary {
-  return selectProject(value);
-}
 
 export function projectFixture(id: ProjectId): ProjectFixture {
   return PROJECT_FIXTURES[selectProject(id).id as KnownProjectId];

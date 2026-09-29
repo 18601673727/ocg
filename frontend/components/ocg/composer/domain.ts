@@ -70,12 +70,6 @@ export function dispatchComposerIntent(
   }
 }
 
-/**
- * Converts raw composer text into a typed intent. `null` means "this resolver
- * does not recognize the input", so the deterministic parser remains the
- * fallback. No natural-language resolver is shipped yet.
- */
-export type ComposerIntentResolver = (input: string) => ComposerIntent | null;
 
 const MISSION_CREATE_PATTERN = /^\/mission\s+create(?:\s+([\s\S]*))?$/i;
 const MISSION_ONLY_PATTERN = /^\/mission\s*$/i;
@@ -120,13 +114,6 @@ export function parseComposerIntent(raw: string): ComposerIntent {
   };
 }
 
-/** Runs an optional future resolver first, then falls back to deterministic parsing. */
-export function resolveComposerIntent(
-  raw: string,
-  resolver?: ComposerIntentResolver,
-): ComposerIntent {
-  return resolver?.(raw) ?? parseComposerIntent(raw);
-}
 
 /* -------------------------------------------------------------------------- */
 /* Suggestions                                                                */

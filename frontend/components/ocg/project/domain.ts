@@ -59,20 +59,6 @@ export function resolveProjectParam(value: unknown): ProjectId | undefined {
   return resolveProjectId(value);
 }
 
-export function projectById(id: ProjectId): ProjectSummary {
-  return selectProject(id);
-}
-
-export type ProjectOption = ProjectSummary & {
-  active: boolean;
-};
-
-/** Switcher option list with exactly one active project. */
-export function projectOptions(activeProjectId: unknown): ProjectOption[] {
-  const active = resolveProjectId(activeProjectId);
-  return PROJECTS.map((project) => ({ ...project, active: project.id === active }));
-}
-
 /**
  * Accessible trigger label. Collapsed triggers are icon-only, so the label
  * carries the full active-project context for screen readers and tooltips.

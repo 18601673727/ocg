@@ -27,14 +27,6 @@ export type AttentionFilters = {
   source: AttentionSource | "all";
 };
 
-export const DEFAULT_ATTENTION_FILTERS: AttentionFilters = {
-  tab: "overview",
-  query: "",
-  kind: "all",
-  severity: "all",
-  source: "all",
-};
-
 export const ATTENTION_RESULT_LIMIT = 60;
 export const ATTENTION_HISTORY_LIMIT = 25;
 
@@ -131,29 +123,6 @@ export function selectAttentionSummary(items: AttentionItem[]): AttentionSummary
     high: unresolved.filter((item) => item.severity === "high").length,
     resolved: items.length - unresolved.length,
   };
-}
-
-export function selectSeverityCounts(items: AttentionItem[]): Record<AttentionSeverity, number> {
-  const counts: Record<AttentionSeverity, number> = { info: 0, warning: 0, high: 0, critical: 0 };
-  for (const item of items.filter(isUnresolved)) counts[item.severity] += 1;
-  return counts;
-}
-
-export function selectKindCounts(items: AttentionItem[]): Record<AttentionKind, number> {
-  const counts: Record<AttentionKind, number> = {
-    approval: 0,
-    budget: 0,
-    policy: 0,
-    permission: 0,
-    blocked: 0,
-    "runtime-failure": 0,
-    "resource-degraded": 0,
-    configuration: 0,
-    retry: 0,
-    escalation: 0,
-  };
-  for (const item of items.filter(isUnresolved)) counts[item.kind] += 1;
-  return counts;
 }
 
 function stableId(...parts: Array<string | undefined>): string {

@@ -10,14 +10,10 @@ import type { RuntimeSnapshot } from "../runtime/runtime-types";
 import type { ChatSession } from "../types";
 import type { AttentionItem } from "../attention/domain";
 import type { AttentionQueue } from "../attention/selectors";
-import type { ProjectId, ProjectSummary } from "./domain";
-import { resolveProjectId, selectProject } from "./domain";
+import type { ProjectId } from "./domain";
+import { resolveProjectId } from "./domain";
 import { projectLedgerMissionIds, projectSessionIds } from "./fixtures";
 
-/** Active project lookup with the deterministic Zhuju fallback. */
-export function selectActiveProject(projectId: unknown): ProjectSummary {
-  return selectProject(projectId);
-}
 
 /** Fixture session IDs for a project plus any registered extra session IDs. */
 export function selectProjectSessionIds(

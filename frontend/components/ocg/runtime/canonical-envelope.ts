@@ -483,11 +483,4 @@ export function toMissionExecution(
   };
 }
 
-/**
- * Whether the backend is currently allowed to accept pre-run Mission
- * configuration edits. Once any Run is dispatched the contract is frozen and
- * the PWA must present it as read-only rather than pretending to rewrite it.
- */
-export function isPreRunConfigurationMutable(projection: CanonicalWorkProjection): boolean {
-  return projection.runs.length === 0;
-}
+
