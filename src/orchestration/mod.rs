@@ -43,10 +43,13 @@ pub mod replay;
 pub mod state;
 
 pub use budget::{
-    admit as admit_spend, reservation_id, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
-    MissionBudget, MissionBudgetReceipt, Money, QuotaFacts, QuotaState, Reservation,
-    ReservationState, SpendAction, SpendAssessment, SpendBlock, SpendDecision, SpendRequest,
-    MAX_RESERVATIONS,
+    admit as admit_spend, conflict_settlement_id, reservation_id, settlement_id,
+    settlement_payload_digest, BillableUsage, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
+    MissionBudget, MissionBudgetReceipt, Money, PriceOutcome, PriceRefusal, PricingBasis,
+    QuotaFacts, QuotaState, Reservation, ReservationState, Settlement, SettlementDisposition,
+    SettlementEffect, SettlementVariance, SpendAction, SpendAssessment, SpendBlock, SpendDecision,
+    SpendRequest, TokenPrice, UsageRecord, UsageSource, MAX_RATE_MICROS_PER_MILLION,
+    MAX_RESERVATIONS, MAX_SETTLEMENTS, PRICE_WILDCARD, TOKENS_PER_PRICE_UNIT,
 };
 pub use canonical_control::{
     CanonicalConfigurationResponse, CanonicalControlService, CanonicalDashboardResponse,
@@ -75,10 +78,11 @@ pub use handoff::{
     Transition,
 };
 pub use journal::{
-    replay as replay_execution_events, ApplyOutcome, DependencyEdge, EventAuthority, EventDelta,
-    EventKind, ExecutionEvent, ExecutionProjection, ExecutionSnapshot, JobBinding, JournalBoundary,
-    JournalPrune, ReplayStatus, ResultEvidence, StoredJobConfiguration, StoredVerification,
-    AUTHORITY_ACTOR, INITIAL_CURSOR, JOURNAL_SCHEMA_VERSION, MAX_EVENT_READ,
+    replay as replay_execution_events, ApplyOutcome, BudgetLimitFact, DependencyEdge,
+    EventAuthority, EventDelta, EventKind, ExecutionEvent, ExecutionProjection, ExecutionSnapshot,
+    JobBinding, JournalBoundary, JournalPrune, ProjectAccounting, ReplayStatus, ReservationFact,
+    ResultEvidence, StoredJobConfiguration, StoredVerification, UsageEvidence, AUTHORITY_ACTOR,
+    INITIAL_CURSOR, JOURNAL_SCHEMA_VERSION, MAX_EVENT_READ,
 };
 pub use mission::{
     Mission, MissionEvent, MissionEventKind, MissionPolicyReceipt, MissionReconcileReceipt,

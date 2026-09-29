@@ -196,6 +196,9 @@ pub struct DispatchIntent {
     pub request: String,
     pub reservation_id: Option<String>,
     pub budget_admitted: bool,
+    /// The pricing basis frozen for this dispatch before the provider ran, and
+    /// the only pricing a settlement of this Call may consult.
+    pub pricing_basis: Option<budget::PricingBasis>,
     pub failure: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -206,6 +209,85 @@ pub struct AttemptAuthority {
     pub attempt_id: String,
     pub job_id: String,
     pub generation: u64,
+}
+
+/// The identity a settlement caller *claims*. It is verified against canonical
+/// state inside the accounting transaction, never trusted: the ledger decides
+/// whether this Attempt may still assert an amount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountingAuthority {
+    pub attempt_id: String,
+    pub generation: u64,
+}
+
+/// What one provider run established about a dispatched Call.
+///
+/// The three terminal shapes map onto the three accounting dispositions:
+///
+/// - `Completed` carries the provider-reported usage, if any. It becomes a
+///   `Settled` actual only when a canonical price values it; otherwise the
+///   reservation stays `Unresolved` and the usage is retained as evidence.
+/// - `NotDispatched` is a proof, not a guess: the request never left OCG, so the
+///   reservation is released in full.
+/// - `Failed` and `Fenced` are both "the effect may or may not have happened".
+///   Neither is ever optimistically released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchAccounting {
+    Completed(ProviderSettlement),
+    NotDispatched,
+    Failed,
+    Fenced,
+}
+
+impl DispatchAccounting {
+    /// The reason code this disposition books when nothing more specific applies.
+    fn default_reason(&self) -> &'static str {
+        match self {
+            Self::Completed { .. } => budget::REASON_ACTUAL_REPORTED,
+            Self::NotDispatched => budget::REASON_NOT_DISPATCHED,
+            Self::Failed | Self::Fenced => budget::REASON_EFFECT_UNKNOWN,
+        }
+    }
+}
+
+/// The result of applying one economic disposition to one reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountingOutcome {
+    /// True when a new accounting fact was committed. False means the
+    /// disposition was a duplicate and changed nothing at all.
+    pub recorded: bool,
+    pub disposition: budget::SettlementDisposition,
+    pub reason_code: String,
+    pub settlement_id: String,
+    /// The money movement, present exactly when `recorded` is true.
+    pub effect: Option<budget::SettlementEffect>,
+    /// False when a usage record was observed but not booked because the
+    /// reporting Attempt no longer held authority.
+    pub usage_authoritative: bool,
+}
+
+/// What a provider run reported when it completed a Call.
+///
+/// The route is deliberately absent: the pricing basis was frozen against the
+/// effective dispatched route before the provider ran, and a settlement values
+/// usage against that frozen basis rather than against whatever route the
+/// provider happened to name in its response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSettlement {
+    /// The provider-reported usage, in the provider's own idiom. `None` means
+    /// the provider stated nothing, which is an unknown actual and never a zero
+    /// one.
+    pub usage: Option<budget::UsageRecord>,
+    /// The same usage normalized into non-overlapping billable quantities by
+    /// the provider adapter, which is what the frozen price is applied to.
+    pub billable: Option<budget::BillableUsage>,
+}
+
+/// The canonical dispatch intent a settlement operates on, read inside the
+/// accounting transaction.
+struct AccountingTarget {
+    intent: DispatchIntent,
+    project_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -320,6 +402,10 @@ CREATE TABLE IF NOT EXISTS domain_dispatch_intents (
     request TEXT NOT NULL,
     reservation_id TEXT,
     budget_admitted INTEGER NOT NULL DEFAULT 0 CHECK(budget_admitted IN (0,1)),
+    -- The pricing basis frozen for this dispatch before the provider ran. It is
+    -- the only pricing a settlement of this Call may consult: the current
+    -- configuration is never re-resolved at completion time.
+    pricing_basis TEXT,
     failure TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -329,6 +415,25 @@ CREATE TABLE IF NOT EXISTS domain_budgets (
     budget TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS domain_settlements (
+    settlement_id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES domain_projects(id),
+    call_id TEXT NOT NULL REFERENCES domain_calls(id),
+    dispatch_intent_id TEXT REFERENCES domain_dispatch_intents(id),
+    attempt_id TEXT NOT NULL REFERENCES domain_attempts(id),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    disposition TEXT NOT NULL CHECK(disposition IN ('settled','released','unresolved')),
+    reason_code TEXT NOT NULL,
+    usage_authoritative INTEGER NOT NULL CHECK(usage_authoritative IN (0,1)),
+    -- The content digest of the settlement payload, so a re-delivery of the same
+    -- identity with different content is a conflict rather than a duplicate.
+    payload_digest TEXT NOT NULL DEFAULT '',
+    settlement TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS domain_settlements_by_reservation
+    ON domain_settlements(reservation_id,created_at);
 CREATE TABLE IF NOT EXISTS domain_result_evidence (
     call_id TEXT NOT NULL REFERENCES domain_calls(id),
     attempt_id TEXT NOT NULL REFERENCES domain_attempts(id),
@@ -421,6 +526,18 @@ impl DomainRepository {
             "domain_dispatch_intents",
             "budget_admitted",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &connection,
+            "domain_dispatch_intents",
+            "pricing_basis",
+            "TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "domain_settlements",
+            "payload_digest",
+            "TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(&connection, "domain_job_bindings", "attempt_id", "TEXT")?;
         connection.execute(
@@ -540,58 +657,57 @@ impl DomainRepository {
             job_configurations: all_job_configurations(view)?,
             result_evidence: all_result_evidence(view)?,
             verifications: all_verifications(view)?,
+            reservations: all_reservations(view)?,
+            settlements: all_settlements(view)?,
+            budget_limits: all_budget_limits(view)?,
+            usage_evidence: all_usage_evidence(view)?,
         };
         transaction.commit().map_err(sql)?;
         Ok(snapshot)
     }
 
     pub fn project_budget(&self, project_id: &str) -> Result<budget::MissionBudgetReceipt> {
-        let raw: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT budget FROM domain_budgets WHERE project_id=?1",
-                [project_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql)?;
-        let ledger = raw
-            .map(|raw| {
-                serde_json::from_str::<budget::MissionBudget>(&raw)
-                    .map_err(|error| invalid(&format!("invalid Project budget: {error}")))
-            })
-            .transpose()?
-            .unwrap_or_default();
-        Ok(ledger.receipt())
+        Ok(read_budget(&self.connection, project_id)?.receipt())
     }
 
+    /// The durable accounting facts recorded for one Project, newest last.
+    /// They are a read model of the ledger; the journal keeps the durable
+    /// evidence even after a bounded ledger entry is pruned.
+    pub fn project_settlements(&self, project_id: &str) -> Result<Vec<budget::Settlement>> {
+        query_all(
+            &self.connection,
+            "SELECT settlement FROM domain_settlements WHERE project_id=?1 ORDER BY created_at,settlement_id",
+            &[&project_id],
+            |row| {
+                let raw: String = row.get(0)?;
+                serde_json::from_str(&raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        raw.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            },
+        )
+    }
+
+    /// Set or replace the Project's hard budget: the only supported way past a
+    /// cap, and an explicit operator change rather than an approval.
+    ///
+    /// It is a Money mutation, so the limit that results is journalized in the
+    /// same commit that stored it.
     pub fn set_project_budget(&mut self, project_id: &str, amount: budget::Money) -> Result<bool> {
+        validate_id(project_id)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let raw: Option<String> = transaction
-            .query_row(
-                "SELECT budget FROM domain_budgets WHERE project_id=?1",
-                [project_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql)?;
-        let mut ledger = raw
-            .map(|raw| {
-                serde_json::from_str::<budget::MissionBudget>(&raw)
-                    .map_err(|error| invalid(&format!("invalid Project budget: {error}")))
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let mut ledger = read_budget(&transaction, project_id)?;
         let changed = ledger.set_hard_limit(amount, now())?;
-        let serialized =
-            serde_json::to_string(&ledger).map_err(|error| invalid(&error.to_string()))?;
-        transaction.execute(
-            "INSERT INTO domain_budgets(project_id,budget,updated_at) VALUES(?1,?2,?3) ON CONFLICT(project_id) DO UPDATE SET budget=excluded.budget,updated_at=excluded.updated_at",
-            params![project_id,serialized,now()],
-        ).map_err(sql)?;
+        store_budget(&transaction, project_id, &mut ledger)?;
+        if changed {
+            emit_budget_limit(&transaction, project_id, &ledger)?;
+        }
         transaction.commit().map_err(sql)?;
         Ok(changed)
     }
@@ -840,23 +956,10 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let mut budget = transaction
-            .query_row(
-                "SELECT budget FROM domain_budgets WHERE project_id=?1",
-                [project_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(sql)?
-            .map(|value| {
-                serde_json::from_str::<budget::MissionBudget>(&value).map_err(|error| {
-                    OcgError::config(format!("invalid canonical Project budget: {error}"))
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let materialized = budget.materialize_config(config);
-        let existing = budget
+        let before = read_dispatch_intent_by_call(&transaction, operation_id)?;
+        let mut ledger = read_budget(&transaction, project_id)?;
+        let materialized = ledger.materialize_config(config);
+        let existing = ledger
             .reservation_for(
                 SpendAction::ProviderDispatch,
                 project_id,
@@ -872,11 +975,9 @@ impl DomainRepository {
             quota,
             already_reserved: existing.is_some(),
         };
-        let mut assessment = budget::admit(&budget, config.require_quota, &request);
-        let mut changed = materialized;
-        if let Some(reservation_id) = existing {
-            assessment.reservation_id = Some(reservation_id);
-        }
+        let mut assessment = budget::admit(&ledger, config.require_quota, &request);
+        let mut reserved_id = existing;
+        let mut recorded_reservation = false;
         if assessment.is_allowed() {
             if let Some(amount) = assessment.amount.clone() {
                 let reservation_id = budget::reservation_id(
@@ -885,7 +986,7 @@ impl DomainRepository {
                     generation_i32,
                     operation_id,
                 );
-                changed |= budget.reserve(
+                recorded_reservation = ledger.reserve(
                     SpendAction::ProviderDispatch,
                     project_id,
                     generation_i32,
@@ -893,31 +994,77 @@ impl DomainRepository {
                     amount,
                     now(),
                 );
-                assessment.reservation_id = Some(reservation_id);
+                assessment.reservation_id = Some(reservation_id.clone());
+                reserved_id = Some(reservation_id);
             }
         }
-        let reason_changed = budget.reason.as_deref() != Some(assessment.reason_code.as_str());
-        budget.reason = Some(assessment.reason_code.clone());
-        changed |= reason_changed;
-        if changed {
-            transaction
-                .execute(
-                    "INSERT INTO domain_budgets(project_id,budget,updated_at) VALUES(?1,?2,?3) ON CONFLICT(project_id) DO UPDATE SET budget=excluded.budget,updated_at=excluded.updated_at",
-                    params![project_id, serde_json::to_string(&budget).map_err(|error| OcgError::config(format!("serialize canonical Project budget: {error}")))?, now()],
-                )
-                .map_err(sql)?;
-        }
+        let reason_changed = ledger.reason.as_deref() != Some(assessment.reason_code.as_str());
+        ledger.reason = Some(assessment.reason_code.clone());
+        let mut changed = materialized || reason_changed || recorded_reservation;
         if assessment.is_allowed() {
             let attached = transaction
                 .execute(
-                    "UPDATE domain_dispatch_intents SET reservation_id=?2,budget_admitted=1,updated_at=?3 WHERE call_id=?1 AND state='pending'",
+                    "UPDATE domain_dispatch_intents SET reservation_id=?2,budget_admitted=1,updated_at=?3 WHERE call_id=?1 AND state IN ('pending','queued')",
                     params![operation_id, assessment.reservation_id.as_deref(), now()],
                 )
                 .map_err(sql)?;
-            if attached != 1 {
-                return Err(invalid(
-                    "canonical dispatch intent disappeared during budget admission",
-                ));
+            if attached == 0 {
+                // A replay of an already-admitted dispatch carries the very same
+                // reservation. Anything else means the intent has already moved
+                // past admission, and the reservation must not be left dangling.
+                let current = read_dispatch_intent_by_call(&transaction, operation_id)?
+                    .ok_or_else(|| {
+                        invalid("canonical dispatch intent disappeared during budget admission")
+                    })?;
+                if current.reservation_id.as_deref() != assessment.reservation_id.as_deref() {
+                    return Err(invalid(
+                        "canonical dispatch intent is no longer budget-admittable",
+                    ));
+                }
+            } else {
+                changed = true;
+            }
+        }
+        if changed {
+            store_budget(&transaction, project_id, &mut ledger)?;
+            // Every admission that moved the durable budget leaves one fact
+            // behind: a cap that was materialized, a reservation that was taken,
+            // or a reason that changed. A denied admission is recorded too, so
+            // "the budget refused this" is reconstructable and not just absent.
+            emit_budget_limit(&transaction, project_id, &ledger)?;
+        }
+        let current =
+            read_dispatch_intent_by_call(&transaction, operation_id)?.ok_or_else(|| {
+                invalid("canonical dispatch intent disappeared during budget admission")
+            })?;
+        // The intent acquiring the reservation is the root fact; the money it now
+        // holds is caused by it in the same commit, so no reader can observe a
+        // held reservation whose operation is unrecorded.
+        let mut root = None;
+        if before.as_ref() != Some(&current) {
+            root = Some(emit_dispatch_intent(
+                &transaction,
+                EventKind::DispatchIntentUpdated,
+                &current,
+                None,
+            )?);
+        }
+        if recorded_reservation {
+            if let Some(reservation) = ledger
+                .reservations
+                .iter()
+                .find(|reservation| Some(&reservation.reservation_id) == reserved_id.as_ref())
+            {
+                emit_reservation(
+                    &transaction,
+                    &journal::ReservationFact {
+                        project_id: project_id.to_string(),
+                        call_id: operation_id.to_string(),
+                        reservation: reservation.clone(),
+                    },
+                    &current,
+                    root,
+                )?;
             }
         }
         transaction.commit().map_err(sql)?;
@@ -926,13 +1073,18 @@ impl DomainRepository {
 
     /// Associate a budget reservation with its durable dispatch intent. This
     /// is idempotent so a retry cannot create a second economic obligation.
+    ///
+    /// It is a change to the intent's economic identity, so it is journalized
+    /// with the intent in one commit.
     pub fn attach_dispatch_reservation(
         &mut self,
         call_id: &str,
         reservation_id: Option<&str>,
     ) -> Result<()> {
-        let changed = self
-            .connection
+        let transaction = self.begin()?;
+        let before = read_dispatch_intent_by_call(&transaction, call_id)?
+            .ok_or_else(|| invalid("dispatch intent is no longer attachable"))?;
+        let changed = transaction
             .execute(
                 "UPDATE domain_dispatch_intents SET reservation_id=?2,budget_admitted=1,updated_at=?3 WHERE call_id=?1 AND state IN ('pending','queued')",
                 params![call_id, reservation_id, now()],
@@ -941,12 +1093,20 @@ impl DomainRepository {
         if changed != 1 {
             return Err(invalid("dispatch intent is no longer attachable"));
         }
+        let after = read_dispatch_intent_by_call(&transaction, call_id)?
+            .ok_or_else(|| invalid("dispatch intent is no longer attachable"))?;
+        if after != before {
+            emit_dispatch_intent(&transaction, EventKind::DispatchIntentUpdated, &after, None)?;
+        }
+        transaction.commit().map_err(sql)?;
         Ok(())
     }
 
     pub fn mark_budget_admitted(&mut self, call_id: &str) -> Result<()> {
-        let changed = self
-            .connection
+        let transaction = self.begin()?;
+        let before = read_dispatch_intent_by_call(&transaction, call_id)?
+            .ok_or_else(|| invalid("dispatch intent is no longer budget-admittable"))?;
+        let changed = transaction
             .execute(
                 "UPDATE domain_dispatch_intents SET budget_admitted=1,updated_at=?2 WHERE call_id=?1 AND state IN ('pending','queued')",
                 params![call_id, now()],
@@ -955,68 +1115,173 @@ impl DomainRepository {
         if changed != 1 {
             return Err(invalid("dispatch intent is no longer budget-admittable"));
         }
+        let after = read_dispatch_intent_by_call(&transaction, call_id)?
+            .ok_or_else(|| invalid("dispatch intent is no longer budget-admittable"))?;
+        if after != before {
+            emit_dispatch_intent(&transaction, EventKind::DispatchIntentUpdated, &after, None)?;
+        }
+        transaction.commit().map_err(sql)?;
         Ok(())
     }
 
-    /// Apply the terminal economic disposition exactly once. Unknown or
-    /// provider-started work remains reserved as unresolved; only work proven
-    /// not dispatched is released.
-    pub fn settle_dispatch_budget(&mut self, call_id: &str, outcome: &str) -> Result<()> {
-        if !matches!(
-            outcome,
-            "completed" | "failed" | "fenced" | "not_dispatched"
-        ) {
-            return Err(invalid("invalid dispatch budget outcome"));
-        }
-        let (project_id, generation, reservation_id): (String, i64, Option<String>) = self
+    /// Freeze the pricing basis for one dispatch, durably, before the provider
+    /// is asked to do anything.
+    ///
+    /// This is the only moment pricing is resolved for a Call. The basis names
+    /// the route that was actually dispatched — which is what the price is
+    /// resolved against — and records the price and the revision it came from.
+    /// From here on a settlement of this Call values usage against the frozen
+    /// basis and nothing else: the current configuration is never consulted at
+    /// completion time, so a later pricing revision cannot reprice a dispatch
+    /// that already happened.
+    ///
+    /// It is idempotent per Call: the first freeze wins, and a second call for
+    /// the same Call is a no-op rather than a re-pricing. A Call that was
+    /// admitted before this existed simply has no basis, and its settlement
+    /// reports that instead of inventing one.
+    ///
+    /// Returns `false` when the Call has no dispatch intent that can still be
+    /// frozen, which the caller must treat as "do not dispatch".
+    pub fn freeze_dispatch_pricing(
+        &mut self,
+        call_id: &str,
+        basis: &budget::PricingBasis,
+    ) -> Result<bool> {
+        let transaction = self
             .connection
-            .query_row(
-                "SELECT j.project_id,i.generation,i.reservation_id FROM domain_dispatch_intents i JOIN domain_jobs j ON j.id=i.job_id WHERE i.call_id=?1",
-                [call_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let Some(reservation_id) = reservation_id else {
-            return Ok(());
-        };
-        let mut budget = self
-            .connection
+        // The first freeze wins. A retry of the same dispatch finds the basis
+        // already there and proceeds with it rather than re-pricing the Call.
+        let existing: Option<Option<String>> = transaction
             .query_row(
-                "SELECT budget FROM domain_budgets WHERE project_id=?1",
-                [&project_id],
-                |row| row.get::<_, String>(0),
+                "SELECT pricing_basis FROM domain_dispatch_intents WHERE call_id=?1",
+                [call_id],
+                |row| row.get::<_, Option<String>>(0),
             )
             .optional()
-            .map_err(sql)?
-            .map(|value| {
-                serde_json::from_str::<budget::MissionBudget>(&value).map_err(|error| {
-                    OcgError::config(format!("invalid canonical Project budget: {error}"))
-                })
-            })
-            .transpose()?
-            .ok_or_else(|| invalid("dispatch reservation budget disappeared"))?;
-        let changed = match outcome {
-            "completed" => budget.settle(&reservation_id, None, now())?,
-            "not_dispatched" => budget.release(&reservation_id, now()),
-            "failed" | "fenced" => budget.mark_unresolved(&reservation_id, now()),
-            _ => unreachable!(),
-        };
-        if changed {
-            self.connection
-                .execute(
-                    "UPDATE domain_budgets SET budget=?2,updated_at=?3 WHERE project_id=?1",
-                    params![
-                        project_id,
-                        serde_json::to_string(&budget).map_err(|error| OcgError::config(
-                            format!("serialize canonical Project budget: {error}")
-                        ))?,
-                        now()
-                    ],
-                )
-                .map_err(sql)?;
+            .map_err(sql)?;
+        if existing.flatten().is_some() {
+            transaction.commit().map_err(sql)?;
+            return Ok(true);
         }
-        let _ = generation;
-        Ok(())
+        let changed = transaction
+            .execute(
+                "UPDATE domain_dispatch_intents SET pricing_basis=?2,updated_at=?3 WHERE call_id=?1 AND state IN ('pending','queued') AND pricing_basis IS NULL",
+                params![
+                    call_id,
+                    serde_json::to_string(basis)
+                        .map_err(|error| invalid(&format!("serialize pricing basis: {error}")))?,
+                    now()
+                ],
+            )
+            .map_err(sql)?;
+        if changed != 1 {
+            // No dispatch intent can still be frozen: it has already moved past
+            // admission, so the caller must not dispatch it.
+            transaction.commit().map_err(sql)?;
+            return Ok(false);
+        }
+        let after = read_dispatch_intent_by_call(&transaction, call_id)?
+            .ok_or_else(|| invalid("dispatch intent disappeared during pricing freeze"))?;
+        emit_dispatch_intent(&transaction, EventKind::DispatchIntentUpdated, &after, None)?;
+        transaction.commit().map_err(sql)?;
+        Ok(true)
+    }
+
+    /// Read the pricing basis frozen for one Call, if one was frozen.
+    ///
+    /// This is the only pricing a settlement of the Call may consult. It is
+    /// exposed so the provider adapter can normalize the provider's reported
+    /// counters against the same price the settlement will apply, which keeps
+    /// the quantities it bills and the price that bills them from ever coming
+    /// from different revisions.
+    pub fn dispatch_pricing_basis(&self, call_id: &str) -> Result<Option<budget::PricingBasis>> {
+        let found: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT pricing_basis FROM domain_dispatch_intents WHERE call_id=?1",
+                [call_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some(raw) = found.flatten() else {
+            return Ok(None);
+        };
+        let basis = serde_json::from_str(&raw)
+            .map_err(|error| invalid(&format!("invalid frozen pricing basis: {error}")))?;
+        Ok(Some(basis))
+    }
+
+    /// Apply exactly one economic disposition to one dispatched Call.
+    ///
+    /// This is the single accounting entry point. Every path that ends a
+    /// provider-costly dispatch — completion with usage, a failure, a
+    /// disconnect, a fence, a late result, an attempt terminal transition —
+    /// reaches the ledger through it, so they cannot drift into different
+    /// meanings for `reserved`, `actual`, `released` and `unresolved`.
+    ///
+    /// The Money mutation, the durable settlement row and the journal accounting
+    /// facts all commit in the caller's single immediate transaction, so money
+    /// can never move without exactly one durable record of what moved.
+    ///
+    /// Pricing is never resolved here. The usage is valued against the basis
+    /// frozen for the dispatch before the provider ran, so the canonical Money
+    /// for a Call cannot depend on the pricing configuration that happens to
+    /// exist when the provider reports back.
+    pub fn settle_dispatch_accounting(
+        &mut self,
+        call_id: &str,
+        claim: &AccountingAuthority,
+        accounting: &DispatchAccounting,
+    ) -> Result<AccountingOutcome> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let target = read_accounting_target(&transaction, call_id)?
+            .ok_or_else(|| invalid("no durable dispatch intent exists for this Call"))?;
+        let outcome = apply_accounting_in(&transaction, &target, claim, accounting, None)?;
+        transaction.commit().map_err(sql)?;
+        Ok(outcome)
+    }
+
+    /// Complete a provider Call and settle its reservation in one transaction.
+    ///
+    /// The Call's canonical completion, the dispatch intent's terminal state and
+    /// the Money settlement are one commit: there is no window in which a Call
+    /// is durably complete but its spend is neither reserved nor settled. A
+    /// stale Attempt fails the completion, so it can never book an actual.
+    pub fn complete_provider_dispatch(
+        &mut self,
+        call_id: &str,
+        claim: &AccountingAuthority,
+        response: &str,
+        reported: &ProviderSettlement,
+    ) -> Result<AccountingOutcome> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let root = finish_call_in(
+            &transaction,
+            call_id,
+            &claim.attempt_id,
+            claim.generation,
+            response,
+        )?;
+        let target = read_accounting_target(&transaction, call_id)?
+            .ok_or_else(|| invalid("no durable dispatch intent exists for this Call"))?;
+        let outcome = apply_accounting_in(
+            &transaction,
+            &target,
+            claim,
+            &DispatchAccounting::Completed(reported.clone()),
+            root,
+        )?;
+        transaction.commit().map_err(sql)?;
+        Ok(outcome)
     }
 
     pub fn jobs(&self, project_id: &str) -> Result<Vec<Job>> {
@@ -2611,7 +2876,7 @@ impl DomainRepository {
     /// handing each row back to the bounded dispatcher.
     pub fn pending_dispatch_intents(&self) -> Result<Vec<DispatchIntent>> {
         let mut statement = self.connection.prepare(
-            "SELECT id,call_id,job_id,attempt_id,executor_id,generation,state,effect_kind,effect_state,request,reservation_id,budget_admitted,failure,created_at,updated_at FROM domain_dispatch_intents WHERE state IN ('pending','queued','running') ORDER BY created_at,id"
+            "SELECT id,call_id,job_id,attempt_id,executor_id,generation,state,effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,failure,created_at,updated_at FROM domain_dispatch_intents WHERE state IN ('pending','queued','running') ORDER BY created_at,id"
         ).map_err(sql)?;
         let rows = statement
             .query_map([], |row| {
@@ -2635,9 +2900,19 @@ impl DomainRepository {
                     request: row.get(9)?,
                     reservation_id: row.get(10)?,
                     budget_admitted: row.get(11)?,
-                    failure: row.get(12)?,
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
+                    pricing_basis: match row.get::<_, Option<String>>(12)? {
+                        Some(raw) => Some(serde_json::from_str(&raw).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                raw.len(),
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?),
+                        None => None,
+                    },
+                    failure: row.get(13)?,
+                    created_at: row.get(14)?,
+                    updated_at: row.get(15)?,
                 })
             })
             .map_err(sql)?;
@@ -2713,6 +2988,11 @@ impl DomainRepository {
                     Some(root),
                 )?;
             }
+            // Fencing is also the moment the reservation stops being a live
+            // expectation: the money may or may not have been spent, so it is
+            // retained and marked unresolved in the same commit. Nothing here
+            // can release it.
+            apply_fenced_accounting_in(&transaction, call_id, Some(root))?;
         }
         transaction.commit().map_err(sql)
     }
@@ -3117,6 +3397,131 @@ fn emit_verification(
     )
 }
 
+/// The Project budget's durable accounting state, journalized whenever it moves:
+/// a cap that was materialized or explicitly set, a reservation taken, or an
+/// admission that changed the reason. A reader can reconstruct what the cap and
+/// the rollups were at any cursor, and can never treat the event as the cap
+/// itself.
+fn emit_budget_limit(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    ledger: &budget::MissionBudget,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(
+            EventKind::BudgetLimitSet,
+            "budget_limit",
+            project_id,
+            journal::value(&journal::BudgetLimitFact {
+                project_id: project_id.to_string(),
+                hard_limit: ledger.hard_limit.clone(),
+                origin: ledger.origin,
+                status: ledger.status,
+                currency: ledger.currency.clone(),
+                settled_micros: ledger.settled.micros,
+                reserved_micros: ledger.reserved.micros,
+                unresolved_micros: ledger.unresolved.micros,
+                reason: ledger.reason.clone(),
+                updated_at: ledger.updated_at,
+            })?,
+        )
+        .project(project_id)
+        .causation_key(project_id),
+    )
+}
+
+/// A reservation's post-state, scoped to the Attempt that holds the authority
+/// over the operation it was taken for.
+fn emit_reservation(
+    transaction: &rusqlite::Transaction<'_>,
+    fact: &journal::ReservationFact,
+    intent: &DispatchIntent,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    let kind = match fact.reservation.state {
+        budget::ReservationState::Reserved => EventKind::BudgetReservationRecorded,
+        budget::ReservationState::Settled => EventKind::BudgetSettled,
+        budget::ReservationState::Released => EventKind::BudgetReservationReleased,
+    };
+    journal::append(
+        transaction,
+        EventDraft::new(
+            kind,
+            "reservation",
+            &fact.reservation.reservation_id,
+            journal::value(fact)?,
+        )
+        .project(&fact.project_id)
+        .job(&intent.job_id)
+        .attempt_scope(&intent.attempt_id, &intent.job_id, intent.generation)
+        .executor(intent.executor_id.as_deref())
+        .call(Some(&intent.call_id))
+        .dispatch_intent(Some(&intent.id))
+        .causation_key(&fact.reservation.reservation_id)
+        .caused_by_opt(caused_by),
+    )
+}
+
+/// One accounting fact: how a reservation was discharged, from which usage, at
+/// which price, under which authority.
+fn emit_settlement(
+    transaction: &rusqlite::Transaction<'_>,
+    settlement: &budget::Settlement,
+    intent: &DispatchIntent,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    let kind = match settlement.disposition {
+        budget::SettlementDisposition::Settled => EventKind::BudgetSettled,
+        budget::SettlementDisposition::Released => EventKind::BudgetReservationReleased,
+        budget::SettlementDisposition::Unresolved => EventKind::BudgetUnresolved,
+    };
+    journal::append(
+        transaction,
+        EventDraft::new(
+            kind,
+            "settlement",
+            &settlement.settlement_id,
+            journal::value(settlement)?,
+        )
+        .project(&settlement.project_id)
+        .job(&intent.job_id)
+        .attempt_scope(&intent.attempt_id, &intent.job_id, intent.generation)
+        .executor(intent.executor_id.as_deref())
+        .call(Some(&settlement.call_id))
+        .dispatch_intent(settlement.dispatch_intent_id.as_deref())
+        .causation_key(&settlement.settlement_id)
+        .caused_by_opt(caused_by),
+    )
+}
+
+/// A usage record that was observed but not booked. It is evidence that a spend
+/// happened, and it deliberately asserts no Money.
+fn emit_usage_evidence(
+    transaction: &rusqlite::Transaction<'_>,
+    evidence: &journal::UsageEvidence,
+    intent: &DispatchIntent,
+    caused_by: Option<u64>,
+) -> Result<u64> {
+    journal::append(
+        transaction,
+        EventDraft::new(
+            EventKind::BudgetUsageRetained,
+            "usage_evidence",
+            &evidence.call_id,
+            journal::value(evidence)?,
+        )
+        .project(&evidence.project_id)
+        .job(&intent.job_id)
+        .attempt_scope(&evidence.attempt_id, &intent.job_id, evidence.generation)
+        .executor(intent.executor_id.as_deref())
+        .call(Some(&evidence.call_id))
+        .dispatch_intent(evidence.dispatch_intent_id.as_deref())
+        .causation_key(&evidence.call_id)
+        .caused_by_opt(caused_by),
+    )
+}
+
 // -------------------------------------------------------------------------
 // Row mapping and bulk readers
 //
@@ -3182,14 +3587,24 @@ fn dispatch_intent_from_row(row: &Row<'_>) -> rusqlite::Result<DispatchIntent> {
         request: row.get(9)?,
         reservation_id: row.get(10)?,
         budget_admitted: row.get(11)?,
-        failure: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        pricing_basis: match row.get::<_, Option<String>>(12)? {
+            Some(raw) => Some(serde_json::from_str(&raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    raw.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?),
+            None => None,
+        },
+        failure: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
 const DISPATCH_INTENT_COLUMNS: &str = "id,call_id,job_id,attempt_id,executor_id,generation,state,\
-effect_kind,effect_state,request,reservation_id,budget_admitted,failure,created_at,updated_at";
+effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,failure,created_at,updated_at";
 
 fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
     let state: String = row.get(3)?;
@@ -3381,6 +3796,623 @@ fn read_dispatch_intent_by_call(
         )
         .optional()
         .map_err(sql)
+}
+
+// -------------------------------------------------------------------------
+// Canonical Money accounting
+//
+// The Project budget row is the only budget authority. Every movement of money
+// goes through `apply_accounting_in`, which is called from inside the writer
+// transaction that made the corresponding execution change, so the Money
+// mutation, its durable settlement row and its journal facts are one commit.
+// -------------------------------------------------------------------------
+
+fn read_budget(connection: &Connection, project_id: &str) -> Result<budget::MissionBudget> {
+    let raw: Option<String> = connection
+        .query_row(
+            "SELECT budget FROM domain_budgets WHERE project_id=?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    raw.map(|raw| {
+        serde_json::from_str::<budget::MissionBudget>(&raw)
+            .map_err(|error| invalid(&format!("invalid canonical Project budget: {error}")))
+    })
+    .transpose()
+    .map(|ledger| ledger.unwrap_or_default())
+}
+
+fn store_budget(
+    connection: &Connection,
+    project_id: &str,
+    ledger: &mut budget::MissionBudget,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO domain_budgets(project_id,budget,updated_at) VALUES(?1,?2,?3) ON CONFLICT(project_id) DO UPDATE SET budget=excluded.budget,updated_at=excluded.updated_at",
+        params![
+            project_id,
+            serde_json::to_string(ledger)
+                .map_err(|error| invalid(&format!("serialize canonical Project budget: {error}")))?,
+            now()
+        ],
+    ).map_err(sql)?;
+    Ok(())
+}
+
+/// Resolve the intent a settlement operates on, together with the Project that
+/// owns its budget. Project is the budget authority scope: there is no Mission
+/// budget that could authorize or account for a provider Call.
+fn read_accounting_target(
+    connection: &Connection,
+    call_id: &str,
+) -> Result<Option<AccountingTarget>> {
+    let Some(intent) = read_dispatch_intent_by_call(connection, call_id)? else {
+        return Ok(None);
+    };
+    let project_id: String = connection
+        .query_row(
+            "SELECT project_id FROM domain_jobs WHERE id=?1",
+            [&intent.job_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    Ok(Some(AccountingTarget { intent, project_id }))
+}
+
+/// Whether the Attempt an intent was admitted under is still the Job's single
+/// authority. This is read from canonical state, never from the caller's claim.
+fn attempt_holds_authority(connection: &Connection, intent: &DispatchIntent) -> Result<bool> {
+    let generation = i64::try_from(intent.generation)
+        .map_err(|_| invalid("Attempt generation exceeds SQLite range"))?;
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE a.id=?1 AND a.generation=?2 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id)",
+            params![intent.attempt_id, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql)
+}
+
+/// Whether the reporting caller is the Attempt the reservation belongs to, and
+/// that Attempt is still the Job's authority.
+///
+/// A caller that fails either test is stale. It may still *retain* a
+/// reservation — that only makes the budget stricter — but it may never assert
+/// an actual or hand money back, because both assert a fact about the world only
+/// the current authority is allowed to state.
+fn settlement_may_assert(
+    connection: &Connection,
+    target: &AccountingTarget,
+    claim: &AccountingAuthority,
+) -> Result<bool> {
+    Ok(claim.attempt_id == target.intent.attempt_id
+        && claim.generation == target.intent.generation
+        && attempt_holds_authority(connection, &target.intent)?)
+}
+
+/// Apply one economic disposition to one reservation, and journal everything it
+/// produces, inside the caller's writer transaction.
+///
+/// Three independent guards keep the ledger honest:
+///
+/// 1. The reservation's own state. A terminal reservation discharges nothing and
+///    can never be charged again.
+/// 2. The durable settlement row. Its id is deterministic over the reservation,
+///    the authority, the disposition and the reason, so the same fact delivered
+///    twice — a duplicated provider result, a retried settlement, a replayed
+///    commit — is dropped even after the bounded reservation ledger has pruned
+///    the entry.
+/// 3. The payload digest of that row. Identity is not equality: the same id can
+///    arrive carrying different content, and that is a conflict that must never
+///    be booked, replaced, or silently dropped as a duplicate.
+///
+/// Pricing is never resolved here. The usage is valued against the basis frozen
+/// for the dispatch before the provider ran, so the canonical Money for a Call
+/// cannot depend on the pricing configuration that happens to exist when the
+/// provider reports back.
+#[allow(clippy::too_many_lines)]
+fn apply_accounting_in(
+    transaction: &rusqlite::Transaction<'_>,
+    target: &AccountingTarget,
+    claim: &AccountingAuthority,
+    accounting: &DispatchAccounting,
+    caused_by: Option<u64>,
+) -> Result<AccountingOutcome> {
+    let timestamp = now();
+    let mut ledger = read_budget(transaction, &target.project_id)?;
+    let may_assert = settlement_may_assert(transaction, target, claim)?;
+    let mut usage: Option<budget::UsageRecord> = None;
+    let mut billable: Option<budget::BillableUsage> = None;
+    let mut price_fact: Option<budget::TokenPrice> = None;
+    let mut actual: Option<budget::Money> = None;
+    let mut disposition = budget::SettlementDisposition::Unresolved;
+    let mut reason_code = accounting.default_reason().to_string();
+    match accounting {
+        DispatchAccounting::Completed(reported) => match &reported.usage {
+            Some(record) => {
+                usage = Some(record.clone());
+                billable = reported.billable.clone();
+                // The frozen basis is the only pricing this Call may be valued
+                // against. It was resolved against the effective dispatched
+                // route before the provider ran, so neither a later pricing
+                // revision nor a route the provider happened to name in its
+                // response can change what this usage is worth.
+                let basis = target.intent.pricing_basis.as_ref();
+                let price = basis.and_then(|basis| basis.price.as_ref());
+                let outcome = match basis {
+                    // No basis was frozen for this dispatch at all, which is a
+                    // fact about the dispatch: a price configured later does not
+                    // value this Call.
+                    None => budget::PriceOutcome::Unpriced(budget::PriceRefusal {
+                        reason_code: budget::REASON_USAGE_UNPRICED,
+                        reason: "no pricing basis was frozen for this dispatch, so the reservation is retained rather than valued from a guess".to_string(),
+                    }),
+                    Some(basis) => match basis.price.as_ref() {
+                        None => budget::PriceOutcome::Unpriced(budget::PriceRefusal {
+                            reason_code: budget::REASON_USAGE_UNPRICED,
+                            reason: format!(
+                                "no price for {}/{} was frozen for this dispatch, so the reservation is retained rather than valued from a guess",
+                                basis.effective_provider, basis.effective_model
+                            ),
+                        }),
+                        Some(price) => match billable.as_ref() {
+                            Some(billable) => price.price_usage(billable, &ledger.currency),
+                            // The provider stated usage but the adapter could not
+                            // normalize it into billable quantities. That is an
+                            // unknown component, not a zero one.
+                            None => budget::PriceOutcome::Unpriced(budget::PriceRefusal {
+                                reason_code: budget::REASON_USAGE_INCOMPLETE,
+                                reason: format!(
+                                    "the usage reported for {}/{} could not be normalized into billable quantities, so the actual would be a guess",
+                                    basis.effective_provider, basis.effective_model
+                                ),
+                            }),
+                        },
+                    },
+                };
+                match outcome {
+                    budget::PriceOutcome::Priced(money) => {
+                        actual = Some(money);
+                        disposition = budget::SettlementDisposition::Settled;
+                        price_fact = price.cloned();
+                    }
+                    budget::PriceOutcome::Unpriced(refusal) => {
+                        reason_code = refusal.reason_code.to_string();
+                    }
+                }
+            }
+            // The provider finished the call but stated no usage. The spend is
+            // real and its amount is unknown, so the reservation is retained in
+            // full rather than settled at a fabricated number.
+            None => reason_code = budget::REASON_USAGE_ABSENT.to_string(),
+        },
+        DispatchAccounting::NotDispatched => {
+            disposition = budget::SettlementDisposition::Released;
+        }
+        DispatchAccounting::Failed | DispatchAccounting::Fenced => {}
+    }
+    if !may_assert && disposition.asserts_actual() {
+        // Downgrade, never upgrade: a losing authority can retain money but
+        // never assert or return it.
+        if actual.is_some() {
+            reason_code = budget::REASON_STALE_AUTHORITY.to_string();
+        } else {
+            reason_code = budget::REASON_RELEASE_UNAUTHORIZED.to_string();
+        }
+        disposition = budget::SettlementDisposition::Unresolved;
+        actual = None;
+        price_fact = None;
+    }
+    let usage_authoritative = may_assert && actual.is_some();
+    let Some(reservation_id) = target.intent.reservation_id.clone() else {
+        return Ok(AccountingOutcome {
+            recorded: false,
+            disposition,
+            reason_code: budget::REASON_NO_RESERVATION.to_string(),
+            settlement_id: String::new(),
+            effect: None,
+            usage_authoritative: false,
+        });
+    };
+    let settlement_id = budget::settlement_id(
+        &reservation_id,
+        &target.intent.attempt_id,
+        target.intent.generation,
+        disposition,
+        &reason_code,
+    );
+    // Guard 2 and 3: the durable settlement row decides whether this fact is new,
+    // a duplicate, or a conflict. The writer holds the single-writer lock for
+    // this whole immediate transaction, so reading the row and then acting on it
+    // is atomic against any other accounting writer. This runs before the
+    // reservation-state guard below, because a re-delivered fact for an
+    // already-discharged reservation is exactly where a conflicting payload
+    // would otherwise be mistaken for an ordinary duplicate.
+    let existing: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT payload_digest,settlement FROM domain_settlements WHERE settlement_id=?1",
+            [&settlement_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql)?;
+    if let Some((stored_digest, stored_raw)) = existing {
+        // The candidate carries the effect this fact *would* have booked, so a
+        // re-delivery compares equal to the settlement it repeats even after the
+        // reservation has gone terminal and can no longer be re-derived from
+        // the ledger. The reserved amount comes from the ledger when the entry
+        // is still there and from the recorded settlement when it is not.
+        let stored: budget::Settlement = serde_json::from_str(&stored_raw)
+            .map_err(|error| invalid(&format!("invalid recorded settlement: {error}")))?;
+        let reserved = ledger
+            .reservations
+            .iter()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+            .map(|reservation| reservation.amount.clone())
+            .unwrap_or_else(|| stored.effect.reserved.clone());
+        let candidate = budget::Settlement {
+            settlement_id: settlement_id.clone(),
+            reservation_id: reservation_id.clone(),
+            project_id: target.project_id.clone(),
+            call_id: target.intent.call_id.clone(),
+            dispatch_intent_id: Some(target.intent.id.clone()),
+            attempt_id: target.intent.attempt_id.clone(),
+            generation: target.intent.generation,
+            disposition,
+            pricing: price_fact.clone(),
+            usage: usage.clone(),
+            billable: billable.clone(),
+            payload_digest: String::new(),
+            effect: budget::SettlementEffect::for_discharge(
+                disposition,
+                actual.as_ref(),
+                &reserved,
+            ),
+            reason_code: reason_code.clone(),
+            usage_authoritative,
+            created_at: timestamp,
+        };
+        let candidate_digest = budget::settlement_payload_digest(&candidate);
+        if stored_digest == candidate_digest {
+            // The same fact, delivered twice. No money moves, nothing is
+            // journalized.
+            return Ok(AccountingOutcome {
+                recorded: false,
+                disposition,
+                reason_code,
+                settlement_id,
+                effect: None,
+                usage_authoritative,
+            });
+        }
+        // Same identity, different content. This is not a duplicate: the two
+        // payloads disagree about what actually happened, and neither may
+        // replace the other. The conflicting payload is retained as evidence
+        // under its own idempotent id and asserts no Money, so the canonical
+        // settlement and the reservation it discharged are untouched.
+        return record_settlement_conflict(
+            transaction,
+            target,
+            &candidate,
+            &candidate_digest,
+            caused_by,
+        );
+    }
+    // A terminal reservation can never be charged again. A live one is
+    // discharged, and whether the same fact has already been recorded is decided
+    // by the durable settlement id above rather than by the unresolved flag, so
+    // a later fact carrying new information still gets its own record.
+    let live_reservation = ledger
+        .reservations
+        .iter()
+        .find(|reservation| reservation.reservation_id == reservation_id)
+        .filter(|reservation| reservation.state == budget::ReservationState::Reserved)
+        .cloned();
+    let Some(reserved_entry) = live_reservation else {
+        // Already settled or released: a duplicate changes nothing at all. No
+        // money moves and nothing is journalized.
+        return Ok(AccountingOutcome {
+            recorded: false,
+            disposition,
+            reason_code,
+            settlement_id: String::new(),
+            effect: None,
+            usage_authoritative,
+        });
+    };
+    let effect = match disposition {
+        budget::SettlementDisposition::Settled => ledger
+            .settle_actual(
+                &reservation_id,
+                actual
+                    .clone()
+                    .ok_or_else(|| invalid("a settled disposition requires a known actual"))?,
+                timestamp,
+            )?
+            .ok_or_else(|| invalid("a live reservation could not be settled"))?,
+        budget::SettlementDisposition::Released => ledger
+            .release(&reservation_id, timestamp)
+            .ok_or_else(|| invalid("a live reservation could not be released"))?,
+        budget::SettlementDisposition::Unresolved => {
+            // Retaining an already-unresolved reservation moves no money, but the
+            // fact is still new when it carries a reason or usage the earlier
+            // record did not, so the record is kept either way.
+            ledger
+                .mark_unresolved(&reservation_id, timestamp)
+                .unwrap_or_else(|| budget::SettlementEffect {
+                    actual: budget::Money::zero(reserved_entry.amount.currency.clone()),
+                    released: budget::Money::zero(reserved_entry.amount.currency.clone()),
+                    overage: budget::Money::zero(reserved_entry.amount.currency.clone()),
+                    reserved: reserved_entry.amount.clone(),
+                    variance: None,
+                    exceeded_hard_limit: false,
+                })
+        }
+    };
+    let settlement = budget::Settlement {
+        settlement_id: settlement_id.clone(),
+        reservation_id: reservation_id.clone(),
+        project_id: target.project_id.clone(),
+        call_id: target.intent.call_id.clone(),
+        dispatch_intent_id: Some(target.intent.id.clone()),
+        attempt_id: target.intent.attempt_id.clone(),
+        generation: target.intent.generation,
+        disposition,
+        pricing: price_fact,
+        usage: usage.clone(),
+        billable: billable.clone(),
+        payload_digest: String::new(),
+        effect: effect.clone(),
+        reason_code: reason_code.clone(),
+        usage_authoritative,
+        created_at: timestamp,
+    };
+    let payload_digest = budget::settlement_payload_digest(&settlement);
+    // The record carries its own digest, so a reader can tell what content was
+    // accepted without re-deriving the normalization that produced it.
+    let settlement = budget::Settlement {
+        payload_digest: payload_digest.clone(),
+        ..settlement
+    };
+    transaction
+        .execute(
+            "INSERT INTO domain_settlements(settlement_id,reservation_id,project_id,call_id,dispatch_intent_id,attempt_id,generation,disposition,reason_code,usage_authoritative,payload_digest,settlement,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                settlement_id,
+                reservation_id,
+                target.project_id,
+                target.intent.call_id,
+                target.intent.id,
+                target.intent.attempt_id,
+                i64::try_from(target.intent.generation)
+                    .map_err(|_| invalid("Attempt generation exceeds SQLite range"))?,
+                disposition.as_str(),
+                reason_code,
+                usage_authoritative,
+                payload_digest,
+                serde_json::to_string(&settlement)
+                    .map_err(|error| invalid(&format!("serialize settlement: {error}")))?,
+                timestamp,
+            ],
+        )
+        .map_err(sql)?;
+    ledger.record_settlement(settlement.clone());
+    // An overage is the most urgent thing an operator can be told, so it wins the
+    // durable reason slot over the disposition that produced it.
+    ledger.set_reason(
+        if effect.overage.micros > 0 {
+            budget::REASON_OVERAGE
+        } else {
+            reason_code.as_str()
+        },
+        timestamp,
+    );
+    store_budget(transaction, &target.project_id, &mut ledger)?;
+    // The money moved, so the accounting state it left behind is journaled in the
+    // same commit. Without this the journal's copy of the cap, the rollups and
+    // the status would lag the authoritative row, and a projection rebuilt from
+    // the journal would disagree with one rebuilt from a snapshot.
+    emit_budget_limit(transaction, &target.project_id, &ledger)?;
+    let root = emit_settlement(transaction, &settlement, &target.intent, caused_by)?;
+    if let Some(reservation) = ledger
+        .reservations
+        .iter()
+        .find(|reservation| reservation.reservation_id == reservation_id)
+    {
+        emit_reservation(
+            transaction,
+            &journal::ReservationFact {
+                project_id: target.project_id.clone(),
+                call_id: target.intent.call_id.clone(),
+                reservation: reservation.clone(),
+            },
+            &target.intent,
+            Some(root),
+        )?;
+    }
+    if let Some(record) = usage {
+        if !usage_authoritative {
+            // The spend happened; the reporting Attempt simply may not state it.
+            emit_usage_evidence(
+                transaction,
+                &journal::UsageEvidence {
+                    project_id: target.project_id.clone(),
+                    call_id: target.intent.call_id.clone(),
+                    attempt_id: target.intent.attempt_id.clone(),
+                    generation: target.intent.generation,
+                    dispatch_intent_id: Some(target.intent.id.clone()),
+                    usage: record,
+                    reason_code: budget::REASON_STALE_AUTHORITY.to_string(),
+                    created_at: timestamp,
+                },
+                &target.intent,
+                Some(root),
+            )?;
+        }
+    }
+    Ok(AccountingOutcome {
+        recorded: true,
+        disposition,
+        reason_code,
+        settlement_id,
+        effect: Some(effect),
+        usage_authoritative,
+    })
+}
+
+/// Retain one settlement payload that conflicts with the settlement already
+/// recorded under the same identity.
+///
+/// The two payloads disagree about what actually happened — different usage, a
+/// different actual — so neither may replace the other and neither may be
+/// dropped as an ordinary duplicate. The canonical settlement is left exactly as
+/// it is: no Money moves, the reservation keeps the state it was discharged to,
+/// and the conflicting payload is recorded under its own id, which is derived
+/// from the business id *and* the payload digest. That makes the retention
+/// itself idempotent: the same conflicting payload delivered again is a
+/// duplicate of the record that already retained it.
+///
+/// The retained fact asserts nothing. Its disposition is `Unresolved` and its
+/// effect is zero, so it can never be read as a second charge, a release, or an
+/// overage, while its usage stays visible as evidence of what was claimed.
+#[allow(clippy::too_many_lines)]
+fn record_settlement_conflict(
+    transaction: &rusqlite::Transaction<'_>,
+    target: &AccountingTarget,
+    candidate: &budget::Settlement,
+    candidate_digest: &str,
+    caused_by: Option<u64>,
+) -> Result<AccountingOutcome> {
+    let conflict_id = budget::conflict_settlement_id(&candidate.settlement_id, candidate_digest);
+    // The id is derived from the payload digest, so a row existing under it can
+    // only be the record of this same conflicting payload.
+    let retained: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM domain_settlements WHERE settlement_id=?1)",
+            [&conflict_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if retained {
+        return Ok(AccountingOutcome {
+            recorded: false,
+            disposition: budget::SettlementDisposition::Unresolved,
+            reason_code: budget::REASON_SETTLEMENT_CONFLICT.to_string(),
+            settlement_id: candidate.settlement_id.clone(),
+            effect: None,
+            usage_authoritative: false,
+        });
+    }
+    let timestamp = candidate.created_at;
+    let retained_settlement = budget::Settlement {
+        settlement_id: conflict_id.clone(),
+        reservation_id: candidate.reservation_id.clone(),
+        project_id: candidate.project_id.clone(),
+        call_id: candidate.call_id.clone(),
+        dispatch_intent_id: candidate.dispatch_intent_id.clone(),
+        attempt_id: candidate.attempt_id.clone(),
+        generation: candidate.generation,
+        disposition: budget::SettlementDisposition::Unresolved,
+        pricing: candidate.pricing.clone(),
+        usage: candidate.usage.clone(),
+        billable: candidate.billable.clone(),
+        payload_digest: candidate_digest.to_string(),
+        effect: budget::SettlementEffect::default(),
+        reason_code: budget::REASON_SETTLEMENT_CONFLICT.to_string(),
+        usage_authoritative: false,
+        created_at: timestamp,
+    };
+    transaction
+        .execute(
+            "INSERT INTO domain_settlements(settlement_id,reservation_id,project_id,call_id,dispatch_intent_id,attempt_id,generation,disposition,reason_code,usage_authoritative,payload_digest,settlement,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                conflict_id,
+                retained_settlement.reservation_id,
+                retained_settlement.project_id,
+                retained_settlement.call_id,
+                retained_settlement.dispatch_intent_id,
+                retained_settlement.attempt_id,
+                i64::try_from(retained_settlement.generation)
+                    .map_err(|_| invalid("Attempt generation exceeds SQLite range"))?,
+                retained_settlement.disposition.as_str(),
+                retained_settlement.reason_code,
+                false,
+                candidate_digest,
+                serde_json::to_string(&retained_settlement)
+                    .map_err(|error| invalid(&format!("serialize settlement: {error}")))?,
+                timestamp,
+            ],
+        )
+        .map_err(sql)?;
+    let mut ledger = read_budget(transaction, &target.project_id)?;
+    ledger.record_settlement(retained_settlement.clone());
+    ledger.set_reason(budget::REASON_SETTLEMENT_CONFLICT, timestamp);
+    store_budget(transaction, &target.project_id, &mut ledger)?;
+    let root = emit_settlement(transaction, &retained_settlement, &target.intent, caused_by)?;
+    // The conflicting usage was observed and deliberately not booked, so it is
+    // retained as evidence too — exactly as an unbookable usage from a stale
+    // Attempt is — rather than being visible only inside the settlement record.
+    if let Some(record) = &candidate.usage {
+        emit_usage_evidence(
+            transaction,
+            &journal::UsageEvidence {
+                project_id: target.project_id.clone(),
+                call_id: target.intent.call_id.clone(),
+                attempt_id: target.intent.attempt_id.clone(),
+                generation: target.intent.generation,
+                dispatch_intent_id: Some(target.intent.id.clone()),
+                usage: record.clone(),
+                reason_code: budget::REASON_SETTLEMENT_CONFLICT.to_string(),
+                created_at: timestamp,
+            },
+            &target.intent,
+            Some(root),
+        )?;
+    }
+    Ok(AccountingOutcome {
+        recorded: false,
+        disposition: budget::SettlementDisposition::Unresolved,
+        reason_code: budget::REASON_SETTLEMENT_CONFLICT.to_string(),
+        settlement_id: candidate.settlement_id.clone(),
+        effect: None,
+        usage_authoritative: false,
+    })
+}
+
+/// Retain a fenced dispatch's reservation as unresolved.
+///
+/// Every fencing path converges here — a stale Attempt at claim time, a late
+/// result, a restart with an unknown external effect, an Attempt going terminal
+/// — so no caller can forget it, and none of them can optimistically release
+/// money that a provider may already have been paid for.
+fn apply_fenced_accounting_in(
+    transaction: &rusqlite::Transaction<'_>,
+    call_id: &str,
+    caused_by: Option<u64>,
+) -> Result<AccountingOutcome> {
+    let Some(target) = read_accounting_target(transaction, call_id)? else {
+        return Ok(AccountingOutcome {
+            recorded: false,
+            disposition: budget::SettlementDisposition::Unresolved,
+            reason_code: budget::REASON_NO_RESERVATION.to_string(),
+            settlement_id: String::new(),
+            effect: None,
+            usage_authoritative: false,
+        });
+    };
+    let claim = AccountingAuthority {
+        attempt_id: target.intent.attempt_id.clone(),
+        generation: target.intent.generation,
+    };
+    apply_accounting_in(
+        transaction,
+        &target,
+        &claim,
+        &DispatchAccounting::Fenced,
+        caused_by,
+    )
 }
 
 fn read_verification(
@@ -3613,13 +4645,126 @@ fn all_verifications(connection: &Connection) -> Result<Vec<journal::StoredVerif
     )
 }
 
+/// Every live reservation, with the Project that owns the money and the Call it
+/// was taken for. A `Released` or `Settled` entry is retained in the ledger but
+/// is no longer live, so it is not part of the "still holds money" view.
+fn all_reservations(connection: &Connection) -> Result<Vec<journal::ReservationFact>> {
+    let mut facts = Vec::new();
+    for row in all_budgets(connection)? {
+        for reservation in row.ledger.reservations {
+            if reservation.state != budget::ReservationState::Reserved {
+                continue;
+            }
+            facts.push(journal::ReservationFact {
+                project_id: row.project_id.clone(),
+                call_id: reservation.operation_id.clone(),
+                reservation,
+            });
+        }
+    }
+    Ok(facts)
+}
+
+/// Every accounting fact ever recorded for a Project, in the order it was
+/// applied. This is the durable per-operation record; the bounded in-ledger list
+/// may prune the oldest, this table never does.
+fn all_settlements(connection: &Connection) -> Result<Vec<budget::Settlement>> {
+    query_all(
+        connection,
+        "SELECT settlement FROM domain_settlements ORDER BY created_at,settlement_id",
+        &[],
+        |row| {
+            let raw: String = row.get(0)?;
+            serde_json::from_str(&raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    raw.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        },
+    )
+}
+
+/// Usage that was observed but deliberately not booked. It is reconstructed from
+/// the settlements that carry it, so it can never disagree with the accounting
+/// record it came from.
+fn all_usage_evidence(connection: &Connection) -> Result<Vec<journal::UsageEvidence>> {
+    Ok(all_settlements(connection)?
+        .into_iter()
+        .filter(|settlement| !settlement.usage_authoritative)
+        .filter_map(|settlement| {
+            settlement.usage.map(|usage| journal::UsageEvidence {
+                project_id: settlement.project_id,
+                call_id: settlement.call_id,
+                attempt_id: settlement.attempt_id,
+                generation: settlement.generation,
+                dispatch_intent_id: settlement.dispatch_intent_id,
+                usage,
+                reason_code: settlement.reason_code,
+                created_at: settlement.created_at,
+            })
+        })
+        .collect())
+}
+
+fn all_budgets(connection: &Connection) -> Result<Vec<BudgetLedgerRow>> {
+    query_all(
+        connection,
+        "SELECT project_id,budget FROM domain_budgets ORDER BY project_id",
+        &[],
+        |row| {
+            let project_id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            let ledger = serde_json::from_str::<budget::MissionBudget>(&raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    raw.len(),
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(BudgetLedgerRow { project_id, ledger })
+        },
+    )
+}
+
+struct BudgetLedgerRow {
+    project_id: String,
+    ledger: budget::MissionBudget,
+}
+
+fn all_budget_limits(connection: &Connection) -> Result<Vec<journal::BudgetLimitFact>> {
+    Ok(all_budgets(connection)?
+        .into_iter()
+        .map(|row| journal::BudgetLimitFact {
+            project_id: row.project_id,
+            hard_limit: row.ledger.hard_limit.clone(),
+            origin: row.ledger.origin,
+            status: row.ledger.status,
+            currency: row.ledger.currency.clone(),
+            settled_micros: row.ledger.settled.micros,
+            reserved_micros: row.ledger.reserved.micros,
+            unresolved_micros: row.ledger.unresolved.micros,
+            reason: row.ledger.reason.clone(),
+            updated_at: row.ledger.updated_at,
+        })
+        .collect())
+}
+
+/// Complete a Call inside an existing writer transaction.
+///
+/// Returns the cursor of the `CallUpdated` event, which is the root fact of the
+/// transition. A caller that settles the dispatch's money in the same commit
+/// records that settlement as caused by it, so a reader can see that the
+/// completion and the spend are one decision rather than two.
+#[allow(clippy::too_many_lines)]
 fn finish_call_in(
     transaction: &rusqlite::Transaction<'_>,
     call_id: &str,
     attempt_id: &str,
     generation: u64,
     response: &str,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     validate_id(call_id)?;
     validate_id(attempt_id)?;
     let value: serde_json::Value = serde_json::from_str(response)
@@ -3634,7 +4779,9 @@ fn finish_call_in(
             params![call_id, attempt_id, generation_i64, response], |row| row.get(0)
         ).map_err(sql)?;
     if duplicate {
-        return Ok(());
+        // A duplicate completion changed nothing, so it records nothing. The
+        // caller still settles accounting, which is idempotent on its own.
+        return Ok(None);
     }
     let current: Option<(String, i64)> = transaction
             .query_row(
@@ -3680,7 +4827,7 @@ fn finish_call_in(
             )?;
         }
     }
-    Ok(())
+    Ok(Some(root))
 }
 
 fn finish_attempt_in(
@@ -3790,6 +4937,13 @@ fn finish_attempt_in(
         emit_changed_intents(transaction, &fenced_intents, Some(root))?;
         emit_changed_calls(transaction, &fenced_calls, Some(root))?;
         emit_changed_executors(transaction, &fenced_executors, Some(root))?;
+        // An Attempt going terminal fences every dispatch it still owned. Each
+        // one's reservation is retained as unresolved in the same commit, so
+        // abandoning an Attempt can neither leak a held reservation nor hand
+        // money back that a provider may already have been paid for.
+        for intent in &fenced_intents {
+            apply_fenced_accounting_in(transaction, &intent.call_id, Some(root))?;
+        }
         let job =
             read_job(transaction, &job_id)?.ok_or_else(|| invalid("terminal Job disappeared"))?;
         emit_job_under(

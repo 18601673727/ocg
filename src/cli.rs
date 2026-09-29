@@ -1307,6 +1307,11 @@ fn budget_command(
                 "settled_micros": budget.settled_micros,
                 "reserved_micros": budget.reserved_micros,
                 "unresolved_micros": budget.unresolved_micros,
+                "released_micros": budget.released_micros,
+                "overage_micros": budget.overage_micros,
+                "reservation_count": budget.reservation_count,
+                "settlement_count": budget.settlement_count,
+                "unresolved_settlement_count": budget.unresolved_settlement_count,
                 "reason": budget.reason,
             },
         });
@@ -1329,6 +1334,11 @@ fn budget_command(
             }
         );
         println!("require quota: {}", config.require_quota);
+        println!(
+            "configured token prices: {} (a completed dispatch with no price settles as \
+             unresolved, never at a guess)",
+            config.pricing.len()
+        );
         println!("project {} budget", project.id);
         println!(
             "  {} origin {} currency {}",
@@ -1349,6 +1359,14 @@ fn budget_command(
             budget.settled_micros,
             budget.reserved_micros,
             budget.unresolved_micros,
+        );
+        println!(
+            "  released {} overage {} ({} reservations, {} settlements, {} unresolved)",
+            budget.released_micros,
+            budget.overage_micros,
+            budget.reservation_count,
+            budget.settlement_count,
+            budget.unresolved_settlement_count,
         );
         if let Some(reason) = &budget.reason {
             println!("  reason {reason}");

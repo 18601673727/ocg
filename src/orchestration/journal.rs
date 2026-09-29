@@ -84,9 +84,18 @@
 //!
 //! # Deliberate non-goals
 //!
-//! This round does **not** journalize Money settlement/budget ledger
-//! mutations, does not add replication, clustering or a second writer, and does
-//! not restore any legacy Mission/WorkNode/Run execution semantics. It is a
+//! This round adds accounting fact events for Money: a reservation that was
+//! recorded, the actual a provider run was settled for, the release of a
+//! reservation that never reached the provider, the retention of one whose
+//! actual is still unknown, and a hard limit an operator changed. Those are
+//! facts about the same single-writer commit that moved the money, so they are
+//! written in the same transaction and can never describe a change that was
+//! rolled back. They remain evidence: nothing reads them back to decide an
+//! admission, a settlement or a cap, and the canonical `domain_budgets` row is
+//! still the only budget authority.
+//!
+//! This round does **not** add replication, clustering or a second writer, and
+//! does not restore any legacy Mission/WorkNode/Run execution semantics. It is a
 //! single-node, single-authority journal.
 //!
 //! The stream also has no automatic retention: nothing is pruned on a timer or
@@ -96,6 +105,9 @@
 //! [`EventDelta::ResyncRequired`] instead of being served a partial delta.
 
 use crate::error::{OcgError, Result};
+use crate::orchestration::budget::{
+    BudgetOrigin, BudgetStatus, Money, Reservation, Settlement, UsageRecord,
+};
 use crate::orchestration::domain::{Attempt, Call, DispatchIntent, Executor, Job, Project};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -496,6 +508,25 @@ pub enum EventKind {
     DispatchIntentUpdated,
     ResultEvidenceRecorded,
     VerificationRecorded,
+    /// An operator explicitly changed the Project's hard limit, or an admission
+    /// moved the Project's durable accounting state. The event records the state
+    /// the budget was left in — cap, rollups, status and reason — not a decision
+    /// that any reader may replay as authority.
+    BudgetLimitSet,
+    /// A bounded spend was reserved before a provider-costly side effect.
+    BudgetReservationRecorded,
+    /// A reservation was returned to the Project because the request provably
+    /// never reached the provider.
+    BudgetReservationReleased,
+    /// A reservation was discharged against a provider-reported usage record
+    /// valued in canonical Money.
+    BudgetSettled,
+    /// A reservation is retained because no reliable actual exists. It still
+    /// counts against the hard cap.
+    BudgetUnresolved,
+    /// A usage record was observed but not booked, because the reporting Attempt
+    /// no longer held authority. Evidence, never an actual.
+    BudgetUsageRetained,
 }
 
 /// The authority identity an event was committed under.
@@ -1163,6 +1194,59 @@ pub struct StoredVerification {
     pub created_at: i64,
 }
 
+/// One bounded spend reservation as a projection-visible accounting fact.
+///
+/// It names the Call the reservation was taken for, so a projection can answer
+/// "which operation still holds money" without re-deriving anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReservationFact {
+    pub project_id: String,
+    pub call_id: String,
+    pub reservation: Reservation,
+}
+
+/// A Project budget's durable accounting state as a projection-visible fact.
+///
+/// It is the evidence of what the cap and the rollups were at a given cursor —
+/// including a denied admission, which moves no money and would otherwise leave
+/// no trace. It is not the cap: the authority is the canonical
+/// `domain_budgets` row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BudgetLimitFact {
+    pub project_id: String,
+    pub hard_limit: Option<Money>,
+    pub origin: BudgetOrigin,
+    pub status: BudgetStatus,
+    pub currency: String,
+    pub settled_micros: i64,
+    pub reserved_micros: i64,
+    pub unresolved_micros: i64,
+    /// The reason code of the decision that produced this state.
+    pub reason: Option<String>,
+    pub updated_at: i64,
+}
+
+/// A provider-reported usage record that was observed but deliberately *not*
+/// booked as an actual.
+///
+/// The only reason a usage record is retained without an actual is that the
+/// Attempt reporting it no longer holds authority. The spend still happened, so
+/// the fact is kept; the budget keeps holding the reservation instead of
+/// adopting an amount a fenced authority may not assert.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UsageEvidence {
+    pub project_id: String,
+    pub call_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
+    pub dispatch_intent_id: Option<String>,
+    pub usage: UsageRecord,
+    pub reason_code: String,
+    pub created_at: i64,
+}
+
 /// The canonical rows plus the journal head, read in one transaction.
 ///
 /// This is the base a projection starts from. The cursor and the rows are read
@@ -1188,6 +1272,13 @@ pub struct ExecutionSnapshot {
     pub job_configurations: Vec<StoredJobConfiguration>,
     pub result_evidence: Vec<ResultEvidence>,
     pub verifications: Vec<StoredVerification>,
+    /// The durable accounting facts. They are part of the snapshot because a
+    /// projection that started after the money moved must still be able to
+    /// rebuild the money view from the same boundary.
+    pub reservations: Vec<ReservationFact>,
+    pub settlements: Vec<Settlement>,
+    pub budget_limits: Vec<BudgetLimitFact>,
+    pub usage_evidence: Vec<UsageEvidence>,
 }
 
 /// The outcome of applying one event to a projection.
@@ -1237,6 +1328,16 @@ pub struct ExecutionProjection {
     pub job_configurations: BTreeMap<String, StoredJobConfiguration>,
     pub result_evidence: Vec<ResultEvidence>,
     pub verifications: BTreeMap<String, StoredVerification>,
+    /// Reservations keyed by `reservation_id`.
+    pub reservations: BTreeMap<String, ReservationFact>,
+    /// Settlements keyed by `settlement_id`. The key is deterministic over the
+    /// reservation, the authority and the disposition, so re-applying a
+    /// duplicate overwrites the identical record instead of double-booking it.
+    pub settlements: BTreeMap<String, Settlement>,
+    /// Hard limits keyed by `project_id`.
+    pub budget_limits: BTreeMap<String, BudgetLimitFact>,
+    /// Usage that was observed but never booked, in observation order.
+    pub usage_evidence: Vec<UsageEvidence>,
 }
 
 impl From<ExecutionSnapshot> for ExecutionProjection {
@@ -1288,6 +1389,20 @@ impl From<ExecutionSnapshot> for ExecutionProjection {
                 .verifications
                 .insert(verification.call_id.clone(), verification);
         }
+        for reservation in snapshot.reservations {
+            let id = reservation.reservation.reservation_id.clone();
+            projection.reservations.insert(id, reservation);
+        }
+        for settlement in snapshot.settlements {
+            let id = settlement.settlement_id.clone();
+            projection.settlements.insert(id, settlement);
+        }
+        for limit in snapshot.budget_limits {
+            projection
+                .budget_limits
+                .insert(limit.project_id.clone(), limit);
+        }
+        projection.usage_evidence = snapshot.usage_evidence;
         projection
     }
 }
@@ -1363,6 +1478,24 @@ impl ExecutionProjection {
                 self.verifications
                     .insert(verification.call_id.clone(), verification);
             }
+            "reservation" => {
+                let fact: ReservationFact = decode(&payload, &event.event_id)?;
+                self.reservations
+                    .insert(fact.reservation.reservation_id.clone(), fact);
+            }
+            "settlement" => {
+                let settlement: Settlement = decode(&payload, &event.event_id)?;
+                self.settlements
+                    .insert(settlement.settlement_id.clone(), settlement);
+            }
+            "budget_limit" => {
+                let limit: BudgetLimitFact = decode(&payload, &event.event_id)?;
+                self.budget_limits.insert(limit.project_id.clone(), limit);
+            }
+            "usage_evidence" => {
+                let evidence: UsageEvidence = decode(&payload, &event.event_id)?;
+                self.usage_evidence.push(evidence);
+            }
             other => {
                 return Err(invalid(&format!(
                     "execution journal event {} names an unknown entity type {other}",
@@ -1372,6 +1505,98 @@ impl ExecutionProjection {
         }
         Ok(())
     }
+
+    /// Rebuild one Project's money view from the accounting facts.
+    ///
+    /// The view is derived per identity and then aggregated, never by summing
+    /// the journal:
+    ///
+    /// - `reserved` and `unresolved` come from the *current* state of each
+    ///   reservation. The map is keyed by reservation id and holds the latest
+    ///   post-state journaled for it, so a reservation that has since been
+    ///   settled or released contributes nothing: a refinement moves the same
+    ///   money between states exactly once instead of leaving the earlier state
+    ///   counting as well.
+    /// - `settled`, `released` and `overage` come from the settlements that
+    ///   actually asserted Money. An uncertain dispatch, a retention and a
+    ///   conflicting payload that was refused are all `Unresolved` assertions
+    ///   and assert nothing by definition, so they contribute nothing; the fact
+    ///   that discharged the reservation contributes its effect exactly once.
+    ///   The map is keyed by settlement id, so re-applying the same fact — a
+    ///   duplicated provider result, a replayed commit — overwrites it rather
+    ///   than adding to it.
+    ///
+    /// The result is the same whether the projection is rebuilt from the full
+    /// journal or from a snapshot plus the delta after it: both apply the same
+    /// facts in the same order, and the snapshot carries the same current
+    /// reservation and settlement states the delta would have produced.
+    pub fn accounting(&self, project_id: &str) -> ProjectAccounting {
+        let mut accounting = ProjectAccounting {
+            project_id: project_id.to_string(),
+            ..ProjectAccounting::default()
+        };
+        if let Some(limit) = self.budget_limits.get(project_id) {
+            accounting.hard_limit = limit.hard_limit.clone();
+            accounting.origin = limit.origin;
+            accounting.status = limit.status;
+            accounting.currency = limit.currency.clone();
+            accounting.updated_at = limit.updated_at;
+        }
+        for fact in self.reservations.values() {
+            if fact.project_id != project_id {
+                continue;
+            }
+            if fact.reservation.state == crate::orchestration::budget::ReservationState::Reserved {
+                accounting.reserved_micros = accounting
+                    .reserved_micros
+                    .saturating_add(fact.reservation.amount.micros);
+                if fact.reservation.unresolved {
+                    accounting.unresolved_micros = accounting
+                        .unresolved_micros
+                        .saturating_add(fact.reservation.amount.micros);
+                }
+            }
+        }
+        for settlement in self.settlements.values() {
+            if settlement.project_id != project_id {
+                continue;
+            }
+            // Only a fact that asserted Money moves these totals. A refinement
+            // fact carries no Money of its own — it is the same reservation's
+            // money being restated — so an `Unresolved` assertion can never be
+            // read as a second charge, a second release or a second overage.
+            if !settlement.disposition.asserts_actual() {
+                continue;
+            }
+            accounting.settled_micros = accounting
+                .settled_micros
+                .saturating_add(settlement.effect.actual.micros);
+            accounting.released_micros = accounting
+                .released_micros
+                .saturating_add(settlement.effect.released.micros);
+            accounting.overage_micros = accounting
+                .overage_micros
+                .saturating_add(settlement.effect.overage.micros);
+        }
+        accounting
+    }
+}
+
+/// One Project's money, rebuilt from journaled accounting facts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectAccounting {
+    pub project_id: String,
+    pub currency: String,
+    pub hard_limit: Option<Money>,
+    pub origin: BudgetOrigin,
+    pub status: BudgetStatus,
+    pub settled_micros: i64,
+    pub reserved_micros: i64,
+    pub unresolved_micros: i64,
+    pub released_micros: i64,
+    pub overage_micros: i64,
+    pub updated_at: i64,
 }
 
 fn decode<T: serde::de::DeserializeOwned>(payload: &Value, event_id: &str) -> Result<T> {
