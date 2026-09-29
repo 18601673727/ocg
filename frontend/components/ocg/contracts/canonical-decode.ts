@@ -18,7 +18,6 @@ import type {
   CanonicalProjectsResponse,
   CanonicalWorkEvent,
   CanonicalWorkSnapshot,
-  DispatchWitness,
   GlobalConfiguration,
   ProjectConfiguration,
   ProjectConfigurationView,
@@ -37,6 +36,7 @@ import {
   literal,
   nullable,
   number,
+  oneOf,
   record,
   req,
   string,
@@ -70,37 +70,233 @@ const projectRecord: Decoder<ProjectRecord> = (input, path) => {
   });
 };
 
+/* -------------------------------------------------------------------------- */
+/* The canonical execution state                                               */
+/* -------------------------------------------------------------------------- */
+
 /**
- * A dispatch witness read out of a canonical projection.
+ * The Job, Attempt and Call records the canonical snapshot embeds.
  *
- * The field rules mirror `DispatchWitness::from_json` in
- * `src/orchestration/substrate.rs`, which is the authority: identity strings
- * are non-empty, indices are non-negative integers, and a Run generation starts
- * at 1. Those refinements are not expressible in a TypeScript type, so they are
- * checked here against the same rules rather than invented separately.
+ * `CanonicalWorkSnapshot::mission` is an unconstrained `serde_json::Value` in
+ * `src/orchestration/canonical_control.rs`, assembled by `canonical_snapshot`
+ * from the authoritative records in `src/orchestration/domain.rs`. Those
+ * records carry no `ts_rs` projection of their own — the field set here mirrors
+ * the Rust structs exactly, and each decoder is the check that keeps the mirror
+ * honest: a renamed or retyped field stops the payload here with a path,
+ * instead of reaching a surface as `undefined`.
  */
-export const dispatchWitness: Decoder<DispatchWitness> = (input, path) => {
-  const rec = record(input, path, "a DispatchWitness");
+
+/** The states `domain_jobs.state` admits. */
+export const JOB_STATES = [
+  "pending",
+  "eligible",
+  "running",
+  "cancelling",
+  "completed",
+  "failed",
+  "cancelled",
+  "unknown",
+  "orphaned",
+] as const;
+export type CanonicalJobState = (typeof JOB_STATES)[number];
+
+/** The states `domain_attempts.state` admits. */
+export const ATTEMPT_STATES = [
+  "queued",
+  "running",
+  "cancelling",
+  "completed",
+  "failed",
+  "cancelled",
+  "unknown",
+  "orphaned",
+] as const;
+export type CanonicalAttemptState = (typeof ATTEMPT_STATES)[number];
+
+/** The effect classes `domain_dispatch_intents.effect_kind` admits. */
+export const EFFECT_KINDS = [
+  "idempotent",
+  "strict_fenced",
+  "reconcilable",
+  "non_retryable",
+] as const;
+export type CanonicalEffectKind = (typeof EFFECT_KINDS)[number];
+
+/** One unit of work, owned by exactly one Project. */
+export type CanonicalJob = {
+  id: string;
+  project_id: string;
+  state: CanonicalJobState;
+  generation: number;
+  authoritative_attempt_id: string | null;
+  payload: string;
+  created_at: number;
+  updated_at: number;
+};
+
+/**
+ * One generation of a Job. At most one Attempt of a Job is authoritative at a
+ * time; the rest are retained as history.
+ */
+export type CanonicalAttempt = {
+  id: string;
+  job_id: string;
+  generation: number;
+  state: CanonicalAttemptState;
+  authoritative: boolean;
+  created_at: number;
+  finished_at: number | null;
+};
+
+/**
+ * One invocation inside an Attempt.
+ *
+ * `state` is a bare column in the substrate rather than an enum, so it is
+ * decoded as the string the backend stored instead of being forced into a
+ * closed vocabulary the frontend would have to guess.
+ */
+export type CanonicalCall = {
+  id: string;
+  attempt_id: string;
+  executor_id: string | null;
+  generation: number;
+  side_effect: boolean;
+  effect_kind: CanonicalEffectKind;
+  state: string;
+  request: string;
+  response: string | null;
+  created_at: number;
+  finished_at: number | null;
+};
+
+/** The `mission` payload of a `CanonicalWorkSnapshot`. */
+export type CanonicalExecutionState = {
+  job: CanonicalJob;
+  attempts: CanonicalAttempt[];
+  calls: CanonicalCall[];
+  /** The backend's own note on its graph projection, kept verbatim. */
+  executionGraph: string;
+};
+
+const jobState = oneOf<CanonicalJobState>(JOB_STATES);
+const attemptState = oneOf<CanonicalAttemptState>(ATTEMPT_STATES);
+const effectKind = oneOf<CanonicalEffectKind>(EFFECT_KINDS);
+
+const job: Decoder<CanonicalJob> = (input, path) => {
+  const rec = record(input, path, "a canonical Job");
   if (!rec.ok) return rec;
-  const missionId = req(rec.value, "mission_id", identity, path);
-  if (!missionId.ok) return missionId;
-  const workNodeId = req(rec.value, "work_node_id", index, path);
-  if (!workNodeId.ok) return workNodeId;
-  const runId = req(rec.value, "run_id", index, path);
-  if (!runId.ok) return runId;
-  const runGeneration = req(rec.value, "run_generation", atLeast(1), path);
-  if (!runGeneration.ok) return runGeneration;
-  const runtimeExecutionId = req(rec.value, "runtime_execution_id", identity, path);
-  if (!runtimeExecutionId.ok) return runtimeExecutionId;
-  const dispatchId = req(rec.value, "dispatch_id", identity, path);
-  if (!dispatchId.ok) return dispatchId;
+  const id = req(rec.value, "id", identity, path);
+  if (!id.ok) return id;
+  const projectId = req(rec.value, "project_id", identity, path);
+  if (!projectId.ok) return projectId;
+  const state = req(rec.value, "state", jobState, path);
+  if (!state.ok) return state;
+  const generation = req(rec.value, "generation", index, path);
+  if (!generation.ok) return generation;
+  const authoritativeAttemptId = req(rec.value, "authoritative_attempt_id", nullable(identity), path);
+  if (!authoritativeAttemptId.ok) return authoritativeAttemptId;
+  const payload = req(rec.value, "payload", string, path);
+  if (!payload.ok) return payload;
+  const createdAt = req(rec.value, "created_at", number, path);
+  if (!createdAt.ok) return createdAt;
+  const updatedAt = req(rec.value, "updated_at", number, path);
+  if (!updatedAt.ok) return updatedAt;
   return yes({
-    mission_id: missionId.value,
-    work_node_id: workNodeId.value,
-    run_id: runId.value,
-    run_generation: runGeneration.value,
-    runtime_execution_id: runtimeExecutionId.value,
-    dispatch_id: dispatchId.value,
+    id: id.value,
+    project_id: projectId.value,
+    state: state.value,
+    generation: generation.value,
+    authoritative_attempt_id: authoritativeAttemptId.value,
+    payload: payload.value,
+    created_at: createdAt.value,
+    updated_at: updatedAt.value,
+  });
+};
+
+const attempt: Decoder<CanonicalAttempt> = (input, path) => {
+  const rec = record(input, path, "a canonical Attempt");
+  if (!rec.ok) return rec;
+  const id = req(rec.value, "id", identity, path);
+  if (!id.ok) return id;
+  const jobId = req(rec.value, "job_id", identity, path);
+  if (!jobId.ok) return jobId;
+  const generation = req(rec.value, "generation", atLeast(1), path);
+  if (!generation.ok) return generation;
+  const state = req(rec.value, "state", attemptState, path);
+  if (!state.ok) return state;
+  const authoritative = req(rec.value, "authoritative", boolean, path);
+  if (!authoritative.ok) return authoritative;
+  const createdAt = req(rec.value, "created_at", number, path);
+  if (!createdAt.ok) return createdAt;
+  const finishedAt = req(rec.value, "finished_at", nullable(number), path);
+  if (!finishedAt.ok) return finishedAt;
+  return yes({
+    id: id.value,
+    job_id: jobId.value,
+    generation: generation.value,
+    state: state.value,
+    authoritative: authoritative.value,
+    created_at: createdAt.value,
+    finished_at: finishedAt.value,
+  });
+};
+
+const call: Decoder<CanonicalCall> = (input, path) => {
+  const rec = record(input, path, "a canonical Call");
+  if (!rec.ok) return rec;
+  const id = req(rec.value, "id", identity, path);
+  if (!id.ok) return id;
+  const attemptId = req(rec.value, "attempt_id", identity, path);
+  if (!attemptId.ok) return attemptId;
+  const executorId = req(rec.value, "executor_id", nullable(identity), path);
+  if (!executorId.ok) return executorId;
+  const generation = req(rec.value, "generation", atLeast(1), path);
+  if (!generation.ok) return generation;
+  const sideEffect = req(rec.value, "side_effect", boolean, path);
+  if (!sideEffect.ok) return sideEffect;
+  const kind = req(rec.value, "effect_kind", effectKind, path);
+  if (!kind.ok) return kind;
+  const state = req(rec.value, "state", string, path);
+  if (!state.ok) return state;
+  const request = req(rec.value, "request", string, path);
+  if (!request.ok) return request;
+  const response = req(rec.value, "response", nullable(string), path);
+  if (!response.ok) return response;
+  const createdAt = req(rec.value, "created_at", number, path);
+  if (!createdAt.ok) return createdAt;
+  const finishedAt = req(rec.value, "finished_at", nullable(number), path);
+  if (!finishedAt.ok) return finishedAt;
+  return yes({
+    id: id.value,
+    attempt_id: attemptId.value,
+    executor_id: executorId.value,
+    generation: generation.value,
+    side_effect: sideEffect.value,
+    effect_kind: kind.value,
+    state: state.value,
+    request: request.value,
+    response: response.value,
+    created_at: createdAt.value,
+    finished_at: finishedAt.value,
+  });
+};
+
+const executionState: Decoder<CanonicalExecutionState> = (input, path) => {
+  const rec = record(input, path, "a canonical execution state");
+  if (!rec.ok) return rec;
+  const decodedJob = req(rec.value, "job", job, path);
+  if (!decodedJob.ok) return decodedJob;
+  const attempts = req(rec.value, "attempts", array(attempt), path);
+  if (!attempts.ok) return attempts;
+  const calls = req(rec.value, "calls", array(call), path);
+  if (!calls.ok) return calls;
+  const graph = req(rec.value, "execution_graph", string, path);
+  if (!graph.ok) return graph;
+  return yes({
+    job: decodedJob.value,
+    attempts: attempts.value,
+    calls: calls.value,
+    executionGraph: graph.value,
   });
 };
 
@@ -401,20 +597,17 @@ export const decodeDashboardResponse = (input: unknown): CanonicalDashboardRespo
 export const decodeWorkSnapshot = (input: unknown): CanonicalWorkSnapshot =>
   decode((value) => workSnapshot(value, ""), input);
 
+/**
+ * The Job, Attempts and Calls a canonical snapshot carries.
+ *
+ * Read separately from the snapshot envelope because the envelope's `mission`
+ * field is an unconstrained `JsonValue`: the envelope decoder only proves a
+ * value is there, and this one proves what is in it. A violation raises a
+ * `ContractError` naming the path, which the projection reports as a rejected
+ * snapshot rather than rendering a half-typed Job.
+ */
+export const decodeExecutionState = (input: unknown, path = "mission"): CanonicalExecutionState =>
+  decode((value) => executionState(value, path), input);
+
 export const tryEventsEnvelope = (input: unknown): DecodeResult<CanonicalEventsEnvelope> =>
   eventsEnvelope(input, "");
-
-/**
- * Read a dispatch witness out of a canonical projection.
- *
- * The witness travels inside a `JsonValue` payload, so it is checked against
- * the Rust definition here rather than assembled field by field in the
- * projection. A witness that does not match is `null`, never a partially
- * populated stand-in: the projection refuses to show authority it cannot
- * verify. This is read-only. The PWA never mints, edits, or completes a
- * witness.
- */
-export function decodeWitness(value: unknown, path = "witness"): DispatchWitness | null {
-  const result = dispatchWitness(value, path);
-  return result.ok ? result.value : null;
-}

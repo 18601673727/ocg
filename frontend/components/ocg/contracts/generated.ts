@@ -183,22 +183,6 @@ export type DerivedMetric = { metric: string, value: string | null, unit: string
 
 
 /**
- * The durable dispatch witness: the only identity that correlates one
- * external execution result back to exactly one Run.
- *
- * It is bound at dispatch time, persisted *before* the external execution
- * starts, and validated on every completion. Prompt text, agent role, runtime
- * session identity and ready-queue position are never part of it.
- */
-export type DispatchWitness = { mission_id: string, work_node_id: number, run_id: number, run_generation: number, runtime_execution_id: string, 
-/**
- * Identifies this individual invocation. Several dispatches may share a
- * runtime binding, so it is never derived from one.
- */
-dispatch_id: string, };
-
-
-/**
  * Durable execution outbox record. It is intentionally not an EntityRef.
  */
 export type EffectIntent = { intent_id: EntityId, project_scope: ProjectScope, call_ref: EntityRef, capability_ref: CapabilityRef, reconciliation_key: string, input_fingerprint: string, effect_mode: SideEffectMode, admitted_fence_epoch: string, state: EffectIntentState, created_at: string, updated_at: string, };
@@ -258,6 +242,9 @@ export type ExecutionPolicy = { schema_version: number, mode: ExecutionMode, ret
 
 
 export type ExecutionRetryPolicy = { max_attempts_per_phase: number, retryable_failure_classes: Array<FailureClass>, };
+
+
+export type ExecutionWitness = { job_id: string, attempt_id: string, executor_id: string, call_id: string, generation: number, };
 
 
 export type ExecutorContract = { executor_contract_version: string, executor_ref: string, runtime_ref: string, provider_ref: EntityRef | null, model_ref: EntityRef | null, capability_grants: Array<CapabilityGrant>, execution_limits: ExecutionLimits, budget_scope_ref: EntityRef, budget_snapshot: BudgetSnapshot, deadline: string | null, execution_boundary: string, effective_config_fingerprint: string, created_at: string, };

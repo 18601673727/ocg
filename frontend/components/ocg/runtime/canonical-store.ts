@@ -2,24 +2,25 @@
  * Canonical projection store: the frontend's read model of OCG durable state.
  *
  * The store owns *presentation* state only. Every canonical value it holds came
- * from a validated backend snapshot or event; it never dispatches, completes,
- * replaces or edits a Run. Ordering rules mirror the existing runtime contract:
- * generation and sequence never move backwards, duplicate event identities are
- * idempotent, a gap forces a resync, and a payload for another Project is
- * rejected rather than rendered.
+ * from a validated backend snapshot or event; it never admits, completes or
+ * replaces a Call, and it never decides which Attempt is authoritative.
+ * Ordering rules mirror the existing runtime contract: generation and sequence
+ * never move backwards, duplicate event identities are idempotent, a gap forces
+ * a resync, and a payload for another Project is rejected rather than rendered.
  */
 
 import {
   CANONICAL_API_VERSION,
   CANONICAL_STREAM_ID,
   projectCanonicalSnapshot,
+  selectAttemptHistory,
+  toMissionExecution,
+  type CanonicalExecutionProjection,
   type CanonicalProjectionResult,
-  type CanonicalWorkProjection,
 } from "./canonical-envelope";
 import type { ProjectId } from "../project/domain";
-import type { MissionExecution } from "../execution/domain";
+import type { ExecutionAttempt, MissionExecution } from "../execution/domain";
 import type { CanonicalWorkEvent } from "../contracts";
-import { toMissionExecution } from "./canonical-envelope";
 import { boundDiagnostics, compareGeneration, compareSequence, isSeen, rememberId } from "./event-gate";
 import type { RuntimeDiagnosticSeverity } from "./runtime-envelope";
 import type { RuntimeSyncStatus } from "./reconciler";
@@ -50,6 +51,7 @@ export type CanonicalDiagnostic = {
 
 export type CanonicalCommandAck = {
   commandId: string;
+  /** `mission-config` is the control route's own name for a Job configuration. */
   kind: "project-import" | "global-config" | "project-defaults" | "mission-config";
   accepted: boolean;
   revision?: number;
@@ -61,7 +63,8 @@ export type CanonicalCommandAck = {
  *
  * This is the generated projection of `CanonicalWorkEvent` in
  * `src/orchestration/canonical_control.rs`, not a second declaration of it. The
- * control client hands the store exactly what the decoder produced.
+ * control client hands the store exactly what the decoder produced. The event
+ * tail carries one `attempt_projection` event per Attempt.
  */
 export type CanonicalBackendEvent = CanonicalWorkEvent;
 
@@ -73,8 +76,9 @@ export type CanonicalState = {
   /** Highest applied canonical sequence, or 0 when no snapshot is installed. */
   cursor: number;
   projectId: ProjectId | null;
-  missionId: string | null;
-  projection: CanonicalWorkProjection | null;
+  /** The Job the installed snapshot projects. */
+  jobId: string | null;
+  projection: CanonicalExecutionProjection | null;
   seenEventIds: string[];
   diagnostics: CanonicalDiagnostic[];
   commandAcks: Record<string, CanonicalCommandAck>;
@@ -88,7 +92,7 @@ export function createCanonicalState(): CanonicalState {
     generation: 0,
     cursor: 0,
     projectId: null,
-    missionId: null,
+    jobId: null,
     projection: null,
     seenEventIds: [],
     diagnostics: [],
@@ -124,7 +128,7 @@ export type CanonicalSnapshotInput = {
 
 /**
  * Install a canonical baseline. The generation is the reconnect epoch, not the
- * Mission identity: a reconnect always installs a new snapshot, never a merge.
+ * Job identity: a reconnect always installs a new snapshot, never a merge.
  */
 export function applyCanonicalSnapshot(state: CanonicalState, input: CanonicalSnapshotInput): CanonicalState {
   const generation = input.generation ?? state.generation;
@@ -150,7 +154,7 @@ export function applyCanonicalSnapshot(state: CanonicalState, input: CanonicalSn
     generation,
     cursor: result.projection.cursor,
     projectId: input.projectId,
-    missionId: result.projection.missionId,
+    jobId: result.projection.jobId,
     projection: result.projection,
     // A new baseline invalidates the seen set: the cursor already covers
     // everything at or below it.
@@ -226,9 +230,9 @@ export function applyCanonicalEvents(
       ]);
       continue;
     }
-    if (event.mission_id !== state.missionId) {
+    if (event.mission_id !== state.jobId) {
       next = withDiagnostics(next, [
-        diagnostic("project-mismatch", `Ignored canonical event for Mission "${event.mission_id}".`, "warning", {
+        diagnostic("project-mismatch", `Ignored canonical event for Job "${event.mission_id}".`, "warning", {
           eventId: event.event_id,
           sequence: event.sequence,
         }),
@@ -274,14 +278,10 @@ export function applyCanonicalEvents(
 }
 
 export type CanonicalSelectors = {
-  projection: CanonicalWorkProjection | null;
+  projection: CanonicalExecutionProjection | null;
   execution: MissionExecution | null;
-  /** Runs that no longer hold authority, retained as evidence only. */
-  fencedRuns: Array<{ runId: number; nodeId: number; dispatchId: string }>;
-  /** Dispatches that have not yet delivered a result. */
-  pendingDispatchCount: number;
-  hasPassingVerification: boolean;
-  missionCompleted: boolean;
+  /** Attempt history for the authoritative Job. */
+  attemptHistory: ExecutionAttempt[];
 };
 
 /** Read-only selectors over the canonical projection. */
@@ -291,26 +291,12 @@ export function selectCanonical(state: CanonicalState, title: string): Canonical
     return {
       projection: null,
       execution: null,
-      fencedRuns: [],
-      pendingDispatchCount: 0,
-      hasPassingVerification: false,
-      missionCompleted: false,
+      attemptHistory: [],
     };
   }
   return {
     projection,
     execution: toMissionExecution(projection, title),
-    fencedRuns: projection.runs
-      .filter((run) => run.state === "fenced")
-      .map((run) => ({
-        runId: run.run_id,
-        nodeId: run.node_id,
-        dispatchId: run.witness?.dispatch_id ?? "",
-      })),
-    pendingDispatchCount: projection.runs.filter((run) => run.state === "active").length,
-    hasPassingVerification: projection.verifications.some((record) => record.passed),
-    missionCompleted: projection.workNodes.some(
-      (node) => node.node_id === projection.rootNodeId && node.state === "completed",
-    ),
+    attemptHistory: selectAttemptHistory(projection),
   };
 }

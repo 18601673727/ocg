@@ -214,10 +214,10 @@ export function CanonicalControlSurface({
 
   const saveMissionConfig = () =>
     run(async () => {
-      if (preRun.missionId === null) return;
+      if (preRun.jobId === null) return;
       const result = await client.writeMissionConfiguration(
-        `cmd-mission-config-${preRun.missionId}-${Date.now()}`,
-        preRun.missionId,
+        `cmd-mission-config-${preRun.jobId}-${Date.now()}`,
+        preRun.jobId,
         { profile: draft.profile, routing: draft.routing, hard_budget: draft.hardBudget },
       );
       setAck(describeAcknowledgement(result));
@@ -227,7 +227,7 @@ export function CanonicalControlSurface({
             commandId: result.commandId,
             kind: "mission-config",
             accepted: true,
-            message: "Pre-run Mission configuration persisted",
+            message: "Pre-run Job configuration persisted",
           }),
         );
       }
@@ -369,16 +369,16 @@ export function CanonicalControlSurface({
 
           <Panel
             className="bg-background p-3"
-            title="Mission pre-run configuration"
-            detail={preRun.missionId ? `mission ${preRun.missionId}` : "no Mission selected"}
+            title="Job pre-run configuration"
+            detail={preRun.jobId ? `job ${preRun.jobId}` : "no Job selected"}
           >
             <div className="flex flex-wrap items-end gap-2">
               <label className="flex-1 text-[10px] text-muted-foreground">
-                Mission id
+                Job id
                 <Input
                   className="mt-1 h-7 text-[11px]"
                   value={missionId}
-                  placeholder="wn-..."
+                  placeholder="job-..."
                   onChange={(event) => setMissionId(event.target.value)}
                 />
               </label>
@@ -402,26 +402,26 @@ export function CanonicalControlSurface({
               </Button>
             </div>
             <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[10px]">
-              <dt className="text-muted-foreground">Dispatched Runs</dt>
-              <dd>{state.projection?.runs.length ?? 0}</dd>
-              <dt className="text-muted-foreground">Fenced generations</dt>
-              <dd>{selected.fencedRuns.length}</dd>
-              <dt className="text-muted-foreground">Verification evidence</dt>
-              <dd>{state.projection?.verifications.length ?? 0}</dd>
+              <dt className="text-muted-foreground">Attempts</dt>
+              <dd>{state.projection?.attempts.length ?? 0}</dd>
+              <dt className="text-muted-foreground">Calls</dt>
+              <dd>{state.projection?.calls.length ?? 0}</dd>
+              <dt className="text-muted-foreground">Attempt history</dt>
+              <dd>{selected.attemptHistory.length}</dd>
               <dt className="text-muted-foreground">Canonical cursor</dt>
               <dd>{state.cursor}</dd>
             </dl>
           </Panel>
 
-          <Panel className="bg-background p-3" title="Running Mission" detail="canonical projection">
+          <Panel className="bg-background p-3" title="Running Job" detail="canonical projection">
             {selected.execution ? (
               <div className="h-[420px] overflow-hidden rounded border border-border">
                 <MissionControlSurface execution={selected.execution} />
               </div>
             ) : (
               <p className="text-[11px] text-muted-foreground">
-                Load a canonical Mission to inspect its WorkNode tree, dependency DAG, Run generations, frozen
-                contracts, and verification evidence.
+                Load a canonical Job to inspect its execution graph, Attempt history, Call states, and frozen
+                contracts.
               </p>
             )}
           </Panel>

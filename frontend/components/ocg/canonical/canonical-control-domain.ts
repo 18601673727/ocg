@@ -140,31 +140,31 @@ export function draftFromConfiguration(view: CanonicalConfigurationView | null):
 }
 
 /**
- * Pre-run Mission configuration is only editable while the Mission has no
- * dispatched Run. Once one exists the surface reports it as frozen rather than
- * offering a control that would silently do nothing.
+ * Pre-run Job configuration is only editable while the Job has no
+ * dispatched Attempt. Once one exists the surface reports it as frozen rather
+ * than offering a control that would silently do nothing.
  */
 export function preRunConfigurationState(state: CanonicalState): {
-  missionId: string | null;
+  jobId: string | null;
   editable: boolean;
   reason: string | null;
 } {
-  const missionId = state.missionId;
-  if (missionId === null) {
-    return { missionId: null, editable: false, reason: "No canonical Mission is selected." };
+  const jobId = state.jobId;
+  if (jobId === null) {
+    return { jobId: null, editable: false, reason: "No canonical Job is selected." };
   }
   if (state.projection === null) {
-    return { missionId, editable: false, reason: "Canonical state has not been loaded." };
+    return { jobId, editable: false, reason: "Canonical state has not been loaded." };
   }
-  if (state.projection.runs.length > 0) {
+  if (state.projection.attempts.length > 0) {
     return {
-      missionId,
+      jobId,
       editable: false,
       reason:
-        "A Run is already dispatched. Its frozen executor/model/role contract cannot be edited; changes apply to future dispatches, future child Runs, or a replacement Run.",
+        "An Attempt is already dispatched. Its frozen executor/model/role contract cannot be edited; changes apply to future dispatches or a replacement Job.",
     };
   }
-  return { missionId, editable: true, reason: null };
+  return { jobId, editable: true, reason: null };
 }
 
 export function globalConfigurationCommandId(revision: number): string {

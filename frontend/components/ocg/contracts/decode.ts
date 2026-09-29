@@ -124,24 +124,40 @@ export function literal<T extends string>(expected: T): Decoder<T> {
 }
 
 /**
+ * Membership in a Rust enum's wire vocabulary.
+ *
+ * A `#[serde(rename_all = "snake_case")]` enum arrives as one of its variant
+ * names, so the list here is the enum's variants and not a preference: a value
+ * outside it is a payload the backend cannot have produced, and it is reported
+ * rather than coerced into the nearest known variant.
+ */
+export function oneOf<T extends string>(allowed: readonly T[]): Decoder<T> {
+  return (input, path) =>
+    typeof input === "string" && (allowed as readonly string[]).includes(input)
+      ? yes(input as T)
+      : bad(path, `one of ${allowed.map((value) => `"${value}"`).join(", ")}`);
+}
+
+/**
  * A string that carries an identity.
  *
  * A `String` in Rust accepts `""`, but the contract types that *are* identities
- * reject it on the way in. `DispatchWitness::from_json` is the authority for
- * that rule and this mirrors it, so the PWA refuses the same witnesses the
- * backend would refuse rather than rendering an empty id as if it were one.
+ * reject it on the way in. `safe_id`/`validate_id` in the canonical substrate
+ * are the authority for that rule and this mirrors it, so the PWA refuses the
+ * same identifiers the backend would refuse rather than rendering an empty id
+ * as if it were one.
  */
 export const identity: Decoder<string> = (input, path) =>
   typeof input === "string" && input.length > 0 ? yes(input) : bad(path, "a non-empty string");
 
-/** An integer at or above `floor`, for a generation that starts at 1. */
-export function atLeast(floor: number): Decoder<number> {
-  return (input, path) => {
-    if (typeof input !== "number" || !Number.isInteger(input)) {
-      return bad(path, "an integer");
-    }
-    return input >= floor ? yes(input) : bad(path, `an integer >= ${floor}`);
-  };
+/**
+ * A positive integer, used for generation counters which start at 1.
+ */
+export function atLeast(min: number): Decoder<number> {
+  return (input, path) =>
+    typeof input === "number" && Number.isInteger(input) && input >= min
+      ? yes(input)
+      : bad(path, `an integer >= ${min}`);
 }
 
 export function nullable<T>(decoder: Decoder<T>): Decoder<T | null> {

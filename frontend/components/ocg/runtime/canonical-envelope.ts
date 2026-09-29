@@ -1,127 +1,65 @@
 /**
- * Backend-backed canonical WorkNode/Run projection.
+ * Backend-backed canonical execution projection.
  *
- * The OCG substrate (`ocg.canonical.v1`) is the execution authority. This
- * module is the *projection* boundary: it validates the durable backend
- * contract and maps it onto the existing RuntimeStore presentation shapes.
+ * The SQLite substrate is the execution authority. A Project owns Jobs, a Job
+ * owns Attempts, an Attempt owns Executors and Calls, and exactly one Attempt
+ * of a Job is authoritative at a time. This module is the *projection*
+ * boundary: it validates the durable contract and maps it onto the existing
+ * RuntimeStore presentation shapes.
  *
  * Invariants preserved here:
- * - the API version, project identity and canonical cursor are carried
- *   through unchanged, so a stale generation or a wrong-project payload is
- *   rejected rather than rendered;
- * - a canonical WorkNode, Run generation, frozen contract, dispatch witness
- *   and verification record are never invented or inferred from a label;
- * - the frontend owns no execution authority. It cannot dispatch, complete or
- *   replace a Run, and an active Run's frozen contract is never editable here.
+ * - the API version, Project identity and canonical cursor are carried through
+ *   unchanged, so a stale generation or a foreign Project payload is rejected
+ *   rather than rendered;
+ * - a Job, Attempt, Executor or Call is never invented, and the frontend derives
+ *   no execution identity of its own. It reads the authoritative Attempt the
+ *   backend named and shows every other generation as history rather than
+ *   promoting one;
+ * - the frontend owns no execution authority. It cannot admit, complete or
+ *   replace a Call, and it never decides which Attempt is authoritative.
  */
 
 import type {
   ExecutionAttempt,
+  ExecutionActivityItem,
   ExecutionEdge,
   ExecutionStatus,
   ExecutionTask,
   MissionExecution,
   WorkerExecution,
 } from "../execution/domain";
-import type { MissionStatus } from "../types";
 import type { ProjectId } from "../project/domain";
 
-// The protocol version and the dispatch witness are owned by Rust and projected
-// here, so the envelope validator and the control client cannot disagree with
-// the definition that actually confers authority.
+// The protocol version is owned by Rust and projected here, so the envelope
+// validator and the control client cannot disagree with the definition that
+// actually confers authority.
 export { CANONICAL_API_VERSION } from "../contracts";
 
-import { CANONICAL_API_VERSION, decodeWitness } from "../contracts";
-import type { DispatchWitness } from "../contracts";
-import { asRecordArray, isNonEmptyString, isNonNegativeInteger, isOneOf, isPositiveInteger, isRecord } from "@/lib/narrow";
+import { CANONICAL_API_VERSION, ContractError, decodeExecutionState } from "../contracts";
+import type {
+  CanonicalAttempt,
+  CanonicalAttemptState,
+  CanonicalCall,
+  CanonicalExecutionState,
+  CanonicalJob,
+  CanonicalJobState,
+} from "../contracts";
+import { formatTimestamp } from "@/lib/format";
+import { isNonNegativeInteger, isRecord } from "@/lib/narrow";
 
 export const CANONICAL_STREAM_ID = "ocg.canonical.work";
 
-/** The durable dispatch witness as OCG persists and returns it. */
-export type CanonicalWitness = DispatchWitness;
-
-export type CanonicalRunState =
-  | "active"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "superseded"
-  | "fenced";
-
-export type CanonicalWorkState = "ready" | "running" | "completed" | "failed" | "cancelled";
-
-/** The frozen executor/model/role contract of one Run generation. */
-export type CanonicalRunContract = {
-  executor: string;
-  model: string;
-  role: string;
-};
-
-export type CanonicalWorkNode = {
-  node_id: number;
-  parent_node_id: number | null;
-  spawned_by_run_id: number | null;
-  state: CanonicalWorkState;
-  generation: number;
-  active_run_id: number | null;
-  payload: string;
-};
-
-export type CanonicalRun = {
-  run_id: number;
-  node_id: number;
-  generation: number;
-  state: CanonicalRunState;
-  contract: CanonicalRunContract;
-  runtime_execution_id: string | null;
-  host_session_id: string | null;
-  result: string | null;
-  witness: CanonicalWitness | null;
-};
-
-export type CanonicalDependency = {
-  node_id: number;
-  depends_on_node_id: number;
-};
-
-export type CanonicalEvent = {
-  seq: number;
-  kind: string;
-  payload: string;
-  by_run_id: number | null;
-};
-
-export type CanonicalVerification = {
-  verification_id: string;
-  node_id: number;
-  run_id: number;
-  dispatch_id: string;
-  outcome: "passed" | "failed";
-  passed: boolean;
-  commands: string[];
-  created_at: number;
-};
-
-export type CanonicalLateResult = {
-  node_id: number;
-  run_id: number;
-  dispatch_id: string;
-  result: string;
-};
-
-/** The validated backend snapshot. */
-export type CanonicalWorkProjection = {
+/** The validated backend snapshot, in the substrate's own entities. */
+export type CanonicalExecutionProjection = {
   apiVersion: string;
   projectId: ProjectId;
-  missionId: string;
-  rootNodeId: number;
+  jobId: string;
   cursor: number;
-  workNodes: CanonicalWorkNode[];
-  dependencies: CanonicalDependency[];
-  runs: CanonicalRun[];
-  events: CanonicalEvent[];
-  verifications: CanonicalVerification[];
-  lateResults: CanonicalLateResult[];
+  job: CanonicalJob;
+  attempts: CanonicalAttempt[];
+  calls: CanonicalCall[];
+  /** The backend's note on its graph projection; the PWA draws no graph itself. */
+  executionGraph: string;
 };
 
 export type CanonicalProjectionIssue = {
@@ -130,7 +68,7 @@ export type CanonicalProjectionIssue = {
 };
 
 export type CanonicalProjectionResult =
-  | { ok: true; projection: CanonicalWorkProjection }
+  | { ok: true; projection: CanonicalExecutionProjection }
   | { ok: false; issue: CanonicalProjectionIssue };
 
 function fail(code: CanonicalProjectionIssue["code"], message: string): CanonicalProjectionResult {
@@ -138,38 +76,11 @@ function fail(code: CanonicalProjectionIssue["code"], message: string): Canonica
 }
 
 /**
- * A witness is read against the Rust definition in `components/ocg/contracts`.
- *
- * A witness that does not match that definition yields `null`, so the
- * projection refuses to show authority it cannot verify rather than render a
- * partially populated stand-in.
- */
-function parseWitness(value: unknown): CanonicalWitness | null {
-  return decodeWitness(value);
-}
-
-const RUN_STATES: readonly CanonicalRunState[] = [
-  "active",
-  "completed",
-  "failed",
-  "cancelled",
-  "superseded",
-  "fenced",
-];
-
-const WORK_STATES: readonly CanonicalWorkState[] = ["ready", "running", "completed", "failed", "cancelled"];
-
-function parseContract(value: unknown): CanonicalRunContract | null {
-  if (!isRecord(value)) return null;
-  if (!isNonEmptyString(value.executor) || !isNonEmptyString(value.model) || !isNonEmptyString(value.role)) return null;
-  return { executor: value.executor, model: value.model, role: value.role };
-}
-
-/**
  * Validate one backend snapshot against the durable canonical contract.
  *
- * A wrong API version, a foreign project identity, a non-monotonic cursor or a
- * malformed entity is rejected here; nothing is partially rendered.
+ * A wrong API version, a foreign Project identity, a cursor behind its own
+ * event stream, or a Job/Attempt/Call that does not match the contract is
+ * rejected here; nothing is partially rendered.
  */
 export function projectCanonicalSnapshot(
   input: unknown,
@@ -182,136 +93,62 @@ export function projectCanonicalSnapshot(
   if (input.project_id !== expectedProjectId) {
     return fail("project-mismatch", "Canonical snapshot belongs to another Project.");
   }
-  if (!isNonNegativeInteger(input.cursor)) return fail("cursor", "Canonical snapshot cursor must be a non-negative integer.");
-  const mission = input.mission;
-  if (!isRecord(mission)) return fail("malformed", "Canonical snapshot mission payload is required.");
-  if (!isNonEmptyString(mission.mission_id)) return fail("malformed", "Canonical Mission id is required.");
-  if (!isNonNegativeInteger(mission.root_node_id)) return fail("malformed", "Canonical root node id is required.");
-
-  const rawNodes = asRecordArray(mission.work_nodes);
-  if (rawNodes === null) return fail("malformed", "Canonical work_nodes must be an array of records.");
-  const workNodes: CanonicalWorkNode[] = [];
-  for (const node of rawNodes) {
-    if (!isNonNegativeInteger(node.node_id)) return fail("malformed", "WorkNode id must be a non-negative integer.");
-    if (node.parent_node_id !== null && !isNonNegativeInteger(node.parent_node_id)) {
-      return fail("malformed", "WorkNode parent must be null or a node id.");
-    }
-    if (node.spawned_by_run_id !== null && !isNonNegativeInteger(node.spawned_by_run_id)) {
-      return fail("malformed", "WorkNode spawn provenance must be null or a run id.");
-    }
-    if (node.active_run_id !== null && !isNonNegativeInteger(node.active_run_id)) {
-      return fail("malformed", "WorkNode active run must be null or a run id.");
-    }
-    if (!isNonNegativeInteger(node.generation)) {
-      return fail("malformed", "WorkNode generation must be a non-negative integer.");
-    }
-    if (!isOneOf(node.state, WORK_STATES)) {
-      return fail("malformed", `Unknown canonical WorkNode state "${String(node.state)}".`);
-    }
-    workNodes.push({
-      node_id: node.node_id,
-      parent_node_id: node.parent_node_id ?? null,
-      spawned_by_run_id: node.spawned_by_run_id ?? null,
-      state: node.state,
-      generation: node.generation,
-      active_run_id: node.active_run_id ?? null,
-      payload: typeof node.payload === "string" ? node.payload : "",
-    });
+  if (!isNonNegativeInteger(input.cursor)) {
+    return fail("cursor", "Canonical snapshot cursor must be a non-negative integer.");
   }
 
-  const rawRuns = asRecordArray(mission.runs);
-  if (rawRuns === null) return fail("malformed", "Canonical runs must be an array of records.");
-  const runs: CanonicalRun[] = [];
-  for (const run of rawRuns) {
-    if (!isNonNegativeInteger(run.run_id) || !isNonNegativeInteger(run.node_id)) {
-      return fail("malformed", "Run ids must be non-negative integers.");
-    }
-    if (!isPositiveInteger(run.generation)) {
-      return fail("malformed", "Run generation must be a positive integer.");
-    }
-    if (!isOneOf(run.state, RUN_STATES)) {
-      return fail("malformed", `Unknown canonical Run state "${String(run.state)}".`);
-    }
-    const contract = parseContract(run.contract);
-    if (!contract) return fail("malformed", "Every Run must carry a complete frozen contract.");
-    runs.push({
-      run_id: run.run_id,
-      node_id: run.node_id,
-      generation: run.generation,
-      state: run.state,
-      contract,
-      runtime_execution_id: typeof run.runtime_execution_id === "string" ? run.runtime_execution_id : null,
-      host_session_id: typeof run.host_session_id === "string" ? run.host_session_id : null,
-      result: typeof run.result === "string" ? run.result : null,
-      witness: run.witness === null || run.witness === undefined ? null : parseWitness(run.witness),
-    });
+  let state: CanonicalExecutionState;
+  try {
+    state = decodeExecutionState(input.mission, "mission");
+  } catch (error) {
+    if (error instanceof ContractError) return fail("malformed", error.message);
+    throw error;
   }
 
-  const rawDependencies = asRecordArray(mission.dependencies ?? []);
-  if (rawDependencies === null) return fail("malformed", "Canonical dependencies must be an array of records.");
-  const dependencies: CanonicalDependency[] = [];
-  for (const edge of rawDependencies) {
-    if (!isNonNegativeInteger(edge.node_id) || !isNonNegativeInteger(edge.depends_on_node_id)) {
-      return fail("malformed", "Dependency edges must name two node ids.");
-    }
-    dependencies.push({ node_id: edge.node_id, depends_on_node_id: edge.depends_on_node_id });
+  // The Job carries its own Project scope, so a snapshot whose envelope and
+  // Job disagree is a cross-Project leak rather than a rendering problem.
+  if (state.job.project_id !== expectedProjectId) {
+    return fail("project-mismatch", `Canonical Job ${state.job.id} belongs to another Project.`);
   }
 
-  const rawEvents = asRecordArray(mission.events ?? []);
-  if (rawEvents === null) return fail("malformed", "Canonical events must be an array of records.");
-  const events: CanonicalEvent[] = [];
-  for (const event of rawEvents) {
-    if (!isNonNegativeInteger(event.seq)) {
-      return fail("malformed", "Canonical events must carry a sequence.");
+  // Hierarchy integrity: an Attempt belongs to this Job, and a Call belongs to
+  // one of its Attempts. The backend builds the lists that way, so a violation
+  // means the payload is not the projection of one Job.
+  const attemptIds = new Set(state.attempts.map((item) => item.id));
+  for (const item of state.attempts) {
+    if (item.job_id !== state.job.id) {
+      return fail("malformed", `Attempt ${item.id} does not belong to Job ${state.job.id}.`);
     }
-    events.push({
-      seq: event.seq,
-      kind: isNonEmptyString(event.kind) ? event.kind : "unknown",
-      payload: typeof event.payload === "string" ? event.payload : "",
-      by_run_id: isNonNegativeInteger(event.by_run_id) ? event.by_run_id : null,
-    });
   }
-  const headSequence = events.reduce((highest, event) => Math.max(highest, event.seq), 0);
-  if (input.cursor < headSequence) {
+  for (const item of state.calls) {
+    if (!attemptIds.has(item.attempt_id)) {
+      return fail("malformed", `Call ${item.id} names an Attempt the snapshot does not carry.`);
+    }
+  }
+  // The authoritative Attempt is the backend's decision. A snapshot that names
+  // an Attempt it does not carry is refused rather than rendered as unattached.
+  const authoritative = state.job.authoritative_attempt_id;
+  if (authoritative !== null && !attemptIds.has(authoritative)) {
+    return fail("malformed", `Job ${state.job.id} names an authoritative Attempt it does not carry.`);
+  }
+
+  // The event tail is synthesized one event per Attempt, so a cursor that does
+  // not cover its own Attempts is behind the stream it claims to summarize.
+  if (input.cursor < state.attempts.length) {
     return fail("cursor", "Canonical cursor is behind its own event stream.");
   }
-
-  // Records that are not objects are ignored rather than padded with invented
-  // ids: a selector must never see an id of 0 as evidence of a verification.
-  const verificationRecords = Array.isArray(mission.verifications) ? mission.verifications.filter(isRecord) : [];
-  const verifications = verificationRecords.map((record) => ({
-    verification_id: isNonEmptyString(record.verification_id) ? record.verification_id : "unknown",
-    node_id: isNonNegativeInteger(record.node_id) ? record.node_id : 0,
-    run_id: isNonNegativeInteger(record.run_id) ? record.run_id : 0,
-    dispatch_id: isNonEmptyString(record.dispatch_id) ? record.dispatch_id : "",
-    outcome: record.outcome === "passed" ? ("passed" as const) : ("failed" as const),
-    passed: record.passed === true,
-    commands: Array.isArray(record.commands) ? record.commands.filter(isNonEmptyString) : [],
-    created_at: typeof record.created_at === "number" ? record.created_at : 0,
-  }));
-
-  const lateResultRecords = Array.isArray(mission.late_results) ? mission.late_results.filter(isRecord) : [];
-  const lateResults = lateResultRecords.map((record) => ({
-    node_id: isNonNegativeInteger(record.node_id) ? record.node_id : 0,
-    run_id: isNonNegativeInteger(record.run_id) ? record.run_id : 0,
-    dispatch_id: isNonEmptyString(record.dispatch_id) ? record.dispatch_id : "",
-    result: typeof record.result === "string" ? record.result : "",
-  }));
 
   return {
     ok: true,
     projection: {
       apiVersion: CANONICAL_API_VERSION,
       projectId: expectedProjectId,
-      missionId: mission.mission_id,
-      rootNodeId: mission.root_node_id,
+      jobId: state.job.id,
       cursor: input.cursor,
-      workNodes,
-      dependencies,
-      runs,
-      events,
-      verifications,
-      lateResults,
+      job: state.job,
+      attempts: state.attempts,
+      calls: state.calls,
+      executionGraph: state.executionGraph,
     },
   };
 }
@@ -320,117 +157,200 @@ export function projectCanonicalSnapshot(
 /* Presentation projection                                                    */
 /* -------------------------------------------------------------------------- */
 
-const NODE_STATUS: Record<CanonicalWorkState, ExecutionStatus> = {
-  ready: "ready",
+/**
+ * Job state as the read model reports it.
+ *
+ * `unknown` and `orphaned` are the substrate's own words for "this Job has no
+ * authority behind it any more", which the read model shows as blocked rather
+ * than guessing an outcome for it.
+ */
+const JOB_STATUS: Record<CanonicalJobState, MissionExecution["status"]> = {
+  pending: "waiting",
+  eligible: "waiting",
   running: "running",
+  cancelling: "running",
   completed: "completed",
   failed: "failed",
   cancelled: "cancelled",
+  unknown: "blocked",
+  orphaned: "blocked",
 };
 
-const WORKER_STATUS: Record<CanonicalRunState, WorkerExecution["status"]> = {
-  active: "active",
+/**
+ * Call state as the read model reports it.
+ *
+ * `domain_calls.state` is an unconstrained column, so the vocabulary the
+ * substrate writes is spelled out here and anything else stays visible as its
+ * raw value instead of being coerced into a status it might contradict.
+ */
+const CALL_STATUS: Record<string, ExecutionStatus> = {
+  created: "queued",
+  running: "running",
   completed: "completed",
-  failed: "blocked",
-  cancelled: "idle",
-  superseded: "idle",
-  fenced: "idle",
+  failed: "failed",
+  unknown: "blocked",
 };
 
-const NODE_ID_PREFIX = "wn";
+/** Attempt state as the read model's three-valued attempt history reports it. */
+const ATTEMPT_STATUS: Record<CanonicalAttemptState, ExecutionAttempt["status"]> = {
+  queued: "running",
+  running: "running",
+  cancelling: "running",
+  completed: "completed",
+  failed: "failed",
+  cancelled: "failed",
+  unknown: "failed",
+  orphaned: "failed",
+};
 
-/** A stable, project-scoped task id for one canonical WorkNode. */
-export function canonicalTaskId(projectId: ProjectId, missionId: string, nodeId: number): string {
-  return `${projectId}:${missionId}:${NODE_ID_PREFIX}${nodeId}`;
+const ENTITY_PREFIX = {
+  job: "job",
+  call: "call",
+  executor: "executor",
+} as const;
+
+/** A stable, Project-scoped presentation id for one canonical entity. */
+export function canonicalEntityId(projectId: ProjectId, kind: keyof typeof ENTITY_PREFIX, id: string): string {
+  return `${projectId}:${ENTITY_PREFIX[kind]}:${id}`;
 }
 
-function attemptsForRuns(runs: CanonicalRun[]): ExecutionAttempt[] {
-  return runs.map((run) => ({
-    number: run.generation,
-    status: run.state === "completed" ? "completed" : run.state === "active" ? "running" : "failed",
-    model: run.contract.model,
-    provider: run.contract.model.includes("/") ? run.contract.model.split("/")[0]! : undefined,
-    reason: run.state === "fenced" ? "superseded by a replacement Run generation" : undefined,
-  }));
+function callStatus(call: CanonicalCall): ExecutionStatus {
+  return CALL_STATUS[call.state] ?? "blocked";
+}
+
+function callReason(call: CanonicalCall, status: ExecutionStatus): string | undefined {
+  if (status === "blocked" && CALL_STATUS[call.state] === undefined) {
+    return `Call state "${call.state}" is not one this view interprets.`;
+  }
+  if (status === "failed" || status === "blocked") return call.response ?? undefined;
+  return undefined;
+}
+
+/** The substrate stores epoch seconds; the read model counts milliseconds. */
+function elapsedMs(call: CanonicalCall): number | undefined {
+  if (call.finished_at === null) return undefined;
+  return Math.max(0, (call.finished_at - call.created_at) * 1000);
+}
+
+function instant(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
+}
+
+function callActivity(
+  projectId: ProjectId,
+  jobId: string,
+  call: CanonicalCall,
+  taskId: string,
+  attempt: CanonicalAttempt | undefined,
+): ExecutionActivityItem {
+  const status = callStatus(call);
+  const settled = call.finished_at ?? call.created_at;
+  const message = callReason(call, status) ?? `Call ${call.state}`;
+  const kind =
+    status === "completed"
+      ? "task-completed"
+      : status === "running"
+        ? "task-started"
+        : status === "queued"
+          ? "task-waiting"
+          : status === "failed" || status === "blocked"
+            ? "task-blocked"
+            : "mission-transition";
+  return {
+    id: `${jobId}:call:${call.id}:${settled}`,
+    elapsedMs: Math.max(0, (settled - call.created_at) * 1000),
+    timestamp: formatTimestamp(instant(settled)),
+    missionId: jobId,
+    taskId,
+    workerId:
+      call.executor_id === null
+        ? undefined
+        : canonicalEntityId(projectId, "executor", call.executor_id),
+    kind,
+    message: attempt === undefined ? message : `Generation ${attempt.generation} · ${message}`,
+    status,
+  };
 }
 
 /**
- * Project canonical WorkNode/Run state onto the existing Execution Graph and
- * Mission Control contract. The result is a read-only view: it never becomes
- * execution authority, and it never rewrites a frozen Run contract.
+ * Project the canonical execution state onto the existing Execution Graph and
+ * Mission Control read model.
+ *
+ * A Call is the unit of work, an Attempt is one generation of the Job that owns
+ * it, and an Executor is whoever ran it — those are the only three relationships
+ * the substrate reports, so those are the only ones drawn. The Job's dependency
+ * edges live in the substrate but are not part of this projection, so the graph
+ * is a flat list rather than a DAG the PWA would have to invent edges for.
  */
 export function toMissionExecution(
-  projection: CanonicalWorkProjection,
+  projection: CanonicalExecutionProjection,
   title: string,
 ): MissionExecution {
-  const byNode = new Map<number, CanonicalRun[]>();
-  for (const run of projection.runs) {
-    const list = byNode.get(run.node_id) ?? [];
-    list.push(run);
-    byNode.set(run.node_id, list);
-  }
-  const dependents = new Map<number, number[]>();
-  for (const edge of projection.dependencies) {
-    const list = dependents.get(edge.depends_on_node_id) ?? [];
-    list.push(edge.node_id);
-    dependents.set(edge.depends_on_node_id, list);
-  }
+  const { projectId, jobId } = projection;
+  const attemptById = new Map(projection.attempts.map((item) => [item.id, item]));
 
-  const tasks: ExecutionTask[] = projection.workNodes.map((node) => {
-    const runs = (byNode.get(node.node_id) ?? []).slice().sort((a, b) => a.generation - b.generation);
-    const active = node.active_run_id === null
-      ? null
-      : runs.find((run) => run.run_id === node.active_run_id) ?? null;
-    const attempts = attemptsForRuns(runs);
+  const tasks: ExecutionTask[] = projection.calls.map((call) => {
+    const attempt = attemptById.get(call.attempt_id);
+    const status = callStatus(call);
+    const workerId =
+      call.executor_id === null
+        ? undefined
+        : canonicalEntityId(projectId, "executor", call.executor_id);
     return {
-      id: canonicalTaskId(projection.projectId, projection.missionId, node.node_id),
-      missionId: projection.missionId,
-      title: node.payload || `WorkNode ${node.node_id}`,
-      description: node.parent_node_id === null ? "Mission root WorkNode" : `Child of WorkNode ${node.parent_node_id}`,
+      id: canonicalEntityId(projectId, "call", call.id),
+      missionId: jobId,
+      title: call.id,
+      description: [
+        attempt === undefined ? undefined : `Attempt ${attempt.id} generation ${attempt.generation}`,
+        call.side_effect ? "side effect" : "no side effect",
+        call.effect_kind,
+      ]
+        .filter(Boolean)
+        .join(" · "),
       kind: "task",
-      category: `node-${node.node_id}`,
-      status: NODE_STATUS[node.state],
-      dependencies: projection.dependencies
-        .filter((edge) => edge.node_id === node.node_id)
-        .map((edge) => canonicalTaskId(projection.projectId, projection.missionId, edge.depends_on_node_id)),
-      dependents: (dependents.get(node.node_id) ?? []).map(
-        (dependent) => canonicalTaskId(projection.projectId, projection.missionId, dependent),
-      ),
-      workerId: active === null ? undefined : canonicalTaskId(projection.projectId, projection.missionId, active.run_id),
-      workerRole: active?.contract.role,
-      provider: active?.contract.model.includes("/") ? active.contract.model.split("/")[0]! : active?.contract.model,
-      model: active?.contract.model,
-      attempt: active?.generation,
-      maxAttempts: attempts.length,
-      retryCount: Math.max(0, runs.length - 1),
+      category: call.effect_kind,
+      status,
+      // The projection carries no prerequisite edges, so none are claimed.
+      dependencies: [],
+      dependents: [],
+      workerId,
+      startedAt: instant(call.created_at),
+      finishedAt: call.finished_at === null ? undefined : instant(call.finished_at),
+      elapsedMs: elapsedMs(call),
+      blockedReason: callReason(call, status),
+      outputSummary: call.response ?? undefined,
     };
   });
 
-  const edges: ExecutionEdge[] = projection.dependencies.map((edge) => ({
-    id: `${projection.missionId}:${edge.depends_on_node_id}->${edge.node_id}`,
-    fromTaskId: canonicalTaskId(projection.projectId, projection.missionId, edge.depends_on_node_id),
-    toTaskId: canonicalTaskId(projection.projectId, projection.missionId, edge.node_id),
-    kind: "dependency",
-    status: "pending",
-  }));
+  const taskIdByCall = new Map(projection.calls.map((call, index) => [call.id, tasks[index]!.id]));
 
-  const workers: WorkerExecution[] = projection.runs
-    .filter((run) => run.witness !== null)
-    .map((run) => ({
-      id: canonicalTaskId(projection.projectId, projection.missionId, run.run_id),
-      role: run.contract.role === "lead" ? "lead" : "worker",
-      label: `${run.contract.executor} · ${run.contract.model}`,
-      status: WORKER_STATUS[run.state],
-      provider: run.contract.model.includes("/") ? run.contract.model.split("/")[0]! : run.contract.model,
-      model: run.contract.model,
-      currentTaskId: run.state === "active"
-        ? canonicalTaskId(projection.projectId, projection.missionId, run.node_id)
-        : undefined,
-      completedTaskIds: run.state === "completed"
-        ? [canonicalTaskId(projection.projectId, projection.missionId, run.node_id)]
-        : [],
-      retryCount: Math.max(0, run.generation - 1),
-    }));
+  const workers: WorkerExecution[] = [
+    ...new Set(projection.calls.map((call) => call.executor_id).filter((id): id is string => id !== null)),
+  ].map((executorId) => {
+    const owned = projection.calls.filter((call) => call.executor_id === executorId);
+    const statuses = owned.map(callStatus);
+    const running = owned.find((call) => callStatus(call) === "running");
+    const status: WorkerExecution["status"] = statuses.includes("running")
+      ? "active"
+      : statuses.every((item) => item === "completed")
+        ? "completed"
+        : statuses.some((item) => item === "failed" || item === "blocked")
+          ? "blocked"
+          : "queued";
+    return {
+      id: canonicalEntityId(projectId, "executor", executorId),
+      role: "worker",
+      label: executorId,
+      status,
+      currentTaskId: running === undefined ? undefined : taskIdByCall.get(running.id),
+      completedTaskIds: owned
+        .filter((call) => callStatus(call) === "completed")
+        .map((call) => taskIdByCall.get(call.id) ?? ""),
+      invocationCount: owned.length,
+    };
+  });
+
+  const edges: ExecutionEdge[] = [];
 
   const summary = tasks.reduce(
     (counts, task) => {
@@ -446,41 +366,44 @@ export function toMissionExecution(
     { completed: 0, running: 0, waiting: 0, blocked: 0, failed: 0, retrying: 0, total: 0 },
   );
 
-  const rootState = projection.workNodes.find((node) => node.node_id === projection.rootNodeId)?.state ?? "ready";
-  const status: MissionStatus | "waiting" | "blocked" | "cancelled" =
-    rootState === "completed"
-      ? "completed"
-      : rootState === "cancelled"
-        ? "cancelled"
-        : rootState === "failed"
-          ? "failed"
-          : summary.running > 0
-            ? "running"
-            : "waiting";
-
   return {
-    missionId: projection.missionId,
+    missionId: jobId,
     title,
-    status,
+    status: JOB_STATUS[projection.job.state],
     taskIds: tasks.map((task) => task.id),
     edgeIds: edges.map((edge) => edge.id),
     workerIds: workers.map((worker) => worker.id),
     tasks,
     edges,
     workers,
-    waves: [{ index: 0, taskIds: tasks.map((task) => task.id), status: status === "completed" ? "completed" : "active" }],
+    // The substrate has no waves: an Attempt is a generation of the same Job,
+    // not a batch of parallel work, so none are claimed.
+    waves: [],
     gates: [],
-    activities: projection.events.slice(-20).map((event) => ({
-      id: `${projection.missionId}:${event.seq}`,
-      elapsedMs: event.seq,
-      timestamp: new Date(event.seq * 1000).toISOString(),
-      missionId: projection.missionId,
-      kind: "mission-transition" as const,
-      message: event.kind,
-    })),
+    activities: projection.calls.map((call) =>
+      callActivity(
+        projectId,
+        jobId,
+        call,
+        taskIdByCall.get(call.id) ?? call.id,
+        attemptById.get(call.attempt_id),
+      ),
+    ),
     summary,
-    nextTaskIds: tasks.filter((task) => task.status === "ready").map((task) => task.id),
+    nextTaskIds: [],
   };
 }
 
-
+/** The Attempts of the projected Job, ordered by generation. */
+export function selectAttemptHistory(
+  projection: CanonicalExecutionProjection,
+): ExecutionAttempt[] {
+  return projection.attempts
+    .slice()
+    .sort((left, right) => left.generation - right.generation)
+    .map((attempt) => ({
+      number: attempt.generation,
+      status: ATTEMPT_STATUS[attempt.state],
+      reason: attempt.authoritative ? "authoritative generation" : "superseded generation",
+    }));
+}
