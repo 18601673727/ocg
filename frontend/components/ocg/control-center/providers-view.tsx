@@ -22,6 +22,7 @@ import {
 } from "@/components/ocg/primitives";
 import { humanizeStatus } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { SelectFilter } from "./filters";
 import type {
   BootstrapProvider,
   BootstrapProviderState,
@@ -202,11 +203,10 @@ export function ProvidersView({
             className="h-5 w-36 min-w-0 bg-transparent text-[11px] outline-none placeholder:text-muted-foreground"
           />
         </label>
-        <select
+        <SelectFilter
           value={stateFilter}
           onChange={(event) => onStateFilterChange(event.target.value as BootstrapProviderState | "all")}
           aria-label="Filter providers by connection state"
-          className="h-7 min-w-0 max-w-[10rem] truncate rounded border border-border bg-background px-1.5 text-[11px] outline-none"
         >
           <option value="all">All states</option>
           <option value="connected">Connected</option>
@@ -214,7 +214,7 @@ export function ProvidersView({
           <option value="degraded">Degraded</option>
           <option value="unavailable">Unavailable</option>
           <option value="unknown">Unknown</option>
-        </select>
+        </SelectFilter>
       </div>
 
       <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(220px,300px)_minmax(0,1fr)]">

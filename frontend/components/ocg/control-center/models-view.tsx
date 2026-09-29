@@ -22,6 +22,7 @@ import {
 } from "@/components/ocg/primitives";
 import { humanizeStatus } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { SelectFilter } from "./filters";
 import type {
   BootstrapModel,
   BootstrapModelStatus,
@@ -250,48 +251,47 @@ export function ModelsView({
         </label>
         <div className="flex min-w-0 items-center gap-1.5">
           <span className="sr-only">Filter by provider</span>
-        <select
+        <SelectFilter
+            className="max-w-[13rem]"
             value={providerFilter}
             onChange={(event) => onProviderFilterChange(event.target.value)}
             aria-label="Filter models by provider"
-            className="h-7 min-w-0 max-w-[13rem] truncate rounded border border-border bg-background px-1.5 text-[11px] outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
           >
             <option value="">All providers</option>
             {providers.map((provider) => (
               <option key={provider.id} value={provider.id}>{provider.label}</option>
             ))}
-        </select>
-        <select
+        </SelectFilter>
+        <SelectFilter
+          className="max-w-[9rem]"
           value={statusFilter}
           onChange={(event) => onStatusFilterChange(event.target.value as BootstrapModelStatus | "all")}
           aria-label="Filter models by availability"
-          className="h-7 min-w-0 max-w-[9rem] truncate rounded border border-border bg-background px-1.5 text-[11px] outline-none"
         >
           <option value="all">All availability</option>
           <option value="available">Available</option>
           <option value="pending">Pending</option>
           <option value="unavailable">Unavailable</option>
           <option value="unknown">Unknown</option>
-        </select>
-        <select
+        </SelectFilter>
+        <SelectFilter
+          className="max-w-[9rem]"
           value={assignmentFilter}
           onChange={(event) => onAssignmentFilterChange(event.target.value as "assigned" | "unassigned" | "all")}
           aria-label="Filter models by assignment"
-          className="h-7 min-w-0 max-w-[9rem] truncate rounded border border-border bg-background px-1.5 text-[11px] outline-none"
         >
           <option value="all">All assignments</option>
           <option value="assigned">Assigned</option>
           <option value="unassigned">Unassigned</option>
-        </select>
-        <select
+        </SelectFilter>
+        <SelectFilter
           value={capabilityFilter}
           onChange={(event) => onCapabilityFilterChange(event.target.value)}
           aria-label="Filter models by capability"
-          className="h-7 min-w-0 max-w-[10rem] truncate rounded border border-border bg-background px-1.5 text-[11px] outline-none"
         >
           <option value="">All capabilities</option>
           {capabilities.map((capability) => <option key={capability.id} value={capability.id}>{capability.label}</option>)}
-        </select>
+        </SelectFilter>
         </div>
         <span className="ml-auto shrink-0 text-[10px] tabular-nums text-muted-foreground">
           {filtered.length} / {bootstrap.models.length} models
