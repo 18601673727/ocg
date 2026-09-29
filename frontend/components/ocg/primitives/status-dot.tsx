@@ -8,11 +8,14 @@ export function StatusDot({
   tone,
   pulse = false,
   size = "sm",
+  title,
   className,
 }: {
   tone: Tone;
   pulse?: boolean;
   size?: "sm" | "md";
+  /** The dot is aria-hidden, so carry the meaning in a tooltip when it is the only cue. */
+  title?: string;
   className?: string;
 }) {
   return (
@@ -24,6 +27,7 @@ export function StatusDot({
         pulse && "animate-pulse",
         className,
       )}
+      title={title}
       aria-hidden="true"
     />
   );

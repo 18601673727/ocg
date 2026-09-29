@@ -86,8 +86,3 @@ export const LOG_LEVEL: Record<LogLevel, StatusVisual> = {
   warn: { tone: "amber" },
   error: { tone: "red" },
 };
-
-/** Wire/domain status words render as lowercase words, not kebab-case. */
-export function humanizeStatus(value: string): string {
-  return value.replace(/-/g, " ");
-}
