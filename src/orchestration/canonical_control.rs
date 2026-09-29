@@ -6,7 +6,7 @@
 //! canonical Mission snapshot needed to reconcile a reconnect.
 
 use crate::error::{OcgError, Result};
-use crate::orchestration::substrate::{MissionId, SubstrateRepository};
+use crate::orchestration::domain::DomainRepository;
 use crate::project::{self, ProjectBoundary};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -289,10 +289,7 @@ impl CanonicalControlService {
             return Err(invalid("project root is not a directory"));
         }
         let boundary_root = project::canonicalize(boundary.root());
-        let project_id = format!(
-            "project-{}",
-            &crate::runtime::hash::sha256_hex(root.to_string_lossy().as_bytes())[..24]
-        );
+        let project_id = DomainRepository::open(&root)?.ensure_project(&root)?.id;
         let mut projects = self.read_projects()?;
         let record = projects
             .iter_mut()
@@ -347,7 +344,7 @@ impl CanonicalControlService {
         &self,
         command_id: &str,
         config: GlobalConfiguration,
-        now: i64,
+        _now: i64,
     ) -> Result<CanonicalConfigurationResponse> {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
@@ -367,7 +364,6 @@ impl CanonicalControlService {
             global: config,
             project_defaults: ProjectConfiguration::default(),
         };
-        let _ = now;
         Ok(CanonicalConfigurationResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             command_id: command_id.to_string(),
@@ -383,7 +379,7 @@ impl CanonicalControlService {
         command_id: &str,
         project_id: &str,
         defaults: Value,
-        now: i64,
+        _now: i64,
     ) -> Result<CanonicalConfigurationResponse> {
         if !safe_id(command_id) || !defaults.is_object() {
             return Err(invalid("invalid project configuration command"));
@@ -405,7 +401,6 @@ impl CanonicalControlService {
             global,
             project_defaults: entry,
         };
-        let _ = now;
         Ok(CanonicalConfigurationResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             command_id: command_id.to_string(),
@@ -421,14 +416,13 @@ impl CanonicalControlService {
         command_id: &str,
         mission_id: &str,
         config: Value,
-        now: i64,
+        _now: i64,
     ) -> Result<CanonicalMissionResponse> {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
-        let mission = MissionId::new(mission_id)?;
-        let mut repository = SubstrateRepository::open(&self.root)?;
-        let revision = repository.set_mission_config(&mission, &config, now)?;
+        let mut repository = DomainRepository::open(&self.root)?;
+        let revision = repository.set_job_configuration(mission_id, &config)?;
         Ok(CanonicalMissionResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             command_id: command_id.to_string(),
@@ -440,8 +434,7 @@ impl CanonicalControlService {
     }
 
     pub fn mission_configuration(&self, mission_id: &str) -> Result<Option<(Value, u64)>> {
-        let mission = MissionId::new(mission_id)?;
-        SubstrateRepository::open(&self.root)?.mission_config(&mission)
+        DomainRepository::open(&self.root)?.job_configuration(mission_id)
     }
 
     pub fn canonical_snapshot(
@@ -457,22 +450,25 @@ impl CanonicalControlService {
         if project.root != self.root.to_string_lossy() {
             return Err(invalid("Project identity does not own this boundary"));
         }
-        let mission = MissionId::new(mission_id)?;
-        let mut repository = SubstrateRepository::open(&self.root)?;
-        let state = repository
-            .load(&mission)?
-            .ok_or_else(|| invalid("unknown canonical Mission"))?;
-        let verifications = repository.verifications(&mission)?;
-        let late = repository.late_results(&mission)?;
+        let repository = DomainRepository::open(&self.root)?;
+        let job = repository
+            .job(mission_id)?
+            .ok_or_else(|| invalid("unknown canonical Job"))?;
+        let attempts = repository.attempts_for_job(mission_id)?;
+        let calls = attempts
+            .iter()
+            .map(|attempt| repository.calls_for_attempt(&attempt.id))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let value = json!({
-            "mission_id":mission_id,"root_node_id":0,
-            "work_nodes":state.work_nodes.iter_enumerated().map(|(id,node)| json!({"node_id":id.0,"parent_node_id":node.parent_node_id.map(|id|id.0),"spawned_by_run_id":node.spawned_by_run_id.map(|id|id.0),"state":format!("{:?}",node.state).to_lowercase(),"generation":node.generation,"active_run_id":node.active_run_id.map(|id|id.0),"payload":node.payload})).collect::<Vec<_>>(),
-            "dependencies":state.dependencies.iter().map(|edge| json!({"node_id":edge.node_id.0,"depends_on_node_id":edge.depends_on_node_id.0})).collect::<Vec<_>>(),
-            "runs":state.runs.iter_enumerated().map(|(id,run)| json!({"run_id":id.0,"node_id":run.node_id.0,"generation":run.generation,"state":format!("{:?}",run.state).to_lowercase(),"contract":run.contract(),"runtime_execution_id":run.runtime_execution_id,"host_session_id":run.host_session_id,"result":run.result,"witness":repository.witness_for_run(&mission,id).ok().flatten().map(|witness| witness.to_json())})).collect::<Vec<_>>(),
-            "events":state.events.iter().map(|event| json!({"seq":event.seq,"kind":event.kind,"payload":event.payload,"by_run_id":event.by_run_id.map(|id|id.0)})).collect::<Vec<_>>(),
-            "verifications":verifications,"late_results":late.iter().map(|(node,run,dispatch,result)| json!({"node_id":node,"run_id":run,"dispatch_id":dispatch,"result":result})).collect::<Vec<_>>()
+            "job":job,
+            "attempts":attempts,
+            "calls":calls,
+            "execution_graph":"canonical state projection"
         });
-        let cursor = state.events.last().map(|event| event.seq).unwrap_or(0);
+        let cursor = calls.len() as u64 + attempts.len() as u64;
         Ok(CanonicalWorkSnapshot {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             project_id: project_id.to_string(),
@@ -490,13 +486,14 @@ impl CanonicalControlService {
         let snapshot = self.canonical_snapshot(project_id, mission_id)?;
         let events = snapshot
             .mission
-            .get("events")
+            .get("attempts")
             .and_then(Value::as_array)
-            .ok_or_else(|| invalid("invalid canonical event projection"))?;
+            .ok_or_else(|| invalid("invalid canonical Attempt projection"))?;
         Ok(events
             .iter()
-            .filter_map(|event| {
-                let sequence = event.get("seq")?.as_u64()?;
+            .enumerate()
+            .filter_map(|(index, attempt)| {
+                let sequence = index as u64 + 1;
                 if sequence <= after {
                     return None;
                 }
@@ -506,13 +503,8 @@ impl CanonicalControlService {
                     mission_id: mission_id.to_string(),
                     sequence,
                     event_id: format!("{mission_id}:{sequence}"),
-                    kind: event.get("kind")?.as_str()?.to_string(),
-                    payload: event
-                        .get("payload")
-                        .and_then(|payload| {
-                            serde_json::from_str(payload.as_str().unwrap_or("null")).ok()
-                        })
-                        .unwrap_or(Value::Null),
+                    kind: "attempt_projection".to_string(),
+                    payload: attempt.clone(),
                 })
             })
             .collect())
@@ -528,8 +520,9 @@ impl CanonicalControlService {
             .into_iter()
             .find(|project| project.project_id == project_id)
             .ok_or_else(|| invalid("unknown Project identity"))?;
-        let mut repository = SubstrateRepository::open(&self.root)?;
-        let missions = repository.list_missions()?.into_iter().map(|(id,created,state,completed)| json!({"mission_id":id,"created_at":created,"state":state,"completed_at":completed})).collect();
+        let repository = DomainRepository::open(&self.root)?;
+        let canonical_project = repository.ensure_project(&self.root)?;
+        let missions = repository.jobs(&canonical_project.id)?.into_iter().map(|job| json!({"mission_id":job.id,"job_id":job.id,"created_at":job.created_at,"state":job.state,"updated_at":job.updated_at})).collect();
         let selected_mission = mission_id
             .map(|id| self.canonical_snapshot(&project.project_id, id))
             .transpose()?;

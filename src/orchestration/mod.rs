@@ -22,6 +22,7 @@
 
 pub mod bridge;
 pub mod budget;
+pub mod call_schema;
 pub mod canonical_control;
 pub mod checkpoint;
 pub mod config;
@@ -29,16 +30,16 @@ pub mod context_governor;
 pub mod control;
 pub mod controller;
 pub mod dispatch;
+pub mod domain;
+pub mod execution_dispatch;
 pub mod handoff;
+pub mod mcp_glue;
 pub mod mission;
 pub mod plugin;
 pub mod policy;
 pub mod projection;
-pub mod reconcile;
 pub mod replay;
-pub mod rollover;
 pub mod state;
-pub mod substrate;
 
 pub use budget::{
     admit as admit_spend, reservation_id, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
@@ -73,9 +74,9 @@ pub use handoff::{
     Transition,
 };
 pub use mission::{
-    owner_for_execution, Mission, MissionEvent, MissionEventKind, MissionPolicyReceipt,
-    MissionReconcileReceipt, MissionReconcileState, MissionReconcileStatus, MissionRolloverState,
-    MissionRolloverStatus, MissionStatus, MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
+    Mission, MissionEvent, MissionEventKind, MissionPolicyReceipt, MissionReconcileReceipt,
+    MissionReconcileState, MissionReconcileStatus, MissionRolloverState, MissionRolloverStatus,
+    MissionStatus, MissionSummary, NextAction, MISSION_SCHEMA_VERSION,
 };
 pub use policy::{
     approval_dir, approval_id, approval_path, ensure_pending, evaluate as evaluate_policy,
@@ -84,24 +85,12 @@ pub use policy::{
     PolicyAction, PolicyAssessment, PolicyConfig, PolicyContext, PolicyDecision, PolicySummary,
     ResourceFacts, APPROVALS_DIR, APPROVAL_SCHEMA_VERSION, MAX_APPROVALS,
 };
-pub use reconcile::{
-    latest_artifact, load_artifact, plan, MissionStoreIssue, ObservationStatus, ReconcileAction,
-    ReconcileArtifact, ReconcileDecision, ReconcileInput, ReconcileOutcome, ReconcileResult,
-    ReconcileRun, RuntimeObservation, RECONCILE_SCHEMA_VERSION,
-};
 pub use replay::{
     replay_dir, state_path, AuthoritativeSnapshot, Cursor, DomainEvent, EventEnvelope, ReplayAfter,
     SnapshotConfig, SnapshotService, DEFAULT_RETENTION, MAX_RETENTION, REPLAY_DIR, REPLAY_FILE,
     REPLAY_SCHEMA_VERSION,
 };
-pub use rollover::{
-    ContinuationPacket, LeadBinding, RolloverArtifact, RolloverStatus, ROLLOVER_SCHEMA_VERSION,
-};
 pub use state::{
     Attempts, OrchestrationPhase, OrchestrationState, RepositoryBaseline, SessionState,
     STATE_SCHEMA_VERSION,
-};
-pub use substrate::{
-    Dependency, Event as SubstrateEvent, MissionId, MissionState, Run as SubstrateRun, RunContract,
-    RunId, RunState, SubstrateRepository, WorkNode as SubstrateWorkNode, WorkNodeId, WorkState,
 };

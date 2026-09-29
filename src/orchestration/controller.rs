@@ -31,34 +31,21 @@ use crate::context::engine::{ContextEngine, PlanOutcome};
 use crate::context::freshness::{Provenance, ENGINE_VERSION, SCHEMA_VERSION};
 use crate::context::gitdiff::{snapshot_fingerprint, GitSnapshot};
 use crate::error::{OcgError, Result};
-use crate::orchestration::budget::{
-    self, BudgetConfig, MissionBudgetReceipt, Money, QuotaFacts, SpendAction, SpendAssessment,
-};
+use crate::orchestration::budget::BudgetConfig;
 use crate::orchestration::checkpoint::{self, Checkpoint, Phase};
 use crate::orchestration::config::OrchestrationConfig;
 use crate::orchestration::context_governor::{
     self, ContextObservation, GovernorAction, GovernorDecision, GovernorState,
 };
+use crate::orchestration::domain::{CanonicalAdmission, DomainRepository};
 use crate::orchestration::handoff::{
     HandoffFinding, HandoffVerification, ModelHandoffCapsule, ProjectionInput, Role, Severity,
 };
-use crate::orchestration::mission::{
-    self, Mission, MissionEventKind, MissionReconcileStatus, MissionRolloverStatus, MissionStatus,
-};
 use crate::orchestration::policy::PolicyConfig;
 use crate::orchestration::projection::{self, ProjectionLimits};
-use crate::orchestration::rollover::{
-    self, ContinuationPacket, LeadBinding, RolloverArtifact, RolloverStatus,
-};
 use crate::orchestration::state::{self, Attempts, OrchestrationPhase, SessionState};
-use crate::orchestration::substrate::{
-    DispatchOutcome, DispatchWitness, MissionId, MissionState, RunContract, RunId, RunState,
-    SubstrateRepository, VerificationRecord, WitnessDisposition, WorkNodeId,
-};
 use crate::process::{CaptureRunner, GitHost};
-use crate::runtime::lifecycle::{
-    RuntimeAdapter, RuntimeContinuation, RuntimeError, RuntimeExecutionId, RuntimeProfile,
-};
+use crate::runtime::lifecycle::{RuntimeAdapter, RuntimeExecutionId, RuntimeProfile};
 use crate::telemetry::OrchestrationMetrics;
 use crate::verification::config::VerificationConfig;
 use crate::verification::distill;
@@ -71,10 +58,6 @@ use std::path::{Path, PathBuf};
 /// hand-offs. It is advisory: [`parse_explore_output`] still falls back to a
 /// deterministic line parser when the model ignores it.
 pub const EXPLORE_RESPONSE_CONTRACT: &str = "\nExplore response contract (advisory): end your reply with one JSON object and no prose after it:\n{\"goal\":\"...\",\"constraints\":[\"...\"],\"findings\":[{\"summary\":\"...\",\"source\":\"path\",\"severity\":\"info|warning|critical\"}],\"files\":[\"path\"],\"symbols\":[\"name\"]}\n";
-
-fn runtime_gear_error(error: RuntimeError) -> OcgError {
-    OcgError::config(error.to_string())
-}
 
 /// The dynamic context prepared for an ordinary user message.
 ///
@@ -236,9 +219,9 @@ pub struct ContextGovernanceResult {
     pub observation: ContextObservation,
     pub decision: GovernorDecision,
     /// The Mission-side lifecycle state, when a rollover artifact exists.
-    pub rollover_status: Option<MissionRolloverStatus>,
+    pub rollover_status: Option<String>,
     /// The artifact state, useful to diagnostics and recovery callers.
-    pub artifact_status: Option<RolloverStatus>,
+    pub artifact_status: Option<String>,
     pub artifact_id: Option<String>,
     pub source_session_id: Option<String>,
     pub target_session_id: Option<String>,
@@ -263,202 +246,30 @@ pub struct Controller<'a> {
 }
 
 impl<'a> Controller<'a> {
-    /// The canonical execution lane uses its own Mission namespace. Legacy
-    /// task admission cannot create this identity; it has no JSON fallback.
-    fn work_mission_id(id: &str) -> Result<MissionId> {
-        if !id.starts_with("wn-") {
-            return Err(OcgError::config("canonical MissionId must start with wn-"));
-        }
-        MissionId::new(id)
-    }
-
-    pub fn create_work_mission(
+    /// Admit the session prompt into the SQLite canonical execution domain.
+    /// The legacy Mission snapshot remains a compatibility/context projection;
+    /// it is not consulted for Job, Attempt, Executor, or Call authority.
+    pub fn admit_canonical_job(
         &self,
-        id: &str,
+        binding_key: &str,
         payload: &str,
-        lead: RunContract,
-        runtime: &RuntimeExecutionId,
-    ) -> Result<DispatchWitness> {
-        let id = Self::work_mission_id(id)?;
-        SubstrateRepository::open(&self.root)?.create_live_mission(
-            &id,
-            payload,
-            lead,
-            runtime.as_str(),
-            self.now(),
-        )
+        executor_kind: &str,
+    ) -> Result<CanonicalAdmission> {
+        let mut repository = DomainRepository::open(&self.root)?;
+        let project = repository.ensure_project(&self.root)?;
+        let admission = repository.admit_job(project, binding_key, payload, executor_kind)?;
+        Ok(admission)
     }
 
-    pub fn load_work_mission(&self, id: &str) -> Result<Option<MissionState>> {
-        let id = Self::work_mission_id(id)?;
-        SubstrateRepository::open(&self.root)?.load(&id)
-    }
-
-    pub fn create_child_work(
+    pub fn canonical_authority(
         &self,
-        id: &str,
-        parent: WorkNodeId,
-        by: RunId,
-        payload: &str,
-        dependencies: &[WorkNodeId],
-    ) -> Result<WorkNodeId> {
-        let id = Self::work_mission_id(id)?;
-        SubstrateRepository::open(&self.root)?.create_child_work(
-            &id,
-            parent,
-            by,
-            payload,
-            dependencies,
-            self.now(),
-        )
+        binding_key: &str,
+    ) -> Result<Option<crate::orchestration::domain::AttemptAuthority>> {
+        let repository = DomainRepository::open(&self.root)?;
+        let project = repository.ensure_project(&self.root)?;
+        repository.authority_for_binding(&project.id, binding_key)
     }
 
-    pub fn dispatch_work(
-        &self,
-        id: &str,
-        node: WorkNodeId,
-        by: RunId,
-        contract: RunContract,
-        runtime: &RuntimeExecutionId,
-    ) -> Result<DispatchWitness> {
-        let id = Self::work_mission_id(id)?;
-        SubstrateRepository::open(&self.root)?.dispatch_run(
-            &id,
-            node,
-            by,
-            contract,
-            runtime.as_str(),
-            self.now(),
-        )
-    }
-
-    pub fn finish_work(
-        &self,
-        id: &str,
-        node: WorkNodeId,
-        run: RunId,
-        outcome: RunState,
-        result: Option<&str>,
-    ) -> Result<()> {
-        let id = Self::work_mission_id(id)?;
-        SubstrateRepository::open(&self.root)?.finish_run(
-            &id,
-            node,
-            run,
-            outcome,
-            result,
-            self.now(),
-        )
-    }
-
-    /// Root and child failover call the same repository transaction.
-    pub fn replace_work_run(
-        &self,
-        id: &str,
-        node: WorkNodeId,
-        old: RunId,
-        contract: RunContract,
-        runtime: &RuntimeExecutionId,
-    ) -> Result<DispatchWitness> {
-        let id = Self::work_mission_id(id)?;
-        SubstrateRepository::open(&self.root)?.replace_bound_run(
-            &id,
-            node,
-            old,
-            contract,
-            runtime.as_str(),
-            self.now(),
-        )
-    }
-
-    pub fn record_late_work_result(&self, id: &str, run: RunId, result: &str) -> Result<()> {
-        let id = Self::work_mission_id(id)?;
-        SubstrateRepository::open(&self.root)?.record_fenced_result(&id, run, result)
-    }
-    /// Validate a durable witness against the canonical store. This is the
-    /// bridge's fail-closed identity gate before any result or child mutation.
-    pub fn validate_work_witness(&self, witness: &DispatchWitness) -> Result<WitnessDisposition> {
-        let mut repo = SubstrateRepository::open(&self.root)?;
-        repo.validate_witness(witness)
-    }
-
-    pub fn bind_work_runtime(&self, witness: &DispatchWitness, host_session: &str) -> Result<()> {
-        SubstrateRepository::open(&self.root)?.bind_host_session(witness, host_session)
-    }
-
-    pub fn finish_work_witness(
-        &self,
-        witness: &DispatchWitness,
-        outcome: RunState,
-        result: &str,
-    ) -> Result<DispatchOutcome> {
-        SubstrateRepository::open(&self.root)?.complete_dispatch(
-            witness,
-            outcome,
-            result,
-            self.now(),
-        )
-    }
-
-    pub fn record_work_verification(
-        &self,
-        witness: &DispatchWitness,
-        passed: bool,
-        report: &Value,
-        commands: &[String],
-    ) -> Result<VerificationRecord> {
-        SubstrateRepository::open(&self.root)?.record_verification(
-            witness,
-            passed,
-            report,
-            commands,
-            self.now(),
-        )
-    }
-
-    pub fn inspect_work(&self, id: &str) -> Result<Option<Value>> {
-        let mission = Self::work_mission_id(id)?;
-        let mut repo = SubstrateRepository::open(&self.root)?;
-        let state = repo.load(&mission)?;
-        let Some(state) = state else {
-            return Ok(None);
-        };
-        let lifecycle = repo.mission_state_row(&mission)?;
-        let verifications = repo.verifications(&mission)?;
-        let pending = repo.pending_dispatches(&mission)?;
-        let late = repo.late_results(&mission)?;
-        let mut witness_for = |run_id: RunId| repo.witness_for_run(&mission, run_id).ok().flatten();
-        Ok(Some(json!({
-            "api_version": "ocg.work.inspect.v1",
-            "mission_id": mission.as_str(),
-            "lifecycle": lifecycle.map(|(state,created_at,completed_at)| json!({"state":state,"created_at":created_at,"completed_at":completed_at})),
-            "root_node_id": state.root().0,
-            "work_nodes": state.work_nodes.iter_enumerated().map(|(id,node)| json!({
-                "node_id":id.0,"parent_node_id":node.parent_node_id.map(|id|id.0),
-                "spawned_by_run_id":node.spawned_by_run_id.map(|id|id.0),
-                "state":format!("{:?}",node.state).to_lowercase(),"generation":node.generation,
-                "active_run_id":node.active_run_id.map(|id|id.0),"payload":node.payload,
-                "priority":node.priority,"not_before":node.not_before
-            })).collect::<Vec<_>>(),
-            "dependencies": state.dependencies.iter().map(|dependency| json!({"node_id":dependency.node_id.0,"depends_on_node_id":dependency.depends_on_node_id.0})).collect::<Vec<_>>(),
-            "runs": state.runs.iter_enumerated().map(|(id,run)| {
-                let witness = witness_for(id);
-                json!({"run_id":id.0,"node_id":run.node_id.0,"generation":run.generation,
-                    "state":format!("{:?}",run.state).to_lowercase(),"contract":run.contract(),
-                    "runtime_execution_id":run.runtime_execution_id,"host_session_id":run.host_session_id,
-                    "result":run.result,"witness":witness.map(|w| w.to_json())})
-            }).collect::<Vec<_>>(),
-            "events": state.events.iter().map(|event| json!({"seq":event.seq,"kind":event.kind,"payload":event.payload,"by_run_id":event.by_run_id.map(|id|id.0)})).collect::<Vec<_>>(),
-            "pending_dispatches": pending.iter().map(DispatchWitness::to_json).collect::<Vec<_>>(),
-            "late_results": late.iter().map(|(node,run,dispatch,result)| json!({"node_id":node,"run_id":run,"dispatch_id":dispatch,"result":result})).collect::<Vec<_>>(),
-            "verifications": verifications.iter().map(|record| json!({"verification_id":record.verification_id,"node_id":record.node_id,"run_id":record.run_id,"dispatch_id":record.dispatch_id,"outcome":record.outcome,"trusted":record.trusted,"passed":record.passed,"commands":record.commands,"created_at":record.created_at})).collect::<Vec<_>>()
-        })))
-    }
-
-    pub fn complete_work_mission(&self, id: &str, state: &str) -> Result<()> {
-        let mission = Self::work_mission_id(id)?;
-        SubstrateRepository::open(&self.root)?.complete_mission(&mission, state, self.now())
-    }
     pub fn new(
         root: impl Into<PathBuf>,
         config: OrchestrationConfig,
@@ -504,141 +315,12 @@ impl<'a> Controller<'a> {
         &self.budget
     }
 
-    /// Mandatory economic admission for one provider-costly action.
-    ///
-    /// This is the economic safety boundary and is deliberately *not* part of
-    /// the optional Policy pipeline: it is evaluated independently of
-    /// `policy.enabled`, and a generic approval can never satisfy it. The only
-    /// way past a hard cap is to change the hard budget itself.
-    ///
-    /// It loads the Mission fresh, materializes the configured hard budget
-    /// exactly once, evaluates the bounded spend, and durably records a
-    /// reservation before returning an `Allow`. If a concurrent writer would
-    /// leave an `Allow` unpersisted, the admission fails closed.
-    pub fn admit_mandatory_spend(
-        &self,
-        mission_id: &str,
-        action: SpendAction,
-        operation_id: &str,
-        quota: QuotaFacts,
-        now: i64,
-    ) -> Result<(SpendAssessment, MissionBudgetReceipt)> {
-        let Some(mut mission) = mission::load(&self.root, mission_id)? else {
-            return Err(OcgError::config(
-                "Mission disappeared during mandatory economic admission",
-            ));
-        };
-        let expected_revision = mission.revision;
-        let expected_owner = mission.session_id.clone();
-        let assessment = mission.admit_spend(
-            &self.budget,
-            action,
-            operation_id,
-            self.budget.estimated_cost(),
-            quota,
-            now,
-        );
-        if mission.revision != expected_revision
-            && !mission::save_if_revision(
-                &self.root,
-                &mission,
-                expected_revision,
-                expected_owner.as_deref(),
-            )?
-            && assessment.is_allowed()
-        {
-            // A concurrent local writer won the race. An unpersisted reservation
-            // must never authorize a provider-costly side effect.
-            return Err(OcgError::config(
-                "Mission changed during economic admission; the bounded spend was not durably reserved",
-            ));
-        }
-        let receipt = mission.budget.receipt();
-        Ok((assessment, receipt))
-    }
-
-    /// Settle a mandatory reservation exactly once against the bounded actual
-    /// (or the reservation amount when no actual usage is known).
-    pub fn settle_mandatory_spend(
-        &self,
-        mission_id: &str,
-        reservation_id: &str,
-        actual: Option<Money>,
-        now: i64,
-    ) -> Result<bool> {
-        let Some(mut mission) = mission::load(&self.root, mission_id)? else {
-            return Ok(false);
-        };
-        let expected_revision = mission.revision;
-        let expected_owner = mission.session_id.clone();
-        let changed = mission.settle_spend(reservation_id, actual, now)?;
-        if changed
-            && !mission::save_if_revision(
-                &self.root,
-                &mission,
-                expected_revision,
-                expected_owner.as_deref(),
-            )?
-        {
-            return Err(OcgError::config(
-                "Mission changed while settling a mandatory reservation",
-            ));
-        }
-        Ok(changed)
-    }
-
-    /// Retain a reservation whose dispatch outcome is uncertain.
-    pub fn mark_mandatory_spend_unresolved(
-        &self,
-        mission_id: &str,
-        reservation_id: &str,
-        now: i64,
-    ) -> Result<bool> {
-        let Some(mut mission) = mission::load(&self.root, mission_id)? else {
-            return Ok(false);
-        };
-        let expected_revision = mission.revision;
-        let expected_owner = mission.session_id.clone();
-        let changed = mission.mark_spend_unresolved(reservation_id, now);
-        if changed
-            && !mission::save_if_revision(
-                &self.root,
-                &mission,
-                expected_revision,
-                expected_owner.as_deref(),
-            )?
-        {
-            return Err(OcgError::config(
-                "Mission changed while retaining an unresolved mandatory reservation",
-            ));
-        }
-        Ok(changed)
-    }
-
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Whether `execution_id` is the Mission's current durable runtime
-    /// execution binding. Raw runtime agent names are deliberately not part of
-    /// this decision: an OpenCode session may legitimately change its selected
-    /// agent while remaining the same root execution.
     pub fn is_current_execution(&self, execution_id: &RuntimeExecutionId) -> Result<bool> {
-        let Some(mission) = mission::find_by_session(&self.root, execution_id.as_str())? else {
-            return Ok(false);
-        };
-        Ok(self.is_current_execution_for(&mission, execution_id))
-    }
-
-    /// Check execution authority against an already-loaded Mission. This is
-    /// the allocation-free form used by reconciliation; it deliberately has
-    /// no runtime agent/model interpretation.
-    pub fn is_current_execution_for(
-        &self,
-        mission: &Mission,
-        execution_id: &RuntimeExecutionId,
-    ) -> bool {
-        mission.runtime_execution_id().as_ref() == Some(execution_id)
+        Ok(self.canonical_authority(execution_id.as_str())?.is_some())
     }
 
     pub fn config(&self) -> &OrchestrationConfig {
@@ -659,1542 +341,35 @@ impl<'a> Controller<'a> {
         state::load(&self.root)
     }
 
-    /// Load the Mission for `session.task_id`, creating one from the session
-    /// when the record is absent (sessions admitted before Missions existed
-    /// adopt one lazily, keeping their progress). A corrupt record fails
-    /// explicitly: the store quarantines it and it is never silently replaced
-    /// with a fresh Mission. Returns `None` only for a session with no task.
-    fn ensure_mission(&self, session: &SessionState, now: i64) -> Result<Option<Mission>> {
-        if session.task_id.is_empty() {
-            return Ok(None);
-        }
-        match mission::load(&self.root, &session.task_id)? {
-            Some(mission) => Ok(Some(mission)),
-            None => {
-                let mut mission = Mission::admit(
-                    &session.task_id,
-                    session.task.as_deref().unwrap_or(""),
-                    &session.session_id,
-                    now,
-                );
-                mission.sync_from_session(session);
-                Ok(Some(mission))
-            }
-        }
-    }
-
-    /// Resolve the Mission for a task admission: load the durable record for
-    /// `task_id` (creating it when absent), start a new generation when the
-    /// previous one reached a terminal state, and bind this session as the
-    /// Mission's replaceable execution state. The session's previous Mission
-    /// binding (a different admitted task) is released. The Mission identity
-    /// never changes because a session does.
-    fn admit_or_resume(
-        &self,
-        session_key: &str,
-        task_id: &str,
-        message: &str,
-        previous: Option<&SessionState>,
-        now: i64,
-    ) -> Result<Mission> {
-        if let Some(previous) = previous {
-            if !previous.task_id.is_empty() && previous.task_id != task_id {
-                if let Some(mut old) = mission::load(&self.root, &previous.task_id)? {
-                    if old.session_id.as_deref() == Some(session_key) {
-                        old.release_session(now);
-                        self.save_mission_preserving_reconcile(&old)?;
-                    }
-                }
-            }
-        }
-        let mut mission = match mission::load(&self.root, task_id)? {
-            Some(mission) => mission,
-            None => Mission::admit(task_id, &Self::stored_task_text(message), session_key, now),
-        };
-        if mission.is_terminal() {
-            // A terminal Mission is durable: it is never silently reset. A
-            // genuine re-admission starts a new generation instead.
-            mission.begin_new_generation(now);
-        }
-        if mission.session_id.as_deref() != Some(session_key) {
-            let interrupted_artifact = mission.rollover.artifact_id.clone();
-            let superseded = mission.supersede_rollover_for_rebind(session_key, now)?;
-            if superseded {
-                if let Some(artifact_id) = interrupted_artifact {
-                    if let Some(mut artifact) = rollover::load(&self.root, &artifact_id)? {
-                        artifact.mark_conflict(
-                            "explicit session admission superseded the interrupted rollover",
-                            now,
-                        );
-                        rollover::save(&self.root, &artifact)?;
-                    }
-                }
-            }
-        }
-        mission.bind_runtime_execution(&RuntimeExecutionId::new(session_key), now);
-        if mission.task.is_none() {
-            mission.task = Some(Self::stored_task_text(message));
-        }
-        Ok(mission)
-    }
-
-    /// Save a Mission mutation without allowing an older bridge snapshot to
-    /// erase the reconciler's independently CAS-claimed control state. The
-    /// reconciler still owns all changes to that state; ordinary semantic
-    /// bridge writes remain compatible with the existing controller path.
-    fn save_mission_preserving_reconcile(&self, mission: &Mission) -> Result<()> {
-        let mut candidate = mission.clone();
-        if let Ok(Some(current)) = mission::load(&self.root, &candidate.mission_id) {
-            // The durable budget ledger is authoritative economic state and is
-            // written only through the CAS admission paths. A stale workflow
-            // snapshot must never erase a reservation that was recorded after
-            // the snapshot was taken, or spend could exceed the hard cap.
-            candidate.budget = current.budget.clone();
-            // Preserving a newer durable budget must not also roll the revision
-            // witness backwards and defeat a later CAS.
-            candidate.revision = candidate.revision.max(current.revision);
-            let has_control_state = current.generation == candidate.generation
-                && current.reconcile.status != MissionReconcileStatus::Idle
-                && current.reconcile.operation_id.is_some();
-            let incoming_is_explicit_conflict =
-                candidate.reconcile.status == MissionReconcileStatus::Conflict;
-            if has_control_state {
-                if !incoming_is_explicit_conflict {
-                    candidate.reconcile = current.reconcile.clone();
-                }
-                // The bridge snapshot may predate the reconciler's CAS write.
-                // Never move the durable revision witness backwards while
-                // preserving (or explicitly invalidating) its control state.
-                candidate.revision = candidate.revision.max(current.revision.saturating_add(1));
-                candidate.updated_at = candidate.updated_at.max(current.updated_at);
-            }
-            // The replay authority requires a content change to strictly advance
-            // the revision witness. A merged stale snapshot may still differ in
-            // non-authoritative fields at an equal revision, so advance once
-            // rather than letting the authority reject a legitimate bridge write.
-            if candidate != current && candidate.revision <= current.revision {
-                candidate.revision = current.revision.saturating_add(1);
-                candidate.updated_at = candidate.updated_at.max(current.updated_at);
-            }
-        }
-        mission::save(&self.root, &candidate).map(|_| ())
-    }
-
-    /// Persist the Mission (durable product state, strict) before the session
-    /// state (disposable execution state, fail-soft as before). The Mission
-    /// is authoritative: a Mission write failure fails the call rather than
-    /// letting the session view run ahead of the durable record.
     fn persist(
         &self,
         loaded: &mut state::LoadedState,
         session: SessionState,
-        mission: Option<Mission>,
         now: i64,
     ) -> Result<()> {
-        if let Some(mission) = mission {
-            self.save_mission_preserving_reconcile(&mission)?;
-        }
         loaded.state.upsert(session, now);
-        let _ = state::save(&self.root, &loaded.state);
+        state::save(&self.root, &loaded.state)?;
         Ok(())
     }
 
-    /// Observe one root-Lead context boundary and, when policy and the runtime
-    /// contract agree, replace only the disposable execution session.
-    ///
-    /// The method deliberately owns the whole side-effect sequence. A caller
-    /// cannot mark a Mission as rolled over merely by observing a large number:
-    /// the continuation is staged, the target Lead is read back, the Mission
-    /// witness is checked again, and only then is ownership cut over. Failures
-    /// before cutover leave the old binding authoritative; a failure after
-    /// cutover is recorded as an active-but-unacknowledged rollover so recovery
-    /// can finish it without touching Mission identity or generation.
     pub fn observe_context(
         &self,
         session_id: &str,
-        mut observation: ContextObservation,
-        runtime: &mut dyn RuntimeAdapter,
-        profile: &RuntimeProfile,
-    ) -> Result<ContextGovernanceResult> {
-        let source_session_id = state::safe_id(session_id);
-        if source_session_id.is_empty() {
-            return Err(OcgError::config(
-                "context observation requires a session id",
-            ));
-        }
-        if observation.session_id.is_empty() {
-            observation.session_id = source_session_id.clone();
-        } else if state::safe_id(&observation.session_id) != source_session_id {
-            return Err(OcgError::config(
-                "context observation session does not match the runtime event session",
-            ));
-        }
-        if !self.config.context_governor.enabled {
-            if observation.event_id.is_empty() {
-                observation.event_id = context_governor::event_identity(
-                    &source_session_id,
-                    observation.assistant_message_id.as_deref(),
-                    observation.finish.as_deref(),
-                    Some(observation.observed_at),
-                );
-            }
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::Disabled,
-                    action: GovernorAction::Continue,
-                    utilization_percent: None,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "context governor is disabled".to_string(),
-                },
-                rollover_status: None,
-                artifact_status: None,
-                artifact_id: None,
-                source_session_id: Some(source_session_id),
-                target_session_id: None,
-                note: Some(
-                    "context governor is disabled; no telemetry or Mission mutation was performed"
-                        .to_string(),
-                ),
-            });
-        }
-        let now = self.now();
-        if observation.event_id.is_empty() {
-            observation.event_id = context_governor::event_identity(
-                &source_session_id,
-                observation.assistant_message_id.as_deref(),
-                observation.finish.as_deref(),
-                Some(observation.observed_at),
-            );
-        }
-        let decision = context_governor::decide(&self.config.context_governor, &observation);
-        // Telemetry is written before any runtime mutation. A crash after this
-        // point leaves an inspectable reason and cannot make the artifact the
-        // only source of truth.
-        context_governor::save_observation(&self.root, &observation)?;
-
-        let mut loaded = state::load(&self.root);
-        let session = if let Some(session) = loaded.state.session(&source_session_id).cloned() {
-            session
-        } else if let Some(mission) = mission::find_by_session(&self.root, &source_session_id)? {
-            // The disposable state file may be lost with a TUI/client. Rebuild
-            // only the session view from the authoritative Mission; no
-            // progress, generation or terminal state is inferred from chat.
-            let seeded = mission.seed_session(&source_session_id, now);
-            loaded.state.upsert(seeded.clone(), now);
-            let _ = state::save(&self.root, &loaded.state);
-            seeded
-        } else {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::Unknown,
-                    action: self.config.context_governor.unknown,
-                    utilization_percent: None,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "no admitted Mission/session state is available for rollover"
-                        .to_string(),
-                },
-                rollover_status: None,
-                artifact_status: None,
-                artifact_id: None,
-                source_session_id: Some(source_session_id),
-                target_session_id: None,
-                note: Some(
-                    "context observation was recorded without an admitted session".to_string(),
-                ),
-            });
-        };
-        let Some(mut mission) = self.ensure_mission(&session, now)? else {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::Unknown,
-                    action: self.config.context_governor.unknown,
-                    utilization_percent: None,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "the session has no admitted Mission".to_string(),
-                },
-                rollover_status: None,
-                artifact_status: None,
-                artifact_id: None,
-                source_session_id: Some(source_session_id),
-                target_session_id: None,
-                note: Some("context observation was recorded without a Mission".to_string()),
-            });
-        };
-        if mission.is_terminal() {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::Unknown,
-                    action: GovernorAction::Continue,
-                    utilization_percent: None,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "terminal Missions are frozen against session rollover".to_string(),
-                },
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: None,
-                artifact_id: mission.rollover.artifact_id.clone(),
-                source_session_id: Some(source_session_id),
-                target_session_id: mission.session_id.clone(),
-                note: Some("Mission is terminal; no generation or owner was changed".to_string()),
-            });
-        }
-        if mission.session_id.as_deref() != Some(source_session_id.as_str()) {
-            return Err(OcgError::config(format!(
-                "Mission {} is owned by another session; refusing stale context rollover",
-                mission.mission_id
-            )));
-        }
-        // An acknowledgement failure after cutover is a durable recovery job,
-        // not a reason to wait for another high-pressure observation. Recover
-        // it at the next verified safe boundary even when the new observation
-        // itself is now Normal; an unsafe boundary still only defers.
-        if mission.rollover.status == MissionRolloverStatus::Active
-            && mission.rollover.target_session_id.as_deref() == Some(source_session_id.as_str())
-            && mission
-                .rollover
-                .retry_after
-                .is_some_and(|retry_after| now < retry_after)
-        {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: decision.action,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: true,
-                    reason: "rollover recovery is cooling down; the target owner is retained"
-                        .to_string(),
-                },
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: None,
-                artifact_id: mission.rollover.artifact_id.clone(),
-                source_session_id: Some(source_session_id),
-                target_session_id: mission.session_id,
-                note: mission.rollover.last_error.clone(),
-            });
-        }
-        if mission.rollover.status == MissionRolloverStatus::Active
-            && mission.rollover.target_session_id.as_deref() == Some(source_session_id.as_str())
-        {
-            let pending = rollover::latest_for_mission(&self.root, &mission.mission_id)?;
-            if let Some(artifact) = pending.filter(|artifact| {
-                artifact.generation == mission.generation
-                    && artifact.target_session_id.as_deref() == Some(source_session_id.as_str())
-                    && matches!(
-                        artifact.status,
-                        RolloverStatus::Failed
-                            | RolloverStatus::CutoverIntent
-                            | RolloverStatus::Active
-                    )
-            }) {
-                if !observation.safe_boundary {
-                    return Ok(ContextGovernanceResult {
-                        observation,
-                        decision: GovernorDecision {
-                            state: GovernorState::RolloverRequired,
-                            action: GovernorAction::Continue,
-                            utilization_percent: decision.utilization_percent,
-                            rollover_allowed: false,
-                            deferred_for_boundary: true,
-                            reason:
-                                "active rollover recovery is waiting for a safe semantic boundary"
-                                    .to_string(),
-                        },
-                        rollover_status: Some(MissionRolloverStatus::Active),
-                        artifact_status: Some(artifact.status),
-                        artifact_id: Some(artifact.artifact_id),
-                        source_session_id: Some(source_session_id.clone()),
-                        target_session_id: Some(source_session_id),
-                        note: Some("continuation acknowledgement remains pending".to_string()),
-                    });
-                }
-                return self.recover_active_rollover(
-                    observation,
-                    decision,
-                    source_session_id,
-                    artifact,
-                    runtime,
-                    profile,
-                    now,
-                );
-            }
-        }
-        if !decision.rollover_allowed {
-            let expected_revision = mission.revision;
-            let expected_owner = mission.session_id.clone();
-            if mission::load(&self.root, &mission.mission_id)?.is_none() {
-                self.save_mission_preserving_reconcile(&mission)?;
-            } else {
-                let _ = mission::save_if_revision(
-                    &self.root,
-                    &mission,
-                    expected_revision,
-                    expected_owner.as_deref(),
-                )?;
-            }
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision,
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: None,
-                artifact_id: mission.rollover.artifact_id.clone(),
-                source_session_id: Some(source_session_id),
-                target_session_id: mission.session_id,
-                note: None,
-            });
-        }
-        if matches!(
-            mission.rollover.status,
-            MissionRolloverStatus::Failed | MissionRolloverStatus::Active
-        ) && mission
-            .rollover
-            .retry_after
-            .is_some_and(|retry_after| now < retry_after)
-        {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: decision.action,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: true,
-                    reason: "rollover retry is cooling down; the Mission owner is unchanged"
-                        .to_string(),
-                },
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: None,
-                artifact_id: mission.rollover.artifact_id.clone(),
-                source_session_id: Some(source_session_id),
-                target_session_id: mission.session_id,
-                note: mission.rollover.last_error.clone(),
-            });
-        }
-
-        if mission.rollover.status == MissionRolloverStatus::Conflict {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "rollover is conflicted and requires operator review; the Mission owner is unchanged"
-                        .to_string(),
-                },
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: Some(RolloverStatus::Conflict),
-                artifact_id: mission.rollover.artifact_id.clone(),
-                source_session_id: Some(source_session_id),
-                target_session_id: mission.session_id,
-                note: mission.rollover.last_error.clone(),
-            });
-        }
-
-        // Synchronize the current session view before freezing a continuation
-        // packet. This is the semantic boundary guarantee: the packet cannot
-        // describe an older Mission revision than the one being replaced.
-        let before_sync_revision = mission.revision;
-        let before_sync_owner = mission.session_id.clone();
-        mission.sync_from_session(&session);
-        if mission.revision != before_sync_revision
-            && !mission::save_if_revision(
-                &self.root,
-                &mission,
-                before_sync_revision,
-                before_sync_owner.as_deref(),
-            )?
-        {
-            return Err(OcgError::config(
-                "Mission changed while synchronizing the safe rollover boundary; retry later",
-            ));
-        }
-        let existing = rollover::latest_for_mission(&self.root, &mission.mission_id)?;
-        if existing.as_ref().is_some_and(|artifact| {
-            artifact.generation == mission.generation && artifact.status == RolloverStatus::Conflict
-        }) {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "the latest rollover artifact is conflicted; automatic replacement is frozen"
-                        .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Conflict),
-                artifact_status: Some(RolloverStatus::Conflict),
-                artifact_id: existing.map(|artifact| artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: mission.session_id,
-                note: Some("operator review is required before another rollover".to_string()),
-            });
-        }
-        let can_reuse = existing.as_ref().is_some_and(|existing| {
-            let source_matches = existing.source_session_id == source_session_id
-                || (mission.rollover.status == MissionRolloverStatus::Active
-                    && mission.rollover.target_session_id.as_deref()
-                        == Some(source_session_id.as_str())
-                    && existing.target_session_id.as_deref() == Some(source_session_id.as_str()));
-            existing.generation == mission.generation
-                && source_matches
-                && !existing.status.is_terminal()
-                && existing.status != RolloverStatus::Conflict
-        });
-        let new_artifact = !can_reuse;
-        let mut artifact = if can_reuse {
-            existing.expect("can_reuse implies an existing artifact")
-        } else {
-            RolloverArtifact::prepare_with_debug_retries(
-                &mission,
-                &source_session_id,
-                observation.clone(),
-                decision.reason.clone(),
-                Some(LeadBinding::from_runtime_profile(profile)),
-                now,
-                &self.config.context_governor,
-                self.config.max_debug_retries,
-            )?
-        };
-        artifact.runtime_profile = Some(profile.clone());
-        if artifact.artifact_id.is_empty() {
-            return Err(OcgError::config("rollover artifact has an empty id"));
-        }
-        if artifact.continuation.mission_id != mission.mission_id
-            || artifact.continuation.generation != mission.generation
-        {
-            return Err(OcgError::config(
-                "existing rollover continuation belongs to a different Mission generation",
-            ));
-        }
-        let orphan_prepared = !new_artifact
-            && mission.rollover.status == MissionRolloverStatus::Idle
-            && mission.rollover.artifact_id.is_none()
-            && matches!(
-                artifact.status,
-                RolloverStatus::Prepared
-                    | RolloverStatus::Failed
-                    | RolloverStatus::TargetReady
-                    | RolloverStatus::CutoverIntent
-            );
-        if new_artifact
-            || orphan_prepared
-            || matches!(
-                mission.rollover.status,
-                MissionRolloverStatus::Idle | MissionRolloverStatus::Applied
-            )
-        {
-            rollover::save(&self.root, &artifact)?;
-            let expected_revision = mission.revision;
-            let expected_owner = mission.session_id.clone();
-            mission.request_rollover(
-                &source_session_id,
-                &artifact.artifact_id,
-                &decision.reason,
-                now,
-            )?;
-            mission.mark_rollover_prepared(&artifact.artifact_id, now)?;
-            if !mission::save_if_revision(
-                &self.root,
-                &mission,
-                expected_revision,
-                expected_owner.as_deref(),
-            )? {
-                let conflict_reason = "Mission changed while recording rollover intent";
-                artifact.mark_conflict(conflict_reason, now);
-                rollover::save(&self.root, &artifact)?;
-                self.persist_rollover_conflict(
-                    &artifact.mission_id,
-                    &artifact.artifact_id,
-                    conflict_reason,
-                    now,
-                );
-                return Err(OcgError::config(
-                    "Mission changed while recording rollover intent; the prior owner is unchanged",
-                ));
-            }
-        } else {
-            let source_is_owner = mission.rollover.source_session_id.as_deref()
-                == Some(source_session_id.as_str())
-                || (mission.rollover.status == MissionRolloverStatus::Active
-                    && mission.rollover.target_session_id.as_deref()
-                        == Some(source_session_id.as_str()));
-            if !source_is_owner || mission.rollover.generation != mission.generation {
-                return Err(OcgError::config(
-                    "Mission rollover state does not match the current source session",
-                ));
-            }
-            if mission.rollover.status == MissionRolloverStatus::Failed {
-                // Re-open a retryable artifact explicitly. The event identity
-                // is stable, so a crash/replay does not manufacture another
-                // attempt.
-                if let Some(artifact_id) = mission.rollover.artifact_id.clone() {
-                    let expected_revision = mission.revision;
-                    let expected_owner = mission.session_id.clone();
-                    mission.mark_rollover_prepared(&artifact_id, now)?;
-                    if !mission::save_if_revision(
-                        &self.root,
-                        &mission,
-                        expected_revision,
-                        expected_owner.as_deref(),
-                    )? {
-                        let conflict_reason =
-                            "Mission changed while reopening a retryable rollover";
-                        artifact.mark_conflict(conflict_reason, now);
-                        rollover::save(&self.root, &artifact)?;
-                        self.persist_rollover_conflict(
-                            &artifact.mission_id,
-                            &artifact.artifact_id,
-                            conflict_reason,
-                            now,
-                        );
-                        return Err(OcgError::config(
-                            "Mission changed while reopening rollover; retry later",
-                        ));
-                    }
-                }
-            }
-        }
-        // Refresh a not-yet-targeted packet after a later safe boundary. This
-        // keeps newly committed findings/checkpoints while retaining the same
-        // deterministic artifact identity.
-        if !matches!(
-            artifact.status,
-            RolloverStatus::TargetReady | RolloverStatus::CutoverIntent | RolloverStatus::Active
-        ) {
-            let continuation = ContinuationPacket::from_mission(
-                &mission,
-                self.config.max_debug_retries,
-                self.config.context_governor.max_continuation_bytes,
-            )?;
-            artifact.continuation_digest = continuation.digest.clone();
-            artifact.continuation_bytes = continuation.bytes;
-            artifact.continuation = continuation;
-            artifact.observation = observation.clone();
-            artifact.reason = crate::telemetry::task::redact(&decision.reason);
-            artifact.set_base_mission(&mission);
-            artifact.updated_at = now;
-            rollover::save(&self.root, &artifact)?;
-        }
-        if mission.rollover.status == MissionRolloverStatus::Active
-            && mission.session_id.as_deref() == Some(source_session_id.as_str())
-            && mission.rollover.target_session_id.as_deref() == Some(source_session_id.as_str())
-            && artifact.target_session_id.as_deref() == Some(source_session_id.as_str())
-            && matches!(
-                artifact.status,
-                RolloverStatus::Failed | RolloverStatus::CutoverIntent | RolloverStatus::Active
-            )
-        {
-            return self.recover_active_rollover(
-                observation,
-                decision,
-                source_session_id,
-                artifact,
-                runtime,
-                profile,
-                now,
-            );
-        }
-        if decision.deferred_for_boundary {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision,
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: artifact.target_session_id,
-                note: Some(
-                    "rollover request is durable and waiting for a safe semantic boundary"
-                        .to_string(),
-                ),
-            });
-        }
-
-        let target_session_id = if let Some(target) = artifact.target_session_id.clone() {
-            target
-        } else {
-            match runtime
-                .create_execution()
-                .map(|target| target.to_string())
-                .map_err(runtime_gear_error)
-            {
-                Ok(target) => target,
-                Err(error) => {
-                    artifact.mark_failed(
-                        &error.to_string(),
-                        now,
-                        Some(
-                            now.saturating_add(self.config.context_governor.retry_cooldown_seconds),
-                        ),
-                    );
-                    rollover::save(&self.root, &artifact)?;
-                    self.persist_rollover_failure(
-                        &mut mission,
-                        &artifact.artifact_id,
-                        &error.to_string(),
-                        now,
-                        Some(
-                            now.saturating_add(self.config.context_governor.retry_cooldown_seconds),
-                        ),
-                    )?;
-                    return Ok(ContextGovernanceResult {
-                        observation,
-                        decision: GovernorDecision {
-                            state: GovernorState::RolloverRequired,
-                            action: GovernorAction::Rollover,
-                            utilization_percent: decision.utilization_percent,
-                            rollover_allowed: false,
-                            deferred_for_boundary: false,
-                            reason:
-                                "fresh target session creation failed; the old owner is unchanged"
-                                    .to_string(),
-                        },
-                        rollover_status: Some(mission.rollover.status),
-                        artifact_status: Some(artifact.status),
-                        artifact_id: Some(artifact.artifact_id),
-                        source_session_id: Some(source_session_id),
-                        target_session_id: None,
-                        note: Some(crate::telemetry::task::redact(&error.to_string())),
-                    });
-                }
-            }
-        };
-        let recovering_current_target = mission.rollover.status == MissionRolloverStatus::Active
-            && artifact.target_session_id.as_deref() == Some(target_session_id.as_str());
-        if target_session_id.is_empty()
-            || (target_session_id == source_session_id && !recovering_current_target)
-        {
-            let error = "rollover runtime returned an invalid target session";
-            artifact.mark_failed(
-                error,
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            );
-            rollover::save(&self.root, &artifact)?;
-            self.persist_rollover_failure(
-                &mut mission,
-                &artifact.artifact_id,
-                error,
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            )?;
-            return Err(OcgError::config(error));
-        }
-
-        let target_execution_id = RuntimeExecutionId::new(target_session_id.clone());
-        if let Err(error) = runtime
-            .prepare_execution(&target_execution_id, profile)
-            .map(|_| ())
-            .map_err(runtime_gear_error)
-        {
-            artifact.mark_failed(
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            );
-            rollover::save(&self.root, &artifact)?;
-            self.persist_rollover_failure(
-                &mut mission,
-                &artifact.artifact_id,
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            )?;
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Rollover,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "target Lead verification failed; the old owner is unchanged"
-                        .to_string(),
-                },
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(crate::telemetry::task::redact(&error.to_string())),
-            });
-        }
-        // The target identity is a runtime fact, not merely a string returned
-        // by the create call. Session info is read back before staging.
-        if let Err(error) = verify_target_execution(runtime, &target_execution_id) {
-            artifact.mark_failed(
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            );
-            rollover::save(&self.root, &artifact)?;
-            self.persist_rollover_failure(
-                &mut mission,
-                &artifact.artifact_id,
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            )?;
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Rollover,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason:
-                        "target session identity could not be verified; the old owner is unchanged"
-                            .to_string(),
-                },
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(crate::telemetry::task::redact(&error.to_string())),
-            });
-        }
-
-        let continuation = RuntimeContinuation::new(
-            artifact.prompt_id(),
-            artifact.continuation.render(),
-            "OCG same-generation Mission continuation",
-            rollover::continuation_metadata(&artifact.continuation),
-        );
-        if let Err(error) = runtime
-            .stage_runtime_continuation(&target_execution_id, &continuation)
-            .map_err(runtime_gear_error)
-        {
-            artifact.mark_failed(
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            );
-            rollover::save(&self.root, &artifact)?;
-            self.persist_rollover_failure(
-                &mut mission,
-                &artifact.artifact_id,
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            )?;
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Rollover,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "continuation staging failed; the old owner is unchanged".to_string(),
-                },
-                rollover_status: Some(mission.rollover.status),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(crate::telemetry::task::redact(&error.to_string())),
-            });
-        }
-        if artifact.status == RolloverStatus::Prepared || artifact.status == RolloverStatus::Failed
-        {
-            artifact.mark_target_ready(
-                &target_session_id,
-                LeadBinding::from_runtime_profile(profile),
-                now,
-            )?;
-            rollover::save(&self.root, &artifact)?;
-        }
-        if mission.rollover.target_session_id.is_none() {
-            let expected_revision = mission.revision;
-            let expected_owner = mission.session_id.clone();
-            mission.mark_rollover_target_ready(&artifact.artifact_id, &target_session_id, now)?;
-            if !mission::save_if_revision(
-                &self.root,
-                &mission,
-                expected_revision,
-                expected_owner.as_deref(),
-            )? {
-                let conflict_reason = "Mission changed while recording the verified target";
-                artifact.mark_conflict(conflict_reason, now);
-                rollover::save(&self.root, &artifact)?;
-                self.persist_rollover_conflict(
-                    &artifact.mission_id,
-                    &artifact.artifact_id,
-                    conflict_reason,
-                    now,
-                );
-                return Ok(ContextGovernanceResult {
-                    observation,
-                    decision: GovernorDecision {
-                        state: GovernorState::RolloverRequired,
-                        action: GovernorAction::Continue,
-                        utilization_percent: decision.utilization_percent,
-                        rollover_allowed: false,
-                        deferred_for_boundary: false,
-                        reason:
-                            "Mission changed while recording the target; the old owner is unchanged"
-                                .to_string(),
-                    },
-                    rollover_status: Some(MissionRolloverStatus::Conflict),
-                    artifact_status: Some(artifact.status),
-                    artifact_id: Some(artifact.artifact_id),
-                    source_session_id: Some(source_session_id),
-                    target_session_id: Some(target_session_id),
-                    note: Some(
-                        "target verification was not committed; operator review is required"
-                            .to_string(),
-                    ),
-                });
-            }
-        }
-        artifact.set_base_mission(&mission);
-        artifact.updated_at = now;
-        rollover::save(&self.root, &artifact)?;
-
-        // Re-read the durable Mission immediately before cutover. This is a
-        // fail-closed optimistic CAS: a concurrent progress update or a
-        // different owner makes the rollover a conflict, never an overwrite.
-        let mut current = mission::load(&self.root, &mission.mission_id)?
-            .ok_or_else(|| OcgError::config("Mission disappeared during rollover cutover"))?;
-        let witness_ok = current.mission_id == artifact.mission_id
-            && current.generation == artifact.generation
-            && current.revision == artifact.base_mission_revision
-            && current.session_id.as_deref() == Some(source_session_id.as_str())
-            && current.rollover.artifact_id.as_deref() == Some(artifact.artifact_id.as_str())
-            && current.rollover.target_session_id.as_deref() == Some(target_session_id.as_str());
-        if !witness_ok {
-            let conflict_reason = "Mission ownership witness changed before cutover";
-            artifact.mark_conflict(conflict_reason, now);
-            rollover::save(&self.root, &artifact)?;
-            self.persist_rollover_conflict(
-                &artifact.mission_id,
-                &artifact.artifact_id,
-                conflict_reason,
-                now,
-            );
-            // Do not rewrite a Mission that another worker may have advanced;
-            // the conflict artifact is sufficient to freeze automatic retry.
-            let _ = current.mark_rollover_conflict(
-                &artifact.artifact_id,
-                "Mission ownership witness changed before cutover",
-                now,
-            );
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Rollover,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "rollover conflict; the old owner remains authoritative".to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Conflict),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(
-                    "Mission changed after rollover preparation; operator review is required"
-                        .to_string(),
-                ),
-            });
-        }
-        artifact.mark_cutover_intent(now)?;
-        rollover::save(&self.root, &artifact)?;
-        let expected_revision = current.revision;
-        let expected_owner = current.session_id.clone();
-        current.bind_rollover_session(
-            &artifact.artifact_id,
-            &artifact.source_session_id,
-            &target_session_id,
-            now,
-        )?;
-        if !mission::save_if_revision(
-            &self.root,
-            &current,
-            expected_revision,
-            expected_owner.as_deref(),
-        )? {
-            let conflict_reason = "Mission changed during the final rollover cutover";
-            artifact.mark_conflict(conflict_reason, now);
-            rollover::save(&self.root, &artifact)?;
-            self.persist_rollover_conflict(
-                &artifact.mission_id,
-                &artifact.artifact_id,
-                conflict_reason,
-                now,
-            );
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "Mission changed during cutover; the prior owner was not overwritten"
-                        .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Conflict),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some("optimistic Mission CAS rejected the cutover".to_string()),
-            });
-        }
-        artifact.mark_active(now)?;
-        rollover::save(&self.root, &artifact)?;
-
-        // Seed a new disposable session view from the durable Mission. The old
-        // view is intentionally retained for diagnostics/transcript recovery.
-        let mut state_after = state::load(&self.root);
-        let seeded = current.seed_session(&target_session_id, now);
-        state_after.state.upsert(seeded, now);
-        let state_error = state::save(&self.root, &state_after.state).err();
-
-        // Mandatory economic admission before the provider-costly resume. It is
-        // independent of `policy.enabled` and cannot be satisfied by a generic
-        // approval. The cutover already happened, so a refusal leaves an Active
-        // rollover that the recovery path finishes once the budget is raised.
-        let identity = crate::orchestration::policy::resource_identity_for_profile(
-            profile,
-            Some(&runtime.identity()),
-        );
-        let quota = budget::quota_facts(&self.root, &identity, now);
-        let (assessment, _receipt) = match self.admit_mandatory_spend(
-            &artifact.mission_id,
-            SpendAction::ResumeContinuation,
-            &artifact.artifact_id,
-            quota,
-            now,
-        ) {
-            Ok(admitted) => admitted,
-            Err(error) => {
-                return Ok(ContextGovernanceResult {
-                    observation,
-                    decision: GovernorDecision {
-                        state: GovernorState::RolloverRequired,
-                        action: GovernorAction::Rollover,
-                        utilization_percent: decision.utilization_percent,
-                        rollover_allowed: false,
-                        deferred_for_boundary: false,
-                        reason: "the required economic admission could not be evaluated; recovery is pending"
-                            .to_string(),
-                    },
-                    rollover_status: Some(MissionRolloverStatus::Active),
-                    artifact_status: Some(artifact.status),
-                    artifact_id: Some(artifact.artifact_id),
-                    source_session_id: Some(source_session_id),
-                    target_session_id: Some(target_session_id),
-                    note: Some(crate::telemetry::task::redact(&error.to_string())),
-                });
-            }
-        };
-        if !assessment.is_allowed() {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Rollover,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "the hard Mission budget or quota defers the continuation; recovery is pending"
-                        .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Active),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(assessment.reason.clone()),
-            });
-        }
-        let reservation_id = assessment.reservation_id.clone();
-        // The admission persisted the Mission (a reservation bumps its
-        // revision). Every completion path below reloads the Mission before its
-        // acknowledgement CAS, so no pre-dispatch local view is retained.
-        if let Err(error) = runtime
-            .resume_runtime_continuation(&target_execution_id, &continuation)
-            .map_err(runtime_gear_error)
-        {
-            // The dispatch outcome is uncertain: retain the reservation.
-            if let Some(id) = reservation_id.as_deref() {
-                let _ = self.mark_mandatory_spend_unresolved(&artifact.mission_id, id, now);
-            }
-            let retry_after =
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds));
-            artifact.mark_failed(&error.to_string(), now, retry_after);
-            rollover::save(&self.root, &artifact)?;
-            // Retaining the uncertain reservation bumped the Mission revision;
-            // reload so the failure acknowledgement CASes the current revision.
-            let mut current = mission::load(&self.root, &artifact.mission_id)?
-                .ok_or_else(|| OcgError::config("Mission disappeared during rollover failure"))?;
-            let expected_revision = current.revision;
-            let expected_owner = current.session_id.clone();
-            let _ = current.mark_rollover_failed(
-                &artifact.artifact_id,
-                &error.to_string(),
-                now,
-                retry_after,
-            );
-            let _ = mission::save_if_revision(
-                &self.root,
-                &current,
-                expected_revision,
-                expected_owner.as_deref(),
-            )?;
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Rollover,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason:
-                        "continuation acknowledgement failed after cutover; recovery is pending"
-                            .to_string(),
-                },
-                rollover_status: Some(current.rollover.status),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(crate::telemetry::task::redact(&error.to_string())),
-            });
-        }
-        // Settle the bounded spend exactly once on a proven dispatch.
-        if let Some(id) = reservation_id.as_deref() {
-            let _ = self.settle_mandatory_spend(&artifact.mission_id, id, None, now);
-        }
-        // Settling bumped the Mission revision; reload so the acknowledgement
-        // CASes the current revision rather than a pre-settlement one.
-        let mut current = mission::load(&self.root, &artifact.mission_id)?.ok_or_else(|| {
-            OcgError::config("Mission disappeared during rollover acknowledgement")
-        })?;
-        let expected_revision = current.revision;
-        let expected_owner = current.session_id.clone();
-        current.mark_rollover_applied(&artifact.artifact_id, &target_session_id, now)?;
-        if !mission::save_if_revision(
-            &self.root,
-            &current,
-            expected_revision,
-            expected_owner.as_deref(),
-        )? {
-            let conflict_reason = "Mission changed before continuation acknowledgement";
-            artifact.mark_conflict(conflict_reason, now);
-            rollover::save(&self.root, &artifact)?;
-            self.persist_rollover_conflict(
-                &artifact.mission_id,
-                &artifact.artifact_id,
-                conflict_reason,
-                now,
-            );
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "Mission changed before acknowledgement; the target owner is retained"
-                        .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Conflict),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some("optimistic Mission CAS rejected acknowledgement".to_string()),
-            });
-        }
-        artifact.mark_applied(now)?;
-        rollover::save(&self.root, &artifact)?;
-        Ok(ContextGovernanceResult {
-            observation,
-            decision: GovernorDecision {
-                rollover_allowed: false,
-                deferred_for_boundary: false,
-                ..decision
-            },
-            rollover_status: Some(current.rollover.status),
-            artifact_status: Some(artifact.status),
-            artifact_id: Some(artifact.artifact_id),
-            source_session_id: Some(source_session_id),
-            target_session_id: Some(target_session_id),
-            note: state_error
-                .map(|error| crate::telemetry::task::redact(&error.to_string()))
-                .or(Some("same-generation session rollover applied".to_string())),
-        })
-    }
-
-    fn persist_rollover_failure(
-        &self,
-        mission: &mut Mission,
-        artifact_id: &str,
-        error: &str,
-        now: i64,
-        retry_after: Option<i64>,
-    ) -> Result<()> {
-        let expected_revision = mission.revision;
-        let expected_owner = mission.session_id.clone();
-        let _ = mission.mark_rollover_failed(artifact_id, error, now, retry_after);
-        let _ = mission::save_if_revision(
-            &self.root,
-            mission,
-            expected_revision,
-            expected_owner.as_deref(),
-        )?;
-        Ok(())
-    }
-
-    fn persist_rollover_conflict(
-        &self,
-        mission_id: &str,
-        artifact_id: &str,
-        reason: &str,
-        now: i64,
-    ) {
-        let Ok(Some(mut mission)) = mission::load(&self.root, mission_id) else {
-            return;
-        };
-        if mission.rollover.artifact_id.as_deref() != Some(artifact_id) {
-            return;
-        }
-        let expected_revision = mission.revision;
-        let expected_owner = mission.session_id.clone();
-        if mission
-            .mark_rollover_conflict(artifact_id, reason, now)
-            .is_ok()
-        {
-            let _ = mission::save_if_revision(
-                &self.root,
-                &mission,
-                expected_revision,
-                expected_owner.as_deref(),
-            );
-        }
-    }
-
-    fn persist_active_failure(
-        &self,
-        artifact: &RolloverArtifact,
-        error: &str,
-        now: i64,
-        retry_after: Option<i64>,
-    ) {
-        let Ok(Some(mut current)) = mission::load(&self.root, &artifact.mission_id) else {
-            return;
-        };
-        if current.session_id.as_deref() == artifact.target_session_id.as_deref() {
-            let _ = self.persist_rollover_failure(
-                &mut current,
-                &artifact.artifact_id,
-                error,
-                now,
-                retry_after,
-            );
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn recover_active_rollover(
-        &self,
         observation: ContextObservation,
-        decision: GovernorDecision,
-        source_session_id: String,
-        mut artifact: RolloverArtifact,
-        runtime: &mut dyn RuntimeAdapter,
-        profile: &RuntimeProfile,
-        now: i64,
+        _runtime: &mut dyn RuntimeAdapter,
+        _profile: &RuntimeProfile,
     ) -> Result<ContextGovernanceResult> {
-        artifact.runtime_profile = Some(profile.clone());
-        let target_session_id = artifact
-            .target_session_id
-            .clone()
-            .ok_or_else(|| OcgError::config("active rollover has no target session"))?;
-        let target_execution_id = RuntimeExecutionId::new(target_session_id.clone());
-        if let Err(error) = runtime
-            .prepare_execution(&target_execution_id, profile)
-            .map(|_| ())
-            .map_err(runtime_gear_error)
-        {
-            artifact.mark_failed(
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            );
-            rollover::save(&self.root, &artifact)?;
-            self.persist_active_failure(
-                &artifact,
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            );
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason:
-                        "active target Lead could not be reverified; the target owner is retained"
-                            .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Active),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(crate::telemetry::task::redact(&error.to_string())),
-            });
-        }
-        if let Err(error) = verify_target_execution(runtime, &target_execution_id) {
-            artifact.mark_failed(
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            );
-            rollover::save(&self.root, &artifact)?;
-            self.persist_active_failure(
-                &artifact,
-                &error.to_string(),
-                now,
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds)),
-            );
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "active target identity could not be reverified; the target owner is retained"
-                        .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Active),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(crate::telemetry::task::redact(&error.to_string())),
-            });
-        }
-        // Mandatory economic admission before the provider-costly resume. This
-        // is independent of `policy.enabled` and cannot be satisfied by a
-        // generic approval.
-        let identity = crate::orchestration::policy::resource_identity_for_profile(
-            profile,
-            Some(&runtime.identity()),
-        );
-        let quota = budget::quota_facts(&self.root, &identity, now);
-        let (assessment, _receipt) = match self.admit_mandatory_spend(
-            &artifact.mission_id,
-            SpendAction::ResumeContinuation,
-            &artifact.artifact_id,
-            quota,
-            now,
-        ) {
-            Ok(admitted) => admitted,
-            Err(error) => {
-                return Ok(ContextGovernanceResult {
-                    observation,
-                    decision: GovernorDecision {
-                        state: GovernorState::RolloverRequired,
-                        action: GovernorAction::Continue,
-                        utilization_percent: decision.utilization_percent,
-                        rollover_allowed: false,
-                        deferred_for_boundary: false,
-                        reason: "the required economic admission could not be evaluated; the target owner is retained"
-                            .to_string(),
-                    },
-                    rollover_status: Some(MissionRolloverStatus::Active),
-                    artifact_status: Some(artifact.status),
-                    artifact_id: Some(artifact.artifact_id),
-                    source_session_id: Some(source_session_id),
-                    target_session_id: Some(target_session_id),
-                    note: Some(crate::telemetry::task::redact(&error.to_string())),
-                });
-            }
-        };
-        if !assessment.is_allowed() {
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "the hard Mission budget or quota defers the continuation; the target owner is retained"
-                        .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Active),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(assessment.reason.clone()),
-            });
-        }
-        let reservation_id = assessment.reservation_id.clone();
-        let continuation = RuntimeContinuation::new(
-            artifact.prompt_id(),
-            artifact.continuation.render(),
-            "OCG same-generation Mission continuation",
-            rollover::continuation_metadata(&artifact.continuation),
-        );
-        if let Err(error) = runtime
-            .resume_runtime_continuation(&target_execution_id, &continuation)
-            .map_err(runtime_gear_error)
-        {
-            // The dispatch outcome is uncertain: retain the reservation.
-            if let Some(id) = reservation_id.as_deref() {
-                let _ = self.mark_mandatory_spend_unresolved(&artifact.mission_id, id, now);
-            }
-            let retry_after =
-                Some(now.saturating_add(self.config.context_governor.retry_cooldown_seconds));
-            artifact.mark_failed(&error.to_string(), now, retry_after);
-            rollover::save(&self.root, &artifact)?;
-            self.persist_active_failure(&artifact, &error.to_string(), now, retry_after);
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason:
-                        "active continuation could not be resumed; the target owner is retained"
-                            .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Active),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some(crate::telemetry::task::redact(&error.to_string())),
-            });
-        }
-        // Settle the bounded spend exactly once on a proven dispatch.
-        if let Some(id) = reservation_id.as_deref() {
-            let _ = self.settle_mandatory_spend(&artifact.mission_id, id, None, now);
-        }
-        artifact.mark_active(now)?;
-        rollover::save(&self.root, &artifact)?;
-        let Some(mut current) = mission::load(&self.root, &artifact.mission_id)? else {
-            return Err(OcgError::config(
-                "Mission disappeared while acknowledging active rollover",
-            ));
-        };
-        if current.session_id.as_deref() != Some(target_session_id.as_str())
-            || current.rollover.artifact_id.as_deref() != Some(artifact.artifact_id.as_str())
-            || current.rollover.target_session_id.as_deref() != Some(target_session_id.as_str())
-            || current.generation != artifact.generation
-        {
-            artifact.mark_conflict(
-                "active target owner changed before continuation acknowledgement",
-                now,
-            );
-            rollover::save(&self.root, &artifact)?;
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason: "active target owner changed; no Mission was overwritten".to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Conflict),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some("operator review is required for the changed active owner".to_string()),
-            });
-        }
-        let expected_revision = current.revision;
-        let expected_owner = current.session_id.clone();
-        current.mark_rollover_applied(&artifact.artifact_id, &target_session_id, now)?;
-        if !mission::save_if_revision(
-            &self.root,
-            &current,
-            expected_revision,
-            expected_owner.as_deref(),
-        )? {
-            artifact.mark_conflict(
-                "Mission changed before active continuation acknowledgement",
-                now,
-            );
-            rollover::save(&self.root, &artifact)?;
-            return Ok(ContextGovernanceResult {
-                observation,
-                decision: GovernorDecision {
-                    state: GovernorState::RolloverRequired,
-                    action: GovernorAction::Continue,
-                    utilization_percent: decision.utilization_percent,
-                    rollover_allowed: false,
-                    deferred_for_boundary: false,
-                    reason:
-                        "Mission changed before active acknowledgement; no owner was overwritten"
-                            .to_string(),
-                },
-                rollover_status: Some(MissionRolloverStatus::Conflict),
-                artifact_status: Some(artifact.status),
-                artifact_id: Some(artifact.artifact_id),
-                source_session_id: Some(source_session_id),
-                target_session_id: Some(target_session_id),
-                note: Some("optimistic Mission CAS rejected the acknowledgement".to_string()),
-            });
-        }
-        let mut state_after = state::load(&self.root);
-        state_after
-            .state
-            .upsert(current.seed_session(&target_session_id, now), now);
-        let state_error = state::save(&self.root, &state_after.state).err();
-        artifact.mark_applied(now)?;
-        rollover::save(&self.root, &artifact)?;
+        let mut decision = self.evaluate_context(session_id, observation.clone())?;
+        decision.rollover_allowed = false;
         Ok(ContextGovernanceResult {
             observation,
-            decision: GovernorDecision {
-                rollover_allowed: false,
-                deferred_for_boundary: false,
-                ..decision
-            },
-            rollover_status: Some(current.rollover.status),
-            artifact_status: Some(artifact.status),
-            artifact_id: Some(artifact.artifact_id),
-            source_session_id: Some(source_session_id),
-            target_session_id: Some(target_session_id),
-            note: state_error
-                .map(|error| crate::telemetry::task::redact(&error.to_string()))
-                .or(Some(
-                    "active same-generation rollover recovered".to_string(),
-                )),
+            decision,
+            rollover_status: None,
+            artifact_status: None,
+            artifact_id: None,
+            source_session_id: Some(session_id.to_string()),
+            target_session_id: None,
+            note: Some("execution replacement requires a canonical Attempt command".into()),
         })
     }
 
@@ -2407,28 +582,15 @@ impl<'a> Controller<'a> {
     pub fn prepare_lead_context(&self, session_id: &str, message: &str) -> Result<LeadContext> {
         let now = self.now();
         let session_key = state::safe_id(session_id);
-        let task_id = Self::task_id(message);
+        let admission = self.admit_canonical_job(session_id, message, "lead")?;
+        let task_id = admission.job.id;
         let mut loaded = state::load(&self.root);
-        let existing = loaded.state.session(&session_key).cloned();
-        let (mut session, mut mission) = match existing {
-            Some(session) if session.task_id == task_id => {
-                let mission = self.ensure_mission(&session, now)?;
-                (session, mission)
-            }
-            previous => {
-                // A new task boundary for this session (or a brand-new
-                // session): resolve the durable Mission and seed the session
-                // from it. The repository baseline identity is session-scoped
-                // and derived from indexed content, not the task wording, so
-                // it carries over the task switch.
-                let mission =
-                    self.admit_or_resume(&session_key, &task_id, message, previous.as_ref(), now)?;
-                let mut fresh = mission.seed_session(&session_key, now);
-                fresh.repository_generation_id =
-                    previous.and_then(|session| session.repository_generation_id.clone());
-                (fresh, Some(mission))
-            }
-        };
+        let mut session = loaded
+            .state
+            .session(&session_key)
+            .cloned()
+            .filter(|session| session.task_id == task_id)
+            .unwrap_or_else(|| SessionState::new(&session_key, &task_id, now));
         session.session_id = session_key.clone();
         session.task_id = task_id.clone();
         session.phase = OrchestrationPhase::Idle;
@@ -2464,10 +626,7 @@ impl<'a> Controller<'a> {
             session.last_rich_bytes = baseline.rich_bytes;
         }
         session.updated_at = now;
-        if let Some(mission) = &mut mission {
-            mission.sync_from_session(&session);
-        }
-        self.persist(&mut loaded, session, mission, now)?;
+        self.persist(&mut loaded, session, now)?;
 
         Ok(LeadContext {
             session_id: session_key,
@@ -2509,61 +668,32 @@ impl<'a> Controller<'a> {
     /// over: the baseline is keyed by the task-independent repository
     /// generation, never by task wording.
     pub fn admit_user_task(&self, session_id: &str, message: &str) -> Result<TaskAdmission> {
+        let admission = self.admit_canonical_job(session_id, message, "lead")?;
         let now = self.now();
         let session_key = state::safe_id(session_id);
-        let task_id = Self::task_id(message);
+        let task_id = admission.job.id;
         let mut loaded = state::load(&self.root);
-        let existing = loaded.state.session(&session_key).cloned();
-        match existing {
-            Some(session) if session.task_id == task_id => {
-                // The running task was re-admitted. Nothing resets; only the
-                // stored task text may need backfilling (e.g. the session was
-                // first observed by a pre-admission model dispatch), and a
-                // Mission file may need adopting for a session that predates
-                // Missions.
-                let mut mission = self.ensure_mission(&session, now)?;
-                let mut session = session;
-                let mut touched = false;
-                if session.task.is_none() {
-                    session.task = Some(Self::stored_task_text(message));
-                    touched = true;
-                }
-                if let Some(mission) = &mut mission {
-                    mission.sync_from_session(&session);
-                    self.save_mission_preserving_reconcile(mission)?;
-                }
-                if touched {
-                    session.updated_at = now;
-                    loaded.state.upsert(session, now);
-                    let _ = state::save(&self.root, &loaded.state);
-                }
-                Ok(TaskAdmission {
-                    session_id: session_key,
-                    task_id,
-                    changed: false,
-                })
+        let previous = loaded.state.session(&session_key).cloned();
+        let changed = previous
+            .as_ref()
+            .is_none_or(|session| session.task_id != task_id);
+        let mut session = if changed {
+            let mut session = SessionState::new(&session_key, &task_id, now);
+            if let Some(previous) = previous {
+                session.repository_generation_id = previous.repository_generation_id;
+                session.repository_baseline = previous.repository_baseline;
             }
-            previous => {
-                let generation_id = previous
-                    .as_ref()
-                    .and_then(|session| session.repository_generation_id.clone());
-                let baseline = previous
-                    .as_ref()
-                    .and_then(|session| session.repository_baseline.clone());
-                let mut mission =
-                    self.admit_or_resume(&session_key, &task_id, message, previous.as_ref(), now)?;
-                let mut fresh = mission.seed_session(&session_key, now);
-                fresh.repository_generation_id = generation_id;
-                fresh.repository_baseline = baseline;
-                mission.sync_from_session(&fresh);
-                self.persist(&mut loaded, fresh, Some(mission), now)?;
-                Ok(TaskAdmission {
-                    session_id: session_key,
-                    task_id,
-                    changed: true,
-                })
-            }
-        }
+            session
+        } else {
+            previous.ok_or_else(|| OcgError::config("session projection disappeared"))?
+        };
+        session.task = Some(Self::stored_task_text(&admission.job.payload));
+        self.persist(&mut loaded, session, now)?;
+        Ok(TaskAdmission {
+            session_id: session_key,
+            task_id,
+            changed,
+        })
     }
 
     /// `session.context` (OpenCode V2): provide the current session repository
@@ -2774,7 +904,6 @@ impl<'a> Controller<'a> {
             session.task = Some(Self::stored_task_text(task));
         }
         let overall_task_id = session.task_id.clone();
-        let mut mission = self.ensure_mission(&session, now)?;
 
         let previous = session.source;
         session.phase = phase_for(role);
@@ -2930,24 +1059,10 @@ impl<'a> Controller<'a> {
             if let Some(id) = &checkpoint_id {
                 session.push_checkpoint(id);
             }
-            if let Some(mission) = &mut mission {
-                let event = mission.event(
-                    MissionEventKind::DebugToBuild,
-                    checkpoint_id.as_deref().unwrap_or(""),
-                    checkpoint_id.clone(),
-                    Some(session_key.clone()),
-                    None,
-                    now,
-                );
-                mission.record(event);
-            }
         }
 
         session.source = role;
-        if let Some(mission) = &mut mission {
-            mission.sync_from_session(&session);
-        }
-        self.persist(&mut loaded, session, mission, now)?;
+        self.persist(&mut loaded, session, now)?;
 
         let mut metrics = OrchestrationMetrics {
             phase: Some(phase_for(role).as_str().to_string()),
@@ -2993,7 +1108,6 @@ impl<'a> Controller<'a> {
             .session(&session_key)
             .cloned()
             .unwrap_or_else(|| SessionState::new(&session_key, "", now));
-        let mut mission = self.ensure_mission(&session, now)?;
         let parsed = parse_explore_output(output);
         for finding in &parsed.findings {
             session.push_finding(finding.clone());
@@ -3034,21 +1148,9 @@ impl<'a> Controller<'a> {
         if let Some(id) = &checkpoint_id {
             session.push_checkpoint(id);
         }
-        if let Some(mission) = &mut mission {
-            let event = mission.event(
-                MissionEventKind::ExploreToBuild,
-                checkpoint_id.as_deref().unwrap_or(""),
-                checkpoint_id.clone(),
-                Some(session_key.clone()),
-                None,
-                now,
-            );
-            mission.record(event);
-            mission.sync_from_session(&session);
-        }
 
         let task_id = session.task_id.clone();
-        self.persist(&mut loaded, session, mission, now)?;
+        self.persist(&mut loaded, session, now)?;
 
         let metrics = OrchestrationMetrics {
             phase: Some(OrchestrationPhase::Build.as_str().to_string()),
@@ -3086,7 +1188,6 @@ impl<'a> Controller<'a> {
             .cloned()
             .unwrap_or_else(|| SessionState::new(&session_key, "", now));
         session.attempts.build += 1;
-        let mut mission = self.ensure_mission(&session, now)?;
         let stage = stage
             .map(str::to_string)
             .unwrap_or_else(|| self.verification.default_stage.clone());
@@ -3097,10 +1198,7 @@ impl<'a> Controller<'a> {
             let note = format!(
                 "no trusted verification command is configured for stage '{stage}'; nothing was run"
             );
-            if let Some(mission) = &mut mission {
-                mission.sync_from_session(&session);
-            }
-            self.persist(&mut loaded, session.clone(), mission, now)?;
+            self.persist(&mut loaded, session.clone(), now)?;
             return Ok(BuildOutcome {
                 session_id: session_key,
                 task_id,
@@ -3132,10 +1230,7 @@ impl<'a> Controller<'a> {
                 session.phase = OrchestrationPhase::Verify;
                 let task_id = session.task_id.clone();
                 let note = format!("verification could not run: {error}");
-                if let Some(mission) = &mut mission {
-                    mission.sync_from_session(&session);
-                }
-                self.persist(&mut loaded, session.clone(), mission, now)?;
+                self.persist(&mut loaded, session.clone(), now)?;
                 return Ok(BuildOutcome {
                     session_id: session_key,
                     task_id,
@@ -3171,33 +1266,12 @@ impl<'a> Controller<'a> {
         if let Some(id) = &checkpoint_id {
             session.push_checkpoint(id);
         }
-        if let Some(mission) = &mut mission {
-            let event = mission.event(
-                MissionEventKind::BuildToVerify,
-                checkpoint_id.as_deref().unwrap_or(""),
-                checkpoint_id.clone(),
-                Some(session_key.clone()),
-                None,
-                now,
-            );
-            mission.record(event);
-        }
         let task_id = session.task_id.clone();
 
         if report.passed() {
             session.attempts.verify += 1;
             session.phase = OrchestrationPhase::Done;
-            if let Some(mission) = &mut mission {
-                mission.sync_from_session(&session);
-                // Durable completion. Replaying an already-recorded completion
-                // is a no-op; the terminal state survives every later session.
-                mission.complete(
-                    &session_key,
-                    Some(format!("verification stage '{}' passed", report.stage)),
-                    now,
-                )?;
-            }
-            self.persist(&mut loaded, session.clone(), mission, now)?;
+            self.persist(&mut loaded, session.clone(), now)?;
             return Ok(BuildOutcome {
                 session_id: session_key,
                 task_id,
@@ -3226,10 +1300,7 @@ impl<'a> Controller<'a> {
         if session.attempts.build <= self.config.max_build_retries {
             session.phase = OrchestrationPhase::Build;
             let attempt = session.attempts.build;
-            if let Some(mission) = &mut mission {
-                mission.sync_from_session(&session);
-            }
-            self.persist(&mut loaded, session.clone(), mission, now)?;
+            self.persist(&mut loaded, session.clone(), now)?;
             return Ok(BuildOutcome {
                 session_id: session_key,
                 task_id,
@@ -3268,22 +1339,7 @@ impl<'a> Controller<'a> {
         if let Some(id) = &debug_checkpoint {
             session.push_checkpoint(id);
         }
-        if let Some(mission) = &mut mission {
-            let event = mission.event(
-                MissionEventKind::VerifyToDebug,
-                debug_checkpoint
-                    .as_deref()
-                    .or(checkpoint_id.as_deref())
-                    .unwrap_or(""),
-                debug_checkpoint.clone().or(checkpoint_id.clone()),
-                Some(session_key.clone()),
-                Some(reason.clone()),
-                now,
-            );
-            mission.record(event);
-            mission.sync_from_session(&session);
-        }
-        self.persist(&mut loaded, session.clone(), mission, now)?;
+        self.persist(&mut loaded, session.clone(), now)?;
         let mut metrics = orchestration_metrics(
             OrchestrationPhase::Debug,
             Role::Verify,
@@ -3336,7 +1392,6 @@ impl<'a> Controller<'a> {
             .unwrap_or_else(|| SessionState::new(&session_key, "", now));
         session.attempts.debug += 1;
         session.phase = OrchestrationPhase::Debug;
-        let mut mission = self.ensure_mission(&session, now)?;
         let mut handoff = self.debug_handoff_from_session(&session, &session_key);
         if let Some(escalation) = self.debug_escalation(session.attempts.debug) {
             handoff.capsule.omitted.push(escalation.clone());
@@ -3347,90 +1402,8 @@ impl<'a> Controller<'a> {
         }
         handoff.metrics.attempt = Some(session.attempts.debug);
         handoff.metrics.retry = Some(session.attempts.debug.saturating_sub(1));
-        if let Some(mission) = &mut mission {
-            mission.sync_from_session(&session);
-        }
-        self.persist(&mut loaded, session, mission, now)?;
+        self.persist(&mut loaded, session, now)?;
         Ok(handoff)
-    }
-
-    /// Load the durable Mission for `mission_id`.
-    ///
-    /// Unlike the disposable session state, a corrupt record fails explicitly
-    /// (it is quarantined by the store, never silently read as "no Mission").
-    pub fn load_mission(&self, mission_id: &str) -> Result<Option<Mission>> {
-        mission::load(&self.root, mission_id)
-    }
-
-    /// The durable Mission currently bound to a session, when that session
-    /// has an admitted task.
-    pub fn session_mission(&self, session_id: &str) -> Result<Option<Mission>> {
-        let session_key = state::safe_id(session_id);
-        let Some(session) = state::load(&self.root).state.session(&session_key).cloned() else {
-            return Ok(None);
-        };
-        if session.task_id.is_empty() {
-            return Ok(None);
-        }
-        mission::load(&self.root, &session.task_id)
-    }
-
-    /// Durably fail the Mission bound to a session, with an inspectable
-    /// reason. Replaying the same failure (same generation) is a no-op;
-    /// failing a Mission that already reached another terminal state fails
-    /// explicitly instead of overwriting it. Re-admitting the task starts a
-    /// new generation.
-    pub fn fail_mission(&self, session_id: &str, reason: &str) -> Result<Mission> {
-        self.terminate_mission(session_id, MissionStatus::Failed, reason)
-    }
-
-    /// Durably cancel the Mission bound to a session. Same semantics as
-    /// [`Self::fail_mission`].
-    pub fn cancel_mission(&self, session_id: &str, reason: &str) -> Result<Mission> {
-        self.terminate_mission(session_id, MissionStatus::Cancelled, reason)
-    }
-
-    fn terminate_mission(
-        &self,
-        session_id: &str,
-        status: MissionStatus,
-        reason: &str,
-    ) -> Result<Mission> {
-        let now = self.now();
-        let session_key = state::safe_id(session_id);
-        let session = state::load(&self.root)
-            .state
-            .session(&session_key)
-            .cloned()
-            .ok_or_else(|| {
-                OcgError::config(format!(
-                    "cannot mark a mission {}: session '{session_key}' has no admitted task",
-                    status.as_str()
-                ))
-            })?;
-        let mut mission = self.ensure_mission(&session, now)?.ok_or_else(|| {
-            OcgError::config(format!(
-                "cannot mark a mission {}: the session has no admitted task",
-                status.as_str()
-            ))
-        })?;
-        let note = Self::stored_task_text(reason);
-        match status {
-            MissionStatus::Failed => {
-                mission.fail(&session_key, Some(note), now)?;
-            }
-            MissionStatus::Cancelled => {
-                mission.cancel(&session_key, Some(note), now)?;
-            }
-            other => {
-                return Err(OcgError::config(format!(
-                    "terminate_mission requires a terminal state, not {}",
-                    other.as_str()
-                )))
-            }
-        }
-        mission::save(&self.root, &mission)?;
-        Ok(mission)
     }
 
     fn debug_handoff_from_session(
@@ -4421,22 +2394,6 @@ pub fn diff_reference(block: &str) -> Option<String> {
         "sha256:{}",
         crate::runtime::hash::sha256_hex(block.as_bytes())
     ))
-}
-
-fn verify_target_execution(
-    runtime: &dyn RuntimeAdapter,
-    target_execution_id: &RuntimeExecutionId,
-) -> Result<()> {
-    let execution = runtime
-        .inspect_execution(target_execution_id)
-        .map_err(runtime_gear_error)?;
-    if execution.id != *target_execution_id {
-        return Err(OcgError::config(format!(
-            "runtime reported target execution {}, expected {}",
-            execution.id, target_execution_id
-        )));
-    }
-    Ok(())
 }
 
 /// A public summary of an existing hand-off for diagnostics.

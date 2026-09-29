@@ -489,13 +489,13 @@ Commands:
   tools <task...>       show the capability plan / Tool Context Firewall view
   checkpoint list|show|save
                         inspect, or create, a phase checkpoint
-  reconcile [--once]    reconcile durable Missions once (explicit; no daemon)
+  reconcile [--once]    reconcile canonical dispatch authority once
   resources [--json] [--observe]
                         inspect the descriptive Resource Registry (read-only)
-  policy [--json]       show the effective Policy and latest admission per Mission
-  budget [--json]       show the effective economic config and durable Mission budget
-  budget set --mission <id> --limit <micros> --currency <CUR>
-                        explicitly set a hard Mission budget (the only way past a cap)
+  policy [--json]       show the effective Project policy
+  budget [--json]       show the canonical Project budget
+  budget set --project-id <id> --limit <micros> --currency <CUR>
+                        explicitly set a hard Project budget
   approvals [--json]    list durable approval requests (read-only)
   approve <id> [--note TEXT] [--json]
                         approve a pending admission request
@@ -503,10 +503,8 @@ Commands:
                         reject a pending admission request
   serve [--addr 127.0.0.1:PORT]
                         run the loopback-only HTTP/SSE control server
-  work create|admit|start|configure|show-config|plan|dispatch|replace|verify|bind|deliver|terminate|inspect|recover
-                        canonical WorkNode/Run control: every mutating operation
-                        is witness-bound, and completion requires verification
-                        run the loopback-only HTTP/SSE control server
+  work create|admit|child|plan|dispatch|replace|finish|deliver|inspect|ready|recover|status|set-config|config
+                        canonical Job / Attempt execution commands
   mcp                   run the local project-scoped STDIO MCP server
   version               report OCG, platform and the resolved OpenCode runtime
   doctor                diagnose layering, Lead contracts, OpenCode, proxy and runtime (read-only)
@@ -911,12 +909,26 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         }
         Command::Mcp(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
-            if !args.is_empty() {
+            if args.is_empty() {
+                crate::mcp::serve_stdio(&project_root).map_err(Failure::Ocg)?;
+                return Ok(0);
+            }
+            if args.first().and_then(|arg| arg.to_str()) != Some("--http") {
                 return Err(usage_failure(
-                    "ocg mcp accepts no arguments (STDIO is the only transport)",
+                    "ocg mcp accepts no arguments, or --http [--addr 127.0.0.1:PORT]",
                 ));
             }
-            crate::mcp::serve_stdio(&project_root).map_err(Failure::Ocg)?;
+            let mut addr = "127.0.0.1:0".to_string();
+            let mut index = 1;
+            while index < args.len() {
+                let text = args[index].to_string_lossy();
+                if text == "--addr" || text.starts_with("--addr=") {
+                    addr = option_value(args, "--addr", &mut index)?;
+                    continue;
+                }
+                return Err(usage_failure(format!("unknown mcp option: {text}")));
+            }
+            crate::mcp::serve_http(&project_root, &addr).map_err(Failure::Ocg)?;
             Ok(0)
         }
         Command::Bridge(args) => {
@@ -933,11 +945,11 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
 /// runtime endpoint or OpenCode's registered service is available; otherwise
 /// Missions are reported as runtime-unavailable and no replacement is made.
 fn reconcile_command(
-    effective: &config::Effective,
+    _effective: &config::Effective,
     project_root: &Path,
-    invocation_dir: &Path,
-    level: &str,
-    env: &Env,
+    _invocation_dir: &Path,
+    _level: &str,
+    _env: &Env,
     args: &[OsString],
     pretty: bool,
 ) -> std::result::Result<i32, Failure> {
@@ -949,136 +961,11 @@ fn reconcile_command(
             )));
         }
     }
-    validate::require_valid(effective).map_err(Failure::Ocg)?;
-    // A planning pass needs a structurally valid Profile with a selected
-    // model: the reconciler plans against a Lead runtime identity, and an
-    // unselected Profile has none.
-    crate::profile::Profile::from_ocg_config(&effective.data)
-        .and_then(|profile| profile.select(Some(level)).map(|_| ()))
-        .map_err(Failure::Ocg)?;
-    let orchestration = crate::orchestration::OrchestrationConfig::from_config(&effective.data)
-        .map_err(Failure::Ocg)?;
-    if !orchestration.enabled {
-        let value = json!({"disabled": true, "results": [], "issues": []});
-        println!(
-            "{}",
-            if pretty {
-                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
-            } else {
-                serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
-            }
-        );
-        return Ok(0);
-    }
-    let context = ContextConfig::from_config(&effective.data).map_err(Failure::Ocg)?;
-    let capabilities = CapabilityConfig::from_config(&effective.data).map_err(Failure::Ocg)?;
-    let verification = VerificationConfig::from_config(&effective.data).map_err(Failure::Ocg)?;
-    let policy = crate::orchestration::policy::PolicyConfig::from_config(&effective.data)
-        .map_err(Failure::Ocg)?;
-    let budget = crate::orchestration::budget::BudgetConfig::from_config(&effective.data)
-        .map_err(Failure::Ocg)?;
-    let contract = model::lead_contract(&effective.data, level).map_err(Failure::Ocg)?;
-    let profile = LeadSelection::from_contract(&contract).runtime_profile();
-    let git = SystemGitHost;
-    let clock = SystemClock;
-    let controller = crate::orchestration::controller::Controller::new(
-        project_root,
-        orchestration,
-        context,
-        capabilities,
-        verification,
-        &git,
-        &clock,
-    )
-    .with_policy(policy)
-    .with_budget(budget);
-
-    let print_run = |run: crate::orchestration::reconcile::ReconcileRun| {
-        let value = serde_json::to_value(&run).map_err(|error| {
-            Failure::Ocg(OcgError::config(format!(
-                "cannot serialize reconcile result: {error}"
-            )))
-        })?;
-        println!(
-            "{}",
-            if pretty {
-                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
-            } else {
-                serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
-            }
-        );
-        Ok(if run.has_failures() { 1 } else { 0 })
-    };
-
-    // Purely observational: the registry records the runtime availability the
-    // pass actually observed. It never changes a reconcile decision, receipt or
-    // exit status, and a registry write failure is ignored.
-    let publish = |run: &crate::orchestration::reconcile::ReconcileRun| {
-        let identity = crate::resources::ResourceIdentity::for_model(
-            &contract.provider_id,
-            &contract.model_id,
-        )
-        .with_runtime_family("opencode", "v2");
-        let now = clock.now_unix();
-        let mut registry = crate::resources::load(project_root).registry;
-        crate::orchestration::reconcile::publish_resource_observations(
-            run,
-            &mut registry,
-            &identity,
-            now,
-        );
-        let _ = crate::resources::save(project_root, &registry);
-    };
-
-    if let (Some(url), Some(password)) = (
-        env.v2_server_url.as_deref(),
-        env.v2_server_password.as_ref(),
-    ) {
-        let registration = compat::v2_client::ServiceRegistration::new(url, password.expose());
-        match compat::v2_client::V2SessionClient::connect(
-            &registration,
-            env.v2_directory
-                .clone()
-                .unwrap_or_else(|| invocation_dir.to_string_lossy().into_owned()),
-        ) {
-            Ok(mut client) => {
-                let mut reconciler = crate::orchestration::reconcile::Reconciler::new(
-                    &controller,
-                    &mut client,
-                    profile,
-                );
-                let run = reconciler.reconcile_once();
-                publish(&run);
-                return print_run(run);
-            }
-            Err(_) => {
-                let mut reconciler = crate::orchestration::reconcile::Reconciler::without_runtime(
-                    &controller,
-                    profile,
-                );
-                return print_run(reconciler.reconcile_once());
-            }
-        }
-    }
-
-    // Discovery is a fallback for an explicitly invoked standalone pass. It is
-    // still an OpenCode V2 client and never a second runtime implementation.
-    if let Ok(registration) = compat::v2_client::ServiceRegistration::discover() {
-        if let Ok(mut client) = compat::v2_client::V2SessionClient::connect(
-            &registration,
-            invocation_dir.to_string_lossy().into_owned(),
-        ) {
-            let mut reconciler =
-                crate::orchestration::reconcile::Reconciler::new(&controller, &mut client, profile);
-            let run = reconciler.reconcile_once();
-            publish(&run);
-            return print_run(run);
-        }
-    }
-
-    let mut reconciler =
-        crate::orchestration::reconcile::Reconciler::without_runtime(&controller, profile);
-    print_run(reconciler.reconcile_once())
+    let mut repository =
+        crate::orchestration::domain::DomainRepository::open(project_root).map_err(Failure::Ocg)?;
+    let result = repository.reconcile_dispatches().map_err(Failure::Ocg)?;
+    print_json(&result, pretty);
+    Ok(0)
 }
 
 /// `ocg resources [--json] [--observe]`: read-only inspection of the
@@ -1348,86 +1235,17 @@ fn policy_command(
     let config = crate::orchestration::policy::PolicyConfig::from_config(&effective.data)
         .map_err(Failure::Ocg)?;
 
-    let (summaries, corrupt) = crate::orchestration::mission::list(project_root);
-    let mut decisions = Vec::new();
-    for summary in &summaries {
-        let Ok(Some(mission)) =
-            crate::orchestration::mission::load(project_root, &summary.mission_id)
-        else {
-            continue;
-        };
-        if let Some(policy) = mission
-            .reconcile
-            .last_receipt
-            .as_ref()
-            .and_then(|receipt| receipt.policy.as_ref())
-        {
-            decisions.push((
-                summary.mission_id.clone(),
-                summary.generation,
-                policy.clone(),
-            ));
-        }
-    }
-
+    let repository =
+        crate::orchestration::domain::DomainRepository::open(project_root).map_err(Failure::Ocg)?;
+    let project = repository
+        .ensure_project(project_root)
+        .map_err(Failure::Ocg)?;
+    let value = json!({"enabled":config.enabled,"require_approval_for":config.require_approval_for,
+        "fingerprint":config.fingerprint(),"project_id":project.id});
     if json {
-        let value = json!({
-            "enabled": config.enabled,
-            "require_approval_for": config.require_approval_for,
-            "fingerprint": config.fingerprint(),
-            "corrupt_missions": corrupt,
-            "missions": decisions
-                .iter()
-                .map(|(mission_id, generation, policy)| {
-                    json!({
-                        "mission_id": mission_id,
-                        "generation": generation,
-                        "decision": policy.decision,
-                        "rule": policy.rule,
-                        "reason_code": policy.reason_code,
-                        "reason": policy.reason,
-                        "action": policy.action,
-                        "approval_id": policy.approval_id,
-                        "required_facts": policy.required_facts,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        });
         print_json(&value, pretty);
     } else {
-        println!(
-            "policy: {}",
-            if config.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
-        println!(
-            "require approval for: {}",
-            if config.require_approval_for.is_empty() {
-                "none".to_string()
-            } else {
-                config.require_approval_for.join(", ")
-            }
-        );
-        if corrupt > 0 {
-            println!("corrupt Missions: {corrupt} (skipped)");
-        }
-        if decisions.is_empty() {
-            println!("no recorded policy decisions");
-        }
-        for (mission_id, generation, policy) in &decisions {
-            println!("{mission_id} gen {generation}");
-            println!(
-                "  {} {} {} [{}]",
-                policy.decision, policy.rule, policy.reason_code, policy.action
-            );
-            println!("  {}", policy.reason);
-            if let Some(id) = &policy.approval_id {
-                println!("  approval {id}");
-            }
-        }
+        println!("{value}");
     }
     Ok(0)
 }
@@ -1435,9 +1253,9 @@ fn policy_command(
 /// `ocg budget [--json]` and `ocg budget set ...`.
 ///
 /// The read form is read-only: it shows the effective economic configuration
-/// and each durable Mission's accounting. The `set` form is the only supported
-/// way to raise or change a hard Mission budget; a generic approval can never do
-/// it, and no currency is ever converted.
+/// and the canonical Project's durable accounting. The `set` form is the only
+/// supported way to raise or change a hard Project budget; a generic approval
+/// can never do it, and no currency is ever converted.
 fn budget_command(
     effective: &config::Effective,
     project_root: &Path,
@@ -1463,20 +1281,14 @@ fn budget_command(
     let config = crate::orchestration::budget::BudgetConfig::from_config(&effective.data)
         .map_err(Failure::Ocg)?;
 
-    let (summaries, corrupt) = crate::orchestration::mission::list(project_root);
-    let mut budgets = Vec::new();
-    for summary in &summaries {
-        let Ok(Some(mission)) =
-            crate::orchestration::mission::load(project_root, &summary.mission_id)
-        else {
-            continue;
-        };
-        budgets.push((
-            summary.mission_id.clone(),
-            mission.generation,
-            mission.budget.receipt(),
-        ));
-    }
+    let repository =
+        crate::orchestration::domain::DomainRepository::open(project_root).map_err(Failure::Ocg)?;
+    let project = repository
+        .ensure_project(project_root)
+        .map_err(Failure::Ocg)?;
+    let budget = repository
+        .project_budget(&project.id)
+        .map_err(Failure::Ocg)?;
 
     if json {
         let value = json!({
@@ -1486,24 +1298,17 @@ fn budget_command(
             "estimated_operation_cost_micros": config.estimated_operation_cost_micros,
             "require_quota": config.require_quota,
             "fingerprint": config.fingerprint(),
-            "corrupt_missions": corrupt,
-            "missions": budgets
-                .iter()
-                .map(|(mission_id, generation, budget)| {
-                    json!({
-                        "mission_id": mission_id,
-                        "generation": generation,
-                        "status": budget.status,
-                        "origin": budget.origin,
-                        "currency": budget.currency,
-                        "hard_limit_micros": budget.hard_limit_micros,
-                        "settled_micros": budget.settled_micros,
-                        "reserved_micros": budget.reserved_micros,
-                        "unresolved_micros": budget.unresolved_micros,
-                        "reason": budget.reason,
-                    })
-                })
-                .collect::<Vec<_>>(),
+            "project_id": project.id,
+            "budget": {
+                "status": budget.status,
+                "origin": budget.origin,
+                "currency": budget.currency,
+                "hard_limit_micros": budget.hard_limit_micros,
+                "settled_micros": budget.settled_micros,
+                "reserved_micros": budget.reserved_micros,
+                "unresolved_micros": budget.unresolved_micros,
+                "reason": budget.reason,
+            },
         });
         print_json(&value, pretty);
     } else {
@@ -1524,98 +1329,108 @@ fn budget_command(
             }
         );
         println!("require quota: {}", config.require_quota);
-        if corrupt > 0 {
-            println!("corrupt Missions: {corrupt} (skipped)");
-        }
-        if budgets.is_empty() {
-            println!("no durable Mission budgets");
-        }
-        for (mission_id, generation, budget) in &budgets {
-            println!("{mission_id} gen {generation}");
-            println!(
-                "  {} origin {} currency {}",
-                budget.status,
-                budget.origin,
-                if budget.currency.is_empty() {
-                    "unknown"
-                } else {
-                    &budget.currency
-                }
-            );
-            println!(
-                "  hard limit {} settled {} reserved {} unresolved {}",
-                budget
-                    .hard_limit_micros
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                budget.settled_micros,
-                budget.reserved_micros,
-                budget.unresolved_micros,
-            );
-            if let Some(reason) = &budget.reason {
-                println!("  reason {reason}");
+        println!("project {} budget", project.id);
+        println!(
+            "  {} origin {} currency {}",
+            budget.status,
+            budget.origin,
+            if budget.currency.is_empty() {
+                "unknown"
+            } else {
+                &budget.currency
             }
+        );
+        println!(
+            "  hard limit {} settled {} reserved {} unresolved {}",
+            budget
+                .hard_limit_micros
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            budget.settled_micros,
+            budget.reserved_micros,
+            budget.unresolved_micros,
+        );
+        if let Some(reason) = &budget.reason {
+            println!("  reason {reason}");
         }
     }
     Ok(0)
 }
 
-/// `ocg budget set --mission <id> --limit <micros> --currency <CUR>`: the only
-/// supported way past a hard cap. It is an explicit operator change to the
-/// durable hard budget itself, never an approval.
+/// `ocg budget set --project-id <id> --limit <micros> --currency <CUR>`: the
+/// only supported way past a hard cap. It is an explicit operator change to the
+/// durable Project hard budget itself, never an approval. `--mission` is
+/// accepted as a legacy alias for the same Project identity.
 fn budget_set_command(
     effective: &config::Effective,
     project_root: &Path,
     args: &[OsString],
     pretty: bool,
 ) -> std::result::Result<i32, Failure> {
+    // `--mission` remains a legacy alias for the same canonical Project
+    // identity; normalize the flag before parsing so both the `--flag value`
+    // and `--flag=value` forms behave identically.
+    let normalized: Vec<OsString> = args
+        .iter()
+        .map(|arg| {
+            let text = arg.to_string_lossy();
+            if text.starts_with("--mission") {
+                OsString::from(text.replacen("--mission", "--project-id", 1))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect();
     let mut json = false;
-    let mut mission_id: Option<String> = None;
+    let mut project_id: Option<String> = None;
     let mut limit: Option<i64> = None;
     let mut currency: Option<String> = None;
     let mut index = 0;
-    while index < args.len() {
-        let text = args[index].to_string_lossy().into_owned();
+    while index < normalized.len() {
+        let text = normalized[index].to_string_lossy().into_owned();
         match text.as_str() {
             "--json" => {
                 json = true;
                 index += 1;
             }
-            "--mission" => mission_id = Some(option_value(args, "--mission", &mut index)?),
+            "--project-id" => {
+                project_id = Some(option_value(&normalized, "--project-id", &mut index)?)
+            }
             "--limit" => {
-                let value = option_value(args, "--limit", &mut index)?;
+                let value = option_value(&normalized, "--limit", &mut index)?;
                 limit = Some(value.parse::<i64>().map_err(|_| {
                     usage_failure(format!("--limit must be an integer, got '{value}'"))
                 })?);
             }
-            "--currency" => currency = Some(option_value(args, "--currency", &mut index)?),
-            _ if text.starts_with("--mission=") => {
-                mission_id = Some(option_value(args, "--mission", &mut index)?)
+            "--currency" => currency = Some(option_value(&normalized, "--currency", &mut index)?),
+            _ if text.starts_with("--project-id=") => {
+                project_id = Some(option_value(&normalized, "--project-id", &mut index)?)
             }
             _ if text.starts_with("--limit=") => {
-                let value = option_value(args, "--limit", &mut index)?;
+                let value = option_value(&normalized, "--limit", &mut index)?;
                 limit = Some(value.parse::<i64>().map_err(|_| {
                     usage_failure(format!("--limit must be an integer, got '{value}'"))
                 })?);
             }
             _ if text.starts_with("--currency=") => {
-                currency = Some(option_value(args, "--currency", &mut index)?)
+                currency = Some(option_value(&normalized, "--currency", &mut index)?)
             }
             _ => return Err(usage_failure(format!("unknown budget set option: {text}"))),
         }
     }
-    let mission_id = mission_id.ok_or_else(|| usage_failure("--mission <id> is required"))?;
+    let project_id = project_id.ok_or_else(|| usage_failure("--project-id <id> is required"))?;
     let limit = limit.ok_or_else(|| usage_failure("--limit <micros> is required"))?;
     let currency = currency.ok_or_else(|| usage_failure("--currency <CUR> is required"))?;
     validate::require_valid(effective).map_err(Failure::Ocg)?;
-    let clock = SystemClock;
-    let now = clock.now_unix();
-    let service = crate::orchestration::ControlService::open(project_root).map_err(Failure::Ocg)?;
+    let mut repository =
+        crate::orchestration::domain::DomainRepository::open(project_root).map_err(Failure::Ocg)?;
     let amount = crate::orchestration::budget::Money::new(limit, currency);
-    let view = service
-        .set_budget(&mission_id, amount, now)
-        .map_err(|error| Failure::Ocg(error.into_ocg_error()))?;
-    let budget = view.budget;
+    let changed = repository
+        .set_project_budget(&project_id, amount)
+        .map_err(Failure::Ocg)?;
+    let budget = repository
+        .project_budget(&project_id)
+        .map_err(Failure::Ocg)?;
     if json {
         print_json(
             &serde_json::to_value(&budget).unwrap_or(serde_json::Value::Null),
@@ -1623,7 +1438,7 @@ fn budget_set_command(
         );
     } else {
         println!(
-            "{mission_id} hard budget set to {} micros {}",
+            "{project_id} hard budget set to {} micros {} (changed {changed})",
             budget.hard_limit_micros.unwrap_or(limit),
             budget.currency
         );
@@ -1834,23 +1649,27 @@ fn serve_command(
 /// accepts exactly that witness, and a stale or fenced delivery is retained as
 /// evidence without changing authoritative state.
 fn work_command(
-    effective: &config::Effective,
+    _effective: &config::Effective,
     project_root: &Path,
     args: &[OsString],
     pretty: bool,
 ) -> std::result::Result<i32, Failure> {
-    use crate::orchestration::substrate::{
-        DispatchWitness, MissionId, RunContract, RunState, SubstrateRepository, WorkNodeId,
-    };
-    let words: Vec<String> = args
+    canonical_work_command(project_root, args, pretty)
+}
+
+fn canonical_work_command(
+    project_root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> std::result::Result<i32, Failure> {
+    let words = args
         .iter()
         .map(|value| value.to_string_lossy().into_owned())
-        .collect();
+        .collect::<Vec<_>>();
     let subcommand = words
         .first()
         .cloned()
-        .ok_or_else(|| usage_failure("ocg work requires a subcommand (try 'ocg help')"))?;
-    // Accept both `--name value` and `--name=value`.
+        .ok_or_else(|| usage_failure("ocg work requires a subcommand"))?;
     let option = |name: &str| -> Option<String> {
         let flag = format!("--{name}");
         let prefix = format!("{flag}=");
@@ -1865,352 +1684,139 @@ fn work_command(
     let required = |name: &str| -> std::result::Result<String, Failure> {
         option(name).ok_or_else(|| usage_failure(format!("--{name} is required")))
     };
-    let configured_model = || -> std::result::Result<String, Failure> {
-        let profile =
-            crate::profile::Profile::from_ocg_config(&effective.data).map_err(Failure::Ocg)?;
-        let requested = option("model");
-        let key = requested.as_deref().and_then(|value| {
-            profile
-                .models
-                .get_key_value(value)
-                .map(|(key, _)| key.as_str())
-                .or_else(|| {
-                    profile.models.iter().find_map(|(key, model)| {
-                        (format!("{}/{}", model.provider, model.id) == value)
-                            .then_some(key.as_str())
-                    })
-                })
-        });
-        if requested.is_some() && key.is_none() {
-            return Err(Failure::Ocg(OcgError::config(
-                "requested model is not configured in the OCG Profile",
-            )));
-        }
-        let (_, selected) = profile
-            .select(key.or(profile.default_model.as_deref()))
-            .map_err(Failure::Ocg)?;
-        Ok(format!("{}/{}", selected.provider, selected.id))
+    let mut repository =
+        crate::orchestration::domain::DomainRepository::open(project_root).map_err(Failure::Ocg)?;
+    let project = repository
+        .ensure_project(project_root)
+        .map_err(Failure::Ocg)?;
+    let print = |value: serde_json::Value| {
+        print_json(&value, pretty);
+        Ok(0)
     };
-    let index = |name: &str| -> std::result::Result<usize, Failure> {
-        required(name)?
-            .parse::<usize>()
-            .map_err(|_| usage_failure(format!("--{name} must be a non-negative integer")))
-    };
-    let now = SystemClock.now_unix();
-    let mut repo = SubstrateRepository::open(project_root).map_err(Failure::Ocg)?;
-    let mission_of = |value: &str| -> std::result::Result<MissionId, Failure> {
-        MissionId::new(value).map_err(Failure::Ocg)
-    };
-
     match subcommand.as_str() {
-        // Create a canonical Mission with its root WorkNode and Lead Run bound
-        // atomically, and print the root dispatch witness.
-        "admit" => {
-            let mission = mission_of(&required("mission")?)?;
+        "admit" | "create" => {
+            let binding = option("session")
+                .unwrap_or_else(|| option("binding").unwrap_or_else(|| "cli".into()));
+            let payload = option("objective").unwrap_or_default();
+            let kind = option("agent").unwrap_or_else(|| "lead".into());
+            let admission = repository
+                .admit_job(project, &binding, &payload, &kind)
+                .map_err(Failure::Ocg)?;
+            print(serde_json::json!({
+                "project_id": admission.project.id,
+                "job_id": admission.job.id,
+                "attempt_id": admission.attempt.id,
+                "executor_id": admission.executor.id,
+                "generation": admission.attempt.generation,
+            }))
+        }
+        "plan" | "child" => {
             let session = required("session")?;
-            let contract = RunContract {
-                executor: option("agent").unwrap_or_else(|| "lead".into()),
-                model: configured_model()?,
-                role: option("role").unwrap_or_else(|| "lead".into()),
-            };
-            let objective = option("objective").unwrap_or_default();
-            let witness = repo
-                .create_live_mission(&mission, &objective, contract, &session, now)
-                .map_err(Failure::Ocg)?;
-            print_json(&witness.to_json(), pretty);
-            Ok(0)
-        }
-        // Create an undispatched canonical Mission: a root WorkNode with no Run
-        // yet. This is the pre-run state the PWA Mission configurator edits.
-        "create" => {
-            let mission = mission_of(&required("mission")?)?;
-            let objective = option("objective").unwrap_or_default();
-            let state = repo
-                .create_mission(&mission, &objective, now)
-                .map_err(Failure::Ocg)?;
-            print_json(
-                &serde_json::json!({
-                    "mission_id": mission.as_str(),
-                    "root_node_id": state.root().0,
-                    "dispatched": false,
-                }),
-                pretty,
-            );
-            Ok(0)
-        }
-        // Dispatch the root Run of an existing undispatched Mission.
-        "start" => {
-            let mission = mission_of(&required("mission")?)?;
-            let session = required("session")?;
-            let contract = RunContract {
-                executor: option("agent").unwrap_or_else(|| "lead".into()),
-                model: configured_model()?,
-                role: option("role").unwrap_or_else(|| "lead".into()),
-            };
-            let witness = repo
-                .activate_mission(&mission, contract, &session, now)
-                .map_err(Failure::Ocg)?;
-            print_json(&witness.to_json(), pretty);
-            Ok(0)
-        }
-        // Set the pre-run Mission configuration. This fails once any Run is
-        // dispatched: a dispatched Run keeps its frozen executor contract.
-        "configure" => {
-            let mission = mission_of(&required("mission")?)?;
-            let raw = required("config")?;
-            let value: serde_json::Value = serde_json::from_str(&raw)
-                .map_err(|error| usage_failure(format!("--config must be JSON: {error}")))?;
-            let revision = repo
-                .set_mission_config(&mission, &value, now)
-                .map_err(Failure::Ocg)?;
-            print_json(
-                &serde_json::json!({"mission_id": mission.as_str(), "revision": revision, "configuration": value}),
-                pretty,
-            );
-            Ok(0)
-        }
-        // Read the pre-run Mission configuration.
-        "show-config" => {
-            let mission = mission_of(&required("mission")?)?;
-            let view = repo.mission_config(&mission).map_err(Failure::Ocg)?;
-            print_json(
-                &serde_json::json!({"mission_id": mission.as_str(), "configuration": view}),
-                pretty,
-            );
-            Ok(0)
-        }
-        // Create a child WorkNode owned by an authoritative parent Run.
-        "plan" => {
-            let mission = mission_of(&required("mission")?)?;
-            let parent = WorkNodeId(index("node")?);
-            let by = crate::orchestration::substrate::RunId(index("run")?);
+            let parent = repository
+                .authority_for_binding(&project.id, &session)
+                .map_err(Failure::Ocg)?
+                .ok_or_else(|| {
+                    Failure::Ocg(OcgError::config("session has no canonical authority"))
+                })?;
+            let payload = option("objective").unwrap_or_default();
             let dependencies = option("depends-on")
                 .map(|raw| {
                     raw.split(',')
-                        .filter_map(|item| item.trim().parse::<usize>().ok())
-                        .map(WorkNodeId)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let objective = option("objective").unwrap_or_default();
-            let child = repo
-                .create_child_work(&mission, parent, by, &objective, &dependencies, now)
+            let dependency_refs = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
+            let job = repository
+                .create_child_job(&parent, &payload, &dependency_refs)
                 .map_err(Failure::Ocg)?;
-            print_json(&serde_json::json!({"node_id": child.0}), pretty);
-            Ok(0)
+            print(serde_json::json!({"project_id":job.project_id,"job_id":job.id,"job":job}))
         }
-        // Start a ready WorkNode and print the durable dispatch witness.
         "dispatch" => {
-            let mission = mission_of(&required("mission")?)?;
-            let node = WorkNodeId(index("node")?);
-            let by = crate::orchestration::substrate::RunId(index("run")?);
-            let contract = RunContract {
-                executor: option("agent").unwrap_or_else(|| "worker".into()),
-                model: configured_model()?,
-                role: option("role").unwrap_or_else(|| "worker".into()),
-            };
-            let binding = required("runtime-execution")?;
-            let witness = repo
-                .dispatch_run(&mission, node, by, contract, &binding, now)
+            let job_id = required("job")?;
+            let (attempt, executor) = repository
+                .dispatch_job(&job_id, &option("agent").unwrap_or_else(|| "worker".into()))
                 .map_err(Failure::Ocg)?;
-            print_json(&witness.to_json(), pretty);
-            Ok(0)
+            print(
+                serde_json::json!({"job_id":job_id,"attempt_id":attempt.id,"executor_id":executor.id,"generation":attempt.generation}),
+            )
         }
-        // Replace a Run: the old generation is fenced in the same commit that
-        // publishes the replacement witness.
         "replace" => {
-            let mission = mission_of(&required("mission")?)?;
-            let node = WorkNodeId(index("node")?);
-            let old = crate::orchestration::substrate::RunId(index("run")?);
-            let contract = RunContract {
-                executor: option("agent").unwrap_or_else(|| "worker".into()),
-                model: configured_model()?,
-                role: option("role").unwrap_or_else(|| "worker".into()),
-            };
-            let binding = required("runtime-execution")?;
-            let witness = repo
-                .replace_bound_run(&mission, node, old, contract, &binding, now)
+            let job_id = required("job")?;
+            let admission = repository
+                .replace_attempt_checked(
+                    &job_id,
+                    &option("agent").unwrap_or_else(|| "worker".into()),
+                    Some(&required("attempt")?),
+                )
                 .map_err(Failure::Ocg)?;
-            print_json(&witness.to_json(), pretty);
-            Ok(0)
+            print(
+                serde_json::json!({"job_id":admission.job.id,"attempt_id":admission.attempt.id,"executor_id":admission.executor.id,"generation":admission.attempt.generation}),
+            )
         }
-        // Deliver one witnessed result. A completed outcome requires passing
-        // verification evidence for the same dispatch.
-        "deliver" => {
-            let raw = required("witness")?;
-            let value: serde_json::Value = serde_json::from_str(&raw)
-                .map_err(|error| usage_failure(format!("--witness must be JSON: {error}")))?;
-            let witness = DispatchWitness::from_json(&value).map_err(Failure::Ocg)?;
-            let result = option("result").unwrap_or_default();
-            let outcome = match option("outcome").as_deref() {
-                Some("failed") => RunState::Failed,
-                Some("cancelled") => RunState::Cancelled,
-                _ => RunState::Completed,
-            };
-            let applied = repo
-                .complete_dispatch(&witness, outcome, &result, now)
-                .map_err(Failure::Ocg)?;
-            print_json(&serde_json::to_value(&applied).unwrap_or_default(), pretty);
-            Ok(0)
-        }
-        // Record trusted verification evidence for exactly one dispatch.
-        "verify" => {
-            let raw = required("witness")?;
-            let value: serde_json::Value = serde_json::from_str(&raw)
-                .map_err(|error| usage_failure(format!("--witness must be JSON: {error}")))?;
-            let witness = DispatchWitness::from_json(&value).map_err(Failure::Ocg)?;
-            let report = option("report")
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                .unwrap_or_else(|| serde_json::json!({"source":"ocg work verify"}));
-            let commands = option("commands")
-                .map(|raw| {
-                    raw.split(',')
-                        .map(|item| item.trim().to_string())
-                        .filter(|item| !item.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            // The evidence is produced here, by the trusted verification
-            // runner, from the project's own configured commands. A caller may
-            // add an assertion, but the recorded verdict is always the runner's.
-            let (report, passed, recorded_commands) = match option("stage") {
-                Some(stage) => {
-                    let config =
-                        VerificationConfig::from_config(&effective.data).map_err(Failure::Ocg)?;
-                    let clock = SystemClock;
-                    let executed = crate::verification::runner::execute(
-                        &crate::verification::runner::VerifyRequest {
-                            root: project_root,
-                            config: &config,
-                            stage: stage.clone(),
-                            runner: &crate::process::SystemCaptureRunner,
-                            clock: &clock,
-                            test_proposal: None,
-                        },
-                    )
+        "finish" | "deliver" => {
+            let attempt_id = required("attempt")?;
+            let outcome = option("outcome").unwrap_or_else(|| "completed".into());
+            if !matches!(outcome.as_str(), "completed" | "failed") {
+                return Err(usage_failure(
+                    "outcome must be completed or failed; cancellation requires confirmed stop",
+                ));
+            }
+            if let Some(call_id) = option("call") {
+                let generation = required("generation")?
+                    .parse::<u64>()
+                    .map_err(|_| usage_failure("--generation must be an integer"))?;
+                let result = option("result").unwrap_or_else(|| "null".into());
+                let witness = repository
+                    .witness_for_call(&call_id, &attempt_id, generation)
                     .map_err(Failure::Ocg)?;
-                    let value = serde_json::to_value(&executed).map_err(|error| {
-                        Failure::Ocg(OcgError::config(format!(
-                            "verification report could not be serialized: {error}"
-                        )))
-                    })?;
-                    let passed = executed.passed();
-                    let executed_commands = executed
-                        .results
-                        .iter()
-                        .map(|result| result.display())
-                        .collect::<Vec<_>>();
-                    (value, passed, executed_commands)
-                }
-                // No stage: the caller is recording an explicit operator
-                // assertion rather than a trusted command result. It is stored
-                // as such and can never complete a Run on its own.
-                None => {
-                    let passed = option("outcome").as_deref() != Some("failed");
-                    let mut value = report;
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert("evidence".to_string(), json!("operator-assertion"));
-                    }
-                    (value, passed, commands)
-                }
-            };
-            let record = repo
-                .record_verification(&witness, passed, &report, &recorded_commands, now)
+                let disposition = repository
+                    .deliver_result(&witness, &result, outcome == "completed")
+                    .map_err(Failure::Ocg)?;
+                return print(
+                    json!({"attempt_id":attempt_id,"call_id":call_id,"disposition":disposition,"applied":disposition == "authoritative"}),
+                );
+            } else if subcommand == "deliver" {
+                return Err(usage_failure("deliver requires --call and --generation"));
+            }
+            repository
+                .finish_attempt(&attempt_id, outcome == "completed")
                 .map_err(Failure::Ocg)?;
-            print_json(&serde_json::to_value(&record).unwrap_or_default(), pretty);
-            Ok(0)
+            print(serde_json::json!({"attempt_id":attempt_id,"outcome":outcome,"applied":true}))
         }
-        // Bind a dispatched Run to the concrete host session reported later.
-        "bind" => {
-            let raw = required("witness")?;
-            let value: serde_json::Value = serde_json::from_str(&raw)
-                .map_err(|error| usage_failure(format!("--witness must be JSON: {error}")))?;
-            let witness = DispatchWitness::from_json(&value).map_err(Failure::Ocg)?;
-            let host = required("host-session")?;
-            repo.bind_host_session(&witness, &host)
-                .map_err(Failure::Ocg)?;
-            print_json(
-                &serde_json::json!({"witness": witness.to_json(), "host_session_id": host}),
-                pretty,
-            );
-            Ok(0)
-        }
-        // The terminal Mission transition. Success requires a completed root
-        // and passing verification evidence.
-        "terminate" => {
-            let mission = mission_of(&required("mission")?)?;
-            let state = option("state").unwrap_or_else(|| "completed".into());
-            repo.complete_mission(&mission, &state, now)
-                .map_err(Failure::Ocg)?;
-            let row = repo.mission_state_row(&mission).map_err(Failure::Ocg)?;
-            print_json(
-                &serde_json::json!({"mission_id": mission.as_str(), "lifecycle": row}),
-                pretty,
-            );
-            Ok(0)
-        }
-        // Read-only canonical inspection: the full ownership tree, dependency
-        // DAG, Run generations, contracts, witnesses, verifications and events.
         "inspect" => {
-            let mission = mission_of(&required("mission")?)?;
-            let value = canonical_inspection(project_root, &mission)?;
-            print_json(&value, pretty);
-            Ok(0)
+            let job_id = required("job")?;
+            print(repository.inspect_job(&job_id).map_err(Failure::Ocg)?)
         }
-        // Durable recovery: what is still pending after a restart, with no
-        // guessing from chat text.
-        "recover" => {
-            let mission = mission_of(&required("mission")?)?;
-            let pending = repo.pending_dispatches(&mission).map_err(Failure::Ocg)?;
-            let state = repo.load(&mission).map_err(Failure::Ocg)?;
-            let ready = state
-                .as_ref()
-                .map(|state| {
-                    state
-                        .ready(now)
-                        .iter()
-                        .map(|node| serde_json::json!({"node_id": node.0}))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            print_json(
-                &serde_json::json!({
-                    "mission_id": mission.as_str(),
-                    "pending_dispatches": pending.iter().map(DispatchWitness::to_json).collect::<Vec<_>>(),
-                    "ready": ready,
-                    "resumed": true,
-                }),
-                pretty,
-            );
-            Ok(0)
+        "ready" => print(
+            json!({"project_id":project.id,"ready":repository.ready_jobs(&project.id).map_err(Failure::Ocg)?}),
+        ),
+        "recover" | "reconcile" => print(repository.reconcile_dispatches().map_err(Failure::Ocg)?),
+        "status" => print(
+            json!({"project":project,"jobs":repository.jobs(&project.id).map_err(Failure::Ocg)?}),
+        ),
+        "set-config" => {
+            let job_id = required("job")?;
+            let value: Value = serde_json::from_str(&required("json")?)
+                .map_err(|error| usage_failure(error.to_string()))?;
+            let revision = repository
+                .set_job_configuration(&job_id, &value)
+                .map_err(Failure::Ocg)?;
+            print(json!({"job_id":job_id,"revision":revision,"configuration":value}))
         }
+        "config" => {
+            let job_id = required("job")?;
+            print(
+                json!({"job_id":job_id,"configuration":repository.job_configuration(&job_id).map_err(Failure::Ocg)?}),
+            )
+        }
+
         _ => Err(usage_failure(format!(
-            "unknown ocg work subcommand: {subcommand}"
+            "unknown canonical work subcommand: {subcommand}"
         ))),
     }
-}
-
-/// One read-only canonical inspection, shared by `ocg work inspect` and the
-/// control surface. It reads only the durable substrate.
-fn canonical_inspection(
-    project_root: &Path,
-    mission: &crate::orchestration::substrate::MissionId,
-) -> std::result::Result<serde_json::Value, Failure> {
-    let git = crate::process::SystemGitHost;
-    let clock = SystemClock;
-    let controller = crate::orchestration::Controller::new(
-        project_root,
-        crate::orchestration::OrchestrationConfig::default(),
-        ContextConfig::default(),
-        CapabilityConfig::default(),
-        crate::verification::config::VerificationConfig::default(),
-        &git,
-        &clock,
-    );
-    controller
-        .inspect_work(mission.as_str())
-        .map_err(Failure::Ocg)?
-        .ok_or_else(|| Failure::Ocg(OcgError::config("unknown canonical Mission")))
 }
 
 /// Create the user-global OCG Profile; never overwrite an existing file.
@@ -4067,34 +3673,18 @@ fn doctor_command(
                         ),
                     );
                 }
-                let (missions, corrupt_missions) =
-                    crate::orchestration::mission::list(project_root);
-                if missions.is_empty() && corrupt_missions == 0 {
-                    doctor.line(
-                        "info",
-                        "orchestration missions",
-                        "not present (created by the bridge on first task admission)",
-                    );
-                } else if corrupt_missions > 0 {
-                    doctor.line(
-                        "warn",
-                        "orchestration missions",
-                        &format!(
-                            "{} mission(s); {} unreadable record(s) (quarantined on load, never silently reset)",
-                            missions.len(),
-                            corrupt_missions
-                        ),
-                    );
-                } else {
-                    let active = missions
-                        .iter()
-                        .filter(|mission| !mission.status.is_terminal())
-                        .count();
-                    doctor.line(
+                match crate::orchestration::domain::DomainRepository::open(project_root).and_then(
+                    |repository| {
+                        let project = repository.ensure_project(project_root)?;
+                        repository.jobs(&project.id)
+                    },
+                ) {
+                    Ok(jobs) => doctor.line(
                         "ok",
-                        "orchestration missions",
-                        &format!("{} mission(s) ({active} active)", missions.len()),
-                    );
+                        "canonical execution",
+                        &format!("{} Job(s)", jobs.len()),
+                    ),
+                    Err(error) => doctor.line("error", "canonical execution", &error.to_string()),
                 }
                 let limits = crate::orchestration::projection::ProjectionLimits {
                     max_bytes: config.max_handoff_bytes,

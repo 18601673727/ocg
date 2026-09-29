@@ -48,7 +48,7 @@ pub use crate::orchestration::canonical_control::{
 /// The authority record. It travels inside a canonical event payload, so the
 /// PWA reads it out of an opaque JSON value and must not be able to drift from
 /// the definition that actually confers authority.
-pub use crate::orchestration::substrate::DispatchWitness;
+pub use crate::orchestration::domain::ExecutionWitness;
 pub use crate::profile::{
     Candidate, Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION,
 };
@@ -172,7 +172,7 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     CanonicalDashboardResponse::export_all(cfg)?;
     CanonicalProjectResponse::export_all(cfg)?;
     ResourceBudget::export_all(cfg)?;
-    DispatchWitness::export_all(cfg)?;
+    ExecutionWitness::export_all(cfg)?;
     CanonicalWorkSnapshot::export_all(cfg)?;
     CanonicalWorkEvent::export_all(cfg)?;
     ProfileView::export_all(cfg)?;

@@ -502,6 +502,8 @@ export const server = async (_input) => ({
       tool: input.tool,
       args,
     });
+    if (!result || !result.ok || !result.witness) throw new Error("canonical delegation admission failed");
+    args.ocg_witness = result.witness;
     if (result && result.context) appendToPrompt(args, result.context);
   },
   "tool.execute.after": async (input, output) => {
@@ -994,11 +996,11 @@ function appendToPrompt(input, context) {
 // value is treated as absent so the bridge fails closed instead of guessing.
 function isWitness(value) {
   if (!value || typeof value !== "object") return false;
-  const required = ["mission_id", "work_node_id", "run_id", "run_generation", "runtime_execution_id", "dispatch_id"];
+  const required = ["job_id", "attempt_id", "executor_id", "call_id"];
   for (const key of required) {
-    if (value[key] === undefined || value[key] === null || value[key] === "") return false;
+    if (typeof value[key] !== "string" || value[key].length === 0) return false;
   }
-  return Number.isInteger(value.work_node_id) && Number.isInteger(value.run_id) && Number.isInteger(value.run_generation);
+  return Number.isSafeInteger(value.generation) && value.generation > 0;
 }
 
 // A completed foreground delivery carries both a structured nested output
@@ -1060,8 +1062,8 @@ export default {
       // session delegate recursively for its own subtree; the bridge
       // re-validates the Run the witness names, so the cache is never
       // authority.
-      const WITNESS_START = "<<<OCG:RUN_WITNESS v1>>>";
-      const WITNESS_END = "<<<OCG:RUN_WITNESS:END>>>";
+      const WITNESS_START = "<<<OCG:ATTEMPT_WITNESS v1>>>";
+      const WITNESS_END = "<<<OCG:ATTEMPT_WITNESS:END>>>";
       const begin = text.indexOf(WITNESS_START);
       if (begin !== -1) {
         const from = begin + WITNESS_START.length;
@@ -1150,11 +1152,12 @@ export default {
       if (!isWorker(input.agent)) return;
       if (typeof input.prompt !== "string" || input.prompt.length === 0) return;
       if (hasContext(input.prompt)) return;
-      const result = await bridge("tool.execute.before", {
+      const result = await strictBridge("tool.execute.before", {
         session_id: event.sessionID,
         tool: event.tool,
         args: input,
       });
+      if (!isWitness(result.witness)) throw new Error("canonical execution witness missing");
       // The bridge may have created a canonical child WorkNode + Run and
       // returned its durable dispatch witness. The witness is attached to the
       // *exact* subagent input object the host hands back to `execute.after`,

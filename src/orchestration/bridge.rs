@@ -12,15 +12,10 @@
 //! No model or network is involved in this translation layer.
 
 use crate::orchestration::context_governor::{ContextObservation, GovernorState};
-use crate::orchestration::controller::{
-    BuildDecision, ContextGovernanceResult, Controller, HandoffOutcome,
-};
+use crate::orchestration::controller::{ContextGovernanceResult, Controller};
+use crate::orchestration::domain::ExecutionWitness;
+use crate::orchestration::domain::{AttemptAuthority, DomainRepository};
 use crate::orchestration::handoff::Role;
-use crate::orchestration::mission;
-use crate::orchestration::substrate::{
-    DispatchWitness, RunContract, RunId, RunState, SubstrateRepository, WitnessDisposition,
-    WorkNodeId,
-};
 use crate::process::CaptureRunner;
 use crate::reports::ReportsConfig;
 use crate::runtime::compat::{BridgeRuntimeClient, LeadSelection};
@@ -217,8 +212,7 @@ impl<'a> BridgeContext<'a> {
             | "work.dispatch"
             | "work.finish"
             | "work.replace"
-            | "work.result.late"
-            | "work.inspect" => self.canonical_work(event, payload),
+            | "work.inspect" => self.canonical_domain_work(event, payload),
             "chat.message" | "chat-message" => self.chat_message(payload),
             "session.prompt" => self.session_prompt(payload),
             "session.context" => self.session_context(payload),
@@ -243,192 +237,155 @@ impl<'a> BridgeContext<'a> {
         outcome.value
     }
 
-    /// Explicit canonical lifecycle boundary. Callers carry the Run witness;
-    /// this path never consults legacy replay, session state or task phases.
-    fn canonical_work(&self, event: &str, payload: &Value) -> BridgeOutcome {
+    fn canonical_domain_work(&self, event: &str, payload: &Value) -> BridgeOutcome {
         let operation = || -> crate::error::Result<Value> {
-            let mission = payload
-                .get("mission_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| crate::error::OcgError::config("missing mission_id"))?;
-            let node = || -> crate::error::Result<WorkNodeId> {
-                Ok(WorkNodeId(
-                    payload
-                        .get("node_id")
-                        .and_then(Value::as_u64)
-                        .and_then(|id| usize::try_from(id).ok())
-                        .ok_or_else(|| crate::error::OcgError::config("missing node_id"))?,
-                ))
-            };
-            let run = || -> crate::error::Result<RunId> {
-                Ok(RunId(
-                    payload
-                        .get("run_id")
-                        .and_then(Value::as_u64)
-                        .and_then(|id| usize::try_from(id).ok())
-                        .ok_or_else(|| crate::error::OcgError::config("missing run_id"))?,
-                ))
-            };
-            let binding = || -> crate::error::Result<RuntimeExecutionId> {
-                Ok(RuntimeExecutionId::new(
-                    payload
-                        .get("runtime_execution_id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| {
-                            crate::error::OcgError::config("missing runtime_execution_id")
-                        })?,
-                ))
-            };
-            let contract = || -> crate::error::Result<RunContract> {
-                let value = payload
-                    .get("contract")
-                    .ok_or_else(|| crate::error::OcgError::config("missing RunContract"))?;
-                serde_json::from_value(value.clone())
-                    .map_err(|_| crate::error::OcgError::config("invalid RunContract"))
-            };
+            let mut repository = DomainRepository::open(self.controller.root())?;
             match event {
                 "work.mission.create" => {
-                    let lead = self.lead_contract.as_ref().ok_or_else(|| {
-                        crate::error::OcgError::config("resolved Lead contract unavailable")
-                    })?;
-                    let runtime_cell = self.rollover_runtime.as_ref().ok_or_else(|| {
-                        crate::error::OcgError::config("Lead runtime unavailable")
-                    })?;
-                    let runtime_id = binding()?;
-                    let mut client = runtime_cell.borrow_mut();
-                    match client.as_lifecycle().execution_parent(&runtime_id) {
-                        Ok(None) => {}
-                        _ => {
-                            return Err(crate::error::OcgError::config(
-                                "root runtime ancestry unavailable",
-                            ))
-                        }
-                    }
-                    crate::runtime::compat::ensure_existing_session_lead(
-                        client.as_session(),
-                        runtime_id.as_str(),
-                        lead,
-                    )
-                    .map_err(|_| crate::error::OcgError::config("Lead enforcement failed"))?;
-                    drop(client);
-                    let payload_text = payload.get("payload").and_then(Value::as_str).unwrap_or("");
-                    let run = self.controller.create_work_mission(
-                        mission,
-                        payload_text,
-                        RunContract {
-                            executor: lead.agent.clone(),
-                            model: lead.full_model_id(),
-                            role: Role::Lead.as_str().into(),
-                        },
-                        &runtime_id,
-                    )?;
-                    Ok(witness_json(json!({"root_node_id":0}), &run))
+                    let session = payload
+                        .get("runtime_execution_id")
+                        .or_else(|| payload.get("session_id"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| crate::error::OcgError::config("missing session_id"))?;
+                    let body = payload.get("payload").and_then(Value::as_str).unwrap_or("");
+                    let executor = payload
+                        .get("contract")
+                        .and_then(|value| value.get("executor"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("lead");
+                    let admission = self
+                        .controller
+                        .admit_canonical_job(session, body, executor)?;
+                    Ok(json!({
+                        "project_id": admission.project.id,
+                        "job_id": admission.job.id,
+                        "attempt_id": admission.attempt.id,
+                        "executor_id": admission.executor.id,
+                        "generation": admission.attempt.generation,
+                    }))
                 }
                 "work.child.create" => {
-                    let deps = payload
+                    let parent = self
+                        .canonical_authority(
+                            payload
+                                .get("session_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                        )
+                        .ok_or_else(|| {
+                            crate::error::OcgError::config("missing canonical parent authority")
+                        })?;
+                    let dependencies = payload
                         .get("dependencies")
                         .and_then(Value::as_array)
-                        .map(|deps| {
-                            deps.iter()
-                                .map(|id| {
-                                    id.as_u64()
-                                        .and_then(|id| usize::try_from(id).ok())
-                                        .map(WorkNodeId)
-                                        .ok_or_else(|| {
-                                            crate::error::OcgError::config("invalid Dependency")
-                                        })
+                        .map(|values| {
+                            values
+                                .iter()
+                                .map(|value| {
+                                    value.as_str().map(str::to_string).ok_or_else(|| {
+                                        crate::error::OcgError::config(
+                                            "dependencies must be Job identifiers",
+                                        )
+                                    })
                                 })
                                 .collect::<crate::error::Result<Vec<_>>>()
                         })
                         .transpose()?
                         .unwrap_or_default();
-                    let child = self.controller.create_child_work(
-                        mission,
-                        node()?,
-                        run()?,
-                        payload.get("payload").and_then(Value::as_str).unwrap_or(""),
-                        &deps,
-                    )?;
-                    Ok(json!({"node_id":child.0}))
-                }
-                "work.dispatch" => {
-                    let run = self.controller.dispatch_work(
-                        mission,
-                        node()?,
-                        run()?,
-                        contract()?,
-                        &binding()?,
-                    )?;
-                    Ok(witness_json(json!({"node_id":node()?.0}), &run))
-                }
-                "work.finish" => {
-                    let outcome = match payload.get("outcome").and_then(Value::as_str) {
-                        Some("completed") => RunState::Completed,
-                        Some("failed") => RunState::Failed,
-                        Some("cancelled") => RunState::Cancelled,
-                        Some("superseded") => RunState::Superseded,
-                        _ => {
-                            return Err(crate::error::OcgError::config(
-                                "invalid terminal Run outcome",
-                            ))
-                        }
-                    };
-                    self.controller.finish_work(
-                        mission,
-                        node()?,
-                        run()?,
-                        outcome,
-                        payload.get("result").and_then(Value::as_str),
-                    )?;
-                    Ok(
-                        json!({"node_id":node()?.0,"run_id":run()?.0,"outcome":outcome_name(outcome)}),
-                    )
-                }
-                "work.replace" => {
-                    let replacement = self.controller.replace_work_run(
-                        mission,
-                        node()?,
-                        run()?,
-                        contract()?,
-                        &binding()?,
-                    )?;
-                    Ok(witness_json(json!({"node_id":node()?.0}), &replacement))
-                }
-                "work.result.late" => {
-                    self.controller.record_late_work_result(
-                        mission,
-                        run()?,
-                        payload.get("result").and_then(Value::as_str).unwrap_or(""),
-                    )?;
-                    Ok(json!({"run_id":run()?.0,"reconciled":true}))
-                }
-                "work.inspect" => {
-                    // Read-only canonical inspection: the full ownership tree,
-                    // dependency DAG, every Run generation, frozen contract,
-                    // witness, verification evidence and event sequence.
-                    Ok(self.controller.inspect_work(mission)?.ok_or_else(|| {
-                        crate::error::OcgError::config("unknown canonical Mission")
-                    })?)
-                }
-                "work.ready" => {
-                    let state = self.controller.load_work_mission(mission)?.ok_or_else(|| {
-                        crate::error::OcgError::config("unknown canonical Mission")
-                    })?;
-                    let ready: Vec<_> = state
-                        .ready(self.controller.now_unix())
-                        .iter()
-                        .map(|id| id.0)
-                        .collect();
+                    let refs = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
+                    let body = payload.get("payload").and_then(Value::as_str).unwrap_or("");
+                    let job = repository.create_child_job(&parent.authority, body, &refs)?;
                     Ok(json!({
-                        "root_node_id":state.root().0,
-                        "ready":ready,
-                        "work_nodes":state.work_nodes.iter_enumerated().map(|(id,n)| json!({"node_id":id.0,"parent_node_id":n.parent_node_id.map(|p|p.0),"spawned_by_run_id":n.spawned_by_run_id.map(|r|r.0),"state":format!("{:?}",n.state).to_lowercase(),"generation":n.generation,"active_run_id":n.active_run_id.map(|r|r.0),"payload":n.payload})).collect::<Vec<_>>(),
-                        "runs":state.runs.iter_enumerated().map(|(id,r)| json!({"run_id":id.0,"node_id":r.node_id.0,"generation":r.generation,"state":outcome_name(r.state),"runtime_execution_id":r.runtime_execution_id,"host_session_id":r.host_session_id,"contract":r.contract()})).collect::<Vec<_>>(),
-                        "dependencies":state.dependencies.iter().map(|d|json!({"node_id":d.node_id.0,"depends_on_node_id":d.depends_on_node_id.0})).collect::<Vec<_>>()
+                        "project_id": job.project_id,
+                        "job_id": job.id,
+                        "job": job,
                     }))
                 }
-                _ => unreachable!(),
+                "work.dispatch" => {
+                    let job_id = payload
+                        .get("job_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| crate::error::OcgError::config("missing job_id"))?;
+                    let kind = payload
+                        .get("executor")
+                        .and_then(Value::as_str)
+                        .unwrap_or("worker");
+                    let (attempt, executor) = repository.dispatch_job(job_id, kind)?;
+                    Ok(
+                        json!({"job_id":job_id,"attempt_id":attempt.id,"executor_id":executor.id,"generation":attempt.generation}),
+                    )
+                }
+                "work.finish" => {
+                    let attempt_id = payload
+                        .get("attempt_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| crate::error::OcgError::config("missing attempt_id"))?;
+                    let state = payload
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed");
+                    if !matches!(state, "completed" | "failed") {
+                        return Err(crate::error::OcgError::config(
+                            "outcome must be completed or failed",
+                        ));
+                    }
+                    if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+                        let generation = payload
+                            .get("generation")
+                            .and_then(Value::as_u64)
+                            .ok_or_else(|| crate::error::OcgError::config("missing generation"))?;
+                        let result = payload.get("result").cloned().unwrap_or(Value::Null);
+                        let witness =
+                            repository.witness_for_call(call_id, attempt_id, generation)?;
+                        let response = serde_json::to_string(&result)
+                            .map_err(|error| crate::error::OcgError::config(error.to_string()))?;
+                        let disposition =
+                            repository.deliver_result(&witness, &response, state == "completed")?;
+                        return Ok(
+                            json!({"attempt_id":attempt_id,"call_id":call_id,"disposition":disposition,"applied":disposition == "authoritative"}),
+                        );
+                    }
+                    if !matches!(state, "completed" | "failed") {
+                        return Err(crate::error::OcgError::config("outcome must be completed or failed; cancellation requires confirmed stop"));
+                    }
+                    repository.finish_attempt(attempt_id, state == "completed")?;
+                    Ok(json!({"attempt_id":attempt_id,"outcome":state,"applied":true}))
+                }
+                "work.replace" => {
+                    let job_id = payload
+                        .get("job_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| crate::error::OcgError::config("missing job_id"))?;
+                    let kind = payload
+                        .get("executor")
+                        .and_then(Value::as_str)
+                        .unwrap_or("worker");
+                    let expected = payload
+                        .get("attempt_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            crate::error::OcgError::config("missing expected attempt_id")
+                        })?;
+                    let admission =
+                        repository.replace_attempt_checked(job_id, kind, Some(expected))?;
+                    Ok(
+                        json!({"job_id":admission.job.id,"attempt_id":admission.attempt.id,"executor_id":admission.executor.id,"generation":admission.attempt.generation}),
+                    )
+                }
+                "work.inspect" => {
+                    let job_id = payload
+                        .get("job_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| crate::error::OcgError::config("missing job_id"))?;
+                    repository.inspect_job(job_id)
+                }
+                "work.ready" => {
+                    let project = repository.ensure_project(self.controller.root())?;
+                    Ok(json!({"project_id":project.id,"ready":repository.ready_jobs(&project.id)?}))
+                }
+                _ => Err(crate::error::OcgError::config(
+                    "unknown canonical work event",
+                )),
             }
         };
         match operation() {
@@ -533,14 +490,9 @@ impl<'a> BridgeContext<'a> {
             );
         };
 
-        // 2. Determine Root Lead ownership via durable Mission binding.
-        //    The runtime's observed agent name is MUTABLE runtime state
-        //    and MUST NOT be used as the authority test (P0-J).
-        //    A session is an OCG Root Lead session if and only if it
-        //    is the current execution binding for a durable Mission.
-        //    If no mission exists yet (first prompt), we enforce
-        //    conservatively since the bridge carries a canonical
-        //    Lead contract.
+        // 2. Determine root ownership from runtime lineage. The canonical
+        //    SQLite binding is established below; mutable agent labels are
+        //    never authority.
         let mut runtime = runtime_cell.borrow_mut();
         let is_root_lead =
             match is_root_lead_execution(self.controller, &mut **runtime, &session_id) {
@@ -577,9 +529,44 @@ impl<'a> BridgeContext<'a> {
         // dispatch attached. Binding it here is what lets the worker create
         // children for its own subtree: the identity is the durable witness,
         // never the agent name or the prompt.
-        if self.controller.config().canonical_execution {
+        {
             if let Some(present) = witness_from_prompt(&text) {
-                if let Err(error) = self.controller.bind_work_runtime(&present, &session_id) {
+                let job_id = &present.job_id;
+                if job_id.is_empty() {
+                    return BridgeOutcome::err(
+                        "canonical binding refused: witness has no Job identity".into(),
+                        Role::Lead,
+                        Some(session_id),
+                    );
+                };
+                let mut repository = match DomainRepository::open(self.controller.root()) {
+                    Ok(repository) => repository,
+                    Err(error) => {
+                        return BridgeOutcome::err(
+                            format!("canonical binding refused: {error}"),
+                            Role::Lead,
+                            Some(session_id),
+                        )
+                    }
+                };
+                let binding = repository
+                    .validate_execution_witness(&present)
+                    .and_then(|call| {
+                        if call.state != "running"
+                            || repository.authority(&present.attempt_id)?.is_none()
+                        {
+                            return Err(crate::error::OcgError::config("stale execution witness"));
+                        }
+                        repository.bind_attempt(
+                            &session_id,
+                            &AttemptAuthority {
+                                job_id: job_id.clone(),
+                                attempt_id: present.attempt_id.clone(),
+                                generation: present.generation,
+                            },
+                        )
+                    });
+                if let Err(error) = binding {
                     return BridgeOutcome::err(
                         format!("canonical binding refused: {error}"),
                         Role::Lead,
@@ -589,20 +576,12 @@ impl<'a> BridgeContext<'a> {
             }
         }
 
-        // 5. ONLY NOW: admit user task (OCG task state advances)
-        let admission = match self.controller.admit_user_task(&session_id, &text) {
-            Ok(a) => a,
-            Err(e) => return BridgeOutcome::err(e.to_string(), Role::Lead, Some(session_id)),
-        };
-
         // 5b. Production cutover: a genuinely admitted root Lead prompt also
-        // establishes the canonical Mission — exactly one root WorkNode and one
-        // Lead Run, bound atomically to this session, with its dispatch witness
-        // committed before any delegated execution starts. The legacy task
-        // record stays a compatibility projection; it cannot make an execution
-        // decision the substrate owns.
+        // establishes the SQLite canonical Project/Job/Attempt/Executor chain.
+        // The legacy task record remains a context compatibility projection and
+        // cannot make a canonical execution decision.
         let canonical = if is_root_lead {
-            match self.admit_canonical_mission(&session_id, &text) {
+            match self.admit_canonical_job(&session_id, &text) {
                 Ok(value) => value,
                 Err(error) => {
                     return BridgeOutcome::err(
@@ -613,7 +592,20 @@ impl<'a> BridgeContext<'a> {
                 }
             }
         } else {
+            if self.canonical_authority(&session_id).is_none() {
+                return BridgeOutcome::err(
+                    "worker prompt requires a current canonical Attempt binding".into(),
+                    Role::Lead,
+                    Some(session_id),
+                );
+            }
             None
+        };
+
+        // 5. ONLY NOW: admit user task (OCG task state advances)
+        let admission = match self.controller.admit_user_task(&session_id, &text) {
+            Ok(a) => a,
+            Err(e) => return BridgeOutcome::err(e.to_string(), Role::Lead, Some(session_id)),
         };
 
         // 6. SUCCESS
@@ -629,74 +621,29 @@ impl<'a> BridgeContext<'a> {
         BridgeOutcome::ok(value, Role::Lead, Some(admission.session_id))
     }
 
-    /// Establish (or recover) the canonical Mission for an admitted root Lead
-    /// session. The Mission id is derived from the session binding, so a
-    /// restart re-attaches to the same durable WorkNode tree instead of
-    /// inventing a new one.
-    fn admit_canonical_mission(
+    /// Establish (or recover) the canonical Job for an admitted root Lead
+    /// session. The session binding is the idempotency key; all authority is
+    /// committed by the SQLite domain repository in one immediate transaction.
+    fn admit_canonical_job(
         &self,
         session_id: &str,
         text: &str,
     ) -> crate::error::Result<Option<Value>> {
-        if !self.controller.config().canonical_execution {
-            return Ok(None);
-        }
-        let mission_id = canonical_mission_id(session_id)
-            .ok_or_else(|| crate::error::OcgError::config("invalid canonical Mission identity"))?;
-        let mut repo = SubstrateRepository::open(self.controller.root())?;
-        if repo.load(&mission_id)?.is_some() {
-            // Already established: report the existing root authority.
-            let witness = repo
-                .witness_for_run(&mission_id, RunId(0))?
-                .ok_or_else(|| {
-                    crate::error::OcgError::config("canonical root Run witness missing")
-                })?;
-            if witness.runtime_execution_id != session_id
-                || witness.work_node_id != 0
-                || repo.validate_witness(&witness)? != WitnessDisposition::Authoritative
-            {
-                return Err(crate::error::OcgError::config(
-                    "canonical root Run is not authoritative",
-                ));
-            }
-            return Ok(Some(json!({
-                "mission_id": mission_id.as_str(),
-                "root_node_id": 0,
-                "run_id": 0,
-                "reused": true,
-                "witness": witness.to_json(),
-            })));
-        }
         let lead = self
             .lead_contract
             .as_ref()
             .ok_or_else(|| crate::error::OcgError::config("canonical Lead contract missing"))?;
-        let contract = RunContract {
-            executor: lead.agent.clone(),
-            model: lead.full_model_id(),
-            role: Role::Lead.as_str().to_string(),
-        };
         let objective: String = text.chars().take(4096).collect();
-        let witness = repo.create_live_mission(
-            &mission_id,
-            &objective,
-            contract,
-            session_id,
-            self.controller.now_unix(),
-        )?;
-        if witness.runtime_execution_id != session_id
-            || repo.validate_witness(&witness)? != WitnessDisposition::Authoritative
-        {
-            return Err(crate::error::OcgError::config(
-                "canonical root Run is not authoritative",
-            ));
-        }
+        let admission = self
+            .controller
+            .admit_canonical_job(session_id, &objective, &lead.agent)?;
         Ok(Some(json!({
-            "mission_id": mission_id.as_str(),
-            "root_node_id": witness.work_node_id,
-            "run_id": witness.run_id,
-            "reused": false,
-            "witness": witness.to_json(),
+            "project_id": admission.project.id,
+            "job_id": admission.job.id,
+            "attempt_id": admission.attempt.id,
+            "generation": admission.attempt.generation,
+            "executor_id": admission.executor.id,
+            "reused": admission.job.generation > 1,
         })))
     }
 
@@ -1076,17 +1023,11 @@ impl<'a> BridgeContext<'a> {
         if let Some(canonical) = self.canonical_dispatch(&session_id, role, &task, &args) {
             return canonical;
         }
-        match self.controller.prepare_handoff(&session_id, role, &task) {
-            Ok(handoff) => BridgeOutcome {
-                value: handoff_value("tool.execute.before", &handoff),
-                metrics: handoff.metrics.clone(),
-                outcome: Outcome::Success,
-                role: Some(role.as_str().to_string()),
-                session_id: Some(handoff.session_id.clone()),
-                task_type: "orchestration".to_string(),
-            },
-            Err(error) => self.error_outcome(error.to_string(), Some(role), Some(session_id)),
-        }
+        self.error_outcome(
+            "delegation requires current canonical Attempt authority".into(),
+            Some(role),
+            Some(session_id),
+        )
     }
 
     fn tool_after(&self, payload: &Value) -> BridgeOutcome {
@@ -1112,47 +1053,25 @@ impl<'a> BridgeContext<'a> {
         if let Some(witness) = witness_from(&args) {
             return self.canonical_result(&session_id, role, witness, payload);
         }
-        match role {
-            Role::Explore | Role::ExploreDeep => self.after_explore(&session_id, payload),
-            Role::Build => self.after_build(&session_id),
-            _ => BridgeOutcome {
-                value: json!({
-                    "ok": true,
-                    "event": "tool.execute.after",
-                    "context": "",
-                    "note": format!("no orchestration action for {} completion", role.as_str()),
-                }),
-                metrics: OrchestrationMetrics::default(),
-                outcome: Outcome::Unknown,
-                role: Some(role.as_str().to_string()),
-                session_id: Some(session_id),
-                task_type: "orchestration".to_string(),
-            },
-        }
+        self.error_outcome(
+            "result delivery requires a canonical execution witness".into(),
+            Some(role),
+            Some(session_id),
+        )
     }
 
-    /// The canonical Mission, WorkNode and Run this caller session is bound
-    /// to. It is a durable binding lookup, never a prompt, role or ready-order
-    /// guess.
+    /// The canonical Attempt this caller session is bound to. SQLite owns the
+    /// lookup; no Mission, WorkNode or ready-order projection participates.
     fn canonical_authority(&self, session_id: &str) -> Option<CanonicalAuthority> {
-        if !self.controller.config().canonical_execution || session_id.is_empty() {
+        if session_id.is_empty() {
             return None;
         }
-        let mut repo = SubstrateRepository::open(self.controller.root()).ok()?;
-        for mission in repo.missions_by_binding(session_id).ok()? {
-            if let Some((node, run)) = repo
-                .authoritative_run_by_binding(&mission, session_id)
-                .ok()
-                .flatten()
-            {
-                return Some(CanonicalAuthority {
-                    mission_id: mission.as_str().to_string(),
-                    node_id: node.0,
-                    run_id: run.0,
-                });
-            }
-        }
-        None
+        let repository = DomainRepository::open(self.controller.root()).ok()?;
+        let project = repository.ensure_project(self.controller.root()).ok()?;
+        let authority = repository
+            .authority_for_binding(&project.id, session_id)
+            .ok()??;
+        Some(CanonicalAuthority { authority })
     }
 
     /// Canonical child dispatch. The returned witness is the only identity the
@@ -1166,27 +1085,25 @@ impl<'a> BridgeContext<'a> {
     ) -> Option<BridgeOutcome> {
         let authority = self.canonical_authority(session_id)?;
         // Only an authoritative caller may create work. A stale or fenced
-        // session never reaches this path at all.
-        let node = WorkNodeId(authority.node_id);
-        let run = RunId(authority.run_id);
-        // The caller must still name a live WorkNode. `canonical_authority`
-        // already proved the Run is authoritative, so this is a cheap shape
-        // check rather than a second authority decision.
-        let parent = self
-            .controller
-            .load_work_mission(&authority.mission_id)
-            .ok()
-            .flatten()?;
-        parent.work_nodes.get(node)?;
-        // A delegated objective is bounded and never the identity.
+        // session is absent from this path.
         let objective: String = task.chars().take(4096).collect();
-        let dependencies = dependencies_from(args);
-        let child = match self.controller.create_child_work(
-            &authority.mission_id,
-            node,
-            run,
+        let dependencies = canonical_dependencies_from(args);
+        let executor = subagent(args).unwrap_or_else(|| role.agent().unwrap_or_default());
+        let mut repository = match DomainRepository::open(self.controller.root()) {
+            Ok(repository) => repository,
+            Err(error) => {
+                return Some(self.error_outcome(
+                    error.to_string(),
+                    Some(role),
+                    Some(session_id.to_string()),
+                ))
+            }
+        };
+        let child = match repository.admit_child(
+            &authority.authority,
             &objective,
-            &dependencies,
+            &dependencies.iter().map(String::as_str).collect::<Vec<_>>(),
+            &executor,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -1197,39 +1114,16 @@ impl<'a> BridgeContext<'a> {
                 ))
             }
         };
-        // The frozen contract records the model the delegated agent will
-        // actually use. OCG writes the worker routing table into the generated
-        // agent config, so the routed model is the real one; the Lead model is
-        // only a visible fallback when the role has no configured model.
-        let executor = subagent(args).unwrap_or_else(|| role.agent().unwrap_or_default());
-        let model = self
-            .routing
-            .as_ref()
-            .and_then(|routing| routing.model_for(role.routing_role()))
-            .map(str::to_string)
-            .or_else(|| self.lead_contract.as_ref().map(|lead| lead.full_model_id()))
-            .unwrap_or_else(|| role.as_str().to_string());
-        let contract = RunContract {
-            executor,
-            model,
-            role: role.as_str().to_string(),
-        };
-        // The child Run's runtime binding is provisional until the host
-        // reports the concrete subagent session; the witness is durable now.
-        let planned = format!(
-            "ocg-pending-{}-{}-{}",
-            authority.mission_id,
-            child.0,
-            role.as_str()
-        );
-        let witness = match self.controller.dispatch_work(
-            &authority.mission_id,
-            child,
-            run,
-            contract,
-            &RuntimeExecutionId::new(planned),
+        let call_request = serde_json::to_string(&json!({ "arguments": args }))
+            .unwrap_or_else(|_| "{\"arguments\":{}}".to_string());
+        let call = match repository.create_call(
+            &child.attempt.id,
+            Some(&child.executor.id),
+            child.attempt.generation,
+            true,
+            &call_request,
         ) {
-            Ok(witness) => witness,
+            Ok(call) => call,
             Err(error) => {
                 return Some(self.error_outcome(
                     error.to_string(),
@@ -1238,6 +1132,22 @@ impl<'a> BridgeContext<'a> {
                 ))
             }
         };
+        if let Err(error) =
+            repository.start_call(&call.id, &child.attempt.id, child.attempt.generation)
+        {
+            let _ = repository.fail_call(
+                &call.id,
+                &child.attempt.id,
+                child.attempt.generation,
+                "call_start_rejected",
+            );
+            return Some(self.error_outcome(
+                error.to_string(),
+                Some(role),
+                Some(session_id.to_string()),
+            ));
+        }
+        let witness = canonical_witness(&authority.authority, &child, Some(&call.id));
         let handoff = self.controller.prepare_handoff(session_id, role, task).ok();
         // The OCG-owned envelope travels with the delegated prompt. It is how
         // a worker session recovers *its own* durable Run identity on its first
@@ -1264,10 +1174,12 @@ impl<'a> BridgeContext<'a> {
             "ok": true,
             "event": "tool.execute.before",
             "canonical": true,
-            "mission_id": authority.mission_id,
-            "node_id": child.0,
-            "parent_node_id": authority.node_id,
-            "parent_run_id": authority.run_id,
+            "job_id": child.job.id,
+            "attempt_id": child.attempt.id,
+            "generation": child.attempt.generation,
+            "executor_id": child.executor.id,
+            "call_id": call.id,
+            "parent_attempt_id": authority.authority.attempt_id,
             "witness": witness.to_json(),
             "context": context,
         });
@@ -1294,182 +1206,76 @@ impl<'a> BridgeContext<'a> {
         &self,
         session_id: &str,
         role: Role,
-        witness: DispatchWitness,
+        witness: ExecutionWitness,
         payload: &Value,
     ) -> BridgeOutcome {
         let output = result_text(payload);
-        let host_session = payload
-            .get("host_session_id")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                payload
-                    .get("result")
-                    .and_then(|result| result.get("sessionID"))
-                    .and_then(Value::as_str)
-            })
-            .unwrap_or("");
-        if !host_session.is_empty() {
-            if let Err(error) = self.controller.bind_work_runtime(&witness, host_session) {
-                return self.error_outcome(
-                    error.to_string(),
-                    Some(role),
-                    Some(session_id.to_string()),
-                );
-            }
+        if !witness.attempt_id.is_empty() {
+            let attempt_id = &witness.attempt_id;
+            return self.canonical_call_result(session_id, role, &witness, attempt_id, &output);
         }
-        let disposition = match self.controller.validate_work_witness(&witness) {
-            Ok(disposition) => disposition,
-            Err(error) => {
-                return self.error_outcome(
-                    error.to_string(),
-                    Some(role),
-                    Some(session_id.to_string()),
-                )
-            }
-        };
-        if !disposition.is_authoritative() {
-            // Retain the evidence and report that authority was refused. The
-            // canonical substrate decides whether it is kept as late evidence.
-            let recorded = self
-                .controller
-                .finish_work_witness(&witness, RunState::Failed, &output);
-            return BridgeOutcome {
-                value: json!({
-                    "ok": true,
-                    "event": "tool.execute.after",
-                    "canonical": true,
-                    "witness": witness.to_json(),
-                    "disposition": disposition.text(),
-                    "applied": false,
-                    "note": "stale delivery retained as non-authoritative evidence",
-                    "outcome": recorded.as_ref().map(|outcome| outcome.disposition.clone()).unwrap_or_else(|_| disposition.text().to_string()),
-                    "context": "",
-                }),
-                metrics: OrchestrationMetrics::default(),
-                outcome: Outcome::Unknown,
-                role: Some(role.as_str().to_string()),
-                session_id: Some(session_id.to_string()),
-                task_type: "orchestration".to_string(),
-            };
-        }
-        // Independent trusted verification, separate from model output. The
-        // three outcomes stay distinct: passing completes the Run, failing fails
-        // it, and *not running* neither completes nor fails anything. A project
-        // with no configured stage must not silently fail real work, nor let it
-        // pass unverified.
-        // `None` becomes the honest "unverified" outcome below, so every path
-        // either returns early or sets `verified` before it is read.
-        let verified = match self.canonical_verification(role) {
-            Some(VerificationOutcome::Passed(report)) => {
-                let commands = verification_commands(&report);
-                if let Err(error) = self
-                    .controller
-                    .record_work_verification(&witness, true, &report, &commands)
-                {
-                    return self.error_outcome(
-                        error.to_string(),
-                        Some(role),
-                        Some(session_id.to_string()),
-                    );
-                }
-                true
-            }
-            Some(VerificationOutcome::Failed(report)) => {
-                let commands = verification_commands(&report);
-                if let Err(error) = self
-                    .controller
-                    .record_work_verification(&witness, false, &report, &commands)
-                {
-                    return self.error_outcome(
-                        error.to_string(),
-                        Some(role),
-                        Some(session_id.to_string()),
-                    );
-                }
-                false
-            }
-            Some(VerificationOutcome::NotRun) | None => {
-                // No trusted command ran, so there is no evidence either way.
-                // Record that explicitly and leave the Run active: the caller
-                // can configure verification and redeliver, and nothing is
-                // completed on an unchecked result.
-                if let Err(error) = self.controller.record_work_verification(
-                    &witness,
-                    false,
-                    &json!({"evidence": "not-run", "note": "no trusted verification stage is configured for this role"}),
-                    &[],
-                ) {
-                    return self.error_outcome(
-                        error.to_string(),
-                        Some(role),
-                        Some(session_id.to_string()),
-                    );
-                }
-                return BridgeOutcome {
-                    value: json!({
-                        "ok": true,
-                        "event": "tool.execute.after",
-                        "canonical": true,
-                        "witness": witness.to_json(),
-                        "disposition": "authoritative",
-                        "applied": false,
-                        "verified": false,
-                        "note": "no trusted verification stage is configured; the Run stays active until the result is verifiable",
-                        "context": "ocg: this result was not verified. Configure a verification stage before completing it.",
-                    }),
-                    metrics: OrchestrationMetrics::default(),
-                    outcome: Outcome::Unknown,
-                    role: Some(role.as_str().to_string()),
-                    session_id: Some(session_id.to_string()),
-                    task_type: "orchestration".to_string(),
+        self.error_outcome(
+            "missing canonical Attempt identity".into(),
+            Some(role),
+            Some(session_id.to_string()),
+        )
+    }
+
+    fn canonical_call_result(
+        &self,
+        session_id: &str,
+        role: Role,
+        witness: &ExecutionWitness,
+        _attempt_id: &str,
+        output: &str,
+    ) -> BridgeOutcome {
+        let operation = || -> crate::error::Result<Value> {
+            let mut repository = DomainRepository::open(self.controller.root())?;
+            let call = repository.validate_execution_witness(witness)?;
+            let response = serde_json::to_string(
+                &serde_json::from_str::<Value>(output)
+                    .unwrap_or_else(|_| Value::String(output.to_string())),
+            )
+            .map_err(|error| crate::error::OcgError::config(error.to_string()))?;
+            let current =
+                repository.authority(&witness.attempt_id)?.is_some() && call.state == "running";
+            let mut verified = repository
+                .verification(&witness.call_id)?
+                .map(|(passed, _)| passed);
+            if current && verified.is_none() {
+                let executor = repository
+                    .executor(&witness.executor_id)?
+                    .ok_or_else(|| crate::error::OcgError::config("missing canonical Executor"))?;
+                let execution_role = Role::parse(&executor.kind).ok_or_else(|| {
+                    crate::error::OcgError::config("Executor has no verification role")
+                })?;
+                let evidence = match self.canonical_verification(execution_role) {
+                    Some(VerificationOutcome::Passed(report)) => Some((true, report)),
+                    Some(VerificationOutcome::Failed(report)) => Some((false, report)),
+                    Some(VerificationOutcome::NotRun) | None => None,
                 };
-            }
-        };
-        let outcome_state = if verified {
-            RunState::Completed
-        } else {
-            RunState::Failed
-        };
-        match self
-            .controller
-            .finish_work_witness(&witness, outcome_state, &output)
-        {
-            Ok(outcome) => {
-                let note = if verified {
-                    format!(
-                        "ocg verification: canonical Run {} completed with passing evidence",
-                        witness.run_id
-                    )
-                } else {
-                    format!(
-                        "ocg verification: canonical Run {} did not complete; trusted verification evidence is required for success",
-                        witness.run_id
-                    )
+                let Some((passed, report)) = evidence else {
+                    return Ok(
+                        json!({"applied":false,"disposition":"unverified","call_id":witness.call_id,
+                        "note":"no trusted verification ran; Attempt remains active"}),
+                    );
                 };
-                BridgeOutcome {
-                    value: json!({
-                        "ok": true,
-                        "event": "tool.execute.after",
-                        "canonical": true,
-                        "witness": witness.to_json(),
-                        "disposition": outcome.disposition,
-                        "applied": outcome.disposition == "authoritative",
-                        "node_state": outcome.node_state,
-                        "run_state": outcome.run_state,
-                        "verification": verified,
-                        "context": note,
-                    }),
-                    metrics: OrchestrationMetrics::default(),
-                    outcome: if verified {
-                        Outcome::Success
-                    } else {
-                        Outcome::Failure
-                    },
-                    role: Some(role.as_str().to_string()),
-                    session_id: Some(session_id.to_string()),
-                    task_type: "orchestration".to_string(),
-                }
+                repository.record_verification(witness, passed, &report)?;
+                verified = repository
+                    .verification(&witness.call_id)?
+                    .map(|(passed, _)| passed);
             }
+            let disposition =
+                repository.deliver_result(witness, &response, verified.unwrap_or(false))?;
+            if disposition == "authoritative" && matches!(role, Role::Explore | Role::ExploreDeep) {
+                self.controller.consume_explore_result(session_id, output)?;
+            }
+            Ok(json!({"event":"tool.execute.after","canonical":true,
+                "call_id":witness.call_id,"attempt_id":witness.attempt_id,"generation":witness.generation,
+                "applied":disposition == "authoritative","disposition":disposition,"verified":verified,"context":""}))
+        };
+        match operation() {
+            Ok(value) => BridgeOutcome::ok(value, role, Some(session_id.to_string())),
             Err(error) => {
                 self.error_outcome(error.to_string(), Some(role), Some(session_id.to_string()))
             }
@@ -1504,88 +1310,6 @@ impl<'a> BridgeContext<'a> {
         })
     }
 
-    fn after_explore(&self, session_id: &str, payload: &Value) -> BridgeOutcome {
-        let output = result_text(payload);
-        match self.controller.consume_explore_result(session_id, &output) {
-            Ok(digest) => {
-                let context = format!(
-                    "explore result captured ({}): {} finding(s), {} location(s){}",
-                    if digest.structured {
-                        "structured JSON"
-                    } else {
-                        "deterministic fallback"
-                    },
-                    digest.findings.len(),
-                    digest.locations.len(),
-                    digest
-                        .checkpoint_id
-                        .as_deref()
-                        .map(|id| format!(", checkpoint {id}"))
-                        .unwrap_or_default()
-                );
-                BridgeOutcome {
-                    value: json!({
-                        "ok": true,
-                        "event": "tool.execute.after",
-                        "session_id": digest.session_id,
-                        "task_id": digest.task_id,
-                        "context": context,
-                        "findings": digest.findings.len(),
-                        "checkpoint": digest.checkpoint_id,
-                    }),
-                    metrics: digest.metrics,
-                    outcome: Outcome::Success,
-                    role: Some(Role::Explore.as_str().to_string()),
-                    session_id: Some(digest.session_id.clone()),
-                    task_type: "orchestration".to_string(),
-                }
-            }
-            Err(error) => self.error_outcome(
-                error.to_string(),
-                Some(Role::Explore),
-                Some(session_id.to_string()),
-            ),
-        }
-    }
-
-    fn after_build(&self, session_id: &str) -> BridgeOutcome {
-        match self.controller.after_build(session_id, self.runner, None) {
-            Ok(outcome) => {
-                let (context, telemetry_outcome) = build_feedback(&outcome.decision);
-                BridgeOutcome {
-                    value: json!({
-                        "ok": true,
-                        "event": "tool.execute.after",
-                        "session_id": outcome.session_id,
-                        "task_id": outcome.task_id,
-                        "stage": outcome.stage,
-                        "context": context,
-                        "checkpoint": outcome.checkpoint_id,
-                    }),
-                    metrics: outcome.metrics,
-                    outcome: telemetry_outcome,
-                    role: Some(Role::Build.as_str().to_string()),
-                    session_id: Some(outcome.session_id.clone()),
-                    task_type: "orchestration".to_string(),
-                }
-            }
-            Err(error) => self.error_outcome(
-                error.to_string(),
-                Some(Role::Build),
-                Some(session_id.to_string()),
-            ),
-        }
-    }
-
-    /// `lead.output` (OpenCode V2 event stream): persist the raw user-visible
-    /// text of one completed assistant step from the Mission's current root
-    /// execution. The raw OpenCode agent name is diagnostic metadata, not the
-    /// authority for root-ness; the durable Mission binding decides that.
-    /// Worker sessions and stale pre-cutover executions are therefore rejected
-    /// without confusing an OpenCode agent name with an OCG role.
-    ///
-    /// The write itself is atomic and every failure is soft — a broken report
-    /// must never break a session.
     fn lead_output(&self, payload: &Value) -> BridgeOutcome {
         let session_id = session_id(payload);
         let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
@@ -1694,10 +1418,12 @@ fn context_governance_value(
     if let Some(result) = result {
         value["rollover_status"] = result
             .rollover_status
+            .as_ref()
             .map(|status| json!(status.as_str()))
             .unwrap_or(Value::Null);
         value["artifact_status"] = result
             .artifact_status
+            .as_ref()
             .map(|status| json!(status.as_str()))
             .unwrap_or(Value::Null);
         value["artifact_id"] = result
@@ -1735,97 +1461,6 @@ fn context_governance_value(
     value
 }
 
-fn handoff_value(event: &str, handoff: &HandoffOutcome) -> Value {
-    json!({
-        "ok": true,
-        "event": event,
-        "session_id": handoff.session_id,
-        "task_id": handoff.task_id,
-        "source": handoff.source.as_str(),
-        "destination": handoff.destination.as_str(),
-        "agent": handoff.agent,
-        "context": handoff.dynamic_context,
-        "handoff_bytes": handoff.capsule.measured_bytes(),
-        "stale": handoff.stale,
-        "stale_reasons": handoff.stale_reasons,
-        "advisory_permissions": handoff.advisory_permissions,
-    })
-}
-
-fn build_feedback(decision: &BuildDecision) -> (String, Outcome) {
-    let mut context = String::new();
-    let outcome = match decision {
-        BuildDecision::Passed { verification, .. } => {
-            context.push_str(&format!(
-                "ocg verification: stage '{}' passed; no Debug hand-off is recommended.\n",
-                verification.stage
-            ));
-            Outcome::Success
-        }
-        BuildDecision::RetryBuild {
-            attempt,
-            verification,
-            ..
-        } => {
-            context.push_str(&format!(
-                "ocg verification: stage '{}' failed; bounded Build retry {attempt} is allowed.\n",
-                verification.stage
-            ));
-            append_verification(&mut context, verification);
-            Outcome::Failure
-        }
-        BuildDecision::Debug {
-            reason,
-            handoff,
-            report,
-        } => {
-            context.push_str(&format!("ocg verification failed: {reason}\n"));
-            context.push_str(&format!(
-                "ocg recommends the Debug role (agent {}).\n",
-                handoff.agent.as_deref().unwrap_or("ocg-debug")
-            ));
-            let verification = crate::orchestration::controller::handoff_verification(report);
-            append_verification(&mut context, &verification);
-            Outcome::Failure
-        }
-        BuildDecision::NotConfigured { note } => {
-            context.push_str(&format!("ocg verification: {note}\n"));
-            Outcome::Unknown
-        }
-    };
-    (context, outcome)
-}
-
-fn append_verification(
-    context: &mut String,
-    verification: &crate::orchestration::handoff::HandoffVerification,
-) {
-    if !verification.failed_commands.is_empty() {
-        context.push_str("failed commands:\n");
-        for command in &verification.failed_commands {
-            context.push_str(&format!("- {command}\n"));
-        }
-    }
-    if !verification.failed_tests.is_empty() {
-        context.push_str("failed tests:\n");
-        for test in &verification.failed_tests {
-            context.push_str(&format!("- {test}\n"));
-        }
-    }
-    if !verification.locations.is_empty() {
-        context.push_str("failing locations:\n");
-        for location in &verification.locations {
-            context.push_str(&format!("- {}\n", location.display()));
-        }
-    }
-    if !verification.raw_log_refs.is_empty() {
-        context.push_str("raw logs:\n");
-        for reference in &verification.raw_log_refs {
-            context.push_str(&format!("- {reference}\n"));
-        }
-    }
-}
-
 fn session_id(payload: &Value) -> String {
     for key in ["session_id", "sessionID", "sessionId"] {
         if let Some(value) = payload.get(key).and_then(Value::as_str) {
@@ -1844,7 +1479,7 @@ fn session_id(payload: &Value) -> String {
 /// protects the first-prompt fallback from promoting a worker/session view
 /// that merely belongs to the same Mission. No runtime agent name is read.
 fn is_root_lead_execution(
-    controller: &Controller<'_>,
+    _controller: &Controller<'_>,
     runtime: &mut dyn BridgeRuntimeClient,
     session_id: &str,
 ) -> crate::error::Result<bool> {
@@ -1864,29 +1499,7 @@ fn is_root_lead_execution(
         }
     }
 
-    // Fast path for the controller's canonical durable ownership predicate.
-    // The lookup below remains explicit because first-prompt admission may
-    // race the creation of the Mission record.
-    if controller.is_current_execution(&execution_id)? {
-        return Ok(true);
-    }
-
-    // This is deliberately an ownership check, not a membership check. The
-    // Mission returned by `find_by_session` must itself carry this exact
-    // durable execution binding. A worker view that can find the Mission but
-    // is not its authoritative binding is rejected.
-    match mission::find_by_session(controller.root(), session_id) {
-        Ok(Some(mission)) => Ok(mission
-            .runtime_execution_id()
-            .is_some_and(|bound| bound == execution_id)),
-        Ok(None) => {
-            // No Mission exists yet for a verified root execution: this is the
-            // only first-prompt case, so enforce conservatively before
-            // admission creates the durable binding.
-            Ok(true)
-        }
-        Err(error) => Err(error),
-    }
+    Ok(true)
 }
 
 fn subagent(args: &Value) -> Option<String> {
@@ -1926,52 +1539,6 @@ fn result_text(payload: &Value) -> String {
     String::new()
 }
 
-/// The canonical Mission id for an admitted Lead session.
-///
-/// It is derived from the durable session binding, so the same session always
-/// re-attaches to the same WorkNode tree across restart. The id is not derived
-/// from prompt text, agent name or ready-queue order.
-fn verification_commands(report: &Value) -> Vec<String> {
-    report
-        .get("results")
-        .and_then(Value::as_array)
-        .map(|results| {
-            results
-                .iter()
-                .filter_map(|result| {
-                    let program = result.get("command").and_then(Value::as_str)?;
-                    let args = result
-                        .get("args")
-                        .and_then(Value::as_array)
-                        .map(|args| {
-                            args.iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .unwrap_or_default();
-                    Some(if args.is_empty() {
-                        program.to_string()
-                    } else {
-                        format!("{program} {args}")
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn canonical_mission_id(session_id: &str) -> Option<crate::orchestration::substrate::MissionId> {
-    use crate::runtime::hash::sha256_hex;
-    let digest = sha256_hex(format!("ocg-canonical|{session_id}").as_bytes());
-    let short = digest.get(..24)?;
-    crate::orchestration::substrate::MissionId::new(format!("wn-{short}")).ok()
-}
-
-/// The three distinct outcomes of trusted verification for one canonical Run.
-///
-/// Keeping `NotRun` separate from `Failed` is what stops an unconfigured project
-/// from failing real work, and stops unchecked work from counting as complete.
 enum VerificationOutcome {
     Passed(Value),
     Failed(Value),
@@ -1980,9 +1547,7 @@ enum VerificationOutcome {
 
 /// The durable canonical authority of a caller session.
 struct CanonicalAuthority {
-    mission_id: String,
-    node_id: usize,
-    run_id: usize,
+    authority: AttemptAuthority,
 }
 
 /// Delimiters of the OCG-owned dispatch-witness envelope.
@@ -1991,15 +1556,15 @@ struct CanonicalAuthority {
 /// prompt. It is the only channel by which a worker session recovers the
 /// durable identity of the Run that created it. It is never parsed for
 /// authority: the bridge re-validates the Run the witness names.
-pub const WITNESS_START: &str = "<<<OCG:RUN_WITNESS v1>>>";
-pub const WITNESS_END: &str = "<<<OCG:RUN_WITNESS:END>>>";
+pub const WITNESS_START: &str = "<<<OCG:ATTEMPT_WITNESS v1>>>";
+pub const WITNESS_END: &str = "<<<OCG:ATTEMPT_WITNESS:END>>>";
 
 /// Read the dispatch witness a delegated prompt carries, if any.
-pub fn witness_from_prompt(text: &str) -> Option<DispatchWitness> {
+pub fn witness_from_prompt(text: &str) -> Option<ExecutionWitness> {
     let start = text.find(WITNESS_START)? + WITNESS_START.len();
     let end = text[start..].find(WITNESS_END)? + start;
     let value: Value = serde_json::from_str(text[start..end].trim()).ok()?;
-    DispatchWitness::from_json(&value).ok()
+    ExecutionWitness::from_json(&value).ok()
 }
 
 /// Read the dispatch witness an adapter attached to this exact invocation.
@@ -2008,42 +1573,35 @@ pub fn witness_from_prompt(text: &str) -> Option<DispatchWitness> {
 /// unchanged. Prompt text is never parsed for identity; a witness that cannot
 /// be read as a complete durable witness is simply absent, and the caller then
 /// falls through to the compatibility path rather than guessing.
-fn witness_from(args: &Value) -> Option<DispatchWitness> {
+fn witness_from(args: &Value) -> Option<ExecutionWitness> {
     let value = args.get("ocg_witness")?;
-    DispatchWitness::from_json(value).ok()
+    ExecutionWitness::from_json(value).ok()
 }
 
-/// Optional explicit dependency edges a caller may attach to a delegation.
-fn dependencies_from(args: &Value) -> Vec<WorkNodeId> {
+fn canonical_dependencies_from(args: &Value) -> Vec<String> {
     args.get("ocg_dependencies")
         .and_then(Value::as_array)
         .map(|list| {
             list.iter()
-                .filter_map(|item| item.as_u64())
-                .filter_map(|raw| usize::try_from(raw).ok())
-                .map(WorkNodeId)
+                .filter_map(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()
 }
 
-fn witness_json(mut value: Value, witness: &DispatchWitness) -> Value {
-    value["run_id"] = json!(witness.run_id);
-    value["run_generation"] = json!(witness.run_generation);
-    value["runtime_execution_id"] = json!(witness.runtime_execution_id);
-    value["dispatch_id"] = json!(witness.dispatch_id);
-    value["witness"] = witness.to_json();
-    value
-}
-
-fn outcome_name(outcome: RunState) -> &'static str {
-    match outcome {
-        RunState::Active => "active",
-        RunState::Completed => "completed",
-        RunState::Failed => "failed",
-        RunState::Cancelled => "cancelled",
-        RunState::Superseded => "superseded",
-        RunState::Fenced => "fenced",
+fn canonical_witness(
+    _parent: &AttemptAuthority,
+    admission: &crate::orchestration::domain::CanonicalAdmission,
+    call_id: Option<&str>,
+) -> ExecutionWitness {
+    ExecutionWitness {
+        job_id: admission.job.id.clone(),
+        attempt_id: admission.attempt.id.clone(),
+        executor_id: admission.executor.id.clone(),
+        call_id: call_id.unwrap_or_default().to_string(),
+        generation: admission.attempt.generation,
     }
 }
 

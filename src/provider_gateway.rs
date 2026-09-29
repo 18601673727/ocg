@@ -1,22 +1,21 @@
 //! Invocation-scoped OpenAI Chat Completions gateway for explicitly migrated routes.
 use crate::error::{OcgError, Result};
 use crate::orchestration::budget::{BudgetConfig, QuotaFacts};
-use crate::orchestration::dispatch::{DispatchId, DispatchRecord, DispatchState, DispatchUsage};
-use crate::orchestration::mission;
-use crate::orchestration::replay::SnapshotService;
+use crate::orchestration::domain::{DomainRepository, EffectIntentState};
+use crate::orchestration::execution_dispatch::{
+    BoundedDispatcher, CompioCallHandler, CompioExecutor, ExecutionEnvelope, ExecutionEvent,
+};
 use crate::provider_transport::{
     ChatStreamEvent, NormalizedUsage, ProviderTransport, ProviderTransportConfig,
 };
 use crate::runtime::compat::v2_client::{ServiceRegistration, V2SessionClient};
-use crate::runtime::lifecycle::RuntimeExecutionId;
-use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread::JoinHandle;
@@ -24,7 +23,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_HEADERS: usize = 16 * 1024;
 const MAX_BODY: usize = 4 * 1024 * 1024;
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct GatewayRoute {
@@ -34,7 +32,10 @@ pub struct GatewayRoute {
 }
 
 pub struct ProviderGateway {
+    _execution_lock: std::fs::File,
     listener: Option<JoinHandle<()>>,
+    executor: Option<JoinHandle<()>>,
+    dispatcher: BoundedDispatcher,
     stop: Arc<AtomicBool>,
     registration: Arc<Mutex<Option<ServiceRegistration>>>,
     url: String,
@@ -51,6 +52,214 @@ struct GatewayContext {
     budget: BudgetConfig,
     token: String,
     invocation: String,
+    dispatcher: BoundedDispatcher,
+}
+
+struct ProviderCallHandler {
+    project: PathBuf,
+    route: GatewayRoute,
+}
+
+impl CompioCallHandler for ProviderCallHandler {
+    fn execute(
+        &self,
+        envelope: ExecutionEnvelope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            let mut domain = DomainRepository::open(&self.project)?;
+            let authority = crate::orchestration::domain::AttemptAuthority {
+                attempt_id: envelope.attempt_id.clone(),
+                job_id: envelope.job_id.clone(),
+                generation: envelope.generation,
+            };
+            match domain.claim_call(
+                &envelope.call_id,
+                &authority.attempt_id,
+                authority.generation,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(error) = envelope
+                        .events
+                        .send(ExecutionEvent::Failed("duplicate_delivery".into()))
+                    {
+                        tracing::debug!(%error, "duplicate delivery receiver disconnected");
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    domain.fence_dispatch_intent(&envelope.call_id, "stale_attempt_authority")?;
+                    if let Err(send_error) = envelope
+                        .events
+                        .send(ExecutionEvent::Failed(error.to_string()))
+                    {
+                        tracing::debug!(%send_error, "stale delivery receiver disconnected");
+                    }
+                    return Ok(());
+                }
+            }
+            let input: Value = serde_json::from_str(&envelope.payload)
+                .map_err(|error| OcgError::config(format!("invalid queued Call input: {error}")))?;
+            let arguments = input
+                .get("arguments")
+                .cloned()
+                .ok_or_else(|| OcgError::config("queued Call is missing arguments"))?;
+            let transport = ProviderTransport::new(self.route.upstream.clone());
+            let prepared = match transport.prepare_json(arguments) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let reason = format!("provider_prepare: {error}");
+                    let _ = domain.fail_call(
+                        &envelope.call_id,
+                        &authority.attempt_id,
+                        authority.generation,
+                        &reason,
+                    );
+                    let _ = domain.finish_dispatch_intent(
+                        &envelope.call_id,
+                        "failed",
+                        EffectIntentState::NotStarted,
+                        Some("provider_prepare"),
+                    );
+                    let _ = domain.settle_dispatch_budget(&envelope.call_id, "not_dispatched");
+                    let _ = envelope.events.send(ExecutionEvent::Failed(reason));
+                    return Ok(());
+                }
+            };
+            let _ = envelope.events.send(ExecutionEvent::Started);
+            let mut stream = match transport.stream(prepared).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let reason = format!("provider_start: {error}");
+                    let _ = domain.fail_call(
+                        &envelope.call_id,
+                        &authority.attempt_id,
+                        authority.generation,
+                        &reason,
+                    );
+                    let _ = domain.finish_dispatch_intent(
+                        &envelope.call_id,
+                        "failed",
+                        EffectIntentState::Unknown,
+                        Some("provider_start"),
+                    );
+                    let _ = domain.settle_dispatch_budget(&envelope.call_id, "failed");
+                    let _ = envelope.events.send(ExecutionEvent::Failed(reason));
+                    return Ok(());
+                }
+            };
+            let mut usage = None;
+            let mut finished = false;
+            let mut finish_event = None;
+            while let Some(event) = futures::StreamExt::next(&mut stream).await {
+                match event {
+                    Ok(event @ crate::provider_transport::ChatStreamEvent::Finish { .. }) => {
+                        if let crate::provider_transport::ChatStreamEvent::Finish {
+                            usage: reported,
+                            ..
+                        } = &event
+                        {
+                            usage = Some(reported.clone());
+                        }
+                        finish_event = Some(event);
+                        finished = true;
+                    }
+                    Ok(crate::provider_transport::ChatStreamEvent::Error(error)) => {
+                        let reason = format!("provider_stream: {error}");
+                        let _ = envelope.events.send(ExecutionEvent::Provider(
+                            crate::provider_transport::ChatStreamEvent::Error(error),
+                        ));
+                        let _ = domain.fail_call(
+                            &envelope.call_id,
+                            &authority.attempt_id,
+                            authority.generation,
+                            &reason,
+                        );
+                        let _ = domain.finish_dispatch_intent(
+                            &envelope.call_id,
+                            "failed",
+                            EffectIntentState::Unknown,
+                            Some("provider_stream"),
+                        );
+                        let _ = domain.settle_dispatch_budget(&envelope.call_id, "failed");
+                        let _ = envelope.events.send(ExecutionEvent::Failed(reason));
+                        return Ok(());
+                    }
+                    Ok(other) => {
+                        let _ = envelope.events.send(ExecutionEvent::Provider(other));
+                    }
+                    Err(error) => {
+                        let reason = format!("provider_stream: {error}");
+                        let _ = domain.fail_call(
+                            &envelope.call_id,
+                            &authority.attempt_id,
+                            authority.generation,
+                            &reason,
+                        );
+                        let _ = domain.finish_dispatch_intent(
+                            &envelope.call_id,
+                            "failed",
+                            EffectIntentState::Unknown,
+                            Some("provider_stream"),
+                        );
+                        let _ = domain.settle_dispatch_budget(&envelope.call_id, "failed");
+                        let _ = envelope.events.send(ExecutionEvent::Failed(reason));
+                        return Ok(());
+                    }
+                }
+            }
+            if finished {
+                let response =
+                    json!({"usage": usage.map(|value| value.raw), "provider": self.route.provider})
+                        .to_string();
+                if domain
+                    .finish_call(
+                        &envelope.call_id,
+                        &authority.attempt_id,
+                        authority.generation,
+                        &response,
+                    )
+                    .is_ok()
+                {
+                    let _ = domain.finish_dispatch_intent(
+                        &envelope.call_id,
+                        "completed",
+                        EffectIntentState::Settled,
+                        None,
+                    );
+                    let _ = domain.settle_dispatch_budget(&envelope.call_id, "completed");
+                    if let Some(event) = finish_event {
+                        let _ = envelope.events.send(ExecutionEvent::Provider(event));
+                    }
+                    let _ = envelope.events.send(ExecutionEvent::Finished);
+                } else {
+                    let _ = domain.fence_dispatch_intent(&envelope.call_id, "late_result");
+                    let _ = domain.settle_dispatch_budget(&envelope.call_id, "fenced");
+                    let _ = envelope
+                        .events
+                        .send(ExecutionEvent::Failed("late_result".into()));
+                }
+            } else {
+                let _ = domain.fail_call(
+                    &envelope.call_id,
+                    &authority.attempt_id,
+                    authority.generation,
+                    "provider_disconnect",
+                );
+                let _ = domain.finish_dispatch_intent(
+                    &envelope.call_id,
+                    "failed",
+                    EffectIntentState::Unknown,
+                    Some("provider_disconnect"),
+                );
+                let _ = domain.settle_dispatch_budget(&envelope.call_id, "failed");
+                let _ = envelope
+                    .events
+                    .send(ExecutionEvent::Failed("provider_disconnect".into()));
+            }
+            Ok(())
+        })
+    }
 }
 
 impl ProviderGateway {
@@ -60,6 +269,17 @@ impl ProviderGateway {
         route: GatewayRoute,
         budget: BudgetConfig,
     ) -> Result<Self> {
+        let mut domain = DomainRepository::open(&project)?;
+        let execution_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(crate::orchestration::state::state_dir(&project).join("provider-executor.lock"))
+            .map_err(|error| OcgError::io("open provider executor ownership lock", error))?;
+        fs2::FileExt::try_lock_exclusive(&execution_lock)
+            .map_err(|error| OcgError::io("canonical provider executor is already owned", error))?;
+        let recovered = domain.recover_provider_dispatches()?;
         let socket = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| OcgError::io("cannot bind private provider gateway", e))?;
         socket
@@ -87,6 +307,23 @@ impl ProviderGateway {
         let invocation = token[..24].to_string();
         let registration = Arc::new(Mutex::new(None));
         let provider_id = route.provider.clone();
+        let dispatcher = BoundedDispatcher::new(32)?;
+        let worker_dispatcher = dispatcher.clone();
+        let worker_project = project.clone();
+        let worker_route = route.clone();
+        let executor = std::thread::Builder::new()
+            .name("ocg-compio-provider-executor".to_string())
+            .spawn(move || {
+                let handler = ProviderCallHandler {
+                    project: worker_project,
+                    route: worker_route,
+                };
+                if let Err(error) = CompioExecutor::run(&worker_dispatcher, &handler) {
+                    tracing::error!(error = %error, "canonical provider executor stopped");
+                }
+            })
+            .map_err(|e| OcgError::io("cannot start canonical provider executor", e))?;
+        recover_dispatches(&project, &dispatcher, recovered, &route);
         let context = Arc::new(GatewayContext {
             project,
             directory,
@@ -95,6 +332,7 @@ impl ProviderGateway {
             budget,
             token: token.clone(),
             invocation: invocation.clone(),
+            dispatcher: dispatcher.clone(),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
@@ -118,7 +356,10 @@ impl ProviderGateway {
             })
             .map_err(|e| OcgError::io("cannot start provider gateway", e))?;
         Ok(Self {
+            _execution_lock: execution_lock,
             listener: Some(listener),
+            executor: Some(executor),
+            dispatcher,
             stop,
             registration,
             url,
@@ -160,6 +401,11 @@ impl Drop for ProviderGateway {
         if let Some(handle) = self.listener.take() {
             let _ = handle.join();
         }
+        let mut dispatcher = self.dispatcher.clone();
+        let _ = dispatcher.close();
+        if let Some(handle) = self.executor.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -168,6 +414,53 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Recover only work whose external effect is known not to have started.
+/// Queued work can be safely re-admitted; running work is fenced because a
+/// process restart cannot prove whether the provider accepted the request.
+fn recover_dispatches(
+    project: &Path,
+    dispatcher: &BoundedDispatcher,
+    intents: Vec<crate::orchestration::domain::DispatchIntent>,
+    route: &GatewayRoute,
+) {
+    let recover = || -> Result<()> {
+        let mut domain = DomainRepository::open(project)?;
+        for intent in intents {
+            let input: Value = serde_json::from_str(&intent.request).map_err(|error| {
+                OcgError::config(format!("invalid durable Call input: {error}"))
+            })?;
+            let provider = input.get("provider_id").and_then(Value::as_str);
+            let model = input.get("model_id").and_then(Value::as_str);
+            if provider.is_none() || model.is_none() {
+                domain
+                    .fence_dispatch_intent(&intent.call_id, "restart_missing_provider_binding")?;
+                continue;
+            }
+            if provider != Some(route.provider.as_str()) || model != Some(route.model.as_str()) {
+                continue;
+            }
+            let Some(authority) = domain.authority(&intent.attempt_id)? else {
+                domain.fence_dispatch_intent(&intent.call_id, "restart_stale_authority")?;
+                continue;
+            };
+            let call = domain.call(&intent.call_id)?;
+            let receiver = crate::orchestration::execution_dispatch::queue_call(
+                &mut domain,
+                &call,
+                &authority,
+                &intent.request,
+                Some(intent.id),
+                dispatcher,
+            )?;
+            drop(receiver);
+        }
+        Ok(())
+    };
+    if let Err(error) = recover() {
+        tracing::error!(%error, "canonical dispatch recovery failed; durable pending intents retained");
+    }
 }
 
 fn respond(socket: &mut TcpStream, code: u16, message: &str) {
@@ -284,14 +577,7 @@ fn handle(mut socket: TcpStream, ctx: &GatewayContext) {
         );
         return;
     }
-    let transport = ProviderTransport::new(ctx.route.upstream.clone());
-    let prepared = match transport.prepare_json(body) {
-        Ok(prepared) => prepared,
-        Err(_) => {
-            respond(&mut socket, 400, "unsupported provider request semantics");
-            return;
-        }
-    };
+    let call_request = json!({"arguments": body,"executor_transport":"provider","provider_id":ctx.route.provider,"model_id":ctx.route.model}).to_string();
     let registration = match ctx.registration.lock() {
         Ok(slot) => slot.clone(),
         Err(_) => None,
@@ -300,67 +586,80 @@ fn handle(mut socket: TcpStream, ctx: &GatewayContext) {
         respond(&mut socket, 503, "gateway runtime not yet ready");
         return;
     };
-    let client = match V2SessionClient::connect(&registration, ctx.directory.clone()) {
+    let _client = match V2SessionClient::connect(&registration, ctx.directory.clone()) {
         Ok(client) => client,
         Err(_) => {
             respond(&mut socket, 503, "runtime lineage unavailable");
             return;
         }
     };
-    let (lineage, owner) = match mission::owner_for_execution(
-        &ctx.project,
-        &client,
-        &RuntimeExecutionId::new(session),
-    ) {
-        Ok(pair) => pair,
+    // Provider ownership is canonical SQLite state. Runtime/session data is
+    // only used to establish the transport connection; it cannot authorize a
+    // provider Call or revive a stale Attempt.
+    let mut domain = match crate::orchestration::domain::DomainRepository::open(&ctx.project) {
+        Ok(domain) => domain,
         Err(_) => {
-            respond(&mut socket, 503, "runtime lineage unavailable");
+            respond(
+                &mut socket,
+                503,
+                "canonical execution authority unavailable",
+            );
             return;
         }
     };
-    let Some(mission) = owner else {
-        respond(&mut socket, 403, "no current Mission owns execution");
+    let project = match domain.ensure_project(&ctx.project) {
+        Ok(project) => project,
+        Err(_) => {
+            respond(&mut socket, 503, "canonical Project unavailable");
+            return;
+        }
+    };
+    let authority = match domain.authority_for_binding(&project.id, session) {
+        Ok(Some(authority)) => authority,
+        Ok(None) => {
+            respond(
+                &mut socket,
+                403,
+                "no current canonical Attempt owns execution",
+            );
+            return;
+        }
+        Err(_) => {
+            respond(&mut socket, 503, "canonical Attempt lookup failed");
+            return;
+        }
+    };
+    let executor = match domain.executor_for_attempt(&authority.attempt_id) {
+        Ok(Some(executor)) => executor,
+        Ok(None) => {
+            respond(&mut socket, 403, "canonical Attempt has no Executor");
+            return;
+        }
+        Err(_) => {
+            respond(&mut socket, 503, "canonical Executor lookup failed");
+            return;
+        }
+    };
+    if domain.mark_attempt_running(&authority).is_err() {
+        respond(
+            &mut socket,
+            403,
+            "canonical Attempt is no longer executable",
+        );
         return;
-    };
-    let service = match SnapshotService::open(&ctx.project) {
-        Ok(service) => service,
+    }
+    let call = match domain.create_call_with_effect(
+        &authority.attempt_id,
+        Some(&executor.id),
+        authority.generation,
+        crate::orchestration::domain::EffectIntentKind::StrictFenced,
+        &call_request,
+    ) {
+        Ok(call) => call,
         Err(_) => {
-            respond(&mut socket, 503, "dispatch authority unavailable");
+            respond(&mut socket, 403, "provider Call admission rejected");
             return;
         }
-    };
-    let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let seed = format!("{}:{}:{seq}:{}", ctx.invocation, now(), session);
-    let id = match DispatchId::new(format!(
-        "dsp-{}",
-        &crate::runtime::hash::sha256_hex(seed.as_bytes())[..32]
-    )) {
-        Ok(id) => id,
-        Err(_) => {
-            respond(&mut socket, 503, "dispatch identity unavailable");
-            return;
-        }
-    };
-    let record = DispatchRecord {
-        id: id.clone(),
-        mission_id: mission.mission_id.clone(),
-        generation: mission.generation,
-        logical_operation: headers
-            .get("x-ocg-logical-operation")
-            .filter(|v| v.len() <= 80)
-            .cloned()
-            .unwrap_or_else(|| id.as_str().to_string()),
-        execution_id: session.clone(),
-        root_id: lineage.root_id.to_string(),
-        provider: ctx.route.provider.clone(),
-        model: ctx.route.model.clone(),
-        reservation_id: None,
-        state: DispatchState::Reserved,
-        created_at: now(),
-        updated_at: now(),
-        usage: None,
-        cost_provenance: "unknown".into(),
-        failure_class: None,
     };
     let quota = if ctx.budget.require_quota {
         crate::orchestration::budget::quota_facts(
@@ -372,96 +671,165 @@ fn handle(mut socket: TcpStream, ctx: &GatewayContext) {
     } else {
         QuotaFacts::unknown()
     };
-    let (assessment, _) = match service.reserve_dispatch(record, &ctx.budget, quota) {
+    let assessment = match domain.admit_dispatch(
+        &project.id,
+        authority.generation,
+        &call.id,
+        &ctx.budget,
+        quota,
+    ) {
         Ok(result) => result,
         Err(_) => {
+            let _ = domain.fail_call(
+                &call.id,
+                &authority.attempt_id,
+                authority.generation,
+                "dispatch_reservation",
+            );
             respond(&mut socket, 503, "dispatch reservation failed");
             return;
         }
     };
     if !assessment.is_allowed() {
+        let _ = domain.fail_call(
+            &call.id,
+            &authority.attempt_id,
+            authority.generation,
+            "economic_admission",
+        );
         respond(
             &mut socket,
             403,
-            "mandatory Mission economic admission blocked provider dispatch",
+            "canonical economic admission blocked provider dispatch",
         );
         return;
     }
-    if service.start_dispatch(&id, now()).is_err() {
-        respond(&mut socket, 503, "dispatch start could not be persisted");
+    if domain
+        .attach_dispatch_reservation(&call.id, assessment.reservation_id.as_deref())
+        .is_err()
+    {
+        let _ = domain.fail_call(
+            &call.id,
+            &authority.attempt_id,
+            authority.generation,
+            "dispatch_reservation_attach",
+        );
+        let _ = domain.settle_dispatch_budget(&call.id, "not_dispatched");
+        respond(
+            &mut socket,
+            503,
+            "canonical dispatch reservation could not be attached",
+        );
         return;
     }
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
+    let events = match crate::orchestration::execution_dispatch::queue_call(
+        &mut domain,
+        &call,
+        &authority,
+        &call_request,
+        Some(call.id.clone()),
+        &ctx.dispatcher,
+    ) {
+        Ok(events) => events,
         Err(_) => {
-            let _ = service.finish_dispatch(
-                &id,
-                DispatchState::KnownNotDispatched,
-                None,
-                Some("local_runtime"),
-                now(),
+            let _ = domain.fail_call(
+                &call.id,
+                &authority.attempt_id,
+                authority.generation,
+                "bounded_dispatch",
             );
-            respond(&mut socket, 503, "provider runtime unavailable");
+            let _ = domain.settle_dispatch_budget(&call.id, "not_dispatched");
+            respond(&mut socket, 503, "canonical bounded dispatcher unavailable");
             return;
         }
     };
-    runtime.block_on(async {
-        let mut events = match transport.stream(prepared).await {
-            Ok(events) => events,
-            Err(error) => {
-                let _ = service.finish_dispatch(&id, DispatchState::Unresolved, None, Some("provider_start_failure"), now());
-                respond(&mut socket, error.status_code().unwrap_or(502), "upstream provider request failed"); return;
-            }
-        };
-        if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").is_err() {
-            let _ = service.finish_dispatch(&id, DispatchState::Unresolved, None, Some("client_disconnect"), now()); return;
-        }
-        let mut usage = None;
-        let mut finished = false;
-        let stream_id = format!("chatcmpl-{}", id.as_str());
-        if send(&mut socket, &stream_id, &ctx.route.model, json!({"role":"assistant"}), None, None).is_err() {
-            let _ = service.finish_dispatch(&id, DispatchState::Unresolved, None, Some("client_disconnect"), now()); return;
-        }
-        while let Some(event) = events.next().await {
-            let result = match event {
-                Ok(ChatStreamEvent::TextDelta { delta }) => send(&mut socket, &stream_id, &ctx.route.model, json!({"content":delta}), None, None),
-                Ok(ChatStreamEvent::ReasoningDelta { delta }) => send(&mut socket, &stream_id, &ctx.route.model, json!({"reasoning_content":delta}), None, None),
-                Ok(ChatStreamEvent::ToolCallStart { index, id, name }) => send(&mut socket, &stream_id, &ctx.route.model,
-                    json!({"tool_calls":[{"index":index,"id":id,"type":"function","function":{"name":name,"arguments":""}}]}), None, None),
-                Ok(ChatStreamEvent::ToolCallArgumentsDelta { index, delta, .. }) => send(&mut socket, &stream_id, &ctx.route.model,
-                    json!({"tool_calls":[{"index":index,"function":{"arguments":delta}}]}), None, None),
-                Ok(ChatStreamEvent::Finish { reason, usage: reported, .. }) => {
+    if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").is_err() {
+        return;
+    }
+    let stream_id = format!("chatcmpl-{}", call.id);
+    let _ = send(
+        &mut socket,
+        &stream_id,
+        &ctx.route.model,
+        json!({"role":"assistant"}),
+        None,
+        None,
+    );
+    let mut finished = false;
+    let mut usage = None;
+    while let Ok(event) = events.recv() {
+        let result = match event {
+            ExecutionEvent::Started => Ok(()),
+            ExecutionEvent::Provider(event) => match event {
+                ChatStreamEvent::TextDelta { delta } => send(
+                    &mut socket,
+                    &stream_id,
+                    &ctx.route.model,
+                    json!({"content":delta}),
+                    None,
+                    None,
+                ),
+                ChatStreamEvent::ReasoningDelta { delta } => send(
+                    &mut socket,
+                    &stream_id,
+                    &ctx.route.model,
+                    json!({"reasoning_content":delta}),
+                    None,
+                    None,
+                ),
+                ChatStreamEvent::ToolCallStart { index, id, name } => send(
+                    &mut socket,
+                    &stream_id,
+                    &ctx.route.model,
+                    json!({"tool_calls":[{"index":index,"id":id,"type":"function","function":{"name":name,"arguments":""}}]}),
+                    None,
+                    None,
+                ),
+                ChatStreamEvent::ToolCallArgumentsDelta { index, delta, .. } => send(
+                    &mut socket,
+                    &stream_id,
+                    &ctx.route.model,
+                    json!({"tool_calls":[{"index":index,"function":{"arguments":delta}}]}),
+                    None,
+                    None,
+                ),
+                ChatStreamEvent::Finish {
+                    reason,
+                    usage: reported,
+                    ..
+                } => {
                     usage = Some(reported);
                     finished = true;
-                    send(&mut socket, &stream_id, &ctx.route.model, json!({}), Some(reason.as_openai_str()), None)
-                },
-                Ok(ChatStreamEvent::Error(_)) | Err(_) => { break; }
-                Ok(ChatStreamEvent::Metadata { .. }) | Ok(ChatStreamEvent::ToolCallComplete { .. }) => Ok(()),
-            };
-            if result.is_err() { break; }
-        }
-        let evidence = usage.as_ref().map(|v| DispatchUsage {
-            input_tokens: v.input_tokens.map(u64::from), output_tokens: v.output_tokens.map(u64::from),
-            reasoning_tokens: v.reasoning_tokens.map(u64::from),
-            cache_read_tokens: v.cache_read_tokens.map(u64::from),
-            cache_write_tokens: v.cache_write_tokens.map(u64::from),
-            provenance: if v.raw.is_some() { "provider_reported" } else { "unknown" }.into(),
-        });
-        let state = if finished { DispatchState::Settled } else { DispatchState::Unresolved };
-        // Never claim success on the client until durable settlement succeeds.
-        if service.finish_dispatch(&id, state, evidence, (!finished).then_some("midstream_disconnect"), now()).is_err() {
-            return;
-        }
-        if finished {
-            if let Some(tokens) = usage.as_ref() {
-                let _ = send_usage(&mut socket, &stream_id, &ctx.route.model, tokens);
+                    send(
+                        &mut socket,
+                        &stream_id,
+                        &ctx.route.model,
+                        json!({}),
+                        Some(reason.as_openai_str()),
+                        None,
+                    )
+                }
+                ChatStreamEvent::Error(_) => Err(std::io::Error::other("provider stream error")),
+                ChatStreamEvent::Metadata { .. } | ChatStreamEvent::ToolCallComplete { .. } => {
+                    Ok(())
+                }
+            },
+            ExecutionEvent::Failed(_) => Err(std::io::Error::other("provider execution failed")),
+            ExecutionEvent::Finished => {
+                finished = true;
+                Ok(())
             }
-            let _ = socket.write_all(b"data: [DONE]\n\n");
+        };
+        if result.is_err() {
+            break;
         }
-    });
+    }
+    if finished {
+        if let Some(tokens) = usage.as_ref() {
+            let _ = send_usage(&mut socket, &stream_id, &ctx.route.model, tokens);
+        }
+        let _ = socket.write_all(b"data: [DONE]\n\n");
+    }
 }
 
 fn send(

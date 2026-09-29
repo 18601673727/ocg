@@ -5,7 +5,20 @@ use serde::{Deserialize, Serialize};
 pub const MAX_DISPATCHES: usize = 1024;
 
 /// Unique identity for one potentially chargeable network attempt.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    derive_more::AsRef,
+    derive_more::Display,
+)]
+#[display("{}", _0)]
+#[as_ref(forward)]
 pub struct DispatchId(String);
 
 impl DispatchId {

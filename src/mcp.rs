@@ -8,10 +8,14 @@ use crate::error::{OcgError, Result};
 use crate::orchestration::budget::{normalize_currency, Money};
 use crate::orchestration::checkpoint::is_safe_id;
 use crate::orchestration::control::{ControlError, ControlService, ReplaySlice};
+use crate::orchestration::mcp_glue::{self, McpDispatcher, McpEnvelope, McpSession};
 use crate::orchestration::policy::{ApprovalStatus, MAX_REASON_BYTES};
+use rust_mcp_schema::mcp_2025_11_25::{JsonrpcMessage, JsonrpcRequest, JsonrpcResponse};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SERVER_NAME: &str = "ocg";
@@ -39,132 +43,172 @@ pub fn serve_stdio(root: &Path) -> Result<()> {
     serve(&service, stdin.lock(), stdout.lock())
 }
 
+/// Serve MCP over loopback HTTP. ntex owns HTTP framing and Compio owns the
+/// async runtime; protocol decoding and session correlation remain in
+/// `mcp_glue`. A session is carried by `MCP-Session-Id` and is intentionally
+/// scoped to one HTTP server process.
+pub fn serve_http(root: &Path, addr: &str) -> Result<()> {
+    let socket: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|_| OcgError::config("MCP HTTP address must be a numeric IP address and port"))?;
+    if !socket.ip().is_loopback() {
+        return Err(OcgError::config(
+            "MCP HTTP transport only permits loopback addresses",
+        ));
+    }
+    let service = Arc::new(ControlService::open(root)?);
+    let system = ntex::rt::System::new("ocg-mcp", ntex::rt::DefaultRuntime);
+    system.block_on(async move {
+        ntex::web::HttpServer::new(async move || {
+            let service = service.clone();
+            ntex::web::App::new().service(ntex::web::resource("/mcp").route(ntex::web::post().to(
+                move |request: ntex::web::HttpRequest, mut payload: ntex::web::types::Payload| {
+                    let service = service.clone();
+                    async move { handle_http(service, request, &mut payload).await }
+                },
+            )))
+        })
+        .workers(1)
+        .disable_signals()
+        .bind(socket)
+        .map_err(|error| OcgError::io("cannot bind MCP HTTP server", error))?
+        .run()
+        .await
+        .map_err(|error| OcgError::io("MCP HTTP server failed", error))
+    })
+}
+
+async fn handle_http(
+    service: Arc<ControlService>,
+    request: ntex::web::HttpRequest,
+    payload: &mut ntex::web::types::Payload,
+) -> ntex::web::HttpResponse {
+    let session_id = request
+        .headers()
+        .get("MCP-Session-Id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(mcp_glue::new_session_id);
+    let mut session = match McpSession::new(session_id.clone()) {
+        Ok(session) => session,
+        Err(error) => {
+            return ntex::web::HttpResponse::BadRequest().body(error.to_string());
+        }
+    };
+    // HTTP requests are independent, so retain only the protocol handshake
+    // state between them. A client-provided id is not trusted as proof that
+    // initialize already completed.
+    let sessions = http_sessions();
+    session.initialized = sessions
+        .lock()
+        .map(|sessions| sessions.contains(&session_id))
+        .unwrap_or(false);
+    let dispatcher = SchemaDispatcher { service: &service };
+    match mcp_glue::handle_ntex(&mut session, &dispatcher, payload).await {
+        Ok(mut response) => {
+            if session.initialized {
+                if let Ok(mut sessions) = http_sessions().lock() {
+                    sessions.insert(session_id.clone());
+                }
+            }
+            if let Ok(value) = ntex::http::header::HeaderValue::from_str(&session_id) {
+                response.headers_mut().insert(
+                    ntex::http::header::HeaderName::from_static("mcp-session-id"),
+                    value,
+                );
+            }
+            response
+        }
+        Err(error) => ntex::web::HttpResponse::BadRequest().body(error.to_string()),
+    }
+}
+
+fn http_sessions() -> &'static Mutex<BTreeSet<String>> {
+    static SESSIONS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
 /// Protocol engine separated from process I/O for deterministic tests.
 pub fn serve<R: BufRead, W: Write>(
     service: &ControlService,
     mut input: R,
     mut output: W,
 ) -> Result<()> {
+    let mut session = McpSession::new(mcp_glue::new_session_id())?;
+    let dispatcher = SchemaDispatcher { service };
     loop {
-        let Some(frame) = read_frame(&mut input)? else {
+        let Some(frame) = mcp_glue::read_stdio_frame(&mut input)? else {
             return Ok(());
         };
         if frame.is_empty() {
             continue;
         }
-        let request: Value = match serde_json::from_slice(&frame) {
-            Ok(value) => value,
-            Err(_) => {
-                write_message(
-                    &mut output,
-                    protocol_error(Value::Null, -32700, "parse error"),
-                )?;
+        let message = match mcp_glue::decode_message(&frame) {
+            Ok(message) => message,
+            Err(error) => {
+                let response = mcp_glue::error_message(None, -32700, &error.to_string());
+                mcp_glue::write_stdio_message(&mut output, &response)?;
                 continue;
             }
         };
-        let Some(object) = request.as_object() else {
-            write_message(
-                &mut output,
-                protocol_error(Value::Null, -32600, "invalid request"),
-            )?;
-            continue;
-        };
-        let id = object.get("id").cloned();
-        let valid_id = id
+        match message {
+            JsonrpcMessage::Request(request) => {
+                let envelope = McpEnvelope {
+                    session_id: session.session_id.clone(),
+                    request,
+                };
+                let bytes = mcp_glue::dispatch(&mut session, &dispatcher, envelope)?;
+                let response = serde_json::from_slice::<JsonrpcMessage>(&bytes)
+                    .map_err(|error| OcgError::config(format!("invalid MCP response: {error}")))?;
+                mcp_glue::write_stdio_message(&mut output, &response)?;
+            }
+            JsonrpcMessage::Notification(notification) => {
+                if notification.method == "exit" {
+                    return Ok(());
+                }
+            }
+            JsonrpcMessage::ResultResponse(_) | JsonrpcMessage::ErrorResponse(_) => continue,
+        }
+    }
+}
+
+struct SchemaDispatcher<'a> {
+    service: &'a ControlService,
+}
+
+impl McpDispatcher for SchemaDispatcher<'_> {
+    fn dispatch(&self, _session: &McpSession, request: JsonrpcRequest) -> Result<JsonrpcResponse> {
+        let id = request.id.clone();
+        let params = request
+            .params
             .as_ref()
-            .is_none_or(|value| value.is_string() || value.is_number());
-        if object.get("jsonrpc") != Some(&Value::String("2.0".to_string())) || !valid_id {
-            write_message(
-                &mut output,
-                protocol_error(Value::Null, -32600, "invalid request"),
-            )?;
-            continue;
-        }
-        let Some(method) = object.get("method").and_then(Value::as_str) else {
-            write_message(
-                &mut output,
-                protocol_error(id.unwrap_or(Value::Null), -32600, "invalid request"),
-            )?;
-            continue;
-        };
-        if method == "exit" && id.is_none() {
-            return Ok(());
-        }
-        if id.is_none() {
-            // Notifications (`notifications/initialized`, cancellation, etc.)
-            // never receive a response and never mutate authority.
-            continue;
-        }
-        let id = id.expect("checked above");
-        let response = match method {
-            "initialize" => initialize(object.get("params")),
+            .map(|value| Value::Object(value.clone()));
+        let response = match request.method.as_str() {
+            "initialize" => initialize(params.as_ref()),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-            "tools/call" => call_tool(service, object.get("params")),
-            "shutdown" => Ok(Value::Null),
-            _ => Err(protocol_error(id.clone(), -32601, "method not found")),
+            "tools/call" => call_tool(self.service, params.as_ref()),
+            "shutdown" => Ok(json!({})),
+            _ => Err(protocol_error(
+                request_id_value(&id),
+                -32601,
+                "method not found",
+            )),
         };
-        match response {
-            Ok(result) => write_message(
-                &mut output,
-                json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            )?,
-            Err(error) => write_message(&mut output, error)?,
-        }
+        let value = match response {
+            Ok(result) => {
+                json!({ "jsonrpc": "2.0", "id": request_id_value(&id), "result": result })
+            }
+            Err(error) => error,
+        };
+        serde_json::from_value(value)
+            .map_err(|error| OcgError::config(format!("invalid MCP response shape: {error}")))
     }
 }
 
-fn read_frame<R: BufRead>(input: &mut R) -> Result<Option<Vec<u8>>> {
-    let mut frame = Vec::new();
-    loop {
-        let available = input
-            .fill_buf()
-            .map_err(|error| OcgError::io("cannot read MCP stdin", error))?;
-        if available.is_empty() {
-            return if frame.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(frame))
-            };
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(available.len(), |index| index + 1);
-        if frame.len().saturating_add(take) > MAX_REQUEST_BYTES {
-            input.consume(take);
-            while newline.is_none() {
-                let available = input
-                    .fill_buf()
-                    .map_err(|error| OcgError::io("cannot drain oversized MCP request", error))?;
-                if available.is_empty() {
-                    break;
-                }
-                let next = available.iter().position(|byte| *byte == b'\n');
-                let consume = next.map_or(available.len(), |index| index + 1);
-                input.consume(consume);
-                if next.is_some() {
-                    break;
-                }
-            }
-            return Ok(Some(b"{".to_vec()));
-        }
-        frame.extend_from_slice(&available[..take]);
-        input.consume(take);
-        if newline.is_some() {
-            while matches!(frame.last(), Some(b'\n' | b'\r')) {
-                frame.pop();
-            }
-            return Ok(Some(frame));
-        }
-    }
-}
-
-fn write_message<W: Write>(output: &mut W, value: Value) -> Result<()> {
-    serde_json::to_writer(&mut *output, &value)
-        .map_err(|error| OcgError::config(format!("cannot serialize MCP response: {error}")))?;
-    output
-        .write_all(b"\n")
-        .and_then(|_| output.flush())
-        .map_err(|error| OcgError::io("cannot write MCP stdout", error))
+fn request_id_value(id: &rust_mcp_schema::mcp_2025_11_25::RequestId) -> Value {
+    serde_json::to_value(id).unwrap_or(Value::Null)
 }
 
 fn initialize(params: Option<&Value>) -> std::result::Result<Value, Value> {
@@ -222,11 +266,22 @@ fn call_tool(
             ))
         }
     };
+    if let Err(error) =
+        crate::orchestration::call_schema::validate_input(&json!({"arguments": arguments}))
+    {
+        return Ok(tool_error("invalid_argument", error.to_string()));
+    }
     let outcome = dispatch_tool(service, name, &arguments);
-    Ok(match outcome {
+    let value = match outcome {
         Ok(value) => tool_success(value),
         Err(error) => tool_error_value(error),
-    })
+    };
+    if let Err(error) =
+        crate::orchestration::call_schema::validate_output(&json!({"result": value}))
+    {
+        return Ok(tool_error("internal", error.to_string()));
+    }
+    Ok(value)
 }
 
 fn dispatch_tool(

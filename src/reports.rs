@@ -30,8 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use crate::orchestration::replay::SnapshotService;
-use crate::orchestration::substrate::{MissionId, RunState, SubstrateRepository};
+use crate::orchestration::domain::DomainRepository;
 
 /// The fixed file name under `.ocg/reports/`.
 pub const LATEST_LEAD_OUTPUT_FILE: &str = "latest-lead-output.md";
@@ -264,61 +263,75 @@ pub fn latest_report(root: &Path) -> Result<Option<LatestReport>> {
     let substrate_path = state_dir.join("substrate.sqlite3");
     let report_path = latest_lead_output_path(root);
     if substrate_path.is_file() {
-        let mut repository = SubstrateRepository::open(root)?;
-        let missions = repository.list_missions()?;
-        if let Some((mission_id, _, _mission_state, completed_at)) = missions.into_iter().next() {
-            let mission = MissionId::new(&mission_id)?;
-            let state = repository.load(&mission)?.ok_or_else(|| {
-                OcgError::config("latest canonical Mission disappeared while reading")
-            })?;
-            let run_entry = state
-                .runs
-                .iter_enumerated()
-                .max_by_key(|(_, run)| (run.created_at, run.node_id.0))
-                .map(|(id, run)| (id, run.clone()));
-            if let Some((run_id, run)) = run_entry {
-                let replacements = state
-                    .runs
-                    .iter()
-                    .filter(|run| matches!(run.state, RunState::Fenced | RunState::Superseded))
-                    .count();
-                let node = state.work_nodes.get(run.node_id);
-                let output = run.result.clone().or_else(|| {
-                    state
-                        .runs
-                        .iter()
-                        .rev()
-                        .find_map(|candidate| candidate.result.clone())
+        let repository = DomainRepository::open(root)?;
+        let project = repository.ensure_project(root)?;
+        if let Some(job) = repository
+            .jobs(&project.id)?
+            .into_iter()
+            .max_by_key(|job| (job.updated_at, job.id.clone()))
+        {
+            let attempts = repository.attempts_for_job(&job.id)?;
+            if let Some(attempt) = attempts.last() {
+                let calls = repository.calls_for_attempt(&attempt.id)?;
+                let executor = repository.executor_for_attempt(&attempt.id)?;
+                let latest_call = calls.last();
+                let output = calls.iter().rev().find_map(|call| {
+                    (call.state == "completed")
+                        .then(|| call.response.clone())
+                        .flatten()
                 });
-                let state_label = match run.state {
-                    RunState::Active => "active".to_string(),
-                    RunState::Completed => "completed".to_string(),
-                    RunState::Failed => "failed".to_string(),
-                    RunState::Cancelled => "cancelled".to_string(),
-                    RunState::Superseded => "superseded".to_string(),
-                    RunState::Fenced => "fenced".to_string(),
-                };
-                let usage = usage_from_replay(root, &mission_id, &run.runtime_execution_id);
+                let usage = latest_call
+                    .and_then(|call| call.response.as_deref())
+                    .and_then(|response| serde_json::from_str::<Value>(response).ok())
+                    .map(|value| ReportUsage {
+                        provenance: "canonical_call".to_string(),
+                        input_tokens: value
+                            .get("usage")
+                            .and_then(|usage| usage.get("input_tokens"))
+                            .and_then(Value::as_u64),
+                        output_tokens: value
+                            .get("usage")
+                            .and_then(|usage| usage.get("output_tokens"))
+                            .and_then(Value::as_u64),
+                        cached_tokens: value
+                            .get("usage")
+                            .and_then(|usage| usage.get("cache_read_tokens"))
+                            .and_then(Value::as_u64),
+                        reasoning_tokens: value
+                            .get("usage")
+                            .and_then(|usage| usage.get("reasoning_tokens"))
+                            .and_then(Value::as_u64),
+                    })
+                    .unwrap_or_default();
                 return Ok(Some(LatestReport {
-                    source: "canonical substrate".to_string(),
-                    mission_id: Some(mission_id),
-                    work_node_id: Some(run.node_id.0),
-                    work_identity: node.map(|node| node.payload.clone()),
-                    run_id: Some(run_id.0),
-                    state: state_label,
-                    executor: Some(run.contract().executor.clone()),
-                    provider: provider_from_executor(run.contract().executor.as_str()),
-                    model: Some(run.contract().model.clone()),
-                    role: Some(run.contract().role.clone()),
-                    started_at: Some(run.created_at),
-                    finished_at: run.finished_at.or(completed_at),
-                    last_activity_at: run.finished_at.or(Some(run.created_at)),
+                    source: "canonical Project/Job/Attempt".to_string(),
+                    mission_id: Some(job.id.clone()),
+                    work_node_id: None,
+                    work_identity: Some(job.payload.clone()),
+                    run_id: None,
+                    state: format!("{}", attempt.state),
+                    executor: executor.as_ref().map(|executor| executor.kind.clone()),
+                    provider: executor
+                        .as_ref()
+                        .and_then(|executor| provider_from_executor(&executor.kind)),
+                    model: executor.as_ref().and_then(|executor| {
+                        executor
+                            .kind
+                            .split_once('/')
+                            .map(|(_, model)| model.to_string())
+                    }),
+                    role: None,
+                    started_at: Some(attempt.created_at),
+                    finished_at: attempt.finished_at,
+                    last_activity_at: latest_call
+                        .map(|call| call.finished_at.unwrap_or(call.created_at))
+                        .or(Some(attempt.created_at)),
                     output,
-                    failure_reason: (run.state == RunState::Failed)
-                        .then(|| run.result.clone())
-                        .flatten(),
-                    attempts: state.runs.len(),
-                    replacements,
+                    failure_reason: latest_call
+                        .filter(|call| call.state == "failed")
+                        .and_then(|call| call.response.clone()),
+                    attempts: attempts.len(),
+                    replacements: attempts.len().saturating_sub(1),
                     usage,
                 }));
             }
@@ -358,40 +371,4 @@ fn provider_from_executor(executor: &str) -> Option<String> {
     executor
         .split_once('/')
         .map(|(provider, _)| provider.to_string())
-}
-
-fn usage_from_replay(
-    root: &Path,
-    mission_id: &str,
-    runtime_execution_id: &Option<String>,
-) -> ReportUsage {
-    let Ok(service) = SnapshotService::open(root) else {
-        return ReportUsage::default();
-    };
-    let Ok(snapshot) = service.snapshot() else {
-        return ReportUsage::default();
-    };
-    let dispatch = snapshot
-        .dispatches
-        .values()
-        .filter(|dispatch| {
-            dispatch.mission_id == mission_id
-                && runtime_execution_id
-                    .as_deref()
-                    .is_none_or(|id| dispatch.execution_id == *id)
-        })
-        .max_by_key(|dispatch| (dispatch.updated_at, dispatch.id.as_str().to_string()));
-    let Some(dispatch) = dispatch else {
-        return ReportUsage::default();
-    };
-    let Some(usage) = &dispatch.usage else {
-        return ReportUsage::default();
-    };
-    ReportUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cached_tokens: usage.cache_read_tokens,
-        reasoning_tokens: usage.reasoning_tokens,
-        provenance: usage.provenance.clone(),
-    }
 }

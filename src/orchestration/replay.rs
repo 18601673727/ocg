@@ -47,18 +47,12 @@
 //! never stored here.
 
 use crate::error::{OcgError, Result};
-use crate::orchestration::budget::{
-    BudgetConfig, CostBasis, QuotaFacts, SpendAction, SpendAssessment,
-};
-use crate::orchestration::dispatch::{
-    DispatchId, DispatchRecord, DispatchState, DispatchUsage, MAX_DISPATCHES,
-};
+use crate::orchestration::dispatch::{DispatchRecord, DispatchState, MAX_DISPATCHES};
 use crate::orchestration::mission::{self, Mission};
 use crate::orchestration::policy::{self, ApprovalRecord, MAX_APPROVALS};
 use crate::resources::{self, ResourceObservation, MAX_RESOURCES};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -231,188 +225,6 @@ pub struct SnapshotService {
 impl SnapshotService {
     /// Compare current ownership and atomically reserve one distinct network
     /// attempt with its Dispatch record. A failure cannot authorize a send.
-    pub fn reserve_dispatch(
-        &self,
-        mut dispatch: DispatchRecord,
-        config: &BudgetConfig,
-        quota: QuotaFacts,
-    ) -> Result<(SpendAssessment, DispatchRecord)> {
-        dispatch.validate()?;
-        if dispatch.state != DispatchState::Reserved || dispatch.reservation_id.is_some() {
-            return Err(OcgError::config(
-                "dispatch must enter as a fresh reservation",
-            ));
-        }
-        let _lock = ReplayLock::acquire(&self.root)?;
-        let mut document = read_document(&self.root)?;
-        if document
-            .snapshot
-            .dispatches
-            .contains_key(dispatch.id.as_str())
-        {
-            return Err(OcgError::config("DispatchId was already admitted"));
-        }
-        let mission = document
-            .snapshot
-            .missions
-            .get(&dispatch.mission_id)
-            .ok_or_else(|| OcgError::config("no current Mission for provider dispatch"))?;
-        if mission.is_terminal()
-            || mission.generation != dispatch.generation
-            || mission.session_id.as_deref() != Some(&dispatch.root_id)
-        {
-            return Err(OcgError::config("provider dispatch owner is stale"));
-        }
-        let mut mission = mission.clone();
-        // The configurable operation estimate is NOT a provider-enforced upper
-        // bound. An estimate cannot authorize a hard-capped network attempt.
-        let assessment = mission.admit_spend(
-            config,
-            SpendAction::ProviderDispatch,
-            dispatch.id.as_str(),
-            CostBasis::Unknown,
-            quota,
-            dispatch.created_at,
-        );
-        if !assessment.is_allowed() {
-            return Ok((assessment, dispatch));
-        }
-        dispatch.reservation_id = assessment.reservation_id.clone();
-        if mission != document.snapshot.missions[&dispatch.mission_id] {
-            append_to_document(
-                &mut document,
-                DomainEvent::MissionUpsert { mission },
-                self.retention,
-            )?;
-        }
-        append_to_document(
-            &mut document,
-            DomainEvent::DispatchUpsert {
-                dispatch: dispatch.clone(),
-            },
-            self.retention,
-        )?;
-        write_document(&self.root, &document)?;
-        Ok((assessment, dispatch))
-    }
-
-    /// Claim the network send in durable state; it can succeed only once.
-    pub fn start_dispatch(&self, id: &DispatchId, now: i64) -> Result<DispatchRecord> {
-        let _lock = ReplayLock::acquire(&self.root)?;
-        let mut document = read_document(&self.root)?;
-        let mut dispatch = document
-            .snapshot
-            .dispatches
-            .get(id.as_str())
-            .ok_or_else(|| OcgError::config("unknown DispatchId"))?
-            .clone();
-        if dispatch.state != DispatchState::Reserved {
-            return Err(OcgError::config("DispatchId cannot send twice"));
-        }
-        let mission = document
-            .snapshot
-            .missions
-            .get(&dispatch.mission_id)
-            .ok_or_else(|| OcgError::config("dispatch Mission missing"))?;
-        if mission.is_terminal()
-            || mission.generation != dispatch.generation
-            || mission.session_id.as_deref() != Some(&dispatch.root_id)
-        {
-            return Err(OcgError::config(
-                "dispatch Mission root is no longer current",
-            ));
-        }
-        dispatch.state = DispatchState::DispatchStarted;
-        dispatch.updated_at = now;
-        append_to_document(
-            &mut document,
-            DomainEvent::DispatchUpsert {
-                dispatch: dispatch.clone(),
-            },
-            self.retention,
-        )?;
-        write_document(&self.root, &document)?;
-        Ok(dispatch)
-    }
-
-    /// Record a terminal attempt. An uncertain attempt retains its reservation.
-    pub fn finish_dispatch(
-        &self,
-        id: &DispatchId,
-        state: DispatchState,
-        usage: Option<DispatchUsage>,
-        failure: Option<&str>,
-        now: i64,
-    ) -> Result<bool> {
-        if !matches!(
-            state,
-            DispatchState::Settled
-                | DispatchState::Unresolved
-                | DispatchState::KnownNotDispatched
-                | DispatchState::Failed
-        ) {
-            return Err(OcgError::config("invalid dispatch completion state"));
-        }
-        let _lock = ReplayLock::acquire(&self.root)?;
-        let mut document = read_document(&self.root)?;
-        let mut dispatch = document
-            .snapshot
-            .dispatches
-            .get(id.as_str())
-            .ok_or_else(|| OcgError::config("unknown DispatchId"))?
-            .clone();
-        if dispatch.state == state {
-            return Ok(false);
-        }
-        if dispatch.state != DispatchState::DispatchStarted {
-            return Err(OcgError::config("dispatch not started or already finished"));
-        }
-        let mut mission = document
-            .snapshot
-            .missions
-            .get(&dispatch.mission_id)
-            .ok_or_else(|| OcgError::config("dispatch Mission missing"))?
-            .clone();
-        if mission.generation != dispatch.generation {
-            return Err(OcgError::config("dispatch Mission generation changed"));
-        }
-        if let Some(reservation) = &dispatch.reservation_id {
-            match state {
-                DispatchState::Settled => {
-                    mission.settle_spend(reservation, None, now)?;
-                }
-                DispatchState::Unresolved | DispatchState::Failed => {
-                    mission.mark_spend_unresolved(reservation, now);
-                }
-                DispatchState::KnownNotDispatched => {
-                    mission.release_spend(reservation, now);
-                }
-                _ => unreachable!(),
-            }
-        }
-        dispatch.state = state;
-        dispatch.updated_at = now;
-        dispatch.usage = usage;
-        dispatch.failure_class = failure.map(str::to_string);
-        dispatch.validate()?;
-        if mission != document.snapshot.missions[&dispatch.mission_id] {
-            append_to_document(
-                &mut document,
-                DomainEvent::MissionUpsert { mission },
-                self.retention,
-            )?;
-        }
-        append_to_document(
-            &mut document,
-            DomainEvent::DispatchUpsert { dispatch },
-            self.retention,
-        )?;
-        write_document(&self.root, &document)?;
-        Ok(true)
-    }
-    /// Open the replay authority, bootstrapping from existing durable domains
-    /// on first use. A previously initialized store whose document is missing
-    /// fails closed.
     pub fn open(root: &Path) -> Result<Self> {
         Self::open_with_config(root, SnapshotConfig::default())
     }
@@ -453,6 +265,14 @@ impl SnapshotService {
     /// write. Returns `Ok(None)` when the event does not change the
     /// authoritative state (a no-op never creates an event).
     pub fn append(&self, event: DomainEvent) -> Result<Option<Cursor>> {
+        if matches!(
+            event,
+            DomainEvent::MissionUpsert { .. } | DomainEvent::DispatchUpsert { .. }
+        ) {
+            return Err(OcgError::config(
+                "historical execution records are read-only",
+            ));
+        }
         let _lock = ReplayLock::acquire(&self.root)?;
         ensure_initialized_locked(&self.root)?;
         let mut document = read_document(&self.root)?;
@@ -461,40 +281,6 @@ impl SnapshotService {
         };
         write_document(&self.root, &document)?;
         Ok(Some(cursor))
-    }
-
-    /// Atomically compare and commit one Mission mutation under the replay
-    /// lock. Returns `false` when the expected revision/generation/owner no
-    /// longer matches. Repeating an already-committed candidate is idempotent.
-    pub(crate) fn compare_and_append_mission(
-        root: &Path,
-        mission: &Mission,
-        expected_revision: u64,
-        expected_owner: Option<&str>,
-    ) -> Result<bool> {
-        let _lock = ReplayLock::acquire(root)?;
-        ensure_initialized_locked(root)?;
-        let mut document = read_document(root)?;
-        let Some(current) = document.snapshot.missions.get(&mission.mission_id) else {
-            return Ok(false);
-        };
-        if current == mission {
-            return Ok(true);
-        }
-        if current.revision != expected_revision
-            || current.generation != mission.generation
-            || expected_owner.is_some_and(|owner| current.session_id.as_deref() != Some(owner))
-        {
-            return Ok(false);
-        }
-        let event = DomainEvent::MissionUpsert {
-            mission: mission.clone(),
-        };
-        let Some(_) = append_to_document(&mut document, event, DEFAULT_RETENTION)? else {
-            return Ok(true);
-        };
-        write_document(root, &document)?;
-        Ok(true)
     }
 
     /// Replay the events strictly after `cursor`.
@@ -548,34 +334,6 @@ impl SnapshotService {
         } else {
             ReplayAfter::Success { events }
         }
-    }
-
-    /// Explicitly start a new epoch after an asserted continuity loss.
-    ///
-    /// This is the **only** way an epoch changes. It requires a nonempty,
-    /// bounded reason and the caller-supplied replacement snapshot. Ordinary
-    /// corruption never reaches this path automatically.
-    pub fn begin_new_epoch_after_continuity_loss(
-        root: &Path,
-        snapshot: AuthoritativeSnapshot,
-        reason: &str,
-    ) -> Result<Self> {
-        let reason = bounded_reason(reason)?;
-        validate_snapshot(&snapshot)?;
-        let _lock = ReplayLock::acquire(root)?;
-        let next_epoch = match read_epoch_for_reset(root) {
-            Some(epoch) if epoch >= 1 => epoch
-                .checked_add(1)
-                .ok_or_else(|| OcgError::config("replay epoch is exhausted"))?,
-            _ => 1,
-        };
-        let document = ReplayDocument::genesis(next_epoch, snapshot, Some(reason))?;
-        write_document(root, &document)?;
-        write_marker(root, next_epoch)?;
-        Ok(Self {
-            root: root.to_path_buf(),
-            retention: SnapshotConfig::default().retention,
-        })
     }
 }
 
@@ -632,17 +390,6 @@ impl ReplayDocument {
             self.floor_seq - 1
         }
     }
-}
-
-/// Record one normalized Mission update through the authority, before the
-/// compatibility projection is written. Bootstrap-safe: it never calls the
-/// projection's own save path, so it cannot recurse.
-pub(crate) fn record_mission_update(root: &Path, mission: &Mission) -> Result<()> {
-    let service = SnapshotService::open(root)?;
-    service.append(DomainEvent::MissionUpsert {
-        mission: mission.clone(),
-    })?;
-    Ok(())
 }
 
 /// Record one normalized Approval update through the authority.
@@ -1277,21 +1024,6 @@ fn validate_resource_value(observation: &ResourceObservation) -> Result<()> {
         .map_err(|detail| OcgError::config(format!("replay resource is invalid: {detail}")))
 }
 
-fn bounded_reason(reason: &str) -> Result<String> {
-    let reason = reason.trim();
-    if reason.is_empty() {
-        return Err(OcgError::config(
-            "a continuity-loss epoch change requires a nonempty reason",
-        ));
-    }
-    if reason.len() > MAX_EPOCH_REASON_BYTES {
-        return Err(OcgError::config(format!(
-            "the continuity-loss reason must be at most {MAX_EPOCH_REASON_BYTES} bytes"
-        )));
-    }
-    Ok(crate::telemetry::task::redact(reason))
-}
-
 fn snapshot_digest(snapshot: &AuthoritativeSnapshot) -> Result<String> {
     let bytes = serde_json::to_vec(snapshot).map_err(|error| {
         OcgError::config(format!(
@@ -1317,20 +1049,6 @@ fn envelope_hash(cursor: &Cursor, prev_hash: &str, event: &DomainEvent) -> Resul
     bytes.push(b'|');
     bytes.extend_from_slice(&event_bytes);
     Ok(crate::runtime::hash::sha256_hex(&bytes))
-}
-
-/// Read a best-effort prior epoch for an explicit continuity-loss reset. The
-/// document may itself be corrupt, so this tolerates parse failures and falls
-/// back to the marker; the caller applies a checked increment.
-fn read_epoch_for_reset(root: &Path) -> Option<u64> {
-    if let Ok(text) = fs::read_to_string(state_path(root)) {
-        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            if let Some(epoch) = value.get("epoch").and_then(Value::as_u64) {
-                return Some(epoch);
-            }
-        }
-    }
-    read_marker_epoch(root).ok().flatten()
 }
 
 fn write_document(root: &Path, document: &ReplayDocument) -> Result<()> {

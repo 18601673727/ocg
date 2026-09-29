@@ -35,7 +35,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use aimux_core::content::ContentPart;
 use aimux_core::error::{AiMuxError, ApiCallError};
@@ -50,7 +49,6 @@ use aimux_providers::openai::{OpenAIConfig, OpenAIProvider};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tower::Service;
 
 /// A normalized stream of provider events.
 pub type ChatEventStream =
@@ -232,37 +230,6 @@ impl ProviderTransport {
     ) -> Result<ChatEventStream, TransportError> {
         let prepared = self.prepare(request)?;
         self.stream(prepared).await
-    }
-}
-
-/// Tower adapter for the network-free provider preparation boundary.
-///
-/// The service validates and translates one request per call. Dispatch remains
-/// on [`ProviderTransport::stream`] so existing gateway ownership and retry
-/// policy are unchanged while Tower middleware can be added at the boundary.
-#[derive(Debug, Clone)]
-pub struct ProviderPrepareService {
-    transport: ProviderTransport,
-}
-
-impl ProviderPrepareService {
-    #[must_use]
-    pub fn new(transport: ProviderTransport) -> Self {
-        Self { transport }
-    }
-}
-
-impl Service<ChatRequest> for ProviderPrepareService {
-    type Response = PreparedChat;
-    type Error = TransportError;
-    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: ChatRequest) -> Self::Future {
-        std::future::ready(self.transport.prepare(request))
     }
 }
 

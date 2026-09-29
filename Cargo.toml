@@ -40,6 +40,15 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde_yaml_ng = "0.10.0"
 fs2 = "0.4"
 typed-index-collections = "3.5"
+petgraph = "0.8"
+compio = { version = "0.19", default-features = false, features = ["runtime"] }
+ntex = { version = "3.12", default-features = false, features = ["compio"] }
+rust-mcp-schema = { version = "2.0", default-features = false, features = ["2025_11_25", "schema_utils"] }
+flume = "0.11"
+strum = { version = "0.27", features = ["derive"] }
+derive_more = { version = "2", features = ["as_ref", "display", "deref", "from"] }
+schemars = "1.2"
+jsonschema = { version = "0.58", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 # Phase 3B-1 provider transport substrate. Pinned to the exact versions the
 # aimux 0.3.0 conformance probe was run against; `default-features = false`
@@ -50,13 +59,11 @@ aimux-providers = { version = "=0.3.0", default-features = false }
 # at construction as well as per call.
 aimux-provider-utils = "=0.3.0"
 futures = "0.3"
-tokio = { version = "1", features = ["rt", "time", "net", "signal"] }
 anyhow = "1"
-tower = { version = "0.5", features = ["util"] }
 # Incremental architecture dependencies. Keep features narrow until the
 # corresponding runtime, diagnostics, error, parsing, and identifier layers
 # are migrated in later steps.
-tokio-util = { version = "0.7", features = ["rt"] }
+ctrlc = "3.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"

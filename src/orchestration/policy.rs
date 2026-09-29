@@ -40,7 +40,66 @@
 
 use crate::error::{OcgError, Result};
 use crate::orchestration::mission::{MissionReconcileStatus, MissionStatus};
-use crate::orchestration::reconcile::{ObservationStatus, ReconcileAction};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationStatus {
+    Exists,
+    Missing,
+    Unbound,
+    ObservationFailed,
+    RuntimeUnavailable,
+    AuthenticationFailure,
+    TransientTransportFailure,
+    Unsupported,
+}
+
+impl ObservationStatus {
+    pub fn is_failure(self) -> bool {
+        !matches!(self, Self::Exists | Self::Missing | Self::Unbound)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exists => "exists",
+            Self::Missing => "missing",
+            Self::Unbound => "unbound",
+            Self::ObservationFailed => "observation_failed",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::AuthenticationFailure => "authentication_failure",
+            Self::TransientTransportFailure => "transient_transport_failure",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileAction {
+    Noop,
+    Wait,
+    RecoverRollover,
+    RecoverExecution,
+    EnsureExecution,
+    ContinueExecution,
+    Escalate,
+    Blocked,
+}
+
+impl ReconcileAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Noop => "noop",
+            Self::Wait => "wait",
+            Self::RecoverRollover => "recover_rollover",
+            Self::RecoverExecution => "recover_execution",
+            Self::EnsureExecution => "ensure_execution",
+            Self::ContinueExecution => "continue_execution",
+            Self::Escalate => "escalate",
+            Self::Blocked => "blocked",
+        }
+    }
+}
 use crate::resources::{
     CostValue, Fact, QuotaValue, ResourceHealth, ResourceId, ResourceIdentity, ResourceProvenance,
     ResourceRecord,

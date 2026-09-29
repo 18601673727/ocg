@@ -20,7 +20,7 @@
 
 use crate::error::{OcgError, Result};
 use crate::orchestration::budget::{MissionBudgetReceipt, Money};
-use crate::orchestration::mission::{self, Mission};
+use crate::orchestration::mission::Mission;
 use crate::orchestration::policy::{self, ApprovalIssue, ApprovalRecord, ApprovalStatus};
 use crate::orchestration::replay::{
     AuthoritativeSnapshot, Cursor, EventEnvelope, ReplayAfter, SnapshotConfig, SnapshotService,
@@ -565,84 +565,40 @@ impl ControlService {
     }
 
     /// Read the durable budget of one Mission.
-    pub fn budget(&self, mission_id: &str) -> std::result::Result<BudgetView, ControlError> {
-        let view = self.snapshot()?;
-        let mission = view
-            .snapshot
-            .missions
-            .get(mission_id)
-            .cloned()
-            .ok_or_else(|| ControlError::not_found(format!("unknown Mission '{mission_id}'")))?;
+    pub fn budget(&self, project_id: &str) -> std::result::Result<BudgetView, ControlError> {
+        let repository = crate::orchestration::domain::DomainRepository::open(&self.root)
+            .map_err(ControlError::storage)?;
         Ok(BudgetView {
-            cursor: view.cursor,
-            mission_id: mission.mission_id.clone(),
-            revision: mission.revision,
+            cursor: Cursor::default(),
+            mission_id: project_id.to_string(),
+            revision: 0,
             changed: false,
-            budget: mission.budget.receipt(),
+            budget: repository
+                .project_budget(project_id)
+                .map_err(ControlError::storage)?,
         })
     }
 
-    /// Explicitly set the hard Mission budget.
-    ///
-    /// This is the only supported path past a hard cap: it goes through
-    /// `Mission::set_hard_budget` and the authority-backed revision CAS
-    /// (`mission::save_if_revision`). A lost CAS is a typed conflict, never a
-    /// silent overwrite.
     pub fn set_budget(
         &self,
-        mission_id: &str,
+        project_id: &str,
         amount: Money,
-        now: i64,
+        _now: i64,
     ) -> std::result::Result<BudgetView, ControlError> {
-        let mut mission = self.load_mission(mission_id)?;
-        let expected_revision = mission.revision;
-        let expected_owner = mission.session_id.clone();
-        let changed = mission
-            .set_hard_budget(amount, now)
+        let mut repository = crate::orchestration::domain::DomainRepository::open(&self.root)
+            .map_err(ControlError::storage)?;
+        let changed = repository
+            .set_project_budget(project_id, amount)
             .map_err(mutation_error)?;
-        let saved = mission::save_if_revision(
-            &self.root,
-            &mission,
-            expected_revision,
-            expected_owner.as_deref(),
-        )
-        .map_err(ControlError::storage)?;
-        if !saved {
-            return Err(ControlError::conflict(
-                "Mission changed while setting the hard budget; retry later",
-            ));
-        }
-        // As with all query responses, pair the returned state with a cursor
-        // from the same post-commit authority read. This cannot skip a racing
-        // writer's event while returning pre-race state.
-        let snapshot = self.snapshot()?;
-        let mission = snapshot
-            .snapshot
-            .missions
-            .get(mission_id)
-            .cloned()
-            .ok_or_else(|| {
-                ControlError::conflict(
-                    "Mission changed after the budget committed; refresh and retry",
-                )
-            })?;
         Ok(BudgetView {
-            cursor: snapshot.cursor,
-            mission_id: mission.mission_id.clone(),
-            revision: mission.revision,
+            cursor: Cursor::default(),
+            mission_id: project_id.to_string(),
+            revision: 0,
             changed,
-            budget: mission.budget.receipt(),
+            budget: repository
+                .project_budget(project_id)
+                .map_err(ControlError::storage)?,
         })
-    }
-
-    fn load_mission(&self, mission_id: &str) -> std::result::Result<Mission, ControlError> {
-        match mission::load(&self.root, mission_id) {
-            Ok(Some(mission)) => Ok(mission),
-            Ok(None) => Err(ControlError::not_found(format!(
-                "unknown Mission '{mission_id}'"
-            ))),
-            Err(error) => Err(ControlError::storage(error)),
-        }
     }
 }
 
