@@ -105,6 +105,14 @@ export type Mission = {
 
 export type RuntimeConnectionState = "connected" | "connecting" | "disconnected" | "failed";
 
+/** The same states, as data, so a validator can check membership. */
+export const RUNTIME_CONNECTION_STATES: readonly RuntimeConnectionState[] = [
+  "connected",
+  "connecting",
+  "disconnected",
+  "failed",
+];
+
 export type RuntimeStatus = {
   state: RuntimeConnectionState;
   detail?: string;

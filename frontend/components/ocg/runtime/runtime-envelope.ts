@@ -19,12 +19,15 @@ import type {
   ToolActivity,
   Worker,
 } from "../types";
+import { RUNTIME_CONNECTION_STATES } from "../types";
 import type { BootstrapState } from "../bootstrap/types";
 import type { MissionExecution } from "../execution/domain";
 import { isProjectId, type ProjectId } from "../project/domain";
 import type { MissionLaunchResult } from "./runtime-types";
+import { isNonEmptyString, isNonNegativeInteger, isOneOf, isRecord } from "@/lib/narrow";
+import { ATTENTION_LIFECYCLES, type AttentionItem } from "../attention/domain";
+import { LOG_LEVELS } from "../logs/domain";
 import type { RuntimeObservability } from "./observability";
-import type { AttentionItem } from "../attention/domain";
 import type { ResourceLedgerEntry } from "../resource-ledger/types";
 import type { LogEntry } from "../logs/domain";
 
@@ -187,18 +190,6 @@ export type RuntimeEnvelopeValidation =
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
 
 function isIsoDate(value: unknown): value is string {
   return isNonEmptyString(value) && Number.isFinite(Date.parse(value));
@@ -429,10 +420,6 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
 /* Validation / normalization                                                 */
 /* -------------------------------------------------------------------------- */
 
-const CONNECTION_STATES = ["connected", "connecting", "disconnected", "failed"] as const;
-const ATTENTION_STATES = ["pending", "acknowledged", "approved", "rejected", "resolved", "expired", "superseded"] as const;
-const LOG_LEVELS = ["trace", "debug", "info", "warn", "error"] as const;
-
 function diagnostic(
   code: RuntimeDiagnosticCode,
   message: string,
@@ -447,7 +434,7 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
     case "runtime.status-changed": {
       const status = payload.status;
       if (!isRecord(status) || typeof status.state !== "string") return "status.state is required.";
-      if (!(CONNECTION_STATES as readonly string[]).includes(status.state)) {
+      if (!isOneOf(status.state, RUNTIME_CONNECTION_STATES)) {
         return `Unknown runtime connection state "${String(status.state)}".`;
       }
       if (status.detail !== undefined && typeof status.detail !== "string") return "status.detail must be a string when present.";
@@ -512,7 +499,7 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       const item = payload.item;
       if (!isRecord(item) || !isNonEmptyString(item.id)) return "attention item.id is required.";
       if (!isNonEmptyString(item.status)) return "attention item.status is required.";
-      if (!(ATTENTION_STATES as readonly string[]).includes(item.status)) return "attention item.status is invalid.";
+      if (!isOneOf(item.status, ATTENTION_LIFECYCLES)) return "attention item.status is invalid.";
       if (!isNonEmptyString(item.updatedAt)) return "attention item.updatedAt is required.";
       if (item.projectId !== undefined && !isProjectId(item.projectId)) return "attention item.projectId must be a known Project ID.";
       return null;
@@ -532,7 +519,7 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       if (!isRecord(entry) || !isNonEmptyString(entry.id)) return "log entry.id is required.";
       if (!isIsoDate(entry.timestamp)) return "log entry.timestamp must be a valid timestamp.";
       if (!isNonEmptyString(entry.source)) return "log entry.source is required.";
-      if (!isNonEmptyString(entry.level) || !(LOG_LEVELS as readonly string[]).includes(entry.level)) return "log entry.level is invalid.";
+      if (!isOneOf(entry.level, LOG_LEVELS)) return "log entry.level is invalid.";
       if (typeof entry.message !== "string") return "log entry.message must be a string.";
       return null;
     }
@@ -589,11 +576,11 @@ export function validateRuntimeEnvelope(input: unknown): RuntimeEnvelopeValidati
   if (!isIsoDate(input.occurredAt)) return diagnostic("schema-invalid", "occurredAt must be a valid timestamp.");
   if (typeof input.type !== "string") return diagnostic("schema-invalid", "type is required.");
 
-  if (!(RUNTIME_EVENT_TYPES as readonly string[]).includes(input.type)) {
+  if (!isOneOf(input.type, RUNTIME_EVENT_TYPES)) {
     return diagnostic("unknown-event-type", `Unknown runtime event type "${input.type}".`, "warning");
   }
 
-  const type = input.type as RuntimeEventType;
+  const type = input.type;
   const payloadError = validatePayload(type, input.payload);
   if (payloadError) return diagnostic("schema-invalid", payloadError);
 

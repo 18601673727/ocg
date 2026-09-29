@@ -46,6 +46,17 @@ export type AttentionLifecycle =
   | "expired"
   | "superseded";
 
+/** The same lifecycle, as data, so a validator can check membership. */
+export const ATTENTION_LIFECYCLES: readonly AttentionLifecycle[] = [
+  "pending",
+  "acknowledged",
+  "approved",
+  "rejected",
+  "resolved",
+  "expired",
+  "superseded",
+];
+
 export type AttentionSeverity = "info" | "warning" | "high" | "critical";
 
 export type AttentionSource =

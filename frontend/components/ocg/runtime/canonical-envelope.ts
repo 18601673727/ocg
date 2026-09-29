@@ -33,6 +33,7 @@ export { CANONICAL_API_VERSION } from "../contracts";
 
 import { CANONICAL_API_VERSION, decodeWitness } from "../contracts";
 import type { DispatchWitness } from "../contracts";
+import { asRecordArray, isNonEmptyString, isNonNegativeInteger, isOneOf, isPositiveInteger, isRecord } from "@/lib/narrow";
 
 export const CANONICAL_STREAM_ID = "ocg.canonical.work";
 
@@ -132,25 +133,6 @@ export type CanonicalProjectionResult =
   | { ok: true; projection: CanonicalWorkProjection }
   | { ok: false; issue: CanonicalProjectionIssue };
 
-export type CanonicalSnapshotInput = {
-  api_version?: unknown;
-  project_id?: unknown;
-  cursor?: unknown;
-  mission?: unknown;
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isIndex(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
-
-function isText(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
 function fail(code: CanonicalProjectionIssue["code"], message: string): CanonicalProjectionResult {
   return { ok: false, issue: { code, message } };
 }
@@ -179,7 +161,7 @@ const WORK_STATES: readonly CanonicalWorkState[] = ["ready", "running", "complet
 
 function parseContract(value: unknown): CanonicalRunContract | null {
   if (!isRecord(value)) return null;
-  if (!isText(value.executor) || !isText(value.model) || !isText(value.role)) return null;
+  if (!isNonEmptyString(value.executor) || !isNonEmptyString(value.model) || !isNonEmptyString(value.role)) return null;
   return { executor: value.executor, model: value.model, role: value.role };
 }
 
@@ -190,7 +172,7 @@ function parseContract(value: unknown): CanonicalRunContract | null {
  * malformed entity is rejected here; nothing is partially rendered.
  */
 export function projectCanonicalSnapshot(
-  input: CanonicalSnapshotInput,
+  input: unknown,
   expectedProjectId: ProjectId,
 ): CanonicalProjectionResult {
   if (!isRecord(input)) return fail("malformed", "Canonical snapshot must be an object.");
@@ -200,121 +182,121 @@ export function projectCanonicalSnapshot(
   if (input.project_id !== expectedProjectId) {
     return fail("project-mismatch", "Canonical snapshot belongs to another Project.");
   }
-  if (!isIndex(input.cursor)) return fail("cursor", "Canonical snapshot cursor must be a non-negative integer.");
+  if (!isNonNegativeInteger(input.cursor)) return fail("cursor", "Canonical snapshot cursor must be a non-negative integer.");
   const mission = input.mission;
   if (!isRecord(mission)) return fail("malformed", "Canonical snapshot mission payload is required.");
-  if (!isText(mission.mission_id)) return fail("malformed", "Canonical Mission id is required.");
-  if (!isIndex(mission.root_node_id)) return fail("malformed", "Canonical root node id is required.");
+  if (!isNonEmptyString(mission.mission_id)) return fail("malformed", "Canonical Mission id is required.");
+  if (!isNonNegativeInteger(mission.root_node_id)) return fail("malformed", "Canonical root node id is required.");
 
-  const rawNodes = mission.work_nodes;
-  if (!Array.isArray(rawNodes) || rawNodes.some((node) => !isRecord(node))) {
-    return fail("malformed", "Canonical work_nodes must be an array of records.");
-  }
+  const rawNodes = asRecordArray(mission.work_nodes);
+  if (rawNodes === null) return fail("malformed", "Canonical work_nodes must be an array of records.");
   const workNodes: CanonicalWorkNode[] = [];
   for (const node of rawNodes) {
-    if (!isIndex(node!.node_id)) return fail("malformed", "WorkNode id must be a non-negative integer.");
-    if (node!.parent_node_id !== null && !isIndex(node!.parent_node_id)) {
+    if (!isNonNegativeInteger(node.node_id)) return fail("malformed", "WorkNode id must be a non-negative integer.");
+    if (node.parent_node_id !== null && !isNonNegativeInteger(node.parent_node_id)) {
       return fail("malformed", "WorkNode parent must be null or a node id.");
     }
-    if (node!.spawned_by_run_id !== null && !isIndex(node!.spawned_by_run_id)) {
+    if (node.spawned_by_run_id !== null && !isNonNegativeInteger(node.spawned_by_run_id)) {
       return fail("malformed", "WorkNode spawn provenance must be null or a run id.");
     }
-    if (node!.active_run_id !== null && !isIndex(node!.active_run_id)) {
+    if (node.active_run_id !== null && !isNonNegativeInteger(node.active_run_id)) {
       return fail("malformed", "WorkNode active run must be null or a run id.");
     }
-    if (!Number.isInteger(node!.generation) || (node!.generation as number) < 0) {
+    if (!isNonNegativeInteger(node.generation)) {
       return fail("malformed", "WorkNode generation must be a non-negative integer.");
     }
-    if (typeof node!.state !== "string" || !WORK_STATES.includes(node!.state as CanonicalWorkState)) {
-      return fail("malformed", `Unknown canonical WorkNode state "${String(node!.state)}".`);
+    if (!isOneOf(node.state, WORK_STATES)) {
+      return fail("malformed", `Unknown canonical WorkNode state "${String(node.state)}".`);
     }
     workNodes.push({
-      node_id: node!.node_id as number,
-      parent_node_id: (node!.parent_node_id ?? null) as number | null,
-      spawned_by_run_id: (node!.spawned_by_run_id ?? null) as number | null,
-      state: node!.state as CanonicalWorkState,
-      generation: node!.generation as number,
-      active_run_id: (node!.active_run_id ?? null) as number | null,
-      payload: typeof node!.payload === "string" ? node!.payload : "",
+      node_id: node.node_id,
+      parent_node_id: node.parent_node_id ?? null,
+      spawned_by_run_id: node.spawned_by_run_id ?? null,
+      state: node.state,
+      generation: node.generation,
+      active_run_id: node.active_run_id ?? null,
+      payload: typeof node.payload === "string" ? node.payload : "",
     });
   }
 
-  const rawRuns = mission.runs;
-  if (!Array.isArray(rawRuns) || rawRuns.some((run) => !isRecord(run))) {
-    return fail("malformed", "Canonical runs must be an array of records.");
-  }
+  const rawRuns = asRecordArray(mission.runs);
+  if (rawRuns === null) return fail("malformed", "Canonical runs must be an array of records.");
   const runs: CanonicalRun[] = [];
   for (const run of rawRuns) {
-    if (!isIndex(run!.run_id) || !isIndex(run!.node_id)) return fail("malformed", "Run ids must be non-negative integers.");
-    if (!Number.isInteger(run!.generation) || (run!.generation as number) < 1) {
+    if (!isNonNegativeInteger(run.run_id) || !isNonNegativeInteger(run.node_id)) {
+      return fail("malformed", "Run ids must be non-negative integers.");
+    }
+    if (!isPositiveInteger(run.generation)) {
       return fail("malformed", "Run generation must be a positive integer.");
     }
-    if (typeof run!.state !== "string" || !RUN_STATES.includes(run!.state as CanonicalRunState)) {
-      return fail("malformed", `Unknown canonical Run state "${String(run!.state)}".`);
+    if (!isOneOf(run.state, RUN_STATES)) {
+      return fail("malformed", `Unknown canonical Run state "${String(run.state)}".`);
     }
-    const contract = parseContract(run!.contract);
+    const contract = parseContract(run.contract);
     if (!contract) return fail("malformed", "Every Run must carry a complete frozen contract.");
     runs.push({
-      run_id: run!.run_id as number,
-      node_id: run!.node_id as number,
-      generation: run!.generation as number,
-      state: run!.state as CanonicalRunState,
+      run_id: run.run_id,
+      node_id: run.node_id,
+      generation: run.generation,
+      state: run.state,
       contract,
-      runtime_execution_id: typeof run!.runtime_execution_id === "string" ? run!.runtime_execution_id : null,
-      host_session_id: typeof run!.host_session_id === "string" ? run!.host_session_id : null,
-      result: typeof run!.result === "string" ? run!.result : null,
-      witness: run!.witness === null || run!.witness === undefined ? null : parseWitness(run!.witness),
+      runtime_execution_id: typeof run.runtime_execution_id === "string" ? run.runtime_execution_id : null,
+      host_session_id: typeof run.host_session_id === "string" ? run.host_session_id : null,
+      result: typeof run.result === "string" ? run.result : null,
+      witness: run.witness === null || run.witness === undefined ? null : parseWitness(run.witness),
     });
   }
 
-  const rawDependencies = mission.dependencies ?? [];
-  if (!Array.isArray(rawDependencies)) return fail("malformed", "Canonical dependencies must be an array.");
+  const rawDependencies = asRecordArray(mission.dependencies ?? []);
+  if (rawDependencies === null) return fail("malformed", "Canonical dependencies must be an array of records.");
   const dependencies: CanonicalDependency[] = [];
   for (const edge of rawDependencies) {
-    if (!isRecord(edge) || !isIndex(edge.node_id) || !isIndex(edge.depends_on_node_id)) {
+    if (!isNonNegativeInteger(edge.node_id) || !isNonNegativeInteger(edge.depends_on_node_id)) {
       return fail("malformed", "Dependency edges must name two node ids.");
     }
-    dependencies.push({ node_id: edge.node_id as number, depends_on_node_id: edge.depends_on_node_id as number });
+    dependencies.push({ node_id: edge.node_id, depends_on_node_id: edge.depends_on_node_id });
   }
 
-  const rawEvents = mission.events ?? [];
-  if (!Array.isArray(rawEvents) || rawEvents.some((event) => !isRecord(event) || !isIndex(event.seq))) {
-    return fail("malformed", "Canonical events must carry a sequence.");
+  const rawEvents = asRecordArray(mission.events ?? []);
+  if (rawEvents === null) return fail("malformed", "Canonical events must be an array of records.");
+  const events: CanonicalEvent[] = [];
+  for (const event of rawEvents) {
+    if (!isNonNegativeInteger(event.seq)) {
+      return fail("malformed", "Canonical events must carry a sequence.");
+    }
+    events.push({
+      seq: event.seq,
+      kind: isNonEmptyString(event.kind) ? event.kind : "unknown",
+      payload: typeof event.payload === "string" ? event.payload : "",
+      by_run_id: isNonNegativeInteger(event.by_run_id) ? event.by_run_id : null,
+    });
   }
-  const events: CanonicalEvent[] = rawEvents.map((event) => ({
-    seq: (event as { seq: number }).seq,
-    kind: isText((event as { kind?: unknown }).kind) ? ((event as { kind: string }).kind) : "unknown",
-    payload: typeof (event as { payload?: unknown }).payload === "string" ? ((event as { payload: string }).payload) : "",
-    by_run_id: isIndex((event as { by_run_id?: unknown }).by_run_id) ? ((event as { by_run_id: number }).by_run_id) : null,
-  }));
   const headSequence = events.reduce((highest, event) => Math.max(highest, event.seq), 0);
   if (input.cursor < headSequence) {
     return fail("cursor", "Canonical cursor is behind its own event stream.");
   }
 
-  const verifications = Array.isArray(mission.verifications) ? (mission.verifications as unknown[]).map((entry) => {
-    const record = entry as Record<string, unknown>;
-    return {
-      verification_id: isText(record.verification_id) ? record.verification_id : "unknown",
-      node_id: isIndex(record.node_id) ? record.node_id : 0,
-      run_id: isIndex(record.run_id) ? record.run_id : 0,
-      dispatch_id: isText(record.dispatch_id) ? record.dispatch_id : "",
-      outcome: record.outcome === "passed" ? ("passed" as const) : ("failed" as const),
-      passed: record.passed === true,
-      commands: Array.isArray(record.commands) ? record.commands.filter(isText) : [],
-      created_at: typeof record.created_at === "number" ? record.created_at : 0,
-    };
-  }) : [];
+  // Records that are not objects are ignored rather than padded with invented
+  // ids: a selector must never see an id of 0 as evidence of a verification.
+  const verificationRecords = Array.isArray(mission.verifications) ? mission.verifications.filter(isRecord) : [];
+  const verifications = verificationRecords.map((record) => ({
+    verification_id: isNonEmptyString(record.verification_id) ? record.verification_id : "unknown",
+    node_id: isNonNegativeInteger(record.node_id) ? record.node_id : 0,
+    run_id: isNonNegativeInteger(record.run_id) ? record.run_id : 0,
+    dispatch_id: isNonEmptyString(record.dispatch_id) ? record.dispatch_id : "",
+    outcome: record.outcome === "passed" ? ("passed" as const) : ("failed" as const),
+    passed: record.passed === true,
+    commands: Array.isArray(record.commands) ? record.commands.filter(isNonEmptyString) : [],
+    created_at: typeof record.created_at === "number" ? record.created_at : 0,
+  }));
 
-  const lateResults = Array.isArray(mission.late_results) ? (mission.late_results as unknown[]).map((entry) => {
-    const record = entry as Record<string, unknown>;
-    return {
-      node_id: isIndex(record.node_id) ? record.node_id : 0,
-      run_id: isIndex(record.run_id) ? record.run_id : 0,
-      dispatch_id: isText(record.dispatch_id) ? record.dispatch_id : "",
-      result: typeof record.result === "string" ? record.result : "",
-    };
-  }) : [];
+  const lateResultRecords = Array.isArray(mission.late_results) ? mission.late_results.filter(isRecord) : [];
+  const lateResults = lateResultRecords.map((record) => ({
+    node_id: isNonNegativeInteger(record.node_id) ? record.node_id : 0,
+    run_id: isNonNegativeInteger(record.run_id) ? record.run_id : 0,
+    dispatch_id: isNonEmptyString(record.dispatch_id) ? record.dispatch_id : "",
+    result: typeof record.result === "string" ? record.result : "",
+  }));
 
   return {
     ok: true,
@@ -322,7 +304,7 @@ export function projectCanonicalSnapshot(
       apiVersion: CANONICAL_API_VERSION,
       projectId: expectedProjectId,
       missionId: mission.mission_id,
-      rootNodeId: mission.root_node_id as number,
+      rootNodeId: mission.root_node_id,
       cursor: input.cursor,
       workNodes,
       dependencies,

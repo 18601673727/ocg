@@ -36,6 +36,7 @@ import type {
 import { validateRuntimeEnvelope } from "./runtime-envelope";
 import type { RuntimeSnapshotEnvelope, RuntimeSnapshotScope } from "./runtime-snapshot";
 import { emptyRuntimeSnapshot, sameSnapshotScope, validateRuntimeSnapshotEnvelope } from "./runtime-snapshot";
+import { boundDiagnostics, compareGeneration, compareSequence, isSeen, rememberId } from "./event-gate";
 
 export type RuntimeSyncStatus =
   | "uninitialized"
@@ -70,9 +71,6 @@ export type RuntimeState = {
   snapshot: RuntimeSnapshot;
   sync: RuntimeSyncState;
 };
-
-export const MAX_RUNTIME_DIAGNOSTICS = 50;
-const MAX_SEEN_IDS = 500;
 
 export function createUninitializedRuntimeState(scenario: ScenarioId): RuntimeState {
   return {
@@ -129,17 +127,6 @@ export function recordRuntimeDiagnostic(
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
 
-function boundDiagnostics(diagnostics: RuntimeDiagnostic[]): RuntimeDiagnostic[] {
-  return diagnostics.length <= MAX_RUNTIME_DIAGNOSTICS
-    ? diagnostics
-    : diagnostics.slice(diagnostics.length - MAX_RUNTIME_DIAGNOSTICS);
-}
-
-function boundSeen(seen: readonly string[], next?: string): string[] {
-  const combined = next !== undefined ? [...seen, next] : [...seen];
-  return combined.length <= MAX_SEEN_IDS ? combined : combined.slice(combined.length - MAX_SEEN_IDS);
-}
-
 function withDiagnostics(state: RuntimeState, diagnostics: RuntimeDiagnostic[]): RuntimeState {
   if (diagnostics.length === 0) return state;
   return {
@@ -194,8 +181,8 @@ function consumeEnvelope(
       cursor: { streamId: envelope.streamId, sequence: envelope.sequence },
       lastEventId: envelope.eventId,
       lastSuccessfulSyncAt: envelope.occurredAt,
-      seenEventIds: boundSeen(sync.seenEventIds, envelope.eventId),
-      seenDeltaKeys: deltaKey !== undefined ? boundSeen(sync.seenDeltaKeys, deltaKey) : sync.seenDeltaKeys,
+      seenEventIds: rememberId(sync.seenEventIds, envelope.eventId),
+      seenDeltaKeys: deltaKey !== undefined ? rememberId(sync.seenDeltaKeys, deltaKey) : sync.seenDeltaKeys,
       diagnostics: boundDiagnostics([...sync.diagnostics, ...diagnostics]),
     },
   };
@@ -369,7 +356,8 @@ export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope
     });
   }
 
-  if (envelope.generation < sync.generation) {
+  const generation = compareGeneration(envelope.generation, sync.generation);
+  if (generation === "stale") {
     return withDiagnostics(state, [{
       code: "generation-stale",
       severity: "warning",
@@ -379,7 +367,7 @@ export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope
     }]);
   }
 
-  if (envelope.generation > sync.generation) {
+  if (generation === "unknown") {
     return requireResync(state, {
       code: "generation-unknown",
       severity: "warning",
@@ -400,11 +388,12 @@ export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope
   }
 
   // Duplicate event identity is a pure idempotent no-op.
-  if (sync.seenEventIds.includes(envelope.eventId)) {
+  if (isSeen(sync.seenEventIds, envelope.eventId)) {
     return state;
   }
 
-  if (envelope.sequence <= sync.cursor.sequence) {
+  const sequence = compareSequence(envelope.sequence, sync.cursor.sequence);
+  if (sequence === "stale") {
     return withDiagnostics(state, [{
       code: "sequence-stale",
       severity: "warning",
@@ -414,7 +403,7 @@ export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope
     }]);
   }
 
-  if (envelope.sequence > sync.cursor.sequence + 1) {
+  if (sequence === "gap") {
     return requireResync(state, {
       code: "sequence-gap",
       severity: "warning",
@@ -461,8 +450,8 @@ export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope
       cursor: { streamId: envelope.streamId, sequence: envelope.sequence },
       lastEventId: envelope.eventId,
       lastSuccessfulSyncAt: envelope.occurredAt,
-      seenEventIds: boundSeen(sync.seenEventIds, envelope.eventId),
-      seenDeltaKeys: deltaKey !== undefined ? boundSeen(sync.seenDeltaKeys, deltaKey) : sync.seenDeltaKeys,
+      seenEventIds: rememberId(sync.seenEventIds, envelope.eventId),
+      seenDeltaKeys: deltaKey !== undefined ? rememberId(sync.seenDeltaKeys, deltaKey) : sync.seenDeltaKeys,
       commandResults: envelope.type === "mission.launch-updated"
         ? { ...sync.commandResults, [envelope.payload.result.commandId]: envelope.payload.result }
         : sync.commandResults,

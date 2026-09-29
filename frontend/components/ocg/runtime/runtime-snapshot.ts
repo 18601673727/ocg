@@ -7,6 +7,7 @@
  */
 
 import type { BootstrapState } from "../bootstrap/types";
+import { isRecord, isNonEmptyString, isNonNegativeInteger } from "@/lib/narrow";
 import { createBootstrapFixture } from "../bootstrap/fixtures";
 import { isProjectId, type ProjectId } from "../project/domain";
 import { selectProjectSnapshot } from "../project/selectors";
@@ -41,18 +42,6 @@ export type RuntimeSnapshotEnvelope = {
 export type RuntimeSnapshotValidation =
   | { ok: true; envelope: RuntimeSnapshotEnvelope }
   | { ok: false; diagnostic: RuntimeDiagnostic };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
 
 function invalidSnapshot(message: string): RuntimeSnapshotValidation {
   return {

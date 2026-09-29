@@ -20,17 +20,13 @@ import type { ProjectId } from "../project/domain";
 import type { MissionExecution } from "../execution/domain";
 import type { CanonicalWorkEvent } from "../contracts";
 import { toMissionExecution } from "./canonical-envelope";
+import { boundDiagnostics, compareGeneration, compareSequence, isSeen, rememberId } from "./event-gate";
+import type { RuntimeDiagnosticSeverity } from "./runtime-envelope";
+import type { RuntimeSyncStatus } from "./reconciler";
+import { isRecord } from "@/lib/narrow";
 
-export const MAX_CANONICAL_DIAGNOSTICS = 50;
-const MAX_SEEN_EVENT_IDS = 500;
-
-export type CanonicalSyncStatus =
-  | "uninitialized"
-  | "loading-snapshot"
-  | "live"
-  | "reconnecting"
-  | "stale"
-  | "error";
+/** The canonical tail syncs with the same vocabulary as the event stream. */
+export type CanonicalSyncStatus = RuntimeSyncStatus;
 
 export type CanonicalDiagnosticCode =
   | "snapshot-rejected"
@@ -46,7 +42,7 @@ export type CanonicalDiagnosticCode =
 
 export type CanonicalDiagnostic = {
   code: CanonicalDiagnosticCode;
-  severity: "info" | "warning" | "error";
+  severity: RuntimeDiagnosticSeverity;
   message: string;
   eventId?: string;
   sequence?: number;
@@ -60,14 +56,12 @@ export type CanonicalCommandAck = {
   message: string;
 };
 
-/** One canonical event as delivered by the backend tail. */
 /**
  * A canonical work event as the backend sends it.
  *
  * This is the generated projection of `CanonicalWorkEvent` in
- * `src/orchestration/canonical_control.rs`, not a second declaration of it. It
- * was a hand-written copy that could drift from Rust; now the control client
- * hands the store exactly what the decoder produced.
+ * `src/orchestration/canonical_control.rs`, not a second declaration of it. The
+ * control client hands the store exactly what the decoder produced.
  */
 export type CanonicalBackendEvent = CanonicalWorkEvent;
 
@@ -103,15 +97,6 @@ export function createCanonicalState(): CanonicalState {
   };
 }
 
-function boundDiagnostics(diagnostics: readonly CanonicalDiagnostic[]): CanonicalDiagnostic[] {
-  return diagnostics.slice(-MAX_CANONICAL_DIAGNOSTICS);
-}
-
-function boundSeen(seen: readonly string[], eventId: string): string[] {
-  const next = [...seen, eventId];
-  return next.length > MAX_SEEN_EVENT_IDS ? next.slice(next.length - MAX_SEEN_EVENT_IDS) : next;
-}
-
 function withDiagnostics(state: CanonicalState, diagnostics: readonly CanonicalDiagnostic[]): CanonicalState {
   return { ...state, diagnostics: boundDiagnostics([...state.diagnostics, ...diagnostics]) };
 }
@@ -143,20 +128,21 @@ export type CanonicalSnapshotInput = {
  */
 export function applyCanonicalSnapshot(state: CanonicalState, input: CanonicalSnapshotInput): CanonicalState {
   const generation = input.generation ?? state.generation;
-  if (generation < state.generation) {
+  if (compareGeneration(generation, state.generation) === "stale") {
     return withDiagnostics(state, [
       diagnostic("snapshot-stale", `Ignored canonical snapshot from old generation ${generation}.`),
     ]);
   }
   if (state.projection !== null && state.projectId === input.projectId) {
-    const incomingCursor = (input.payload as { cursor?: unknown } | null)?.cursor;
+    const payload = isRecord(input.payload) ? input.payload : null;
+    const incomingCursor = payload?.cursor;
     if (typeof incomingCursor === "number" && incomingCursor < state.cursor) {
       return withDiagnostics(state, [
         diagnostic("snapshot-stale", `Ignored canonical snapshot at cursor ${incomingCursor} (current ${state.cursor}).`),
       ]);
     }
   }
-  const result = projectCanonicalSnapshot(input.payload as never, input.projectId);
+  const result = projectCanonicalSnapshot(input.payload, input.projectId);
   if (!result.ok) return noteRejected(state, result);
   return {
     status: "live",
@@ -195,12 +181,13 @@ export function applyCanonicalEvents(
   options: { generation?: number; projectId: ProjectId } ,
 ): CanonicalState {
   const generation = options.generation ?? state.generation;
-  if (generation < state.generation) {
+  const generationDecision = compareGeneration(generation, state.generation);
+  if (generationDecision === "stale") {
     return withDiagnostics(state, [
       diagnostic("generation-stale", `Ignored canonical events from old generation ${generation}.`),
     ]);
   }
-  if (generation > state.generation) {
+  if (generationDecision === "unknown") {
     return withDiagnostics(state, [
       diagnostic(
         "generation-unknown",
@@ -248,7 +235,7 @@ export function applyCanonicalEvents(
       ]);
       continue;
     }
-    if (next.seenEventIds.includes(event.event_id)) {
+    if (isSeen(next.seenEventIds, event.event_id)) {
       next = withDiagnostics(next, [
         diagnostic("duplicate-event", `Ignored duplicate canonical event ${event.event_id}.`, "info", {
           eventId: event.event_id,
@@ -257,7 +244,8 @@ export function applyCanonicalEvents(
       ]);
       continue;
     }
-    if (event.sequence <= next.cursor) {
+    const decision = compareSequence(event.sequence, next.cursor);
+    if (decision === "stale") {
       next = withDiagnostics(next, [
         diagnostic("sequence-stale", `Ignored stale canonical sequence ${event.sequence} (cursor ${next.cursor}).`, "warning", {
           eventId: event.event_id,
@@ -266,7 +254,7 @@ export function applyCanonicalEvents(
       ]);
       continue;
     }
-    if (event.sequence > next.cursor + 1) {
+    if (decision === "gap") {
       next = withDiagnostics(next, [
         diagnostic("sequence-gap", `Canonical sequence gap: expected ${next.cursor + 1}, received ${event.sequence}.`, "warning", {
           eventId: event.event_id,
@@ -279,7 +267,7 @@ export function applyCanonicalEvents(
     next = {
       ...next,
       cursor: event.sequence,
-      seenEventIds: boundSeen(next.seenEventIds, event.event_id),
+      seenEventIds: rememberId(next.seenEventIds, event.event_id),
     };
   }
   return { ...next, status: next.resyncRequired ? "reconnecting" : "live" };
