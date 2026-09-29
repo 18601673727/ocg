@@ -1,8 +1,16 @@
 "use client";
 
+import type { ComponentType } from "react";
 import { cn } from "@/lib/utils";
 
-export type TabItem<Id extends string> = { id: Id; label: string; /** Live count for the tab, e.g. open approvals. */ count?: number };
+export type TabItem<Id extends string> = {
+  id: Id;
+  label: string;
+  /** Live count for the tab, e.g. open approvals. */
+  count?: number;
+  /** Leading icon, for a tab bar that stands on its own without panel titles. */
+  icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+};
 
 /**
  * Segmented tab bar.
@@ -41,6 +49,7 @@ export function SegmentedTabs<Id extends string>({
     >
       {tabs.map((tab) => {
         const selected = tab.id === value;
+        const Icon = tab.icon;
         return (
           <button
             key={tab.id}
@@ -55,6 +64,7 @@ export function SegmentedTabs<Id extends string>({
               selected ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
             )}
           >
+            {Icon && <Icon className="size-3.5 shrink-0" aria-hidden />}
             <span className="min-w-0 truncate">{tab.label}</span>
             {tab.count !== undefined && (
               <span

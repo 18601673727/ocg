@@ -141,6 +141,17 @@ export type RouteAssignment = {
 };
 
 /** Roles are derived from profile routes, keeping provider/model inventory distinct from routing policy. */
+/** Every model id a profile route actually points at, for assignment filters. */
+export function selectAssignedModelIds(state: BootstrapState): Set<string> {
+  const assigned = new Set<string>();
+  for (const profile of state.profiles) {
+    for (const route of profile.routes ?? []) {
+      if (route.modelId !== null) assigned.add(route.modelId);
+    }
+  }
+  return assigned;
+}
+
 export function selectModelAssignments(state: BootstrapState, modelId: string): RouteAssignment[] {
   return state.profiles.flatMap((profile) =>
     (profile.routes ?? [])
