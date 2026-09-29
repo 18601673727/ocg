@@ -8,6 +8,8 @@
 
 import type { MissionStatus } from "../types";
 
+import type { Tone } from "../primitives";
+
 export type AttentionSeverity = "info" | "attention" | "warning" | "critical";
 
 export type AttentionKind =
@@ -100,10 +102,13 @@ export type UsageSummary = {
   available: boolean;
 };
 
+/** Subset of the shared tone scale the activity feed ranks itself by. */
+export type RecentActivityTone = Extract<Tone, "emerald" | "violet" | "amber" | "red" | "slate">;
+
 export type RecentActivityItem = {
   id: string;
   timeAgo: string;
   summary: string;
   kind: "mission" | "worker" | "provider" | "model" | "budget" | "resource" | "verification";
-  tone: "emerald" | "amber" | "red" | "violet" | "slate";
+  tone: RecentActivityTone;
 };

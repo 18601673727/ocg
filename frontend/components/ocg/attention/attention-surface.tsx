@@ -55,15 +55,7 @@ import {
   selectAttentionSummary,
 } from "./selectors";
 import { createAttentionQueue } from "./fixtures";
-
-export type AttentionNavigate = {
-  onOpenChat: () => void;
-  onOpenMissionControl: () => void;
-  onOpenControlCenter: () => void;
-  onOpenLedger: () => void;
-  onOpenLogs: () => void;
-  onOpenSettings: () => void;
-};
+import type { WorkspaceView } from "../layout/view-domain";
 
 type AttentionSurfaceProps = {
   snapshot: RuntimeSnapshot;
@@ -73,7 +65,9 @@ type AttentionSurfaceProps = {
    * used, preserving the standalone behavior.
    */
   queue?: AttentionQueue;
-} & AttentionNavigate;
+  /** Opens the workspace an item points at; the shell decides the address. */
+  onNavigate: (view: WorkspaceView) => void;
+};
 
 const TAB_LABELS: Record<AttentionTab, string> = {
   overview: "Overview",
@@ -116,30 +110,21 @@ const DESTINATION_LABELS: Record<AttentionDestination, string> = {
   chat: "Chat",
 };
 
-function destinationAction(destination: AttentionDestination, navigate: AttentionNavigate): () => void {
-  switch (destination) {
-    case "mission-control": return navigate.onOpenMissionControl;
-    case "control-center": return navigate.onOpenControlCenter;
-    case "resource-ledger": return navigate.onOpenLedger;
-    case "logs": return navigate.onOpenLogs;
-    case "settings": return navigate.onOpenSettings;
-    case "chat": return navigate.onOpenChat;
-  }
-}
+/** Where each destination is opened. Only `resource-ledger` names a view differently. */
+const DESTINATION_VIEWS: Record<AttentionDestination, WorkspaceView> = {
+  "mission-control": "mission-control",
+  "control-center": "control-center",
+  "resource-ledger": "ledger",
+  logs: "logs",
+  settings: "settings",
+  chat: "chat",
+};
 
 /** Local fixture decisions use a fixed clock so UI state stays deterministic. */
 const DECISION_CLOCK = "2026-09-25T10:00:00Z";
 
 export function AttentionSurface(props: AttentionSurfaceProps) {
-  const { snapshot, initialTab = "overview", queue: queueProp } = props;
-  const navigate: AttentionNavigate = {
-    onOpenChat: props.onOpenChat,
-    onOpenMissionControl: props.onOpenMissionControl,
-    onOpenControlCenter: props.onOpenControlCenter,
-    onOpenLedger: props.onOpenLedger,
-    onOpenLogs: props.onOpenLogs,
-    onOpenSettings: props.onOpenSettings,
-  };
+  const { snapshot, initialTab = "overview", queue: queueProp, onNavigate } = props;
 
   // Fixture queue is stable per scenario; decisions mutate local state only.
   const queue = useMemo(
@@ -327,7 +312,7 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
           >
             <AttentionInspector
               item={selected}
-              navigate={navigate}
+              onNavigate={onNavigate}
               onClose={() => setSelectedId(null)}
               onDecide={handleDecide}
               onAcknowledge={handleAcknowledge}
@@ -423,20 +408,20 @@ function EmptyState({ tab, hasItems }: { tab: AttentionTab; hasItems: boolean })
 
 function AttentionInspector({
   item,
-  navigate,
+  onNavigate,
   onClose,
   onDecide,
   onAcknowledge,
   onResolve,
 }: {
   item: AttentionItem;
-  navigate: AttentionNavigate;
+  onNavigate: (view: WorkspaceView) => void;
   onClose: () => void;
   onDecide: (id: string, decision: "approved" | "rejected") => void;
   onAcknowledge: (id: string) => void;
   onResolve: (id: string) => void;
 }) {
-  const openDestination = destinationAction(item.destination, navigate);
+  const openDestination = () => onNavigate(DESTINATION_VIEWS[item.destination]);
   const unresolved = isUnresolved(item);
   const approval = item.approval;
 

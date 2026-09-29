@@ -32,6 +32,7 @@ import { WORK_TYPE_LABEL } from "../types";
 import { ProjectSwitcher } from "../project/project-switcher";
 import type { ProjectId, ProjectSummary } from "../project/domain";
 import { DEFAULT_PROJECT_ID, PROJECTS } from "../project/domain";
+import type { WorkspaceView } from "../layout/view-domain";
 
 const GROUP_ORDER: WorkType[] = ["research", "coding", "design", "devops"];
 
@@ -42,9 +43,7 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
   devops: Server,
 };
 
-export type WorkspaceTarget = "home" | "attention" | "chat" | "ledger" | "control-center" | "mission-control" | "logs" | "settings" | "canonical";
-
-const WORKSPACE_NAV: { target: WorkspaceTarget; label: string; icon: typeof Search }[] = [
+const WORKSPACE_NAV: { target: WorkspaceView; label: string; icon: typeof Search }[] = [
   { target: "home", label: "Home", icon: Home },
   { target: "attention", label: "Attention", icon: Bell },
   { target: "chat", label: "Chat", icon: MessageSquare },
@@ -64,23 +63,19 @@ type OcgSidebarProps = {
   onNewChat: () => void;
   runtimeStatus: RuntimeStatus;
   /** Active top-level workspace, used to highlight the navigation group. */
-  activeWorkspace?: WorkspaceTarget;
+  activeView?: WorkspaceView;
   /** Project switcher inputs. The switcher renders only when onChange is given. */
   projects?: readonly ProjectSummary[];
   activeProjectId?: ProjectId;
   onProjectChange?: (id: ProjectId) => void;
   /** Unresolved attention count shown as a quiet badge next to Attention. */
   attentionCount?: number;
-  onOpenChat?: () => void;
-  onOpenHome?: () => void;
-  onOpenAttention?: () => void;
-  onOpenLedger?: () => void;
-  onOpenControlCenter?: () => void;
-  onOpenMissionControl?: () => void;
-  onOpenLogs?: () => void;
-  onOpenSettings?: () => void;
-  /** Backend-backed OCG control surface (Project Manager, configurators). */
-  onOpenCanonical?: () => void;
+  /**
+   * Opens a workspace, or closes it back to the chat root when it is already
+   * open. Omitting it hides the workspace navigation group entirely, which is
+   * how a page renders the sidebar without shell navigation.
+   */
+  onNavigate?: (view: WorkspaceView) => void;
 };
 
 const RUNTIME_LABEL: Record<RuntimeStatus["state"], string> = {
@@ -132,33 +127,14 @@ export function OcgSidebar({
   onSelect,
   onNewChat,
   runtimeStatus,
-  activeWorkspace = "chat",
+  activeView = "chat",
   projects = PROJECTS,
   activeProjectId = DEFAULT_PROJECT_ID,
   onProjectChange,
   attentionCount = 0,
-  onOpenChat,
-  onOpenHome,
-  onOpenAttention,
-  onOpenLedger,
-  onOpenControlCenter,
-  onOpenMissionControl,
-  onOpenLogs,
-  onOpenSettings,
-  onOpenCanonical,
+  onNavigate,
 }: OcgSidebarProps) {
-  const navHandlers: Record<WorkspaceTarget, (() => void) | undefined> = {
-    home: onOpenHome,
-    attention: onOpenAttention,
-    chat: onOpenChat,
-    ledger: onOpenLedger,
-    "control-center": onOpenControlCenter,
-    "mission-control": onOpenMissionControl,
-    logs: onOpenLogs,
-    settings: onOpenSettings,
-    canonical: onOpenCanonical,
-  };
-  const hasNav = Boolean(onOpenChat || onOpenHome || onOpenAttention || onOpenLedger || onOpenControlCenter || onOpenMissionControl || onOpenLogs);
+  const hasNav = Boolean(onNavigate);
 
   if (collapsed) {
     return (
@@ -183,14 +159,13 @@ export function OcgSidebar({
               <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
               {WORKSPACE_NAV.map((item) => {
                 const Icon = item.icon;
-                const handler = navHandlers[item.target];
-                if (!handler) return null;
+                if (!onNavigate) return null;
                 return (
                   <RailButton
                     key={item.target}
                     label={item.target === "attention" && attentionCount > 0 ? `${item.label} (${attentionCount} need action)` : item.label}
-                    active={activeWorkspace === item.target}
-                    onClick={handler}
+                    active={activeView === item.target}
+                    onClick={() => onNavigate(item.target)}
                   >
                     <span className="relative">
                       <Icon className="size-4" />
@@ -229,7 +204,7 @@ export function OcgSidebar({
             })}
           </div>
           <div className="flex flex-col items-center gap-1">
-            <RailButton label="Settings" onClick={onOpenSettings}>
+            <RailButton label="Settings" onClick={onNavigate ? () => onNavigate("settings") : undefined}>
               <Settings className="size-4" />
             </RailButton>
             <Avatar size="sm">
@@ -290,14 +265,13 @@ export function OcgSidebar({
             <ul className="flex flex-col gap-px">
               {WORKSPACE_NAV.map((item) => {
                 const Icon = item.icon;
-                const handler = navHandlers[item.target];
-                if (!handler) return null;
-                const active = activeWorkspace === item.target;
+                if (!onNavigate) return null;
+                const active = activeView === item.target;
                 return (
                   <li key={item.target}>
                     <button
                       type="button"
-                      onClick={handler}
+                      onClick={() => onNavigate(item.target)}
                       aria-current={active ? "page" : undefined}
                       className={cn(
                         "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 transition-colors",
@@ -427,7 +401,7 @@ export function OcgSidebar({
                     size="icon-xs"
                      aria-label="Open settings"
                      title="Open settings"
-                     onClick={onOpenSettings}
+                     onClick={onNavigate ? () => onNavigate("settings") : undefined}
                   >
                     <Settings className="size-4" />
                   </Button>

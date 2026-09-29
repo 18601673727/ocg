@@ -44,7 +44,7 @@ import {
   type MissionDraftTextField,
 } from "../mission/draft-domain";
 import type { MissionLaunchResult } from "../runtime/runtime-types";
-import type { WorkspaceView } from "./view-domain";
+import { workspaceViewHref, type WorkspaceView } from "./view-domain";
 
 export type { WorkspaceView } from "./view-domain";
 
@@ -175,11 +175,22 @@ export function RuntimeWorkspace({
     setMobileNavOpen(false);
   }, [activeWorkType, createSession, registerProjectSession]);
 
+  /**
+   * The one navigation path for every workspace control in the shell. Where a
+   * view lives, and whether selecting it again closes it, is decided by the
+   * view domain, so the topbar, sidebar and surfaces all agree.
+   */
+  const navigate = useCallback((target: WorkspaceView) => {
+    setMobileNavOpen(false);
+    setMobileMissionOpen(false);
+    const href = workspaceViewHref(view, target);
+    if (href !== null) router.push(withProject(href));
+  }, [router, view, withProject]);
+
   const selectSession = useCallback((id: string) => {
     setActiveSessionId(id);
-    setMobileNavOpen(false);
-    if (view !== "chat") router.push(withProject("/"));
-  }, [router, view, withProject]);
+    navigate("chat");
+  }, [navigate]);
 
   // --- Mission draft lifecycle (single pure reducer, scoped per Project) ----
 
@@ -371,58 +382,6 @@ export function RuntimeWorkspace({
     });
   }, [activeSessionKey, handleCreateMissionDraft, sendMessage]);
 
-  const handleOpenChat = useCallback(() => {
-    setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-    if (view !== "chat") router.push(withProject("/"));
-  }, [router, view, withProject]);
-
-  const handleOpenHome = useCallback(() => {
-    setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-    if (view !== "home") router.push(withProject("/?scenario=home-overview"));
-  }, [router, view, withProject]);
-
-  const handleOpenAttention = useCallback(() => {
-    setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-    if (view !== "attention") router.push(withProject("/?scenario=attention-overview"));
-  }, [router, view, withProject]);
-
-  const handleOpenLedger = useCallback(() => {
-    setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-    router.push(view === "ledger" ? withProject("/") : withProject("/resource-ledger"));
-  }, [router, view, withProject]);
-
-  const handleOpenControlCenter = useCallback(() => {
-    setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-    router.push(view === "control-center" ? withProject("/") : withProject("/?scenario=profiles-models"));
-  }, [router, view, withProject]);
-
-  const handleOpenMissionControl = useCallback(() => {
-    setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-    router.push(isMissionControl ? withProject("/") : withProject("/?scenario=mission-control"));
-  }, [isMissionControl, router, withProject]);
-
-  const handleOpenLogs = useCallback(() => {
-    setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-    router.push(isLogs ? withProject("/") : withProject("/?scenario=logs-live"));
-  }, [isLogs, router, withProject]);
-
-  const handleOpenCanonical = useCallback(() => {
-    router.push(withProject("/canonical"));
-  }, [router, withProject]);
-
-  const handleOpenSettings = useCallback(() => {
-    setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-    router.push(isSettings ? withProject("/") : withProject("/settings"));
-  }, [isSettings, router, withProject]);
-
   const handleSelectProfile = useCallback((profileId: string) => {
     void setActiveProfile(profileId);
   }, [setActiveProfile]);
@@ -468,17 +427,9 @@ export function RuntimeWorkspace({
       projects={projects}
       activeProjectId={activeProjectId}
       onProjectChange={handleProjectChange}
-      activeWorkspace={view}
+      activeView={view}
       attentionCount={attentionCount}
-      onOpenChat={handleOpenChat}
-      onOpenHome={handleOpenHome}
-      onOpenAttention={handleOpenAttention}
-      onOpenLedger={handleOpenLedger}
-      onOpenControlCenter={handleOpenControlCenter}
-      onOpenMissionControl={handleOpenMissionControl}
-      onOpenLogs={handleOpenLogs}
-      onOpenSettings={handleOpenSettings}
-      onOpenCanonical={handleOpenCanonical}
+      onNavigate={navigate}
     />
   );
 
@@ -523,17 +474,9 @@ export function RuntimeWorkspace({
             projects={projects}
             activeProjectId={activeProjectId}
             onProjectChange={handleProjectChange}
-            activeWorkspace={view}
+            activeView={view}
             attentionCount={attentionCount}
-            onOpenChat={handleOpenChat}
-            onOpenHome={handleOpenHome}
-            onOpenAttention={handleOpenAttention}
-            onOpenLedger={handleOpenLedger}
-            onOpenControlCenter={handleOpenControlCenter}
-            onOpenMissionControl={handleOpenMissionControl}
-            onOpenLogs={handleOpenLogs}
-            onOpenSettings={handleOpenSettings}
-            onOpenCanonical={handleOpenCanonical}
+            onNavigate={navigate}
           />
         </aside>
       </div>
@@ -543,26 +486,13 @@ export function RuntimeWorkspace({
           session={activeSession}
           sidebarCollapsed={sidebarCollapsed}
           missionOpen={missionOpen}
-          missionControls={!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && !isHome && !isAttention}
-          ledgerActive={isLedger}
-          controlCenterActive={isControlCenter}
-          missionControlActive={isMissionControl}
-          logsActive={isLogs}
-          settingsActive={isSettings}
-          homeActive={isHome}
-          attentionActive={isAttention}
+          missionControls={view === "chat" || view === "canonical"}
+          activeView={view}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
           onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileMission={() => setMobileMissionOpen(true)}
-          onOpenChat={handleOpenChat}
-          onOpenHome={handleOpenHome}
-          onOpenAttention={handleOpenAttention}
-          onOpenLedger={handleOpenLedger}
-          onOpenControlCenter={handleOpenControlCenter}
-          onOpenMissionControl={handleOpenMissionControl}
-          onOpenLogs={handleOpenLogs}
-          onOpenSettings={handleOpenSettings}
+          onNavigate={navigate}
           runtimeStatus={snapshot.status}
           syncStatus={sync?.status ?? null}
         />
@@ -586,7 +516,7 @@ export function RuntimeWorkspace({
               <MissionControlSurface
                 key={`${activeProjectId}:${activeSession.id}`}
                 execution={snapshot.executionBySession[activeSession.id]!}
-                onOpenInspector={() => router.push(withProject("/"))}
+                onOpenInspector={() => navigate("chat")}
               />
             ) : (
               <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">No Mission execution is available.</div>
@@ -621,13 +551,7 @@ export function RuntimeWorkspace({
             <HomeSurface
               key={activeProjectId}
               snapshot={snapshot}
-              onOpenChat={handleOpenChat}
-              onOpenAttention={handleOpenAttention}
-              onOpenMissionControl={handleOpenMissionControl}
-              onOpenControlCenter={handleOpenControlCenter}
-              onOpenLedger={handleOpenLedger}
-              onOpenLogs={handleOpenLogs}
-              onOpenSettings={handleOpenSettings}
+              onNavigate={navigate}
             />
           </main>
         ) : isAttention ? (
@@ -636,12 +560,7 @@ export function RuntimeWorkspace({
               key={activeProjectId}
               snapshot={snapshot}
               queue={attentionQueue}
-              onOpenChat={handleOpenChat}
-              onOpenMissionControl={handleOpenMissionControl}
-              onOpenControlCenter={handleOpenControlCenter}
-              onOpenLedger={handleOpenLedger}
-              onOpenLogs={handleOpenLogs}
-              onOpenSettings={handleOpenSettings}
+              onNavigate={navigate}
             />
           </main>
         ) : (
@@ -679,7 +598,7 @@ export function RuntimeWorkspace({
               )}
             >
               <div className={cn("h-full", missionMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
-                {mission && missionOpen && <MissionView mission={mission} observability={observability} mode={missionMode} onModeChange={setMissionMode} onClose={() => setMissionMode("collapsed")} onOpenMissionControl={handleOpenMissionControl} />}
+                {mission && missionOpen && <MissionView mission={mission} observability={observability} mode={missionMode} onModeChange={setMissionMode} onClose={() => setMissionMode("collapsed")} onOpenMissionControl={() => navigate("mission-control")} />}
               </div>
             </aside>
           </main>
@@ -705,7 +624,7 @@ export function RuntimeWorkspace({
                mobileMissionOpen ? "translate-x-0" : "translate-x-full",
              )}
             >
-            {mobileMissionOpen && mission && <MissionView mission={mission} observability={observability} mode="expanded" onClose={() => setMobileMissionOpen(false)} onOpenMissionControl={handleOpenMissionControl} />}
+            {mobileMissionOpen && mission && <MissionView mission={mission} observability={observability} mode="expanded" onClose={() => setMobileMissionOpen(false)} onOpenMissionControl={() => navigate("mission-control")} />}
           </aside>
         </div>
       )}

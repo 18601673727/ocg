@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import type { ChatSession, RuntimeStatus } from "../types";
 import { WORK_TYPE_LABEL } from "../types";
 import { isDegradedSyncStatus, type RuntimeSyncStatus } from "../runtime/reconciler";
+import type { WorkspaceView } from "../layout/view-domain";
 
 type OcgTopbarProps = {
   session: ChatSession;
@@ -26,31 +27,70 @@ type OcgTopbarProps = {
   missionOpen: boolean;
   /** When false, the mission panel toggles are hidden (for example on the ledger view). Defaults to true. */
   missionControls?: boolean;
-  /** Highlights the ledger action while the ledger workspace is the active view. */
-  ledgerActive?: boolean;
-  /** Highlights the Control Center action while it is the active view. */
-  controlCenterActive?: boolean;
-  missionControlActive?: boolean;
-  logsActive?: boolean;
-  settingsActive?: boolean;
-  homeActive?: boolean;
-  attentionActive?: boolean;
   onToggleSidebar: () => void;
   onToggleMission: () => void;
   onOpenMobileSidebar: () => void;
   onOpenMobileMission: () => void;
-  onOpenChat?: () => void;
-  onOpenHome?: () => void;
-  onOpenAttention?: () => void;
-  onOpenLedger?: () => void;
-  onOpenControlCenter?: () => void;
-  onOpenMissionControl?: () => void;
-  onOpenLogs?: () => void;
-  onOpenSettings?: () => void;
+  /**
+   * Opens a workspace, or closes it when it is already the active view. Omitting
+   * it hides the whole shortcut group, which is how a surface renders the topbar
+   * without workspace navigation.
+   */
+  onNavigate?: (view: WorkspaceView) => void;
+  /** Current workspace, used to highlight the matching shortcut. */
+  activeView?: WorkspaceView;
   runtimeStatus: RuntimeStatus;
   /** Canonical reconciler sync status. Only degraded states are surfaced. */
   syncStatus?: RuntimeSyncStatus | null;
 };
+
+/**
+ * Workspace shortcuts, in bar order. The placeholder "more actions" control sat
+ * between Attention and the surfaces, so the group is kept in two pieces.
+ */
+const SHORTCUTS_BEFORE_MENU: WorkspaceShortcut[] = [
+  { view: "home", icon: Home, label: "Home" },
+  { view: "attention", icon: Bell, label: "Attention" },
+];
+
+const SHORTCUTS_AFTER_MENU: WorkspaceShortcut[] = [
+  { view: "ledger", icon: Table2, label: "Resource ledger" },
+  { view: "control-center", icon: SlidersHorizontal, label: "Control Center" },
+  { view: "mission-control", icon: Workflow, label: "Mission Control" },
+  { view: "logs", icon: ScrollText, label: "Logs and diagnostics" },
+  { view: "settings", icon: Settings, label: "Settings" },
+];
+
+type WorkspaceShortcut = {
+  view: WorkspaceView;
+  icon: typeof Home;
+  label: string;
+};
+
+function Shortcut({
+  shortcut,
+  active,
+  onNavigate,
+}: {
+  shortcut: WorkspaceShortcut;
+  active: boolean;
+  onNavigate: (view: WorkspaceView) => void;
+}) {
+  const Icon = shortcut.icon;
+  const action = `${active ? "Close" : "Open"} ${shortcut.label}`;
+  return (
+    <Button
+      variant={active ? "secondary" : "ghost"}
+      size="icon-xs"
+      onClick={() => onNavigate(shortcut.view)}
+      aria-label={action}
+      aria-current={active ? "page" : undefined}
+      title={action}
+    >
+      <Icon className="size-4" />
+    </Button>
+  );
+}
 
 const WORK_TYPE_DOT: Record<ChatSession["workType"], string> = {
   research: "bg-sky-500",
@@ -64,25 +104,12 @@ export function OcgTopbar({
   sidebarCollapsed,
   missionOpen,
   missionControls = true,
-  ledgerActive = false,
-  controlCenterActive = false,
-  missionControlActive = false,
-  logsActive = false,
-  settingsActive = false,
-  homeActive = false,
-  attentionActive = false,
   onToggleSidebar,
   onToggleMission,
   onOpenMobileSidebar,
   onOpenMobileMission,
-  onOpenChat,
-  onOpenHome,
-  onOpenAttention,
-  onOpenLedger,
-  onOpenControlCenter,
-  onOpenMissionControl,
-  onOpenLogs,
-  onOpenSettings,
+  onNavigate,
+  activeView = "chat",
   runtimeStatus,
   syncStatus,
 }: OcgTopbarProps) {
@@ -164,31 +191,15 @@ export function OcgTopbar({
         </div>
       )}
 
-      {onOpenHome && (
-        <Button
-          variant={homeActive ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={onOpenHome}
-          aria-label={homeActive ? "Close Home" : "Open Home"}
-          aria-current={homeActive ? "page" : undefined}
-          title="Open Home"
-        >
-          <Home className="size-4" />
-        </Button>
-      )}
-
-      {onOpenAttention && (
-        <Button
-          variant={attentionActive ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={onOpenAttention}
-          aria-label={attentionActive ? "Close Attention" : "Open Attention"}
-          aria-current={attentionActive ? "page" : undefined}
-          title="Open Attention"
-        >
-          <Bell className="size-4" />
-        </Button>
-      )}
+      {onNavigate &&
+        SHORTCUTS_BEFORE_MENU.map((shortcut) => (
+          <Shortcut
+            key={shortcut.view}
+            shortcut={shortcut}
+            active={activeView === shortcut.view}
+            onNavigate={onNavigate}
+          />
+        ))}
 
       <Button
         variant="ghost"
@@ -199,70 +210,15 @@ export function OcgTopbar({
         <MoreHorizontal className="size-4" />
       </Button>
 
-      {onOpenLedger && (
-        <Button
-          variant={ledgerActive ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={onOpenLedger}
-          aria-label={ledgerActive ? "Open chat workspace" : "Open resource ledger"}
-          aria-current={ledgerActive ? "page" : undefined}
-          title={ledgerActive ? "Open chat workspace" : "Open resource ledger"}
-        >
-          <Table2 className="size-4" />
-        </Button>
-      )}
-
-      {onOpenControlCenter && (
-        <Button
-          variant={controlCenterActive ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={onOpenControlCenter}
-          aria-label={controlCenterActive ? "Close Control Center" : "Open Control Center"}
-          aria-current={controlCenterActive ? "page" : undefined}
-          title={controlCenterActive ? "Close Control Center" : "Open Control Center"}
-        >
-          <SlidersHorizontal className="size-4" />
-        </Button>
-      )}
-
-      {onOpenMissionControl && (
-        <Button
-          variant={missionControlActive ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={onOpenMissionControl}
-          aria-label={missionControlActive ? "Close Mission Control" : "Open Mission Control"}
-          aria-current={missionControlActive ? "page" : undefined}
-          title={missionControlActive ? "Close Mission Control" : "Open Mission Control"}
-        >
-          <Workflow className="size-4" />
-        </Button>
-      )}
-
-      {onOpenLogs && (
-        <Button
-          variant={logsActive ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={onOpenLogs}
-          aria-label={logsActive ? "Close Logs" : "Open Logs and diagnostics"}
-          aria-current={logsActive ? "page" : undefined}
-          title={logsActive ? "Close Logs" : "Open Logs and diagnostics"}
-        >
-          <ScrollText className="size-4" />
-        </Button>
-      )}
-
-      {onOpenSettings && (
-        <Button
-          variant={settingsActive ? "secondary" : "ghost"}
-          size="icon-xs"
-          onClick={onOpenSettings}
-          aria-label={settingsActive ? "Close Settings" : "Open Settings"}
-          aria-current={settingsActive ? "page" : undefined}
-          title={settingsActive ? "Close Settings" : "Open Settings"}
-        >
-          <Settings className="size-4" />
-        </Button>
-      )}
+      {onNavigate &&
+        SHORTCUTS_AFTER_MENU.map((shortcut) => (
+          <Shortcut
+            key={shortcut.view}
+            shortcut={shortcut}
+            active={activeView === shortcut.view}
+            onNavigate={onNavigate}
+          />
+        ))}
 
       {missionControls && (
         <>
