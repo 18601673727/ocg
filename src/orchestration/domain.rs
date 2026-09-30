@@ -667,7 +667,7 @@ impl DomainRepository {
         Ok(snapshot)
     }
 
-    pub fn project_budget(&self, project_id: &str) -> Result<budget::MissionBudgetReceipt> {
+    pub fn project_budget(&self, project_id: &str) -> Result<budget::ProjectBudgetReceipt> {
         Ok(read_budget(&self.connection, project_id)?.receipt())
     }
 
@@ -3406,7 +3406,7 @@ fn emit_verification(
 fn emit_budget_limit(
     transaction: &rusqlite::Transaction<'_>,
     project_id: &str,
-    ledger: &budget::MissionBudget,
+    ledger: &budget::ProjectBudget,
 ) -> Result<u64> {
     journal::append(
         transaction,
@@ -3808,7 +3808,7 @@ fn read_dispatch_intent_by_call(
 // mutation, its durable settlement row and its journal facts are one commit.
 // -------------------------------------------------------------------------
 
-fn read_budget(connection: &Connection, project_id: &str) -> Result<budget::MissionBudget> {
+fn read_budget(connection: &Connection, project_id: &str) -> Result<budget::ProjectBudget> {
     let raw: Option<String> = connection
         .query_row(
             "SELECT budget FROM domain_budgets WHERE project_id=?1",
@@ -3818,7 +3818,7 @@ fn read_budget(connection: &Connection, project_id: &str) -> Result<budget::Miss
         .optional()
         .map_err(sql)?;
     raw.map(|raw| {
-        serde_json::from_str::<budget::MissionBudget>(&raw)
+        serde_json::from_str::<budget::ProjectBudget>(&raw)
             .map_err(|error| invalid(&format!("invalid canonical Project budget: {error}")))
     })
     .transpose()
@@ -3828,7 +3828,7 @@ fn read_budget(connection: &Connection, project_id: &str) -> Result<budget::Miss
 fn store_budget(
     connection: &Connection,
     project_id: &str,
-    ledger: &mut budget::MissionBudget,
+    ledger: &mut budget::ProjectBudget,
 ) -> Result<()> {
     connection.execute(
         "INSERT INTO domain_budgets(project_id,budget,updated_at) VALUES(?1,?2,?3) ON CONFLICT(project_id) DO UPDATE SET budget=excluded.budget,updated_at=excluded.updated_at",
@@ -4717,7 +4717,7 @@ fn all_budgets(connection: &Connection) -> Result<Vec<BudgetLedgerRow>> {
         |row| {
             let project_id: String = row.get(0)?;
             let raw: String = row.get(1)?;
-            let ledger = serde_json::from_str::<budget::MissionBudget>(&raw).map_err(|error| {
+            let ledger = serde_json::from_str::<budget::ProjectBudget>(&raw).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
                     raw.len(),
                     rusqlite::types::Type::Text,
@@ -4731,7 +4731,7 @@ fn all_budgets(connection: &Connection) -> Result<Vec<BudgetLedgerRow>> {
 
 struct BudgetLedgerRow {
     project_id: String,
-    ledger: budget::MissionBudget,
+    ledger: budget::ProjectBudget,
 }
 
 fn all_budget_limits(connection: &Connection) -> Result<Vec<journal::BudgetLimitFact>> {

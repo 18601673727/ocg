@@ -20,7 +20,9 @@
 import type {
   CanonicalAttempt,
   CanonicalCall,
+  CanonicalDispatchIntent,
   CanonicalEffectKind,
+  CanonicalExecutor,
   CanonicalJobState,
 } from "../contracts";
 import type { ProjectId } from "../project/domain";
@@ -84,6 +86,7 @@ const ENTITY_PREFIX = {
   attempt: "attempt",
   call: "call",
   executor: "executor",
+  dispatch_intent: "dispatch-intent",
 } as const;
 
 export type CanonicalEntityKind = keyof typeof ENTITY_PREFIX;
@@ -259,47 +262,159 @@ export function attemptHistoryOf(
 export type ExecutorStatus = "running" | "queued" | "settled" | "unrecognized";
 
 /**
- * An Executor as this projection can see it.
+ * How an Executor's durable state is rendered.
  *
- * The canonical work snapshot names an Executor only through the Calls it ran,
- * so that is all this records: the identity, its Calls, and the aggregate of
- * their states. Executor kind, runtime and frozen contract are not in this
- * projection, so they are not guessed here.
+ * `domain_executors.state` is an unconstrained column, so the words the
+ * substrate actually writes are spelled out here. `created` and `ready` are
+ * awaiting work; `running` is live; `fenced` is the terminal state written when
+ * the owning Attempt is replaced or closed; the remaining words are the
+ * Attempt's own terminal states, written through verbatim. Anything else stays
+ * `unrecognized` with its raw state beside it, rather than being coerced into a
+ * status this projection cannot justify.
+ */
+const EXECUTOR_STATUS: Record<string, ExecutorStatus> = {
+  created: "queued",
+  ready: "queued",
+  running: "running",
+  fenced: "settled",
+  completed: "settled",
+  failed: "unrecognized",
+  cancelled: "unrecognized",
+  unknown: "unrecognized",
+  orphaned: "unrecognized",
+};
+
+export function executorStatus(executor: CanonicalExecutor): ExecutorStatus {
+  return EXECUTOR_STATUS[executor.state] ?? "unrecognized";
+}
+
+/**
+ * An Executor as the backend recorded it.
+ *
+ * The canonical snapshot carries an Executor itself — the Attempt that owns it,
+ * its kind and its durable state — so this projection reads those values rather
+ * than reconstructing an Executor out of the Calls that reference it. The Calls
+ * it ran are still listed, because they are the Calls whose canonical
+ * `executor_id` names this Executor.
  */
 export type ExecutionExecutor = {
+  /** Stable Project-scoped presentation identity. */
   id: string;
+  /** The canonical Executor identity the substrate wrote. */
   executorId: string;
+  attemptId: string;
+  /** The substrate's own kind column, shown verbatim. */
+  kind: string;
   status: ExecutorStatus;
+  /** The raw state column, shown verbatim whenever this view cannot interpret it. */
+  rawState: string;
   callIds: string[];
   runningCallId: string | undefined;
   settledCallCount: number;
 };
 
-function executorStatus(calls: readonly ExecutionCall[]): ExecutorStatus {
-  if (calls.some((call) => call.status === "running")) return "running";
-  if (calls.some((call) => call.status === "unrecognized")) return "unrecognized";
-  if (calls.length > 0 && calls.every((call) => call.status === "completed")) return "settled";
-  return "queued";
-}
-
 export function executorsOf(
   projectId: ProjectId,
+  executors: readonly CanonicalExecutor[],
   calls: readonly ExecutionCall[],
 ): ExecutionExecutor[] {
-  const ids = [
-    ...new Set(calls.map((call) => call.executorId).filter((id): id is string => id !== null)),
-  ];
-  return ids.map((executorId) => {
-    const owned = calls.filter((call) => call.executorId === executorId);
+  return executors.map((executor) => {
+    const owned = calls.filter((call) => call.executorId === executor.id);
     return {
-      id: canonicalEntityId(projectId, "executor", executorId),
-      executorId,
-      status: executorStatus(owned),
+      id: canonicalEntityId(projectId, "executor", executor.id),
+      executorId: executor.id,
+      attemptId: executor.attempt_id,
+      kind: executor.kind,
+      status: executorStatus(executor),
+      rawState: executor.state,
       callIds: owned.map((call) => call.id),
       runningCallId: owned.find((call) => call.status === "running")?.id,
       settledCallCount: owned.filter(isSettled).length,
     };
   });
+}
+
+/* -------------------------------------------------------------------------- */
+/* DispatchIntent                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How a DispatchIntent's durable state is rendered.
+ *
+ * `domain_dispatch_intents.state` admits `pending`, `queued`, `running`,
+ * `completed`, `failed` and `fenced`. `fenced` is the state written when the
+ * owning Attempt is replaced or closed, and `failed` when the effect could not
+ * be carried out; the raw state stays beside the rendering either way.
+ */
+export type DispatchIntentStatus =
+  | "pending"
+  | "running"
+  | "settled"
+  | "failed"
+  | "fenced"
+  | "unrecognized";
+
+const DISPATCH_INTENT_STATUS: Record<string, DispatchIntentStatus> = {
+  pending: "pending",
+  queued: "pending",
+  running: "running",
+  completed: "settled",
+  failed: "failed",
+  fenced: "fenced",
+};
+
+export function dispatchIntentStatus(intent: CanonicalDispatchIntent): DispatchIntentStatus {
+  return DISPATCH_INTENT_STATUS[intent.state] ?? "unrecognized";
+}
+
+/**
+ * A DispatchIntent as the backend recorded it: the durable admission of one
+ * Call's effect, frozen before the provider ran. It is a canonical entity in
+ * its own right, not a derivation from the Call it admits.
+ */
+export type ExecutionDispatchIntent = {
+  /** Stable Project-scoped presentation identity. */
+  id: string;
+  /** The canonical DispatchIntent identity the substrate wrote. */
+  dispatchIntentId: string;
+  callId: string;
+  attemptId: string;
+  executorId: string | null;
+  generation: number;
+  status: DispatchIntentStatus;
+  /** The raw state column, shown verbatim whenever this view cannot interpret it. */
+  rawState: string;
+  effectKind: CanonicalEffectKind;
+  /** The raw effect lifecycle column, shown verbatim. */
+  effectState: string;
+  request: string;
+  budgetAdmitted: boolean;
+  failure: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export function dispatchIntentsOf(
+  projectId: ProjectId,
+  intents: readonly CanonicalDispatchIntent[],
+): ExecutionDispatchIntent[] {
+  return intents.map((intent) => ({
+    id: canonicalEntityId(projectId, "dispatch_intent", intent.id),
+    dispatchIntentId: intent.id,
+    callId: intent.call_id,
+    attemptId: intent.attempt_id,
+    executorId: intent.executor_id,
+    generation: intent.generation,
+    status: dispatchIntentStatus(intent),
+    rawState: intent.state,
+    effectKind: intent.effect_kind,
+    effectState: intent.effect_state,
+    request: intent.request,
+    budgetAdmitted: intent.budget_admitted,
+    failure: intent.failure,
+    createdAt: intent.created_at,
+    updatedAt: intent.updated_at,
+  }));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -437,6 +552,7 @@ export type JobExecution = {
   /** Calls owned by the authoritative Attempt, in canonical creation order. */
   authoritativeCalls: ExecutionCall[];
   executors: ExecutionExecutor[];
+  dispatchIntents: ExecutionDispatchIntent[];
   summary: JobCallSummary;
   /** Progress over the authoritative Attempt's Calls, or `null` when undecidable. */
   progress: JobProgress | null;
@@ -499,7 +615,8 @@ export function callsForGeneration(
  * Assembles the read model from validated canonical entities.
  *
  * `projectCanonicalSnapshot` has already proved the hierarchy (every Attempt
- * belongs to this Job, every Call to one of its Attempts, the authoritative
+ * belongs to this Job, every Executor and Call to one of its Attempts, every
+ * DispatchIntent to this Job and one of its Attempts, and the authoritative
  * Attempt is carried), so this function only projects. It is exported for that
  * one caller and for nothing else.
  */
@@ -516,7 +633,9 @@ export function assembleJobExecution(input: {
     updated_at: number;
   };
   attempts: readonly CanonicalAttempt[];
+  executors: readonly CanonicalExecutor[];
   calls: readonly CanonicalCall[];
+  dispatchIntents: readonly CanonicalDispatchIntent[];
 }): JobExecution {
   const { projectId } = input;
   const generationByAttempt = new Map(input.attempts.map((attempt) => [attempt.id, attempt.generation]));
@@ -538,7 +657,8 @@ export function assembleJobExecution(input: {
     attempts: attemptHistoryOf(projectId, input.attempts, calls),
     calls,
     authoritativeCalls,
-    executors: executorsOf(projectId, calls),
+    executors: executorsOf(projectId, input.executors, calls),
+    dispatchIntents: dispatchIntentsOf(projectId, input.dispatchIntents),
     summary: summarizeCalls(calls),
     progress: progressOf(authoritativeCalls),
     currentCall: authoritativeCalls.find((call) => call.status === "running") ?? null,

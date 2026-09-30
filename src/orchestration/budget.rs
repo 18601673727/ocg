@@ -1,10 +1,10 @@
-//! Mandatory Mission monetary budget and quota admission.
+//! Mandatory Project monetary budget and quota admission.
 //!
 //! This module is the **economic safety boundary** of the control plane. It
 //! answers exactly one question before any provider-costly side effect:
 //!
 //! ```text
-//! given this Mission's durable budget,
+//! given this Project's durable budget,
 //!       this proposed bounded spend,
 //!       the current quota facts,
 //! may OCG intentionally start this provider-costly work?
@@ -12,7 +12,7 @@
 //!
 //! Two properties make it different from the optional Policy layer:
 //!
-//! 1. **It is not bypassable.** A configured hard Mission budget is a cutoff,
+//! 1. **It is not bypassable.** A configured hard Project budget is a cutoff,
 //!    not an alert. The admission is evaluated independently of
 //!    `policy.enabled`, and a generic approval can never authorize exceeding a
 //!    hard cap. The only way past a cap is to explicitly change the hard budget
@@ -52,8 +52,8 @@
 //!
 //! # The Project is the budget scope
 //!
-//! The ledger is keyed by Project. There is no Mission budget: a Mission holds
-//! no money and can neither authorize nor account for a provider Call.
+//! The ledger is keyed by Project. The Project holds the money and is the only
+//! scope that can authorize or account for a provider Call.
 //!
 //! The module owns only the budget model and its pure decision function. It
 //! performs no runtime side effect and no network I/O; the registry read used
@@ -65,12 +65,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
-/// Schema version for a durable Mission budget. It is additive to the Mission
-/// schema, so old records deserialize with a default (unconfigured) budget.
+/// Schema version for a durable Project budget. It is additive to the canonical
+/// Project state, so old records deserialize with a default (unconfigured)
+/// budget.
 pub const BUDGET_SCHEMA_VERSION: u32 = 1;
-/// Upper bound on retained reservations per Mission.
+/// Upper bound on retained reservations per Project.
 pub const MAX_RESERVATIONS: usize = 32;
-/// Upper bound on retained settlement records per Mission. This bounds a
+/// Upper bound on retained settlement records per Project. This bounds a
 /// recent, inspectable view only: the authoritative accumulators are never
 /// derived from this list, and the durable `domain_settlements` table keeps
 /// every settlement ever recorded, so the 65th settlement and every later one
@@ -88,25 +89,25 @@ pub const MICROS_PER_UNIT: i64 = 1_000_000;
 
 /// The action is admissible and, when a hard limit applies, a reservation was
 /// recorded.
-pub const REASON_ALLOWED: &str = "mission_spend_allowed";
+pub const REASON_ALLOWED: &str = "project_spend_allowed";
 /// No hard budget is configured, so there is no economic cutoff.
-pub const REASON_UNCONFIGURED: &str = "mission_budget_unconfigured";
-/// An explicit per-Mission hard limit was set.
-pub const REASON_EXPLICIT_LIMIT: &str = "mission_budget_explicit_limit";
+pub const REASON_UNCONFIGURED: &str = "project_budget_unconfigured";
+/// An explicit Project hard limit was set.
+pub const REASON_EXPLICIT_LIMIT: &str = "project_budget_explicit_limit";
 /// The bounded spend would push committed spend past the hard cap.
-pub const REASON_HARD_LIMIT: &str = "mission_hard_budget_exceeded";
+pub const REASON_HARD_LIMIT: &str = "project_hard_budget_exceeded";
 /// Settled spend already exceeds the hard cap.
-pub const REASON_BREACHED: &str = "mission_budget_breached";
+pub const REASON_BREACHED: &str = "project_budget_breached";
 /// Currencies differ; OCG never performs FX conversion.
-pub const REASON_CURRENCY: &str = "mission_budget_currency_mismatch";
+pub const REASON_CURRENCY: &str = "project_budget_currency_mismatch";
 /// The cost of a required provider-costly action is unknown.
-pub const REASON_COST_UNKNOWN: &str = "mission_cost_unknown";
+pub const REASON_COST_UNKNOWN: &str = "project_cost_unknown";
 /// The quota fact reports no remaining capacity.
-pub const REASON_QUOTA_EXHAUSTED: &str = "mission_quota_exhausted";
+pub const REASON_QUOTA_EXHAUSTED: &str = "project_quota_exhausted";
 /// No authoritative quota fact is known while a quota is required.
-pub const REASON_QUOTA_UNKNOWN: &str = "mission_quota_unknown";
+pub const REASON_QUOTA_UNKNOWN: &str = "project_quota_unknown";
 /// The latest quota fact is stale and is not treated as a current fact.
-pub const REASON_QUOTA_STALE: &str = "mission_quota_stale";
+pub const REASON_QUOTA_STALE: &str = "project_quota_stale";
 
 /// A provider-reported usage record was priced into canonical Money.
 pub const REASON_ACTUAL_REPORTED: &str = "project_actual_usage_priced";
@@ -623,11 +624,11 @@ fn scaled_micros(tokens: u64, micros_per_million: i64) -> Option<i64> {
     i64::try_from(numerator / i128::from(TOKENS_PER_PRICE_UNIT)).ok()
 }
 
-/// Where a Mission's effective hard limit comes from.
+/// Where a Project's effective hard limit comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetOrigin {
-    /// No hard budget was ever configured for this Mission.
+    /// No hard budget was ever configured for this Project.
     #[default]
     LegacyUnconfigured,
     /// The limit was materialized from the effective `budget` configuration.
@@ -646,7 +647,7 @@ impl BudgetOrigin {
     }
 }
 
-/// The economic status of a Mission budget.
+/// The economic status of a Project budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetStatus {
@@ -793,12 +794,12 @@ impl SpendAssessment {
     }
 
     /// A fail-closed assessment for a hard budget that *is* configured but could
-    /// not be applied to this Mission (for example an accounting-currency
+    /// not be applied to this Project (for example an accounting-currency
     /// conflict). It denies rather than falling back to an unconfigured,
     /// uncapped admission, so the absence of an enforceable limit never means
     /// "allow".
     pub fn configured_but_unenforceable(
-        budget: &MissionBudget,
+        budget: &ProjectBudget,
         reason_code: &str,
         reason: impl Into<String>,
     ) -> Self {
@@ -953,8 +954,8 @@ pub struct SettlementEffect {
 impl SettlementEffect {
     /// The effect a discharge *would* have, before it is applied.
     ///
-    /// This mirrors exactly what [`MissionBudget::settle_actual`],
-    /// [`MissionBudget::release`] and [`MissionBudget::mark_unresolved`] book,
+    /// This mirrors exactly what [`ProjectBudget::settle_actual`],
+    /// [`ProjectBudget::release`] and [`ProjectBudget::mark_unresolved`] book,
     /// field for field, but as a pure function of the disposition, the actual
     /// and the reserved amount. It exists so the payload digest of a settlement
     /// can be computed before the discharge is applied — and so a re-delivery of
@@ -1125,13 +1126,13 @@ pub fn conflict_settlement_id(settlement_id: &str, payload_digest: &str) -> Stri
     format!("stlc-{}", digest.get(..16).unwrap_or(&digest))
 }
 
-/// The durable Mission budget. It is the durable accounting substrate that
+/// The durable Project budget. It is the durable accounting substrate that
 /// survives restart, rollover, retries and recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct MissionBudget {
+pub struct ProjectBudget {
     pub schema_version: u32,
-    /// The Mission's accounting currency. Empty until a currency is known.
+    /// The Project's accounting currency. Empty until a currency is known.
     pub currency: String,
     /// The durable hard limit, materialized once from configuration or set
     /// explicitly by an operator. Never silently changed by a later config
@@ -1165,7 +1166,7 @@ pub struct MissionBudget {
     pub updated_at: i64,
 }
 
-impl Default for MissionBudget {
+impl Default for ProjectBudget {
     fn default() -> Self {
         Self {
             schema_version: BUDGET_SCHEMA_VERSION,
@@ -1186,7 +1187,7 @@ impl Default for MissionBudget {
     }
 }
 
-impl MissionBudget {
+impl ProjectBudget {
     /// Total committed spend: settled plus outstanding reservations.
     pub fn committed(&self) -> Money {
         Money::new(
@@ -1266,13 +1267,13 @@ impl MissionBudget {
     pub fn set_hard_limit(&mut self, amount: Money, now: i64) -> Result<bool> {
         if amount.micros <= 0 {
             return Err(OcgError::config(
-                "a hard Mission budget must be a positive amount",
+                "a hard Project budget must be a positive amount",
             ));
         }
         let currency = normalize_currency(&amount.currency)?;
         if !self.currency.is_empty() && self.currency != currency {
             return Err(OcgError::config(format!(
-                "Mission budget is accounted in {}; refusing to reinterpret it as {currency} (no FX conversion)",
+                "Project budget is accounted in {}; refusing to reinterpret it as {currency} (no FX conversion)",
                 self.currency
             )));
         }
@@ -1298,11 +1299,11 @@ impl MissionBudget {
     pub fn reservation_for(
         &self,
         action: SpendAction,
-        mission_id: &str,
+        project_id: &str,
         generation: u32,
         operation_id: &str,
     ) -> Option<&Reservation> {
-        let id = reservation_id(action, mission_id, generation, operation_id);
+        let id = reservation_id(action, project_id, generation, operation_id);
         self.reservations
             .iter()
             .find(|reservation| reservation.reservation_id == id)
@@ -1313,13 +1314,13 @@ impl MissionBudget {
     pub fn reserve(
         &mut self,
         action: SpendAction,
-        mission_id: &str,
+        project_id: &str,
         generation: u32,
         operation_id: &str,
         amount: Money,
         now: i64,
     ) -> bool {
-        let id = reservation_id(action, mission_id, generation, operation_id);
+        let id = reservation_id(action, project_id, generation, operation_id);
         if let Some(index) = self
             .reservations
             .iter()
@@ -1544,8 +1545,8 @@ impl MissionBudget {
     }
 
     /// A bounded, serializable projection for receipts and CLI output.
-    pub fn receipt(&self) -> MissionBudgetReceipt {
-        MissionBudgetReceipt {
+    pub fn receipt(&self) -> ProjectBudgetReceipt {
+        ProjectBudgetReceipt {
             status: self.status.as_str().to_string(),
             origin: self.origin.as_str().to_string(),
             currency: self.currency.clone(),
@@ -1567,10 +1568,10 @@ impl MissionBudget {
     }
 }
 
-/// A bounded projection of a Mission budget for durable receipts.
+/// A bounded projection of a Project budget for durable receipts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct MissionBudgetReceipt {
+pub struct ProjectBudgetReceipt {
     pub status: String,
     pub origin: String,
     pub currency: String,
@@ -1681,12 +1682,12 @@ pub fn quota_facts(root: &Path, identity: &ResourceIdentity, now: i64) -> QuotaF
 /// to the same reservation, so a retry cannot reserve twice.
 pub fn reservation_id(
     action: SpendAction,
-    mission_id: &str,
+    project_id: &str,
     generation: u32,
     operation_id: &str,
 ) -> String {
     let key = format!(
-        "ocg-reservation-v1|{mission_id}|{generation}|{}|{operation_id}",
+        "ocg-reservation-v1|{project_id}|{generation}|{}|{operation_id}",
         action.as_str()
     );
     let digest = crate::runtime::hash::sha256_hex(key.as_bytes());
@@ -1699,7 +1700,7 @@ pub fn reservation_id(
 /// (bounded), and aggregates by a strict precedence so a hard cap and an
 /// exhausted quota are both visible rather than one hiding the other.
 pub fn admit(
-    budget: &MissionBudget,
+    budget: &ProjectBudget,
     require_quota: bool,
     request: &SpendRequest<'_>,
 ) -> SpendAssessment {
@@ -1716,13 +1717,13 @@ pub fn admit(
             if budget.currency.is_empty() {
                 blocks.push(SpendBlock::deny(
                     REASON_CURRENCY,
-                    "the Mission has a hard budget but no accounting currency",
+                    "the Project has a hard budget but no accounting currency",
                 ));
             } else if limit.currency != budget.currency {
                 blocks.push(SpendBlock::deny(
                     REASON_CURRENCY,
                     format!(
-                        "the hard limit currency {} differs from the Mission budget currency {}; no FX conversion is performed",
+                        "the hard limit currency {} differs from the Project budget currency {}; no FX conversion is performed",
                         limit.currency, budget.currency
                     ),
                 ));
@@ -1731,7 +1732,7 @@ pub fn admit(
                     blocks.push(SpendBlock::deny(
                         REASON_BREACHED,
                         format!(
-                            "settled spend {} exceeds the hard Mission budget {}; the overage is recorded and further paid work is denied",
+                            "settled spend {} exceeds the hard Project budget {}; the overage is recorded and further paid work is denied",
                             budget.settled.micros, limit.micros
                         ),
                     ));
@@ -1761,7 +1762,7 @@ pub fn admit(
                                 blocks.push(SpendBlock::deny(
                                     REASON_HARD_LIMIT,
                                     format!(
-                                        "reserving {} would raise committed spend to {} above the hard Mission budget {}",
+                                        "reserving {} would raise committed spend to {} above the hard Project budget {}",
                                         amount.micros, next, limit.micros
                                     ),
                                 ));
@@ -1820,9 +1821,9 @@ pub fn admit(
     let reason = match &primary {
         Some(block) => block.reason.clone(),
         None if budget.hard_limit.is_some() => {
-            "the bounded spend is within the hard Mission budget".to_string()
+            "the bounded spend is within the hard Project budget".to_string()
         }
-        None => "no hard Mission budget is configured".to_string(),
+        None => "no hard Project budget is configured".to_string(),
     };
 
     // `already` means no new reservation is recorded, so there is no new amount
@@ -1867,8 +1868,8 @@ fn reset_suffix(reset_at: Option<i64>) -> String {
 #[serde(rename_all = "camelCase", default)]
 pub struct BudgetConfig {
     pub currency: Option<String>,
-    /// A default hard Mission budget in micro-units, materialized once into each
-    /// Mission that does not already have an explicit budget.
+    /// A default hard Project budget in micro-units, materialized once into each
+    /// Project that does not already have an explicit budget.
     pub hard_limit_micros: Option<i64>,
     /// The bounded pre-authorization estimate for a provider-costly operation.
     /// Without it, a hard-budgeted provider-costly action is deferred rather

@@ -364,7 +364,9 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       cursor: 0,
       job: { id: jobId, state: "pending", generation: 0, authoritative_attempt_id: null, created_at: 1_750_000_000, updated_at: 1_750_000_000 },
       attempts: [],
+      executors: [],
       calls: [],
+      dispatchIntents: [],
     });
     const accounting = { ceiling: { amount: command.hardBudgetMicros / 1_000_000, unit: "USD", source: "job-configuration" as const }, consumption: null };
     const observability = createLaunchedObservability(legacyCommand, missionId);

@@ -98,21 +98,28 @@ export function CanonicalControlSurface({
 
   const refresh = useCallback(
     async (project: CanonicalProjectRecord, job: string) => {
-      const snapshot = await client.readJobSnapshot(project.project_id, job);
-      if (isCanonicalRejection(snapshot)) {
-        setError(snapshot.message);
-        return;
-      }
-      const generation = store.getCanonical().generation + 1;
-      const next = store.applyCanonicalSnapshot({
-        payload: snapshot,
-        projectId: scopeIdFor(project),
-        generation,
-      });
-      setState(next);
-      const events = await client.readJobEvents(project.project_id, job, next.cursor);
-      if (!isCanonicalRejection(events)) {
-        setState(store.applyCanonicalEvents(events, { projectId: scopeIdFor(project), generation }));
+      const projectId = scopeIdFor(project);
+      // The store projects whole authoritative snapshots and never advances its
+      // cursor from a raw event, so a canonical event tail means the installed
+      // snapshot is behind: refetch it until the tail is empty. Each round
+      // advances the cursor together with the projection it belongs to.
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const snapshot = await client.readJobSnapshot(project.project_id, job);
+        if (isCanonicalRejection(snapshot)) {
+          setError(snapshot.message);
+          return;
+        }
+        const generation = store.getCanonical().generation + 1;
+        const next = store.applyCanonicalSnapshot({ payload: snapshot, projectId, generation });
+        setState(next);
+        // A rejected or stale snapshot leaves the projection and its cursor
+        // untouched, so there is no coherent new tail to read.
+        if (next.projection === null || next.cursor !== snapshot.cursor) return;
+        const events = await client.readJobEvents(project.project_id, job, next.cursor);
+        if (isCanonicalRejection(events)) return;
+        const applied = store.applyCanonicalEvents(events, { projectId, generation });
+        setState(applied);
+        if (!applied.resyncRequired) return;
       }
     },
     [client, store],

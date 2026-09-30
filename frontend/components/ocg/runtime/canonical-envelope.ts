@@ -39,7 +39,9 @@ export type CanonicalExecutionProjection = {
   cursor: number;
   job: CanonicalExecutionState["job"];
   attempts: CanonicalExecutionState["attempts"];
+  executors: CanonicalExecutionState["executors"];
   calls: CanonicalExecutionState["calls"];
+  dispatchIntents: CanonicalExecutionState["dispatchIntents"];
   /** The backend's note on its graph projection; the PWA draws no graph itself. */
   executionGraph: string;
 };
@@ -60,9 +62,11 @@ function fail(code: CanonicalProjectionIssue["code"], message: string): Canonica
 /**
  * Validate one backend snapshot against the durable canonical contract.
  *
- * A wrong API version, a foreign Project identity, a cursor behind its
- * own event stream, or a Job/Attempt/Call that does not match the
- * contract is rejected here; nothing is partially rendered.
+ * A wrong API version, a foreign Project identity, a malformed cursor, or a
+ * Job/Attempt/Executor/Call/DispatchIntent that does not match the contract is
+ * rejected here; nothing is partially rendered. The cursor is a position in
+ * the backend's execution journal, not a count of entities, so it is checked
+ * for well-formedness only and never against the number of Attempts.
  */
 export function projectCanonicalSnapshot(
   input: unknown,
@@ -97,18 +101,27 @@ export function projectCanonicalSnapshot(
       return fail("malformed", `Attempt ${item.id} does not belong to Job ${state.job.id}.`);
     }
   }
+  for (const item of state.executors) {
+    if (!attemptIds.has(item.attempt_id)) {
+      return fail("malformed", `Executor ${item.id} names an Attempt the snapshot does not carry.`);
+    }
+  }
   for (const item of state.calls) {
     if (!attemptIds.has(item.attempt_id)) {
       return fail("malformed", `Call ${item.id} names an Attempt the snapshot does not carry.`);
     }
   }
+  for (const item of state.dispatchIntents) {
+    if (item.job_id !== state.job.id) {
+      return fail("malformed", `DispatchIntent ${item.id} does not belong to Job ${state.job.id}.`);
+    }
+    if (!attemptIds.has(item.attempt_id)) {
+      return fail("malformed", `DispatchIntent ${item.id} names an Attempt the snapshot does not carry.`);
+    }
+  }
   const authoritative = state.job.authoritative_attempt_id;
   if (authoritative !== null && !attemptIds.has(authoritative)) {
     return fail("malformed", `Job ${state.job.id} names an authoritative Attempt it does not carry.`);
-  }
-
-  if (input.cursor < state.attempts.length) {
-    return fail("cursor", "Canonical cursor is behind its own event stream.");
   }
 
   return {
@@ -120,7 +133,9 @@ export function projectCanonicalSnapshot(
       cursor: input.cursor,
       job: state.job,
       attempts: state.attempts,
+      executors: state.executors,
       calls: state.calls,
+      dispatchIntents: state.dispatchIntents,
       executionGraph: state.executionGraph,
     },
   };
@@ -143,7 +158,9 @@ export function assembleJobExecutionFromProjection(
     cursor: projection.cursor,
     job: projection.job,
     attempts: projection.attempts,
+    executors: projection.executors,
     calls: projection.calls,
+    dispatchIntents: projection.dispatchIntents,
   });
 }
 

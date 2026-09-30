@@ -20,7 +20,7 @@ import {
 import type { ProjectId } from "../project/domain";
 import type { CanonicalJobEvent } from "../contracts";
 import type { JobExecution } from "../execution/domain";
-import { boundDiagnostics, compareGeneration, compareSequence, isSeen, rememberId } from "./event-gate";
+import { boundDiagnostics, compareFilteredSequence, compareGeneration, isSeen } from "./event-gate";
 
 export {
   CANONICAL_API_VERSION,
@@ -106,6 +106,17 @@ export function applyCanonicalCommandAck(state: CanonicalState, ack: CanonicalCo
   return { ...state, commandAcks: { ...state.commandAcks, [ack.commandId]: ack } };
 }
 
+/**
+ * Apply the canonical event tail for one Job.
+ *
+ * The canonical store cannot reduce an event into its projection: the event
+ * carries only an opaque `kind`/`payload` pair, and the projection is built
+ * exclusively from a whole authoritative snapshot. So a newer event is never
+ * applied here — it sets `resyncRequired` and leaves the cursor where the
+ * projection left it. The caller refetches the snapshot, which advances cursor
+ * and projection together. This is also why a Job-filtered sequence that skips
+ * numbers belonging to other Jobs is not treated as a gap.
+ */
 export function applyCanonicalEvents(
   state: CanonicalState,
   events: readonly CanonicalBackendEvent[],
@@ -132,17 +143,22 @@ export function applyCanonicalEvents(
       next = withDiagnostics(next, [diagnostic("duplicate-event", `Ignored duplicate canonical event ${event.event_id}.`, "info", { eventId: event.event_id, sequence: event.sequence })]);
       continue;
     }
-    const sequence = compareSequence(event.sequence, next.cursor);
-    if (sequence === "stale") {
+    if (compareFilteredSequence(event.sequence, next.cursor) === "stale") {
       next = withDiagnostics(next, [diagnostic("sequence-stale", `Ignored stale canonical sequence ${event.sequence}.`, "warning", { eventId: event.event_id, sequence: event.sequence })]);
       continue;
     }
-    if (sequence === "gap") {
-      next = withDiagnostics(next, [diagnostic("sequence-gap", `Canonical sequence gap: expected ${next.cursor + 1}, received ${event.sequence}.`, "error", { eventId: event.event_id, sequence: event.sequence })]);
-      next = { ...next, resyncRequired: true, status: "reconnecting" };
-      break;
-    }
-    next = { ...next, cursor: event.sequence, seenEventIds: rememberId(next.seenEventIds, event.event_id) };
+    // The event is real, belongs to this Job, and is newer than the projection
+    // the store holds. This store projects whole authoritative snapshots: the
+    // canonical event carries only an opaque `kind`/`payload` pair, so the
+    // projection cannot be advanced from it. Advancing the cursor alone would
+    // leave the cursor ahead of a stale projection, so the event is refused and
+    // an authoritative snapshot refresh is demanded instead. The snapshot
+    // advances the cursor together with the projection it belongs to. The
+    // stream is Job-filtered, so a sequence beyond `cursor + 1` is a skipped
+    // foreign Job, not a gap.
+    next = withDiagnostics(next, [diagnostic("resync-required", `Canonical event ${event.event_id} at sequence ${event.sequence} is newer than snapshot cursor ${next.cursor}; refetch the canonical snapshot.`, "warning", { eventId: event.event_id, sequence: event.sequence })]);
+    next = { ...next, resyncRequired: true, status: "reconnecting" };
+    break;
   }
   return { ...next, status: next.resyncRequired ? "reconnecting" : "live" };
 }

@@ -1,11 +1,19 @@
 /**
  * The ordering rules both projection stores share.
  *
- * The event reconciler and the canonical store apply the same contract: a
- * generation never moves backwards, an unknown generation needs a snapshot, a
- * duplicate event identity is a no-op, a sequence at or below the cursor is
- * stale, and a sequence beyond `cursor + 1` is a gap that forces a resync.
- * Keeping the decision here is what stops the two stores drifting apart; each
+ * The two stores see two different streams, so they classify a sequence
+ * differently:
+ *
+ * - the event reconciler consumes an unfiltered stream, where a sequence beyond
+ *   `cursor + 1` really is a gap that forces a resync;
+ * - the canonical store consumes a stream already filtered to one Job, where
+ *   the global journal sequence numbers skip everything belonging to other
+ *   Jobs. A jump beyond `cursor + 1` is then the normal shape of the stream,
+ *   not a gap, so [`compareFilteredSequence`] distinguishes only stale from
+ *   next.
+ *
+ * Generation ordering and duplicate detection are identical for both, and
+ * keeping every decision here is what stops the two stores drifting apart; each
  * store still decides what a decision *means* for its own state.
  */
 
@@ -45,4 +53,19 @@ export function compareSequence(sequence: number, cursor: number): SequenceDecis
   if (sequence <= cursor) return "stale";
   if (sequence > cursor + 1) return "gap";
   return "next";
+}
+
+export type FilteredSequenceDecision = "stale" | "next";
+
+/**
+ * Classify one sequence from a stream filtered to a single entity.
+ *
+ * A Job-filtered tail carries only the events of one Job, so the global journal
+ * sequence numbers it returns skip whatever belongs to other Jobs. A jump
+ * beyond `cursor + 1` is therefore the normal shape of the stream, not a gap:
+ * anything at or below the cursor is a late event, and anything above it is
+ * simply the next retained event for this Job.
+ */
+export function compareFilteredSequence(sequence: number, cursor: number): FilteredSequenceDecision {
+  return sequence <= cursor ? "stale" : "next";
 }

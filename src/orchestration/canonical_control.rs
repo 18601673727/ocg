@@ -6,7 +6,7 @@
 //! canonical Mission snapshot needed to reconcile a reconnect.
 
 use crate::error::{OcgError, Result};
-use crate::orchestration::domain::{Attempt, Call, DomainRepository};
+use crate::orchestration::domain::{Attempt, Call, DispatchIntent, DomainRepository, Executor};
 use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
 use crate::project::{self, ProjectBoundary};
 use serde::{Deserialize, Serialize};
@@ -502,10 +502,27 @@ impl CanonicalControlService {
             .filter(|call| attempts.iter().any(|attempt| attempt.id == call.attempt_id))
             .cloned()
             .collect();
+        // Executors and DispatchIntents are backend-owned canonical entities,
+        // not a frontend re-derivation from Calls. An Executor belongs to one
+        // Attempt; a DispatchIntent belongs to one Job.
+        let executors: Vec<Executor> = projection
+            .executors
+            .values()
+            .filter(|executor| attempts.iter().any(|attempt| attempt.id == executor.attempt_id))
+            .cloned()
+            .collect();
+        let dispatch_intents: Vec<DispatchIntent> = projection
+            .dispatch_intents
+            .values()
+            .filter(|intent| intent.job_id == job.id)
+            .cloned()
+            .collect();
         let value = json!({
             "job":job,
             "attempts":attempts,
+            "executors":executors,
             "calls":calls,
+            "dispatch_intents":dispatch_intents,
             "execution_graph":"canonical state projection"
         });
         Ok(CanonicalJobSnapshot {

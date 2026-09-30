@@ -169,11 +169,51 @@ export type CanonicalCall = {
   finished_at: number | null;
 };
 
+/**
+ * One Executor the backend recorded for an Attempt.
+ *
+ * `kind` and `state` are unconstrained columns in the substrate, so they are
+ * decoded as the strings the backend stored rather than being forced into a
+ * closed vocabulary the frontend would have to guess.
+ */
+export type CanonicalExecutor = {
+  id: string;
+  attempt_id: string;
+  kind: string;
+  state: string;
+  created_at: number;
+};
+
+/**
+ * The effect lifecycle a DispatchIntent records.
+ *
+ * `state` and `effect_state` are the substrate's own columns; `effect_kind` is
+ * the frozen effect class the Call schema admitted.
+ */
+export type CanonicalDispatchIntent = {
+  id: string;
+  call_id: string;
+  job_id: string;
+  attempt_id: string;
+  executor_id: string | null;
+  generation: number;
+  state: string;
+  effect_kind: CanonicalEffectKind;
+  effect_state: string;
+  request: string;
+  budget_admitted: boolean;
+  failure: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
 /** The `job` payload of a `CanonicalJobSnapshot`. */
 export type CanonicalExecutionState = {
   job: CanonicalJob;
   attempts: CanonicalAttempt[];
+  executors: CanonicalExecutor[];
   calls: CanonicalCall[];
+  dispatchIntents: CanonicalDispatchIntent[];
   /** The backend's own note on its graph projection, kept verbatim. */
   executionGraph: string;
 };
@@ -281,6 +321,77 @@ const call: Decoder<CanonicalCall> = (input, path) => {
   });
 };
 
+const executor: Decoder<CanonicalExecutor> = (input, path) => {
+  const rec = record(input, path, "a canonical Executor");
+  if (!rec.ok) return rec;
+  const id = req(rec.value, "id", identity, path);
+  if (!id.ok) return id;
+  const attemptId = req(rec.value, "attempt_id", identity, path);
+  if (!attemptId.ok) return attemptId;
+  const kind = req(rec.value, "kind", string, path);
+  if (!kind.ok) return kind;
+  const state = req(rec.value, "state", string, path);
+  if (!state.ok) return state;
+  const createdAt = req(rec.value, "created_at", number, path);
+  if (!createdAt.ok) return createdAt;
+  return yes({
+    id: id.value,
+    attempt_id: attemptId.value,
+    kind: kind.value,
+    state: state.value,
+    created_at: createdAt.value,
+  });
+};
+
+const dispatchIntent: Decoder<CanonicalDispatchIntent> = (input, path) => {
+  const rec = record(input, path, "a canonical DispatchIntent");
+  if (!rec.ok) return rec;
+  const id = req(rec.value, "id", identity, path);
+  if (!id.ok) return id;
+  const callId = req(rec.value, "call_id", identity, path);
+  if (!callId.ok) return callId;
+  const jobId = req(rec.value, "job_id", identity, path);
+  if (!jobId.ok) return jobId;
+  const attemptId = req(rec.value, "attempt_id", identity, path);
+  if (!attemptId.ok) return attemptId;
+  const executorId = req(rec.value, "executor_id", nullable(identity), path);
+  if (!executorId.ok) return executorId;
+  const generation = req(rec.value, "generation", atLeast(1), path);
+  if (!generation.ok) return generation;
+  const state = req(rec.value, "state", string, path);
+  if (!state.ok) return state;
+  const kind = req(rec.value, "effect_kind", effectKind, path);
+  if (!kind.ok) return kind;
+  const effectState = req(rec.value, "effect_state", string, path);
+  if (!effectState.ok) return effectState;
+  const request = req(rec.value, "request", string, path);
+  if (!request.ok) return request;
+  const budgetAdmitted = req(rec.value, "budget_admitted", boolean, path);
+  if (!budgetAdmitted.ok) return budgetAdmitted;
+  const failure = req(rec.value, "failure", nullable(string), path);
+  if (!failure.ok) return failure;
+  const createdAt = req(rec.value, "created_at", number, path);
+  if (!createdAt.ok) return createdAt;
+  const updatedAt = req(rec.value, "updated_at", number, path);
+  if (!updatedAt.ok) return updatedAt;
+  return yes({
+    id: id.value,
+    call_id: callId.value,
+    job_id: jobId.value,
+    attempt_id: attemptId.value,
+    executor_id: executorId.value,
+    generation: generation.value,
+    state: state.value,
+    effect_kind: kind.value,
+    effect_state: effectState.value,
+    request: request.value,
+    budget_admitted: budgetAdmitted.value,
+    failure: failure.value,
+    created_at: createdAt.value,
+    updated_at: updatedAt.value,
+  });
+};
+
 const executionState: Decoder<CanonicalExecutionState> = (input, path) => {
   const rec = record(input, path, "a canonical execution state");
   if (!rec.ok) return rec;
@@ -288,14 +399,20 @@ const executionState: Decoder<CanonicalExecutionState> = (input, path) => {
   if (!decodedJob.ok) return decodedJob;
   const attempts = req(rec.value, "attempts", array(attempt), path);
   if (!attempts.ok) return attempts;
+  const executors = req(rec.value, "executors", array(executor), path);
+  if (!executors.ok) return executors;
   const calls = req(rec.value, "calls", array(call), path);
   if (!calls.ok) return calls;
+  const dispatchIntents = req(rec.value, "dispatch_intents", array(dispatchIntent), path);
+  if (!dispatchIntents.ok) return dispatchIntents;
   const graph = req(rec.value, "execution_graph", string, path);
   if (!graph.ok) return graph;
   return yes({
     job: decodedJob.value,
     attempts: attempts.value,
+    executors: executors.value,
     calls: calls.value,
+    dispatchIntents: dispatchIntents.value,
     executionGraph: graph.value,
   });
 };
