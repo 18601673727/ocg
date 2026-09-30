@@ -198,7 +198,7 @@ pub enum Command {
     Reject(Vec<OsString>),
     /// Run the loopback-only HTTP/SSE control server.
     Serve(Vec<OsString>),
-    /// Canonical WorkNode/Run control: admit, configure, dispatch, deliver and
+    /// Canonical Job/Attempt control: admit, configure, dispatch, deliver and
     /// inspect a canonical Mission. Every mutating operation is witness-bound.
     Work(Vec<OsString>),
     /// Run the project-scoped STDIO MCP adapter.
@@ -1660,7 +1660,7 @@ fn serve_command(
     Ok(0)
 }
 
-/// `ocg work <subcommand>`: the canonical WorkNode/Run control surface.
+/// `ocg work <subcommand>`: the canonical Job/Attempt control surface.
 ///
 /// This is the same authority the bridge uses. Every mutating operation is
 /// witness-bound: `dispatch` prints the durable dispatch witness, `deliver`
@@ -4691,7 +4691,7 @@ fn bridge_payload(
         crate::orchestration::bridge::BridgeContext::new(&controller, &runner, telemetry_config)
             .with_reports(reports)
             // The worker routing table OCG writes into the generated agent
-            // config. A canonical child Run freezes the model its agent will
+            // config. A canonical child Attempt freezes the model its agent will
             // actually use, so the recorded contract is not an approximation.
             .with_routing(crate::orchestration::bridge::WorkerRouting::from_config(
                 &effective.data,

@@ -87,7 +87,7 @@ pub struct BridgeContext<'a> {
     /// authority gate to enforce Lead before task admission.
     pub lead_contract: Option<LeadSelection>,
     /// The worker routing table OCG wrote into the generated agent config:
-    /// `role -> provider/model`. A canonical child Run's frozen contract must
+    /// `role -> provider/model`. A canonical child Attempt's frozen contract must
     /// record the model that agent will actually use, not the Lead's.
     pub routing: Option<WorkerRouting>,
 }
@@ -182,7 +182,7 @@ impl<'a> BridgeContext<'a> {
         self
     }
 
-    /// Attach the resolved worker routing table so a canonical child Run can
+    /// Attach the resolved worker routing table so a canonical child Attempt can
     /// freeze the model its agent will actually use.
     pub fn with_routing(mut self, routing: WorkerRouting) -> Self {
         self.routing = Some(routing);
@@ -1016,9 +1016,9 @@ impl<'a> BridgeContext<'a> {
         };
         let task = task_text(&args);
         // Production cutover: a delegated execution that belongs to a live
-        // canonical Mission is dispatched as a real child WorkNode + Run and
+        // canonical Mission is dispatched as a real child Job + Attempt and
         // returns its durable witness. The legacy hand-off capsule is still
-        // projected for the model, but it never decides which Run a result
+        // projected for the model, but it never decides which Attempt a result
         // belongs to.
         if let Some(canonical) = self.canonical_dispatch(&session_id, role, &task, &args) {
             return canonical;
@@ -1048,7 +1048,7 @@ impl<'a> BridgeContext<'a> {
             };
         };
         // The witness travels with the exact subagent invocation. When it is
-        // present the canonical Run owns the result: the legacy
+        // present the canonical Attempt owns the result: the legacy
         // session/phase correlation path is not consulted at all.
         if let Some(witness) = witness_from(&args) {
             return self.canonical_result(&session_id, role, witness, payload);
@@ -1061,7 +1061,7 @@ impl<'a> BridgeContext<'a> {
     }
 
     /// The canonical Attempt this caller session is bound to. SQLite owns the
-    /// lookup; no Mission, WorkNode or ready-order projection participates.
+    /// lookup; no Mission, Job or ready-order projection participates.
     fn canonical_authority(&self, session_id: &str) -> Option<CanonicalAuthority> {
         if session_id.is_empty() {
             return None;
@@ -1150,10 +1150,10 @@ impl<'a> BridgeContext<'a> {
         let witness = canonical_witness(&authority.authority, &child, Some(&call.id));
         let handoff = self.controller.prepare_handoff(session_id, role, task).ok();
         // The OCG-owned envelope travels with the delegated prompt. It is how
-        // a worker session recovers *its own* durable Run identity on its first
+        // a worker session recovers *its own* durable Attempt identity on its first
         // prompt admission, so it can create children for its own subtree. It
         // is a structured, delimited block rather than prose the model is
-        // asked to reason about, and the bridge always re-validates the Run it
+        // asked to reason about, and the bridge always re-validates the Attempt it
         // names before anything changes.
         let envelope = format!(
             "{WITNESS_START}\n{}\n{WITNESS_END}",
@@ -1199,9 +1199,9 @@ impl<'a> BridgeContext<'a> {
         })
     }
 
-    /// Canonical result handling: the witness decides which Run changes state.
+    /// Canonical result handling: the witness decides which Attempt changes state.
     /// A late or duplicate delivery is retained as evidence and reported
-    /// honestly; it never mutates the WorkNode.
+    /// honestly; it never mutates the Job.
     fn canonical_result(
         &self,
         session_id: &str,
@@ -1282,7 +1282,7 @@ impl<'a> BridgeContext<'a> {
         }
     }
 
-    /// Run the configured trusted verification stage for one canonical Run.
+    /// Run the configured trusted verification stage for one canonical Attempt.
     /// Returns `(passed, report)`. The report is the durable evidence record;
     /// model output is never used as evidence.
     fn canonical_verification(&self, role: Role) -> Option<VerificationOutcome> {
@@ -1554,8 +1554,8 @@ struct CanonicalAuthority {
 ///
 /// The envelope is a structured, OCG-owned block appended to a delegated
 /// prompt. It is the only channel by which a worker session recovers the
-/// durable identity of the Run that created it. It is never parsed for
-/// authority: the bridge re-validates the Run the witness names.
+/// durable identity of the Attempt that created it. It is never parsed for
+/// authority: the bridge re-validates the Attempt the witness names.
 pub const WITNESS_START: &str = "<<<OCG:ATTEMPT_WITNESS v1>>>";
 pub const WITNESS_END: &str = "<<<OCG:ATTEMPT_WITNESS:END>>>";
 

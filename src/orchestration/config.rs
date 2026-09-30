@@ -57,7 +57,7 @@ pub const ENV_ENABLED: &str = "OCG_ORCHESTRATION";
 pub struct OrchestrationConfig {
     /// Allow orchestration. When false no plugin is emitted and no state is kept.
     pub enabled: bool,
-    /// Route admitted/delegated execution through the canonical WorkNode/Run
+    /// Route admitted/delegated execution through the canonical Job/Attempt
     /// substrate. This remains explicit opt-in until admission, result delivery,
     /// recovery and terminal transitions share one authority. The default
     /// legacy lane must not silently create a second competing decision source.

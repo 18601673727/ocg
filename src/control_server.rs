@@ -22,7 +22,7 @@
 
 use crate::contracts::{
     ApiErrorBody, ApiErrorEnvelope, CanonicalConfigurationEnvelope, CanonicalEventsEnvelope,
-    CanonicalMissionConfigEnvelope, CanonicalProjectsResponse, ProfileView,
+    CanonicalJobConfigEnvelope, CanonicalProjectsResponse, ProfileView,
 };
 use crate::error::{OcgError, Result};
 use crate::orchestration::budget::{normalize_currency, Money};
@@ -753,34 +753,34 @@ fn handle_canonical(
                     .ok_or_else(|| OcgError::config("defaults are required"))?;
                 answer!(service.set_project_defaults(&id, project, defaults, now)?)
             }
-            Route::CanonicalMissionConfigGet { mission } => {
-                let stored = service.mission_configuration(mission)?;
+            Route::CanonicalJobConfigGet { job } => {
+                let stored = service.job_configuration(job)?;
                 let (configuration, revision) = stored.unwrap_or((Value::Null, 0));
-                answer!(CanonicalMissionConfigEnvelope {
+                answer!(CanonicalJobConfigEnvelope {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    mission_id: mission.to_string(),
+                    job_id: job.to_string(),
                     configuration,
                     revision,
                 })
             }
-            Route::CanonicalMissionConfigPut { mission } => {
+            Route::CanonicalJobConfigPut { job } => {
                 let body = body()?;
                 let id = command_id(&body)?;
                 let config = body
                     .get("configuration")
                     .cloned()
                     .ok_or_else(|| OcgError::config("configuration is required"))?;
-                answer!(service.set_mission_configuration(&id, mission, config, now)?)
+                answer!(service.set_job_configuration(&id, job, config, now)?)
             }
             Route::CanonicalSnapshot => {
                 let project = query("project_id")?;
-                let mission = query("mission_id")?;
-                answer!(service.canonical_snapshot(&project, &mission)?)
+                let job = query("job_id")?;
+                answer!(service.canonical_snapshot(&project, &job)?)
             }
             Route::CanonicalDashboard => {
                 let project = query("project_id")?;
-                let mission = request.query.get("mission_id").map(String::as_str);
-                answer!(service.dashboard(&project, mission)?)
+                let job = request.query.get("job_id").map(String::as_str);
+                answer!(service.dashboard(&project, job)?)
             }
             _ => unreachable!("not a canonical route"),
         }
@@ -793,8 +793,8 @@ fn handle_canonical(
             | Route::CanonicalConfigurationGet
             | Route::CanonicalConfigurationPut
             | Route::CanonicalConfigurationProjectPut { .. }
-            | Route::CanonicalMissionConfigGet { .. }
-            | Route::CanonicalMissionConfigPut { .. }
+            | Route::CanonicalJobConfigGet { .. }
+            | Route::CanonicalJobConfigPut { .. }
             | Route::CanonicalSnapshot
             | Route::CanonicalEvents
             | Route::CanonicalDashboard
@@ -806,30 +806,26 @@ fn handle_canonical(
     // gets its own status and code so the client can distinguish "refetch the
     // snapshot" from "your request was malformed" and from "nothing is new".
     if let Route::CanonicalEvents = route {
-        let (project, mission, after) = match (
+        let (project, job, after) = match (
             request.query.get("project_id").cloned(),
-            request.query.get("mission_id").cloned(),
+            request.query.get("job_id").cloned(),
             request
                 .query
                 .get("after")
                 .and_then(|raw| raw.parse::<u64>().ok())
                 .unwrap_or(0),
         ) {
-            (Some(project), Some(mission), after) if !project.is_empty() && !mission.is_empty() => {
-                (project, mission, after)
+            (Some(project), Some(job), after) if !project.is_empty() && !job.is_empty() => {
+                (project, job, after)
             }
             _ => {
                 return Some(write_api_error(
                     stream,
-                    &ApiError::new(
-                        400,
-                        "invalid_request",
-                        "project_id and mission_id are required",
-                    ),
+                    &ApiError::new(400, "invalid_request", "project_id and job_id are required"),
                 ))
             }
         };
-        let outcome = match service.canonical_event_tail(&project, &mission, after) {
+        let outcome = match service.canonical_event_tail(&project, &job, after) {
             Ok(outcome) => outcome,
             Err(error) => {
                 return Some(write_api_error(
@@ -842,7 +838,7 @@ fn handle_canonical(
             CanonicalEventTail::Events(events) => CanonicalEventsEnvelope {
                 api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                 project_id: project,
-                mission_id: mission,
+                job_id: job,
                 events,
             },
             CanonicalEventTail::ResyncRequired {
@@ -1428,16 +1424,16 @@ enum Route {
     Resources,
     BudgetGet { mission: String },
     BudgetPut { mission: String },
-    // Canonical WorkNode/Run control surface (project import, configuration,
-    // pre-run Mission configuration, snapshots and the event tail).
+    // Canonical Job/Attempt control surface (project import, configuration,
+    // pre-attempt Job configuration, snapshots and the event tail).
     CanonicalProjects,
     CanonicalProjectImport,
     CanonicalProjectsGet { project: String },
     CanonicalConfigurationGet,
     CanonicalConfigurationPut,
     CanonicalConfigurationProjectPut { project: String },
-    CanonicalMissionConfigGet { mission: String },
-    CanonicalMissionConfigPut { mission: String },
+    CanonicalJobConfigGet { job: String },
+    CanonicalJobConfigPut { job: String },
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
@@ -1481,14 +1477,14 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 )
                 | (
                     "GET",
-                    ["api", "v1", "canonical", "missions", _, "configuration"]
+                    ["api", "v1", "canonical", "jobs", _, "configuration"]
                 )
                 | (
                     "PUT",
-                    ["api", "v1", "canonical", "missions", _, "configuration"]
+                    ["api", "v1", "canonical", "jobs", _, "configuration"]
                 )
-                | ("GET", ["api", "v1", "canonical", "work"])
-                | ("GET", ["api", "v1", "canonical", "work", "events"])
+                | ("GET", ["api", "v1", "canonical", "jobs"])
+                | ("GET", ["api", "v1", "canonical", "jobs", "events"])
                 | ("GET", ["api", "v1", "canonical", "dashboard"])
                 // A browser preflight is answered by the canonical CORS
                 // handler, which is the only place that echoes an origin.
@@ -1497,9 +1493,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "projects", _])
                 | ("OPTIONS", ["api", "v1", "canonical", "configuration"])
                 | ("OPTIONS", ["api", "v1", "canonical", "configuration", "projects", _])
-                | ("OPTIONS", ["api", "v1", "canonical", "missions", _, "configuration"])
-                | ("OPTIONS", ["api", "v1", "canonical", "work"])
-                | ("OPTIONS", ["api", "v1", "canonical", "work", "events"])
+                | ("OPTIONS", ["api", "v1", "canonical", "jobs", _, "configuration"])
+                | ("OPTIONS", ["api", "v1", "canonical", "jobs"])
+                | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
         );
         if !is_route {
@@ -1532,18 +1528,14 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 project: safe_id(project)?,
             })
         }
-        ("GET", ["api", "v1", "canonical", "missions", mission, "configuration"]) => {
-            Ok(Route::CanonicalMissionConfigGet {
-                mission: safe_id(mission)?,
-            })
+        ("GET", ["api", "v1", "canonical", "jobs", job, "configuration"]) => {
+            Ok(Route::CanonicalJobConfigGet { job: safe_id(job)? })
         }
-        ("PUT", ["api", "v1", "canonical", "missions", mission, "configuration"]) => {
-            Ok(Route::CanonicalMissionConfigPut {
-                mission: safe_id(mission)?,
-            })
+        ("PUT", ["api", "v1", "canonical", "jobs", job, "configuration"]) => {
+            Ok(Route::CanonicalJobConfigPut { job: safe_id(job)? })
         }
-        ("GET", ["api", "v1", "canonical", "work"]) => Ok(Route::CanonicalSnapshot),
-        ("GET", ["api", "v1", "canonical", "work", "events"]) => Ok(Route::CanonicalEvents),
+        ("GET", ["api", "v1", "canonical", "jobs"]) => Ok(Route::CanonicalSnapshot),
+        ("GET", ["api", "v1", "canonical", "jobs", "events"]) => Ok(Route::CanonicalEvents),
         ("GET", ["api", "v1", "canonical", "dashboard"]) => Ok(Route::CanonicalDashboard),
         ("OPTIONS", ["api", "v1", "canonical", ..]) => Ok(Route::CanonicalPreflight),
         ("GET", ["api", "v1", "snapshot"]) => Ok(Route::Snapshot),
@@ -1651,9 +1643,9 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         ["api", "v1", "profile", "bootstrap"] => Some("POST"),
         ["api", "v1", "canonical", "configuration"] => Some("GET, PUT"),
         ["api", "v1", "canonical", "configuration", "projects", _] => Some("PUT"),
-        ["api", "v1", "canonical", "missions", _, "configuration"] => Some("GET, PUT"),
-        ["api", "v1", "canonical", "work"]
-        | ["api", "v1", "canonical", "work", "events"]
+        ["api", "v1", "canonical", "jobs", _, "configuration"] => Some("GET, PUT"),
+        ["api", "v1", "canonical", "jobs"]
+        | ["api", "v1", "canonical", "jobs", "events"]
         | ["api", "v1", "canonical", "dashboard"]
         | ["api", "v1", "canonical", "projects"] => Some("GET"),
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),

@@ -687,7 +687,7 @@ impl<'a> Controller<'a> {
         } else {
             previous.ok_or_else(|| OcgError::config("session projection disappeared"))?
         };
-        session.task = Some(Self::stored_task_text(&admission.job.payload));
+        session.task = Some(Self::stored_task_text(&admission.job.spec));
         self.persist(&mut loaded, session, now)?;
         Ok(TaskAdmission {
             session_id: session_key,

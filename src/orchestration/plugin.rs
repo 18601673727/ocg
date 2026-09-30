@@ -599,7 +599,7 @@ function executable() {
   return process.env.OCG_BRIDGE || "ocg";
 }
 
-// The durable Run identity of each canonical worker session, learned from the
+// The durable Attempt identity of each canonical worker session, learned from the
 // OCG-owned envelope on its first admitted prompt. It is a bounded cache of a
 // fact the backend already holds; the bridge re-validates every witness, so a
 // lost or stale entry can never grant authority.
@@ -1058,9 +1058,9 @@ export default {
       const text = prompt && typeof prompt.text === "string" ? prompt.text : "";
       if (!text.trim()) return;
       // A worker session's own task prompt carries the OCG-owned dispatch
-      // envelope from the Run that created it. Remembering it is what lets this
+      // envelope from the Attempt that created it. Remembering it is what lets this
       // session delegate recursively for its own subtree; the bridge
-      // re-validates the Run the witness names, so the cache is never
+      // re-validates the Attempt the witness names, so the cache is never
       // authority.
       const WITNESS_START = "<<<OCG:ATTEMPT_WITNESS v1>>>";
       const WITNESS_END = "<<<OCG:ATTEMPT_WITNESS:END>>>";
@@ -1138,10 +1138,10 @@ export default {
       const input = event.input && typeof event.input === "object" ? event.input : {};
       // An invocation that already carries a canonical witness was dispatched
       // by a previous call for this exact input. Re-dispatching would create a
-      // second child WorkNode, so this hook is a no-op for it.
+      // second child Job, so this hook is a no-op for it.
       if (isWitness(input.ocg_witness)) return;
       // A Lead always owns a delegation, and so does an OCG Worker that is
-      // itself an authoritative canonical Run (recursive child creation).
+      // itself an authoritative canonical Attempt (recursive child creation).
       // Any other caller is still ignored.
       const cached = isWitness(ownWitness.get(event.sessionID)) ? ownWitness.get(event.sessionID) : null;
       if (!isWitness(input.ocg_caller_witness) && cached && !isWitness(input.ocg_witness)) {
@@ -1158,10 +1158,10 @@ export default {
         args: input,
       });
       if (!isWitness(result.witness)) throw new Error("canonical execution witness missing");
-      // The bridge may have created a canonical child WorkNode + Run and
+      // The bridge may have created a canonical child Job + Attempt and
       // returned its durable dispatch witness. The witness is attached to the
       // *exact* subagent input object the host hands back to `execute.after`,
-      // so the completion is correlated by Run identity and never by prompt,
+      // so the completion is correlated by Attempt identity and never by prompt,
       // role, session ordering or ready order. It is a structured field, not
       // model-visible prose.
       if (result && result.witness && isWitness(result.witness)) {
@@ -1181,7 +1181,7 @@ export default {
       if (!event || event.tool !== "subagent") return;
       const canonicalInput = event.input && typeof event.input === "object" ? event.input : {};
       // A witnessed completion is delivered from a Lead or from an OCG Worker
-      // that is itself an authoritative canonical Run.
+      // that is itself an authoritative canonical Attempt.
       const witnessed = isWitness(canonicalInput.ocg_witness);
       if (!witnessed && !isLead(event.agent)) return;
       if (!isWorker(canonicalInput.agent)) return;
@@ -1194,7 +1194,7 @@ export default {
       if (typeof nested.output !== "string") return;
       if (deliveryHasContext(delivery)) return;
       // The witness attached to this exact invocation travels back unchanged.
-      // When it is present the canonical Run decides the result; the legacy
+      // When it is present the canonical Attempt decides the result; the legacy
       // session/phase correlation is not consulted.
       const witness = event.input && event.input.ocg_witness;
       const result = await bridge("tool.execute.after", {

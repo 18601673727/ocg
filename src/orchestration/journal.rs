@@ -95,7 +95,7 @@
 //! still the only budget authority.
 //!
 //! This round does **not** add replication, clustering or a second writer, and
-//! does not restore any legacy Mission/WorkNode/Run execution semantics. It is a
+//! does not restore any legacy Mission/Job/Attempt execution semantics. It is a
 //! single-node, single-authority journal.
 //!
 //! The stream also has no automatic retention: nothing is pruned on a timer or

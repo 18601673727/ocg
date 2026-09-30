@@ -1,4 +1,4 @@
-//! Backend-backed control plane for the canonical WorkNode/Run lane.
+//! Backend-backed control plane for the canonical Job/Attempt lane.
 //!
 //! This module is deliberately transport-neutral. The PWA and loopback server
 //! consume these DTOs; neither owns execution state. The SQLite substrate is
@@ -112,31 +112,31 @@ pub struct CanonicalConfigurationResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-pub struct CanonicalMissionResponse {
+pub struct CanonicalJobConfigResponse {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
     pub command_id: String,
     pub accepted: bool,
-    pub mission_id: String,
+    pub job_id: String,
     pub revision: u64,
     pub configuration: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-pub struct CanonicalWorkSnapshot {
+pub struct CanonicalJobSnapshot {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
     pub project_id: String,
-    pub mission: Value,
+    pub job: Value,
     pub cursor: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-pub struct CanonicalWorkEvent {
+pub struct CanonicalJobEvent {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
     pub project_id: String,
-    pub mission_id: String,
+    pub job_id: String,
     /// The canonical execution journal cursor this event occupies.
     pub sequence: u64,
     pub event_id: String,
@@ -153,7 +153,7 @@ pub struct CanonicalWorkEvent {
 pub enum CanonicalEventTail {
     /// The complete delta after the requested cursor, in cursor order. May be
     /// empty when the cursor is already at the head.
-    Events(Vec<CanonicalWorkEvent>),
+    Events(Vec<CanonicalJobEvent>),
     /// The requested cursor is below the journal's retained floor, so its delta
     /// can no longer be produced. The consumer must refetch
     /// [`CanonicalControlService::canonical_snapshot`] and resume from the
@@ -173,8 +173,8 @@ pub struct CanonicalDashboardResponse {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
     pub project_id: String,
-    pub missions: Vec<Value>,
-    pub selected_mission: Option<CanonicalWorkSnapshot>,
+    pub jobs: Vec<Value>,
+    pub selected_job: Option<CanonicalJobSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -437,30 +437,30 @@ impl CanonicalControlService {
         })
     }
 
-    pub fn set_mission_configuration(
+    pub fn set_job_configuration(
         &self,
         command_id: &str,
-        mission_id: &str,
+        job_id: &str,
         config: Value,
         _now: i64,
-    ) -> Result<CanonicalMissionResponse> {
+    ) -> Result<CanonicalJobConfigResponse> {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
         let mut repository = DomainRepository::open(&self.root)?;
-        let revision = repository.set_job_configuration(mission_id, &config)?;
-        Ok(CanonicalMissionResponse {
+        let revision = repository.set_job_configuration(job_id, &config)?;
+        Ok(CanonicalJobConfigResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             command_id: command_id.to_string(),
             accepted: true,
-            mission_id: mission_id.to_string(),
+            job_id: job_id.to_string(),
             revision,
             configuration: config,
         })
     }
 
-    pub fn mission_configuration(&self, mission_id: &str) -> Result<Option<(Value, u64)>> {
-        DomainRepository::open(&self.root)?.job_configuration(mission_id)
+    pub fn job_configuration(&self, job_id: &str) -> Result<Option<(Value, u64)>> {
+        DomainRepository::open(&self.root)?.job_configuration(job_id)
     }
 
     /// The canonical snapshot of one Job, taken at the real journal cursor.
@@ -472,8 +472,8 @@ impl CanonicalControlService {
     pub fn canonical_snapshot(
         &self,
         project_id: &str,
-        mission_id: &str,
-    ) -> Result<CanonicalWorkSnapshot> {
+        job_id: &str,
+    ) -> Result<CanonicalJobSnapshot> {
         let project = self
             .read_projects()?
             .into_iter()
@@ -487,7 +487,7 @@ impl CanonicalControlService {
         let projection = ExecutionProjection::from(snapshot);
         let job = projection
             .jobs
-            .get(mission_id)
+            .get(job_id)
             .cloned()
             .ok_or_else(|| invalid("unknown canonical Job"))?;
         let attempts: Vec<Attempt> = projection
@@ -508,10 +508,10 @@ impl CanonicalControlService {
             "calls":calls,
             "execution_graph":"canonical state projection"
         });
-        Ok(CanonicalWorkSnapshot {
+        Ok(CanonicalJobSnapshot {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             project_id: project_id.to_string(),
-            mission: value,
+            job: value,
             cursor: projection.cursor,
         })
     }
@@ -528,7 +528,7 @@ impl CanonicalControlService {
     pub fn canonical_event_tail(
         &self,
         project_id: &str,
-        mission_id: &str,
+        job_id: &str,
         after: u64,
     ) -> Result<CanonicalEventTail> {
         let project = self
@@ -540,14 +540,14 @@ impl CanonicalControlService {
             return Err(invalid("Project identity does not own this boundary"));
         }
         let repository = DomainRepository::open(&self.root)?;
-        match repository.journal_delta_for_job(mission_id, after, MAX_EVENT_READ)? {
+        match repository.journal_delta_for_job(job_id, after, MAX_EVENT_READ)? {
             EventDelta::Available { events, .. } => Ok(CanonicalEventTail::Events(
                 events
                     .into_iter()
-                    .map(|event| CanonicalWorkEvent {
+                    .map(|event| CanonicalJobEvent {
                         api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                         project_id: project.project_id.clone(),
-                        mission_id: mission_id.to_string(),
+                        job_id: job_id.to_string(),
                         sequence: event.seq,
                         event_id: event.event_id,
                         kind: event.kind.to_string(),
@@ -580,7 +580,7 @@ impl CanonicalControlService {
     pub fn dashboard(
         &self,
         project_id: &str,
-        mission_id: Option<&str>,
+        job_id: Option<&str>,
     ) -> Result<CanonicalDashboardResponse> {
         let project = self
             .read_projects()?
@@ -589,15 +589,15 @@ impl CanonicalControlService {
             .ok_or_else(|| invalid("unknown Project identity"))?;
         let repository = DomainRepository::open(&self.root)?;
         let canonical_project = repository.ensure_project(&self.root)?;
-        let missions = repository.jobs(&canonical_project.id)?.into_iter().map(|job| json!({"mission_id":job.id,"job_id":job.id,"created_at":job.created_at,"state":job.state,"updated_at":job.updated_at})).collect();
-        let selected_mission = mission_id
+        let jobs = repository.jobs(&canonical_project.id)?.into_iter().map(|job| json!({"job_id":job.id,"created_at":job.created_at,"state":job.state,"updated_at":job.updated_at})).collect();
+        let selected_job = job_id
             .map(|id| self.canonical_snapshot(&project.project_id, id))
             .transpose()?;
         Ok(CanonicalDashboardResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             project_id: project.project_id,
-            missions,
-            selected_mission,
+            jobs,
+            selected_job,
         })
     }
 }

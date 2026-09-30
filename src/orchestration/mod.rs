@@ -53,8 +53,8 @@ pub use budget::{
 };
 pub use canonical_control::{
     CanonicalConfigurationResponse, CanonicalControlService, CanonicalDashboardResponse,
-    CanonicalEventTail, CanonicalMissionResponse, CanonicalProjectResponse, CanonicalWorkEvent,
-    CanonicalWorkSnapshot, GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView,
+    CanonicalEventTail, CanonicalJobConfigResponse, CanonicalJobEvent, CanonicalJobSnapshot,
+    CanonicalProjectResponse, GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView,
     ProjectRecord, CANONICAL_CONTROL_API_VERSION,
 };
 pub use checkpoint::{Checkpoint, CheckpointSummary, LoadedCheckpoint, Phase, Staleness};

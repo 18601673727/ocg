@@ -1,7 +1,7 @@
 //! Rust-owned 0.5 core vocabulary and transport primitives.
 //!
 //! These types are deliberately transport-safe and execution-neutral. Durable
-//! execution remains owned by the existing WorkNode/Run repository; this module
+//! execution remains owned by the canonical Project/Job/Attempt repository; this module
 //! gives that repository, the control API and the PWA one vocabulary for refs,
 //! lifecycle, failure and measurement facts.
 
@@ -53,8 +53,8 @@ impl PartialOrd for EntityId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
-    WorkNode,
-    Run,
+    Job,
+    Attempt,
     Call,
     Command,
     Approval,
@@ -108,8 +108,8 @@ pub enum Actor {
         client_id: Option<String>,
     },
     Core,
-    Run {
-        run_ref: EntityRef,
+    Attempt {
+        attempt_ref: EntityRef,
     },
     Call {
         call_ref: EntityRef,
@@ -139,7 +139,7 @@ pub enum ExternalSourceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-pub struct WorkNodeBlocker {
+pub struct JobBlocker {
     pub kind: BlockerKind,
     pub blocking_ref: Option<EntityRef>,
     pub reason_code: String,
@@ -157,7 +157,7 @@ pub enum BlockerKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkNodeLifecycle {
+pub enum JobLifecycle {
     Pending,
     Ready,
     Settling,
@@ -167,7 +167,7 @@ pub enum WorkNodeLifecycle {
     Cancelled,
 }
 
-impl WorkNodeLifecycle {
+impl JobLifecycle {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
@@ -207,13 +207,13 @@ impl WorkNodeLifecycle {
         );
         allowed
             .then_some(next)
-            .ok_or_else(|| invalid(format!("illegal WorkNode transition: {self:?} -> {next:?}")))
+            .ok_or_else(|| invalid(format!("illegal Job transition: {self:?} -> {next:?}")))
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
-pub enum RunLifecycle {
+pub enum AttemptLifecycle {
     Created,
     Queued,
     Running,
@@ -223,7 +223,7 @@ pub enum RunLifecycle {
     Preempted,
 }
 
-impl RunLifecycle {
+impl AttemptLifecycle {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -247,7 +247,7 @@ impl RunLifecycle {
         );
         allowed
             .then_some(next)
-            .ok_or_else(|| invalid(format!("illegal Run transition: {self:?} -> {next:?}")))
+            .ok_or_else(|| invalid(format!("illegal Attempt transition: {self:?} -> {next:?}")))
     }
 }
 
@@ -440,7 +440,7 @@ impl ExecutionPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ExecutionLeaseRecord {
-    pub run_ref: EntityRef,
+    pub attempt_ref: EntityRef,
     pub lease_id: EntityId,
     pub holder_id: String,
     pub fence_epoch: String,
@@ -462,7 +462,7 @@ pub enum LeaseState {
 pub struct BudgetScope {
     pub id: EntityId,
     pub project_scope: ProjectScope,
-    pub work_node_ref: EntityRef,
+    pub job_ref: EntityRef,
     pub ceiling_tokens: Option<u64>,
     pub ceiling_cost: Option<String>,
     pub reserved_tokens: Option<u64>,
@@ -535,14 +535,14 @@ pub enum ProjectionEffectPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
-    WorkNodeCreated,
-    WorkNodeStateChanged,
-    WorkNodeDependenciesChanged,
-    WorkNodeReopened,
-    WorkNodeArchived,
-    WorkNodeBlockerAdded,
-    WorkNodeBlockerResolved,
-    WorkNodeReady,
+    JobCreated,
+    JobStateChanged,
+    JobDependenciesChanged,
+    JobReopened,
+    JobArchived,
+    JobBlockerAdded,
+    JobBlockerResolved,
+    JobReady,
     DependencySatisfied,
     SpawnRequested,
     SpawnDeduplicated,
@@ -550,14 +550,14 @@ pub enum EventType {
     RetryRequested,
     ReplacementRequested,
     RecoveryRequested,
-    RunCreated,
-    RunQueued,
-    RunStarted,
-    RunSucceeded,
-    RunFailed,
-    RunCancelled,
-    RunPreempted,
-    RunFenced,
+    AttemptCreated,
+    AttemptQueued,
+    AttemptStarted,
+    AttemptSucceeded,
+    AttemptFailed,
+    AttemptCancelled,
+    AttemptPreempted,
+    AttemptFenced,
     CallCreated,
     CallQueued,
     CallStarted,
@@ -636,25 +636,25 @@ impl EventType {
     pub fn subject_kind(self) -> EntityKind {
         use EntityKind::*;
         match self {
-            Self::WorkNodeCreated
-            | Self::WorkNodeStateChanged
-            | Self::WorkNodeDependenciesChanged
-            | Self::WorkNodeReopened
-            | Self::WorkNodeArchived
-            | Self::WorkNodeBlockerAdded
-            | Self::WorkNodeBlockerResolved
-            | Self::WorkNodeReady
+            Self::JobCreated
+            | Self::JobStateChanged
+            | Self::JobDependenciesChanged
+            | Self::JobReopened
+            | Self::JobArchived
+            | Self::JobBlockerAdded
+            | Self::JobBlockerResolved
+            | Self::JobReady
             | Self::DependencySatisfied
             | Self::SpawnRequested
-            | Self::SpawnDeduplicated => WorkNode,
-            Self::RunCreated
-            | Self::RunQueued
-            | Self::RunStarted
-            | Self::RunSucceeded
-            | Self::RunFailed
-            | Self::RunCancelled
-            | Self::RunPreempted
-            | Self::RunFenced => Run,
+            | Self::SpawnDeduplicated => Job,
+            Self::AttemptCreated
+            | Self::AttemptQueued
+            | Self::AttemptStarted
+            | Self::AttemptSucceeded
+            | Self::AttemptFailed
+            | Self::AttemptCancelled
+            | Self::AttemptPreempted
+            | Self::AttemptFenced => Attempt,
             Self::CallCreated
             | Self::CallQueued
             | Self::CallStarted
@@ -707,7 +707,7 @@ impl EventType {
             Self::SchedulerDecision
             | Self::RetryRequested
             | Self::ReplacementRequested
-            | Self::RecoveryRequested => WorkNode,
+            | Self::RecoveryRequested => Job,
         }
     }
 }
@@ -717,14 +717,14 @@ impl EventType {
 pub fn event_registry() -> Vec<EventRegistryEntry> {
     use EventType::*;
     let all = [
-        WorkNodeCreated,
-        WorkNodeStateChanged,
-        WorkNodeDependenciesChanged,
-        WorkNodeReopened,
-        WorkNodeArchived,
-        WorkNodeBlockerAdded,
-        WorkNodeBlockerResolved,
-        WorkNodeReady,
+        JobCreated,
+        JobStateChanged,
+        JobDependenciesChanged,
+        JobReopened,
+        JobArchived,
+        JobBlockerAdded,
+        JobBlockerResolved,
+        JobReady,
         DependencySatisfied,
         SpawnRequested,
         SpawnDeduplicated,
@@ -732,14 +732,14 @@ pub fn event_registry() -> Vec<EventRegistryEntry> {
         RetryRequested,
         ReplacementRequested,
         RecoveryRequested,
-        RunCreated,
-        RunQueued,
-        RunStarted,
-        RunSucceeded,
-        RunFailed,
-        RunCancelled,
-        RunPreempted,
-        RunFenced,
+        AttemptCreated,
+        AttemptQueued,
+        AttemptStarted,
+        AttemptSucceeded,
+        AttemptFailed,
+        AttemptCancelled,
+        AttemptPreempted,
+        AttemptFenced,
         CallCreated,
         CallQueued,
         CallStarted,
@@ -813,14 +813,14 @@ pub fn event_registry() -> Vec<EventRegistryEntry> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "event_type", content = "payload", rename_all = "snake_case")]
 pub enum EventPayload {
-    WorkNodeCreated(serde_json::Value),
-    WorkNodeStateChanged(serde_json::Value),
-    WorkNodeDependenciesChanged(serde_json::Value),
-    WorkNodeReopened(serde_json::Value),
-    WorkNodeArchived(serde_json::Value),
-    WorkNodeBlockerAdded(serde_json::Value),
-    WorkNodeBlockerResolved(serde_json::Value),
-    WorkNodeReady(serde_json::Value),
+    JobCreated(serde_json::Value),
+    JobStateChanged(serde_json::Value),
+    JobDependenciesChanged(serde_json::Value),
+    JobReopened(serde_json::Value),
+    JobArchived(serde_json::Value),
+    JobBlockerAdded(serde_json::Value),
+    JobBlockerResolved(serde_json::Value),
+    JobReady(serde_json::Value),
     DependencySatisfied(serde_json::Value),
     SpawnRequested(serde_json::Value),
     SpawnDeduplicated(serde_json::Value),
@@ -828,14 +828,14 @@ pub enum EventPayload {
     RetryRequested(serde_json::Value),
     ReplacementRequested(serde_json::Value),
     RecoveryRequested(serde_json::Value),
-    RunCreated(serde_json::Value),
-    RunQueued(serde_json::Value),
-    RunStarted(serde_json::Value),
-    RunSucceeded(serde_json::Value),
-    RunFailed(serde_json::Value),
-    RunCancelled(serde_json::Value),
-    RunPreempted(serde_json::Value),
-    RunFenced(serde_json::Value),
+    AttemptCreated(serde_json::Value),
+    AttemptQueued(serde_json::Value),
+    AttemptStarted(serde_json::Value),
+    AttemptSucceeded(serde_json::Value),
+    AttemptFailed(serde_json::Value),
+    AttemptCancelled(serde_json::Value),
+    AttemptPreempted(serde_json::Value),
+    AttemptFenced(serde_json::Value),
     CallCreated(serde_json::Value),
     CallQueued(serde_json::Value),
     CallStarted(serde_json::Value),
@@ -915,10 +915,10 @@ pub enum ProjectionEffect {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct SyncWindowPolicy {
-    pub nonterminal_work_nodes_per_project: u32,
-    pub terminal_work_nodes_per_project: u32,
-    pub runs_per_work_node: u32,
-    pub calls_per_run: u32,
+    pub nonterminal_jobs_per_project: u32,
+    pub terminal_jobs_per_project: u32,
+    pub attempts_per_job: u32,
+    pub calls_per_attempt: u32,
     pub commands_per_project: u32,
     pub approvals_per_project: u32,
     pub changesets_per_project: u32,
@@ -944,8 +944,8 @@ pub struct CanonicalSyncProjection {
     pub project_scope: ProjectScope,
     pub sync_policy_version: String,
     pub window: SyncWindowPolicy,
-    pub work_nodes: Vec<CanonicalEntityProjection>,
-    pub runs: Vec<CanonicalEntityProjection>,
+    pub jobs: Vec<CanonicalEntityProjection>,
+    pub attempts: Vec<CanonicalEntityProjection>,
     pub calls: Vec<CanonicalEntityProjection>,
     pub commands: Vec<CanonicalEntityProjection>,
     pub approvals: Vec<CanonicalEntityProjection>,
@@ -1073,7 +1073,7 @@ pub struct Message {
     pub project_scope: ProjectScope,
     pub conversation_ref: EntityRef,
     pub author: Actor,
-    pub produced_by_run_ref: Option<EntityRef>,
+    pub produced_by_attempt_ref: Option<EntityRef>,
     pub blocks: Vec<MessageBlock>,
     pub state: MessageLifecycle,
     pub revision: u64,
@@ -1116,7 +1116,7 @@ pub struct TransientMessageDelta {
     pub generation: String,
     pub stream_id: String,
     pub message_ref: EntityRef,
-    pub run_ref: EntityRef,
+    pub attempt_ref: EntityRef,
     pub chunk_index: String,
     pub delta_utf8: String,
 }
@@ -1175,7 +1175,7 @@ pub struct CapabilityRevocation {
     pub id: EntityId,
     pub project_scope: ProjectScope,
     pub capability_ref: CapabilityRef,
-    pub run_ref: Option<EntityRef>,
+    pub attempt_ref: Option<EntityRef>,
     pub actor: Actor,
     pub reason_code: String,
     pub state: CapabilityRevocationState,

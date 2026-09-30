@@ -139,8 +139,8 @@ impl SpawnFingerprintInputV1 {
 fn entity_kind_name(reference: &EntityRef) -> &'static str {
     use crate::core_contract::EntityKind::*;
     match reference.kind {
-        WorkNode => "work_node",
-        Run => "run",
+        Job => "job",
+        Attempt => "attempt",
         Call => "call",
         Command => "command",
         Approval => "approval",

@@ -24,24 +24,24 @@ pub use crate::fingerprint::{
 };
 
 pub use crate::core_contract::{
-    event_registry, ActivityCursor, Actor, Approval, ApprovalDecision, ApprovalState, BlockerKind,
-    BudgetScope, BudgetSnapshot, CallLifecycle, CanonicalEntityProjection, CanonicalSyncProjection,
-    CapabilityConstraints, CapabilityGrant, CapabilityRef, CapabilityRevocation,
-    CapabilityRevocationState, ChildCancellationPolicy, ChildFailurePolicy, ChildJoinPolicy,
-    ChildPolicy, ClientKind, Command, CommandState, Consistency, DerivedMetric, EffectIntent,
-    EffectIntentState, EntityId, EntityKind, EntityRef, EventEnvelope, EventPayload,
-    EventRegistryEntry, EventType, ExecutionGraphEdge, ExecutionGraphNode,
-    ExecutionGraphProjection, ExecutionLeaseRecord, ExecutionLimits, ExecutionMode,
-    ExecutionPolicy, ExecutionRetryPolicy, ExecutorContract, ExternalSourceKind, Fact, Failure,
-    FailureClass, LeaseState, MeasurementQuality, MeasurementView, Message, MessageBlock,
-    MessageBlockKind, MessageLifecycle, ProjectScope, ProjectionEffect, ProjectionEffectPolicy,
-    ResumeCursor, RunLifecycle, SideEffectMode, Snapshot, SpawnChildRequest, SyncWindowPolicy,
-    TransientMessageDelta, WorkNodeBlocker, WorkNodeLifecycle, CORE_CONTRACT_VERSION,
+    event_registry, ActivityCursor, Actor, Approval, ApprovalDecision, ApprovalState,
+    AttemptLifecycle, BlockerKind, BudgetScope, BudgetSnapshot, CallLifecycle,
+    CanonicalEntityProjection, CanonicalSyncProjection, CapabilityConstraints, CapabilityGrant,
+    CapabilityRef, CapabilityRevocation, CapabilityRevocationState, ChildCancellationPolicy,
+    ChildFailurePolicy, ChildJoinPolicy, ChildPolicy, ClientKind, Command, CommandState,
+    Consistency, DerivedMetric, EffectIntent, EffectIntentState, EntityId, EntityKind, EntityRef,
+    EventEnvelope, EventPayload, EventRegistryEntry, EventType, ExecutionGraphEdge,
+    ExecutionGraphNode, ExecutionGraphProjection, ExecutionLeaseRecord, ExecutionLimits,
+    ExecutionMode, ExecutionPolicy, ExecutionRetryPolicy, ExecutorContract, ExternalSourceKind,
+    Fact, Failure, FailureClass, JobBlocker, JobLifecycle, LeaseState, MeasurementQuality,
+    MeasurementView, Message, MessageBlock, MessageBlockKind, MessageLifecycle, ProjectScope,
+    ProjectionEffect, ProjectionEffectPolicy, ResumeCursor, SideEffectMode, Snapshot,
+    SpawnChildRequest, SyncWindowPolicy, TransientMessageDelta, CORE_CONTRACT_VERSION,
     CURSOR_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION,
 };
 pub use crate::orchestration::canonical_control::{
-    CanonicalConfigurationResponse, CanonicalDashboardResponse, CanonicalMissionResponse,
-    CanonicalProjectResponse, CanonicalWorkEvent, CanonicalWorkSnapshot, GlobalConfiguration,
+    CanonicalConfigurationResponse, CanonicalDashboardResponse, CanonicalJobConfigResponse,
+    CanonicalJobEvent, CanonicalJobSnapshot, CanonicalProjectResponse, GlobalConfiguration,
     ProjectConfiguration, ProjectConfigurationView, ProjectRecord, ResourceBudget,
     CANONICAL_CONTROL_API_VERSION,
 };
@@ -85,30 +85,26 @@ pub struct CanonicalConfigurationEnvelope {
     pub configuration: ProjectConfigurationView,
 }
 
-/// `GET /api/v1/canonical/missions/{mission}/configuration`
-///
-/// The substrate stores a Mission's configuration as a `(value, revision)`
-/// pair. That pair used to be interpolated into the response whole, which
-/// serialised as `{"0":…,"1":…}`; the two halves are named fields now.
+/// `GET /api/v1/canonical/jobs/{job}/configuration`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-pub struct CanonicalMissionConfigEnvelope {
+pub struct CanonicalJobConfigEnvelope {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
-    pub mission_id: String,
-    /// `null` when the Mission has no stored pre-run configuration yet.
+    pub job_id: String,
+    /// `null` when the Job has no stored pre-attempt configuration yet.
     pub configuration: Value,
     /// The substrate revision the configuration was read at; `0` when unset.
     pub revision: u64,
 }
 
-/// `GET /api/v1/canonical/work/events`
+/// `GET /api/v1/canonical/jobs/events`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct CanonicalEventsEnvelope {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
     pub project_id: String,
-    pub mission_id: String,
-    pub events: Vec<CanonicalWorkEvent>,
+    pub job_id: String,
+    pub events: Vec<CanonicalJobEvent>,
 }
 
 /// `GET|POST|PUT /api/v1/profile` and `/api/v1/profile/bootstrap`.
@@ -166,15 +162,15 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     CanonicalProjectsResponse::export_all(cfg)?;
     CanonicalConfigurationEnvelope::export_all(cfg)?;
     CanonicalConfigurationResponse::export_all(cfg)?;
-    CanonicalMissionConfigEnvelope::export_all(cfg)?;
-    CanonicalMissionResponse::export_all(cfg)?;
+    CanonicalJobConfigEnvelope::export_all(cfg)?;
+    CanonicalJobConfigResponse::export_all(cfg)?;
     CanonicalEventsEnvelope::export_all(cfg)?;
     CanonicalDashboardResponse::export_all(cfg)?;
     CanonicalProjectResponse::export_all(cfg)?;
     ResourceBudget::export_all(cfg)?;
     ExecutionWitness::export_all(cfg)?;
-    CanonicalWorkSnapshot::export_all(cfg)?;
-    CanonicalWorkEvent::export_all(cfg)?;
+    CanonicalJobSnapshot::export_all(cfg)?;
+    CanonicalJobEvent::export_all(cfg)?;
     ProfileView::export_all(cfg)?;
     ProfileBootstrapRequest::export_all(cfg)?;
     ProfileReplaceRequest::export_all(cfg)?;
@@ -238,7 +234,7 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     ProjectionEffect::export_all(cfg)?;
     ProjectionEffectPolicy::export_all(cfg)?;
     ResumeCursor::export_all(cfg)?;
-    RunLifecycle::export_all(cfg)?;
+    AttemptLifecycle::export_all(cfg)?;
     Snapshot::export_all(cfg)?;
     SpawnChildSpecV1::export_all(cfg)?;
     SpawnFingerprintInputV1::export_all(cfg)?;
@@ -246,8 +242,8 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     SpawnChildRequest::export_all(cfg)?;
     SyncWindowPolicy::export_all(cfg)?;
     TransientMessageDelta::export_all(cfg)?;
-    WorkNodeBlocker::export_all(cfg)?;
-    WorkNodeLifecycle::export_all(cfg)?;
+    JobBlocker::export_all(cfg)?;
+    JobLifecycle::export_all(cfg)?;
     Ok(())
 }
 
