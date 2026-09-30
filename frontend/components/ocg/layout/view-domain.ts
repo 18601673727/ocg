@@ -14,7 +14,7 @@ export type WorkspaceView =
   | "attention"
   | "ledger"
   | "control-center"
-  | "mission-control"
+  | "job-execution"
   | "logs"
   | "settings"
   | "canonical";
@@ -25,7 +25,7 @@ export const WORKSPACE_VIEWS: readonly WorkspaceView[] = [
   "attention",
   "ledger",
   "control-center",
-  "mission-control",
+  "job-execution",
   "logs",
   "settings",
   "canonical",
@@ -48,8 +48,8 @@ export function deriveScenarioWorkspaceView(scenario: ScenarioId): WorkspaceView
       return "control-center";
     case "resource-ledger":
       return "ledger";
-    case "mission-control":
-      return "mission-control";
+    case "job-execution":
+      return "job-execution";
     case "logs-live":
       return "logs";
     default:
@@ -76,9 +76,10 @@ export type WorkspaceTarget = {
 /**
  * Where each workspace lives.
  *
- * Home, attention and the mission surfaces share the root route and are chosen
- * by `scenario`, which keeps one in-memory runtime instance alive across the
- * switch. The ledger, settings and OCG control surfaces have their own route.
+ * Home, attention and the job execution surface share the root route and are
+ * chosen by `scenario`, which keeps one in-memory runtime instance alive across
+ * the switch. The ledger, settings and OCG control surfaces have their own
+ * route.
  */
 const WORKSPACE_TARGETS: Record<WorkspaceView, WorkspaceTarget> = {
   chat: { href: "/", toggles: false },
@@ -86,7 +87,7 @@ const WORKSPACE_TARGETS: Record<WorkspaceView, WorkspaceTarget> = {
   attention: { href: "/?scenario=attention-overview", toggles: false },
   "control-center": { href: "/?scenario=profiles-models", toggles: true },
   ledger: { href: "/resource-ledger", toggles: true },
-  "mission-control": { href: "/?scenario=mission-control", toggles: true },
+  "job-execution": { href: "/?scenario=job-execution", toggles: true },
   logs: { href: "/?scenario=logs-live", toggles: true },
   settings: { href: "/settings", toggles: true },
   canonical: { href: "/canonical", toggles: false },

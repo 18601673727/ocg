@@ -60,7 +60,7 @@ function LedgerStrip({ ledger }: { ledger: ResourceLedger | null }) {
         <strong className="font-semibold tabular-nums text-foreground">{formatCostMicros(summary.costMicros)}</strong>
         <span>({summary.costProvenance})</span>
       </span>
-      <span>{summary.missionCount} missions</span>
+      <span>{summary.jobCount} jobs</span>
       <span>{summary.workerCount} workers</span>
       <span>{summary.leadEntryCount} lead calls</span>
     </div>

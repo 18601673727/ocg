@@ -54,7 +54,7 @@ const WORKSPACE_NAV: { target: WorkspaceView; label: string; icon: typeof Search
   { target: "chat", label: "Chat", icon: MessageSquare },
   { target: "control-center", label: "Control Center", icon: SlidersHorizontal },
   { target: "ledger", label: "Resource Ledger", icon: Table2 },
-  { target: "mission-control", label: "Mission Control", icon: Workflow },
+  { target: "job-execution", label: "Job Execution", icon: Workflow },
   { target: "logs", label: "Logs / Diagnostics", icon: ScrollText },
   { target: "canonical", label: "OCG Control", icon: SlidersHorizontal },
 ];

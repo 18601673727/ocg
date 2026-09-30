@@ -83,18 +83,8 @@ export type ChatMessage = {
   tool?: ToolActivity;
 };
 
-/** Legacy fixture vocabulary retained until the remaining presentation surfaces migrate. */
-export type MissionTaskStatus = "pending" | "active" | "completed" | "failed";
-export type MissionTask = { id: string; title: string; status: MissionTaskStatus };
-export type MissionStatus = "planning" | "running" | "paused" | "completed" | "failed" | "budget-exhausted";
+/** Status an observability participant (a provider invocation) can report. */
 export type WorkerStatus = "queued" | "starting" | "active" | "waiting" | "idle" | "completed" | "failed" | "cancelled";
-export type Worker = { id: string; name: string; status: WorkerStatus; task?: string };
-export type ResourceCommitment = { workers: number; mode: "capped" | "flexible" };
-export type BudgetState = { spent: number; limit: number; currency: "USD"; status: "within-limit" | "exhausted" };
-export type Mission = {
-  title: string; goal: string; status: MissionStatus; completed: number; total: number; current: string;
-  tasks: MissionTask[]; workers: Worker[]; elapsed: string; commitment: ResourceCommitment; budget: BudgetState; warnings: string[];
-};
 export type ToolActivityStatus = "pending" | "running" | "success" | "failure" | "retrying" | "waiting-approval";
 export type ToolActivity = { id: string; name: string; status: string; durationMs: number; summary: string; detail: string; retryCount?: number };
 
@@ -127,15 +117,12 @@ export type OcgRuntimeEvent =
   | { type: "activity.updated"; sessionId: string; messageId: string; activity: CallActivity }
   | { type: "job.execution-updated"; sessionId: string; execution: import("./execution/domain").JobExecution; accounting: import("./execution/accounting").JobAccounting | null }
   | { type: "job.launch-updated"; sessionId: string; result: import("./runtime/runtime-types").JobLaunchResult }
-  | { type: "mission.updated"; sessionId: string; mission: Mission }
   | { type: "observability.updated"; sessionId: string; observability: import("./runtime/observability").RuntimeObservability }
-  | { type: "mission.launch-updated"; sessionId: string; result: import("./runtime/runtime-types").MissionLaunchResult }
   | { type: "attention.updated"; item: import("./attention/domain").AttentionItem }
   | { type: "ledger.entry-added"; entry: import("./resource-ledger/types").ResourceLedgerEntry }
   | { type: "ledger.entry-updated"; entry: import("./resource-ledger/types").ResourceLedgerEntry }
   | { type: "log.appended"; entry: import("./logs/domain").LogEntry }
   | { type: "bootstrap.updated"; bootstrap: import("./bootstrap/types").BootstrapState }
-  | { type: "worker.updated"; sessionId: string; worker: Worker }
   | { type: "warning"; message: string }
   | { type: "error"; message: string }
   | { type: "cancelled"; sessionId: string; messageId?: string };

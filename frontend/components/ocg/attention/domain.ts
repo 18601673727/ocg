@@ -60,7 +60,6 @@ export const ATTENTION_LIFECYCLES: readonly AttentionLifecycle[] = [
 export type AttentionSeverity = "info" | "warning" | "high" | "critical";
 
 export type AttentionSource =
-  | "mission"
   | "execution"
   | "runtime"
   | "provider"
@@ -69,7 +68,7 @@ export type AttentionSource =
   | "configuration";
 
 export type AttentionDestination =
-  | "mission-control"
+  | "job-execution"
   | "control-center"
   | "resource-ledger"
   | "logs"
@@ -77,7 +76,7 @@ export type AttentionDestination =
   | "chat";
 
 export type ApprovalType =
-  | "mission-launch"
+  | "job-launch"
   | "spend-increase"
   | "provider-use"
   | "external-action"
@@ -92,8 +91,9 @@ export type AttentionApproval = {
   requestedAction: string;
   reason: string;
   requester: string;
-  missionId?: string;
-  missionTitle?: string;
+  jobId?: string;
+  jobTitle?: string;
+  sessionId?: string;
   taskId?: string;
   taskTitle?: string;
   requestedAt: string;
@@ -108,8 +108,8 @@ export type AttentionApproval = {
 };
 
 export type BlockedContext = {
-  missionId: string;
-  missionTitle: string;
+  jobId: string;
+  jobTitle: string;
   taskId?: string;
   taskTitle?: string;
   workerId?: string;
@@ -147,8 +147,9 @@ export type AttentionItem = {
    * leave this unset and are scoped by the project snapshot instead.
    */
   projectId?: ProjectId;
-  missionId?: string;
-  missionTitle?: string;
+  jobId?: string;
+  jobTitle?: string;
+  sessionId?: string;
   taskId?: string;
   taskTitle?: string;
   providerId?: string;
@@ -216,7 +217,6 @@ export const ATTENTION_STATUS_LABELS: Record<AttentionLifecycle, string> = {
 };
 
 export const ATTENTION_SOURCE_LABELS: Record<AttentionSource, string> = {
-  mission: "Mission",
   execution: "Execution",
   runtime: "Runtime",
   provider: "Provider",
@@ -226,7 +226,7 @@ export const ATTENTION_SOURCE_LABELS: Record<AttentionSource, string> = {
 };
 
 export const APPROVAL_TYPE_LABELS: Record<ApprovalType, string> = {
-  "mission-launch": "Mission launch",
+  "job-launch": "Job launch",
   "spend-increase": "Spend increase",
   "provider-use": "Provider use",
   "external-action": "External action",

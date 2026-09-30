@@ -102,7 +102,7 @@ const KIND_TONE: Record<AttentionKind, Tone> = {
 };
 
 const DESTINATION_LABELS: Record<AttentionDestination, string> = {
-  "mission-control": "Mission Control",
+  "job-execution": "Job Execution",
   "control-center": "Control Center",
   "resource-ledger": "Resource Ledger",
   logs: "Logs",
@@ -112,7 +112,7 @@ const DESTINATION_LABELS: Record<AttentionDestination, string> = {
 
 /** Where each destination is opened. Only `resource-ledger` names a view differently. */
 const DESTINATION_VIEWS: Record<AttentionDestination, WorkspaceView> = {
-  "mission-control": "mission-control",
+  "job-execution": "job-execution",
   "control-center": "control-center",
   "resource-ledger": "ledger",
   logs: "logs",
@@ -212,7 +212,7 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
               <Input
                 value={filters.query}
                 onChange={(event) => setFilters((f) => ({ ...f, query: event.target.value }))}
-                placeholder="Search title, Mission, provider…"
+                placeholder="Search title, Job, provider…"
                 aria-label="Search attention items"
                 className="pl-8"
               />
@@ -375,7 +375,7 @@ function AttentionRow({ item, selected, onSelect }: { item: AttentionItem; selec
           <span className="inline-flex items-center gap-1">
             <Clock3 className="size-3" aria-hidden="true" />{item.createdAt}
           </span>
-          {item.missionTitle && <span className="truncate">· {item.missionTitle}</span>}
+          {item.jobTitle && <span className="truncate">· {item.jobTitle}</span>}
           <span>· {ATTENTION_STATUS_LABELS[item.status]}</span>
         </span>
       </span>
@@ -534,7 +534,7 @@ function InspectorAnswer({ question, answer }: { question: string; answer: strin
 
 function InspectorAffected({ item }: { item: AttentionItem }) {
   const rows: Array<[string, string]> = [];
-  if (item.missionTitle) rows.push(["Mission", item.missionTitle]);
+  if (item.jobTitle) rows.push(["Job", item.jobTitle]);
   if (item.taskTitle) rows.push(["Task", item.taskTitle]);
   if (item.providerLabel) rows.push(["Provider", item.providerLabel + (item.model ? ` · ${item.model}` : "")]);
   if (item.blocked?.workerLabel) rows.push(["Worker", item.blocked.workerLabel]);

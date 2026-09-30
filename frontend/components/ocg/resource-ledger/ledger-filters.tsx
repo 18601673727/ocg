@@ -78,11 +78,11 @@ export function LedgerFilters({
           onChange={(window) => onChange({ ...filter, window: window as TimeWindow })}
         />
         <FilterSelect
-          label="Mission"
-          value={filter.missionId}
-          options={options.missions}
-          allLabel="All missions"
-          onChange={(missionId) => onChange({ ...filter, missionId })}
+          label="Job"
+          value={filter.jobId}
+          options={options.jobs}
+          allLabel="All jobs"
+          onChange={(jobId) => onChange({ ...filter, jobId })}
         />
         <FilterSelect
           label="Worker"

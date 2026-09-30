@@ -3,8 +3,8 @@
  * missing data always renders as the unknown glyph.
  *
  * Every surface that shows a count, cost, duration or clock label uses these so
- * the same quantity reads identically in the ledger, the inspector and Mission
- * Control. A surface with a genuinely different rule (a ledger needs UTC, the
+ * the same quantity reads identically in the ledger, the inspector and Job
+ * Execution. A surface with a genuinely different rule (a ledger needs UTC, the
  * log tail needs a local clock) gets its own named function here rather than a
  * second private helper in a feature folder.
  */

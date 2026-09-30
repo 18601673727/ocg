@@ -83,7 +83,6 @@ export function validateRuntimeSnapshotEnvelope(input: unknown): RuntimeSnapshot
   if (!isNonEmptyString(input.snapshot.scenario)) return invalidSnapshot("Snapshot scenario is required.");
   if (!Array.isArray(input.snapshot.sessions)) return invalidSnapshot("Snapshot sessions must be an array.");
   if (!isRecord(input.snapshot.messagesBySession)) return invalidSnapshot("Snapshot messagesBySession must be an object.");
-  if (!isRecord(input.snapshot.missionsBySession)) return invalidSnapshot("Snapshot missionsBySession must be an object.");
   if (!isRecord(input.snapshot.observabilityBySession)) return invalidSnapshot("Snapshot observabilityBySession must be an object.");
   if (!isRecord(input.snapshot.executionBySession)) return invalidSnapshot("Snapshot executionBySession must be an object.");
   if (input.snapshot.resourceLedger !== null && (!isRecord(input.snapshot.resourceLedger) || !Array.isArray(input.snapshot.resourceLedger.entries) || input.snapshot.resourceLedger.entries.some((entry) => !isRecord(entry) || !isNonEmptyString(entry.id)))) {
@@ -116,7 +115,6 @@ export function emptyRuntimeSnapshot(scenario: ScenarioId): RuntimeSnapshot {
     status: { state: "connecting", detail: "Runtime snapshot is not loaded." },
     sessions: [],
     messagesBySession: {},
-    missionsBySession: {},
     observabilityBySession: {},
     executionBySession: {},
     accountingBySession: {},
@@ -146,7 +144,6 @@ export function createRuntimeSnapshotFromFixture(fixture: ScenarioFixture): Runt
     status: JSON.parse(JSON.stringify(fixture.runtimeStatus)),
     sessions: JSON.parse(JSON.stringify(fixture.sessions)),
     messagesBySession: JSON.parse(JSON.stringify(fixture.messagesBySession)),
-    missionsBySession: JSON.parse(JSON.stringify(fixture.missionsBySession)),
     observabilityBySession: JSON.parse(JSON.stringify(fixture.observabilityBySession)),
     executionBySession,
     accountingBySession,

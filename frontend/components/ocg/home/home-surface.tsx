@@ -16,7 +16,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
   selectHomeAttention,
-  selectHomeActiveMissions,
+  selectHomeActiveJobs,
   selectRecentWork,
   selectResourceHealthSummary,
   selectHomeUsageSummary,
@@ -25,7 +25,7 @@ import {
 import type {
   AttentionDestination,
   AttentionItem,
-  ActiveMissionProjection,
+  ActiveJobProjection,
   ContinueWorkingEntry,
   RecentActivityItem,
   ResourceHealthSummary,
@@ -51,7 +51,7 @@ type HomeSurfaceProps = {
 
 /** Where a home attention row sends the operator. Onboarding lives in Settings. */
 const DESTINATION_VIEWS: Record<AttentionDestination, WorkspaceView> = {
-  "mission-control": "mission-control",
+  "job-execution": "job-execution",
   "control-center": "control-center",
   "resource-ledger": "ledger",
   logs: "logs",
@@ -79,20 +79,15 @@ const KIND_LABELS: Record<AttentionItem["kind"], string> = {
   degradedResource: "Degraded resource",
 };
 
-const STATUS_LABELS: Record<ActiveMissionProjection["status"], string> = {
-  planning: "Planning",
+const STATUS_LABELS: Record<ActiveJobProjection["status"], string> = {
   running: "Running",
-  paused: "Paused",
-  completed: "Completed",
-  failed: "Failed",
-  "budget-exhausted": "Budget exhausted",
   pending: "Pending",
 };
 
 export function HomeSurface(props: HomeSurfaceProps) {
   const { snapshot } = props;
   const attention = useMemo(() => selectHomeAttention(snapshot), [snapshot]);
-  const missions = useMemo(() => selectHomeActiveMissions(snapshot), [snapshot]);
+  const jobs = useMemo(() => selectHomeActiveJobs(snapshot), [snapshot]);
   const recentWork = useMemo(() => selectRecentWork(snapshot.sessions), [snapshot.sessions]);
   const resourceHealth = useMemo(() => selectResourceHealthSummary(snapshot.bootstrap), [snapshot.bootstrap]);
   const usage = useMemo(() => selectHomeUsageSummary(snapshot.resourceLedger), [snapshot.resourceLedger]);
@@ -125,7 +120,7 @@ export function HomeSurface(props: HomeSurfaceProps) {
         <div className="grid gap-5 lg:grid-cols-[1fr_320px] xl:grid-cols-[1fr_380px]">
           {/* Left column */}
           <div className="flex flex-col gap-5">
-            <ActiveMissionsSection missions={missions} onNavigate={props.onNavigate} />
+            <ActiveJobsSection jobs={jobs} onNavigate={props.onNavigate} />
             <ContinueWorkingSection entries={recentWork} />
             <RecentActivitySection items={activity} />
           </div>
@@ -203,71 +198,71 @@ function AttentionSection({
 }
 
 // ---------------------------------------------------------------------------
-// Active missions section
+// Active jobs section
 // ---------------------------------------------------------------------------
 
-function ActiveMissionsSection({
-  missions,
+function ActiveJobsSection({
+  jobs,
   onNavigate,
 }: {
-  missions: ActiveMissionProjection[];
+  jobs: ActiveJobProjection[];
   onNavigate: (view: WorkspaceView) => void;
 }) {
-  const openMissionControl = () => onNavigate("mission-control");
-  if (missions.length === 0) {
+  const openJobExecution = () => onNavigate("job-execution");
+  if (jobs.length === 0) {
     return (
-      <section aria-label="Active missions">
-        <SectionHeading title="Active Missions" />
-        <EmptyPanel icon={Rocket} title="No active missions" hint="Start a Mission to see it here" className="mt-2" />
+      <section aria-label="Active jobs">
+        <SectionHeading title="Active Jobs" />
+        <EmptyPanel icon={Rocket} title="No active jobs" hint="Start a Job to see it here" className="mt-2" />
       </section>
     );
   }
 
   return (
-    <section aria-label="Active missions">
+    <section aria-label="Active jobs">
       <SectionHeading
-        title="Active Missions"
-        action={<Button variant="ghost" size="xs" onClick={openMissionControl}>Mission Control <ArrowRight className="ml-1 size-3" /></Button>}
+        title="Active Jobs"
+        action={<Button variant="ghost" size="xs" onClick={openJobExecution}>Job Execution <ArrowRight className="ml-1 size-3" /></Button>}
       />
       <div className="flex flex-col gap-2">
-        {missions.map((mission) => (
-          <MissionCard key={mission.id} mission={mission} onClick={openMissionControl} />
+        {jobs.map((job) => (
+          <JobCard key={job.id} job={job} onClick={openJobExecution} />
         ))}
       </div>
     </section>
   );
 }
 
-function MissionCard({ mission, onClick }: { mission: ActiveMissionProjection; onClick: () => void }) {
-  const statusLabel = STATUS_LABELS[mission.status] ?? mission.status;
-  const waveInfo = mission.currentWave && mission.totalWaves ? `Wave ${mission.currentWave}/${mission.totalWaves}` : null;
-  const budgetText = mission.budgetSpent !== undefined && mission.budgetLimit ? `$${mission.budgetSpent.toFixed(2)} / $${mission.budgetLimit.toFixed(2)}` : null;
+function JobCard({ job, onClick }: { job: ActiveJobProjection; onClick: () => void }) {
+  const statusLabel = STATUS_LABELS[job.status] ?? job.status;
+  const waveInfo = job.currentWave && job.totalWaves ? `Wave ${job.currentWave}/${job.totalWaves}` : null;
+  const budgetText = job.budgetSpent !== undefined && job.budgetLimit ? `$${job.budgetSpent.toFixed(2)} / $${job.budgetLimit.toFixed(2)}` : null;
 
   return (
     <button
       type="button"
       onClick={onClick}
       className="flex w-full items-start gap-3 rounded-lg border border-border bg-card p-3 text-left transition-colors hover:bg-muted/30"
-      aria-label={`${mission.title} · ${statusLabel} · ${mission.completed} of ${mission.total} tasks`}
+      aria-label={`${job.title} · ${statusLabel} · ${job.completed} of ${job.total} calls`}
     >
       <div className="flex min-w-0 flex-1 flex-col gap-1.5">
         <div className="flex items-center gap-2">
-          <span className="truncate text-[13px] font-semibold">{mission.title}</span>
+          <span className="truncate text-[13px] font-semibold">{job.title}</span>
           <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium capitalize bg-muted text-muted-foreground">
             {statusLabel}
           </span>
         </div>
         <div className="flex items-center gap-3 text-[12px] text-muted-foreground">
-          <span>{mission.completed} / {mission.total} tasks</span>
-          {mission.activeWorkers > 0 && <span>{mission.activeWorkers} active</span>}
-          {mission.blockedWorkers > 0 && <span className="text-amber-600 dark:text-amber-400">{mission.blockedWorkers} blocked</span>}
+          <span>{job.completed} / {job.total} calls</span>
+          {job.activeWorkers > 0 && <span>{job.activeWorkers} active</span>}
+          {job.blockedWorkers > 0 && <span className="text-amber-600 dark:text-amber-400">{job.blockedWorkers} blocked</span>}
           {waveInfo && <span>{waveInfo}</span>}
-          <span className="ml-auto flex items-center gap-1"><Clock3 className="size-3" />{mission.elapsed}</span>
+          <span className="ml-auto flex items-center gap-1"><Clock3 className="size-3" />{job.elapsed}</span>
         </div>
         {budgetText && (
           <div className="flex items-center gap-2 text-[12px]">
             <span className="text-muted-foreground">{budgetText}</span>
-            <span className="text-[11px] text-muted-foreground">({mission.progress}%)</span>
+            <span className="text-[11px] text-muted-foreground">({job.progress}%)</span>
           </div>
         )}
       </div>
@@ -294,7 +289,7 @@ function ContinueWorkingSection({ entries }: { entries: ContinueWorkingEntry[] }
             className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-muted/40"
           >
             <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted">
-              {entry.kind === "mission" ? (
+              {entry.kind === "job" ? (
                 <LayoutDashboard className="size-3.5 text-muted-foreground" />
               ) : entry.kind === "diagnostics" ? (
                 <Search className="size-3.5 text-muted-foreground" />

@@ -1,7 +1,6 @@
 import type {
   ChatMessage,
   ChatSession,
-  Mission,
   RuntimeStatus,
   ToolActivity,
 } from "../types";
@@ -26,7 +25,7 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "worker-parallel",
   "build-failed",
   "retry-success",
-  "mission-complete",
+  "job-completed",
   "budget-exhausted",
   "runtime-disconnected",
   "runtime-connecting",
@@ -50,7 +49,7 @@ export const SCENARIO_IDS: readonly ScenarioId[] = [
   "onboarding-discovery",
   "onboarding-ready",
   "profiles-models",
-  "mission-control",
+  "job-execution",
   "logs-live",
   "home-overview",
   "home-calm",
@@ -73,9 +72,9 @@ const sessions: ChatSession[] = [
   baseSession,
   { id: "research-space-bunny", title: "Space Bunny architecture study", workType: "research", updatedAt: "2h ago" },
   { id: "research-rust-graph", title: "Rust graph storage options", workType: "research", updatedAt: "1d ago" },
-  { id: "coding-mission-runtime", title: "OCG durable mission runtime", workType: "coding", updatedAt: "12m ago" },
+  { id: "coding-mission-runtime", title: "OCG durable job runtime", workType: "coding", updatedAt: "12m ago" },
   { id: "coding-tool-gateway", title: "Tool Call Gateway", workType: "coding", updatedAt: "3h ago" },
-  { id: "design-resource-controls", title: "Mission resource controls", workType: "design", updatedAt: "2d ago" },
+  { id: "design-resource-controls", title: "Job resource controls", workType: "design", updatedAt: "2d ago" },
   { id: "devops-debian-runtime", title: "Debian runtime setup", workType: "devops", updatedAt: "5h ago" },
   { id: "devops-cloudflare-access", title: "Cloudflare remote access", workType: "devops", updatedAt: "4d ago" },
 ];
@@ -108,7 +107,7 @@ function normalMessages(): ChatMessage[] {
     message(
       "normal-a1",
       "assistant",
-      "Keep the shell, conversation state, and Mission state separate. The mock runtime owns the data today, so a future transport can replace it without changing the panels.",
+      "Keep the shell, conversation state, and Job state separate. The mock runtime owns the data today, so a future transport can replace it without changing the panels.",
     ),
   ];
 }
@@ -123,35 +122,9 @@ function genericMessages(session: ChatSession): ChatMessage[] {
     message(
       `${session.id}-a1`,
       "assistant",
-      `Open question for **${session.title}**:\n\n- Scope the smallest deliverable first.\n- Keep UI state local until the runtime contract is frozen.\n- Record decisions in the thread for the later durable Mission.\n\nThis is mock content — no backend is connected in this phase.`,
+      `Open question for **${session.title}**:\n\n- Scope the smallest deliverable first.\n- Keep UI state local until the runtime contract is frozen.\n- Record decisions in the thread for the later durable Job.\n\nThis is mock content — no backend is connected in this phase.`,
     ),
   ];
-}
-
-function mission(status: Mission["status"], overrides: Partial<Mission> = {}): Mission {
-  return {
-    title: "Build OCG PWA shell",
-    goal: "Exercise the frontend runtime boundary with a realistic Mission surface.",
-    status,
-    completed: 3,
-    total: 7,
-    current: "Implement runtime abstraction",
-    tasks: [
-      { id: "t1", title: "Establish project baseline", status: "completed" },
-      { id: "t2", title: "Build application shell", status: "completed" },
-      { id: "t3", title: "Define frontend domain", status: "completed" },
-      { id: "t4", title: "Exercise mock runtime", status: "active" },
-      { id: "t5", title: "Connect future transport", status: "pending" },
-      { id: "t6", title: "Add durable persistence", status: "pending" },
-      { id: "t7", title: "Ship runtime integration", status: "pending" },
-    ],
-    workers: [{ id: "ocg-local", name: "ocg-local", status: "idle", task: "Waiting" }],
-    elapsed: "42m",
-    commitment: { workers: 2, mode: "capped" },
-    budget: { spent: 4.2, limit: 25, currency: "USD", status: "within-limit" },
-    warnings: [],
-    ...overrides,
-  };
 }
 
 function runtimeWorker(
@@ -205,7 +178,7 @@ function activity(
   };
 }
 
-function createDefaultObservability(missionId: string): RuntimeObservability {
+function createDefaultObservability(jobId: string): RuntimeObservability {
   const workers = [
     runtimeWorker("lead", "Lead-Mid", "Command Code", "Muse Spark 1.3 Contributor", {
       status: "active",
@@ -234,8 +207,8 @@ function createDefaultObservability(missionId: string): RuntimeObservability {
   ];
   const total = usage(15300, "estimated");
   return {
-    mission: {
-      missionId,
+    job: {
+      jobId,
       tokenUsage: { input: usage(11000), output: usage(4300), total },
       costMicros: usage(92000, "estimated"),
       elapsedMs: 2520000,
@@ -257,10 +230,10 @@ function createDefaultObservability(missionId: string): RuntimeObservability {
   };
 }
 
-function createLiveObservability(missionId: string): RuntimeObservability {
+function createLiveObservability(jobId: string): RuntimeObservability {
   return {
-    mission: {
-      missionId,
+    job: {
+      jobId,
       tokenUsage: { input: usage(6400), output: usage(1800), total: usage(8200, "estimated") },
       costMicros: usage(51000, "estimated"),
       elapsedMs: 18000,
@@ -297,7 +270,7 @@ function createLiveObservability(missionId: string): RuntimeObservability {
       { timestamp: "00:18", elapsedMs: 18000, cumulativeUsage: { input: usage(6400), output: usage(1800), total: usage(8200, "estimated") } },
     ),
     activities: [
-      activity("live-lead-started", 0, "worker-started", "Lead started coordinating the Mission", { workerId: "lead", label: "Lead-Mid", role: "lead", provider: "Command Code", model: "Muse Spark 1.3 Contributor", status: "active" }),
+      activity("live-lead-started", 0, "worker-started", "Lead started coordinating the Job", { workerId: "lead", label: "Lead-Mid", role: "lead", provider: "Command Code", model: "Muse Spark 1.3 Contributor", status: "active" }),
       activity("live-explore-started", 4000, "worker-started", "Explore started runtime mapping", { workerId: "explore", label: "Explore", role: "worker", provider: "OpenCode Go", model: "Space Bunny Free", status: "active" }),
       activity("live-deep-started", 9000, "worker-started", "Explore Deep started architecture review", { workerId: "explore-deep", label: "Explore Deep", role: "worker", provider: "OpenCode Go", model: "Space Bunny Free", status: "active" }),
       activity("live-usage-estimated", 18000, "invocation-started", "Streaming usage is estimated"),
@@ -320,7 +293,7 @@ function updateLiveObservability(base: RuntimeObservability, step: 1 | 2 | 3): R
       tokenUsage: { input: usage(1500), output: usage(300), total: usage(1800, "estimated") },
       costMicros: usage(7000, "estimated"), latencyMs: 480, ttftMs: 120,
     });
-    next.mission = { ...next.mission, tokenUsage: { input: usage(8300), output: usage(2300), total: usage(10600, "estimated") }, costMicros: usage(68000, "estimated"), elapsedMs: 25000, invocationCount: 5, activeWorkerCount: 3 };
+    next.job = { ...next.job, tokenUsage: { input: usage(8300), output: usage(2300), total: usage(10600, "estimated") }, costMicros: usage(68000, "estimated"), elapsedMs: 25000, invocationCount: 5, activeWorkerCount: 3 };
     next.activities = [...next.activities, activity("live-explore-completed", 25000, "worker-completed", "Explore completed runtime mapping", next.workers.find((worker) => worker.workerId === "explore")), activity("live-build-started", 25000, "worker-started", "Build started implementation", next.workers.find((worker) => worker.workerId === "build")), activity("live-verify-waiting", 25000, "worker-waiting", "Verify is waiting for the build", next.workers.find((worker) => worker.workerId === "verify"))];
     next.timeline = [...next.timeline, { timestamp: "00:25", elapsedMs: 25000, cumulativeUsage: { input: usage(8300), output: usage(2300), total: usage(10600, "estimated") } }];
   }
@@ -331,7 +304,7 @@ function updateLiveObservability(base: RuntimeObservability, step: 1 | 2 | 3): R
     if (deep) Object.assign(deep, { status: "completed", finishedAt: "00:31", elapsedMs: 31000, successCount: 1, tokenUsage: { input: usage(1500), output: usage(490), total: usage(1990) }, costMicros: usage(10000), latencyMs: 760, tokensPerSecond: 29 });
     if (build) Object.assign(build, { status: "active", elapsedMs: 18000, invocationCount: 2, retryCount: 1, tokenUsage: { input: usage(2100), output: usage(600), total: usage(2700, "estimated") }, costMicros: usage(11000, "estimated"), latencyMs: 540 });
     if (verify) Object.assign(verify, { status: "active", startedAt: "00:33", elapsedMs: 5000, invocationCount: 1, tokenUsage: { input: usage(900), output: usage(120), total: usage(1020, "estimated") }, latencyMs: 390 });
-    next.mission = { ...next.mission, tokenUsage: { input: usage(10800), output: usage(3200), total: usage(14000, "estimated") }, costMicros: usage(88000, "estimated"), elapsedMs: 36000, invocationCount: 7, retryCount: 1, activeWorkerCount: 3 };
+    next.job = { ...next.job, tokenUsage: { input: usage(10800), output: usage(3200), total: usage(14000, "estimated") }, costMicros: usage(88000, "estimated"), elapsedMs: 36000, invocationCount: 7, retryCount: 1, activeWorkerCount: 3 };
     next.activities = [...next.activities, activity("live-build-failed", 32000, "invocation-failed", "Build invocation failed transiently", build), activity("live-build-retry", 33000, "retry-scheduled", "Build retry scheduled after transient failure", build), activity("live-verify-started", 36000, "worker-started", "Verify started the post-build check", verify)];
     next.timeline = [...next.timeline, { timestamp: "00:36", elapsedMs: 36000, cumulativeUsage: { input: usage(10800), output: usage(3200), total: usage(14000, "estimated") } }];
   }
@@ -339,8 +312,8 @@ function updateLiveObservability(base: RuntimeObservability, step: 1 | 2 | 3): R
     next.workers = next.workers.map((worker) => worker.workerId === "docs"
       ? { ...worker, status: "completed", elapsedMs: 6000, invocationCount: 1, successCount: 1, tokenUsage: { input: usage(700), output: usage(220), total: usage(920) } }
       : { ...worker, status: worker.status === "idle" ? "completed" : "completed", finishedAt: "00:44", successCount: worker.successCount ?? 1, tokenUsage: Object.fromEntries(Object.entries(worker.tokenUsage).map(([key, value]) => [key, value && { ...value, provenance: "reported" }])) as WorkerRuntimeStats["tokenUsage"] });
-    next.mission = { ...next.mission, tokenUsage: { input: usage(12400, "reported"), output: usage(3900, "reported"), total: usage(16300, "reported") }, costMicros: usage(104000, "reported"), estimatedFinalSpend: usage(10.4, "reported"), elapsedMs: 44000, invocationCount: 9, retryCount: 1, activeWorkerCount: 0 };
-    next.activities = [...next.activities, activity("live-usage-finalized", 44000, "usage-finalized", "Provider-reported usage finalized"), activity("live-mission-complete", 44000, "mission-transition", "Mission completed")];
+    next.job = { ...next.job, tokenUsage: { input: usage(12400, "reported"), output: usage(3900, "reported"), total: usage(16300, "reported") }, costMicros: usage(104000, "reported"), estimatedFinalSpend: usage(10.4, "reported"), elapsedMs: 44000, invocationCount: 9, retryCount: 1, activeWorkerCount: 0 };
+    next.activities = [...next.activities, activity("live-usage-finalized", 44000, "usage-finalized", "Provider-reported usage finalized"), activity("live-job-complete", 44000, "job-transition", "Job completed")];
     next.timeline = [...next.timeline, { timestamp: "00:44", elapsedMs: 44000, cumulativeUsage: { input: usage(12400, "reported"), output: usage(3900, "reported"), total: usage(16300, "reported") } }];
   }
   return next;
@@ -351,11 +324,10 @@ export type ScenarioFixture = {
   runtimeStatus: RuntimeStatus;
   sessions: ChatSession[];
   messagesBySession: Record<string, ChatMessage[]>;
-  missionsBySession: Record<string, Mission | null>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
   resourceLedger: ResourceLedger | null;
   bootstrap: BootstrapState;
-  observabilityUpdates?: { afterMs: number; sessionId: string; observability: RuntimeObservability; mission?: Mission }[];
+  observabilityUpdates?: { afterMs: number; sessionId: string; observability: RuntimeObservability }[];
   streamChunks?: string[];
   streamDelayMs?: number;
 };
@@ -369,7 +341,6 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
     messagesBySession: Object.fromEntries(
       sessions.map((session) => [session.id, session.id === baseSession.id ? normalMessages() : genericMessages(session)]),
     ),
-    missionsBySession: Object.fromEntries(sessions.map((session) => [session.id, mission("running")])),
     observabilityBySession: Object.fromEntries(sessions.map((session) => [session.id, createDefaultObservability(session.id)])),
     resourceLedger: createResourceLedgerFixture(id),
     streamChunks: [
@@ -381,21 +352,6 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
   };
 
   switch (id) {
-    case "mission-control": {
-      fixture.missionsBySession[baseSession.id] = mission("running", {
-        title: "Canonical Job",
-        goal: "Dogfood the frontend execution inspector while preserving existing OCG surfaces.",
-        completed: 0,
-        total: 0,
-        current: "Verify is checking the integration gate",
-        tasks: [],
-        workers: [],
-        elapsed: "55m",
-        commitment: { workers: 0, mode: "capped" },
-        budget: { spent: 0, limit: 0, currency: "USD", status: "within-limit" },
-      });
-      break;
-    }
     case "long-stream":
       fixture.messagesBySession[baseSession.id] = [
         message("stream-u1", "user", "Show me the runtime state as it arrives."),
@@ -417,49 +373,21 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
         message("tool-a1", "assistant", "The mock runtime can show several activities without coupling the UI to a backend protocol."),
       ];
       break;
-    case "worker-parallel":
-      fixture.missionsBySession[baseSession.id] = mission("running", {
-        current: "Parallel workers are evaluating shell boundaries",
-        workers: [
-          { id: "worker-research", name: "researcher", status: "active", task: "Compare runtime contracts" },
-          { id: "worker-build", name: "builder", status: "active", task: "Exercise fixture states" },
-          { id: "worker-review", name: "reviewer", status: "completed", task: "Review component boundaries" },
-        ],
-        commitment: { workers: 3, mode: "capped" },
-      });
-      break;
     case "observability-live": {
       const live = createLiveObservability(baseSession.id);
       fixture.observabilityBySession[baseSession.id] = live;
-      fixture.missionsBySession[baseSession.id] = mission("running", {
-        current: "Lead is coordinating parallel runtime work",
-        workers: [
-          { id: "lead", name: "Lead-Mid", status: "active", task: "Coordinate Mission" },
-          { id: "explore", name: "Explore", status: "active", task: "Map runtime boundaries" },
-          { id: "explore-deep", name: "Explore Deep", status: "active", task: "Check architecture impact" },
-        ],
-        commitment: { workers: 7, mode: "flexible" },
-      });
       const step1 = updateLiveObservability(live, 1);
       const step2 = updateLiveObservability(step1, 2);
       const step3 = updateLiveObservability(step2, 3);
       fixture.observabilityUpdates = [
-        { afterMs: 650, sessionId: baseSession.id, observability: step1, mission: mission("running", { completed: 4, current: "Build is assembling the selected change", budget: { spent: 6.8, limit: 25, currency: "USD", status: "within-limit" }, workers: [{ id: "lead", name: "Lead-Mid", status: "active", task: "Coordinate Mission" }, { id: "explore", name: "Explore", status: "completed", task: "Map runtime boundaries" }, { id: "build", name: "Build", status: "active", task: "Implement foundation" }] }) },
-        { afterMs: 1300, sessionId: baseSession.id, observability: step2, mission: mission("running", { completed: 5, current: "Verify is checking the build after one retry", budget: { spent: 8.8, limit: 25, currency: "USD", status: "within-limit" }, workers: [{ id: "lead", name: "Lead-Mid", status: "active", task: "Coordinate Mission" }, { id: "build", name: "Build", status: "active", task: "Implement foundation" }, { id: "verify", name: "Verify", status: "active", task: "Review the result" }] }) },
-        { afterMs: 1950, sessionId: baseSession.id, observability: step3, mission: mission("completed", { completed: 7, current: "Mission complete", budget: { spent: 10.4, limit: 25, currency: "USD", status: "within-limit" }, tasks: fixture.missionsBySession[baseSession.id]!.tasks.map((task) => ({ ...task, status: "completed" })), workers: [{ id: "lead", name: "Lead-Mid", status: "completed", task: "Mission complete" }] }) },
+        { afterMs: 650, sessionId: baseSession.id, observability: step1 },
+        { afterMs: 1300, sessionId: baseSession.id, observability: step2 },
+        { afterMs: 1950, sessionId: baseSession.id, observability: step3 },
       ];
       break;
     }
     case "build-failed":
       fixture.runtimeStatus = { state: "failed", detail: "Build verification reported a fixture failure" };
-      fixture.missionsBySession[baseSession.id] = mission("failed", {
-        current: "Build verification failed",
-        tasks: fixture.missionsBySession[baseSession.id]!.tasks.map((task) =>
-          task.id === "t4" ? { ...task, status: "failed" } : task,
-        ),
-        workers: [{ id: "builder", name: "builder", status: "failed", task: "Build verification" }],
-        warnings: ["The fixture represents a failed build; no command was executed."],
-      });
       fixture.messagesBySession[baseSession.id] = [
         message("failed-u1", "user", "Run the build verification."),
         message("failed-t1", "tool", "", "failed", tool("failed-t1", "failure", "build.verify", "Build failed with fixture error")),
@@ -467,42 +395,20 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
       ];
       break;
     case "retry-success":
-      fixture.missionsBySession[baseSession.id] = mission("running", {
-        warnings: ["One activity succeeded after a retry."],
-        current: "Continue after successful retry",
-      });
       fixture.messagesBySession[baseSession.id] = [
         message("retry-u1", "user", "Retry the failed build."),
         message("retry-t1", "tool", "", "completed", tool("retry-t1", "success", "build.verify", "Succeeded on retry")),
-        message("retry-a1", "assistant", "The retry succeeded. The Mission can continue without hiding the earlier failure."),
+        message("retry-a1", "assistant", "The retry succeeded. The Job can continue without hiding the earlier failure."),
       ];
-      break;
-    case "mission-complete":
-      fixture.missionsBySession[baseSession.id] = mission("completed", {
-        completed: 7,
-        current: "Mission complete",
-        tasks: fixture.missionsBySession[baseSession.id]!.tasks.map((task) => ({ ...task, status: "completed" })),
-        workers: [{ id: "ocg-local", name: "ocg-local", status: "completed", task: "All tasks complete" }],
-      });
-      break;
-    case "budget-exhausted":
-      fixture.missionsBySession[baseSession.id] = mission("budget-exhausted", {
-        current: "Budget exhausted before the next task",
-        budget: { spent: 25, limit: 25, currency: "USD", status: "exhausted" },
-        warnings: ["Hard budget reached. No additional work will be started."],
-      });
       break;
     case "runtime-disconnected":
       fixture.runtimeStatus = { state: "disconnected", detail: "No local runtime is connected" };
-      fixture.missionsBySession[baseSession.id] = null;
       break;
     case "runtime-connecting":
       fixture.runtimeStatus = { state: "connecting", detail: "Connecting to the local mock runtime" };
-      fixture.missionsBySession[baseSession.id] = null;
       break;
     case "runtime-failed":
       fixture.runtimeStatus = { state: "failed", detail: "The local mock runtime failed to start" };
-      fixture.missionsBySession[baseSession.id] = null;
       break;
     case "permission-required":
       fixture.messagesBySession[baseSession.id] = [
@@ -510,81 +416,17 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
         message("permission-t1", "tool", "", "pending", tool("permission-t1", "waiting-approval", "workspace.write", "Waiting for operator approval")),
         message("permission-a1", "assistant", "The next activity is waiting for approval before it can continue."),
       ];
-      fixture.missionsBySession[baseSession.id] = mission("paused", { current: "Waiting for operator approval" });
       break;
     case "home-overview": {
       // Deterministic busy workspace for the Home overview surface.
-      // Uses profiles-models bootstrap for full resource data.
+      // Uses profiles-models bootstrap for full resource data. Canonical Job
+      // execution comes from the execution fixtures, not a parallel object.
       fixture.bootstrap = createBootstrapFixture("profiles-models");
-      fixture.missionsBySession[baseSession.id] = mission("running", {
-        title: "Consolidate frontend architecture",
-        goal: "Dogfood the frontend execution inspector while preserving existing OCG surfaces.",
-        completed: 8,
-        total: 13,
-        current: "Wave 4/6",
-        tasks: [
-          { id: "t1", title: "Recon", status: "completed" },
-          { id: "t2", title: "Inventory", status: "completed" },
-          { id: "t3", title: "Foundation", status: "completed" },
-          { id: "t4", title: "Design system", status: "completed" },
-          { id: "t5", title: "Runtime boundary", status: "completed" },
-          { id: "t6", title: "Mission inspector", status: "completed" },
-          { id: "t7", title: "Onboarding", status: "completed" },
-          { id: "t8", title: "Resource ledger", status: "failed" },
-          { id: "t9", title: "Responsive", status: "active" },
-          { id: "t10", title: "Integration gate", status: "active" },
-          { id: "t11", title: "Verification follow-up", status: "pending" },
-          { id: "t12", title: "Conflict debug", status: "failed" },
-          { id: "t13", title: "Release gate", status: "pending" },
-        ],
-        workers: [
-          { id: "lead", name: "Lead", status: "active", task: "Coordinate" },
-          { id: "explore", name: "Explore", status: "completed", task: "Recon" },
-          { id: "explore-deep", name: "Explore Deep", status: "completed", task: "Inventory" },
-          { id: "build", name: "Build", status: "active", task: "Resource ledger" },
-          { id: "verify", name: "Verify", status: "active", task: "Integration" },
-          { id: "debug", name: "Debug", status: "waiting", task: "Conflict" },
-        ],
-        elapsed: "55m",
-        commitment: { workers: 6, mode: "capped" },
-        budget: { spent: 4.2, limit: 25, currency: "USD", status: "within-limit" },
-      });
-      // Add a paused mission
-      fixture.missionsBySession["research-space-bunny"] = {
-        title: "Space Bunny architecture study",
-        goal: "Research workspace.",
-        status: "paused",
-        completed: 2,
-        total: 5,
-        current: "Blocked on dependency",
-        tasks: [{ id: "t1", title: "One", status: "completed" }, { id: "t2", title: "Two", status: "failed" }],
-        workers: [{ id: "explore", name: "Explore", status: "waiting" }],
-        elapsed: "42m",
-        commitment: { workers: 1, mode: "capped" },
-        budget: { spent: 8.0, limit: 25, currency: "USD", status: "within-limit" },
-        warnings: [],
-      };
-      // Add a recently completed mission
-      fixture.missionsBySession["research-rust-graph"] = {
-        title: "Rust graph storage options",
-        goal: "Research workspace.",
-        status: "completed",
-        completed: 5,
-        total: 5,
-        current: "Complete",
-        tasks: [],
-        workers: [{ id: "explore-deep", name: "Explore Deep", status: "completed" }],
-        elapsed: "3h",
-        commitment: { workers: 1, mode: "capped" },
-        budget: { spent: 3.5, limit: 10, currency: "USD", status: "within-limit" },
-        warnings: [],
-      };
       break;
     }
     case "home-calm": {
-      // Calm workspace with no active missions and no attention items.
+      // Calm workspace with no active jobs and no attention items.
       fixture.bootstrap = createBootstrapFixture("local-ready");
-      fixture.missionsBySession = {};
       fixture.resourceLedger = createResourceLedgerFixture("home-calm");
       break;
     }
@@ -592,52 +434,20 @@ export function createScenarioFixture(id: ScenarioId): ScenarioFixture {
       // Representative actionable mix: spend + retry + launch approvals,
       // a runtime failure needing inspection, provider degradation from the
       // shared bootstrap, real execution-blocked work, and resolved history.
-      // Reuses the home-overview mission/execution shape so cross-links stay
-      // consistent with Mission Control.
+      // Reads the canonical Job execution projection so cross-links stay
+      // consistent with Job Execution.
       fixture.bootstrap = createBootstrapFixture("profiles-models");
-      fixture.missionsBySession[baseSession.id] = mission("running", {
-        title: "Consolidate OCG frontend architecture",
-        goal: "Dogfood the frontend execution inspector while preserving existing OCG surfaces.",
-        completed: 8,
-        total: 13,
-        current: "Wave 4/6",
-        tasks: [
-          { id: "t1", title: "Recon", status: "completed" },
-          { id: "t2", title: "Inventory", status: "completed" },
-          { id: "t3", title: "Foundation", status: "completed" },
-          { id: "t4", title: "Design system", status: "completed" },
-          { id: "t5", title: "Runtime boundary", status: "completed" },
-          { id: "t6", title: "Mission inspector", status: "completed" },
-          { id: "t7", title: "Onboarding", status: "completed" },
-          { id: "t8", title: "Resource ledger", status: "failed" },
-          { id: "t9", title: "Responsive", status: "active" },
-          { id: "t10", title: "Integration gate", status: "active" },
-          { id: "t11", title: "Verification follow-up", status: "pending" },
-          { id: "t12", title: "Conflict debug", status: "failed" },
-          { id: "t13", title: "Release gate", status: "pending" },
-        ],
-        workers: [
-          { id: "lead", name: "Lead", status: "active", task: "Coordinate" },
-          { id: "build", name: "Build", status: "active", task: "Resource ledger" },
-          { id: "verify", name: "Verify", status: "active", task: "Integration" },
-          { id: "debug", name: "Debug", status: "waiting", task: "Conflict" },
-        ],
-        elapsed: "55m",
-        commitment: { workers: 6, mode: "capped" },
-        budget: { spent: 4.2, limit: 25, currency: "USD", status: "within-limit" },
-      });
       fixture.resourceLedger = createResourceLedgerFixture("attention-overview");
       break;
     }
     case "attention-calm": {
       // Healthy workspace: local-ready bootstrap with the optional
-      // auth-required connection resolved, no missions, no ledger,
+      // auth-required connection resolved, no jobs, no ledger,
       // history-only fixture queue. Empty state must look intentional.
       fixture.bootstrap = createBootstrapFixture("local-ready");
       fixture.bootstrap.connections = fixture.bootstrap.connections.filter(
         (connection) => connection.state !== "auth-required",
       );
-      fixture.missionsBySession = {};
       fixture.resourceLedger = null;
       break;
     }

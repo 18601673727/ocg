@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
  * Labelled native select used by every filter row.
  *
  * The label is always visible and the select is always named, so a filter
- * reads the same in the logs surface and in Mission Control.
+ * reads the same in the logs surface and in Job Execution.
  */
 export function FilterSelect({
   label,

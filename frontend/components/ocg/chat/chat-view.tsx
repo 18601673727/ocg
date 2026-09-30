@@ -25,7 +25,7 @@ import {
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { BORDER_TONE, StatusDot, TEXT_TONE, TOOL_STATUS } from "@/components/ocg/primitives";
 import { ActivityPulse } from "../activity-pulse";
-import type { ChatMessage, ChatSession, Mission, RuntimeStatus } from "../types";
+import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
 import {
   applyComposerSuggestion,
   matchComposerSuggestions,
@@ -311,7 +311,7 @@ function Composer({
     setHighlight(null);
     setDismissedFor(null);
     setCommandError(null);
-    if (applied.action === "create-mission") {
+    if (applied.action === "create-job") {
       onDraftChange("");
       onIntent(parseComposerIntent(applied.text));
       return;
@@ -368,7 +368,7 @@ function Composer({
                         )}
                       >
                         <span className="mt-0.5 text-muted-foreground" aria-hidden="true">
-                          {suggestion.action === "create-mission"
+                          {suggestion.action === "create-job"
                             ? <Sparkles className="size-3.5" />
                             : <Command className="size-3.5" />}
                         </span>
@@ -417,7 +417,7 @@ function Composer({
                 }
               }}
               rows={1}
-              placeholder="Message OCG… (type / for Mission commands)"
+              placeholder="Message OCG… (type / for Job commands)"
               aria-label="Message OCG"
               role="combobox"
               aria-autocomplete="list"
@@ -452,7 +452,7 @@ function Composer({
               <Mic className="size-4" />
             </Button>
             <span className="ml-1 hidden text-[11px] text-muted-foreground sm:inline">
-              / for Mission · Enter to send · Shift+Enter for newline
+              / for Job · Enter to send · Shift+Enter for newline
             </span>
             <Button
               type="submit"
@@ -480,7 +480,6 @@ type ChatViewProps = {
   session: ChatSession;
   messages: ChatMessage[];
   runtimeStatus: RuntimeStatus;
-  mission?: Mission | null;
   onComposerIntent: (intent: ComposerIntent) => void;
   /** Structured command surfaces are composed by the shell, not selected here. */
   composerSurface?: React.ReactNode;
@@ -489,7 +488,7 @@ type ChatViewProps = {
 
 const SUGGESTIONS = [
   "Summarize the open decisions in this thread",
-  "Draft the layout grid for Sidebar | Chat | Mission",
+  "Draft the layout grid for Sidebar | Chat | Job",
   "List what Phase 2 needs from this mock state",
 ];
 
@@ -497,7 +496,6 @@ export function ChatView({
   session,
   messages,
   runtimeStatus,
-  mission,
   onComposerIntent,
   composerSurface,
   composerSurfaceKey,
@@ -557,7 +555,6 @@ export function ChatView({
                 )}
                 <span>
                   Runtime <span className="font-medium">{runtimeStatus.state}</span>
-                  {mission ? ` · Mission ${mission.status}` : " · no Mission loaded"}
                   {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
                 </span>
               </div>

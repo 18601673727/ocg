@@ -197,8 +197,8 @@ export function LedgerCallRow({
           </span>
         </div>
         <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[10px] text-muted-foreground">
-          <span className="min-w-0 max-w-full truncate" title={entry.missionLabel}>
-            {entry.missionLabel}
+          <span className="min-w-0 max-w-full truncate" title={entry.jobLabel}>
+            {entry.jobLabel}
           </span>
           <span aria-hidden>·</span>
           <span className="min-w-0 max-w-full truncate" title={entry.taskLabel}>
@@ -253,36 +253,36 @@ export function AttributionSummary({ summary }: { summary: LedgerSummary }) {
   );
 }
 
-/** Hierarchical Mission → task → worker attribution drilldown, including unknowns. */
+/** Hierarchical Job → task → worker attribution drilldown, including unknowns. */
 export function AttributionBreakdown({
-  missions,
+  jobs,
   unknownEntries,
   onSelectEntry,
 }: {
-  missions: LedgerGroup[];
+  jobs: LedgerGroup[];
   unknownEntries: ResourceLedgerEntry[];
   onSelectEntry: (entry: ResourceLedgerEntry) => void;
 }) {
-  if (missions.length === 0 && unknownEntries.length === 0) {
+  if (jobs.length === 0 && unknownEntries.length === 0) {
     return <EmptyState className="px-2 py-4">No attributed calls match the current filters.</EmptyState>;
   }
   return (
     <div className="flex min-w-0 flex-col gap-2">
-      {missions.map((mission) => (
-        <details key={mission.key} className="min-w-0 rounded-md border border-border open:bg-muted/20">
+      {jobs.map((job) => (
+        <details key={job.key} className="min-w-0 rounded-md border border-border open:bg-muted/20">
           <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 px-2.5 py-2 marker:hidden">
             <div className="min-w-0 flex-1">
-              <p className="truncate text-[12px] font-medium" title={mission.label}>
-                {mission.label}
+              <p className="truncate text-[12px] font-medium" title={job.label}>
+                {job.label}
               </p>
               <p className="truncate text-[10px] text-muted-foreground">
-                {mission.summary.entryCount} calls · {mission.summary.workerCount} workers ·{" "}
-                {formatTokens(mission.summary.totalTokens)} tokens
+                {job.summary.entryCount} calls · {job.summary.workerCount} workers ·{" "}
+                {formatTokens(job.summary.totalTokens)} tokens
               </p>
             </div>
             <div className="flex shrink-0 flex-wrap justify-end gap-1">
               {ATTRIBUTION_CONFIDENCES.map((confidence) => {
-                const count = mission.summary.byAttribution[confidence];
+                const count = job.summary.byAttribution[confidence];
                 if (count === 0) return null;
                 return (
                   <span
@@ -297,7 +297,7 @@ export function AttributionBreakdown({
             </div>
           </summary>
           <div className="min-w-0 border-t border-border px-2.5 py-2">
-            <TaskBreakdown mission={mission} onSelectEntry={onSelectEntry} />
+            <TaskBreakdown job={job} onSelectEntry={onSelectEntry} />
           </div>
         </details>
       ))}
@@ -309,7 +309,7 @@ export function AttributionBreakdown({
         >
           <SectionTitle detail={`${unknownEntries.length} calls`}>Unknown attribution</SectionTitle>
           <p className="mb-1.5 text-[10px] text-muted-foreground">
-            These calls could not be assigned to a Mission or task and are surfaced instead of being hidden.
+            These calls could not be assigned to a Job or task and are surfaced instead of being hidden.
           </p>
           <ul className="flex flex-col gap-1">
             {unknownEntries.map((entry) => (
@@ -340,23 +340,23 @@ export function AttributionBreakdown({
 }
 
 function TaskBreakdown({
-  mission,
+  job,
   onSelectEntry,
 }: {
-  mission: LedgerGroup;
+  job: LedgerGroup;
   onSelectEntry: (entry: ResourceLedgerEntry) => void;
 }) {
-  const tasks = groupEntries(mission.entries, "task");
+  const tasks = groupEntries(job.entries, "task");
   return (
     <div className="flex min-w-0 flex-col gap-2">
-      {mission.summary.byAttribution.unknown > 0 && (
+      {job.summary.byAttribution.unknown > 0 && (
         <p className="text-[10px] text-amber-600 dark:text-amber-400">
-          {mission.summary.byAttribution.unknown} call(s) under this Mission have unknown attribution.
+          {job.summary.byAttribution.unknown} call(s) under this Job have unknown attribution.
         </p>
       )}
-      {mission.summary.byReconciliation.mismatch > 0 && (
+      {job.summary.byReconciliation.mismatch > 0 && (
         <p className="text-[10px] text-red-600 dark:text-red-400">
-          {mission.summary.byReconciliation.mismatch} reconciliation mismatch(es) need review.
+          {job.summary.byReconciliation.mismatch} reconciliation mismatch(es) need review.
         </p>
       )}
       <ul className="flex flex-col gap-1.5">
@@ -398,9 +398,9 @@ function TaskBreakdown({
       </ul>
       <button
         type="button"
-        onClick={() => onSelectEntry(mission.entries[0])}
+        onClick={() => onSelectEntry(job.entries[0])}
         className="self-start rounded border border-border px-2 py-0.5 text-[10px] hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring"
-        title="Inspect the first call in this Mission"
+        title="Inspect the first call in this Job"
       >
         Inspect first call
       </button>

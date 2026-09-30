@@ -1,16 +1,19 @@
 /**
- * Pure Mission draft domain.
+ * Pure Job draft domain.
  *
- * A MissionDraft is the operator-owned, frontend-only record of an in-progress
+ * A JobDraft is the operator-owned, frontend-only record of an in-progress
  * launch. It never calls a runtime and never persists to a backend. The
  * lifecycle is a single field (not a pile of booleans) and every transition is
  * a pure reducer step.
  */
 
 import { PROJECT_IDS, type ProjectId } from "../project/domain";
+import type { JobLaunchCommand } from "../runtime/runtime-types";
+
+export type { JobLaunchCommand };
 
 /** A single lifecycle field replaces scattered `isSubmitting`/`hasError` flags. */
-export type MissionDraftLifecycle =
+export type JobDraftLifecycle =
   | "drafting"
   | "invalid"
   | "ready"
@@ -20,10 +23,10 @@ export type MissionDraftLifecycle =
 
 export type HardBudgetSource = "fixture-recommended" | "user";
 
-export type MissionDraftTextField = "objective" | "successCriteria" | "constraints";
+export type JobDraftTextField = "objective" | "successCriteria" | "constraints";
 
-export type MissionDraftField =
-  | MissionDraftTextField
+export type JobDraftField =
+  | JobDraftTextField
   | "hardBudgetMicros"
   | "hardBudgetSource"
   | "resourceCommitment"
@@ -31,7 +34,7 @@ export type MissionDraftField =
   | "projectId"
   | "sessionId";
 
-export type MissionDraftIssueCode =
+export type JobDraftIssueCode =
   | "objective-required"
   | "objective-too-short"
   | "success-criteria-required"
@@ -42,17 +45,17 @@ export type MissionDraftIssueCode =
   | "resource-commitment-out-of-range"
   | "project-invalid"
   | "session-required"
-  | "launched-without-mission"
+  | "launched-without-job"
   | "launch-failed-without-message";
 
-export type MissionDraftIssue = {
-  code: MissionDraftIssueCode;
-  field: MissionDraftField;
+export type JobDraftIssue = {
+  code: JobDraftIssueCode;
+  field: JobDraftField;
   message: string;
   severity: "error" | "warning";
 };
 
-export type MissionDraft = {
+export type JobDraft = {
   /** Stable per (project, session) scope. */
   id: string;
   projectId: ProjectId;
@@ -64,14 +67,14 @@ export type MissionDraft = {
   hardBudgetSource: HardBudgetSource;
   /** Normalized 0..1 share of available capacity. */
   resourceCommitment: number;
-  lifecycle: MissionDraftLifecycle;
-  issues: MissionDraftIssue[];
-  missionId?: string;
+  lifecycle: JobDraftLifecycle;
+  issues: JobDraftIssue[];
+  jobId?: string;
   launchMessage?: string;
 };
 
 /**
- * The existing fixture Mission cap is $25. This is explicitly a fixture
+ * The existing fixture Job cap is $25. This is explicitly a fixture
  * recommendation for the local mock runtime, not a production policy.
  */
 export const FIXTURE_RECOMMENDED_BUDGET_MICROS = 25_000_000;
@@ -83,19 +86,6 @@ export const FIXTURE_RECOMMENDED_BUDGET_NOTE =
 export const HARD_BUDGET_MIN_MICROS = 1;
 export const MIN_OBJECTIVE_LENGTH = 12;
 export const DEFAULT_RESOURCE_COMMITMENT = 0.5;
-
-export type MissionLaunchCommand = {
-  /** Stable command identity; identical content reuses the recorded result. */
-  commandId: string;
-  draftId: string;
-  projectId: ProjectId;
-  sessionId: string;
-  objective: string;
-  successCriteria: string;
-  constraints: string;
-  hardBudgetMicros: number;
-  resourceCommitment: number;
-};
 
 /* -------------------------------------------------------------------------- */
 /* Money helpers                                                              */
@@ -116,8 +106,8 @@ export function usdToMicros(dollars: number): number | null {
 /* Identity                                                                   */
 /* -------------------------------------------------------------------------- */
 
-export function missionDraftId(projectId: ProjectId, sessionId: string): string {
-  return `mission-draft:${projectId}:${sessionId}`;
+export function jobDraftId(projectId: ProjectId, sessionId: string): string {
+  return `job-draft:${projectId}:${sessionId}`;
 }
 
 /** Pure scope key used to store one draft per Project + session. */
@@ -129,7 +119,7 @@ export function draftScopeKey(projectId: ProjectId, sessionId: string): string {
 /* Creation                                                                    */
 /* -------------------------------------------------------------------------- */
 
-export function createMissionDraft(input: {
+export function createJobDraft(input: {
   projectId: ProjectId;
   sessionId: string;
   objective?: string;
@@ -139,12 +129,12 @@ export function createMissionDraft(input: {
   hardBudgetSource?: HardBudgetSource;
   resourceCommitment?: number;
   id?: string;
-}): MissionDraft {
+}): JobDraft {
   const seededBudget = input.hardBudgetMicros === undefined
     ? FIXTURE_RECOMMENDED_BUDGET_MICROS
     : input.hardBudgetMicros;
-  const draft: MissionDraft = {
-    id: input.id ?? missionDraftId(input.projectId, input.sessionId),
+  const draft: JobDraft = {
+    id: input.id ?? jobDraftId(input.projectId, input.sessionId),
     projectId: input.projectId,
     sessionId: input.sessionId,
     objective: input.objective?.trim() ?? "",
@@ -156,29 +146,29 @@ export function createMissionDraft(input: {
     lifecycle: "drafting",
     issues: [],
   };
-  return { ...draft, issues: validateMissionDraft(draft) };
+  return { ...draft, issues: validateJobDraft(draft) };
 }
 
 /* -------------------------------------------------------------------------- */
 /* Validation                                                                  */
 /* -------------------------------------------------------------------------- */
 
-export function missionDraftHasErrors(issues: readonly MissionDraftIssue[]): boolean {
+export function jobDraftHasErrors(issues: readonly JobDraftIssue[]): boolean {
   return issues.some((issue) => issue.severity === "error");
 }
 
-export function validateMissionDraft(
-  draft: MissionDraft,
+export function validateJobDraft(
+  draft: JobDraft,
   validProjectIds: readonly string[] = PROJECT_IDS,
-): MissionDraftIssue[] {
-  const issues: MissionDraftIssue[] = [];
+): JobDraftIssue[] {
+  const issues: JobDraftIssue[] = [];
   const objective = draft.objective.trim();
 
   if (objective.length === 0) {
     issues.push({
       code: "objective-required",
       field: "objective",
-      message: "Add an objective before launching a Mission.",
+      message: "Add an objective before launching a Job.",
       severity: "error",
     });
   } else if (objective.length < MIN_OBJECTIVE_LENGTH) {
@@ -212,7 +202,7 @@ export function validateMissionDraft(
     issues.push({
       code: "session-required",
       field: "sessionId",
-      message: "A Mission draft must belong to a session.",
+      message: "A Job draft must belong to a session.",
       severity: "error",
     });
   }
@@ -258,11 +248,11 @@ export function validateMissionDraft(
     });
   }
 
-  if (draft.lifecycle === "launched" && !draft.missionId) {
+  if (draft.lifecycle === "launched" && !draft.jobId) {
     issues.push({
-      code: "launched-without-mission",
+      code: "launched-without-job",
       field: "lifecycle",
-      message: "A launched draft must reference the created Mission.",
+      message: "A launched draft must reference the created Job.",
       severity: "error",
     });
   }
@@ -283,28 +273,28 @@ export function validateMissionDraft(
 /* Reducer                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export type MissionDraftAction =
-  | { type: "update-field"; field: MissionDraftTextField; value: string }
+export type JobDraftAction =
+  | { type: "update-field"; field: JobDraftTextField; value: string }
   | { type: "set-hard-budget"; micros: number | null; source: HardBudgetSource }
   | { type: "set-resource-commitment"; value: number }
   | { type: "validate" }
   | { type: "start-launch" }
-  | { type: "launch-succeeded"; missionId: string; message?: string }
+  | { type: "launch-succeeded"; jobId: string; message?: string }
   | { type: "launch-failed"; message: string };
 
-function withLiveIssues(draft: MissionDraft): MissionDraft {
-  return { ...draft, issues: validateMissionDraft(draft) };
+function withLiveIssues(draft: JobDraft): JobDraft {
+  return { ...draft, issues: validateJobDraft(draft) };
 }
 
-function isSettling(lifecycle: MissionDraftLifecycle): boolean {
+function isSettling(lifecycle: JobDraftLifecycle): boolean {
   return lifecycle === "launching" || lifecycle === "launched";
 }
 
-export function missionDraftReducer(draft: MissionDraft, action: MissionDraftAction): MissionDraft {
+export function jobDraftReducer(draft: JobDraft, action: JobDraftAction): JobDraft {
   switch (action.type) {
     case "update-field": {
       if (isSettling(draft.lifecycle)) return draft;
-      const next: MissionDraft = {
+      const next: JobDraft = {
         ...draft,
         [action.field]: action.value,
         lifecycle: "drafting",
@@ -315,7 +305,7 @@ export function missionDraftReducer(draft: MissionDraft, action: MissionDraftAct
 
     case "set-hard-budget": {
       if (isSettling(draft.lifecycle)) return draft;
-      const next: MissionDraft = {
+      const next: JobDraft = {
         ...draft,
         hardBudgetMicros: action.micros,
         hardBudgetSource: action.source,
@@ -327,7 +317,7 @@ export function missionDraftReducer(draft: MissionDraft, action: MissionDraftAct
 
     case "set-resource-commitment": {
       if (isSettling(draft.lifecycle)) return draft;
-      const next: MissionDraft = {
+      const next: JobDraft = {
         ...draft,
         resourceCommitment: action.value,
         lifecycle: "drafting",
@@ -338,18 +328,18 @@ export function missionDraftReducer(draft: MissionDraft, action: MissionDraftAct
 
     case "validate": {
       if (isSettling(draft.lifecycle)) return draft;
-      const issues = validateMissionDraft(draft);
+      const issues = validateJobDraft(draft);
       return {
         ...draft,
         issues,
-        lifecycle: missionDraftHasErrors(issues) ? "invalid" : "ready",
+        lifecycle: jobDraftHasErrors(issues) ? "invalid" : "ready",
       };
     }
 
     case "start-launch": {
       if (isSettling(draft.lifecycle)) return draft;
-      const issues = validateMissionDraft(draft);
-      if (missionDraftHasErrors(issues)) {
+      const issues = validateJobDraft(draft);
+      if (jobDraftHasErrors(issues)) {
         return { ...draft, issues, lifecycle: "invalid" };
       }
       return { ...draft, issues, lifecycle: "launching", launchMessage: undefined };
@@ -360,7 +350,7 @@ export function missionDraftReducer(draft: MissionDraft, action: MissionDraftAct
       return {
         ...draft,
         lifecycle: "launched",
-        missionId: action.missionId,
+        jobId: action.jobId,
         launchMessage: action.message,
         issues: [],
       };
@@ -377,7 +367,7 @@ export function missionDraftReducer(draft: MissionDraft, action: MissionDraftAct
 /* Command conversion                                                          */
 /* -------------------------------------------------------------------------- */
 
-function missionLaunchContentKey(draft: MissionDraft): string {
+function jobLaunchContentKey(draft: JobDraft): string {
   return [
     draft.projectId,
     draft.sessionId,
@@ -393,12 +383,12 @@ function missionLaunchContentKey(draft: MissionDraft): string {
  * Converts a valid draft into the runtime boundary command. Returns null when
  * the draft is not launchable, so callers cannot send a half-formed command.
  */
-export function toMissionLaunchCommand(draft: MissionDraft): MissionLaunchCommand | null {
-  const issues = validateMissionDraft(draft);
-  if (missionDraftHasErrors(issues) || draft.hardBudgetMicros === null) return null;
+export function toJobLaunchCommand(draft: JobDraft): JobLaunchCommand | null {
+  const issues = validateJobDraft(draft);
+  if (jobDraftHasErrors(issues) || draft.hardBudgetMicros === null) return null;
 
   return {
-    commandId: `mission-launch:${draft.id}:${missionLaunchContentKey(draft)}`,
+    commandId: `job-launch:${draft.id}:${jobLaunchContentKey(draft)}`,
     draftId: draft.id,
     projectId: draft.projectId,
     sessionId: draft.sessionId,

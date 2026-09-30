@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Compact inline Mission draft surface.
+ * Compact inline Job draft surface.
  *
  * Rendered inside the Chat column (not a new page and not a modal). It uses the
  * existing OCG primitives and visual language, keeps a single scroll owner, and
@@ -15,24 +15,24 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import type { ProjectSummary } from "../project/domain";
-import type { MissionLaunchResult } from "../runtime/runtime-types";
+import type { JobLaunchResult } from "../runtime/runtime-types";
 import {
   FIXTURE_RECOMMENDED_BUDGET_MICROS,
   FIXTURE_RECOMMENDED_BUDGET_NOTE,
   HARD_BUDGET_MIN_MICROS,
   microsToUsd,
-  missionDraftHasErrors,
+  jobDraftHasErrors,
   usdToMicros,
   type HardBudgetSource,
-  type MissionDraft,
-  type MissionDraftTextField,
+  type JobDraft,
+  type JobDraftTextField,
 } from "./draft-domain";
 
-type MissionDraftSurfaceProps = {
+type JobDraftSurfaceProps = {
   project: ProjectSummary;
-  draft: MissionDraft;
-  launchResult?: MissionLaunchResult | null;
-  onFieldChange: (field: MissionDraftTextField, value: string) => void;
+  draft: JobDraft;
+  launchResult?: JobLaunchResult | null;
+  onFieldChange: (field: JobDraftTextField, value: string) => void;
   onBudgetChange: (micros: number | null, source: HardBudgetSource) => void;
   onCommitmentChange: (value: number) => void;
   onValidate: () => void;
@@ -40,14 +40,14 @@ type MissionDraftSurfaceProps = {
   onClose: () => void;
 };
 
-const OUTCOME_TONE: Record<MissionLaunchResult["outcome"], string> = {
+const OUTCOME_TONE: Record<JobLaunchResult["outcome"], string> = {
   accepted: "border-emerald-500/40 bg-emerald-500/5 text-emerald-800 dark:text-emerald-200",
   rejected: "border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-200",
   "requires-attention": "border-violet-500/40 bg-violet-500/5 text-violet-800 dark:text-violet-200",
   failed: "border-red-500/40 bg-red-500/5 text-red-800 dark:text-red-200",
 };
 
-export function MissionDraftSurface({
+export function JobDraftSurface({
   project,
   draft,
   launchResult,
@@ -57,14 +57,14 @@ export function MissionDraftSurface({
   onValidate,
   onLaunch,
   onClose,
-}: MissionDraftSurfaceProps) {
+}: JobDraftSurfaceProps) {
   const summaryRef = useRef<HTMLDivElement>(null);
   const [budgetText, setBudgetText] = useState(() =>
     draft.hardBudgetMicros === null ? "" : String(microsToUsd(draft.hardBudgetMicros)),
   );
 
   const isLaunching = draft.lifecycle === "launching";
-  const hasErrors = missionDraftHasErrors(draft.issues);
+  const hasErrors = jobDraftHasErrors(draft.issues);
   const commitmentPercent = Math.round(draft.resourceCommitment * 100);
 
   const setFixtureBudget = () => {
@@ -101,7 +101,7 @@ export function MissionDraftSurface({
 
   return (
     <section
-      aria-label="Mission draft"
+      aria-label="Job draft"
       className="flex flex-col gap-3 rounded-lg border border-border bg-background px-3 py-3 shadow-[0_1px_2px_rgba(0,0,0,0.04)] sm:px-4"
     >
       <header className="flex items-start gap-2">
@@ -109,7 +109,7 @@ export function MissionDraftSurface({
           <Target className="size-3.5 text-muted-foreground" />
         </span>
         <div className="min-w-0 flex-1">
-          <h2 className="text-[13px] font-semibold tracking-tight">Mission draft</h2>
+          <h2 className="text-[13px] font-semibold tracking-tight">Job draft</h2>
           <p className="mt-0.5 text-[11px] text-muted-foreground">
             Active Project <span className="font-medium text-foreground">{project.name}</span> · from the shell, not selected here
           </p>
@@ -119,8 +119,8 @@ export function MissionDraftSurface({
           variant="ghost"
           size="icon-xs"
           onClick={onClose}
-          aria-label="Close Mission draft"
-          title="Close Mission draft"
+          aria-label="Close Job draft"
+          title="Close Job draft"
         >
           <X className="size-4" />
         </Button>
@@ -146,15 +146,15 @@ export function MissionDraftSurface({
       </div>
 
       <div className="flex flex-col gap-1">
-        <label htmlFor="mission-draft-objective" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+        <label htmlFor="job-draft-objective" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           Objective
         </label>
         <Textarea
-          id="mission-draft-objective"
+          id="job-draft-objective"
           value={draft.objective}
           onChange={(event) => onFieldChange("objective", event.target.value)}
           onBlur={onValidate}
-          placeholder="What should this Mission accomplish?"
+          placeholder="What should this Job accomplish?"
           aria-invalid={draft.issues.some((issue) => issue.field === "objective" && issue.severity === "error")}
           disabled={isLaunching}
           className="min-h-11 text-[13px]"
@@ -163,11 +163,11 @@ export function MissionDraftSurface({
 
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="flex flex-col gap-1">
-          <label htmlFor="mission-draft-criteria" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label htmlFor="job-draft-criteria" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             Success criteria
           </label>
           <Textarea
-            id="mission-draft-criteria"
+            id="job-draft-criteria"
             value={draft.successCriteria}
             onChange={(event) => onFieldChange("successCriteria", event.target.value)}
             onBlur={onValidate}
@@ -178,11 +178,11 @@ export function MissionDraftSurface({
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label htmlFor="mission-draft-constraints" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label htmlFor="job-draft-constraints" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             Constraints / notes
           </label>
           <Textarea
-            id="mission-draft-constraints"
+            id="job-draft-constraints"
             value={draft.constraints}
             onChange={(event) => onFieldChange("constraints", event.target.value)}
             onBlur={onValidate}
@@ -195,13 +195,13 @@ export function MissionDraftSurface({
 
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="flex flex-col gap-1">
-          <label htmlFor="mission-draft-budget" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label htmlFor="job-draft-budget" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             Hard budget (USD)
           </label>
           <div className="flex items-center gap-2">
             <span aria-hidden="true" className="text-[13px] text-muted-foreground">$</span>
             <Input
-              id="mission-draft-budget"
+              id="job-draft-budget"
               type="text"
               inputMode="decimal"
               value={budgetText}
@@ -232,11 +232,11 @@ export function MissionDraftSurface({
         </div>
 
         <div className="flex flex-col gap-1">
-          <label htmlFor="mission-draft-commitment" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label htmlFor="job-draft-commitment" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
             Resource commitment
           </label>
           <input
-            id="mission-draft-commitment"
+            id="job-draft-commitment"
             type="range"
             min={0}
             max={1}
@@ -291,7 +291,7 @@ export function MissionDraftSurface({
           ) : (
             <>
               <Rocket className="size-3.5" aria-hidden="true" />
-              Launch Mission
+              Launch Job
             </>
           )}
         </Button>

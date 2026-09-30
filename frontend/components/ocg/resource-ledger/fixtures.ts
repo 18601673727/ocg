@@ -2,7 +2,7 @@
  * Deterministic Resource Ledger fixture.
  *
  * The `resource-ledger` scenario exercises every shape the inspector must
- * render: multiple Missions and tasks, a Lead plus workers, arbitrary
+ * render: multiple Jobs and tasks, a Lead plus workers, arbitrary
  * providers, the same model on different providers, variants, component
  * diversity, heavy cache reuse, missing reasoning, known/unavailable/
  * explicit-zero cost, every usage authority and attribution confidence, and
@@ -33,8 +33,8 @@ type EntryInput = {
   durationMs?: number | null;
   latencyMs?: number | null;
   ttftMs?: number | null;
-  missionId: string;
-  missionLabel: string;
+  jobId: string;
+  jobLabel: string;
   taskId: string;
   taskLabel: string;
   workerId: string;
@@ -51,7 +51,7 @@ type EntryInput = {
   costMicros?: number | null;
   costProvenance?: CostProvenance;
   attributionConfidence?: AttributionConfidence;
-  attributedMissionId?: string | null;
+  attributedJobId?: string | null;
   attributedTaskId?: string | null;
   reconciliation?: ReconciliationStatus;
   note?: string | null;
@@ -75,8 +75,8 @@ function record(input: EntryInput): ResourceLedgerEntry {
     durationMs: input.durationMs ?? null,
     latencyMs: input.latencyMs ?? null,
     ttftMs: input.ttftMs ?? null,
-    missionId: input.missionId,
-    missionLabel: input.missionLabel,
+    jobId: input.jobId,
+    jobLabel: input.jobLabel,
     taskId: input.taskId,
     taskLabel: input.taskLabel,
     workerId: input.workerId,
@@ -93,16 +93,16 @@ function record(input: EntryInput): ResourceLedgerEntry {
     costMicros: input.costMicros ?? null,
     costProvenance: input.costProvenance ?? (costProvided ? "reported" : "unavailable"),
     attributionConfidence: input.attributionConfidence ?? "exact",
-    attributedMissionId: input.attributedMissionId ?? input.missionId,
+    attributedJobId: input.attributedJobId ?? input.jobId,
     attributedTaskId: input.attributedTaskId ?? input.taskId,
     reconciliation: input.reconciliation ?? "reconciled",
     note: input.note ?? null,
   };
 }
 
-const RUNTIME = { id: "mission-runtime", label: "Durable mission runtime" } as const;
-const LEDGER = { id: "mission-ledger", label: "Resource ledger inspector" } as const;
-const DEPLOY = { id: "mission-deploy", label: "Deploy readiness" } as const;
+const RUNTIME = { id: "job-runtime", label: "Durable job runtime" } as const;
+const LEDGER = { id: "job-ledger", label: "Resource ledger inspector" } as const;
+const DEPLOY = { id: "job-deploy", label: "Deploy readiness" } as const;
 
 const LEAD = {
   workerId: "lead",
@@ -114,13 +114,13 @@ const LEAD = {
 };
 
 const ENTRIES: ResourceLedgerEntry[] = [
-  // Mission 1 — Durable mission runtime.
+  // Job 1 — Durable job runtime.
   record({
     ...LEAD,
     id: "rl-001",
     minutes: 0,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "scope",
     taskLabel: "Scope runtime contract",
     callIndex: 1,
@@ -137,8 +137,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-002",
     minutes: 3,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "scope",
     taskLabel: "Scope runtime contract",
     workerId: "explore",
@@ -156,8 +156,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-003",
     minutes: 7,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "build",
     taskLabel: "Implement runtime boundary",
     workerId: "explore",
@@ -179,8 +179,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-004",
     minutes: 11,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "build",
     taskLabel: "Implement runtime boundary",
     workerId: "explore-deep",
@@ -198,8 +198,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-005",
     minutes: 15,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "build",
     taskLabel: "Implement runtime boundary",
     workerId: "build",
@@ -218,8 +218,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-006",
     minutes: 18,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "build",
     taskLabel: "Implement runtime boundary",
     workerId: "build",
@@ -242,8 +242,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-007",
     minutes: 20,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "build",
     taskLabel: "Implement runtime boundary",
     workerId: "build",
@@ -263,8 +263,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-008",
     minutes: 24,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "verify",
     taskLabel: "Verify parallel workers",
     workerId: "verify",
@@ -283,8 +283,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
     ...LEAD,
     id: "rl-009",
     minutes: 28,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "verify",
     taskLabel: "Verify parallel workers",
     callIndex: 2,
@@ -297,8 +297,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-010",
     minutes: 33,
-    missionId: RUNTIME.id,
-    missionLabel: RUNTIME.label,
+    jobId: RUNTIME.id,
+    jobLabel: RUNTIME.label,
     taskId: "verify",
     taskLabel: "Verify parallel workers",
     workerId: "docs",
@@ -313,19 +313,19 @@ const ENTRIES: ResourceLedgerEntry[] = [
     costMicros: 3_000,
     costProvenance: "estimated",
     attributionConfidence: "unknown",
-    attributedMissionId: null,
+    attributedJobId: null,
     attributedTaskId: null,
     reconciliation: "pending",
-    note: "Timestamp-only attribution; owning Mission is unknown.",
+    note: "Timestamp-only attribution; owning Job is unknown.",
   }),
 
-  // Mission 2 — Resource ledger inspector.
+  // Job 2 — Resource ledger inspector.
   record({
     ...LEAD,
     id: "rl-011",
     minutes: 36,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "model",
     taskLabel: "Normalize ledger model",
     callIndex: 1,
@@ -337,8 +337,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-012",
     minutes: 40,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "model",
     taskLabel: "Normalize ledger model",
     workerId: "budget",
@@ -359,8 +359,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-013",
     minutes: 44,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "model",
     taskLabel: "Normalize ledger model",
     workerId: "explore-deep",
@@ -378,8 +378,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-014",
     minutes: 48,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "model",
     taskLabel: "Normalize ledger model",
     workerId: "explore",
@@ -399,8 +399,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-015",
     minutes: 52,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "chart",
     taskLabel: "Chart component traffic",
     workerId: "build",
@@ -418,8 +418,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-016",
     minutes: 56,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "chart",
     taskLabel: "Chart component traffic",
     workerId: "verify",
@@ -440,8 +440,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-017",
     minutes: 58,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "chart",
     taskLabel: "Chart component traffic",
     workerId: "verify",
@@ -461,8 +461,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-018",
     minutes: 62,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "docs",
     taskLabel: "Document provenance",
     workerId: "docs",
@@ -483,8 +483,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
     ...LEAD,
     id: "rl-019",
     minutes: 66,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "docs",
     taskLabel: "Document provenance",
     callIndex: 2,
@@ -496,8 +496,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-020",
     minutes: 70,
-    missionId: LEDGER.id,
-    missionLabel: LEDGER.label,
+    jobId: LEDGER.id,
+    jobLabel: LEDGER.label,
     taskId: "docs",
     taskLabel: "Document provenance",
     workerId: "budget",
@@ -513,13 +513,13 @@ const ENTRIES: ResourceLedgerEntry[] = [
     costProvenance: "reported",
   }),
 
-  // Mission 3 — Deploy readiness.
+  // Job 3 — Deploy readiness.
   record({
     ...LEAD,
     id: "rl-021",
     minutes: 76,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "probe",
     taskLabel: "Probe provider reachability",
     callIndex: 1,
@@ -531,8 +531,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-022",
     minutes: 82,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "probe",
     taskLabel: "Probe provider reachability",
     workerId: "explore",
@@ -552,8 +552,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-023",
     minutes: 88,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "probe",
     taskLabel: "Probe provider reachability",
     workerId: "debug",
@@ -572,8 +572,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-024",
     minutes: 92,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "probe",
     taskLabel: "Probe provider reachability",
     workerId: "debug",
@@ -595,8 +595,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-025",
     minutes: 96,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "probe",
     taskLabel: "Probe provider reachability",
     workerId: "debug",
@@ -615,8 +615,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-026",
     minutes: 102,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     workerId: "verify",
@@ -634,8 +634,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-027",
     minutes: 108,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     workerId: "build",
@@ -653,8 +653,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-028",
     minutes: 115,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     workerId: "docs",
@@ -676,8 +676,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-029",
     minutes: 120,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     workerId: "docs",
@@ -699,8 +699,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
     ...LEAD,
     id: "rl-030",
     minutes: 128,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     callIndex: 2,
@@ -712,8 +712,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-031",
     minutes: 134,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     workerId: "budget",
@@ -731,8 +731,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-032",
     minutes: 140,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     workerId: "explore",
@@ -752,8 +752,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
   record({
     id: "rl-033",
     minutes: 145,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     workerId: "debug",
@@ -772,8 +772,8 @@ const ENTRIES: ResourceLedgerEntry[] = [
     ...LEAD,
     id: "rl-034",
     minutes: 150,
-    missionId: DEPLOY.id,
-    missionLabel: DEPLOY.label,
+    jobId: DEPLOY.id,
+    jobLabel: DEPLOY.label,
     taskId: "rollout",
     taskLabel: "Prepare rollout",
     callIndex: 3,

@@ -17,8 +17,8 @@ export { SegmentedTabs, type TabItem } from "./segmented-tabs";
 export { SectionHeading, SectionTitle } from "./section-title";
 export { StatusDot } from "./status-dot";
 export {
+  JOB_STATE,
   LOG_LEVEL,
-  MISSION_STATUS,
   RUNTIME_CONNECTION,
   RUNTIME_CONNECTION_LABEL,
   SYNC_STATUS,

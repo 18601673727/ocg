@@ -8,7 +8,7 @@
  */
 
 import type { ProjectId } from "../project/domain";
-import type { MissionLaunchCommand } from "../mission/draft-domain";
+import type { JobLaunchCommand } from "../job/draft-domain";
 import type { AnyRuntimeEnvelope, RuntimeError, RuntimeResumeCursor } from "./runtime-envelope";
 import {
   RuntimeEnvelopeFactory,
@@ -21,11 +21,11 @@ import { createScenarioFixture } from "./scenarios";
 
 export type RuntimeTransportCommand =
   | {
-      kind: "launch-mission";
+      kind: "launch-job";
       commandId: string;
       projectId: ProjectId;
       sessionId: string;
-      command: MissionLaunchCommand;
+      command: JobLaunchCommand;
     }
   | { kind: "send-message"; commandId: string; sessionId: string; content: string }
   | { kind: "cancel"; commandId: string; sessionId: string; messageId?: string };
@@ -327,11 +327,10 @@ export function createReplayScenario(id: ReplayScenarioId, scenario: ScenarioId 
     }
 
     case "command-ack": {
-      const seed = createSeed("mission-control");
+      const seed = createSeed("job-execution");
       const sessionId = "design-pwa-shell";
-      const mission = seed.fixture.missionsBySession[sessionId]!;
       const accepted = seed.factory.envelope(
-        "mission.launch-updated",
+        "job.launch-updated",
         {
           result: {
             outcome: "accepted",
@@ -339,20 +338,15 @@ export function createReplayScenario(id: ReplayScenarioId, scenario: ScenarioId 
             draftId: "replay-draft-1",
             projectId: "zhuju",
             sessionId,
-            missionId: "mission-replay-draft-1",
-            message: "Mission accepted.",
+            jobId: "job-replay-draft-1",
+            message: "Job accepted.",
             duplicate: false,
           },
         },
         { projectId: "zhuju", sessionId, commandId: "replay-command-1" },
       );
-      const missionUpdate = seed.factory.envelope(
-        "mission.updated",
-        { mission },
-        { projectId: "zhuju", sessionId },
-      );
       const rejected = seed.factory.envelope(
-        "mission.launch-updated",
+        "job.launch-updated",
         {
           result: {
             outcome: "rejected",
@@ -366,7 +360,7 @@ export function createReplayScenario(id: ReplayScenarioId, scenario: ScenarioId 
         },
         { projectId: "zhuju", sessionId, commandId: "replay-command-2" },
       );
-      return { id, streamId: seed.streamId, generation: seed.generation, steps: [snapshotStep(seed), eventStep(accepted), eventStep(missionUpdate), eventStep(rejected)] };
+      return { id, streamId: seed.streamId, generation: seed.generation, steps: [snapshotStep(seed), eventStep(accepted), eventStep(rejected)] };
     }
   }
 }

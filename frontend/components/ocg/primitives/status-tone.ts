@@ -8,9 +8,9 @@
  */
 
 import type { LogLevel } from "../logs/domain";
+import type { CanonicalJobState } from "../contracts";
 import type { RuntimeSyncStatus } from "../runtime/reconciler";
 import type {
-  MissionStatus,
   RuntimeConnectionState,
   ToolActivityStatus,
   WorkerStatus,
@@ -61,13 +61,16 @@ export const WORKER_STATUS: Record<WorkerStatus, StatusVisual> = {
   cancelled: { tone: "slate" },
 };
 
-export const MISSION_STATUS: Record<MissionStatus, StatusVisual> = {
-  planning: { tone: "sky" },
+export const JOB_STATE: Record<CanonicalJobState, StatusVisual> = {
+  pending: { tone: "slate" },
+  eligible: { tone: "sky" },
   running: { tone: "amber", pulse: true },
-  paused: { tone: "slate" },
+  cancelling: { tone: "amber", pulse: true },
   completed: { tone: "emerald" },
   failed: { tone: "red" },
-  "budget-exhausted": { tone: "red" },
+  cancelled: { tone: "slate" },
+  unknown: { tone: "slate" },
+  orphaned: { tone: "red" },
 };
 
 export const TOOL_STATUS: Record<ToolActivityStatus, StatusVisual> = {

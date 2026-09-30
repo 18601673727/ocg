@@ -1,7 +1,6 @@
 import type {
   ChatMessage,
   ChatSession,
-  Mission,
   OcgRuntimeEvent,
   RuntimeStatus,
   SendMessageInput,
@@ -17,19 +16,15 @@ import {
 import { ONBOARDING_STAGES, type BootstrapState, type OnboardingStageId } from "../bootstrap/types";
 import type {
   CreateSessionInput,
-  MissionLaunchCommand,
-  MissionLaunchResult,
+  JobLaunchCommand,
+  JobLaunchResult,
   OcgRuntimeClient,
   RuntimeSnapshot,
   ScenarioId,
 } from "./runtime-types";
 import { PROJECTS, isProjectId, type ProjectId } from "../project/domain";
 import { projectSessionIds } from "../project/fixtures";
-import {
-  createLaunchedMission,
-  createLaunchedObservability,
-  missionIdForLaunch,
-} from "../mission/launch-fixtures";
+import { createJobLaunchObservability } from "../job/launch-fixtures";
 import { assembleJobExecution } from "../execution/domain";
 import { CANONICAL_API_VERSION } from "../contracts";
 import { RuntimeEnvelopeFactory, eventSessionId, type AnyRuntimeEnvelope } from "./runtime-envelope";
@@ -57,7 +52,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   private readonly envelopes: RuntimeEnvelopeFactory;
   private liveScenarioStarted = false;
   /** Accepted launch results keyed by stable command identity for idempotency. */
-  private readonly launchResults = new Map<string, MissionLaunchResult>();
+  private readonly launchResults = new Map<string, JobLaunchResult>();
 
   constructor(scenario: ScenarioId) {
     this.scenario = scenario;
@@ -97,10 +92,6 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
 
   async getMessages(sessionId: string): Promise<ChatMessage[]> {
     return clone(this.store.getSnapshot().messagesBySession[sessionId] ?? []);
-  }
-
-  async getMission(sessionId: string): Promise<Mission | null> {
-    return clone(this.store.getSnapshot().missionsBySession[sessionId] ?? null);
   }
 
   async getObservability(sessionId: string) {
@@ -221,12 +212,6 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     const updatedSession = { ...session, updatedAt: "now" };
     this.emit({ type: "conversation.session-updated", session: clone(updatedSession) });
 
-    const currentMission = this.store.getSnapshot().missionsBySession[sessionId];
-    if (currentMission?.status === "running") {
-      const updatedMission = { ...currentMission, current: "Responding to operator" };
-      this.emit({ type: "mission.updated", sessionId, mission: clone(updatedMission) });
-    }
-
     const assistantId = `mock-assistant-${Date.now()}-${this.nextId++}`;
     const assistant: ChatMessage = {
       id: assistantId,
@@ -283,20 +268,16 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   }
 
   /**
-   * Deterministic, frontend-only Mission launch.
+   * Deterministic, frontend-only Job launch.
    *
    * - disconnected runtimes fail without mutating the snapshot;
    * - a session owned by another Project is rejected;
    * - a repeated accepted command identity returns the previously recorded result;
    * - rejected/failed attempts remain retryable if the runtime condition changes;
-   * - an accepted command projects Mission/execution/observability through the
+   * - an accepted command projects execution/observability through the
    *   canonical reconciler, never through a parallel UI mutation.
    */
-  async launchMission(command: MissionLaunchCommand): Promise<MissionLaunchResult> {
-    return this.launchJob(command);
-  }
-
-  async launchJob(command: MissionLaunchCommand): Promise<MissionLaunchResult> {
+  async launchJob(command: JobLaunchCommand): Promise<JobLaunchResult> {
     const prior = this.launchResults.get(command.commandId);
     if (prior) {
       return { ...clone(prior), duplicate: true };
@@ -308,13 +289,13 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     // accepted commands are the ones that need duplicate protection.
     if (result.outcome === "accepted") this.launchResults.set(command.commandId, clone(result));
     this.emit(
-      { type: "mission.launch-updated", sessionId: command.sessionId, result: clone(result) },
+      { type: "job.launch-updated", sessionId: command.sessionId, result: clone(result) },
       { projectId: command.projectId ?? null, commandId: command.commandId },
     );
     return clone(result);
   }
 
-  private resolveLaunch(command: MissionLaunchCommand): MissionLaunchResult {
+  private resolveLaunch(command: JobLaunchCommand): JobLaunchResult {
     const base = {
       commandId: command.commandId,
       draftId: command.draftId,
@@ -354,9 +335,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       return { ...base, outcome: "rejected", message: "The hard budget must be a positive whole number of micros; launch rejected." };
     }
 
-    const legacyCommand = { ...command, successCriteria: command.successCriteria ?? "", constraints: command.constraints ?? "", resourceCommitment: command.resourceCommitment ?? 1 };
-    const missionId = missionIdForLaunch(legacyCommand);
-    const mission = createLaunchedMission(legacyCommand, missionId);
+    const normalizedCommand = { ...command, successCriteria: command.successCriteria ?? "", constraints: command.constraints ?? "", resourceCommitment: command.resourceCommitment ?? 1 };
     const jobId = `job-${command.draftId}`;
     const execution = assembleJobExecution({
       apiVersion: CANONICAL_API_VERSION,
@@ -369,25 +348,23 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       dispatchIntents: [],
     });
     const accounting = { ceiling: { amount: command.hardBudgetMicros / 1_000_000, unit: "USD", source: "job-configuration" as const }, consumption: null };
-    const observability = createLaunchedObservability(legacyCommand, missionId);
+    const observability = createJobLaunchObservability(normalizedCommand, jobId);
     const projectId = command.projectId ?? null;
-    const result: MissionLaunchResult = {
+    const result: JobLaunchResult = {
       ...base,
       outcome: "accepted",
-      missionId,
       jobId,
       message: `Job "${jobId}" accepted for execution.`,
     };
 
     // Acknowledgement and entity projections share the same canonical path.
     // The acknowledgement is first so command correlation is observable before
-    // the resulting Mission/execution projections arrive.
+    // the resulting execution projections arrive.
     this.emit(
-      { type: "mission.launch-updated", sessionId: command.sessionId, result: clone(result) },
-      { projectId, commandId: command.commandId, missionId },
+      { type: "job.launch-updated", sessionId: command.sessionId, result: clone(result) },
+      { projectId, commandId: command.commandId },
     );
-    const correlation = { projectId, commandId: command.commandId, missionId };
-    this.emit({ type: "mission.updated", sessionId: command.sessionId, mission: clone(mission) }, correlation);
+    const correlation = { projectId, commandId: command.commandId };
     this.emit({ type: "job.execution-updated", sessionId: command.sessionId, execution: clone(execution), accounting }, correlation);
     this.emit({ type: "observability.updated", sessionId: command.sessionId, observability: clone(observability) }, correlation);
 
@@ -411,7 +388,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
    */
   private emit(
     event: OcgRuntimeEvent,
-    scope: { projectId?: ProjectId | null; commandId?: string; missionId?: string } = {},
+    scope: { projectId?: ProjectId | null; commandId?: string } = {},
   ): void {
     const envelope = this.stampEnvelope(event, scope);
     this.store.applyEnvelope(envelope);
@@ -420,7 +397,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
 
   private stampEnvelope(
     event: OcgRuntimeEvent,
-    scope: { projectId?: ProjectId | null; commandId?: string; missionId?: string },
+    scope: { projectId?: ProjectId | null; commandId?: string },
   ): AnyRuntimeEnvelope {
     const sessionId = eventSessionId(event);
     const projectId = scope.projectId !== undefined
@@ -431,7 +408,6 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     return this.envelopes.fromRuntimeEvent(event, {
       projectId,
       commandId: scope.commandId,
-      missionId: scope.missionId,
       sessionId,
     });
   }
@@ -447,9 +423,6 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
           sessionId: update.sessionId,
           observability: clone(update.observability),
         });
-        if (update.mission) {
-          this.emit({ type: "mission.updated", sessionId: update.sessionId, mission: clone(update.mission) });
-        }
       }, update.afterMs);
       const timers = this.timers.get("__observability__") ?? [];
       this.timers.set("__observability__", [...timers, timer]);

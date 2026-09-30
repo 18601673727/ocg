@@ -56,7 +56,7 @@ function baseResources(): BootstrapResource[] {
     },
     {
       id: "repo-runtime",
-      label: "Durable mission runtime",
+      label: "Durable job runtime",
       kind: "repository",
       source: "local",
       status: "available",

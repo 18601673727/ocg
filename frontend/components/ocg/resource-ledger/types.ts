@@ -4,7 +4,7 @@
  * This module is deliberately presentation-free. It owns the shape of a single
  * provider call as it appears in the Resource Ledger Inspector: usage split into
  * explicit components, cost with an explicit provenance, how usage was
- * authorized, how confidently the call was attributed to a Mission/task, and
+ * authorized, how confidently the call was attributed to a Job/task, and
  * whether the call reconciled against the durable ledger.
  *
  * Missing data is always `null` (rendered as `—`), never a fabricated zero.
@@ -90,7 +90,7 @@ export const USAGE_AUTHORITY_DEFINITION: Record<UsageAuthority, string> = {
   estimated: "Usage was estimated locally from tokens or streaming deltas.",
 };
 
-/** Confidence that this call belongs to the Mission/task it is grouped under. */
+/** Confidence that this call belongs to the Job/task it is grouped under. */
 export type AttributionConfidence = "exact" | "inferred" | "fallback" | "unknown";
 
 export const ATTRIBUTION_CONFIDENCES: readonly AttributionConfidence[] = [
@@ -108,9 +108,9 @@ export const ATTRIBUTION_CONFIDENCE_LABEL: Record<AttributionConfidence, string>
 };
 
 export const ATTRIBUTION_CONFIDENCE_DEFINITION: Record<AttributionConfidence, string> = {
-  exact: "The call carries an explicit Mission and task identifier.",
-  inferred: "The Mission/task was inferred from worker, task ordering, or time window.",
-  fallback: "Attribution fell back to the owning Mission because the task is not known.",
+  exact: "The call carries an explicit Job and task identifier.",
+  inferred: "The Job/task was inferred from worker, task ordering, or time window.",
+  fallback: "Attribution fell back to the owning Job because the task is not known.",
   unknown: "The call could not be attributed; it is surfaced as an unknown bucket.",
 };
 
@@ -169,8 +169,8 @@ export type ResourceLedgerEntry = {
   durationMs: number | null;
   latencyMs: number | null;
   ttftMs: number | null;
-  missionId: string;
-  missionLabel: string;
+  jobId: string;
+  jobLabel: string;
   taskId: string;
   taskLabel: string;
   workerId: string;
@@ -190,7 +190,7 @@ export type ResourceLedgerEntry = {
   costMicros: number | null;
   costProvenance: CostProvenance;
   attributionConfidence: AttributionConfidence;
-  attributedMissionId: string | null;
+  attributedJobId: string | null;
   attributedTaskId: string | null;
   reconciliation: ReconciliationStatus;
   note: string | null;
@@ -247,7 +247,7 @@ export const ALL_FILTER_VALUE = "all";
 
 export type LedgerFilter = {
   window: TimeWindow;
-  missionId: string;
+  jobId: string;
   workerId: string;
   provider: string;
   /** `provider\u0000model` key so the same model on different providers stays distinct. */
@@ -256,7 +256,7 @@ export type LedgerFilter = {
 
 export const DEFAULT_LEDGER_FILTER: LedgerFilter = {
   window: "all",
-  missionId: ALL_FILTER_VALUE,
+  jobId: ALL_FILTER_VALUE,
   workerId: ALL_FILTER_VALUE,
   provider: ALL_FILTER_VALUE,
   modelKey: ALL_FILTER_VALUE,
@@ -269,14 +269,14 @@ export type FilterOption = {
 };
 
 export type LedgerFilterOptions = {
-  missions: FilterOption[];
+  jobs: FilterOption[];
   workers: FilterOption[];
   providers: FilterOption[];
   models: FilterOption[];
 };
 
 export type LedgerDimension =
-  | "mission"
+  | "job"
   | "task"
   | "worker"
   | "provider"

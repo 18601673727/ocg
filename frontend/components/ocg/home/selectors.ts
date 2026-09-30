@@ -5,7 +5,7 @@
  * snapshot. No new state is introduced here and no values are invented.
  */
 
-import type { AttentionItem, AttentionSeverity, ActiveMissionProjection, ContinueWorkingEntry, ResourceHealthSummary as HomeResourceHealthSummary, UsageSummary, RecentActivityItem } from "./domain";
+import type { AttentionItem, AttentionSeverity, ActiveJobProjection, ContinueWorkingEntry, ResourceHealthSummary as HomeResourceHealthSummary, UsageSummary, RecentActivityItem } from "./domain";
 import type { BootstrapState } from "../bootstrap/types";
 import type { JobExecution } from "../execution/domain";
 import type { JobAccounting } from "../execution/accounting";
@@ -83,10 +83,11 @@ export function selectHomeAttention(snapshot: {
         kind: "runtimeFailure",
         title: `Job ${execution.jobId} failed`,
         summary: `Job execution failed in session ${sessionId}.`,
-        missionId: sessionId,
+        jobId: execution.jobId,
+        sessionId,
         createdAt: "now",
         status: "open",
-        destination: "mission-control",
+        destination: "job-execution",
       });
     }
   }
@@ -111,11 +112,11 @@ export type JobSummary = {
   updatedAt: string;
 };
 
-export function selectHomeActiveMissions(snapshot: {
+export function selectHomeActiveJobs(snapshot: {
   sessions: { id: string; title: string }[];
   executionBySession: Record<string, JobExecution | null>;
-}): ActiveMissionProjection[] {
-  const results: ActiveMissionProjection[] = [];
+}): ActiveJobProjection[] {
+  const results: ActiveJobProjection[] = [];
   for (const session of snapshot.sessions) {
     const execution = snapshot.executionBySession[session.id];
     if (!execution) continue;
@@ -133,8 +134,8 @@ export function selectHomeActiveMissions(snapshot: {
         waitingWorkers: execution.executors.filter((executor) => executor.status === "queued").length,
         elapsed: "ongoing",
         progress: execution.progress?.percent ?? 0,
-        destination: "mission-control",
-        status: execution.state === "running" ? "running" : "planning",
+        destination: "job-execution",
+        status: execution.state === "running" ? "running" : "pending",
         updatedAt: new Date(execution.updatedAt * 1000).toISOString(),
       });
     }
@@ -245,7 +246,7 @@ export function selectRecentProductActivity(snapshot: {
       summary: session.title,
       subtitle: `Session · ${session.workType}`,
       timestamp: session.updatedAt,
-      kind: "mission" as const,
+      kind: "job" as const,
       tone: "slate" as const,
       timeAgo: session.updatedAt ?? "now",
     });
@@ -255,7 +256,7 @@ export function selectRecentProductActivity(snapshot: {
     items.push({
       id: `execution-${sessionId}`,
       summary: `Job ${execution.jobId} · ${execution.state} · ${execution.calls.length} calls`,
-      kind: "mission" as const,
+      kind: "job" as const,
       tone: execution.state === "failed" ? "red" as const : "emerald" as const,
       timeAgo: new Date(execution.updatedAt * 1000).toISOString(),
     });

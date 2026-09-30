@@ -3,7 +3,7 @@
  *
  * The PWA is a projection/control surface, never an execution authority. This
  * module makes that boundary explicit in types: the only mutations are
- * Project registration, global/project defaults, and pre-run Mission
+ * Project registration, global/project defaults, and pre-run Job
  * configuration, and each one carries a stable command identity. A dispatched
  * Run's frozen executor contract is read-only here by construction.
  */
@@ -43,8 +43,8 @@ export type DraftIssueCode =
   | "profile-invalid"
   | "routing-invalid"
   | "root-required"
-  | "mission-required"
-  | "mission-dispatched";
+  | "job-required"
+  | "job-dispatched";
 
 export type DraftIssue = { code: DraftIssueCode; message: string; field: string };
 

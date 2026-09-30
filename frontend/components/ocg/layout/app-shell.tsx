@@ -4,8 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ChatView } from "../chat/chat-view";
-import { MissionView } from "../mission/mission-view";
-import { MissionDraftSurface } from "../mission/mission-draft-surface";
+import { JobInspector } from "../execution/job-inspector";
+import { JobDraftSurface } from "../job/job-draft-surface";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
@@ -33,16 +33,16 @@ import {
 import { withProjectParam, type ProjectId } from "../project/domain";
 import { dispatchComposerIntent, type ComposerIntent } from "../composer/domain";
 import {
-  createMissionDraft,
+  createJobDraft,
   draftScopeKey,
-  missionDraftReducer,
-  toMissionLaunchCommand,
+  jobDraftReducer,
+  toJobLaunchCommand,
   type HardBudgetSource,
-  type MissionDraft,
-  type MissionDraftAction,
-  type MissionDraftTextField,
-} from "../mission/draft-domain";
-import type { MissionLaunchResult } from "../runtime/runtime-types";
+  type JobDraft,
+  type JobDraftAction,
+  type JobDraftTextField,
+} from "../job/draft-domain";
+import type { JobLaunchResult } from "../runtime/runtime-types";
 import { workspaceViewHref, type WorkspaceView } from "./view-domain";
 
 export type { WorkspaceView } from "./view-domain";
@@ -54,7 +54,7 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, createSession, sendMessage, setActiveProfile, cancel, launchMission, sync } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, createSession, sendMessage, setActiveProfile, cancel, launchJob, sync } = useOcgRuntime();
   const {
     activeProjectId,
     activeProject,
@@ -67,17 +67,17 @@ export function RuntimeWorkspace({
   const [activeSessionId, setActiveSessionId] = useState("design-pwa-shell");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [missionMode, setMissionMode] = useState<InspectorMode>("docked");
-  const [mobileMissionOpen, setMobileMissionOpen] = useState(false);
-  // Mission drafts are held keyed by Project + session scope so one Project's
+  const [inspectorMode, setInspectorMode] = useState<InspectorMode>("docked");
+  const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
+  // Job drafts are held keyed by Project + session scope so one Project's
   // in-progress launch can never appear in another.
-  const [missionDrafts, setMissionDrafts] = useState<Record<string, MissionDraft>>({});
+  const [jobDrafts, setJobDrafts] = useState<Record<string, JobDraft>>({});
   const [visibleDraftScopes, setVisibleDraftScopes] = useState<Record<string, boolean>>({});
-  const [launchResults, setLaunchResults] = useState<Record<string, MissionLaunchResult>>({});
+  const [launchResults, setLaunchResults] = useState<Record<string, JobLaunchResult>>({});
   const activeDraftScopeRef = useRef<string | null>(null);
 
   // Project-scoped projection of the shared runtime snapshot. Every surface
-  // below consumes this, so project switches cannot leak sessions, missions,
+  // below consumes this, so project switches cannot leak sessions, jobs,
   // executions, or ledger entries across projects.
   // The backend-backed OCG control endpoint. It is a projection/control surface:
   // the PWA never becomes the execution authority.
@@ -92,7 +92,7 @@ export function RuntimeWorkspace({
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setMobileNavOpen(false);
-        setMobileMissionOpen(false);
+        setMobileInspectorOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -104,7 +104,7 @@ export function RuntimeWorkspace({
   const activeWorkType = activeSession?.workType;
   const isLedger = view === "ledger";
   const isControlCenter = view === "control-center";
-  const isMissionControl = view === "mission-control";
+  const isJobExecution = view === "job-execution";
   const isLogs = view === "logs";
   const isSettings = view === "settings";
   const isCanonical = view === "canonical";
@@ -161,7 +161,7 @@ export function RuntimeWorkspace({
    */
   const navigate = useCallback((target: WorkspaceView) => {
     setMobileNavOpen(false);
-    setMobileMissionOpen(false);
+    setMobileInspectorOpen(false);
     const href = workspaceViewHref(view, target);
     if (href !== null) router.push(withProject(href));
   }, [router, view, withProject]);
@@ -171,37 +171,37 @@ export function RuntimeWorkspace({
     navigate("chat");
   }, [navigate]);
 
-  // --- Mission draft lifecycle (single pure reducer, scoped per Project) ----
+  // --- Job draft lifecycle (single pure reducer, scoped per Project) ----
 
   const activeDraftScope = activeSession ? draftScopeKey(activeProjectId, activeSession.id) : null;
   useEffect(() => {
     activeDraftScopeRef.current = activeDraftScope;
   }, [activeDraftScope]);
   const activeDraft = activeDraftScope && visibleDraftScopes[activeDraftScope]
-    ? missionDrafts[activeDraftScope] ?? null
+    ? jobDrafts[activeDraftScope] ?? null
     : null;
   const activeLaunchResult = activeDraftScope ? launchResults[activeDraftScope] ?? null : null;
 
-  const dispatchDraft = useCallback((scopeKey: string, action: MissionDraftAction) => {
-    setMissionDrafts((current) => {
+  const dispatchDraft = useCallback((scopeKey: string, action: JobDraftAction) => {
+    setJobDrafts((current) => {
       const draft = current[scopeKey];
       if (!draft) return current;
-      const next = missionDraftReducer(draft, action);
+      const next = jobDraftReducer(draft, action);
       if (next === draft) return current;
       return { ...current, [scopeKey]: next };
     });
   }, []);
 
-  const handleCreateMissionDraft = useCallback((seed?: string) => {
+  const handleCreateJobDraft = useCallback((seed?: string) => {
     if (!activeSession) return;
     const scopeKey = draftScopeKey(activeProjectId, activeSession.id);
-    const existingDraft = missionDrafts[scopeKey];
-    setMissionDrafts((current) => {
+    const existingDraft = jobDrafts[scopeKey];
+    setJobDrafts((current) => {
       const existing = current[scopeKey];
       if (!existing) {
         return {
           ...current,
-          [scopeKey]: createMissionDraft({
+          [scopeKey]: createJobDraft({
             projectId: activeProjectId,
             sessionId: activeSession.id,
             objective: seed,
@@ -214,7 +214,7 @@ export function RuntimeWorkspace({
         // Launch button would be a no-op.
         return {
           ...current,
-          [scopeKey]: createMissionDraft({
+          [scopeKey]: createJobDraft({
             projectId: activeProjectId,
             sessionId: activeSession.id,
             objective: seed,
@@ -225,7 +225,7 @@ export function RuntimeWorkspace({
       if (seed && existing.objective.trim().length === 0) {
         return {
           ...current,
-          [scopeKey]: missionDraftReducer(existing, { type: "update-field", field: "objective", value: seed }),
+          [scopeKey]: jobDraftReducer(existing, { type: "update-field", field: "objective", value: seed }),
         };
       }
       return current;
@@ -240,15 +240,15 @@ export function RuntimeWorkspace({
     }
     setVisibleDraftScopes((current) => ({ ...current, [scopeKey]: true }));
     setMobileNavOpen(false);
-    setMobileMissionOpen(false);
-  }, [activeProjectId, activeSession, missionDrafts]);
+    setMobileInspectorOpen(false);
+  }, [activeProjectId, activeSession, jobDrafts]);
 
-  const handleCloseMissionDraft = useCallback(() => {
+  const handleCloseJobDraft = useCallback(() => {
     if (!activeDraftScope) return;
     setVisibleDraftScopes((current) => ({ ...current, [activeDraftScope]: false }));
   }, [activeDraftScope]);
 
-  const handleMissionDraftFieldChange = useCallback((field: MissionDraftTextField, value: string) => {
+  const handleJobDraftFieldChange = useCallback((field: JobDraftTextField, value: string) => {
     if (!activeDraftScope) return;
     dispatchDraft(activeDraftScope, { type: "update-field", field, value });
     setLaunchResults((current) => {
@@ -259,7 +259,7 @@ export function RuntimeWorkspace({
     });
   }, [activeDraftScope, dispatchDraft]);
 
-  const handleMissionDraftBudgetChange = useCallback((micros: number | null, source: HardBudgetSource) => {
+  const handleJobDraftBudgetChange = useCallback((micros: number | null, source: HardBudgetSource) => {
     if (!activeDraftScope) return;
     dispatchDraft(activeDraftScope, { type: "set-hard-budget", micros, source });
     setLaunchResults((current) => {
@@ -270,7 +270,7 @@ export function RuntimeWorkspace({
     });
   }, [activeDraftScope, dispatchDraft]);
 
-  const handleMissionDraftCommitmentChange = useCallback((value: number) => {
+  const handleJobDraftCommitmentChange = useCallback((value: number) => {
     if (!activeDraftScope) return;
     dispatchDraft(activeDraftScope, { type: "set-resource-commitment", value });
     setLaunchResults((current) => {
@@ -281,25 +281,25 @@ export function RuntimeWorkspace({
     });
   }, [activeDraftScope, dispatchDraft]);
 
-  const handleMissionDraftValidate = useCallback(() => {
+  const handleJobDraftValidate = useCallback(() => {
     if (!activeDraftScope) return;
     dispatchDraft(activeDraftScope, { type: "validate" });
   }, [activeDraftScope, dispatchDraft]);
 
-  const handleLaunchMission = useCallback(() => {
+  const handleLaunchJob = useCallback(() => {
     if (!activeSession || !activeDraftScope) return;
-    const draft = missionDrafts[activeDraftScope];
+    const draft = jobDrafts[activeDraftScope];
     if (!draft || draft.lifecycle === "launching" || draft.lifecycle === "launched") return;
 
-    const launching = missionDraftReducer(draft, { type: "start-launch" });
-    setMissionDrafts((current) => ({ ...current, [activeDraftScope]: launching }));
+    const launching = jobDraftReducer(draft, { type: "start-launch" });
+    setJobDrafts((current) => ({ ...current, [activeDraftScope]: launching }));
     if (launching.lifecycle !== "launching") return;
 
-    const command = toMissionLaunchCommand(launching);
+    const command = toJobLaunchCommand(launching);
     if (!command) {
-      setMissionDrafts((current) => ({
+      setJobDrafts((current) => ({
         ...current,
-        [activeDraftScope]: missionDraftReducer(launching, {
+        [activeDraftScope]: jobDraftReducer(launching, {
           type: "launch-failed",
           message: "Draft validation failed before launch.",
         }),
@@ -307,16 +307,16 @@ export function RuntimeWorkspace({
       return;
     }
 
-    const settleLaunch = (result: MissionLaunchResult) => {
-      setMissionDrafts((current) => {
+    const settleLaunch = (result: JobLaunchResult) => {
+      setJobDrafts((current) => {
         const currentDraft = current[activeDraftScope] ?? launching;
         const settled = result.outcome === "accepted"
-          ? missionDraftReducer(currentDraft, {
+          ? jobDraftReducer(currentDraft, {
               type: "launch-succeeded",
-              missionId: result.missionId ?? command.draftId,
+              jobId: result.jobId ?? command.draftId,
               message: result.message,
             })
-          : missionDraftReducer(currentDraft, { type: "launch-failed", message: result.message });
+          : jobDraftReducer(currentDraft, { type: "launch-failed", message: result.message });
         return { ...current, [activeDraftScope]: settled };
       });
       setLaunchResults((current) => ({ ...current, [activeDraftScope]: result }));
@@ -329,17 +329,17 @@ export function RuntimeWorkspace({
       }
       if (result.outcome === "accepted" && activeDraftScopeRef.current === activeDraftScope) {
         // Keep the same scenario so the in-memory runtime instance (and its
-        // freshly projected Mission execution) survives the navigation.
-        router.push(withProject(`/?view=mission-control&scenario=${encodeURIComponent(snapshot.scenario)}`));
+        // freshly projected Job execution) survives the navigation.
+        router.push(withProject(`/?view=job-execution&scenario=${encodeURIComponent(snapshot.scenario)}`));
       }
     };
 
-    void launchMission(command)
+    void launchJob(command)
       .then(settleLaunch)
       .catch((error: unknown) => {
         const message = error instanceof Error && error.message
           ? error.message
-          : "The runtime adapter failed while launching this Mission.";
+          : "The runtime adapter failed while launching this Job.";
         settleLaunch({
           outcome: "failed",
           commandId: command.commandId,
@@ -350,16 +350,16 @@ export function RuntimeWorkspace({
           duplicate: false,
         });
       });
-  }, [activeDraftScope, activeSession, launchMission, missionDrafts, router, snapshot.scenario, withProject]);
+  }, [activeDraftScope, activeSession, launchJob, jobDrafts, router, snapshot.scenario, withProject]);
 
   const handleComposerIntent = useCallback((intent: ComposerIntent) => {
     dispatchComposerIntent(intent, {
       chat: ({ text }) => {
         if (activeSessionKey) void sendMessage(activeSessionKey, { content: text });
       },
-      "mission.create": ({ seed }) => handleCreateMissionDraft(seed),
+      "job.create": ({ seed }) => handleCreateJobDraft(seed),
     });
-  }, [activeSessionKey, handleCreateMissionDraft, sendMessage]);
+  }, [activeSessionKey, handleCreateJobDraft, sendMessage]);
 
   const handleSelectProfile = useCallback((profileId: string) => {
     void setActiveProfile(profileId);
@@ -370,7 +370,7 @@ export function RuntimeWorkspace({
   // the operator in the same project.
   const handleProjectChange = useCallback((id: ProjectId) => {
     setMobileNavOpen(false);
-    setMobileMissionOpen(false);
+    setMobileInspectorOpen(false);
     if (activeSessionKey) void cancel(activeSessionKey);
     // Reset the active session to one the target project owns so a stale
     // selection cannot survive the switch.
@@ -390,9 +390,10 @@ export function RuntimeWorkspace({
   if (!activeSession) return null;
 
   const messages = snapshot.messagesBySession[activeSession.id] ?? [];
-  const mission = snapshot.missionsBySession[activeSession.id];
+  const execution = snapshot.executionBySession[activeSession.id] ?? null;
+  const accounting = snapshot.accountingBySession[activeSession.id] ?? null;
   const observability = snapshot.observabilityBySession[activeSession.id];
-  const missionOpen = missionMode !== "collapsed";
+  const inspectorOpen = inspectorMode !== "collapsed";
 
   const sidebar = (
     <OcgSidebar
@@ -464,13 +465,13 @@ export function RuntimeWorkspace({
         <OcgTopbar
           session={activeSession}
           sidebarCollapsed={sidebarCollapsed}
-          missionOpen={missionOpen}
-          missionControls={view === "chat" || view === "canonical"}
+          inspectorOpen={inspectorOpen}
+          inspectorControls={view === "chat" || view === "canonical"}
           activeView={view}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
-          onToggleMission={() => setMissionMode((value) => value === "collapsed" ? "docked" : "collapsed")}
+          onToggleInspector={() => setInspectorMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
-          onOpenMobileMission={() => setMobileMissionOpen(true)}
+          onOpenMobileInspector={() => setMobileInspectorOpen(true)}
           onNavigate={navigate}
           runtimeStatus={snapshot.status}
           syncStatus={sync?.status ?? null}
@@ -489,16 +490,16 @@ export function RuntimeWorkspace({
               onSelectProfile={handleSelectProfile}
             />
           </main>
-        ) : isMissionControl ? (
-          <main aria-label="Mission Control" className="flex min-h-0 flex-1 overflow-hidden">
-            {snapshot.executionBySession[activeSession.id] ? (
+        ) : isJobExecution ? (
+          <main aria-label="Job Execution" className="flex min-h-0 flex-1 overflow-hidden">
+            {execution ? (
               <JobExecutionSurface
                 key={`${activeProjectId}:${activeSession.id}`}
-                execution={snapshot.executionBySession[activeSession.id]!}
+                execution={execution}
                 onOpenInspector={() => navigate("chat")}
               />
             ) : (
-              <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">No Mission execution is available.</div>
+              <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">No Job execution is available.</div>
             )}
           </main>
         ) : isLogs ? (
@@ -550,19 +551,18 @@ export function RuntimeWorkspace({
                 session={activeSession}
                 messages={messages}
                 runtimeStatus={snapshot.status}
-                mission={mission}
                 onComposerIntent={handleComposerIntent}
                 composerSurface={activeDraft ? (
-                  <MissionDraftSurface
+                  <JobDraftSurface
                     project={activeProject}
                     draft={activeDraft}
                     launchResult={activeLaunchResult}
-                    onFieldChange={handleMissionDraftFieldChange}
-                    onBudgetChange={handleMissionDraftBudgetChange}
-                    onCommitmentChange={handleMissionDraftCommitmentChange}
-                    onValidate={handleMissionDraftValidate}
-                    onLaunch={handleLaunchMission}
-                    onClose={handleCloseMissionDraft}
+                    onFieldChange={handleJobDraftFieldChange}
+                    onBudgetChange={handleJobDraftBudgetChange}
+                    onCommitmentChange={handleJobDraftCommitmentChange}
+                    onValidate={handleJobDraftValidate}
+                    onLaunch={handleLaunchJob}
+                    onClose={handleCloseJobDraft}
                   />
                 ) : null}
                 composerSurfaceKey={activeDraft?.id}
@@ -570,40 +570,59 @@ export function RuntimeWorkspace({
             </div>
 
             <aside
-              aria-label="Mission panel"
+              aria-label="Job inspector"
               className={cn(
                 "hidden shrink-0 overflow-hidden border-border bg-background transition-[width,opacity] duration-200 ease-out lg:block",
-                 missionMode === "expanded" ? "w-[min(640px,42vw)] border-l opacity-100" : missionMode === "docked" ? "w-[min(360px,28vw)] border-l opacity-100" : "w-0 border-l-0 opacity-0",
+                 inspectorMode === "expanded" ? "w-[min(640px,42vw)] border-l opacity-100" : inspectorMode === "docked" ? "w-[min(360px,28vw)] border-l opacity-100" : "w-0 border-l-0 opacity-0",
               )}
             >
-              <div className={cn("h-full", missionMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
-                {mission && missionOpen && <MissionView mission={mission} observability={observability} mode={missionMode} onModeChange={setMissionMode} onClose={() => setMissionMode("collapsed")} onOpenMissionControl={() => navigate("mission-control")} />}
+              <div className={cn("h-full", inspectorMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
+                {execution && inspectorOpen && (
+                  <JobInspector
+                    execution={execution}
+                    accounting={accounting}
+                    observability={observability}
+                    mode={inspectorMode}
+                    onModeChange={setInspectorMode}
+                    onClose={() => setInspectorMode("collapsed")}
+                    onOpenJobExecution={() => navigate("job-execution")}
+                  />
+                )}
               </div>
             </aside>
           </main>
         )}
       </div>
 
-      {!isLedger && !isControlCenter && !isMissionControl && !isLogs && !isSettings && !isHome && !isAttention && (
+      {!isLedger && !isControlCenter && !isJobExecution && !isLogs && !isSettings && !isHome && !isAttention && (
         <div
-          className={cn("fixed inset-0 z-50 lg:hidden", !mobileMissionOpen && "pointer-events-none")}
-          aria-hidden={!mobileMissionOpen}
+          className={cn("fixed inset-0 z-50 lg:hidden", !mobileInspectorOpen && "pointer-events-none")}
+          aria-hidden={!mobileInspectorOpen}
         >
           <div
-            onClick={() => setMobileMissionOpen(false)}
+            onClick={() => setMobileInspectorOpen(false)}
             className={cn(
               "absolute inset-0 bg-black/40 transition-opacity duration-200",
-              mobileMissionOpen ? "opacity-100" : "opacity-0",
+              mobileInspectorOpen ? "opacity-100" : "opacity-0",
             )}
           />
           <aside
-            aria-label="Mission panel"
+            aria-label="Job inspector"
             className={cn(
                "absolute inset-y-0 right-0 w-full max-w-none border-l border-border bg-background transition-transform duration-200 ease-out sm:w-[640px] sm:max-w-[85vw]",
-               mobileMissionOpen ? "translate-x-0" : "translate-x-full",
+               mobileInspectorOpen ? "translate-x-0" : "translate-x-full",
              )}
             >
-            {mobileMissionOpen && mission && <MissionView mission={mission} observability={observability} mode="expanded" onClose={() => setMobileMissionOpen(false)} onOpenMissionControl={() => navigate("mission-control")} />}
+            {mobileInspectorOpen && execution && (
+              <JobInspector
+                execution={execution}
+                accounting={accounting}
+                observability={observability}
+                mode="expanded"
+                onClose={() => setMobileInspectorOpen(false)}
+                onOpenJobExecution={() => navigate("job-execution")}
+              />
+            )}
           </aside>
         </div>
       )}

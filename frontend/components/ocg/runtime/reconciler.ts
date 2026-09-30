@@ -16,11 +16,11 @@
  * - entity-missing/malformed payloads yield diagnostics, not corruption.
  */
 
-import type { ChatMessage, Mission } from "../types";
+import type { ChatMessage } from "../types";
 import type { ProjectId } from "../project/domain";
 import { PROJECTS } from "../project/domain";
-import { projectLedgerMissionIds, projectSessionIds } from "../project/fixtures";
-import type { MissionLaunchResult, RuntimeSnapshot, ScenarioId } from "./runtime-types";
+import { projectLedgerJobIds, projectSessionIds } from "../project/fixtures";
+import type { JobLaunchResult, RuntimeSnapshot, ScenarioId } from "./runtime-types";
 import { boundActivities, boundTimeline } from "./observability";
 import { normalizeLogEntry } from "../logs/domain";
 import type {
@@ -62,7 +62,7 @@ export type RuntimeSyncState = {
   seenEventIds: string[];
   seenDeltaKeys: string[];
   /** Latest command acknowledgement by stable command identity. */
-  commandResults: Record<string, MissionLaunchResult>;
+  commandResults: Record<string, JobLaunchResult>;
   /** Runtime ownership learned from scoped snapshots/events for dynamic sessions. */
   sessionProjects: Record<string, ProjectId>;
 };
@@ -202,9 +202,9 @@ function ownerProjectForSession(sessionId: string): ProjectId | null {
   return null;
 }
 
-function ownerProjectForMission(missionId: string): ProjectId | null {
+function ownerProjectForJob(jobId: string): ProjectId | null {
   for (const project of PROJECTS) {
-    if (projectLedgerMissionIds(project.id).includes(missionId)) return project.id;
+    if (projectLedgerJobIds(project.id).includes(jobId)) return project.id;
   }
   return null;
 }
@@ -224,7 +224,7 @@ function hasPayloadScopeViolation(sync: RuntimeSyncState, envelope: AnyRuntimeEn
     return envelope.payload.item.projectId !== undefined && envelope.payload.item.projectId !== envelope.projectId;
   }
   if (envelope.type === "ledger.entry-added" || envelope.type === "ledger.entry-updated") {
-    const owner = ownerProjectForMission(envelope.payload.entry.missionId);
+    const owner = ownerProjectForJob(envelope.payload.entry.jobId);
     return owner !== null && owner !== envelope.projectId;
   }
   return false;
@@ -417,7 +417,7 @@ export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope
   // even when the command is rejected because that Project does not own the
   // referenced session. It must remain observable rather than being mistaken
   // for a spoofed domain update.
-  if (envelope.type !== "mission.launch-updated" && hasPayloadScopeViolation(sync, envelope)) {
+  if (envelope.type !== "job.launch-updated" && hasPayloadScopeViolation(sync, envelope)) {
     return consumeEnvelope(state, envelope, [{
       code: "project-scope-mismatch",
       severity: "warning",
@@ -452,7 +452,7 @@ export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope
       lastSuccessfulSyncAt: envelope.occurredAt,
       seenEventIds: rememberId(sync.seenEventIds, envelope.eventId),
       seenDeltaKeys: deltaKey !== undefined ? rememberId(sync.seenDeltaKeys, deltaKey) : sync.seenDeltaKeys,
-      commandResults: envelope.type === "mission.launch-updated"
+      commandResults: envelope.type === "job.launch-updated"
         ? { ...sync.commandResults, [envelope.payload.result.commandId]: envelope.payload.result }
         : sync.commandResults,
       sessionProjects: envelope.sessionId && envelope.projectId !== null && !sync.sessionProjects[envelope.sessionId]
@@ -506,7 +506,6 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
           ...snapshot,
           sessions: [session, ...snapshot.sessions],
           messagesBySession: { ...snapshot.messagesBySession, [session.id]: snapshot.messagesBySession[session.id] ?? [] },
-          missionsBySession: { ...snapshot.missionsBySession, [session.id]: snapshot.missionsBySession[session.id] ?? null },
           observabilityBySession: { ...snapshot.observabilityBySession, [session.id]: snapshot.observabilityBySession[session.id] ?? null },
            executionBySession: { ...snapshot.executionBySession, [session.id]: snapshot.executionBySession[session.id] ?? null },
            accountingBySession: { ...snapshot.accountingBySession, [session.id]: snapshot.accountingBySession[session.id] ?? null },
@@ -612,16 +611,6 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
       return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
     }
 
-    case "mission.updated": {
-      if (!sessionExists(snapshot, sessionId)) {
-        return { snapshot, diagnostics: [diag("unknown-session", `Mission update for unknown session "${sessionId ?? ""}".`, { sessionId })] };
-      }
-      return {
-        snapshot: { ...snapshot, missionsBySession: { ...snapshot.missionsBySession, [sessionId]: envelope.payload.mission } },
-        diagnostics: [],
-      };
-    }
-
     case "observability.updated": {
       if (!sessionExists(snapshot, sessionId)) {
         return { snapshot, diagnostics: [diag("unknown-session", `Observability update for unknown session "${sessionId ?? ""}".`, { sessionId })] };
@@ -657,29 +646,10 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
       };
     }
 
-    case "worker.updated": {
-      if (!sessionExists(snapshot, sessionId)) {
-        return { snapshot, diagnostics: [diag("unknown-session", `Worker update for unknown session "${sessionId ?? ""}".`, { sessionId })] };
-      }
-      const mission: Mission | null | undefined = snapshot.missionsBySession[sessionId];
-      if (!mission) {
-        return { snapshot, diagnostics: [diag("unknown-entity", `Worker update with no Mission for session "${sessionId}".`, { sessionId }, "info")] };
-      }
-      const worker = envelope.payload.worker;
-      const workers = mission.workers.some((item) => item.id === worker.id)
-        ? mission.workers.map((item) => (item.id === worker.id ? worker : item))
-        : [...mission.workers, worker];
-      return {
-        snapshot: { ...snapshot, missionsBySession: { ...snapshot.missionsBySession, [sessionId]: { ...mission, workers } } },
-        diagnostics: [],
-      };
-    }
-
     case "bootstrap.updated":
       return { snapshot: { ...snapshot, bootstrap: envelope.payload.bootstrap }, diagnostics: [] };
 
-    case "job.launch-updated":
-    case "mission.launch-updated": {
+    case "job.launch-updated": {
       const result = envelope.payload.result;
       if (result.outcome === "accepted") return { snapshot, diagnostics: [] };
       const code: RuntimeDiagnosticCode = result.outcome === "rejected" ? "command-rejected" : "command-failed";

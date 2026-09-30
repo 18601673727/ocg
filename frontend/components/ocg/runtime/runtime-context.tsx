@@ -3,8 +3,8 @@
 import { createContext, useCallback, useContext, useMemo, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { MockOcgRuntimeClient } from "./mock-client";
-import type { CreateSessionInput, MissionLaunchResult, OcgRuntimeClient, ScenarioId } from "./runtime-types";
-import type { MissionLaunchCommand } from "../mission/draft-domain";
+import type { CreateSessionInput, JobLaunchResult, OcgRuntimeClient, ScenarioId } from "./runtime-types";
+import type { JobLaunchCommand } from "../job/draft-domain";
 import type { ChatSession, SendMessageInput } from "../types";
 import type { RuntimeSnapshot } from "./runtime-types";
 import type { RuntimeDiagnostic } from "./runtime-envelope";
@@ -26,7 +26,7 @@ type RuntimeContextValue = {
   completeOnboarding: () => Promise<void>;
   retryBootstrap: () => Promise<void>;
   setActiveProfile: (profileId: string) => Promise<void>;
-  launchMission: (command: MissionLaunchCommand) => Promise<MissionLaunchResult>;
+  launchJob: (command: JobLaunchCommand) => Promise<JobLaunchResult>;
 };
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
@@ -69,19 +69,19 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   const setActiveProfile = useCallback(async (profileId: string) => {
     await client.setActiveProfile?.(profileId);
   }, [client]);
-  const launchMission = useCallback(async (command: MissionLaunchCommand): Promise<MissionLaunchResult> => {
-    if (!client.launchMission) {
+  const launchJob = useCallback(async (command: JobLaunchCommand): Promise<JobLaunchResult> => {
+    if (!client.launchJob) {
       return {
         outcome: "failed",
         commandId: command.commandId,
         draftId: command.draftId,
         projectId: command.projectId,
         sessionId: command.sessionId,
-        message: "This runtime client does not support Mission launch.",
+        message: "This runtime client does not support Job launch.",
         duplicate: false,
       };
     }
-    return client.launchMission(command);
+    return client.launchJob(command);
   }, [client]);
 
   const value = useMemo(
@@ -98,9 +98,9 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       completeOnboarding,
       retryBootstrap,
       setActiveProfile,
-      launchMission,
+      launchJob,
     }),
-    [cancel, client, completeOnboarding, createSession, diagnostics, launchMission, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
+    [cancel, client, completeOnboarding, createSession, diagnostics, launchJob, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
   );
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

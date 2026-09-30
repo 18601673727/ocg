@@ -13,7 +13,6 @@ import type { ProjectId } from "../project/domain";
 import type { RuntimeSyncState } from "./reconciler";
 import type { AttentionItem } from "../attention/domain";
 import type { LogEntry } from "../logs/domain";
-import type { Mission } from "../types";
 import type { RuntimeObservability } from "./observability";
 
 export type JobLaunchOutcome = "accepted" | "rejected" | "requires-attention" | "failed";
@@ -25,7 +24,6 @@ export type JobLaunchResult = {
   projectId: ProjectId;
   sessionId: string;
   jobId?: string;
-  missionId?: string;
   message: string;
   duplicate: boolean;
 };
@@ -42,23 +40,20 @@ export type JobLaunchCommand = {
   resourceCommitment?: number;
 };
 
-/** Compatibility names for surfaces that are still being moved to Job terminology. */
-export type MissionLaunchResult = JobLaunchResult;
-export type MissionLaunchCommand = JobLaunchCommand;
-
 export type ScenarioId =
   | "normal-chat"
   | "long-stream"
-  | "call-heavy"
-  | "executor-parallel"
+  | "tool-heavy"
+  | "worker-parallel"
   | "build-failed"
   | "retry-success"
   | "job-completed"
+  | "budget-exhausted"
   | "runtime-disconnected"
   | "runtime-connecting"
   | "runtime-failed"
   | "permission-required"
-  | "execution-live"
+  | "observability-live"
   | "resource-ledger"
   | "local-ready"
   | "local-first-run"
@@ -81,13 +76,7 @@ export type ScenarioId =
   | "home-overview"
   | "home-calm"
   | "attention-overview"
-  | "attention-calm"
-  | "tool-heavy"
-  | "worker-parallel"
-  | "mission-complete"
-  | "budget-exhausted"
-  | "observability-live"
-  | "mission-control";
+  | "attention-calm";
 
 /** Single execution read model: canonical Job/Attempt/Call + accounting ceiling. */
 export type RuntimeSnapshot = {
@@ -95,7 +84,6 @@ export type RuntimeSnapshot = {
   status: RuntimeStatus;
   sessions: ChatSession[];
   messagesBySession: Record<string, ChatMessage[]>;
-  missionsBySession: Record<string, Mission | null>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
   executionBySession: Record<string, JobExecution | null>;
   accountingBySession: Record<string, JobAccounting | null>;

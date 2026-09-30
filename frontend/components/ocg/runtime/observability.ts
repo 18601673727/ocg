@@ -67,8 +67,8 @@ export type ModelStats = {
   ttftMs?: number;
 };
 
-export type MissionRuntimeStats = {
-  missionId: string;
+export type JobRuntimeStats = {
+  jobId: string;
   tokenUsage: TokenUsage;
   costMicros?: UsageValue;
   estimatedFinalSpend?: UsageValue;
@@ -92,7 +92,7 @@ export type RuntimeActivityKind =
   | "invocation-failed"
   | "usage-finalized"
   | "worker-waiting"
-  | "mission-transition";
+  | "job-transition";
 
 export type RuntimeActivityItem = {
   id: string;
@@ -109,17 +109,19 @@ export type RuntimeActivityItem = {
 };
 
 export type BudgetUsageProjection = {
-  spent: number;
-  limit: number;
-  remaining: number;
-  percent: number;
-  burnRatePerMinute?: number;
+  /** Hard ceiling amount in whole currency units, or `null` when none is recorded. */
+  limit: number | null;
+  /** The unit the ceiling is expressed in, or `null` when none is recorded. */
+  unit: string | null;
+  /** Which configuration recorded the ceiling, or `null` when none is recorded. */
+  source: string | null;
+  /** A modelled final spend, present only when a caller supplies one. */
   estimatedFinalSpend?: UsageValue;
 };
 
 /** Normalized observability state. It intentionally contains no transport or backend DTOs. */
 export type RuntimeObservability = {
-  mission: MissionRuntimeStats;
+  job: JobRuntimeStats;
   workers: WorkerRuntimeStats[];
   timeline: UsageTimelinePoint[];
   activities: RuntimeActivityItem[];
@@ -239,18 +241,19 @@ export function toChartableTimeline(points: UsageTimelinePoint[]): ChartableTime
   });
 }
 
+/**
+ * The control plane exposes a Job's hard budget ceiling and nothing about what
+ * it has spent, so this projection states the ceiling only: no spend, burn rate,
+ * or percentage is modelled or borrowed from another surface.
+ */
 export function deriveBudgetUsage(
-  budget: { spent: number; limit: number },
-  elapsedMs?: number,
+  ceiling: { amount: number; unit: string; source: string } | null,
   estimatedFinalSpend?: UsageValue,
 ): BudgetUsageProjection {
-  const remaining = Math.max(0, budget.limit - budget.spent);
   return {
-    spent: budget.spent,
-    limit: budget.limit,
-    remaining,
-    percent: budget.limit > 0 ? Math.min(100, (budget.spent / budget.limit) * 100) : 0,
-    burnRatePerMinute: elapsedMs && elapsedMs > 0 ? budget.spent / (elapsedMs / 60_000) : undefined,
+    limit: ceiling?.amount ?? null,
+    unit: ceiling?.unit ?? null,
+    source: ceiling?.source ?? null,
     estimatedFinalSpend,
   };
 }

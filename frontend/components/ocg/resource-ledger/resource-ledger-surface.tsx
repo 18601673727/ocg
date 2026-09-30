@@ -36,7 +36,7 @@ import {
   latestTimestampMs,
   summarize,
   toLedgerTimeSeries,
-  UNKNOWN_MISSION_KEY,
+  UNKNOWN_JOB_KEY,
 } from "./selectors";
 import {
   formatCostMicros,
@@ -165,12 +165,12 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
   const providerGroups = useMemo(() => groupEntries(filtered, "provider"), [filtered]);
   const modelGroups = useMemo(() => groupEntries(filtered, "model"), [filtered]);
   const modelVariantGroups = useMemo(() => groupEntries(filtered, "modelVariant"), [filtered]);
-  const missionGroups = useMemo(
-    () => groupEntries(filtered, "mission").filter((group) => group.key !== UNKNOWN_MISSION_KEY),
+  const jobGroups = useMemo(
+    () => groupEntries(filtered, "job").filter((group) => group.key !== UNKNOWN_JOB_KEY),
     [filtered],
   );
   const unknownEntries = useMemo(
-    () => filtered.filter((entry) => entry.attributionConfidence === "unknown" || entry.attributedMissionId === null),
+    () => filtered.filter((entry) => entry.attributionConfidence === "unknown" || entry.attributedJobId === null),
     [filtered],
   );
 
@@ -187,7 +187,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
             {formatCount(summary.entryCount)} calls
           </Pill>
           <span className="text-[10px] text-muted-foreground">
-            {summary.missionCount} missions · {summary.workerCount} workers
+            {summary.jobCount} jobs · {summary.workerCount} workers
           </span>
           <span
             className="ml-auto shrink-0 text-[10px] text-muted-foreground"
@@ -249,8 +249,8 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
                 icon={Layers}
               />
               <Metric
-                label="Missions / workers"
-                value={`${summary.missionCount} / ${summary.workerCount}`}
+                label="Jobs / workers"
+                value={`${summary.jobCount} / ${summary.workerCount}`}
                 detail={`${summary.leadEntryCount} lead calls`}
                 icon={Users}
               />
@@ -319,7 +319,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
           <div className="flex min-w-0 flex-col gap-3">
             <AttributionSummary summary={summary} />
             <AttributionBreakdown
-              missions={missionGroups}
+              jobs={jobGroups}
               unknownEntries={unknownEntries}
               onSelectEntry={setSelectedEntry}
             />

@@ -81,7 +81,7 @@ function matchesQuery(item: AttentionItem, query: string): boolean {
   const haystack = [
     item.title,
     item.summary,
-    item.missionTitle,
+    item.jobTitle,
     item.taskTitle,
     item.providerLabel,
     item.model,
@@ -148,7 +148,7 @@ export function selectDerivedAttention(snapshot: RuntimeSnapshot, fixtureQueue: 
         createdAt: "now",
         updatedAt: "now",
         status: "pending",
-        destination: "mission-control",
+        destination: "job-execution",
         source: "runtime",
         approval: null,
         blocked: null,

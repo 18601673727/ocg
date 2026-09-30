@@ -7,13 +7,14 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
   EmptyState,
-  MISSION_STATUS,
+  JOB_STATE,
   Pill,
   ProgressBar,
   SegmentedTabs,
   type TabItem,
 } from "@/components/ocg/primitives";
-import type { Mission } from "../types";
+import type { JobExecution } from "./domain";
+import type { JobAccounting } from "./accounting";
 import type { RuntimeObservability } from "../runtime/observability";
 import { ObservabilityPanel } from "../observability/observability-panel";
 import {
@@ -23,13 +24,14 @@ import {
   type InspectorTab,
 } from "../observability/inspector-state";
 
-type MissionViewProps = {
-  mission: Mission;
+type JobInspectorProps = {
+  execution: JobExecution;
+  accounting?: JobAccounting | null;
   observability?: RuntimeObservability | null;
   mode?: InspectorMode;
   onModeChange?: (mode: InspectorMode) => void;
   onClose: () => void;
-  onOpenMissionControl?: () => void;
+  onOpenJobExecution?: () => void;
 };
 
 const TAB_LABELS: Record<InspectorTab, string> = {
@@ -40,57 +42,62 @@ const TAB_LABELS: Record<InspectorTab, string> = {
 
 const TABS: TabItem<InspectorTab>[] = INSPECTOR_TABS.map((id) => ({ id, label: TAB_LABELS[id] }));
 
-function MissionContext({ mission, compact = false }: { mission: Mission; compact?: boolean }) {
-  const pct = mission.total > 0 ? Math.round((mission.completed / mission.total) * 100) : 0;
+/** Canonical Job summary: state, Project, and settled Calls over the authoritative Attempt. */
+function JobContext({ execution, compact = false }: { execution: JobExecution; compact?: boolean }) {
+  const progress = execution.progress;
+  const settled = progress?.settled ?? 0;
+  const total = progress?.total ?? 0;
+  const pct = progress?.percent ?? 0;
   return (
     <div className={cn(compact ? "rounded-md border border-border bg-muted/20 px-2.5 py-2" : "", "min-w-0")}>
       <p
         className={cn("truncate font-semibold tracking-tight", compact ? "text-[12px]" : "text-[14px]")}
-        title={mission.title}
+        title={execution.jobId}
       >
-        {mission.title}
+        {execution.jobId}
       </p>
       <div className="mt-1.5 flex items-center gap-1.5">
         <Pill
-          tone={MISSION_STATUS[mission.status].tone}
+          tone={JOB_STATE[execution.state].tone}
           dot
-          pulse={MISSION_STATUS[mission.status].pulse}
+          pulse={JOB_STATE[execution.state].pulse}
         >
-          {humanizeStatus(mission.status)}
+          {humanizeStatus(execution.state)}
         </Pill>
         <span className="text-[11px] text-muted-foreground">
-          {mission.completed} / {mission.total} tasks
+          {settled} / {total} calls
         </span>
         <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">{pct}%</span>
       </div>
       <ProgressBar
         className="mt-2"
-        value={mission.completed}
-        max={mission.total}
-        ariaLabel="Mission progress"
+        value={settled}
+        max={total}
+        ariaLabel="Job progress"
       />
-      {!compact && <p className="mt-1 text-[11px] text-muted-foreground">{pct}% complete · local fixture</p>}
+      {!compact && <p className="mt-1 text-[11px] text-muted-foreground">{pct}% of the authoritative Attempt&apos;s Calls settled · {execution.projectId}</p>}
     </div>
   );
 }
 
-export function MissionView({
-  mission,
+export function JobInspector({
+  execution,
+  accounting = null,
   observability,
   mode = "docked",
   onModeChange,
   onClose,
-  onOpenMissionControl,
-}: MissionViewProps) {
+  onOpenJobExecution,
+}: JobInspectorProps) {
   const [tab, setTab] = useState<InspectorTab>("overview");
   const nextMode = toggleInspectorMode(mode);
   return (
     <div className="flex h-full w-full min-w-0 flex-col">
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5">
         <CircleDot className="size-4 text-muted-foreground" aria-hidden="true" />
-        <h2 className="flex-1 text-[13px] font-semibold tracking-tight">Mission Inspector</h2>
-        {onOpenMissionControl && (
-          <Button variant="ghost" size="icon-xs" onClick={onOpenMissionControl} aria-label="Open Mission Control" title="Open Mission Control">
+        <h2 className="flex-1 text-[13px] font-semibold tracking-tight">Job Inspector</h2>
+        {onOpenJobExecution && (
+          <Button variant="ghost" size="icon-xs" onClick={onOpenJobExecution} aria-label="Open Job Execution" title="Open Job Execution">
             <ExternalLink className="size-3.5" />
           </Button>
         )}
@@ -100,13 +107,13 @@ export function MissionView({
             size="icon-xs"
             className="hidden lg:inline-flex"
             onClick={() => onModeChange(nextMode)}
-            aria-label={mode === "expanded" ? "Dock mission inspector" : "Expand mission inspector"}
-            title={mode === "expanded" ? "Dock mission inspector" : "Expand mission inspector"}
+            aria-label={mode === "expanded" ? "Dock job inspector" : "Expand job inspector"}
+            title={mode === "expanded" ? "Dock job inspector" : "Expand job inspector"}
           >
             {mode === "expanded" ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
           </Button>
         )}
-        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label="Collapse mission inspector" title="Collapse mission inspector">
+        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label="Collapse job inspector" title="Collapse job inspector">
           <X className="size-4" />
         </Button>
       </header>
@@ -114,24 +121,24 @@ export function MissionView({
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
         {!observability ? (
           <div className="flex flex-col gap-3">
-            <MissionContext mission={mission} />
-            <EmptyState>Runtime observability is not available for this Mission yet.</EmptyState>
+            <JobContext execution={execution} />
+            <EmptyState>Runtime observability is not available for this Job yet.</EmptyState>
           </div>
         ) : (
           <>
-            <MissionContext mission={mission} compact={tab !== "overview"} />
+            <JobContext execution={execution} compact={tab !== "overview"} />
             <nav className="sticky top-0 z-10 -mx-3 mt-3 border-y border-border bg-background/95 px-3 py-1.5 backdrop-blur">
               <SegmentedTabs
                 tabs={TABS}
                 value={tab}
                 onSelect={setTab}
-                ariaLabel="Mission inspector surfaces"
-                panelIdBase="mission-inspector"
+                ariaLabel="Job inspector surfaces"
+                panelIdBase="job-inspector"
                 className="grid-cols-3"
               />
             </nav>
-            <div id={`mission-inspector-${tab}`} role="tabpanel" aria-label={TAB_LABELS[tab]} className="mt-3">
-              <ObservabilityPanel mission={mission} observability={observability} tab={tab} />
+            <div id={`job-inspector-${tab}`} role="tabpanel" aria-label={TAB_LABELS[tab]} className="mt-3">
+              <ObservabilityPanel execution={execution} accounting={accounting} observability={observability} tab={tab} />
             </div>
           </>
         )}

@@ -135,7 +135,7 @@ export type LedgerSummary = {
   retryingCount: number;
   /** Calls that were a retry attempt (attempt > 1). */
   retryCount: number;
-  missionCount: number;
+  jobCount: number;
   taskCount: number;
   workerCount: number;
   leadEntryCount: number;
@@ -165,8 +165,8 @@ export function summarize(entries: readonly ResourceLedgerEntry[]): LedgerSummar
     failureCount: entries.filter((entry) => entry.status === "failure").length,
     retryingCount: entries.filter((entry) => entry.status === "retrying").length,
     retryCount: entries.filter((entry) => entry.attempt > 1).length,
-    missionCount: new Set(entries.map((entry) => entry.missionId)).size,
-    taskCount: new Set(entries.map((entry) => `${entry.missionId}\u0000${entry.taskId}`)).size,
+    jobCount: new Set(entries.map((entry) => entry.jobId)).size,
+    taskCount: new Set(entries.map((entry) => `${entry.jobId}\u0000${entry.taskId}`)).size,
     workerCount: new Set(entries.map((entry) => entry.workerId)).size,
     leadEntryCount: entries.filter((entry) => entry.role === "lead").length,
     traffic,
@@ -193,7 +193,7 @@ export type LedgerGroup = {
   summary: LedgerSummary;
 };
 
-export const UNKNOWN_MISSION_KEY = "__unknown_mission__";
+export const UNKNOWN_JOB_KEY = "__unknown_job__";
 export const UNKNOWN_TASK_KEY = "__unknown_task__";
 
 function dimensionOf(
@@ -201,17 +201,17 @@ function dimensionOf(
   dimension: LedgerDimension,
 ): { key: string; label: string; detail: string | null } {
   switch (dimension) {
-    case "mission":
-      return entry.attributedMissionId === null
-        ? { key: UNKNOWN_MISSION_KEY, label: "Unknown Mission", detail: null }
-        : { key: entry.attributedMissionId, label: entry.missionLabel, detail: entry.missionId };
+    case "job":
+      return entry.attributedJobId === null
+        ? { key: UNKNOWN_JOB_KEY, label: "Unknown Job", detail: null }
+        : { key: entry.attributedJobId, label: entry.jobLabel, detail: entry.jobId };
     case "task":
       return entry.attributedTaskId === null
-        ? { key: `${entry.attributedMissionId ?? UNKNOWN_MISSION_KEY}\u0000${UNKNOWN_TASK_KEY}`, label: "Unknown task", detail: entry.attributedMissionId ? entry.missionLabel : null }
+        ? { key: `${entry.attributedJobId ?? UNKNOWN_JOB_KEY}\u0000${UNKNOWN_TASK_KEY}`, label: "Unknown task", detail: entry.attributedJobId ? entry.jobLabel : null }
         : {
-            key: `${entry.attributedMissionId ?? UNKNOWN_MISSION_KEY}\u0000${entry.attributedTaskId}`,
+            key: `${entry.attributedJobId ?? UNKNOWN_JOB_KEY}\u0000${entry.attributedTaskId}`,
             label: entry.taskLabel,
-            detail: entry.missionLabel,
+            detail: entry.jobLabel,
           };
     case "worker":
       return { key: entry.workerId, label: entry.workerLabel, detail: entry.role };
@@ -283,7 +283,7 @@ export function filterEntries(
   const windowMs = filter.window === "all" ? null : TIME_WINDOW_MS[filter.window];
 
   return entries.filter((entry) => {
-    if (filter.missionId !== ALL_FILTER_VALUE && entry.missionId !== filter.missionId) return false;
+    if (filter.jobId !== ALL_FILTER_VALUE && entry.jobId !== filter.jobId) return false;
     if (filter.workerId !== ALL_FILTER_VALUE && entry.workerId !== filter.workerId) return false;
     if (filter.provider !== ALL_FILTER_VALUE && entry.provider !== filter.provider) return false;
     if (filter.modelKey !== ALL_FILTER_VALUE && modelKey(entry.provider, entry.model) !== filter.modelKey) {
@@ -302,7 +302,7 @@ export function filterEntries(
 export function isFilterActive(filter: LedgerFilter): boolean {
   return (
     filter.window !== DEFAULT_LEDGER_FILTER.window ||
-    filter.missionId !== DEFAULT_LEDGER_FILTER.missionId ||
+    filter.jobId !== DEFAULT_LEDGER_FILTER.jobId ||
     filter.workerId !== DEFAULT_LEDGER_FILTER.workerId ||
     filter.provider !== DEFAULT_LEDGER_FILTER.provider ||
     filter.modelKey !== DEFAULT_LEDGER_FILTER.modelKey
@@ -330,7 +330,7 @@ function dedupe(
  */
 export function filterOptions(entries: readonly ResourceLedgerEntry[]): LedgerFilterOptions {
   return {
-    missions: dedupe(entries, (entry) => ({ value: entry.missionId, label: entry.missionLabel })),
+    jobs: dedupe(entries, (entry) => ({ value: entry.jobId, label: entry.jobLabel })),
     workers: dedupe(entries, (entry) => ({
       value: entry.workerId,
       label: entry.workerLabel,

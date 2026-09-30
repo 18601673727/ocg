@@ -14,9 +14,9 @@ export type ComposerIntentSource =
   /** Reserved for a future structured or natural-language intent resolver. */
   | "resolver";
 
-export type ComposerMissionCreateIntent = {
-  kind: "mission.create";
-  /** Optional trailing objective typed after `/mission create`. */
+export type ComposerJobCreateIntent = {
+  kind: "job.create";
+  /** Optional trailing objective typed after `/job create`. */
   seed?: string;
   raw: string;
   source: Exclude<ComposerIntentSource, "plain-text">;
@@ -39,7 +39,7 @@ export type ComposerUnknownCommandIntent = {
 
 export type ComposerIntent =
   | ComposerChatIntent
-  | ComposerMissionCreateIntent
+  | ComposerJobCreateIntent
   | ComposerUnknownCommandIntent;
 
 /**
@@ -49,7 +49,7 @@ export type ComposerIntent =
  */
 export type ComposerIntentHandlers = {
   chat: (intent: ComposerChatIntent) => void;
-  "mission.create": (intent: ComposerMissionCreateIntent) => void;
+  "job.create": (intent: ComposerJobCreateIntent) => void;
   "unknown-command"?: (intent: ComposerUnknownCommandIntent) => void;
 };
 
@@ -61,8 +61,8 @@ export function dispatchComposerIntent(
     case "chat":
       handlers.chat(intent);
       return;
-    case "mission.create":
-      handlers["mission.create"](intent);
+    case "job.create":
+      handlers["job.create"](intent);
       return;
     case "unknown-command":
       handlers["unknown-command"]?.(intent);
@@ -71,8 +71,8 @@ export function dispatchComposerIntent(
 }
 
 
-const MISSION_CREATE_PATTERN = /^\/mission\s+create(?:\s+([\s\S]*))?$/i;
-const MISSION_ONLY_PATTERN = /^\/mission\s*$/i;
+const JOB_CREATE_PATTERN = /^\/job\s+create(?:\s+([\s\S]*))?$/i;
+const JOB_ONLY_PATTERN = /^\/job\s*$/i;
 
 /** Deterministic parse. Normal text stays chat; malformed slash commands stay explicit. */
 export function parseComposerIntent(raw: string): ComposerIntent {
@@ -83,23 +83,23 @@ export function parseComposerIntent(raw: string): ComposerIntent {
     return { kind: "chat", text: trimmed, raw: text, source: "plain-text" };
   }
 
-  const missionCreate = MISSION_CREATE_PATTERN.exec(trimmed);
-  if (missionCreate) {
-    const seed = missionCreate[1]?.trim();
+  const jobCreate = JOB_CREATE_PATTERN.exec(trimmed);
+  if (jobCreate) {
+    const seed = jobCreate[1]?.trim();
     return {
-      kind: "mission.create",
+      kind: "job.create",
       ...(seed ? { seed } : {}),
       raw: text,
       source: "slash-command",
     };
   }
 
-  if (MISSION_ONLY_PATTERN.test(trimmed)) {
+  if (JOB_ONLY_PATTERN.test(trimmed)) {
     return {
       kind: "unknown-command",
-      command: "/mission",
+      command: "/job",
       raw: text,
-      reason: "Incomplete command. Use /mission create to open a Mission draft.",
+      reason: "Incomplete command. Use /job create to open a Job draft.",
       source: "slash-command",
     };
   }
@@ -109,7 +109,7 @@ export function parseComposerIntent(raw: string): ComposerIntent {
     kind: "unknown-command",
     command,
     raw: text,
-    reason: `Unknown command ${command}. Try /mission create.`,
+    reason: `Unknown command ${command}. Try /job create.`,
     source: "slash-command",
   };
 }
@@ -119,9 +119,9 @@ export function parseComposerIntent(raw: string): ComposerIntent {
 /* Suggestions                                                                */
 /* -------------------------------------------------------------------------- */
 
-export type ComposerSuggestionKind = "mission" | "mission.create";
+export type ComposerSuggestionKind = "job" | "job.create";
 
-export type ComposerSuggestionAction = "insert" | "create-mission";
+export type ComposerSuggestionAction = "insert" | "create-job";
 
 export type ComposerSuggestion = {
   /** Stable identity for keys and `aria-activedescendant`. */
@@ -137,31 +137,31 @@ export type ComposerSuggestion = {
 
 export const COMPOSER_SUGGESTIONS: readonly ComposerSuggestion[] = [
   {
-    id: "composer-mission",
-    kind: "mission",
-    label: "Mission",
-    command: "/mission ",
-    description: "Keep typing a Mission command. Use /mission create to open a draft.",
-    keywords: ["mission"],
+    id: "composer-job",
+    kind: "job",
+    label: "Job",
+    command: "/job ",
+    description: "Keep typing a Job command. Use /job create to open a draft.",
+    keywords: ["job"],
     action: "insert",
   },
   {
-    id: "composer-create-mission",
-    kind: "mission.create",
-    label: "Create Mission",
-    command: "/mission create",
-    description: "Open an inline Mission draft for the active Project.",
-    keywords: ["mission", "create", "draft", "new"],
-    action: "create-mission",
+    id: "composer-create-job",
+    kind: "job.create",
+    label: "Create Job",
+    command: "/job create",
+    description: "Open an inline Job draft for the active Project.",
+    keywords: ["job", "create", "draft", "new"],
+    action: "create-job",
   },
   {
-    id: "composer-mission-create-command",
-    kind: "mission.create",
-    label: "/mission create",
-    command: "/mission create",
+    id: "composer-job-create-command",
+    kind: "job.create",
+    label: "/job create",
+    command: "/job create",
     description: "Explicit command form; accepts an optional seed objective.",
-    keywords: ["mission", "create", "seed"],
-    action: "create-mission",
+    keywords: ["job", "create", "seed"],
+    action: "create-job",
   },
 ];
 
@@ -191,8 +191,8 @@ function suggestionMatchesToken(suggestion: ComposerSuggestion, token: string): 
 
 /**
  * Pure matcher. Every query token must appear in the suggestion's label,
- * command, or keywords, so "/" and "/mission" both return the full list while
- * a narrower query such as "/mission create" drops the generic Mission entry.
+ * command, or keywords, so "/" and "/job" both return the full list while
+ * a narrower query such as "/job create" drops the generic Job entry.
  */
 export function matchComposerSuggestions(raw: string, limit = COMPOSER_SUGGESTIONS.length): ComposerSuggestion[] {
   const { active, query } = parseComposerSuggestionQuery(raw);

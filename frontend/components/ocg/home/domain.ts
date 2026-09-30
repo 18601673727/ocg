@@ -2,11 +2,9 @@
  * Home domain types and pure helpers.
  *
  * Home is a projection over existing normalized domains (bootstrap,
- * missions, sessions, resource ledger). It does not own new backend
+ * job execution, sessions, resource ledger). It does not own new backend
  * state and never invent values.
  */
-
-import type { MissionStatus } from "../types";
 
 import type { Tone } from "../primitives";
 
@@ -24,7 +22,7 @@ export type AttentionKind =
   | "degradedResource";
 
 export type AttentionDestination =
-  | "mission-control"
+  | "job-execution"
   | "control-center"
   | "resource-ledger"
   | "logs"
@@ -37,7 +35,8 @@ export type AttentionItem = {
   kind: AttentionKind;
   title: string;
   summary: string;
-  missionId?: string;
+  jobId?: string;
+  sessionId?: string;
   taskId?: string;
   workerId?: string;
   provider?: string;
@@ -47,10 +46,10 @@ export type AttentionItem = {
   destination: AttentionDestination;
 };
 
-export type ActiveMissionProjection = {
+export type ActiveJobProjection = {
   id: string;
   title: string;
-  status: MissionStatus | "pending";
+  status: "running" | "pending";
   completed: number;
   total: number;
   currentWave?: number;
@@ -62,7 +61,7 @@ export type ActiveMissionProjection = {
   budgetSpent?: number;
   budgetLimit?: number;
   progress: number;
-  destination: "mission-control";
+  destination: "job-execution";
   sessionId?: string;
   jobId?: string;
   projectId?: string;
@@ -74,7 +73,7 @@ export type ContinueWorkingEntry = {
   title: string;
   subtitle: string;
   timeAgo: string;
-  kind: "chat" | "mission" | "diagnostics" | "configuration";
+  kind: "chat" | "job" | "diagnostics" | "configuration";
   destination: string;
   sessionId?: string;
   updatedAt?: string;
@@ -120,7 +119,7 @@ export type RecentActivityItem = {
   id: string;
   timeAgo: string;
   summary: string;
-  kind: "mission" | "worker" | "provider" | "model" | "budget" | "resource" | "verification";
+  kind: "job" | "worker" | "provider" | "model" | "budget" | "resource" | "verification";
   tone: RecentActivityTone;
   title?: string;
   subtitle?: string;

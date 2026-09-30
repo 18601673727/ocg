@@ -13,16 +13,13 @@
 import type {
   ChatMessage,
   ChatSession,
-  Mission,
   OcgRuntimeEvent,
   RuntimeStatus,
   ToolActivity,
-  Worker,
 } from "../types";
 import { RUNTIME_CONNECTION_STATES } from "../types";
 import type { BootstrapState } from "../bootstrap/types";
 import { isProjectId, type ProjectId } from "../project/domain";
-import type { MissionLaunchResult } from "./runtime-types";
 import { isNonEmptyString, isNonNegativeInteger, isOneOf, isRecord } from "@/lib/narrow";
 import { ATTENTION_LIFECYCLES, type AttentionItem } from "../attention/domain";
 import { LOG_LEVELS } from "../logs/domain";
@@ -65,15 +62,12 @@ export type RuntimeEnvelopePayloads = {
   };
   "conversation.message-completed": { message: ChatMessage };
   "activity.updated": { messageId: string; activity: ToolActivity };
-  "mission.updated": { mission: Mission };
   "observability.updated": { observability: RuntimeObservability };
-  "mission.launch-updated": { result: MissionLaunchResult };
   "attention.updated": { item: AttentionItem };
   "ledger.entry-added": { entry: ResourceLedgerEntry };
   "ledger.entry-updated": { entry: ResourceLedgerEntry };
   "log.appended": { entry: LogEntry };
   "bootstrap.updated": { bootstrap: BootstrapState };
-  "worker.updated": { worker: Worker };
   warning: { message: string };
   error: { message: string };
   cancelled: { messageId?: string };
@@ -91,15 +85,12 @@ export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
   "conversation.message-delta",
   "conversation.message-completed",
   "activity.updated",
-  "mission.updated",
   "observability.updated",
-  "mission.launch-updated",
   "attention.updated",
   "ledger.entry-added",
   "ledger.entry-updated",
   "log.appended",
   "bootstrap.updated",
-  "worker.updated",
   "warning",
   "error",
   "cancelled",
@@ -117,7 +108,6 @@ export type RuntimeEnvelopeHeader = {
   occurredAt: string;
   commandId?: string;
   sessionId?: string;
-  missionId?: string;
 };
 
 export type RuntimeEnvelope<
@@ -219,7 +209,6 @@ export type RuntimeEnvelopeHeaderInput = {
   eventVersion?: number;
   commandId?: string;
   sessionId?: string;
-  missionId?: string;
 };
 
 /** Build a typed envelope from a raw presentation event plus a stamped header. */
@@ -240,7 +229,6 @@ export function envelopeFromRuntimeEvent(
     ...(header.sessionId ?? eventSessionId(event) ?? undefined
       ? { sessionId: header.sessionId ?? eventSessionId(event)! }
       : {}),
-    ...(header.missionId !== undefined ? { missionId: header.missionId } : {}),
   };
 
   switch (event.type) {
@@ -262,12 +250,8 @@ export function envelopeFromRuntimeEvent(
       return { ...base, type: event.type, payload: { execution: event.execution, accounting: event.accounting } };
     case "job.launch-updated":
       return { ...base, type: event.type, payload: { result: event.result } };
-    case "mission.updated":
-      return { ...base, type: event.type, payload: { mission: event.mission } };
     case "observability.updated":
       return { ...base, type: event.type, payload: { observability: event.observability } };
-    case "mission.launch-updated":
-      return { ...base, type: event.type, payload: { result: event.result } };
     case "attention.updated":
       return { ...base, type: event.type, payload: { item: event.item } };
     case "ledger.entry-added":
@@ -278,8 +262,6 @@ export function envelopeFromRuntimeEvent(
       return { ...base, type: event.type, payload: { entry: event.entry } };
     case "bootstrap.updated":
       return { ...base, type: event.type, payload: { bootstrap: event.bootstrap } };
-    case "worker.updated":
-      return { ...base, type: event.type, payload: { worker: event.worker } };
     case "warning":
       return { ...base, type: event.type, payload: { message: event.message } };
     case "error":
@@ -317,7 +299,6 @@ export class RuntimeEnvelopeFactory {
       projectId?: ProjectId | null;
       commandId?: string;
       sessionId?: string;
-      missionId?: string;
     } = {},
   ): AnyRuntimeEnvelope {
     const sequence = this.sequence++;
@@ -330,7 +311,6 @@ export class RuntimeEnvelopeFactory {
       projectId: scope.projectId ?? null,
       commandId: scope.commandId,
       sessionId: scope.sessionId,
-      missionId: scope.missionId,
     });
   }
 
@@ -341,7 +321,6 @@ export class RuntimeEnvelopeFactory {
       projectId?: ProjectId | null;
       commandId?: string;
       sessionId?: string;
-      missionId?: string;
     } = {},
   ): RuntimeEnvelope<T> {
     const sequence = this.sequence++;
@@ -356,7 +335,6 @@ export class RuntimeEnvelopeFactory {
       occurredAt: this.isoAt(sequence),
       ...(scope.commandId !== undefined ? { commandId: scope.commandId } : {}),
       ...(scope.sessionId !== undefined ? { sessionId: scope.sessionId } : {}),
-      ...(scope.missionId !== undefined ? { missionId: scope.missionId } : {}),
       type,
       payload,
     };
@@ -392,12 +370,8 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
       return { type: envelope.type, sessionId, message: envelope.payload.message };
     case "activity.updated":
       return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, activity: envelope.payload.activity };
-    case "mission.updated":
-      return { type: envelope.type, sessionId, mission: envelope.payload.mission };
     case "observability.updated":
       return { type: envelope.type, sessionId, observability: envelope.payload.observability };
-    case "mission.launch-updated":
-      return { type: envelope.type, sessionId, result: envelope.payload.result };
     case "attention.updated":
       return { type: envelope.type, item: envelope.payload.item };
     case "ledger.entry-added":
@@ -408,8 +382,6 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
       return { type: envelope.type, entry: envelope.payload.entry };
     case "bootstrap.updated":
       return { type: envelope.type, bootstrap: envelope.payload.bootstrap };
-    case "worker.updated":
-      return { type: envelope.type, sessionId, worker: envelope.payload.worker };
     case "warning":
       return { type: envelope.type, message: envelope.payload.message };
     case "error":
@@ -484,22 +456,14 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       if (!isRecord(payload.activity) || !isNonEmptyString(payload.activity.id)) return "activity.id is required.";
       return null;
     }
-    case "mission.updated": {
-      const mission = payload.mission;
-      if (!isRecord(mission) || !isNonEmptyString(mission.status)) return "mission.status is required.";
-      if (!( ["planning", "running", "paused", "completed", "failed", "budget-exhausted"] as readonly string[]).includes(mission.status)) return "mission.status is invalid.";
-      if (typeof mission.title !== "string") return "mission.title must be a string.";
-      return null;
-    }
     case "observability.updated": {
       const observability = payload.observability;
       if (!isRecord(observability)) return "observability must be an object.";
       if (!Array.isArray(observability.workers)) return "observability.workers must be an array.";
-      if (!isRecord(observability.mission)) return "observability.mission must be an object.";
+      if (!isRecord(observability.job)) return "observability.job must be an object.";
       return null;
     }
-    case "job.launch-updated":
-    case "mission.launch-updated": {
+    case "job.launch-updated": {
       const result = payload.result;
       if (!isRecord(result) || !isNonEmptyString(result.outcome)) return "result.outcome is required.";
       if (!isNonEmptyString(result.commandId)) return "result.commandId is required.";
@@ -518,7 +482,7 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
     case "ledger.entry-updated": {
       const entry = payload.entry;
       if (!isRecord(entry) || !isNonEmptyString(entry.id)) return "ledger entry.id is required.";
-      if (!isNonEmptyString(entry.missionId)) return "ledger entry.missionId is required.";
+      if (!isNonEmptyString(entry.jobId)) return "ledger entry.jobId is required.";
       if (!isNonEmptyString(entry.timestamp)) return "ledger entry.timestamp is required.";
       if (!isNonNegativeInteger(entry.attempt) || entry.attempt < 1) return "ledger entry.attempt must be a positive integer.";
       if (entry.costMicros !== null && (typeof entry.costMicros !== "number" || !Number.isSafeInteger(entry.costMicros) || entry.costMicros < 0)) return "ledger entry.costMicros must be a non-negative safe integer or null.";
@@ -535,11 +499,6 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
     }
     case "bootstrap.updated": {
       if (!isRecord(payload.bootstrap)) return "bootstrap must be an object.";
-      return null;
-    }
-    case "worker.updated": {
-      const worker = payload.worker;
-      if (!isRecord(worker) || !isNonEmptyString(worker.id)) return "worker.id is required.";
       return null;
     }
     case "warning":

@@ -3,9 +3,9 @@
  *
  * Each session's execution is a set of *canonical* entities — a Job, its
  * Attempt history, and the Calls those Attempts own — shaped exactly like the
- * `mission` payload the control plane returns for a real Project. The fixtures
+ * `job` payload the control plane returns for a real Project. The fixtures
  * are therefore projected by the same `assembleJobExecution` path the backend
- * uses; there is no parallel Mission-shaped fixture model to drift from it.
+ * uses; there is no parallel Job-shaped fixture model to drift from it.
  *
  * Accounting is ceiling-only. The control plane exposes a hard budget in
  * global, Project-default, or Job configuration, and exposes nothing about what

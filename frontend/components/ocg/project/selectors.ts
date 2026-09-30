@@ -12,7 +12,7 @@ import type { AttentionItem } from "../attention/domain";
 import type { AttentionQueue } from "../attention/selectors";
 import type { ProjectId } from "./domain";
 import { resolveProjectId } from "./domain";
-import { projectLedgerMissionIds, projectSessionIds } from "./fixtures";
+import { projectLedgerJobIds, projectSessionIds } from "./fixtures";
 
 
 /** Fixture session IDs for a project plus any registered extra session IDs. */
@@ -48,7 +48,7 @@ export function resolveSelectedSessionId(
  *
  * Sessions and their per-session maps are filtered to the project's session
  * IDs (plus any registered extras). The resource ledger is filtered by the
- * project's Mission IDs. Everything else (scenario, status, bootstrap) is
+ * project's Job IDs. Everything else (scenario, status, bootstrap) is
  * shared and passes through unchanged.
  */
 export function selectProjectSnapshot(
@@ -61,9 +61,9 @@ export function selectProjectSnapshot(
   const keepBySession = <T>(record: Record<string, T>): Record<string, T> =>
     Object.fromEntries(Object.entries(record).filter(([key]) => allowed.has(key)));
 
-  const missionIds = new Set(projectLedgerMissionIds(id));
+  const jobIds = new Set(projectLedgerJobIds(id));
   const ledgerEntries = snapshot.resourceLedger?.entries.filter((entry) =>
-    missionIds.has(entry.missionId) || (entry.sessionId !== null && allowed.has(entry.sessionId)),
+    jobIds.has(entry.jobId) || (entry.sessionId !== null && allowed.has(entry.sessionId)),
   ) ?? [];
   const resourceLedger = snapshot.resourceLedger && ledgerEntries.length > 0
     ? { ...snapshot.resourceLedger, entries: ledgerEntries }
@@ -75,7 +75,6 @@ export function selectProjectSnapshot(
     ...snapshot,
     sessions: snapshot.sessions.filter((session) => allowed.has(session.id)),
     messagesBySession: keepBySession(snapshot.messagesBySession),
-    missionsBySession: keepBySession(snapshot.missionsBySession),
     observabilityBySession: keepBySession(snapshot.observabilityBySession),
     executionBySession: keepBySession(snapshot.executionBySession),
     accountingBySession: keepBySession(snapshot.accountingBySession),

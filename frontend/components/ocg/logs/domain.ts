@@ -23,7 +23,7 @@ export type LogEntry = {
   source: LogSource;
   category?: string;
   message: string;
-  missionId?: string;
+  jobId?: string;
   taskId?: string;
   workerId?: string;
   workerRole?: string;
@@ -42,7 +42,7 @@ export type LogFilters = {
   text?: string;
   level?: LogLevel | "all";
   source?: string;
-  missionId?: string;
+  jobId?: string;
   workerId?: string;
   workerRole?: string;
   provider?: string;
@@ -140,7 +140,7 @@ export function filterLogEntries(entries: LogEntry[], filters: LogFilters = {}):
       entry.message,
       entry.source,
       entry.category,
-      entry.missionId,
+      entry.jobId,
       entry.taskId,
       entry.workerId,
       entry.workerRole,
@@ -154,7 +154,7 @@ export function filterLogEntries(entries: LogEntry[], filters: LogFilters = {}):
       (!query || searchable.includes(query)) &&
       (!filters.level || filters.level === "all" || entry.level === filters.level) &&
       (!filters.source || entry.source === filters.source) &&
-      (!filters.missionId || entry.missionId === filters.missionId) &&
+      (!filters.jobId || entry.jobId === filters.jobId) &&
       (!filters.workerId || entry.workerId === filters.workerId) &&
       (!filters.workerRole || entry.workerRole === filters.workerRole) &&
       (!filters.provider || entry.provider === filters.provider) &&
@@ -187,14 +187,14 @@ function fixtureEntry(entry: LogEntry): LogEntry {
 export function createLogsLiveFixture(projectScope?: string): LogEntry[] {
   const entries = [
     fixtureEntry({ id: "logs-startup", timestamp: at(0), level: "info", source: "OCG Core", category: "startup", message: "Workspace runtime initialized", sessionId: "logs-live-session", correlationId: "corr-logs-live" }),
-    fixtureEntry({ id: "logs-mission-start", timestamp: at(1), level: "info", source: "Mission", category: "lifecycle", message: "Mission started: diagnose provider recovery", missionId: "mission-logs-live", sessionId: "logs-live-session", correlationId: "corr-logs-live" }),
-    fixtureEntry({ id: "logs-worker-invocation", timestamp: at(2), level: "info", source: "Worker", category: "invocation", message: "Worker invocation started", missionId: "mission-logs-live", taskId: "task-provider-health", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", invocationId: "invoke-verify-01", sessionId: "logs-live-session" }),
-    fixtureEntry({ id: "logs-runtime-warning", timestamp: at(3), level: "warn", source: "Runtime", category: "health", message: "Provider response exceeded the expected latency window", missionId: "mission-logs-live", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", fields: { latencyMs: 1840, thresholdMs: 1200 } }),
-    fixtureEntry({ id: "logs-retry", timestamp: at(4), level: "warn", source: "Orchestration", category: "retry", message: "Retry scheduled after transient provider timeout", missionId: "mission-logs-live", taskId: "task-provider-health", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", fields: { attempt: 2, maxAttempts: 3, backoffMs: 500 } }),
-    fixtureEntry({ id: "logs-redaction", timestamp: at(5), level: "info", source: "Provider", category: "redaction", message: "Provider diagnostic payload normalized with sensitive fields removed", missionId: "mission-logs-live", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", redacted: true, fields: { redacted: true, sensitiveFieldRemoved: true, fieldCount: 2 } }),
-    fixtureEntry({ id: "logs-error", timestamp: at(6), level: "error", source: "Model", category: "invocation", message: "Model invocation failed with a transient provider timeout", missionId: "mission-logs-live", taskId: "task-provider-health", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", invocationId: "invoke-verify-01", fields: { code: "provider-timeout", retryable: true } }),
-    fixtureEntry({ id: "logs-recovery", timestamp: at(7), level: "info", source: "Runtime", category: "recovery", message: "Provider health recovered; retry may continue", missionId: "mission-logs-live", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", fields: { health: "ready" } }),
-    fixtureEntry({ id: "logs-complete", timestamp: at(8), level: "info", source: "Mission", category: "lifecycle", message: "Mission completed successfully", missionId: "mission-logs-live", sessionId: "logs-live-session", correlationId: "corr-logs-live", fields: { completedTasks: 1, failedAttempts: 1 } }),
+    fixtureEntry({ id: "logs-job-start", timestamp: at(1), level: "info", source: "Job", category: "lifecycle", message: "Job started: diagnose provider recovery", jobId: "job-logs-live", sessionId: "logs-live-session", correlationId: "corr-logs-live" }),
+    fixtureEntry({ id: "logs-worker-invocation", timestamp: at(2), level: "info", source: "Worker", category: "invocation", message: "Worker invocation started", jobId: "job-logs-live", taskId: "task-provider-health", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", invocationId: "invoke-verify-01", sessionId: "logs-live-session" }),
+    fixtureEntry({ id: "logs-runtime-warning", timestamp: at(3), level: "warn", source: "Runtime", category: "health", message: "Provider response exceeded the expected latency window", jobId: "job-logs-live", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", fields: { latencyMs: 1840, thresholdMs: 1200 } }),
+    fixtureEntry({ id: "logs-retry", timestamp: at(4), level: "warn", source: "Orchestration", category: "retry", message: "Retry scheduled after transient provider timeout", jobId: "job-logs-live", taskId: "task-provider-health", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", fields: { attempt: 2, maxAttempts: 3, backoffMs: 500 } }),
+    fixtureEntry({ id: "logs-redaction", timestamp: at(5), level: "info", source: "Provider", category: "redaction", message: "Provider diagnostic payload normalized with sensitive fields removed", jobId: "job-logs-live", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", redacted: true, fields: { redacted: true, sensitiveFieldRemoved: true, fieldCount: 2 } }),
+    fixtureEntry({ id: "logs-error", timestamp: at(6), level: "error", source: "Model", category: "invocation", message: "Model invocation failed with a transient provider timeout", jobId: "job-logs-live", taskId: "task-provider-health", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", invocationId: "invoke-verify-01", fields: { code: "provider-timeout", retryable: true } }),
+    fixtureEntry({ id: "logs-recovery", timestamp: at(7), level: "info", source: "Runtime", category: "recovery", message: "Provider health recovered; retry may continue", jobId: "job-logs-live", workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", fields: { health: "ready" } }),
+    fixtureEntry({ id: "logs-complete", timestamp: at(8), level: "info", source: "Job", category: "lifecycle", message: "Job completed successfully", jobId: "job-logs-live", sessionId: "logs-live-session", correlationId: "corr-logs-live", fields: { completedTasks: 1, failedAttempts: 1 } }),
   ];
   if (!projectScope) return entries;
   const sessionId = `logs-${projectScope}-session`;

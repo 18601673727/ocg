@@ -61,8 +61,8 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
         <Field label="Worker">
           {entry.workerLabel} <span className="text-muted-foreground">({entry.workerId})</span>
         </Field>
-        <Field label="Mission">
-          <span title={entry.missionId}>{entry.missionLabel}</span>
+        <Field label="Job">
+          <span title={entry.jobId}>{entry.jobLabel}</span>
         </Field>
         <Field label="Task">
           <span title={entry.taskId}>{entry.taskLabel}</span>
@@ -146,7 +146,7 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
         <div className="flex flex-wrap items-center gap-1.5">
           <AttributionPill value={entry.attributionConfidence} />
           <span className="text-[10px] text-muted-foreground">
-            Attributed to {entry.attributedMissionId ?? "an unknown Mission"}
+            Attributed to {entry.attributedJobId ?? "an unknown Job"}
             {entry.attributedTaskId ? ` / ${entry.attributedTaskId}` : " / unknown task"}
           </span>
         </div>

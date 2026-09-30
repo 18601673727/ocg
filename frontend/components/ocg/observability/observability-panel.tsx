@@ -14,14 +14,11 @@ import {
 } from "recharts";
 import {
   Activity,
-  AlertCircle,
-  Check,
   Clock3,
   Coins,
   Cpu,
   Gauge,
   GitBranch,
-  RefreshCw,
   Users,
   Wallet,
   Zap,
@@ -42,12 +39,12 @@ import {
   EmptyState,
   Metric,
   Pill,
-  ProgressBar,
   SectionTitle,
   StatusDot,
   WORKER_STATUS,
 } from "@/components/ocg/primitives";
-import type { Mission, MissionTask } from "../types";
+import type { JobExecution } from "../execution/domain";
+import type { JobAccounting } from "../execution/accounting";
 import {
   aggregateModelStats,
   aggregateProviderStats,
@@ -84,13 +81,7 @@ function formatCostUsage(value?: UsageValue): string {
     : UNKNOWN;
 }
 
-function formatDollarUsage(value?: UsageValue): string {
-  return value
-    ? withApproximation(formatDollars(value.value), value.provenance === "estimated")
-    : UNKNOWN;
-}
-
-function TokenMetrics({ tokenUsage }: { tokenUsage: RuntimeObservability["mission"]["tokenUsage"] }) {
+function TokenMetrics({ tokenUsage }: { tokenUsage: RuntimeObservability["job"]["tokenUsage"] }) {
   return (
     <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-2 2xl:grid-cols-3">
       <Metric label="Total tokens" value={formatTokenUsage(tokenUsage.total)} icon={Gauge} />
@@ -103,32 +94,28 @@ function TokenMetrics({ tokenUsage }: { tokenUsage: RuntimeObservability["missio
   );
 }
 
-function BudgetSection({ mission, observability }: { mission: Mission; observability: RuntimeObservability }) {
-  const budget = deriveBudgetUsage(
-    mission.budget,
-    observability.mission.elapsedMs,
-    observability.mission.estimatedFinalSpend,
-  );
+function BudgetSection({ accounting, observability }: { accounting: JobAccounting | null; observability: RuntimeObservability }) {
+  const budget = deriveBudgetUsage(accounting?.ceiling ?? null, observability.job.estimatedFinalSpend);
   return (
-    <section className="rounded-md border border-border bg-muted/20 p-2.5" aria-label="Mission budget">
+    <section className="rounded-md border border-border bg-muted/20 p-2.5" aria-label="Job budget">
       <div className="flex items-center gap-1.5">
         <Wallet className="size-3.5 text-muted-foreground" aria-hidden="true" />
         <h3 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Budget</h3>
         <span className="ml-auto text-[10px] text-muted-foreground">hard limit</span>
       </div>
-      <div className="mt-2 flex items-baseline justify-between gap-2">
-        <span className="text-[16px] font-semibold tabular-nums">{formatDollars(budget.spent)}</span>
-        <span className="text-[11px] text-muted-foreground">of {formatDollars(budget.limit)}</span>
-        <span className="ml-auto text-[11px] font-medium tabular-nums">{budget.percent.toFixed(0)}%</span>
-      </div>
-      <ProgressBar value={budget.percent} max={100} ariaLabel="Budget consumed" tone={budget.percent >= 90 ? "bg-red-500" : "bg-foreground"} className="mt-1.5" />
-      <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-muted-foreground">
-        <span>remaining <strong className="font-medium text-foreground">{formatDollars(budget.remaining)}</strong></span>
-        <span className="text-right">burn <strong className="font-medium text-foreground">{budget.burnRatePerMinute === undefined ? UNKNOWN : `${formatDollars(budget.burnRatePerMinute)}/min`}</strong></span>
-        <span>forecast <strong className="font-medium text-foreground">{formatDollarUsage(budget.estimatedFinalSpend)}</strong></span>
-        <span className="text-right">commitment <strong className="font-medium text-foreground">{mission.commitment.workers} {mission.commitment.mode}</strong></span>
-      </div>
-      {budget.estimatedFinalSpend && <p className="mt-1 text-[10px] text-muted-foreground">Forecast is {budget.estimatedFinalSpend.provenance}; hard budget remains authoritative.</p>}
+      {budget.limit === null ? (
+        <p className="mt-2 text-[11px] text-muted-foreground">No hard budget ceiling is recorded for this Job.</p>
+      ) : (
+        <>
+          <div className="mt-2 flex items-baseline justify-between gap-2">
+            <span className="text-[16px] font-semibold tabular-nums">{formatDollars(budget.limit)}</span>
+            <span className="text-[11px] text-muted-foreground">{budget.unit ?? "USD"} ceiling</span>
+            <span className="ml-auto text-[10px] text-muted-foreground">{budget.source}</span>
+          </div>
+          <p className="mt-1 text-[10px] text-muted-foreground">Consumption is not reported by the control plane; the ceiling stays authoritative.</p>
+          {budget.estimatedFinalSpend && <p className="mt-1 text-[10px] text-muted-foreground">Forecast is {budget.estimatedFinalSpend.provenance}; hard budget remains authoritative.</p>}
+        </>
+      )}
     </section>
   );
 }
@@ -151,17 +138,16 @@ function CurrentRuntimeSummary({ observability }: { observability: RuntimeObserv
   );
 }
 
-function TaskList({ tasks }: { tasks: MissionTask[] }) {
+/** Canonical Call/Attempt counts, the only execution figures the projection states. */
+function CallSummary({ execution }: { execution: JobExecution }) {
+  const summary = execution.summary;
   return (
-    <ul className="flex flex-col">
-      {tasks.map((task) => (
-        <li key={task.id} className={cn("flex items-center gap-2 rounded-md px-2 py-1.5 text-[12px]", task.status === "active" && "bg-muted font-medium", task.status !== "active" && "text-muted-foreground", task.status === "failed" && "text-red-600 dark:text-red-400")}>
-          {task.status === "completed" ? <Check className="size-3.5 text-emerald-600" aria-hidden="true" /> : task.status === "active" ? <RefreshCw className="size-3.5 animate-spin text-foreground" aria-hidden="true" /> : task.status === "failed" ? <AlertCircle className="size-3.5 text-red-500" aria-hidden="true" /> : <span className="size-3.5 rounded-full border border-muted-foreground/40" aria-hidden="true" />}
-          <span className={cn("min-w-0 flex-1 truncate", task.status === "completed" && "line-through decoration-muted-foreground/50")}>{task.title}</span>
-          {task.status === "active" && <span className="rounded border border-border bg-background px-1 text-[9px]">now</span>}
-        </li>
-      ))}
-    </ul>
+    <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+      <Metric label="Calls" value={`${summary.total}`} />
+      <Metric label="Running" value={`${summary.running}`} />
+      <Metric label="Settled" value={`${summary.completed}`} />
+      <Metric label="Failed" value={`${summary.failed}`} />
+    </div>
   );
 }
 
@@ -170,7 +156,7 @@ function ActivityRow({ item }: { item: RuntimeActivityItem }) {
     <li className="flex items-start gap-2 border-b border-border/70 py-2 last:border-0">
       <span className="mt-0.5 shrink-0 font-mono text-[10px] text-muted-foreground">{item.timestamp}</span>
       <div className="min-w-0 flex-1">
-        <p className="text-[11px] leading-4"><strong className="font-medium">{item.workerLabel ?? (item.role === "lead" ? "Lead" : "Mission")}</strong> {item.summary}</p>
+        <p className="text-[11px] leading-4"><strong className="font-medium">{item.workerLabel ?? (item.role === "lead" ? "Lead" : "Job")}</strong> {item.summary}</p>
         {(item.provider || item.model) && <p className="break-words text-[10px] text-muted-foreground">{item.provider}{item.provider && item.model ? " · " : ""}{item.model}</p>}
       </div>
       {item.status && <Pill tone={WORKER_STATUS[item.status].tone} variant="quiet" dot pulse={WORKER_STATUS[item.status].pulse}>{humanizeStatus(item.status)}</Pill>}
@@ -244,7 +230,7 @@ function TimelineChart({ observability }: { observability: RuntimeObservability 
   if (data.length === 0 || data.every((point) => point.total === null)) return <EmptyState className="px-2 py-4">Cumulative token usage is not available yet.</EmptyState>;
   return (
     <>
-      <ChartFrame label={`Mission cumulative token usage, ${data.length} points; latest ${latest?.total ?? "unavailable"} tokens`}>
+      <ChartFrame label={`Job cumulative token usage, ${data.length} points; latest ${latest?.total ?? "unavailable"} tokens`}>
         <ResponsiveContainer width="100%" height="100%" initialDimension={{ width: 320, height: 160 }} minWidth={48} minHeight={120} debounce={50}>
           <LineChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke={CHART_GRID} vertical={false} />
@@ -309,18 +295,18 @@ function AggregateDetail({ selection, providers, models }: { selection: Aggregat
   return <div className="mt-2 rounded-md border border-border bg-muted/20 p-2 text-[11px]" aria-label="Selected aggregate detail"><p className="break-words font-medium">{name}</p><div className="mt-1.5 grid grid-cols-2 gap-1.5 text-muted-foreground"><span>workers <strong className="text-foreground">{item.workerCount}</strong></span><span>active <strong className="text-foreground">{item.activeWorkers}</strong></span><span>calls <strong className="text-foreground">{item.invocationCount}</strong></span><span>retries <strong className="text-foreground">{item.retryCount}</strong></span><span>tokens <strong className="text-foreground">{formatTokenUsage(item.tokenUsage.total)}</strong></span><span>cost <strong className="text-foreground">{formatCostUsage(item.costMicros)}</strong></span><span>latency <strong className="text-foreground">{formatDuration(item.latencyMs)}</strong></span></div></div>;
 }
 
-function OverviewSurface({ mission, observability }: { mission: Mission; observability: RuntimeObservability }) {
+function OverviewSurface({ execution, accounting, observability }: { execution: JobExecution; accounting: JobAccounting | null; observability: RuntimeObservability }) {
   const latestActivity = observability.activities.at(-1);
+  const currentCall = execution.currentCall ?? execution.latestCall;
   return (
     <div className="flex flex-col gap-3">
-      <div className="grid grid-cols-2 gap-1.5"><Metric label="Tokens" value={formatTokenUsage(observability.mission.tokenUsage.total)} icon={Gauge} /><Metric label="Cost" value={formatCostUsage(observability.mission.costMicros)} icon={Coins} /><Metric label="Elapsed" value={formatDuration(observability.mission.elapsedMs)} icon={Clock3} /><Metric label="Active workers" value={`${observability.mission.activeWorkerCount}`} icon={Users} /></div>
-      <p className="text-[12px] leading-5 text-muted-foreground">{mission.goal}</p>
+      <div className="grid grid-cols-2 gap-1.5"><Metric label="Tokens" value={formatTokenUsage(observability.job.tokenUsage.total)} icon={Gauge} /><Metric label="Cost" value={formatCostUsage(observability.job.costMicros)} icon={Coins} /><Metric label="Elapsed" value={formatDuration(observability.job.elapsedMs)} icon={Clock3} /><Metric label="Active workers" value={`${observability.job.activeWorkerCount}`} icon={Users} /></div>
+      <p className="text-[12px] leading-5 text-muted-foreground"><span className="font-medium text-foreground">{execution.jobId}</span> · {execution.projectId} · {humanizeStatus(execution.state)}</p>
       <CurrentRuntimeSummary observability={observability} />
-      <BudgetSection mission={mission} observability={observability} />
-      <section><SectionTitle detail={`${mission.completed}/${mission.total}`}>Tasks</SectionTitle><TaskList tasks={mission.tasks} /></section>
-      <section><SectionTitle>Current task</SectionTitle><p className="rounded-md border border-border bg-muted/30 px-2.5 py-2 text-[12px] font-medium">{mission.current}</p></section>
+      <BudgetSection accounting={accounting} observability={observability} />
+      <section><SectionTitle detail={execution.progress ? `${execution.progress.settled}/${execution.progress.total}` : `${execution.summary.total}`}>Calls</SectionTitle><CallSummary execution={execution} /></section>
+      <section><SectionTitle>Current call</SectionTitle><p className="rounded-md border border-border bg-muted/30 px-2.5 py-2 text-[12px] font-medium">{currentCall ? `Call ${currentCall.callId} · ${currentCall.effectKind} · ${humanizeStatus(currentCall.status)}` : "No Call has been admitted for this Job yet."}</p></section>
       {latestActivity && <section><SectionTitle detail="latest">Runtime activity</SectionTitle><ul className="rounded-md border border-border px-2"><ActivityRow item={latestActivity} /></ul></section>}
-      {mission.warnings.length > 0 && <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-2 text-[11px] text-muted-foreground">{mission.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
     </div>
   );
 }
@@ -340,24 +326,24 @@ function RuntimeSurface({ observability }: { observability: RuntimeObservability
   );
 }
 
-function UsageSurface({ mission, observability }: { mission: Mission; observability: RuntimeObservability }) {
+function UsageSurface({ accounting, observability }: { accounting: JobAccounting | null; observability: RuntimeObservability }) {
   const [selection, setSelection] = useState<AggregateSelection>(null);
   const providers = useMemo(() => aggregateProviderStats(observability.workers), [observability.workers]);
   const models = useMemo(() => aggregateModelStats(observability.workers), [observability.workers]);
   return (
     <div className="flex flex-col gap-4">
-      <BudgetSection mission={mission} observability={observability} />
-      <section><SectionTitle detail="cumulative · bounded history">Mission token timeline</SectionTitle><TimelineChart observability={observability} /></section>
+      <BudgetSection accounting={accounting} observability={observability} />
+      <section><SectionTitle detail="cumulative · bounded history">Job token timeline</SectionTitle><TimelineChart observability={observability} /></section>
       <section><SectionTitle detail="tokens by participant">Worker resource breakdown</SectionTitle><WorkerBreakdown workers={observability.workers} selectedWorkerId={null} /></section>
-      <section><SectionTitle>Token breakdown</SectionTitle><TokenMetrics tokenUsage={observability.mission.tokenUsage} /></section>
+      <section><SectionTitle>Token breakdown</SectionTitle><TokenMetrics tokenUsage={observability.job.tokenUsage} /></section>
       <section><SectionTitle detail="select for detail">Provider statistics</SectionTitle><ul className="rounded-md border border-border px-2">{providers.map((provider) => <AggregateRow key={provider.provider} name={provider.provider} tokens={provider.tokenUsage.total} calls={provider.invocationCount} active={provider.activeWorkers} cost={provider.costMicros} success={provider.successCount} failure={provider.failureCount} latency={provider.latencyMs} selected={selection?.kind === "provider" && selection.key === provider.provider} onSelect={() => setSelection({ kind: "provider", key: provider.provider })} />)}</ul></section>
       <section><SectionTitle detail="select for detail">Model statistics</SectionTitle><ul className="rounded-md border border-border px-2">{models.map((model) => <AggregateRow key={`${model.provider}-${model.model}`} name={model.model} detail={model.provider} tokens={model.tokenUsage.total} calls={model.invocationCount} active={model.activeWorkers} cost={model.costMicros} success={model.successCount} failure={model.failureCount} latency={model.latencyMs} selected={selection?.kind === "model" && selection.key === `${model.provider}\u0000${model.model}`} onSelect={() => setSelection({ kind: "model", key: `${model.provider}\u0000${model.model}` })} />)}</ul><AggregateDetail selection={selection} providers={providers} models={models} /></section>
     </div>
   );
 }
 
-export function ObservabilityPanel({ mission, observability, tab }: { mission: Mission; observability: RuntimeObservability; tab: InspectorTab }) {
-  if (tab === "overview") return <OverviewSurface mission={mission} observability={observability} />;
+export function ObservabilityPanel({ execution, accounting, observability, tab }: { execution: JobExecution; accounting: JobAccounting | null; observability: RuntimeObservability; tab: InspectorTab }) {
+  if (tab === "overview") return <OverviewSurface execution={execution} accounting={accounting} observability={observability} />;
   if (tab === "runtime") return <RuntimeSurface observability={observability} />;
-  return <UsageSurface mission={mission} observability={observability} />;
+  return <UsageSurface accounting={accounting} observability={observability} />;
 }

@@ -32,13 +32,13 @@ import type { WorkspaceView } from "../layout/view-domain";
 type OcgTopbarProps = {
   session: ChatSession;
   sidebarCollapsed: boolean;
-  missionOpen: boolean;
-  /** When false, the mission panel toggles are hidden (for example on the ledger view). Defaults to true. */
-  missionControls?: boolean;
+  inspectorOpen: boolean;
+  /** When false, the job inspector toggles are hidden (for example on the ledger view). Defaults to true. */
+  inspectorControls?: boolean;
   onToggleSidebar: () => void;
-  onToggleMission: () => void;
+  onToggleInspector: () => void;
   onOpenMobileSidebar: () => void;
-  onOpenMobileMission: () => void;
+  onOpenMobileInspector: () => void;
   /**
    * Opens a workspace, or closes it when it is already the active view. Omitting
    * it hides the whole shortcut group, which is how a surface renders the topbar
@@ -64,7 +64,7 @@ const SHORTCUTS_BEFORE_MENU: WorkspaceShortcut[] = [
 const SHORTCUTS_AFTER_MENU: WorkspaceShortcut[] = [
   { view: "ledger", icon: Table2, label: "Resource ledger" },
   { view: "control-center", icon: SlidersHorizontal, label: "Control Center" },
-  { view: "mission-control", icon: Workflow, label: "Mission Control" },
+  { view: "job-execution", icon: Workflow, label: "Job Execution" },
   { view: "logs", icon: ScrollText, label: "Logs and diagnostics" },
   { view: "settings", icon: Settings, label: "Settings" },
 ];
@@ -110,12 +110,12 @@ const WORK_TYPE_DOT: Record<ChatSession["workType"], string> = {
 export function OcgTopbar({
   session,
   sidebarCollapsed,
-  missionOpen,
-  missionControls = true,
+  inspectorOpen,
+  inspectorControls = true,
   onToggleSidebar,
-  onToggleMission,
+  onToggleInspector,
   onOpenMobileSidebar,
-  onOpenMobileMission,
+  onOpenMobileInspector,
   onNavigate,
   activeView = "chat",
   runtimeStatus,
@@ -219,30 +219,30 @@ export function OcgTopbar({
           />
         ))}
 
-      {missionControls && (
+      {inspectorControls && (
         <>
-          {/* Mobile mission toggle */}
+          {/* Mobile job inspector toggle */}
           <Button
             variant="ghost"
             size="icon-xs"
             className="lg:hidden"
-            onClick={onOpenMobileMission}
-            aria-label="Open mission panel"
-            title="Open mission panel"
+            onClick={onOpenMobileInspector}
+            aria-label="Open job inspector"
+            title="Open job inspector"
           >
             <PanelRight className="size-4" />
           </Button>
-          {/* Desktop mission toggle */}
+          {/* Desktop job inspector toggle */}
           <Button
-            variant={!missionOpen ? "secondary" : "ghost"}
+            variant={!inspectorOpen ? "secondary" : "ghost"}
             size="icon-xs"
             className="hidden lg:inline-flex"
-            onClick={onToggleMission}
-            aria-label={missionOpen ? "Collapse mission panel" : "Expand mission panel"}
-            aria-expanded={missionOpen}
-            title={missionOpen ? "Collapse mission panel" : "Expand mission panel"}
+            onClick={onToggleInspector}
+            aria-label={inspectorOpen ? "Collapse job inspector" : "Expand job inspector"}
+            aria-expanded={inspectorOpen}
+            title={inspectorOpen ? "Collapse job inspector" : "Expand job inspector"}
           >
-            {missionOpen ? (
+            {inspectorOpen ? (
               <ChevronsRight className="size-4" />
             ) : (
               <ChevronsLeft className="size-4" />
