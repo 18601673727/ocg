@@ -47,6 +47,12 @@ fn validate_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Durable Job identity and Attempt identity use SQLite text at the storage
+/// boundary but remain separately named throughout the domain API.
+pub type JobId = String;
+pub type AttemptId = String;
+pub type JobSpec = String;
+
 fn ensure_column(
     connection: &Connection,
     table: &str,
@@ -80,12 +86,13 @@ pub struct Project {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
-    pub id: String,
+    pub id: JobId,
     pub project_id: String,
     pub state: JobState,
     pub generation: u64,
-    pub authoritative_attempt_id: Option<String>,
-    pub payload: String,
+    pub authoritative_attempt_id: Option<AttemptId>,
+    #[serde(rename = "payload")]
+    pub spec: JobSpec,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -115,8 +122,8 @@ impl JobState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attempt {
-    pub id: String,
-    pub job_id: String,
+    pub id: AttemptId,
+    pub job_id: JobId,
     pub generation: u64,
     pub state: AttemptState,
     pub authoritative: bool,
@@ -141,7 +148,7 @@ pub enum AttemptState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Executor {
     pub id: String,
-    pub attempt_id: String,
+    pub attempt_id: AttemptId,
     pub kind: String,
     pub state: String,
     pub created_at: i64,
@@ -150,7 +157,7 @@ pub struct Executor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Call {
     pub id: String,
-    pub attempt_id: String,
+    pub attempt_id: AttemptId,
     pub executor_id: Option<String>,
     pub generation: u64,
     pub side_effect: bool,
@@ -186,8 +193,8 @@ pub enum EffectIntentState {
 pub struct DispatchIntent {
     pub id: String,
     pub call_id: String,
-    pub job_id: String,
-    pub attempt_id: String,
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
     pub executor_id: Option<String>,
     pub generation: u64,
     pub state: String,
@@ -206,8 +213,8 @@ pub struct DispatchIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptAuthority {
-    pub attempt_id: String,
-    pub job_id: String,
+    pub attempt_id: AttemptId,
+    pub job_id: JobId,
     pub generation: u64,
 }
 
@@ -216,7 +223,7 @@ pub struct AttemptAuthority {
 /// whether this Attempt may still assert an amount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountingAuthority {
-    pub attempt_id: String,
+    pub attempt_id: AttemptId,
     pub generation: u64,
 }
 
@@ -292,8 +299,8 @@ struct AccountingTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 pub struct ExecutionWitness {
-    pub job_id: String,
-    pub attempt_id: String,
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
     pub executor_id: String,
     pub call_id: String,
     pub generation: u64,
@@ -544,12 +551,6 @@ impl DomainRepository {
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
             [],
         ).map_err(sql)?;
-        connection
-            .execute(
-                "INSERT INTO domain_dispatch_intents(id,call_id,job_id,attempt_id,executor_id,generation,state,effect_kind,effect_state,request,reservation_id,budget_admitted,failure,created_at,updated_at) SELECT 'intent-' || c.id,c.id,a.job_id,c.attempt_id,c.executor_id,c.generation,CASE WHEN c.state='created' THEN 'pending' WHEN c.state='running' THEN 'running' ELSE 'completed' END,CASE WHEN c.side_effect=1 THEN 'strict_fenced' ELSE 'idempotent' END,CASE WHEN c.state='running' THEN 'unknown' ELSE 'settled' END,c.request,NULL,1,NULL,c.created_at,COALESCE(c.finished_at,c.created_at) FROM domain_calls c JOIN domain_attempts a ON a.id=c.attempt_id WHERE NOT EXISTS(SELECT 1 FROM domain_dispatch_intents i WHERE i.call_id=c.id)",
-                [],
-            )
-            .map_err(sql)?;
         let repository = Self { connection, path };
         repository.ensure_project(root)?;
         Ok(repository)
@@ -1653,7 +1654,7 @@ impl DomainRepository {
             state: JobState::Pending,
             generation: 0,
             authoritative_attempt_id: None,
-            payload: payload.to_string(),
+            spec: payload.to_string(),
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -1757,7 +1758,7 @@ impl DomainRepository {
             state: JobState::Pending,
             generation: 0,
             authoritative_attempt_id: None,
-            payload: payload.to_string(),
+            spec: payload.to_string(),
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -1925,7 +1926,7 @@ impl DomainRepository {
             state: JobState::Running,
             generation: 1,
             authoritative_attempt_id: Some(attempt_id.clone()),
-            payload: payload.to_string(),
+            spec: payload.to_string(),
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -2007,7 +2008,7 @@ impl DomainRepository {
     ///
     /// The binding key is the stable session/runtime identity supplied by the
     /// caller. Re-admission is idempotent and returns the existing authority;
-    /// no legacy Mission, WorkNode, Run, or JSON recovery record participates.
+    /// no legacy Mission, Job, Attempt, or JSON recovery record participates.
     pub fn admit_job(
         &mut self,
         project: Project,
@@ -2033,7 +2034,7 @@ impl DomainRepository {
                             id: row.get(0)?, project_id: row.get(1)?,
                             state: row.get::<_, String>(2)?.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
                             generation: u64::try_from(row.get::<_, i64>(3)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                            authoritative_attempt_id: row.get(4)?, payload: row.get(5)?,
+                            authoritative_attempt_id: row.get(4)?, spec: row.get(5)?,
                             created_at: row.get(6)?, updated_at: row.get(7)?,
                         },
                         Attempt {
@@ -2091,7 +2092,7 @@ impl DomainRepository {
             state: JobState::Running,
             generation: 1,
             authoritative_attempt_id: Some(attempt_id.clone()),
-            payload: payload.to_string(),
+            spec: payload.to_string(),
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -3122,7 +3123,7 @@ impl DomainRepository {
                 Ok((row.get(0)?, row.get(1)?, state, generation, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
             },
         ).optional().map_err(sql)?.map(|(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at)| {
-            Ok(Job { id, project_id, state: JobState::parse(&state)?, generation: u64::try_from(generation).map_err(|_| invalid("negative Job generation"))?, authoritative_attempt_id, payload, created_at, updated_at })
+            Ok(Job { id, project_id, state: JobState::parse(&state)?, generation: u64::try_from(generation).map_err(|_| invalid("negative Job generation"))?, authoritative_attempt_id, spec: payload, created_at, updated_at })
         }).transpose()
     }
 
@@ -3641,7 +3642,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         generation: u64::try_from(row.get::<_, i64>(3)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         authoritative_attempt_id: row.get(4)?,
-        payload: row.get(5)?,
+        spec: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
     })

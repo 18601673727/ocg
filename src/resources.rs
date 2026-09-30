@@ -3,16 +3,16 @@
 //! The registry answers *what execution resources does OCG know about, what
 //! facts are known about each, where did those facts come from, how fresh are
 //! they, and what capabilities and availability are known*. It deliberately
-//! does **not** answer *which resource should a Mission use*: that is future
+//! does **not** answer which resource a Job should use: that is future
 //! Policy / Placement work. Nothing here selects, ranks, scores, rotates or
 //! fails over a resource.
 //!
 //! Three identities stay mechanically distinct:
 //!
 //! ```text
-//! MissionId          durable work identity        (orchestration::mission)
+//! JobId              durable work identity        (orchestration::domain)
 //! ResourceId         execution-capable resource   (this module)
-//! RuntimeExecutionId one concrete execution       (runtime::lifecycle)
+//! RuntimeExecutionId one concrete runtime         (runtime::lifecycle)
 //! ```
 //!
 //! Unknown is a first-class state. When OCG has no authoritative source for a
@@ -1173,38 +1173,13 @@ pub(crate) fn load_raw(root: &Path) -> Result<LoadedRegistry> {
     })
 }
 
-/// Load the authoritative durable registry.
-///
-/// Once the replay authority is initialized it is the read source; only before
-/// first initialization is the legacy projection consulted for migration
-/// bootstrap. An initialized-but-unreadable authority fails closed with the
-/// registry's existing `corrupt` representation.
+/// Load the independent durable resource registry.
 pub fn load(root: &Path) -> LoadedRegistry {
-    match crate::orchestration::replay::read_authoritative_snapshot(root) {
-        Ok(Some(snapshot)) => {
-            let updated_at = snapshot
-                .resources
-                .values()
-                .map(|observation| observation.updated_at)
-                .max()
-                .unwrap_or(0);
-            LoadedRegistry {
-                registry: ResourceRegistry::from_observations(updated_at, snapshot.resources),
-                corrupt: false,
-                exists: true,
-                issues: Vec::new(),
-            }
-        }
-        Ok(None) => match load_raw(root) {
-            Ok(loaded) => loaded,
-            Err(error) => corrupt(file_issue(
-                &registry_path(root),
-                &format!("registry projection could not be read: {error}"),
-            )),
-        },
+    match load_raw(root) {
+        Ok(loaded) => loaded,
         Err(error) => corrupt(file_issue(
-            &crate::orchestration::replay::state_path(root),
-            &format!("replay authority is unreadable: {error}"),
+            &registry_path(root),
+            &format!("resource registry could not be read: {error}"),
         )),
     }
 }
@@ -1248,8 +1223,6 @@ pub(crate) fn validate_observation(
 /// Persist the registry atomically. Only dynamic observations are written.
 pub fn save(root: &Path, registry: &ResourceRegistry) -> Result<PathBuf> {
     crate::runtime::install::ensure_gitignore(root)?;
-    // The replay authority is committed before the compatibility projection.
-    crate::orchestration::replay::record_resource_updates(root, registry)?;
     let path = registry_path(root);
     let document = RegistryDocument {
         schema_version: RESOURCE_SCHEMA_VERSION,

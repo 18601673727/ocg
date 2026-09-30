@@ -198,7 +198,7 @@ pub enum Command {
     Reject(Vec<OsString>),
     /// Run the loopback-only HTTP/SSE control server.
     Serve(Vec<OsString>),
-    /// Canonical WorkNode/Run control: admit, configure, dispatch, deliver and
+    /// Canonical Job/Attempt control: admit, configure, dispatch, deliver and
     /// inspect a canonical Mission. Every mutating operation is witness-bound.
     Work(Vec<OsString>),
     /// Run the project-scoped STDIO MCP adapter.
@@ -1660,7 +1660,7 @@ fn serve_command(
     Ok(0)
 }
 
-/// `ocg work <subcommand>`: the canonical WorkNode/Run control surface.
+/// `ocg work <subcommand>`: the canonical Job/Attempt control surface.
 ///
 /// This is the same authority the bridge uses. Every mutating operation is
 /// witness-bound: `dispatch` prints the durable dispatch witness, `deliver`
@@ -2439,18 +2439,6 @@ fn runtime_plugin_env(
     env.push((
         OsString::from("OCG_ORCHESTRATION_ENABLED"),
         OsString::from("1"),
-    ));
-    // The raw latest-Lead-output capture rides on the generated plugin. Export
-    // the resolved switch so the adapter can stay inert without a bridge spawn
-    // when it is disabled; the bridge re-checks the same policy.
-    let reports = crate::reports::ReportsConfig::from_config(&effective.data)?;
-    env.push((
-        OsString::from("OCG_REPORTS_LATEST_LEAD_OUTPUT"),
-        OsString::from(if reports.latest_lead_output.enabled {
-            "1"
-        } else {
-            "0"
-        }),
     ));
     let governor =
         crate::orchestration::OrchestrationConfig::from_config(&effective.data)?.context_governor;
@@ -4683,15 +4671,10 @@ fn bridge_payload(
     let runner = SystemCaptureRunner;
     let (telemetry_config, warnings) = telemetry_for(effective, env);
     print_telemetry_warnings(&warnings);
-    let reports = match crate::reports::ReportsConfig::from_config(&effective.data) {
-        Ok(config) => config,
-        Err(error) => return json!({"ok": false, "error": error.to_string()}),
-    };
     let mut bridge =
         crate::orchestration::bridge::BridgeContext::new(&controller, &runner, telemetry_config)
-            .with_reports(reports)
             // The worker routing table OCG writes into the generated agent
-            // config. A canonical child Run freezes the model its agent will
+            // config. A canonical child Attempt freezes the model its agent will
             // actually use, so the recorded contract is not an approximation.
             .with_routing(crate::orchestration::bridge::WorkerRouting::from_config(
                 &effective.data,
