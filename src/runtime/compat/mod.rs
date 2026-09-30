@@ -4,8 +4,8 @@
 //!
 //! ```text
 //! runtime/common contract
-//! ├── v1 adapter   (1.18.x: `plugin`, `task`, request-scoped Lead)
-//! └── v2 adapter   (2.0.x: `plugin`, `subagent`, session-scoped Lead)
+//! ├── v1 adapter   (1.18.x: `task`, request-scoped Lead)
+//! └── v2 adapter   (2.0.x: `subagent`, session-scoped Lead)
 //! ```
 //!
 //! Every version-specific decision lives here. No unrelated module may branch
@@ -191,19 +191,8 @@ pub trait RuntimeAdapter: Send + Sync {
     /// The family this adapter implements.
     fn major(&self) -> Major;
 
-    /// The generated-config array key for package plugins.
-    fn plugin_key(&self) -> &'static str;
-
     /// The OpenCode permission/tool key for worker delegation.
     fn task_key(&self) -> &'static str;
-
-    /// The generated plugin source for this runtime.
-    fn plugin_source(&self) -> &'static str;
-
-    /// The `file://` URL for a local adapter when this runtime supports local
-    /// adapters in its config array. Runtimes which discover local plugins via
-    /// a config directory return `Ok(None)`.
-    fn local_plugin_uri(&self, path: &Path) -> Result<Option<String>>;
 
     /// How the Lead contract is applied.
     fn lead_selection(&self) -> LeadSelectionMode;
@@ -536,20 +525,8 @@ impl RuntimeAdapter for MemorySessionClient {
         Major::V2
     }
 
-    fn plugin_key(&self) -> &'static str {
-        "plugin"
-    }
-
     fn task_key(&self) -> &'static str {
         "subagent"
-    }
-
-    fn plugin_source(&self) -> &'static str {
-        ""
-    }
-
-    fn local_plugin_uri(&self, _path: &Path) -> Result<Option<String>> {
-        Ok(None)
     }
 
     fn lead_selection(&self) -> LeadSelectionMode {

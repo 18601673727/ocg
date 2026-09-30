@@ -14,16 +14,15 @@ use serde_json::{json, Map, Value};
 /// The result is validated, deterministic and independent of the current
 /// environment: the same inputs always produce the same JSON. Callers that
 /// already detected the runtime use [`build_opencode_config_for`] so the
-/// generated plugin array, local plugin URI and delegation permission key match
-/// the runtime family.
+/// delegation permission key matches the runtime family.
 pub fn build_opencode_config(effective: &Effective, level: &str) -> Result<Value> {
     build_opencode_config_for(effective, level, crate::runtime::compat::v1_adapter())
 }
 
 /// Build compatibility configuration for a selected OCG Profile model.
 ///
-/// No version conditional lives here: the adapter supplies the plugin key, the
-/// delegation permission key and the canonical local plugin URI.
+/// No version conditional lives here: the adapter supplies the delegation
+/// permission key.
 pub fn build_opencode_config_for(
     effective: &Effective,
     level: &str,
@@ -194,18 +193,6 @@ pub fn build_opencode_config_for(
         merged = deep_merge(&merged, extra);
     }
 
-    // The generated adapter enforces the selected Lead request contract in
-    // addition to optional dynamic orchestration. Preserve the explicit
-    // no-hook escape hatch: disabled orchestration emits no OCG plugin.
-    if crate::orchestration::OrchestrationConfig::from_config(data)?.enabled {
-        if let Some(uri) = adapter.local_plugin_uri(&effective.cwd)? {
-            crate::orchestration::plugin::inject_plugin_for(
-                &mut merged,
-                adapter.plugin_key(),
-                &uri,
-            );
-        }
-    }
     Ok(merged)
 }
 

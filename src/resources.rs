@@ -966,30 +966,6 @@ impl ResourceRegistry {
         self.observations.get(id.as_str())
     }
 
-    /// The complete durable observation set, keyed by resource id.
-    ///
-    /// This is the exact normalized domain that the replay authority owns; the
-    /// configured uses are derived and never durable.
-    pub(crate) fn observations(&self) -> &BTreeMap<String, ResourceObservation> {
-        &self.observations
-    }
-
-    /// Rebuild the durable registry from an authoritative observation set.
-    /// Configured uses are derived elsewhere and are never supplied here.
-    pub(crate) fn from_observations(
-        updated_at: i64,
-        observations: BTreeMap<String, ResourceObservation>,
-    ) -> Self {
-        let mut registry = Self {
-            schema_version: RESOURCE_SCHEMA_VERSION,
-            updated_at,
-            observations,
-            configured: BTreeMap::new(),
-        };
-        registry.enforce_bound();
-        registry
-    }
-
     /// Build the merged view for one id.
     pub fn resource(&self, id: &ResourceId) -> Option<ResourceRecord> {
         let observation = self.observations.get(id.as_str())?;

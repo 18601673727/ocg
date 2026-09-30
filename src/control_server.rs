@@ -25,12 +25,7 @@ use crate::contracts::{
     CanonicalJobConfigEnvelope, CanonicalProjectsResponse, ProfileView,
 };
 use crate::error::{OcgError, Result};
-use crate::orchestration::budget::{normalize_currency, Money};
 use crate::orchestration::checkpoint::is_safe_id;
-use crate::orchestration::control::{ControlError, ControlService, ReplaySlice};
-use crate::orchestration::policy::ApprovalStatus;
-use crate::orchestration::replay::{Cursor, EventEnvelope, SnapshotConfig};
-use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -39,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Upper bound on the request head (request line + headers).
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -67,7 +62,6 @@ pub struct ServerConfig {
     /// `503` and are closed.
     pub max_clients: usize,
     /// Replay journal retention used by the service this server opens.
-    pub snapshot: SnapshotConfig,
     /// How often an SSE tail polls the authoritative journal.
     pub poll_interval: Duration,
     /// How often an idle SSE tail emits a comment heartbeat.
@@ -82,7 +76,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_clients: DEFAULT_MAX_CLIENTS,
-            snapshot: SnapshotConfig::default(),
             poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
             heartbeat: Duration::from_millis(DEFAULT_HEARTBEAT_MS),
             write_timeout: Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
@@ -121,7 +114,6 @@ impl ServerConfig {
 pub struct ControlServer {
     listener: TcpListener,
     addr: SocketAddr,
-    service: ControlService,
     /// Backend-backed canonical control surface. It is opened best-effort:
     /// a project without a marker still serves the legacy routes, and the
     /// canonical routes report an explicit boundary error instead of guessing.
@@ -161,7 +153,6 @@ impl ControlServer {
     ) -> Result<Self> {
         let requested = parse_loopback_addr(addr)?;
         config.validate()?;
-        let service = ControlService::open_with_config(root, config.snapshot)?;
         let listener = TcpListener::bind(requested).map_err(|error| {
             OcgError::io(
                 format!("cannot bind the control server to {requested}"),
@@ -181,7 +172,6 @@ impl ControlServer {
         Ok(Self {
             listener,
             addr: bound,
-            service,
             canonical: crate::orchestration::canonical_control::CanonicalControlService::open(root)
                 .ok(),
             profile: crate::profile::ProfileService::with_workspace(profile_path, root),
@@ -244,7 +234,6 @@ impl ControlServer {
             return;
         }
         let guard = ClientGuard(Arc::clone(&self.active));
-        let service = self.service.clone();
         let canonical = self.canonical.clone();
         let profile = self.profile.clone();
         let config = self.config.clone();
@@ -253,14 +242,7 @@ impl ControlServer {
             .name("ocg-control-client".to_string())
             .spawn(move || {
                 let _guard = guard;
-                handle_client(
-                    stream,
-                    &service,
-                    canonical.as_ref(),
-                    &profile,
-                    &config,
-                    &stop,
-                );
+                handle_client(stream, canonical.as_ref(), &profile, &config, &stop);
             });
         if spawned.is_err() {
             // The closure (and its guard) is dropped, releasing the slot.
@@ -329,14 +311,6 @@ impl ApiError {
         error
     }
 
-    fn from_control(error: ControlError) -> Self {
-        Self {
-            status: error.http_status(),
-            body: error.to_json(),
-            allow: None,
-        }
-    }
-
     fn to_json(&self) -> Value {
         self.body.clone()
     }
@@ -366,10 +340,6 @@ struct Request {
 }
 
 impl Request {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(name).map(String::as_str)
-    }
-
     fn json_body(&self) -> std::result::Result<Value, ApiError> {
         if self.body.is_empty() {
             return Ok(Value::Null);
@@ -381,11 +351,10 @@ impl Request {
 
 fn handle_client(
     mut stream: TcpStream,
-    service: &ControlService,
     canonical: Option<&crate::orchestration::canonical_control::CanonicalControlService>,
     profile: &crate::profile::ProfileService,
     config: &ServerConfig,
-    stop: &Arc<AtomicBool>,
+    _stop: &Arc<AtomicBool>,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(config.read_timeout));
@@ -437,43 +406,14 @@ fn handle_client(
             return;
         }
     }
-    let outcome = match route {
-        Route::Snapshot => respond_serialized(&mut stream, &service.snapshot()),
-        Route::Approvals => {
-            respond_serialized(&mut stream, &Ok::<_, ControlError>(service.approvals()))
-        }
-        Route::Resources => {
-            respond_serialized(&mut stream, &Ok::<_, ControlError>(service.resources()))
-        }
-        Route::BudgetGet { mission } => respond_serialized(&mut stream, &service.budget(&mission)),
-        Route::Approve { id } => resolve_approval(
-            &mut stream,
-            service,
-            &request,
-            &id,
-            ApprovalStatus::Approved,
+    let _ = write_api_error(
+        &mut stream,
+        &ApiError::new(
+            409,
+            "boundary_required",
+            "canonical control needs an initialized Project boundary",
         ),
-        Route::Reject { id } => resolve_approval(
-            &mut stream,
-            service,
-            &request,
-            &id,
-            ApprovalStatus::Rejected,
-        ),
-        Route::BudgetPut { mission } => put_budget(&mut stream, service, &request, &mission),
-        Route::Events { epoch, after } => {
-            handle_events(&mut stream, service, config, stop, &request, epoch, after)
-        }
-        _ => write_api_error(
-            &mut stream,
-            &ApiError::new(
-                409,
-                "boundary_required",
-                "canonical control needs an initialized Project boundary",
-            ),
-        ),
-    };
-    let _ = outcome;
+    );
 }
 
 /// The CORS allowlist: only a loopback HTTP origin may call the canonical
@@ -884,260 +824,6 @@ fn handle_canonical(
     Some(respond(stream, operation()))
 }
 
-/// Handle approve/reject: mutate, then return the post-commit cursor.
-fn resolve_approval(
-    stream: &mut TcpStream,
-    service: &ControlService,
-    request: &Request,
-    approval_id: &str,
-    status: ApprovalStatus,
-) -> std::io::Result<()> {
-    let body = match request.json_body() {
-        Ok(body) => body,
-        Err(error) => return write_api_error(stream, &error),
-    };
-    let note = match body.get("note") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(note)) => Some(note.clone()),
-        Some(_) => {
-            return write_api_error(
-                stream,
-                &ApiError::new(400, "invalid_request", "note must be a string"),
-            )
-        }
-    };
-    match service.resolve_approval(approval_id, status, note, now_unix()) {
-        Ok((record, cursor)) => {
-            let value = json!({ "cursor": cursor, "approval": record });
-            write_json(stream, 200, &value)
-        }
-        Err(error) => write_api_error(stream, &ApiError::from_control(error)),
-    }
-}
-
-/// Handle `PUT /api/v1/budgets/{mission}`: explicit hard-budget mutation.
-fn put_budget(
-    stream: &mut TcpStream,
-    service: &ControlService,
-    request: &Request,
-    mission_id: &str,
-) -> std::io::Result<()> {
-    let body = match request.json_body() {
-        Ok(body) => body,
-        Err(error) => return write_api_error(stream, &error),
-    };
-    let Some(limit_micros) = body.get("limit_micros").and_then(Value::as_i64) else {
-        return write_api_error(
-            stream,
-            &ApiError::new(
-                400,
-                "invalid_request",
-                "limit_micros is required and must be an integer",
-            ),
-        );
-    };
-    let Some(currency) = body.get("currency").and_then(Value::as_str) else {
-        return write_api_error(
-            stream,
-            &ApiError::new(
-                400,
-                "invalid_request",
-                "currency is required and must be a string",
-            ),
-        );
-    };
-    let currency = match normalize_currency(currency) {
-        Ok(currency) => currency,
-        Err(error) => {
-            return write_api_error(
-                stream,
-                &ApiError::new(400, "invalid_request", error.to_string()),
-            )
-        }
-    };
-    match service.set_budget(mission_id, Money::new(limit_micros, currency), now_unix()) {
-        Ok(view) => write_json(
-            stream,
-            200,
-            &serde_json::to_value(&view).unwrap_or(Value::Null),
-        ),
-        Err(error) => write_api_error(stream, &ApiError::from_control(error)),
-    }
-}
-
-/// Handle `GET /api/v1/events`: replay, then live tail.
-fn handle_events(
-    stream: &mut TcpStream,
-    service: &ControlService,
-    config: &ServerConfig,
-    stop: &Arc<AtomicBool>,
-    request: &Request,
-    epoch: u64,
-    after: u64,
-) -> std::io::Result<()> {
-    // Last-Event-ID may only advance the same-epoch query cursor. A different
-    // epoch is an explicit failure, never a silent reset.
-    let mut cursor = after;
-    if let Some(raw) = request.header("last-event-id") {
-        let Some((last_epoch, last_seq)) = parse_sse_id(raw) else {
-            return write_api_error(
-                stream,
-                &ApiError::new(
-                    400,
-                    "invalid_last_event_id",
-                    "Last-Event-ID must be 'epoch:seq'",
-                ),
-            );
-        };
-        if last_epoch != epoch {
-            return write_api_error(
-                stream,
-                &ApiError::from_control(ControlError::WrongEpoch {
-                    expected: epoch,
-                    got: last_epoch,
-                }),
-            );
-        }
-        cursor = cursor.max(last_seq);
-    }
-
-    // The initial replay is a hard boundary: a wrong/future/expired cursor is a
-    // JSON error response, not a broken stream.
-    let initial = match service.replay(epoch, cursor) {
-        Ok(slice) => slice,
-        Err(error) => return write_api_error(stream, &ApiError::from_control(error)),
-    };
-
-    write_sse_headers(stream)?;
-    let mut last_seq = cursor;
-    let mut last_write = Instant::now();
-    if let ReplaySlice::Events(events) = initial {
-        for envelope in &events {
-            emit_event(stream, envelope)?;
-            last_seq = envelope.cursor.seq;
-        }
-        last_write = Instant::now();
-    }
-
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        match service.replay(epoch, last_seq) {
-            Ok(ReplaySlice::Events(events)) => {
-                for envelope in &events {
-                    emit_event(stream, envelope)?;
-                    last_seq = envelope.cursor.seq;
-                }
-                last_write = Instant::now();
-            }
-            Ok(ReplaySlice::Empty) => {}
-            Err(error) => {
-                // A live failure (retention expired, epoch changed, authority
-                // lost) is explicit and closes the stream.
-                emit_sse_reset(stream, service, &error)?;
-                return Ok(());
-            }
-        }
-        if last_write.elapsed() >= config.heartbeat {
-            emit_heartbeat(stream)?;
-            last_write = Instant::now();
-        }
-        thread::sleep(config.poll_interval);
-    }
-}
-
-fn emit_event(stream: &mut TcpStream, envelope: &EventEnvelope) -> std::io::Result<()> {
-    let data = match serde_json::to_string(envelope) {
-        Ok(data) => data,
-        Err(_) => {
-            let frame = "event: reset_required\ndata: {\"error\":{\"code\":\"serialization_error\",\"message\":\"the journal event could not be serialized\"}}\n\n";
-            stream.write_all(frame.as_bytes())?;
-            stream.flush()?;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "journal event serialization failed",
-            ));
-        }
-    };
-    let frame = format!(
-        "id: {}:{}\nevent: {}\ndata: {}\n\n",
-        envelope.cursor.epoch,
-        envelope.cursor.seq,
-        envelope.event.kind(),
-        data
-    );
-    stream.write_all(frame.as_bytes())?;
-    stream.flush()
-}
-
-fn emit_heartbeat(stream: &mut TcpStream) -> std::io::Result<()> {
-    // A comment carries no `id:` and therefore cannot advance Last-Event-ID.
-    let frame = format!(": heartbeat {}\n\n", now_unix());
-    stream.write_all(frame.as_bytes())?;
-    stream.flush()
-}
-
-fn emit_sse_reset(
-    stream: &mut TcpStream,
-    service: &ControlService,
-    error: &ControlError,
-) -> std::io::Result<()> {
-    let mut data = error.to_json();
-    if let Ok(cursor) = service.head() {
-        data["current_cursor"] = json!(cursor);
-    }
-    let frame = format!("event: reset_required\ndata: {}\n\n", data);
-    stream.write_all(frame.as_bytes())?;
-    stream.flush()
-}
-
-fn write_sse_headers(stream: &mut TcpStream) -> std::io::Result<()> {
-    let head = "HTTP/1.1 200 OK\r\n\
-                Content-Type: text/event-stream\r\n\
-                Cache-Control: no-cache, no-store\r\n\
-                X-Accel-Buffering: no\r\n\
-                Connection: close\r\n\
-                \r\n";
-    stream.write_all(head.as_bytes())?;
-    stream.flush()
-}
-
-fn respond_serialized<T: Serialize>(
-    stream: &mut TcpStream,
-    outcome: &std::result::Result<T, ControlError>,
-) -> std::io::Result<()> {
-    match outcome {
-        Ok(value) => match serde_json::to_vec(value) {
-            Ok(body) if body.len() <= MAX_RESPONSE_BYTES => {
-                write_response(stream, 200, "application/json", &body, &[])
-            }
-            Ok(_) => write_api_error(
-                stream,
-                &ApiError::new(
-                    503,
-                    "response_too_large",
-                    "the serialized response exceeds the control API limit",
-                ),
-            ),
-            Err(_) => write_api_error(
-                stream,
-                &ApiError::new(
-                    500,
-                    "serialization_error",
-                    "the response could not be serialized",
-                ),
-            ),
-        },
-        Err(error) => write_api_error(stream, &ApiError::from_control(error.clone())),
-    }
-}
-
-fn write_json(stream: &mut TcpStream, status: u16, value: &Value) -> std::io::Result<()> {
-    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    write_response(stream, status, "application/json", &body, &[])
-}
-
 fn write_api_error(stream: &mut TcpStream, error: &ApiError) -> std::io::Result<()> {
     let body = serde_json::to_vec(&error.to_json()).unwrap_or_else(|_| b"{}".to_vec());
     let extra: Vec<(&str, String)> = error
@@ -1416,14 +1102,6 @@ enum Route {
     ProfileBootstrap,
     ProfilePut,
     ProfilePreflight,
-    Snapshot,
-    Events { epoch: u64, after: u64 },
-    Approvals,
-    Approve { id: String },
-    Reject { id: String },
-    Resources,
-    BudgetGet { mission: String },
-    BudgetPut { mission: String },
     // Canonical Job/Attempt control surface (project import, configuration,
     // pre-attempt Job configuration, snapshots and the event tail).
     CanonicalProjects,
@@ -1458,14 +1136,6 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("PUT", ["api", "v1", "profile"])
                 | ("OPTIONS", ["api", "v1", "profile"])
                 | ("OPTIONS", ["api", "v1", "profile", "bootstrap"])
-                | ("GET", ["api", "v1", "snapshot"])
-                | ("GET", ["api", "v1", "events"])
-                | ("GET", ["api", "v1", "approvals"])
-                | ("GET", ["api", "v1", "resources"])
-                | ("GET", ["api", "v1", "budgets", _])
-                | ("PUT", ["api", "v1", "budgets", _])
-                | ("POST", ["api", "v1", "approvals", _, "approve"])
-                | ("POST", ["api", "v1", "approvals", _, "reject"])
                 | ("GET", ["api", "v1", "canonical", "projects"])
                 | ("POST", ["api", "v1", "canonical", "projects", "import"])
                 | ("GET", ["api", "v1", "canonical", "projects", _])
@@ -1538,46 +1208,6 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         ("GET", ["api", "v1", "canonical", "jobs", "events"]) => Ok(Route::CanonicalEvents),
         ("GET", ["api", "v1", "canonical", "dashboard"]) => Ok(Route::CanonicalDashboard),
         ("OPTIONS", ["api", "v1", "canonical", ..]) => Ok(Route::CanonicalPreflight),
-        ("GET", ["api", "v1", "snapshot"]) => Ok(Route::Snapshot),
-        ("GET", ["api", "v1", "events"]) => {
-            let after = request
-                .query
-                .get("after")
-                .ok_or_else(|| ApiError::new(400, "invalid_request", "'after' is required"))
-                .and_then(|raw| {
-                    parse_u64(raw).ok_or_else(|| {
-                        ApiError::new(
-                            400,
-                            "invalid_request",
-                            "'after' must be a non-negative integer",
-                        )
-                    })
-                })?;
-            let epoch = request
-                .query
-                .get("epoch")
-                .ok_or_else(|| ApiError::new(400, "invalid_request", "'epoch' is required"))
-                .and_then(|raw| {
-                    parse_u64(raw).filter(|epoch| *epoch > 0).ok_or_else(|| {
-                        ApiError::new(400, "invalid_request", "'epoch' must be a positive integer")
-                    })
-                })?;
-            Ok(Route::Events { epoch, after })
-        }
-        ("GET", ["api", "v1", "approvals"]) => Ok(Route::Approvals),
-        ("POST", ["api", "v1", "approvals", id, "approve"]) => {
-            Ok(Route::Approve { id: safe_id(id)? })
-        }
-        ("POST", ["api", "v1", "approvals", id, "reject"]) => {
-            Ok(Route::Reject { id: safe_id(id)? })
-        }
-        ("GET", ["api", "v1", "resources"]) => Ok(Route::Resources),
-        ("GET", ["api", "v1", "budgets", mission]) => Ok(Route::BudgetGet {
-            mission: safe_id(mission)?,
-        }),
-        ("PUT", ["api", "v1", "budgets", mission]) => Ok(Route::BudgetPut {
-            mission: safe_id(mission)?,
-        }),
         ("GET", _) if !crate::ui_assets::is_control_path(&request.path) => Ok(Route::Product {
             path: request.path.clone(),
         }),
@@ -1650,14 +1280,6 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         | ["api", "v1", "canonical", "projects"] => Some("GET"),
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
         ["api", "v1", "canonical", "projects", _] => Some("GET"),
-        ["api", "v1", "snapshot"]
-        | ["api", "v1", "events"]
-        | ["api", "v1", "approvals"]
-        | ["api", "v1", "resources"] => Some("GET"),
-        ["api", "v1", "budgets", _] => Some("GET, PUT"),
-        ["api", "v1", "approvals", _, "approve"] | ["api", "v1", "approvals", _, "reject"] => {
-            Some("POST")
-        }
         _ => None,
     }
 }
@@ -1671,15 +1293,6 @@ fn safe_id(value: &str) -> std::result::Result<String, ApiError> {
         ));
     }
     Ok(value.to_string())
-}
-
-fn parse_u64(raw: &str) -> Option<u64> {
-    raw.trim().parse::<u64>().ok()
-}
-
-fn parse_sse_id(raw: &str) -> Option<(u64, u64)> {
-    let (epoch, seq) = raw.trim().split_once(':')?;
-    Some((epoch.trim().parse().ok()?, seq.trim().parse().ok()?))
 }
 
 fn now_unix() -> i64 {
@@ -1706,9 +1319,4 @@ fn reason(status: u16) -> &'static str {
         505 => "HTTP Version Not Supported",
         _ => "Error",
     }
-}
-
-/// Parse the `epoch:seq` cursor carried by an SSE `Last-Event-ID` header.
-pub fn parse_last_event_id(raw: &str) -> Option<Cursor> {
-    parse_sse_id(raw).map(|(epoch, seq)| Cursor { epoch, seq })
 }

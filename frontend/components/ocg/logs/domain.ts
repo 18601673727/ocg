@@ -228,10 +228,10 @@ export function deriveRuntimeLogEntries(snapshot: RuntimeSnapshot, sessionId: st
   for (const activity of execution?.activities ?? []) {
     entries.push(fixtureEntry({
       id: `execution-${activity.id}`,
-      timestamp: at(Math.max(0, activity.elapsedMs / 60_000)),
-      level: activity.status === "failed" || activity.status === "blocked" ? "error" : activity.status === "retrying" ? "warn" : "info",
-      source: "Mission",
-      category: activity.kind,
+      timestamp: new Date(activity.at * 1000).toISOString(),
+      level: activity.status === "failed" ? "error" : activity.status === "unrecognized" ? "warn" : "info",
+      source: "Orchestration",
+      category: "call",
       message: activity.message,
       missionId: activity.missionId,
       taskId: activity.taskId,

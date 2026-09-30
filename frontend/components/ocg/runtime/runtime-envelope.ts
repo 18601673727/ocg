@@ -50,6 +50,8 @@ export type RuntimeResumeCursor = string;
 
 /** Per-event normalized payloads for every currently meaningful event. */
 export type RuntimeEnvelopePayloads = {
+  "job.execution-updated": { execution: import("../execution/domain").JobExecution; accounting: import("../execution/accounting").JobAccounting | null };
+  "job.launch-updated": { result: import("./runtime-types").JobLaunchResult };
   "runtime.status-changed": { status: RuntimeStatus };
   "conversation.session-created": { session: ChatSession };
   "conversation.session-updated": { session: ChatSession };
@@ -82,6 +84,8 @@ export type RuntimeEnvelopePayloads = {
 export type RuntimeEventType = keyof RuntimeEnvelopePayloads;
 
 export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
+  "job.execution-updated",
+  "job.launch-updated",
   "runtime.status-changed",
   "conversation.session-created",
   "conversation.session-updated",
@@ -257,6 +261,10 @@ export function envelopeFromRuntimeEvent(
       return { ...base, type: event.type, payload: { message: event.message } };
     case "activity.updated":
       return { ...base, type: event.type, payload: { messageId: event.messageId, activity: event.activity } };
+    case "job.execution-updated":
+      return { ...base, type: event.type, payload: { execution: event.execution, accounting: event.accounting } };
+    case "job.launch-updated":
+      return { ...base, type: event.type, payload: { result: event.result } };
     case "mission.updated":
       return { ...base, type: event.type, payload: { mission: event.mission } };
     case "observability.updated":
@@ -371,6 +379,10 @@ export class RuntimeEnvelopeFactory {
 export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
   const sessionId = envelope.sessionId ?? "";
   switch (envelope.type) {
+    case "job.execution-updated":
+      return { type: envelope.type, sessionId, execution: envelope.payload.execution, accounting: envelope.payload.accounting };
+    case "job.launch-updated":
+      return { type: envelope.type, sessionId, result: envelope.payload.result };
     case "runtime.status-changed":
       return { type: envelope.type, status: envelope.payload.status };
     case "conversation.session-created":
@@ -431,6 +443,15 @@ function diagnostic(
 function validatePayload(type: RuntimeEventType, payload: unknown): string | null {
   if (!isRecord(payload)) return `Event "${type}" payload must be an object.`;
   switch (type) {
+    case "job.execution-updated": {
+      const execution = payload.execution;
+      if (!isRecord(execution) || !isNonEmptyString(execution.jobId)) return "execution.jobId is required.";
+      if (!isProjectId(execution.projectId)) return "execution.projectId is required.";
+      if (!isNonNegativeInteger(execution.generation) || !isNonNegativeInteger(execution.cursor)) return "execution generation and cursor must be non-negative integers.";
+      if (!Array.isArray(execution.attempts) || !Array.isArray(execution.calls) || !Array.isArray(execution.executors)) return "execution entities must be arrays.";
+      if (payload.accounting !== null && !isRecord(payload.accounting)) return "accounting must be an object or null.";
+      return null;
+    }
     case "runtime.status-changed": {
       const status = payload.status;
       if (!isRecord(status) || typeof status.state !== "string") return "status.state is required.";
@@ -489,6 +510,7 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       if (!isRecord(execution) || !isNonEmptyString(execution.missionId)) return "execution.missionId is required.";
       return null;
     }
+    case "job.launch-updated":
     case "mission.launch-updated": {
       const result = payload.result;
       if (!isRecord(result) || !isNonEmptyString(result.outcome)) return "result.outcome is required.";

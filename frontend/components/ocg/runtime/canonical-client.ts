@@ -4,7 +4,7 @@
  * This is the PWA's only route to real OCG state. It carries stable command
  * identities, and every mutation returns a typed acknowledgement from the
  * backend. The client is transport-shaped only: it performs no authority
- * decision, derives no execution identity, and never edits a dispatched Run.
+ * decision, derives no execution identity, and never edits a dispatched Call.
  *
  * Every payload is decoded against the Rust-generated contract in
  * `components/ocg/contracts` before it leaves this module. The previous
@@ -23,12 +23,12 @@ import {
   decodeConfigurationEnvelope,
   decodeDashboardResponse,
   decodeEventsEnvelope,
-  decodeMissionResponse,
+  decodeJobConfigResponse,
+  decodeJobSnapshot,
   decodeProjectResponse,
   decodeProjectsResponse,
-  decodeWorkSnapshot,
   type CanonicalDashboardResponse,
-  type CanonicalWorkSnapshot,
+  type CanonicalJobSnapshot,
   type GlobalConfiguration,
   type JsonValue,
   type ProjectConfigurationView,
@@ -59,11 +59,11 @@ export type CanonicalConfigurationAck = {
   configuration: ProjectConfigurationView;
 };
 
-export type CanonicalMissionConfigAck = {
+export type CanonicalJobConfigAck = {
   ok: true;
   commandId: string;
   accepted: boolean;
-  missionId: string;
+  jobId: string;
   revision: number;
   configuration: JsonValue;
 };
@@ -96,23 +96,23 @@ export interface CanonicalControlClient {
     projectId: string,
     defaults: JsonValue,
   ): Promise<CanonicalResult<CanonicalConfigurationAck>>;
-  writeMissionConfiguration(
+  writeJobConfiguration(
     commandId: string,
-    missionId: string,
+    jobId: string,
     configuration: JsonValue,
-  ): Promise<CanonicalResult<CanonicalMissionConfigAck>>;
-  readWorkSnapshot(
+  ): Promise<CanonicalResult<CanonicalJobConfigAck>>;
+  readJobSnapshot(
     projectId: string,
-    missionId: string,
-  ): Promise<CanonicalResult<CanonicalWorkSnapshot>>;
-  readWorkEvents(
+    jobId: string,
+  ): Promise<CanonicalResult<CanonicalJobSnapshot>>;
+  readJobEvents(
     projectId: string,
-    missionId: string,
+    jobId: string,
     after: number,
   ): Promise<CanonicalResult<CanonicalBackendEvent[]>>;
   readDashboard(
     projectId: string,
-    missionId?: string,
+    jobId?: string,
   ): Promise<CanonicalResult<CanonicalDashboardResponse>>;
 }
 
@@ -265,20 +265,20 @@ export function createHttpCanonicalControlClient(
       return acknowledgeConfiguration(commandId, value);
     },
 
-    async writeMissionConfiguration(commandId, missionId, configuration) {
+    async writeJobConfiguration(commandId, jobId, configuration) {
       const { status, value, text } = await send(
         "PUT",
-        `/api/v1/canonical/missions/${encodeURIComponent(missionId)}/configuration`,
+        `/api/v1/canonical/jobs/${encodeURIComponent(jobId)}/configuration`,
         { command_id: commandId, configuration },
       );
       if (status !== 200) return rejection(commandId, status, text);
       try {
-        const ack = decodeMissionResponse(value);
+        const ack = decodeJobConfigResponse(value);
         return {
           ok: true as const,
           commandId: ack.command_id,
           accepted: ack.accepted,
-          missionId: ack.mission_id,
+          jobId: ack.job_id,
           revision: ack.revision,
           configuration: ack.configuration,
         };
@@ -287,26 +287,26 @@ export function createHttpCanonicalControlClient(
       }
     },
 
-    async readWorkSnapshot(projectId, missionId) {
+    async readJobSnapshot(projectId, jobId) {
       const { status, value, text } = await send(
         "GET",
-        `/api/v1/canonical/work?project_id=${encodeURIComponent(projectId)}&mission_id=${encodeURIComponent(missionId)}`,
+        `/api/v1/canonical/jobs?project_id=${encodeURIComponent(projectId)}&job_id=${encodeURIComponent(jobId)}`,
         undefined,
       );
       if (status !== 200) return rejection("snapshot", status, text);
       // The full snapshot envelope is what the runtime store reconciles
       // against; the decoder checks the envelope without stripping it.
       try {
-        return decodeWorkSnapshot(value);
+        return decodeJobSnapshot(value);
       } catch (error) {
         return contractRejection("snapshot", error);
       }
     },
 
-    async readWorkEvents(projectId, missionId, after) {
+    async readJobEvents(projectId, jobId, after) {
       const { status, value, text } = await send(
         "GET",
-        `/api/v1/canonical/work/events?project_id=${encodeURIComponent(projectId)}&mission_id=${encodeURIComponent(missionId)}&after=${after}`,
+        `/api/v1/canonical/jobs/events?project_id=${encodeURIComponent(projectId)}&job_id=${encodeURIComponent(jobId)}&after=${after}`,
         undefined,
       );
       if (status !== 200) return rejection("events", status, text);
@@ -319,8 +319,8 @@ export function createHttpCanonicalControlClient(
       }
     },
 
-    async readDashboard(projectId, missionId) {
-      const suffix = missionId ? `&mission_id=${encodeURIComponent(missionId)}` : "";
+    async readDashboard(projectId, jobId) {
+      const suffix = jobId ? `&job_id=${encodeURIComponent(jobId)}` : "";
       const { status, value, text } = await send(
         "GET",
         `/api/v1/canonical/dashboard?project_id=${encodeURIComponent(projectId)}${suffix}`,

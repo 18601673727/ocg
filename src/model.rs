@@ -88,9 +88,9 @@ pub fn worker_agent_id(role: &str) -> String {
 
 /// The primary Lead request contract selected from the OCG Profile.
 ///
-/// This value is resolved in Rust and handed to the thin OpenCode plugin for
-/// enforcement at `chat.message`, after OpenCode has applied sticky UI/session
-/// selection but before the user message is saved or sent to a provider.
+/// This value is resolved in Rust and exported to the launched runtime, so the
+/// Lead is fixed after OpenCode has applied any sticky UI/session selection but
+/// before the user message is saved or sent to a provider.
 ///
 /// The Lead is provider-agnostic: `provider_id`/`model_id` come from the
 /// configured registry, not from a hardcoded OpenAI assumption. A reasoning

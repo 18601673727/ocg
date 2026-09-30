@@ -7,7 +7,13 @@ export type ChatSession = {
   updatedAt: string;
 };
 
-export type MessageRole = "user" | "assistant" | "tool";
+/**
+ * Who authored a message.
+ *
+ * `call` mirrors the canonical `Actor` kind of the same name: a Call is the
+ * managed action the substrate ran, and its output can be a message of its own.
+ */
+export type MessageRole = "user" | "assistant" | "call" | "tool";
 
 export type MessageStatus =
   | "pending"
@@ -16,22 +22,54 @@ export type MessageStatus =
   | "cancelled"
   | "failed";
 
-export type ToolActivityStatus =
-  | "pending"
+/**
+ * The lifecycle words a Call admits, drawn from the contract's `CallLifecycle`.
+ *
+ * `succeeded` is the contract word for a settled Call; `completed` is the
+ * display alias this UI uses, since the control surface renders the word
+ * `completed` in the substrate column even for a successful outcome.
+ */
+export type CallActivityStatus =
+  | "created"
+  | "queued"
   | "running"
-  | "success"
-  | "failure"
-  | "retrying"
-  | "waiting-approval";
+  | "completed"
+  | "failed"
+  | "cancelled";
 
-export type ToolActivity = {
+/**
+ * Maps the contract's canonical state onto the UI-visible vocabulary.
+ *
+ * `completed` is mapped from `succeeded` to match the substrate's column word;
+ * the rest are preserved verbatim so the UI is always readable in the contract's
+ * own dialect.
+ */
+export function callActivityStatusFrom(state: string): CallActivityStatus {
+  switch (state) {
+    case "created":
+    case "queued":
+    case "running":
+    case "succeeded":
+    case "completed":
+    case "failed":
+    case "cancelled":
+      return state === "succeeded" ? "completed" : state;
+    default:
+      return "completed";
+  }
+}
+
+/** One managed Call shown inline in the conversation. */
+export type CallActivity = {
   id: string;
+  /** The canonical effect identity, when the substrate named one. */
   name: string;
-  status: ToolActivityStatus;
+  status: string;
   durationMs: number;
   summary: string;
   detail: string;
-  retryCount?: number;
+  /** The Executor the substrate attributed this Call to. */
+  executorId?: string;
 };
 
 export type ChatMessage = {
@@ -40,68 +78,25 @@ export type ChatMessage = {
   content: string;
   createdAt: string;
   status: MessageStatus;
+  call?: CallActivity;
+  /** Temporary read-only compatibility field for the legacy fixture renderer. */
   tool?: ToolActivity;
 };
 
+/** Legacy fixture vocabulary retained until the remaining presentation surfaces migrate. */
 export type MissionTaskStatus = "pending" | "active" | "completed" | "failed";
-
-export type MissionTask = {
-  id: string;
-  title: string;
-  status: MissionTaskStatus;
-};
-
-export type MissionStatus =
-  | "planning"
-  | "running"
-  | "paused"
-  | "completed"
-  | "failed"
-  | "budget-exhausted";
-
-export type WorkerStatus =
-  | "queued"
-  | "starting"
-  | "active"
-  | "waiting"
-  | "idle"
-  | "completed"
-  | "failed"
-  | "cancelled";
-
-export type Worker = {
-  id: string;
-  name: string;
-  status: WorkerStatus;
-  task?: string;
-};
-
-export type ResourceCommitment = {
-  workers: number;
-  mode: "capped" | "flexible";
-};
-
-export type BudgetState = {
-  spent: number;
-  limit: number;
-  currency: "USD";
-  status: "within-limit" | "exhausted";
-};
-
+export type MissionTask = { id: string; title: string; status: MissionTaskStatus };
+export type MissionStatus = "planning" | "running" | "paused" | "completed" | "failed" | "budget-exhausted";
+export type WorkerStatus = "queued" | "starting" | "active" | "waiting" | "idle" | "completed" | "failed" | "cancelled";
+export type Worker = { id: string; name: string; status: WorkerStatus; task?: string };
+export type ResourceCommitment = { workers: number; mode: "capped" | "flexible" };
+export type BudgetState = { spent: number; limit: number; currency: "USD"; status: "within-limit" | "exhausted" };
 export type Mission = {
-  title: string;
-  goal: string;
-  status: MissionStatus;
-  completed: number;
-  total: number;
-  current: string;
-  tasks: MissionTask[];
-  workers: Worker[];
-  elapsed: string;
-  commitment: ResourceCommitment;
-  budget: BudgetState;
-  warnings: string[];
+  title: string; goal: string; status: MissionStatus; completed: number; total: number; current: string;
+  tasks: MissionTask[]; workers: Worker[]; elapsed: string; commitment: ResourceCommitment; budget: BudgetState; warnings: string[];
 };
+export type ToolActivityStatus = "pending" | "running" | "success" | "failure" | "retrying" | "waiting-approval";
+export type ToolActivity = { id: string; name: string; status: string; durationMs: number; summary: string; detail: string; retryCount?: number };
 
 export type RuntimeConnectionState = "connected" | "connecting" | "disconnected" | "failed";
 
@@ -129,7 +124,9 @@ export type OcgRuntimeEvent =
   | { type: "conversation.message-started"; sessionId: string; message: ChatMessage }
   | { type: "conversation.message-delta"; sessionId: string; messageId: string; delta: string }
   | { type: "conversation.message-completed"; sessionId: string; message: ChatMessage }
-  | { type: "activity.updated"; sessionId: string; messageId: string; activity: ToolActivity }
+  | { type: "activity.updated"; sessionId: string; messageId: string; activity: CallActivity }
+  | { type: "job.execution-updated"; sessionId: string; execution: import("./execution/domain").JobExecution; accounting: import("./execution/accounting").JobAccounting | null }
+  | { type: "job.launch-updated"; sessionId: string; result: import("./runtime/runtime-types").JobLaunchResult }
   | { type: "mission.updated"; sessionId: string; mission: Mission }
   | { type: "observability.updated"; sessionId: string; observability: import("./runtime/observability").RuntimeObservability }
   | { type: "execution.updated"; sessionId: string; execution: import("./execution/domain").MissionExecution }

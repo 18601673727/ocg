@@ -68,8 +68,7 @@ impl ModelPreflight {
     }
 }
 
-/// Probe one resolved OpenCode executable with the generated config. Callers
-/// remove OCG's not-yet-materialized local plugin while preserving user config.
+/// Probe one resolved OpenCode executable with the generated config.
 /// A process failure is a non-fatal `Unavailable` result; callers decide
 /// whether to warn (launch) or display an informational diagnostic (doctor).
 pub fn probe(

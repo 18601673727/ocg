@@ -4,7 +4,7 @@
 //! (`.ocg/`) in a directory. The project root is the nearest
 //! ancestor of the invocation directory that contains the marker. Every piece
 //! of project-scoped state (context index/cache, orchestration state,
-//! checkpoints, verification logs, the generated plugin and local telemetry)
+//! checkpoints, verification logs and local telemetry)
 //! is placed under that resolved root, never under an arbitrary working
 //! directory. Two sibling projects therefore can never share state, and a
 //! parent directory that is not itself a project can never become a boundary

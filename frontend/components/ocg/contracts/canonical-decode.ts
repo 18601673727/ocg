@@ -12,12 +12,12 @@ import type {
   CanonicalConfigurationResponse,
   CanonicalDashboardResponse,
   CanonicalEventsEnvelope,
-  CanonicalMissionConfigEnvelope,
-  CanonicalMissionResponse,
+  CanonicalJobConfigEnvelope,
+  CanonicalJobConfigResponse,
+  CanonicalJobEvent,
+  CanonicalJobSnapshot,
   CanonicalProjectResponse,
   CanonicalProjectsResponse,
-  CanonicalWorkEvent,
-  CanonicalWorkSnapshot,
   GlobalConfiguration,
   ProjectConfiguration,
   ProjectConfigurationView,
@@ -77,7 +77,7 @@ const projectRecord: Decoder<ProjectRecord> = (input, path) => {
 /**
  * The Job, Attempt and Call records the canonical snapshot embeds.
  *
- * `CanonicalWorkSnapshot::mission` is an unconstrained `serde_json::Value` in
+ * `CanonicalJobSnapshot::job` is an unconstrained `serde_json::Value` in
  * `src/orchestration/canonical_control.rs`, assembled by `canonical_snapshot`
  * from the authoritative records in `src/orchestration/domain.rs`. Those
  * records carry no `ts_rs` projection of their own — the field set here mirrors
@@ -169,7 +169,7 @@ export type CanonicalCall = {
   finished_at: number | null;
 };
 
-/** The `mission` payload of a `CanonicalWorkSnapshot`. */
+/** The `job` payload of a `CanonicalJobSnapshot`. */
 export type CanonicalExecutionState = {
   job: CanonicalJob;
   attempts: CanonicalAttempt[];
@@ -359,15 +359,15 @@ const configurationView: Decoder<ProjectConfigurationView> = (input, path) => {
   });
 };
 
-const workEvent: Decoder<CanonicalWorkEvent> = (input, path) => {
-  const rec = record(input, path, "a CanonicalWorkEvent");
+const jobEvent: Decoder<CanonicalJobEvent> = (input, path) => {
+  const rec = record(input, path, "a CanonicalJobEvent");
   if (!rec.ok) return rec;
   const apiVersion = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
   if (!apiVersion.ok) return apiVersion;
   const projectId = req(rec.value, "project_id", string, path);
   if (!projectId.ok) return projectId;
-  const missionId = req(rec.value, "mission_id", string, path);
-  if (!missionId.ok) return missionId;
+  const jobId = req(rec.value, "job_id", string, path);
+  if (!jobId.ok) return jobId;
   const sequence = req(rec.value, "sequence", number, path);
   if (!sequence.ok) return sequence;
   const eventId = req(rec.value, "event_id", string, path);
@@ -379,7 +379,7 @@ const workEvent: Decoder<CanonicalWorkEvent> = (input, path) => {
   return yes({
     api_version: apiVersion.value,
     project_id: projectId.value,
-    mission_id: missionId.value,
+    job_id: jobId.value,
     sequence: sequence.value,
     event_id: eventId.value,
     kind: kind.value,
@@ -387,21 +387,21 @@ const workEvent: Decoder<CanonicalWorkEvent> = (input, path) => {
   });
 };
 
-const workSnapshot: Decoder<CanonicalWorkSnapshot> = (input, path) => {
-  const rec = record(input, path, "a CanonicalWorkSnapshot");
+const jobSnapshot: Decoder<CanonicalJobSnapshot> = (input, path) => {
+  const rec = record(input, path, "a CanonicalJobSnapshot");
   if (!rec.ok) return rec;
   const apiVersion = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
   if (!apiVersion.ok) return apiVersion;
   const projectId = req(rec.value, "project_id", string, path);
   if (!projectId.ok) return projectId;
-  const mission = req(rec.value, "mission", jsonValue, path);
-  if (!mission.ok) return mission;
+  const job = req(rec.value, "job", jsonValue, path);
+  if (!job.ok) return job;
   const cursor = req(rec.value, "cursor", number, path);
   if (!cursor.ok) return cursor;
   return yes({
     api_version: apiVersion.value,
     project_id: projectId.value,
-    mission: mission.value,
+    job: job.value,
     cursor: cursor.value,
   });
 };
@@ -445,20 +445,20 @@ const configurationEnvelope: Decoder<CanonicalConfigurationEnvelope> = (input, p
   return yes({ api_version: apiVersion.value, configuration: configuration.value });
 };
 
-const missionConfigEnvelope: Decoder<CanonicalMissionConfigEnvelope> = (input, path) => {
-  const rec = record(input, path, "a CanonicalMissionConfigEnvelope");
+const jobConfigEnvelope: Decoder<CanonicalJobConfigEnvelope> = (input, path) => {
+  const rec = record(input, path, "a CanonicalJobConfigEnvelope");
   if (!rec.ok) return rec;
   const apiVersion = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
   if (!apiVersion.ok) return apiVersion;
-  const missionId = req(rec.value, "mission_id", string, path);
-  if (!missionId.ok) return missionId;
+  const jobId = req(rec.value, "job_id", string, path);
+  if (!jobId.ok) return jobId;
   const configuration = req(rec.value, "configuration", jsonValue, path);
   if (!configuration.ok) return configuration;
   const revision = req(rec.value, "revision", number, path);
   if (!revision.ok) return revision;
   return yes({
     api_version: apiVersion.value,
-    mission_id: missionId.value,
+    job_id: jobId.value,
     configuration: configuration.value,
     revision: revision.value,
   });
@@ -471,14 +471,14 @@ const eventsEnvelope: Decoder<CanonicalEventsEnvelope> = (input, path) => {
   if (!apiVersion.ok) return apiVersion;
   const projectId = req(rec.value, "project_id", string, path);
   if (!projectId.ok) return projectId;
-  const missionId = req(rec.value, "mission_id", string, path);
-  if (!missionId.ok) return missionId;
-  const events = req(rec.value, "events", array(workEvent), path);
+  const jobId = req(rec.value, "job_id", string, path);
+  if (!jobId.ok) return jobId;
+  const events = req(rec.value, "events", array(jobEvent), path);
   if (!events.ok) return events;
   return yes({
     api_version: apiVersion.value,
     project_id: projectId.value,
-    mission_id: missionId.value,
+    job_id: jobId.value,
     events: events.value,
   });
 };
@@ -490,15 +490,15 @@ const dashboardResponse: Decoder<CanonicalDashboardResponse> = (input, path) => 
   if (!apiVersion.ok) return apiVersion;
   const projectId = req(rec.value, "project_id", string, path);
   if (!projectId.ok) return projectId;
-  const missions = req(rec.value, "missions", array(jsonValue), path);
-  if (!missions.ok) return missions;
-  const selectedMission = req(rec.value, "selected_mission", nullable(workSnapshot), path);
-  if (!selectedMission.ok) return selectedMission;
+  const jobs = req(rec.value, "jobs", array(jsonValue), path);
+  if (!jobs.ok) return jobs;
+  const selectedJob = req(rec.value, "selected_job", nullable(jobSnapshot), path);
+  if (!selectedJob.ok) return selectedJob;
   return yes({
     api_version: apiVersion.value,
     project_id: projectId.value,
-    missions: missions.value,
-    selected_mission: selectedMission.value,
+    jobs: jobs.value,
+    selected_job: selectedJob.value,
   });
 };
 
@@ -537,8 +537,8 @@ const configurationAck: Decoder<ConfigurationAck> = (input, path) => {
   });
 };
 
-const missionResponse: Decoder<CanonicalMissionResponse> = (input, path) => {
-  const rec = record(input, path, "a CanonicalMissionResponse");
+const jobConfigResponse: Decoder<CanonicalJobConfigResponse> = (input, path) => {
+  const rec = record(input, path, "a CanonicalJobConfigResponse");
   if (!rec.ok) return rec;
   const apiVersion = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
   if (!apiVersion.ok) return apiVersion;
@@ -546,8 +546,8 @@ const missionResponse: Decoder<CanonicalMissionResponse> = (input, path) => {
   if (!commandId.ok) return commandId;
   const accepted = req(rec.value, "accepted", boolean, path);
   if (!accepted.ok) return accepted;
-  const missionId = req(rec.value, "mission_id", string, path);
-  if (!missionId.ok) return missionId;
+  const jobId = req(rec.value, "job_id", string, path);
+  if (!jobId.ok) return jobId;
   const revision = req(rec.value, "revision", number, path);
   if (!revision.ok) return revision;
   const configuration = req(rec.value, "configuration", jsonValue, path);
@@ -556,7 +556,7 @@ const missionResponse: Decoder<CanonicalMissionResponse> = (input, path) => {
     api_version: apiVersion.value,
     command_id: commandId.value,
     accepted: accepted.value,
-    mission_id: missionId.value,
+    job_id: jobId.value,
     revision: revision.value,
     configuration: configuration.value,
   });
@@ -582,11 +582,11 @@ export const decodeConfigurationEnvelope = (input: unknown): CanonicalConfigurat
 export const decodeConfigurationAck = (input: unknown): ConfigurationAck =>
   decode((value) => configurationAck(value, ""), input);
 
-export const decodeMissionConfigEnvelope = (input: unknown): CanonicalMissionConfigEnvelope =>
-  decode((value) => missionConfigEnvelope(value, ""), input);
+export const decodeJobConfigEnvelope = (input: unknown): CanonicalJobConfigEnvelope =>
+  decode((value) => jobConfigEnvelope(value, ""), input);
 
-export const decodeMissionResponse = (input: unknown): CanonicalMissionResponse =>
-  decode((value) => missionResponse(value, ""), input);
+export const decodeJobConfigResponse = (input: unknown): CanonicalJobConfigResponse =>
+  decode((value) => jobConfigResponse(value, ""), input);
 
 export const decodeEventsEnvelope = (input: unknown): CanonicalEventsEnvelope =>
   decode((value) => eventsEnvelope(value, ""), input);
@@ -594,19 +594,19 @@ export const decodeEventsEnvelope = (input: unknown): CanonicalEventsEnvelope =>
 export const decodeDashboardResponse = (input: unknown): CanonicalDashboardResponse =>
   decode((value) => dashboardResponse(value, ""), input);
 
-export const decodeWorkSnapshot = (input: unknown): CanonicalWorkSnapshot =>
-  decode((value) => workSnapshot(value, ""), input);
+export const decodeJobSnapshot = (input: unknown): CanonicalJobSnapshot =>
+  decode((value) => jobSnapshot(value, ""), input);
 
 /**
  * The Job, Attempts and Calls a canonical snapshot carries.
  *
- * Read separately from the snapshot envelope because the envelope's `mission`
+ * Read separately from the snapshot envelope because the envelope's `job`
  * field is an unconstrained `JsonValue`: the envelope decoder only proves a
  * value is there, and this one proves what is in it. A violation raises a
  * `ContractError` naming the path, which the projection reports as a rejected
  * snapshot rather than rendering a half-typed Job.
  */
-export const decodeExecutionState = (input: unknown, path = "mission"): CanonicalExecutionState =>
+export const decodeExecutionState = (input: unknown, path = "job"): CanonicalExecutionState =>
   decode((value) => executionState(value, path), input);
 
 export const tryEventsEnvelope = (input: unknown): DecodeResult<CanonicalEventsEnvelope> =>

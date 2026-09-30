@@ -50,7 +50,7 @@ export type AttentionItem = {
 export type ActiveMissionProjection = {
   id: string;
   title: string;
-  status: MissionStatus;
+  status: MissionStatus | "pending";
   completed: number;
   total: number;
   currentWave?: number;
@@ -63,6 +63,10 @@ export type ActiveMissionProjection = {
   budgetLimit?: number;
   progress: number;
   destination: "mission-control";
+  sessionId?: string;
+  jobId?: string;
+  projectId?: string;
+  updatedAt?: string;
 };
 
 export type ContinueWorkingEntry = {
@@ -73,6 +77,8 @@ export type ContinueWorkingEntry = {
   kind: "chat" | "mission" | "diagnostics" | "configuration";
   destination: string;
   sessionId?: string;
+  updatedAt?: string;
+  workType?: string;
 };
 
 export type ResourceHealthSummary = {
@@ -88,7 +94,10 @@ export type ResourceHealthSummary = {
   activeProfileLabel: string;
   runtimeState: string;
   hasDegradedOrAuthRequired: boolean;
+  items?: ResourceHealthItem[];
 };
+
+export type ResourceHealthItem = { id: string; label: string; state: "healthy" | "degraded" | "auth-required" | "unavailable"; detail: string | null };
 
 export type UsageSummary = {
   costMicros: number | null;
@@ -100,6 +109,8 @@ export type UsageSummary = {
   cacheLeverage: number | null;
   entryCount: number;
   available: boolean;
+  totalCost?: number | null;
+  hasCost?: boolean;
 };
 
 /** Subset of the shared tone scale the activity feed ranks itself by. */
@@ -111,4 +122,8 @@ export type RecentActivityItem = {
   summary: string;
   kind: "mission" | "worker" | "provider" | "model" | "budget" | "resource" | "verification";
   tone: RecentActivityTone;
+  title?: string;
+  subtitle?: string;
+  timestamp?: string;
+  destination?: string;
 };

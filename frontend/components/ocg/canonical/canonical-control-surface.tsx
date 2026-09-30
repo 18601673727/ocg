@@ -18,7 +18,7 @@ import {
 import { RuntimeStore } from "../runtime/runtime-store";
 import { createUninitializedRuntimeState } from "../runtime/reconciler";
 import { type CanonicalState, selectCanonical } from "../runtime/canonical-store";
-import { MissionControlSurface } from "../mission-control/mission-control-surface";
+import { JobExecutionSurface } from "../execution/job-execution-surface";
 import {
   DEFAULT_CONFIGURATION_DRAFT,
   describeAcknowledgement,
@@ -40,9 +40,9 @@ import {
  *
  * This is a projection and control surface only. It registers/imports real
  * repositories, persists supported global and project configuration, edits an
- * undispatched Mission, and renders a running canonical Mission from durable
- * backend state. It never dispatches, completes or replaces a Run, and a
- * dispatched Run's frozen executor contract is read-only here.
+ * undispatched Job, and renders a running canonical Job from durable backend
+ * state. It never dispatches, completes or replaces a Call, and a dispatched
+ * Call's frozen effect contract is read-only here.
  */
 export type CanonicalControlSurfaceProps = {
   /** Loopback OCG control base URL, e.g. http://127.0.0.1:8710 */
@@ -84,24 +84,21 @@ export function CanonicalControlSurface({
   const [projects, setProjects] = useState<CanonicalProjectRecord[]>([]);
   const [configuration, setConfiguration] = useState<CanonicalConfigurationView | null>(null);
   const [root, setRoot] = useState(initialRoot ?? "");
-  const [missionId, setMissionId] = useState("");
+  const [jobId, setJobId] = useState("");
   const [draft, setDraft] = useState<ConfigurationDraft>({ ...DEFAULT_CONFIGURATION_DRAFT });
   const [ack, setAck] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const activeProjectId = state.projectId;
-  const selected = useMemo(
-    () => selectCanonical(state, missionId || "Canonical Mission"),
-    [state, missionId],
-  );
+  const selected = useMemo(() => selectCanonical(state), [state]);
   const preRun = preRunConfigurationState(state);
   const draftIssues = validateConfigurationDraft(draft);
   const importIssues = validateImportRoot(root);
 
   const refresh = useCallback(
-    async (project: CanonicalProjectRecord, mission: string) => {
-      const snapshot = await client.readWorkSnapshot(project.project_id, mission);
+    async (project: CanonicalProjectRecord, job: string) => {
+      const snapshot = await client.readJobSnapshot(project.project_id, job);
       if (isCanonicalRejection(snapshot)) {
         setError(snapshot.message);
         return;
@@ -113,7 +110,7 @@ export function CanonicalControlSurface({
         generation,
       });
       setState(next);
-      const events = await client.readWorkEvents(project.project_id, mission, next.cursor);
+      const events = await client.readJobEvents(project.project_id, job, next.cursor);
       if (!isCanonicalRejection(events)) {
         setState(store.applyCanonicalEvents(events, { projectId: scopeIdFor(project), generation }));
       }
@@ -212,11 +209,11 @@ export function CanonicalControlSurface({
       }
     });
 
-  const saveMissionConfig = () =>
+  const saveJobConfig = () =>
     run(async () => {
       if (preRun.jobId === null) return;
-      const result = await client.writeMissionConfiguration(
-        `cmd-mission-config-${preRun.jobId}-${Date.now()}`,
+      const result = await client.writeJobConfiguration(
+        `cmd-job-config-${preRun.jobId}-${Date.now()}`,
         preRun.jobId,
         { profile: draft.profile, routing: draft.routing, hard_budget: draft.hardBudget },
       );
@@ -225,7 +222,7 @@ export function CanonicalControlSurface({
         setState(
           store.applyCanonicalCommandAck({
             commandId: result.commandId,
-            kind: "mission-config",
+            kind: "job-config",
             accepted: true,
             message: "Pre-run Job configuration persisted",
           }),
@@ -233,14 +230,14 @@ export function CanonicalControlSurface({
       }
     });
 
-  const loadMission = () =>
+  const loadJob = () =>
     run(async () => {
       const project = projects.find((item) => item.project_id === activeProjectId) ?? projects[0];
       if (!project) {
         setError("Select a Project first.");
         return;
       }
-      await refresh(project, missionId.trim());
+      await refresh(project, jobId.trim());
     });
 
   return (
@@ -277,7 +274,7 @@ export function CanonicalControlSurface({
                     type="button"
                     aria-pressed={project.active}
                     onClick={() => {
-                      if (missionId.trim().length > 0) void refresh(project, missionId.trim());
+                      if (jobId.trim().length > 0) void refresh(project, jobId.trim());
                     }}
                     className={cn(
                       "flex w-full items-center gap-2 rounded border px-2 py-1 text-left text-[10px]",
@@ -377,12 +374,12 @@ export function CanonicalControlSurface({
                 Job id
                 <Input
                   className="mt-1 h-7 text-[11px]"
-                  value={missionId}
+                  value={jobId}
                   placeholder="job-..."
-                  onChange={(event) => setMissionId(event.target.value)}
+                  onChange={(event) => setJobId(event.target.value)}
                 />
               </label>
-              <Button size="xs" variant="outline" disabled={busy || missionId.trim().length === 0} onClick={loadMission}>
+              <Button size="xs" variant="outline" disabled={busy || jobId.trim().length === 0} onClick={loadJob}>
                 <GitCommitHorizontal className="size-3.5" /> Load
               </Button>
             </div>
@@ -396,7 +393,7 @@ export function CanonicalControlSurface({
               <Button
                 size="xs"
                 disabled={busy || draftIssues.length > 0 || !preRun.editable}
-                onClick={saveMissionConfig}
+                onClick={saveJobConfig}
               >
                 <Save className="size-3.5" /> Save pre-run configuration
               </Button>
@@ -416,7 +413,7 @@ export function CanonicalControlSurface({
           <Panel className="bg-background p-3" title="Running Job" detail="canonical projection">
             {selected.execution ? (
               <div className="h-[420px] overflow-hidden rounded border border-border">
-                <MissionControlSurface execution={selected.execution} />
+                <JobExecutionSurface execution={selected.execution} />
               </div>
             ) : (
               <p className="text-[11px] text-muted-foreground">

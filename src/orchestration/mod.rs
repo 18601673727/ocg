@@ -12,7 +12,6 @@ pub mod domain;
 pub mod execution_dispatch;
 pub mod handoff;
 pub mod journal;
-pub mod plugin;
 pub mod projection;
 pub mod state;
 

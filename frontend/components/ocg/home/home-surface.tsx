@@ -86,6 +86,7 @@ const STATUS_LABELS: Record<ActiveMissionProjection["status"], string> = {
   completed: "Completed",
   failed: "Failed",
   "budget-exhausted": "Budget exhausted",
+  pending: "Pending",
 };
 
 export function HomeSurface(props: HomeSurfaceProps) {

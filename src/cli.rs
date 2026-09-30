@@ -25,9 +25,7 @@ use crate::provider_gateway::{GatewayRoute, ProviderGateway};
 use crate::provider_transport::ProviderTransportConfig;
 use crate::proxy::{ProxyScheme, ProxySelection, ProxySource};
 use crate::report;
-use crate::runtime::compat::{
-    self, BridgeRuntimeClient, LeadSelection, RuntimeAdapter, SessionClient,
-};
+use crate::runtime::compat::{self, LeadSelection, RuntimeAdapter, SessionClient};
 use crate::runtime::effective as runtime_effective;
 use crate::runtime::lifecycle::RuntimeAdapter as RuntimeLifecycleAdapter;
 use crate::runtime::lifecycle::RuntimeIdentity;
@@ -184,27 +182,14 @@ pub enum Command {
     Reconcile(Vec<OsString>),
     /// Read-only inspection of the descriptive Resource Registry.
     Resources(Vec<OsString>),
-    /// Read-only inspection of the effective Policy and the latest admission
-    /// decision per durable Mission.
-    Policy(Vec<OsString>),
     /// Inspect the mandatory economic configuration and durable Mission budget,
     /// or explicitly set a hard Mission budget (the only way past a hard cap).
     Budget(Vec<OsString>),
-    /// Read-only listing of durable, generation-bound approval requests.
-    Approvals(Vec<OsString>),
-    /// Resolve a pending approval as approved.
-    Approve(Vec<OsString>),
-    /// Resolve a pending approval as rejected.
-    Reject(Vec<OsString>),
     /// Run the loopback-only HTTP/SSE control server.
     Serve(Vec<OsString>),
     /// Canonical Job/Attempt control: admit, configure, dispatch, deliver and
-    /// inspect a canonical Mission. Every mutating operation is witness-bound.
+    /// inspect a canonical Job. Every mutating operation is witness-bound.
     Work(Vec<OsString>),
-    /// Run the project-scoped STDIO MCP adapter.
-    Mcp(Vec<OsString>),
-    /// Hidden/internal: the generated plugin's bridge. Never advertised.
-    Bridge(Vec<OsString>),
     Version,
     Doctor,
     Upgrade,
@@ -363,18 +348,7 @@ where
             // error it always had.
             if matches!(
                 command_token.as_deref(),
-                Some("checkpoint")
-                    | Some("config")
-                    | Some("reconcile")
-                    | Some("resources")
-                    | Some("policy")
-                    | Some("budget")
-                    | Some("approvals")
-                    | Some("approve")
-                    | Some("reject")
-                    | Some("serve")
-                    | Some("work")
-                    | Some("mcp")
+                Some("checkpoint") | Some("config") | Some("reconcile") | Some("resources")
             ) {
                 rest.push(args[index].clone());
                 index += 1;
@@ -425,15 +399,9 @@ where
         Some("checkpoint") => Command::Checkpoint(rest),
         Some("reconcile") => Command::Reconcile(rest),
         Some("resources") => Command::Resources(rest),
-        Some("policy") => Command::Policy(rest),
         Some("budget") => Command::Budget(rest),
-        Some("approvals") => Command::Approvals(rest),
-        Some("approve") => Command::Approve(rest),
-        Some("reject") => Command::Reject(rest),
         Some("serve") => Command::Serve(rest),
         Some("work") => Command::Work(rest),
-        Some("mcp") => Command::Mcp(rest),
-        Some("__bridge") => Command::Bridge(rest),
         Some("version") => Command::Version,
         Some("doctor") => Command::Doctor,
         Some("upgrade") => Command::Upgrade,
@@ -637,19 +605,14 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         env.home_dir.as_deref(),
     );
     // Profiles are user-global. `project_root` remains the workspace boundary
-    // for orchestration state, context, verification and generated plugins.
+    // for orchestration state, context and verification.
     let project_path = user_path.clone();
     if let Command::Init = cli.command {
         return init_command(&user_path);
     }
     if matches!(
         cli.command,
-        Command::Run(_)
-            | Command::Serve(_)
-            | Command::Mcp(_)
-            | Command::Reconcile(_)
-            | Command::Work(_)
-            | Command::Bridge(_)
+        Command::Run(_) | Command::Serve(_) | Command::Reconcile(_) | Command::Work(_)
     ) && !project_path.is_file()
     {
         return Err(Failure::Ocg(OcgError::config(format!(
@@ -667,10 +630,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
     )
     .map_err(Failure::Ocg)?;
     let mut effective = effective;
-    if matches!(
-        cli.command,
-        Command::Serve(_) | Command::Mcp(_) | Command::Work(_)
-    ) {
+    if matches!(cli.command, Command::Serve(_) | Command::Work(_)) {
         crate::profile::Profile::from_ocg_config(&effective.data).map_err(Failure::Ocg)?;
     }
     // The orchestration escape hatch is applied to the effective config so that
@@ -692,7 +652,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
     if cli.dry_run
         && !matches!(
             cli.command,
-            Command::Reconcile(_) | Command::Serve(_) | Command::Work(_) | Command::Mcp(_)
+            Command::Reconcile(_) | Command::Serve(_) | Command::Work(_)
         )
     {
         // Runtime-facing output: a dry-run must print the same contract a real
@@ -867,37 +827,9 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
             boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
             resources_command(&effective, &project_root, &env, args, cli.pretty)
         }
-        Command::Policy(args) => {
-            boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
-            policy_command(&effective, &project_root, args, cli.pretty)
-        }
         Command::Budget(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
             budget_command(&effective, &project_root, args, cli.pretty)
-        }
-        Command::Approvals(args) => {
-            boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
-            approvals_command(&effective, &project_root, args, cli.pretty)
-        }
-        Command::Approve(args) => {
-            boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
-            resolve_approval_command(
-                &effective,
-                &project_root,
-                args,
-                crate::orchestration::policy::ApprovalStatus::Approved,
-                cli.pretty,
-            )
-        }
-        Command::Reject(args) => {
-            boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
-            resolve_approval_command(
-                &effective,
-                &project_root,
-                args,
-                crate::orchestration::policy::ApprovalStatus::Rejected,
-                cli.pretty,
-            )
         }
         Command::Serve(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
@@ -906,34 +838,6 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
         Command::Work(args) => {
             boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
             work_command(&effective, &project_root, args, cli.pretty)
-        }
-        Command::Mcp(args) => {
-            boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
-            if args.is_empty() {
-                crate::mcp::serve_stdio(&project_root).map_err(Failure::Ocg)?;
-                return Ok(0);
-            }
-            if args.first().and_then(|arg| arg.to_str()) != Some("--http") {
-                return Err(usage_failure(
-                    "ocg mcp accepts no arguments, or --http [--addr 127.0.0.1:PORT]",
-                ));
-            }
-            let mut addr = "127.0.0.1:0".to_string();
-            let mut index = 1;
-            while index < args.len() {
-                let text = args[index].to_string_lossy();
-                if text == "--addr" || text.starts_with("--addr=") {
-                    addr = option_value(args, "--addr", &mut index)?;
-                    continue;
-                }
-                return Err(usage_failure(format!("unknown mcp option: {text}")));
-            }
-            crate::mcp::serve_http(&project_root, &addr).map_err(Failure::Ocg)?;
-            Ok(0)
-        }
-        Command::Bridge(args) => {
-            boundary.require(&invocation_dir).map_err(Failure::Ocg)?;
-            bridge_command(&effective, &project_root, args, &env)
         }
         Command::Upgrade => upgrade_command(&effective, &project_root, &env, cli.disable_proxy),
     }
@@ -1209,47 +1113,6 @@ fn print_resources_text(
     }
 }
 
-/// `ocg policy [--json]`: read-only inspection of the effective admission
-/// policy and the latest durable Policy decision per Mission.
-///
-/// It never evaluates a live action, mutates a Mission or writes an approval.
-fn policy_command(
-    effective: &config::Effective,
-    project_root: &Path,
-    args: &[OsString],
-    pretty: bool,
-) -> std::result::Result<i32, Failure> {
-    let mut json = false;
-    for arg in args {
-        match arg.to_str() {
-            Some("--json") => json = true,
-            _ => {
-                return Err(usage_failure(format!(
-                    "unknown policy option: {} (only --json is supported)",
-                    arg.to_string_lossy()
-                )))
-            }
-        }
-    }
-    validate::require_valid(effective).map_err(Failure::Ocg)?;
-    let config = crate::orchestration::policy::PolicyConfig::from_config(&effective.data)
-        .map_err(Failure::Ocg)?;
-
-    let repository =
-        crate::orchestration::domain::DomainRepository::open(project_root).map_err(Failure::Ocg)?;
-    let project = repository
-        .ensure_project(project_root)
-        .map_err(Failure::Ocg)?;
-    let value = json!({"enabled":config.enabled,"require_approval_for":config.require_approval_for,
-        "fingerprint":config.fingerprint(),"project_id":project.id});
-    if json {
-        print_json(&value, pretty);
-    } else {
-        println!("{value}");
-    }
-    Ok(0)
-}
-
 /// `ocg budget [--json]` and `ocg budget set ...`.
 ///
 /// The read form is read-only: it shows the effective economic configuration
@@ -1485,126 +1348,6 @@ fn option_value(
         .ok_or_else(|| usage_failure(format!("{name} needs a value")))?;
     *index += 2;
     Ok(value.to_string_lossy().into_owned())
-}
-
-/// `ocg approvals [--json]`: read-only listing of durable approval requests.
-fn approvals_command(
-    effective: &config::Effective,
-    project_root: &Path,
-    args: &[OsString],
-    pretty: bool,
-) -> std::result::Result<i32, Failure> {
-    let mut json = false;
-    for arg in args {
-        match arg.to_str() {
-            Some("--json") => json = true,
-            _ => {
-                return Err(usage_failure(format!(
-                    "unknown approvals option: {} (only --json is supported)",
-                    arg.to_string_lossy()
-                )))
-            }
-        }
-    }
-    validate::require_valid(effective).map_err(Failure::Ocg)?;
-    let loaded = crate::orchestration::policy::list_approvals(project_root);
-    if json {
-        let value = json!({
-            "approvals": loaded.approvals,
-            "issues": loaded.issues,
-        });
-        print_json(&value, pretty);
-    } else {
-        if loaded.approvals.is_empty() {
-            println!("no approvals recorded");
-        }
-        for record in &loaded.approvals {
-            println!("{} {}", record.approval_id, record.status.as_str());
-            println!(
-                "  mission {} gen {} action {}",
-                record.mission_id, record.generation, record.action
-            );
-            if let Some(execution) = &record.current_execution_id {
-                println!("  execution {execution}");
-            }
-            println!(
-                "  requested {} resolved {}",
-                record.requested_at,
-                record
-                    .resolved_at
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "never".to_string())
-            );
-        }
-        for issue in &loaded.issues {
-            println!("warning: approval {}: {}", issue.file, issue.detail);
-        }
-    }
-    Ok(0)
-}
-
-/// `ocg approve <id>` / `ocg reject <id>`: resolve one durable approval.
-///
-/// The resolution is bound to the record's exact Mission generation and action;
-/// a later generation or a different action can never inherit it.
-fn resolve_approval_command(
-    effective: &config::Effective,
-    project_root: &Path,
-    args: &[OsString],
-    status: crate::orchestration::policy::ApprovalStatus,
-    pretty: bool,
-) -> std::result::Result<i32, Failure> {
-    let mut json = false;
-    let mut note: Option<String> = None;
-    let mut approval_id: Option<String> = None;
-    let mut index = 0;
-    while index < args.len() {
-        let text = args[index].to_string_lossy().into_owned();
-        if text == "--json" {
-            json = true;
-            index += 1;
-            continue;
-        }
-        if text == "--note" {
-            let value = args
-                .get(index + 1)
-                .ok_or_else(|| usage_failure("--note needs a value"))?;
-            note = Some(value.to_string_lossy().into_owned());
-            index += 2;
-            continue;
-        }
-        if let Some(value) = text.strip_prefix("--note=") {
-            note = Some(value.to_string());
-            index += 1;
-            continue;
-        }
-        if text.starts_with('-') {
-            return Err(usage_failure(format!("unknown option: {text}")));
-        }
-        if approval_id.is_some() {
-            return Err(usage_failure(format!("unexpected argument: {text}")));
-        }
-        approval_id = Some(text);
-        index += 1;
-    }
-    let approval_id = approval_id.ok_or_else(|| usage_failure("an approval id is required"))?;
-    validate::require_valid(effective).map_err(Failure::Ocg)?;
-    let clock = SystemClock;
-    let service = crate::orchestration::ControlService::open(project_root).map_err(Failure::Ocg)?;
-    let (record, _cursor) = service
-        .resolve_approval(&approval_id, status, note, clock.now_unix())
-        .map_err(|error| Failure::Ocg(error.into_ocg_error()))?;
-    if json {
-        let value = serde_json::to_value(&record).unwrap_or(serde_json::Value::Null);
-        print_json(&value, pretty);
-    } else {
-        println!("{} {}", record.approval_id, record.status.as_str());
-        println!(
-            "  mission {} gen {} action {}",
-            record.mission_id, record.generation, record.action
-        );
-    }
-    Ok(0)
 }
 
 fn print_json(value: &serde_json::Value, pretty: bool) {
@@ -1893,7 +1636,7 @@ fn launch(
     // Directory the child OpenCode process starts in and relative arguments
     // resolve against. This is the invocation directory, not the project root.
     invocation_dir: &Path,
-    // The resolved project boundary that owns local state and the plugin.
+    // The resolved project boundary that owns local orchestration state.
     project_root: &Path,
     level: &str,
     args: &[OsString],
@@ -1937,28 +1680,14 @@ fn launch(
 
     let mut resolved =
         build::build_opencode_config_for(effective, level, adapter).map_err(Failure::Ocg)?;
-    // `ocg models` is not a coding session: it must not require the
-    // orchestration plugin to exist or the project directory to be writable.
-    if !coding_session {
-        crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
-    }
-    // OpenCode 2 discovers a generated local plugin through
-    // OPENCODE_CONFIG_DIR/plugins, so it intentionally has no config-array
-    // entry to inspect here.
-    let plugin_active = coding_session
+    // Whether a coding session runs with the canonical orchestration surface
+    // enabled. A non-coding session (for example `ocg models`) never does.
+    let orchestration_active = coding_session
         && crate::orchestration::OrchestrationConfig::from_config(&effective.data)
             .map_err(Failure::Ocg)?
             .enabled;
-    // The catalogue probe runs before local plugin materialization. Keep every
-    // user plugin/config entry, but do not ask OpenCode to load OCG's generated
-    // file before that file exists.
     let preflight_content = if coding_session {
-        let mut probe_config = resolved.clone();
-        crate::orchestration::plugin::remove_ocg_plugin_for(
-            &mut probe_config,
-            adapter.plugin_key(),
-        );
-        Some(serde_json::to_string(&probe_config).map_err(|error| {
+        Some(serde_json::to_string(&resolved).map_err(|error| {
             Failure::Ocg(OcgError::config(format!(
                 "cannot serialize the OpenCode config for runtime model checks: {error}"
             )))
@@ -2135,8 +1864,8 @@ fn launch(
                 let contract =
                     model::lead_contract(&effective.data, level).map_err(Failure::Ocg)?;
                 let lead = LeadSelection::from_contract(&contract);
-                let mut plugin_env = if plugin_active {
-                    let mut vars = runtime_plugin_env(effective, project_root, level, adapter)
+                let mut runtime_env = if orchestration_active {
+                    let mut vars = runtime_runtime_env(effective, project_root, level)
                         .map_err(Failure::Ocg)?;
                     if let Some(gateway) = &gateway {
                         vars.push((
@@ -2156,22 +1885,22 @@ fn launch(
                 } else {
                     Vec::new()
                 };
-                if gateway.is_some() && !plugin_active {
+                if gateway.is_some() && !orchestration_active {
                     return Err(Failure::Ocg(OcgError::config(
-                        "migrated provider requires the V2 correlation plugin",
+                        "migrated provider requires the canonical V2 correlation surface",
                     )));
                 }
                 // This reference must exist in the server environment *before*
                 // spawn. The registration itself arrives only after handshake.
                 #[cfg(unix)]
-                if plugin_active {
+                if orchestration_active {
                     let channel = compat::v2_rendezvous::InvocationChannel::new(project_root)
                         .map_err(Failure::Ocg)?;
-                    plugin_env.push((
+                    runtime_env.push((
                         OsString::from(compat::v2_rendezvous::CHANNEL_ENV),
                         channel.socket().into_os_string(),
                     ));
-                    plugin_env.push((
+                    runtime_env.push((
                         OsString::from(compat::v2_rendezvous::ID_ENV),
                         OsString::from(channel.identity()),
                     ));
@@ -2180,7 +1909,7 @@ fn launch(
                 let runtime = compat::v2_server::OwnedV2Server::start(
                     &selection.path,
                     &content,
-                    &plugin_env,
+                    &runtime_env,
                     &proxy_env,
                 )
                 .map_err(Failure::Ocg)?;
@@ -2221,12 +1950,8 @@ fn launch(
         }
     }
     let runner = ProcessRunner::new(selection.path.into_os_string());
-    // Materialize the adapter *before* exec: if it cannot be written, the
-    // generated `file://` plugin would be broken, so fail clearly instead of
-    // launching an integration that cannot work. A non-coding session (for
-    // example `ocg models`) skips this entirely.
-    let mut extra_env = if plugin_active {
-        runtime_plugin_env(effective, project_root, level, adapter).map_err(Failure::Ocg)?
+    let mut extra_env = if orchestration_active {
+        runtime_runtime_env(effective, project_root, level).map_err(Failure::Ocg)?
     } else {
         Vec::new()
     };
@@ -2269,7 +1994,7 @@ fn launch(
             OsString::from(runtime.password()),
         ));
         // These values exist only in this invocation's child environment. The
-        // generated plugin passes them to the bridge for context observation;
+        // runtime passes them onward for context observation;
         // none is written to Mission, telemetry, rollover or continuation
         // artifacts. The target id also makes the launched OpenCode client
         // select the session whose Lead was verified above.
@@ -2397,41 +2122,21 @@ fn config_output_adapter(
     resolve_adapter(report.version.as_ref()).map_err(Failure::Ocg)
 }
 
-/// Materialize the generated plugin and export the exact bridge environment.
+/// The environment the launched runtime needs to resolve its Lead contract.
 ///
-/// This is the only place `launch` writes local state, and it only happens when
-/// orchestration is enabled. Disabled orchestration returns an empty vector, so
-/// no plugin, no file and no variable reaches OpenCode. A materialization
-/// failure is returned so the launch aborts rather than injecting a `file://`
-/// URL that does not resolve.
-fn runtime_plugin_env(
+/// Only the Lead contract, the project root and the context-governor switch are
+/// exported. Everything a coding session needs is derived in Rust and handed to
+/// the runtime this way; nothing is written into the user's project.
+fn runtime_runtime_env(
     effective: &config::Effective,
     cwd: &Path,
     level: &str,
-    adapter: &dyn RuntimeAdapter,
 ) -> crate::error::Result<Vec<(OsString, OsString)>> {
-    let path = match adapter.major() {
-        compat::Major::V1 => {
-            crate::orchestration::plugin::materialize_with(cwd, adapter.plugin_source())?
-        }
-        compat::Major::V2 => {
-            crate::orchestration::plugin::materialize_v2_with(cwd, adapter.plugin_source())?
-        }
-    };
     let mut env = Vec::new();
-    let exe = std::env::current_exe().map_err(|error| {
-        OcgError::io(
-            "cannot determine the orchestration bridge executable",
-            error,
-        )
-    })?;
-    env.push((OsString::from("OCG_BRIDGE"), exe.into_os_string()));
     env.push((
         OsString::from("OCG_PROJECT"),
         cwd.as_os_str().to_os_string(),
     ));
-    // The plugin starts a fresh `ocg __bridge` process. Preserve the exact
-    // resolved global profile path inside that process too.
     env.push((
         OsString::from("OCG_USER_CONFIG"),
         effective.user_path.as_os_str().to_os_string(),
@@ -2446,12 +2151,6 @@ fn runtime_plugin_env(
         OsString::from("OCG_CONTEXT_GOVERNOR_ENABLED"),
         OsString::from(if governor.enabled { "1" } else { "0" }),
     ));
-    if adapter.major() == compat::Major::V2 {
-        env.push((
-            OsString::from("OPENCODE_CONFIG_DIR"),
-            crate::orchestration::plugin::v2_config_dir(cwd).into_os_string(),
-        ));
-    }
     let contract = model::lead_contract(&effective.data, level)?;
     let contract = serde_json::to_string(&contract).map_err(|error| {
         OcgError::config(format!(
@@ -2462,8 +2161,6 @@ fn runtime_plugin_env(
         OsString::from("OCG_LEAD_CONTRACT"),
         OsString::from(contract),
     ));
-    // Defense in depth: the exported path is the one just materialized.
-    debug_assert!(path.is_file());
     Ok(env)
 }
 
@@ -3167,9 +2864,8 @@ fn doctor_command(
             "skipped because static config/routing validation failed",
         );
     } else if let (Some(program), Some(adapter)) = (report.path.as_deref(), adapter) {
-        let mut resolved =
+        let resolved =
             build::build_opencode_config_for(effective, level, adapter).map_err(Failure::Ocg)?;
-        crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
         let content = serde_json::to_string(&resolved).map_err(|error| {
             Failure::Ocg(OcgError::config(format!(
                 "cannot serialize the OpenCode config for runtime model checks: {error}"
@@ -3624,31 +3320,11 @@ fn doctor_command(
                 ),
             );
             if config.enabled {
-                let (plugin, mechanism) = match adapter {
-                    Some(a) if a.major() == compat::Major::V2 => {
-                        let path = crate::orchestration::plugin::v2_plugin_path(project_root);
-                        let mech = "local-discovery JS adapter at OPENCODE_CONFIG_DIR/plugins; hooks: prompt, context, execute.before/after";
-                        (path, mech)
-                    }
-                    _ => {
-                        let path = crate::orchestration::plugin::plugin_path(project_root);
-                        let mech = "file:// JS adapter injected via config.plugin; hooks: chat.message, tool.execute.before/after";
-                        (path, mech)
-                    }
-                };
-                if plugin.is_file() {
-                    doctor.line(
-                        "ok",
-                        "orchestration plugin",
-                        &format!("{} (mechanism: {mechanism})", plugin.display()),
-                    );
-                } else {
-                    doctor.line(
-                        "info",
-                        "orchestration plugin",
-                        "not materialized yet (written at the next `ocg` launch)",
-                    );
-                }
+                doctor.line(
+                    "ok",
+                    "orchestration state",
+                    "canonical Job/Attempt control surface; no generated plugin",
+                );
                 let loaded = crate::orchestration::state::load(project_root);
                 if !loaded.exists {
                     doctor.line(
@@ -4549,238 +4225,6 @@ fn save_checkpoint(
     Ok(0)
 }
 
-/// `ocg __bridge <event>`: the hidden JSON bridge the generated plugin calls.
-///
-/// It never fails the process: a bad payload, a disabled policy or a controller
-/// error all become `{"ok":false,...}` on stdout, so the adapter can fail soft.
-fn bridge_command(
-    effective: &config::Effective,
-    project_root: &Path,
-    args: &[OsString],
-    env: &Env,
-) -> std::result::Result<i32, Failure> {
-    let event = args
-        .first()
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let value = bridge_payload(effective, project_root, &event, env);
-    println!(
-        "{}",
-        serde_json::to_string(&value).unwrap_or_else(|_| "{\"ok\":false}".to_string())
-    );
-    Ok(0)
-}
-
-/// Build the bridge reply. Fail-soft by construction.
-fn bridge_payload(
-    effective: &config::Effective,
-    project_root: &Path,
-    event: &str,
-    env: &Env,
-) -> Value {
-    // Always consume stdin first, even on the disabled/early-return paths, so
-    // the generated adapter's writer never sees a BrokenPipe. The read is
-    // capped and overflow is rejected fail-soft.
-    let (payload, oversized) = read_stdin_json(BRIDGE_MAX_STDIN_BYTES);
-    if oversized {
-        return json!({
-            "ok": false,
-            "error": format!("bridge payload exceeds the {BRIDGE_MAX_STDIN_BYTES} byte cap"),
-        });
-    }
-    if event.is_empty() {
-        return json!({"ok": false, "error": "missing bridge event"});
-    }
-    if matches!(
-        event,
-        "session.prompt"
-            | "work.dispatch"
-            | "work.replace"
-            | "context.observe"
-            | "session.context.observe"
-            | "context-observation"
-    ) {
-        let readiness =
-            crate::profile::Profile::from_ocg_config(&effective.data).and_then(|profile| {
-                let key = env.v2_lead.as_ref().map(|lead| lead.level.as_str());
-                let (key, _) = profile.select(key)?;
-                if let Some(lead) = env.v2_lead.as_ref() {
-                    let expected = model::lead_contract(&effective.data, key)?;
-                    if lead.agent != expected.agent
-                        || lead.provider_id != expected.provider_id
-                        || lead.model_id != expected.model_id
-                        || lead.variant != expected.variant
-                    {
-                        return Err(OcgError::config(
-                            "invocation Lead does not match the current OCG Profile selection",
-                        ));
-                    }
-                }
-                Ok(())
-            });
-        if let Err(error) = readiness {
-            return json!({"ok": false, "error": error.to_string()});
-        }
-    }
-    let orchestration =
-        match crate::orchestration::OrchestrationConfig::from_config(&effective.data) {
-            Ok(config) => config,
-            Err(error) => return json!({"ok": false, "error": error.to_string()}),
-        };
-    if !orchestration.enabled {
-        return json!({"ok": false, "disabled": true, "context": ""});
-    }
-    let context = match ContextConfig::from_config(&effective.data) {
-        Ok(config) => config,
-        Err(error) => return json!({"ok": false, "error": error.to_string()}),
-    };
-    let capabilities = match CapabilityConfig::from_config(&effective.data) {
-        Ok(config) => config,
-        Err(error) => return json!({"ok": false, "error": error.to_string()}),
-    };
-    let verification = match VerificationConfig::from_config(&effective.data) {
-        Ok(config) => config,
-        Err(error) => return json!({"ok": false, "error": error.to_string()}),
-    };
-    // The bridge is a real execution path: `context.observe` can drive a
-    // rollover continuation resume, which is provider-costly. It must carry the
-    // same optional Policy and mandatory economic configuration as every other
-    // path, so a configured hard Mission budget is enforced here too (and is not
-    // silently replaced by the permissive constructor defaults).
-    let policy = match crate::orchestration::policy::PolicyConfig::from_config(&effective.data) {
-        Ok(config) => config,
-        Err(error) => return json!({"ok": false, "error": error.to_string()}),
-    };
-    let budget = match crate::orchestration::budget::BudgetConfig::from_config(&effective.data) {
-        Ok(config) => config,
-        Err(error) => return json!({"ok": false, "error": error.to_string()}),
-    };
-    let git = SystemGitHost;
-    let clock = SystemClock;
-    let controller = crate::orchestration::controller::Controller::new(
-        project_root,
-        orchestration,
-        context,
-        capabilities,
-        verification,
-        &git,
-        &clock,
-    )
-    .with_policy(policy)
-    .with_budget(budget);
-    let runner = SystemCaptureRunner;
-    let (telemetry_config, warnings) = telemetry_for(effective, env);
-    print_telemetry_warnings(&warnings);
-    let mut bridge =
-        crate::orchestration::bridge::BridgeContext::new(&controller, &runner, telemetry_config)
-            // The worker routing table OCG writes into the generated agent
-            // config. A canonical child Attempt freezes the model its agent will
-            // actually use, so the recorded contract is not an approximation.
-            .with_routing(crate::orchestration::bridge::WorkerRouting::from_config(
-                &effective.data,
-            ));
-    // The session.prompt authority gate and context.observe require a live V2 client.
-    // Ordinary bridge events remain entirely local.
-    if matches!(
-        event,
-        "context.observe"
-            | "session.context.observe"
-            | "context-observation"
-            | "session.prompt"
-            | "work.mission.create"
-    ) {
-        #[cfg(unix)]
-        let channel = std::env::var_os(compat::v2_rendezvous::CHANNEL_ENV);
-        #[cfg(unix)]
-        let registration = if let Some(path) = channel {
-            let identity = std::env::var(compat::v2_rendezvous::ID_ENV).unwrap_or_default();
-            match compat::v2_rendezvous::resolve(Path::new(&path), &identity) {
-                Ok(registration) => Some(registration),
-                Err(error) => return json!({"ok":false,"error":error.to_string()}),
-            }
-        } else if event == "session.prompt" {
-            // Direct endpoint env (or ambient discovery) cannot establish
-            // invocation-owned prompt authority.
-            return json!({"ok":false,"error":"invocation channel unavailable"});
-        } else {
-            env.v2_server_url
-                .as_deref()
-                .zip(env.v2_server_password.as_ref())
-                .map(|(url, password)| {
-                    compat::v2_client::ServiceRegistration::new(url, password.expose())
-                })
-        };
-        #[cfg(not(unix))]
-        let registration = env
-            .v2_server_url
-            .as_deref()
-            .zip(env.v2_server_password.as_ref())
-            .map(|(url, password)| {
-                compat::v2_client::ServiceRegistration::new(url, password.expose())
-            });
-        if let (Some(registration), Some(lead)) = (registration, env.v2_lead.clone()) {
-            let directory = env
-                .v2_directory
-                .clone()
-                .unwrap_or_else(|| project_root.to_string_lossy().into_owned());
-            match compat::v2_client::V2SessionClient::connect(&registration, directory) {
-                Ok(client) => {
-                    let runtime: std::rc::Rc<std::cell::RefCell<Box<dyn BridgeRuntimeClient>>> =
-                        std::rc::Rc::new(std::cell::RefCell::new(Box::new(client)));
-                    bridge = bridge
-                        .with_bridge_runtime(runtime, lead.runtime_profile())
-                        .with_lead_contract(lead);
-                }
-                Err(_) => {
-                    // The bridge will record an explicit unknown observation;
-                    // do not turn a client startup failure into Mission
-                    // failure or expose the credential in the reply.
-                    if event == "session.prompt" {
-                        return json!({"ok":false,"error":"owned runtime connection unavailable"});
-                    }
-                }
-            }
-        } else if event == "session.prompt" {
-            return json!({"ok":false,"error":"invocation runtime or Lead contract unavailable"});
-        }
-    }
-    bridge.dispatch(event, &payload)
-}
-
-/// The hard cap on a bridge payload. The generated adapter never sends anything
-/// close to this; the cap protects against a hostile or broken caller and keeps
-/// memory bounded.
-pub const BRIDGE_MAX_STDIN_BYTES: usize = 4 * 1024 * 1024;
-
-/// Read the bridge payload from stdin with a hard cap. Returns `(value,
-/// oversized)`. Empty or invalid input is `null`, never an error. When the
-/// input exceeds the cap it is drained (so the writer does not get a
-/// BrokenPipe) but not retained, and `oversized` is true.
-fn read_stdin_json(max_bytes: usize) -> (Value, bool) {
-    use std::io::Read;
-    let mut buffer = Vec::new();
-    {
-        let mut limited = std::io::stdin().lock().take(max_bytes as u64 + 1);
-        if limited.read_to_end(&mut buffer).is_err() {
-            return (Value::Null, false);
-        }
-    }
-    // Drain the rest without retaining it, so a larger writer can complete.
-    let mut sink = std::io::sink();
-    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut sink);
-    if buffer.len() > max_bytes {
-        return (Value::Null, true);
-    }
-    let text = String::from_utf8_lossy(&buffer);
-    if text.trim().is_empty() {
-        return (Value::Null, false);
-    }
-    match serde_json::from_str::<Value>(&text) {
-        Ok(value) => (value, false),
-        Err(_) => (Value::Null, false),
-    }
-}
-
 /// `ocg config`: guided, safe Lead/provider configuration.
 ///
 /// The command owns the interactive surface and the runtime probe; everything
@@ -4879,10 +4323,7 @@ fn probe_candidate_config(
     let report = manager.resolve_for_report();
     let program = report.path.clone()?;
     let adapter = resolve_adapter(report.version.as_ref()).ok()?;
-    let mut resolved = build::build_opencode_config_for(effective, level, adapter).ok()?;
-    // The generated plugin is not materialized for a configuration check, so
-    // probe with the exact config minus OCG's not-yet-existing plugin file.
-    crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
+    let resolved = build::build_opencode_config_for(effective, level, adapter).ok()?;
     let content = serde_json::to_string(&resolved).ok()?;
     let proxy = resolve_proxy(disable_proxy);
     let proxy_env = proxy.child_env();
@@ -5005,13 +4446,10 @@ fn activate_candidate_config(
         Err(error) => return Activation::Failed(error.to_string()),
     };
     let lead = LeadSelection::from_contract(&contract);
-    let mut resolved = match build::build_opencode_config_for(effective, level, adapter) {
+    let resolved = match build::build_opencode_config_for(effective, level, adapter) {
         Ok(config) => config,
         Err(error) => return Activation::Failed(error.to_string()),
     };
-    // The generated plugin is not materialized for a check; removing it keeps
-    // the probe honest and leaves no local state behind.
-    crate::orchestration::plugin::remove_ocg_plugin_for(&mut resolved, adapter.plugin_key());
     let content = match serde_json::to_string(&resolved) {
         Ok(content) => content,
         Err(error) => {
@@ -5041,9 +4479,9 @@ fn activate_candidate_config(
 
 /// Resolve the Configured / Resolved / Effective state for one selected model.
 ///
-/// `content` is the serialized OpenCode config with OCG's generated plugin
+/// `content` is the serialized OpenCode config with OCG's resolved routing
 /// removed: diagnostics must not materialize local state, and the removed
-/// plugin never affects which Lead model the runtime selects. `preflight` is
+/// never affects which Lead model the runtime selects. `preflight` is
 /// the already-computed catalogue evidence when the caller has it. Either may
 /// be absent; the state is then reported as unverified/not observed rather than
 /// fabricated.
@@ -5224,12 +4662,8 @@ fn print_runtime_state(
     let program = report.path.clone();
     let content = match (program.as_deref(), adapter) {
         (Some(_), Some(adapter)) => {
-            let mut resolved = build::build_opencode_config_for(effective, level, adapter)
+            let resolved = build::build_opencode_config_for(effective, level, adapter)
                 .map_err(Failure::Ocg)?;
-            crate::orchestration::plugin::remove_ocg_plugin_for(
-                &mut resolved,
-                adapter.plugin_key(),
-            );
             Some(serde_json::to_string(&resolved).map_err(|error| {
                 Failure::Ocg(OcgError::config(format!(
                     "cannot serialize the OpenCode config for the runtime state report: {error}"

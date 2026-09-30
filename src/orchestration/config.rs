@@ -7,9 +7,8 @@
 //!
 //! The policy is deliberately conservative:
 //!
-//! - it is enabled by default and activates at launch by materializing the
-//!   generated plugin; context preparation is what remains explicit (a launch
-//!   never builds the context index);
+//! - it is enabled by default and activates at launch; context preparation is
+//!   what remains explicit (a launch never builds the context index);
 //! - retry budgets start at [[2]] build / [[1]] debug attempts;
 //! - every hand-off capsule is bounded by a configurable runtime optimization
 //!   envelope: an absolute byte cap and a fraction of the rich source context.
@@ -21,8 +20,8 @@
 //!   `4096` / `40%` gate to catch projection regressions.
 //!
 //! `OCG_ORCHESTRATION=0` is an explicit escape hatch that disables the
-//! whole layer for one process. A disabled layer emits no plugin, writes no
-//! state and makes no context decision.
+//! whole layer for one process. A disabled layer writes no state and makes no
+//! context decision.
 
 use crate::error::{OcgError, Result};
 use crate::orchestration::context_governor::ContextGovernorConfig;
@@ -55,7 +54,7 @@ pub const ENV_ENABLED: &str = "OCG_ORCHESTRATION";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OrchestrationConfig {
-    /// Allow orchestration. When false no plugin is emitted and no state is kept.
+    /// Allow orchestration. When false no state is kept and no context is prepared.
     pub enabled: bool,
     /// Build retries after a failed verification, before Debug is recommended.
     pub max_build_retries: usize,

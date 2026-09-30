@@ -26,11 +26,12 @@ import type {
 import { PROJECTS, isProjectId, type ProjectId } from "../project/domain";
 import { projectSessionIds } from "../project/fixtures";
 import {
-  createLaunchedExecution,
   createLaunchedMission,
   createLaunchedObservability,
   missionIdForLaunch,
 } from "../mission/launch-fixtures";
+import { assembleJobExecution } from "../execution/domain";
+import { CANONICAL_API_VERSION } from "../contracts";
 import { RuntimeEnvelopeFactory, eventSessionId, type AnyRuntimeEnvelope } from "./runtime-envelope";
 import { createSnapshotEnvelopeFromFixture } from "./runtime-snapshot";
 import { RuntimeStore } from "./runtime-store";
@@ -292,6 +293,10 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
    *   canonical reconciler, never through a parallel UI mutation.
    */
   async launchMission(command: MissionLaunchCommand): Promise<MissionLaunchResult> {
+    return this.launchJob(command);
+  }
+
+  async launchJob(command: MissionLaunchCommand): Promise<MissionLaunchResult> {
     const prior = this.launchResults.get(command.commandId);
     if (prior) {
       return { ...clone(prior), duplicate: true };
@@ -349,16 +354,27 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       return { ...base, outcome: "rejected", message: "The hard budget must be a positive whole number of micros; launch rejected." };
     }
 
-    const missionId = missionIdForLaunch(command);
-    const mission = createLaunchedMission(command, missionId);
-    const execution = createLaunchedExecution(command, missionId);
-    const observability = createLaunchedObservability(command, missionId);
+    const legacyCommand = { ...command, successCriteria: command.successCriteria ?? "", constraints: command.constraints ?? "", resourceCommitment: command.resourceCommitment ?? 1 };
+    const missionId = missionIdForLaunch(legacyCommand);
+    const mission = createLaunchedMission(legacyCommand, missionId);
+    const jobId = `job-${command.draftId}`;
+    const execution = assembleJobExecution({
+      apiVersion: CANONICAL_API_VERSION,
+      projectId: command.projectId,
+      cursor: 0,
+      job: { id: jobId, state: "pending", generation: 0, authoritative_attempt_id: null, created_at: 1_750_000_000, updated_at: 1_750_000_000 },
+      attempts: [],
+      calls: [],
+    });
+    const accounting = { ceiling: { amount: command.hardBudgetMicros / 1_000_000, unit: "USD", source: "job-configuration" as const }, consumption: null };
+    const observability = createLaunchedObservability(legacyCommand, missionId);
     const projectId = command.projectId ?? null;
     const result: MissionLaunchResult = {
       ...base,
       outcome: "accepted",
       missionId,
-      message: `Mission "${mission.title}" accepted for execution.`,
+      jobId,
+      message: `Job "${jobId}" accepted for execution.`,
     };
 
     // Acknowledgement and entity projections share the same canonical path.
@@ -370,7 +386,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     );
     const correlation = { projectId, commandId: command.commandId, missionId };
     this.emit({ type: "mission.updated", sessionId: command.sessionId, mission: clone(mission) }, correlation);
-    this.emit({ type: "execution.updated", sessionId: command.sessionId, execution: clone(execution) }, correlation);
+    this.emit({ type: "job.execution-updated", sessionId: command.sessionId, execution: clone(execution), accounting }, correlation);
     this.emit({ type: "observability.updated", sessionId: command.sessionId, observability: clone(observability) }, correlation);
 
     return result;
@@ -438,4 +454,3 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     });
   }
 }
-

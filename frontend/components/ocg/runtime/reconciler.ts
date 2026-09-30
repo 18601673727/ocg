@@ -508,7 +508,8 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
           messagesBySession: { ...snapshot.messagesBySession, [session.id]: snapshot.messagesBySession[session.id] ?? [] },
           missionsBySession: { ...snapshot.missionsBySession, [session.id]: snapshot.missionsBySession[session.id] ?? null },
           observabilityBySession: { ...snapshot.observabilityBySession, [session.id]: snapshot.observabilityBySession[session.id] ?? null },
-          executionBySession: { ...snapshot.executionBySession, [session.id]: snapshot.executionBySession[session.id] ?? null },
+           executionBySession: { ...snapshot.executionBySession, [session.id]: snapshot.executionBySession[session.id] ?? null },
+           accountingBySession: { ...snapshot.accountingBySession, [session.id]: snapshot.accountingBySession[session.id] ?? null },
         },
         diagnostics: [],
       };
@@ -642,15 +643,22 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
       };
     }
 
-    case "execution.updated": {
+    case "job.execution-updated": {
       if (!sessionExists(snapshot, sessionId)) {
         return { snapshot, diagnostics: [diag("unknown-session", `Execution update for unknown session "${sessionId ?? ""}".`, { sessionId })] };
       }
       return {
-        snapshot: { ...snapshot, executionBySession: { ...snapshot.executionBySession, [sessionId]: envelope.payload.execution } },
+        snapshot: {
+          ...snapshot,
+          executionBySession: { ...snapshot.executionBySession, [sessionId]: envelope.payload.execution },
+          accountingBySession: { ...snapshot.accountingBySession, [sessionId]: envelope.payload.accounting },
+        },
         diagnostics: [],
       };
     }
+
+    case "execution.updated":
+      return { snapshot, diagnostics: [diag("schema-invalid", "Legacy Mission execution requires a canonical Job snapshot.", { sessionId })] };
 
     case "worker.updated": {
       if (!sessionExists(snapshot, sessionId)) {
@@ -673,6 +681,7 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
     case "bootstrap.updated":
       return { snapshot: { ...snapshot, bootstrap: envelope.payload.bootstrap }, diagnostics: [] };
 
+    case "job.launch-updated":
     case "mission.launch-updated": {
       const result = envelope.payload.result;
       if (result.outcome === "accepted") return { snapshot, diagnostics: [] };

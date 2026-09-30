@@ -24,27 +24,18 @@ import {
 import type { RuntimeSnapshot, ScenarioId } from "./runtime-types";
 import type { ProjectId } from "../project/domain";
 import {
-  applyCanonicalCommandAck,
-  applyCanonicalEvents,
   applyCanonicalSnapshot,
+  applyCanonicalEvents,
+  applyCanonicalCommandAck,
   createCanonicalState,
-  type CanonicalBackendEvent,
-  type CanonicalCommandAck,
-  type CanonicalSelectors,
-  type CanonicalState,
+  selectCanonical,
 } from "./canonical-store";
-import { selectCanonical } from "./canonical-store";
+import type { CanonicalBackendEvent, CanonicalCommandAck, CanonicalSelectors, CanonicalState } from "./canonical-store";
 
 export type RuntimeStoreListener = () => void;
 
 export class RuntimeStore {
   private state: RuntimeState;
-  /**
-   * The backend-backed canonical WorkNode/Run projection, held by the same
-   * store so a canonical snapshot, canonical event and runtime envelope all
-   * commit together and notify listeners once. It is a read model of durable
-   * backend state, never execution authority.
-   */
   private canonical: CanonicalState = createCanonicalState();
   private readonly listeners = new Set<RuntimeStoreListener>();
 
@@ -52,7 +43,6 @@ export class RuntimeStore {
     this.state = initialState;
   }
 
-  /** Stable identity between commits. */
   getState(): RuntimeState {
     return this.state;
   }
@@ -76,19 +66,16 @@ export class RuntimeStore {
     };
   }
 
-  /** Install an authoritative baseline snapshot envelope. */
   installSnapshot(envelope: RuntimeSnapshotEnvelope): RuntimeState {
     this.commit(reconcileSnapshot(this.state, envelope));
     return this.state;
   }
 
-  /** Apply one validated event envelope. */
   applyEnvelope(envelope: AnyRuntimeEnvelope): RuntimeState {
     this.commit(reconcileEvent(this.state, envelope));
     return this.state;
   }
 
-  /** Normalize an untrusted transport value before it reaches reconciliation. */
   applyUnknown(input: unknown): RuntimeState {
     const validation = validateRuntimeEnvelope(input);
     if (!validation.ok) {
@@ -99,7 +86,6 @@ export class RuntimeStore {
     return this.applyEnvelope(validation.envelope);
   }
 
-  /** Normalize an untrusted snapshot value before installing a baseline. */
   installUnknownSnapshot(input: unknown): RuntimeState {
     const validation = validateRuntimeSnapshotEnvelope(input);
     if (!validation.ok) {
@@ -109,7 +95,6 @@ export class RuntimeStore {
     return this.installSnapshot(validation.envelope);
   }
 
-  /** Apply a batch atomically and notify once. */
   applyMany(envelopes: readonly AnyRuntimeEnvelope[]): RuntimeState {
     let next = this.state;
     for (const envelope of envelopes) next = reconcileEvent(next, envelope);
@@ -117,7 +102,6 @@ export class RuntimeStore {
     return this.state;
   }
 
-  /** Reset to a fresh baseline, discarding prior diagnostics and seen sets. */
   resetSnapshot(envelope: RuntimeSnapshotEnvelope): RuntimeState {
     const scenario: ScenarioId = envelope.snapshot.scenario;
     const next = reconcileSnapshot(createUninitializedRuntimeState(scenario), envelope);
@@ -135,20 +119,10 @@ export class RuntimeStore {
     return this.state;
   }
 
-  /* ---------------------------------------------------------------------- */
-  /* Canonical WorkNode/Run projection                                       */
-  /* ---------------------------------------------------------------------- */
-
-  /** The current canonical projection state. */
   getCanonical(): CanonicalState {
     return this.canonical;
   }
 
-  /**
-   * Install a versioned, project-scoped canonical snapshot. A stale generation,
-   * an older cursor, a wrong Project or a malformed entity is refused and
-   * recorded as a canonical diagnostic instead of being rendered.
-   */
   applyCanonicalSnapshot(input: { payload: unknown; projectId: ProjectId; generation?: number }): CanonicalState {
     this.canonical = applyCanonicalSnapshot(this.canonical, {
       payload: input.payload,
@@ -159,37 +133,29 @@ export class RuntimeStore {
     return this.canonical;
   }
 
-  /** Apply a canonical event tail strictly after the installed baseline. */
   applyCanonicalEvents(
     events: readonly CanonicalBackendEvent[],
     options: { projectId: ProjectId; generation?: number },
   ): CanonicalState {
-    this.canonical = applyCanonicalEvents(this.canonical, events, {
-      projectId: options.projectId,
-      generation: options.generation ?? this.canonical.generation,
-    });
+    this.canonical = applyCanonicalEvents(this.canonical, events, options);
     this.notify();
     return this.canonical;
   }
 
-  /** Correlate one control-command acknowledgement by stable command identity. */
   applyCanonicalCommandAck(ack: CanonicalCommandAck): CanonicalState {
     this.canonical = applyCanonicalCommandAck(this.canonical, ack);
     this.notify();
     return this.canonical;
   }
 
-  /** Read-only selectors over the canonical projection. */
-  selectCanonical(title: string): CanonicalSelectors {
-    return selectCanonical(this.canonical, title);
+  selectCanonical(): CanonicalSelectors {
+    return selectCanonical(this.canonical);
   }
 
-  /** Notify listeners after a canonical-only commit. */
   private notify(): void {
     for (const listener of [...this.listeners]) listener();
   }
 
-  /** Returns true when the commit changed state and listeners were notified. */
   private commit(next: RuntimeState): boolean {
     if (next === this.state) return false;
     this.state = next;
@@ -197,5 +163,3 @@ export class RuntimeStore {
     return true;
   }
 }
-
-

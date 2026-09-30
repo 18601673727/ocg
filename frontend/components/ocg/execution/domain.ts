@@ -1,151 +1,45 @@
+/**
+ * The canonical execution read model.
+ *
+ * The SQLite substrate is the execution authority: a Project owns Jobs, a Job
+ * owns Attempts, an Attempt owns Executors and Calls, and exactly one Attempt
+ * of a Job is authoritative at a time. This module is the *shape* the PWA
+ * renders that authority through — nothing more.
+ *
+ * Two rules hold throughout:
+ * - every field is either a canonical value the backend sent or a pure
+ *   derivation from canonical values. A value the projection does not carry is
+ *   absent, never invented;
+ * - the PWA owns no execution authority. It cannot create a Job, promote an
+ *   Attempt, admit a Call, or settle an effect.
+ *
+ * The one constructor of this shape lives in `runtime/canonical-envelope`, so
+ * there is exactly one path from durable canonical state to the execution UI.
+ */
+
+import type {
+  CanonicalAttempt,
+  CanonicalCall,
+  CanonicalEffectKind,
+  CanonicalJobState,
+} from "../contracts";
+import type { ProjectId } from "../project/domain";
+import { formatTimestamp } from "@/lib/format";
 import type { MissionStatus } from "../types";
 
-export type ExecutionStatus =
-  | "planned"
-  | "queued"
-  | "waiting"
-  | "ready"
-  | "starting"
-  | "running"
-  | "blocked"
-  | "verifying"
-  | "retrying"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "skipped";
-
+/** Compatibility read shapes for the legacy mission-control surface. */
+export type ExecutionStatus = "planned" | "queued" | "waiting" | "ready" | "starting" | "running" | "blocked" | "verifying" | "retrying" | "completed" | "failed" | "cancelled" | "skipped";
 export type ExecutionTaskKind = "task" | "gate";
 export type ExecutionEdgeKind = "dependency" | "gate" | "conflict";
-export type ExecutionGateType = "verification" | "review" | "approval" | "integration";
-export type ExecutionGateStatus = "pending" | "running" | "passed" | "failed" | "blocked";
-
-export type ExecutionUsageSummary = {
-  tokens?: number;
-  cost?: number;
-};
-
-export type ExecutionAttempt = {
-  number: number;
-  status: "failed" | "running" | "completed";
-  model?: string;
-  provider?: string;
-  elapsedMs?: number;
-  reason?: string;
-};
-
-export type ExecutionTask = {
-  id: string;
-  missionId: string;
-  title: string;
-  description?: string;
-  kind?: ExecutionTaskKind;
-  category?: string;
-  status: ExecutionStatus;
-  wave?: number;
-  dependencies: string[];
-  dependents: string[];
-  workerId?: string;
-  workerRole?: string;
-  provider?: string;
-  model?: string;
-  variant?: string;
-  startedAt?: string;
-  finishedAt?: string;
-  elapsedMs?: number;
-  attempt?: number;
-  maxAttempts?: number;
-  retryCount?: number;
-  progress?: number;
-  blockedReason?: string;
-  waitingReason?: string;
-  outputSummary?: string;
-  verificationSummary?: string;
-  usageSummary?: ExecutionUsageSummary;
-  attemptHistory?: ExecutionAttempt[];
-  escalationHistory?: { provider: string; model: string; reason: string }[];
-  schedulingReason?: string;
-  capabilityRequirement?: string;
-  priority?: "low" | "normal" | "high";
-};
-
-export type ExecutionEdge = {
-  id: string;
-  fromTaskId: string;
-  toTaskId: string;
-  kind: ExecutionEdgeKind;
-  status?: "pending" | "active" | "completed" | "blocked";
-};
-
-/** How the execution read model describes a Worker. It is not the runtime's
- * `WorkerStatus`: this one is per-Mission and can be `blocked`. */
+export type ExecutionTask = { id: string; missionId: string; title: string; status: ExecutionStatus; dependencies: string[]; dependents: string[]; kind?: ExecutionTaskKind; description?: string; capabilityRequirement?: string; usageSummary?: ExecutionUsageSummary; attemptHistory?: ExecutionAttempt[]; escalationHistory?: { provider: string; model: string; reason: string }[]; schedulingReason?: string; wave?: number; workerId?: string; workerRole?: string; provider?: string; model?: string; variant?: string; startedAt?: string; finishedAt?: string; elapsedMs?: number; attempt?: number; maxAttempts?: number; retryCount?: number; progress?: number; blockedReason?: string; waitingReason?: string; outputSummary?: string; verificationSummary?: string; priority?: "low" | "normal" | "high" };
+export type ExecutionUsageSummary = { tokens?: number; cost?: number };
+export type ExecutionActivityItem = { id: string; elapsedMs: number; timestamp: string; missionId: string; taskId?: string; workerId?: string; kind: string; message: string; status?: ExecutionStatus };
 export type WorkerExecutionStatus = "queued" | "active" | "waiting" | "idle" | "completed" | "blocked";
-
-export type WorkerExecution = {
-  id: string;
-  role: "lead" | "worker";
-  label: string;
-  status: WorkerExecutionStatus;
-  provider?: string;
-  model?: string;
-  variant?: string;
-  currentTaskId?: string;
-  completedTaskIds: string[];
-  invocationCount?: number;
-  retryCount?: number;
-  elapsedMs?: number;
-  usageSummary?: ExecutionUsageSummary;
-};
-
-export type ExecutionWave = {
-  index: number;
-  taskIds: string[];
-  status: "planned" | "active" | "completed";
-};
-
-export type ExecutionGate = {
-  id: string;
-  taskId?: string;
-  type: ExecutionGateType;
-  status: ExecutionGateStatus;
-  reason?: string;
-};
-
-export type ExecutionActivityKind =
-  | "mission-started"
-  | "planner"
-  | "wave-started"
-  | "task-started"
-  | "task-completed"
-  | "task-blocked"
-  | "task-waiting"
-  | "retry-scheduled"
-  | "gate"
-  | "worker-assigned"
-  | "mission-transition";
-
-export type ExecutionActivityItem = {
-  id: string;
-  elapsedMs: number;
-  timestamp: string;
-  missionId: string;
-  taskId?: string;
-  workerId?: string;
-  kind: ExecutionActivityKind;
-  message: string;
-  status?: ExecutionStatus;
-};
-
-export type ExecutionSummary = {
-  completed: number;
-  total: number;
-  running: number;
-  waiting: number;
-  blocked: number;
-  failed: number;
-  retrying: number;
-};
-
+export type WorkerExecution = { id: string; role: "lead" | "worker"; label: string; status: WorkerExecutionStatus; provider?: string; model?: string; variant?: string; currentTaskId?: string; completedTaskIds: string[]; invocationCount?: number; retryCount?: number; elapsedMs?: number; usageSummary?: ExecutionUsageSummary };
+export type ExecutionWave = { index: number; taskIds: string[]; status: "planned" | "active" | "completed" };
+export type ExecutionEdge = { id: string; fromTaskId: string; toTaskId: string; kind: ExecutionEdgeKind; status?: "pending" | "active" | "completed" | "blocked" };
+export type ExecutionGate = { id: string; taskId?: string; type: "verification" | "review" | "approval" | "integration"; status: "pending" | "running" | "passed" | "failed" | "blocked"; reason?: string };
+export type ExecutionSummary = { completed: number; total: number; running: number; waiting: number; blocked: number; failed: number; retrying: number };
 export type MissionExecution = {
   missionId: string;
   title: string;
@@ -168,138 +62,487 @@ export type MissionExecution = {
   nextTaskIds?: string[];
   criticalPathTaskIds?: string[];
 };
+export type ExecutionTaskFilters = { query?: string; status?: ExecutionStatus; wave?: number; workerRole?: string; provider?: string; model?: string };
+export type GraphNode = { id: string; task: ExecutionTask; x: number; y: number; width: number; height: number };
+export type GraphEdge = ExecutionEdge & { source: GraphNode; target: GraphNode };
+export type ExecutionGraph = { nodes: GraphNode[]; edges: GraphEdge[]; width: number; height: number };
+export function formatExecutionStatus(status: ExecutionStatus | MissionExecution["status"]): string { return status.replaceAll("-", " "); }
+export function taskStatusCounts(tasks: ExecutionTask[]): ExecutionSummary { return { completed: tasks.filter((task) => task.status === "completed").length, total: tasks.length, running: tasks.filter((task) => ["starting", "running", "verifying"].includes(task.status)).length, waiting: tasks.filter((task) => ["waiting", "queued", "planned", "ready"].includes(task.status)).length, blocked: tasks.filter((task) => task.status === "blocked").length, failed: tasks.filter((task) => ["failed", "cancelled", "skipped"].includes(task.status)).length, retrying: tasks.filter((task) => task.status === "retrying").length }; }
+export function filterExecutionTasks(tasks: ExecutionTask[], filters: ExecutionTaskFilters = {}): ExecutionTask[] { const query = filters.query?.trim().toLowerCase(); return tasks.filter((task) => (!query || task.title.toLowerCase().includes(query)) && (filters.status === undefined || task.status === filters.status) && (filters.wave === undefined || task.wave === filters.wave) && (filters.workerRole === undefined || task.workerRole === filters.workerRole) && (filters.provider === undefined || task.provider === filters.provider) && (filters.model === undefined || task.model === filters.model)); }
+export function executionWaves(execution: MissionExecution): ExecutionWave[] { return execution.waves; }
+export function currentWave(execution: MissionExecution): number | undefined { return execution.currentWave; }
+export function dependencyClosure(execution: MissionExecution, taskId: string): Set<string> { const byId = new Map<string, ExecutionTask>(execution.tasks.map((task: ExecutionTask) => [task.id, task])); const found = new Set<string>(); const visit = (id: string) => { if (found.has(id)) return; found.add(id); for (const dependency of byId.get(id)?.dependencies ?? []) visit(dependency); }; visit(taskId); return found; }
+export function dependentClosure(execution: MissionExecution, taskId: string): Set<string> { const found = new Set<string>(); const visit = (id: string) => { if (found.has(id)) return; found.add(id); for (const dependent of execution.tasks.find((task: ExecutionTask) => task.id === id)?.dependents ?? []) visit(dependent); }; visit(taskId); return found; }
+export function deriveExecutionGraph(execution: MissionExecution): ExecutionGraph { const nodes: GraphNode[] = execution.tasks.map((task: ExecutionTask, index: number) => ({ id: task.id, task, x: 28, y: 56 + index * 118, width: 188, height: 92 })); const byId = new Map<string, GraphNode>(nodes.map((node: GraphNode) => [node.id, node])); const edges = execution.edges.flatMap((edge: ExecutionEdge) => { const source = byId.get(edge.fromTaskId); const target = byId.get(edge.toTaskId); return source && target ? [{ ...edge, source, target }] : []; }); return { nodes, edges, width: 680, height: Math.max(310, 56 + nodes.length * 118) }; }
 
-export type GraphNode = {
+/* -------------------------------------------------------------------------- */
+/* Identity                                                                   */
+/* -------------------------------------------------------------------------- */
+
+const ENTITY_PREFIX = {
+  job: "job",
+  attempt: "attempt",
+  call: "call",
+  executor: "executor",
+} as const;
+
+export type CanonicalEntityKind = keyof typeof ENTITY_PREFIX;
+
+/**
+ * A stable, Project-scoped presentation id for one canonical entity.
+ *
+ * The substrate identity stays readable inside it. This decorates an identity
+ * for React keys and cross-surface links; it never replaces it.
+ */
+export function canonicalEntityId(
+  projectId: ProjectId,
+  kind: CanonicalEntityKind,
+  id: string,
+): string {
+  return `${projectId}:${ENTITY_PREFIX[kind]}:${id}`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Call                                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How a Call is rendered.
+ *
+ * `domain_calls.state` is an unconstrained column, so the words the substrate
+ * actually writes are spelled out here. Anything else stays on screen as
+ * `unrecognized` with its raw state beside it, rather than being coerced into a
+ * status this projection cannot justify.
+ */
+export type CallStatus = "queued" | "running" | "completed" | "failed" | "unrecognized";
+
+const CALL_STATUS: Record<string, CallStatus> = {
+  created: "queued",
+  queued: "queued",
+  running: "running",
+  succeeded: "completed",
+  completed: "completed",
+  failed: "failed",
+  cancelled: "unrecognized",
+};
+
+export function callStatus(call: CanonicalCall): CallStatus {
+  return CALL_STATUS[call.state] ?? "unrecognized";
+}
+
+/** A Call as the read model renders it. Ids are Project-scoped for presentation. */
+export type ExecutionCall = {
+  /** Stable Project-scoped presentation identity. */
   id: string;
-  task: ExecutionTask;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+  /** The canonical Call identity the substrate wrote. */
+  callId: string;
+  attemptId: string;
+  /** The generation of the Attempt that owns this Call. */
+  attemptGeneration: number;
+  /** The Executor that ran this Call, when the substrate named one. */
+  executorId: string | null;
+  generation: number;
+  status: CallStatus;
+  /** The raw state column, shown verbatim whenever this view cannot interpret it. */
+  rawState: string;
+  /** The effect kind the durable DispatchIntent froze for this Call. */
+  effectKind: CanonicalEffectKind;
+  sideEffect: boolean;
+  request: string;
+  response: string | null;
+  /** Canonical epoch seconds, as the substrate stores them. */
+  createdAt: number;
+  finishedAt: number | null;
+  /** Derived from the two canonical instants; absent while the Call is open. */
+  elapsedMs: number | undefined;
+  /** Why a Call reads as failed or unrecognized, in the substrate's own words. */
+  reason: string | undefined;
 };
 
-export type GraphEdge = ExecutionEdge & {
-  source: GraphNode;
-  target: GraphNode;
-};
+/** The substrate stores epoch seconds; durations are counted in milliseconds. */
+function elapsedMs(call: CanonicalCall): number | undefined {
+  if (call.finished_at === null) return undefined;
+  return Math.max(0, (call.finished_at - call.created_at) * 1000);
+}
 
-export type ExecutionGraph = {
-  nodes: GraphNode[];
-  edges: GraphEdge[];
-  width: number;
-  height: number;
-};
+function callReason(call: CanonicalCall, status: CallStatus): string | undefined {
+  if (status === "unrecognized") {
+    return `Call state "${call.state}" is not one this view interprets.`;
+  }
+  if (status === "failed") return call.response ?? undefined;
+  return undefined;
+}
 
-export type ExecutionTaskFilters = {
-  query?: string;
-  status?: ExecutionStatus;
-  wave?: number;
-  workerRole?: string;
-  provider?: string;
+function toExecutionCall(
+  projectId: ProjectId,
+  call: CanonicalCall,
+  generationByAttempt: ReadonlyMap<string, number>,
+): ExecutionCall {
+  return {
+    id: canonicalEntityId(projectId, "call", call.id),
+    callId: call.id,
+    attemptId: call.attempt_id,
+    attemptGeneration: generationByAttempt.get(call.attempt_id) ?? 0,
+    executorId: call.executor_id,
+    generation: call.generation,
+    status: callStatus(call),
+    rawState: call.state,
+    effectKind: call.effect_kind,
+    sideEffect: call.side_effect,
+    request: call.request,
+    response: call.response,
+    createdAt: call.created_at,
+    finishedAt: call.finished_at,
+    elapsedMs: elapsedMs(call),
+    reason: callReason(call, callStatus(call)),
+  };
+}
+
+export function isSettled(call: ExecutionCall): boolean {
+  return call.status === "completed" || call.status === "failed";
+}
+
+/* -------------------------------------------------------------------------- */
+/* Attempt                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** One generation of one Job, as the substrate recorded it. */
+export type ExecutionAttempt = {
+  id: string;
+  attemptId: string;
+  generation: number;
+  /** The canonical Attempt state, unmodified. */
+  state: CanonicalAttempt["state"];
+  /** The backend's own decision. This view never promotes an Attempt. */
+  authoritative: boolean;
+  createdAt: number;
+  finishedAt: number | null;
+  callCount: number;
+  settledCallCount: number;
+  number?: number;
+  status?: "failed" | "running" | "completed";
   model?: string;
+  provider?: string;
+  elapsedMs?: number;
+  reason?: string;
 };
 
-export function formatExecutionStatus(status: ExecutionStatus | MissionExecution["status"]): string {
-  return status.replaceAll("-", " ");
+/** The Attempt history of one Job, ordered by generation. */
+export function attemptHistoryOf(
+  projectId: ProjectId,
+  attempts: readonly CanonicalAttempt[],
+  calls: readonly ExecutionCall[],
+): ExecutionAttempt[] {
+  return attempts
+    .slice()
+    .sort((left, right) => left.generation - right.generation)
+    .map((attempt) => {
+      const owned = calls.filter((call) => call.attemptId === attempt.id);
+      return {
+        id: canonicalEntityId(projectId, "attempt", attempt.id),
+        attemptId: attempt.id,
+        generation: attempt.generation,
+        state: attempt.state,
+        authoritative: attempt.authoritative,
+        createdAt: attempt.created_at,
+        finishedAt: attempt.finished_at,
+        callCount: owned.length,
+        settledCallCount: owned.filter(isSettled).length,
+      };
+    });
 }
 
-export function taskStatusCounts(tasks: ExecutionTask[]): ExecutionSummary {
-  return {
-    completed: tasks.filter((task) => task.status === "completed").length,
-    total: tasks.length,
-    running: tasks.filter((task) => ["starting", "running", "verifying"].includes(task.status)).length,
-    waiting: tasks.filter((task) => ["waiting", "queued", "planned", "ready"].includes(task.status)).length,
-    blocked: tasks.filter((task) => task.status === "blocked").length,
-    failed: tasks.filter((task) => ["failed", "cancelled", "skipped"].includes(task.status)).length,
-    retrying: tasks.filter((task) => task.status === "retrying" || (task.retryCount ?? 0) > 0).length,
-  };
+/* -------------------------------------------------------------------------- */
+/* Executor                                                                   */
+/* -------------------------------------------------------------------------- */
+
+export type ExecutorStatus = "running" | "queued" | "settled" | "unrecognized";
+
+/**
+ * An Executor as this projection can see it.
+ *
+ * The canonical work snapshot names an Executor only through the Calls it ran,
+ * so that is all this records: the identity, its Calls, and the aggregate of
+ * their states. Executor kind, runtime and frozen contract are not in this
+ * projection, so they are not guessed here.
+ */
+export type ExecutionExecutor = {
+  id: string;
+  executorId: string;
+  status: ExecutorStatus;
+  callIds: string[];
+  runningCallId: string | undefined;
+  settledCallCount: number;
+};
+
+function executorStatus(calls: readonly ExecutionCall[]): ExecutorStatus {
+  if (calls.some((call) => call.status === "running")) return "running";
+  if (calls.some((call) => call.status === "unrecognized")) return "unrecognized";
+  if (calls.length > 0 && calls.every((call) => call.status === "completed")) return "settled";
+  return "queued";
 }
 
-export function filterExecutionTasks(tasks: ExecutionTask[], filters: ExecutionTaskFilters = {}): ExecutionTask[] {
-  const query = filters.query?.trim().toLowerCase();
-  return tasks.filter((task) => (
-    (!query || task.title.toLowerCase().includes(query)) &&
-    (filters.status === undefined || task.status === filters.status) &&
-    (filters.wave === undefined || task.wave === filters.wave) &&
-    (filters.workerRole === undefined || task.workerRole === filters.workerRole) &&
-    (filters.provider === undefined || task.provider === filters.provider) &&
-    (filters.model === undefined || task.model === filters.model)
-  ));
-}
-
-export function executionWaves(execution: MissionExecution): ExecutionWave[] {
-  if (execution.waves.length > 0) return execution.waves;
-  const groups = new Map<number, string[]>();
-  for (const task of execution.tasks) {
-    if (task.wave === undefined) continue;
-    groups.set(task.wave, [...(groups.get(task.wave) ?? []), task.id]);
-  }
-  return [...groups.entries()].sort(([left], [right]) => left - right).map(([index, taskIds]) => ({
-    index,
-    taskIds,
-    status: "planned",
-  }));
-}
-
-export function currentWave(execution: MissionExecution): number | undefined {
-  if (execution.currentWave !== undefined) return execution.currentWave;
-  return executionWaves(execution).find((wave) => wave.status === "active")?.index;
-}
-
-export function dependencyClosure(execution: MissionExecution, taskId: string): Set<string> {
-  const byId = new Map(execution.tasks.map((task) => [task.id, task]));
-  const found = new Set<string>();
-  const visit = (id: string) => {
-    if (found.has(id)) return;
-    found.add(id);
-    for (const dependency of byId.get(id)?.dependencies ?? []) visit(dependency);
-  };
-  visit(taskId);
-  return found;
-}
-
-export function dependentClosure(execution: MissionExecution, taskId: string): Set<string> {
-  const found = new Set<string>();
-  const visit = (id: string) => {
-    if (found.has(id)) return;
-    found.add(id);
-    for (const dependent of execution.tasks.find((task) => task.id === id)?.dependents ?? []) visit(dependent);
-  };
-  visit(taskId);
-  return found;
-}
-
-export function deriveExecutionGraph(execution: MissionExecution): ExecutionGraph {
-  const byWave = new Map<number, ExecutionTask[]>();
-  for (const task of execution.tasks) {
-    const wave = task.wave ?? 1;
-    byWave.set(wave, [...(byWave.get(wave) ?? []), task]);
-  }
-  const waves = [...byWave.keys()].sort((left, right) => left - right);
-  const width = 188;
-  const gapX = 60;
-  const height = 92;
-  const gapY = 26;
-  const nodes = waves.flatMap((wave) => (byWave.get(wave) ?? []).map((task, index) => ({
-    id: task.id,
-    task,
-    x: 28 + (wave - 1) * (width + gapX),
-    y: 56 + index * (height + gapY),
-    width,
-    height,
-  })));
-  const nodesById = new Map(nodes.map((node) => [node.id, node]));
-  const edges = execution.edges.flatMap((edge) => {
-    const source = nodesById.get(edge.fromTaskId);
-    const target = nodesById.get(edge.toTaskId);
-    return source && target ? [{ ...edge, source, target }] : [];
+export function executorsOf(
+  projectId: ProjectId,
+  calls: readonly ExecutionCall[],
+): ExecutionExecutor[] {
+  const ids = [
+    ...new Set(calls.map((call) => call.executorId).filter((id): id is string => id !== null)),
+  ];
+  return ids.map((executorId) => {
+    const owned = calls.filter((call) => call.executorId === executorId);
+    return {
+      id: canonicalEntityId(projectId, "executor", executorId),
+      executorId,
+      status: executorStatus(owned),
+      callIds: owned.map((call) => call.id),
+      runningCallId: owned.find((call) => call.status === "running")?.id,
+      settledCallCount: owned.filter(isSettled).length,
+    };
   });
-  const maxRows = Math.max(1, ...waves.map((wave) => byWave.get(wave)?.length ?? 0));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Derived activity                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One line of Call history.
+ *
+ * The work snapshot carries no event log, so the only timeline this projection
+ * can honestly draw is the Call records themselves: one line per Call, at the
+ * instant the substrate says it settled or was created.
+ */
+export type CallActivityItem = {
+  id: string;
+  jobId: string;
+  callId: string;
+  executorId: string | undefined;
+  attemptGeneration: number;
+  status: CallStatus;
+  /** Canonical epoch seconds of the settled (or created) instant. */
+  at: number;
+  timestamp: string;
+  message: string;
+  elapsedMs?: number;
+  kind?: string;
+  missionId?: string;
+  taskId?: string;
+  workerId?: string;
+};
+
+function callActivity(call: ExecutionCall, jobId: string): CallActivityItem {
+  const at = call.finishedAt ?? call.createdAt;
+  const message =
+    call.status === "completed"
+      ? `Call settled · ${call.effectKind}`
+      : call.status === "running"
+        ? `Call running · ${call.effectKind}`
+        : call.status === "queued"
+          ? `Call queued · ${call.effectKind}`
+          : (call.reason ?? `Call ${call.rawState}`);
   return {
-    nodes,
-    edges,
-    width: Math.max(680, 28 + waves.length * (width + gapX)),
-    height: Math.max(310, 56 + maxRows * (height + gapY)),
+    id: `${jobId}:call:${call.callId}:${at}`,
+    jobId,
+    callId: call.callId,
+    executorId: call.executorId ?? undefined,
+    attemptGeneration: call.attemptGeneration,
+    status: call.status,
+    at,
+    timestamp: formatTimestamp(new Date(at * 1000).toISOString()),
+    message,
   };
 }
 
+export function boundActivity(
+  items: readonly CallActivityItem[],
+  limit = 80,
+): CallActivityItem[] {
+  return items.slice(Math.max(0, items.length - limit));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Job                                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Progress this projection is allowed to state.
+ *
+ * There is no canonical percentage. The one explainable measure is how many of
+ * the Calls the authoritative Attempt carries have settled, so every reader of
+ * this figure sees its denominator with it. It is `null`, not zero, when the
+ * authoritative Attempt carries no Calls.
+ */
+export type JobProgress = {
+  settled: number;
+  total: number;
+  percent: number;
+};
+
+export type JobCallSummary = {
+  total: number;
+  running: number;
+  queued: number;
+  completed: number;
+  failed: number;
+  unrecognized: number;
+};
+
+export function summarizeCalls(calls: readonly ExecutionCall[]): JobCallSummary {
+  return {
+    total: calls.length,
+    running: calls.filter((call) => call.status === "running").length,
+    queued: calls.filter((call) => call.status === "queued").length,
+    completed: calls.filter((call) => call.status === "completed").length,
+    failed: calls.filter((call) => call.status === "failed").length,
+    unrecognized: calls.filter((call) => call.status === "unrecognized").length,
+  };
+}
+
+export function progressOf(calls: readonly ExecutionCall[]): JobProgress | null {
+  if (calls.length === 0) return null;
+  const settled = calls.filter(isSettled).length;
+  return {
+    settled,
+    total: calls.length,
+    percent: Math.round((settled / calls.length) * 100),
+  };
+}
+
+/** The most recently settled (or still open) Call, by canonical instant. */
+export function latestCallOf(calls: readonly ExecutionCall[]): ExecutionCall | null {
+  if (calls.length === 0) return null;
+  return calls.reduce((latest, call) =>
+    (call.finishedAt ?? call.createdAt) >= (latest.finishedAt ?? latest.createdAt) ? call : latest,
+  );
+}
+
+/** The execution of one canonical Job, ready to render. */
+export type JobExecution = {
+  apiVersion: string;
+  projectId: ProjectId;
+  jobId: string;
+  /** The journal cursor this snapshot was taken at. */
+  cursor: number;
+  /** The canonical Job state, unmodified. */
+  state: CanonicalJobState;
+  generation: number;
+  /** The Attempt the backend named authoritative, or `null` before one exists. */
+  authoritativeAttemptId: string | null;
+  /** Canonical Job instants; `updatedAt - createdAt` is the only honest elapsed. */
+  createdAt: number;
+  updatedAt: number;
+  attempts: ExecutionAttempt[];
+  calls: ExecutionCall[];
+  /** Calls owned by the authoritative Attempt, in canonical creation order. */
+  authoritativeCalls: ExecutionCall[];
+  executors: ExecutionExecutor[];
+  summary: JobCallSummary;
+  /** Progress over the authoritative Attempt's Calls, or `null` when undecidable. */
+  progress: JobProgress | null;
+  currentCall: ExecutionCall | null;
+  latestCall: ExecutionCall | null;
+  activities: CallActivityItem[];
+};
+
+export type CallFilters = {
+  query?: string;
+  status?: CallStatus;
+  executorId?: string;
+  /** Restrict to one Attempt generation; `undefined` means every generation. */
+  attemptGeneration?: number;
+};
+
+/** Pure Call filter for the dense execution tables. */
+export function filterCalls(
+  calls: readonly ExecutionCall[],
+  filters: CallFilters = {},
+): ExecutionCall[] {
+  const query = filters.query?.trim().toLowerCase();
+  return calls.filter((call) => {
+    if (filters.status !== undefined && call.status !== filters.status) return false;
+    if (filters.executorId !== undefined && call.executorId !== filters.executorId) return false;
+    if (
+      filters.attemptGeneration !== undefined &&
+      call.attemptGeneration !== filters.attemptGeneration
+    ) {
+      return false;
+    }
+    if (!query) return true;
+    return (
+      call.callId.toLowerCase().includes(query) ||
+      (call.executorId?.toLowerCase().includes(query) ?? false) ||
+      call.rawState.toLowerCase().includes(query) ||
+      call.effectKind.toLowerCase().includes(query)
+    );
+  });
+}
+
+/** Calls one Executor ran, in canonical creation order. */
+export function callsForExecutor(
+  calls: readonly ExecutionCall[],
+  executor: ExecutionExecutor,
+): ExecutionCall[] {
+  const ids = new Set(executor.callIds);
+  return calls.filter((call) => ids.has(call.id));
+}
+
+/** Calls owned by one Attempt generation, in canonical creation order. */
+export function callsForGeneration(
+  calls: readonly ExecutionCall[],
+  generation: number,
+): ExecutionCall[] {
+  return calls.filter((call) => call.attemptGeneration === generation);
+}
+
+/**
+ * Assembles the read model from validated canonical entities.
+ *
+ * `projectCanonicalSnapshot` has already proved the hierarchy (every Attempt
+ * belongs to this Job, every Call to one of its Attempts, the authoritative
+ * Attempt is carried), so this function only projects. It is exported for that
+ * one caller and for nothing else.
+ */
+export function assembleJobExecution(input: {
+  apiVersion: string;
+  projectId: ProjectId;
+  cursor: number;
+  job: {
+    id: string;
+    state: CanonicalJobState;
+    generation: number;
+    authoritative_attempt_id: string | null;
+    created_at: number;
+    updated_at: number;
+  };
+  attempts: readonly CanonicalAttempt[];
+  calls: readonly CanonicalCall[];
+}): JobExecution {
+  const { projectId } = input;
+  const generationByAttempt = new Map(input.attempts.map((attempt) => [attempt.id, attempt.generation]));
+  const calls = input.calls.map((call) => toExecutionCall(projectId, call, generationByAttempt));
+  const authoritativeCalls = input.job.authoritative_attempt_id === null
+    ? []
+    : calls.filter((call) => call.attemptId === input.job.authoritative_attempt_id);
+
+  return {
+    apiVersion: input.apiVersion,
+    projectId,
+    jobId: input.job.id,
+    cursor: input.cursor,
+    state: input.job.state,
+    generation: input.job.generation,
+    authoritativeAttemptId: input.job.authoritative_attempt_id,
+    createdAt: input.job.created_at,
+    updatedAt: input.job.updated_at,
+    attempts: attemptHistoryOf(projectId, input.attempts, calls),
+    calls,
+    authoritativeCalls,
+    executors: executorsOf(projectId, calls),
+    summary: summarizeCalls(calls),
+    progress: progressOf(authoritativeCalls),
+    currentCall: authoritativeCalls.find((call) => call.status === "running") ?? null,
+    latestCall: latestCallOf(calls),
+    activities: calls.map((call) => callActivity(call, input.job.id)),
+  };
+}

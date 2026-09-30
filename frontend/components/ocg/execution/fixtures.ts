@@ -1,105 +1,269 @@
-import type { MissionExecution, ExecutionActivityItem, ExecutionEdge, ExecutionTask, WorkerExecution } from "./domain";
-import { taskStatusCounts } from "./domain";
+/**
+ * Deterministic canonical execution fixtures.
+ *
+ * Each session's execution is a set of *canonical* entities — a Job, its
+ * Attempt history, and the Calls those Attempts own — shaped exactly like the
+ * `mission` payload the control plane returns for a real Project. The fixtures
+ * are therefore projected by the same `assembleJobExecution` path the backend
+ * uses; there is no parallel Mission-shaped fixture model to drift from it.
+ *
+ * Accounting is ceiling-only. The control plane exposes a hard budget in
+ * global, Project-default, or Job configuration, and exposes nothing about what
+ * a Job has spent, so no fixture invents a consumption figure.
+ */
 
-const missionId = "mission-architecture-consolidation";
+import type {
+  CanonicalAttempt,
+  CanonicalCall,
+  CanonicalEffectKind,
+  CanonicalExecutionState,
+  CanonicalJob,
+  CanonicalJobState,
+} from "../contracts";
+import type { ProjectId } from "../project/domain";
+import { emptyAccounting, type JobAccounting } from "./accounting";
 
-function task(input: Omit<ExecutionTask, "missionId" | "dependents">): ExecutionTask {
-  return { ...input, missionId, dependents: [] };
-}
+/** One fixed instant, so every fixture is byte-stable across runs. */
+const T0 = 1_750_000_000;
 
-function edge(fromTaskId: string, toTaskId: string, kind: ExecutionEdge["kind"] = "dependency"): ExecutionEdge {
-  return { id: `edge-${fromTaskId}-${toTaskId}`, fromTaskId, toTaskId, kind, status: "completed" };
-}
+const OBJECTIVE = "Fixture objective recorded by the canonical Job payload.";
 
-const tasks: ExecutionTask[] = [
-  task({ id: "recon", title: "Recon current surfaces", description: "Map the existing OCG shell, runtime boundary, and product surfaces before proposing changes.", category: "Recon", status: "completed", wave: 1, dependencies: [], workerId: "explore", workerRole: "Explore", provider: "OpenCode Go", model: "Space Bunny Free", variant: "deep", elapsedMs: 420000, finishedAt: "00:07:00", outputSummary: "Surface inventory captured with no backend changes.", usageSummary: { tokens: 12800, cost: 0.04 }, schedulingReason: "Independent repository reconnaissance can start immediately.", priority: "high" }),
-  task({ id: "inventory", title: "Inventory runtime state", description: "Record existing normalized Mission, Worker, observability, and resource data available to the UI.", category: "Recon", status: "completed", wave: 1, dependencies: [], workerId: "explore-deep", workerRole: "Explore Deep", provider: "OpenCode Go", model: "Space Bunny Free", variant: "deep", elapsedMs: 510000, finishedAt: "00:08:30", outputSummary: "Existing domain seams and fixture conventions documented.", usageSummary: { tokens: 16400, cost: 0.05 }, schedulingReason: "Runs in parallel with surface reconnaissance.", priority: "high" }),
-  task({ id: "foundation", title: "Define execution foundation", description: "Add the frontend-owned execution read model without introducing a transport or scheduler implementation.", category: "Foundation", status: "completed", wave: 2, dependencies: ["recon", "inventory"], workerId: "lead", workerRole: "Lead", provider: "Command Code", model: "Muse Spark 1.3 Contributor", variant: "mid", elapsedMs: 720000, finishedAt: "00:21:00", outputSummary: "Execution identity, status, wave, gate, and activity projections are defined.", usageSummary: { tokens: 21900, cost: 0.09 }, schedulingReason: "Scheduled after Recon and State Inventory because both define the compatibility boundary.", priority: "high" }),
-  task({ id: "design-system", title: "Set status language", description: "Align graph statuses, badges, and accessible labels with the existing restrained OCG visual language.", category: "Foundation", status: "completed", wave: 2, dependencies: ["recon"], workerId: "lead", workerRole: "Lead", provider: "Command Code", model: "Muse Spark 1.3 Contributor", variant: "mid", elapsedMs: 360000, finishedAt: "00:18:00", outputSummary: "Status semantics remain readable without relying on color alone.", usageSummary: { tokens: 9500, cost: 0.04 }, schedulingReason: "Can proceed from surface inventory while execution types are being shaped." }),
-  task({ id: "runtime-boundary", title: "Preserve runtime boundary", description: "Keep Mission Control fixture data behind the existing runtime snapshot so a future adapter can replace it.", category: "Runtime", status: "completed", wave: 2, dependencies: ["inventory"], workerId: "lead", workerRole: "Lead", provider: "Command Code", model: "Muse Spark 1.3 Contributor", variant: "mid", elapsedMs: 480000, finishedAt: "00:20:00", outputSummary: "No HTTP, SSE, WebSocket, or Rust changes are required for this foundation.", usageSummary: { tokens: 11200, cost: 0.05 }, schedulingReason: "Shared runtime state must remain normalized before projections are wired." }),
-  task({ id: "mission-inspector", title: "Keep Inspector compact", description: "Keep current Mission Inspector as quick context and add a discoverable path into deep execution analysis.", category: "Surface", status: "completed", wave: 3, dependencies: ["foundation"], workerId: "build", workerRole: "Build", provider: "Command Code", model: "DeepSeek V4.1 Flash", variant: "flash", elapsedMs: 540000, finishedAt: "00:30:00", outputSummary: "Mission Inspector remains a side surface; graph does not move into it.", usageSummary: { tokens: 14300, cost: 0.06 }, schedulingReason: "The Inspector is an existing entry point for the new workspace." }),
-  task({ id: "onboarding", title: "Protect onboarding paths", description: "Verify login, onboarding, and bootstrap gates remain separate from Mission Control navigation.", category: "Surface", status: "completed", wave: 3, dependencies: ["foundation"], workerId: "build", workerRole: "Build", provider: "Command Code", model: "DeepSeek V4.1 Flash", variant: "flash", elapsedMs: 390000, finishedAt: "00:27:00", outputSummary: "Bootstrap fixtures and entry gating remain unchanged in behavior.", usageSummary: { tokens: 10200, cost: 0.04 } }),
-  task({ id: "resource-ledger", title: "Connect Ledger context", description: "Show compact budget and token context while leaving detailed accounting to Resource Ledger.", category: "Surface", status: "retrying", wave: 3, dependencies: ["foundation", "design-system"], workerId: "build", workerRole: "Build", provider: "Command Code", model: "Sol", variant: "standard", elapsedMs: 1380000, startedAt: "00:32:00", attempt: 2, maxAttempts: 3, retryCount: 1, progress: 64, outputSummary: "Retrying after a fixture-level provider timeout; context selectors remain bounded.", usageSummary: { tokens: 28700, cost: 0.16 }, attemptHistory: [
-    { number: 1, status: "failed", provider: "Command Code", model: "DeepSeek V4.1 Flash", elapsedMs: 420000, reason: "Provider timeout while deriving compact usage context." },
-    { number: 2, status: "running", provider: "Command Code", model: "Sol", elapsedMs: 960000, reason: "Escalated to a more reliable model for the retry." },
-  ], escalationHistory: [{ provider: "Command Code", model: "DeepSeek V4.1 Flash", reason: "Initial assignment" }, { provider: "Command Code", model: "Sol", reason: "Escalated after provider timeout" }], schedulingReason: "Runs after the shared execution foundation and status language are stable." }),
-  task({ id: "responsive", title: "Responsive execution views", description: "Make graph, task list, and selected detail usable at desktop, tablet, and narrow widths.", category: "Surface", status: "running", wave: 3, dependencies: ["mission-inspector", "onboarding"], workerId: "build", workerRole: "Build", provider: "Command Code", model: "DeepSeek V4.1 Flash", variant: "flash", elapsedMs: 780000, startedAt: "00:38:00", progress: 48, usageSummary: { tokens: 19200, cost: 0.11 }, schedulingReason: "Parallel with Ledger context; shares only the compact surface contract.", priority: "high" }),
-  task({ id: "integration-gate", title: "Integration check", description: "Confirm the execution projections agree across Overview, Graph, Tasks, Workers, and Activity.", category: "Verification", kind: "gate", status: "verifying", wave: 4, dependencies: ["mission-inspector", "onboarding", "resource-ledger", "runtime-boundary"], workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", variant: "standard", elapsedMs: 240000, startedAt: "00:49:00", progress: 72, verificationSummary: "Checking assignment, budget context, and bounded activity invariants.", usageSummary: { tokens: 8100, cost: 0.0 }, schedulingReason: "Assigned to Verify because independent verification is required.", priority: "high" }),
-  task({ id: "a11y-sweep", title: "Accessibility sweep", description: "Ensure graph nodes, controls, status labels, and the task-list equivalent expose the same execution facts.", category: "Quality", status: "completed", wave: 4, dependencies: ["design-system"], workerId: "explore", workerRole: "Explore", provider: "OpenCode Go", model: "Space Bunny Free", variant: "standard", elapsedMs: 510000, finishedAt: "00:46:00", outputSummary: "Keyboard and non-spatial task representations are covered.", usageSummary: { tokens: 12100, cost: 0.03 }, schedulingReason: "Independent quality work can complete in parallel with the integration gate." }),
-  task({ id: "verification", title: "Verification follow-up", description: "Wait for the integration gate before validating the final execution path.", category: "Verification", kind: "gate", status: "waiting", wave: 5, dependencies: ["integration-gate", "a11y-sweep"], workerId: "verify", workerRole: "Verify", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", variant: "standard", waitingReason: "Waiting for Integration check to pass.", verificationSummary: "Gate is pending; no approval interaction is implemented in this fixture.", schedulingReason: "Scheduled after the integration gate and accessibility sweep converge." }),
-  task({ id: "conflict-debug", title: "Resolve overlap warning", description: "Investigate a simulated file-overlap conflict before the final gate can proceed.", category: "Debug", status: "blocked", wave: 5, dependencies: ["resource-ledger"], workerId: "debug", workerRole: "Debug", provider: "OpenCode Go", model: "Space Bunny Free", variant: "deep", blockedReason: "Blocked: files overlap with the active Resource Ledger context task.", outputSummary: "No work started while the conflict group is held.", schedulingReason: "Debug is held until the active conflict group is released.", capabilityRequirement: "filesystem-inspection", priority: "high" }),
-  task({ id: "release-gate", title: "Release readiness", description: "Final read-only gate for the dogfood Mission, including all completed work and explicit blockers.", category: "Verification", kind: "gate", status: "queued", wave: 6, dependencies: ["verification", "conflict-debug"], workerId: "lead", workerRole: "Lead", provider: "Command Code", model: "Muse Spark 1.3 Contributor", variant: "mid", schedulingReason: "Will run after verification and the conflict investigation are resolved.", verificationSummary: "Queued behind two wave-five prerequisites." }),
-];
+type JobSeed = {
+  id: string;
+  projectId: ProjectId;
+  state: CanonicalJobState;
+  generation: number;
+  authoritativeAttemptId: string | null;
+  createdAt?: number;
+  updatedAt?: number;
+};
 
-const edges: ExecutionEdge[] = [
-  edge("recon", "foundation"), edge("inventory", "foundation"), edge("recon", "design-system"), edge("inventory", "runtime-boundary"),
-  edge("foundation", "mission-inspector"), edge("foundation", "onboarding"), edge("foundation", "resource-ledger"), edge("design-system", "resource-ledger"),
-  edge("mission-inspector", "responsive"), edge("onboarding", "responsive"), edge("mission-inspector", "integration-gate", "gate"), edge("onboarding", "integration-gate", "gate"),
-  edge("resource-ledger", "integration-gate", "gate"), edge("runtime-boundary", "integration-gate", "gate"), edge("design-system", "a11y-sweep"),
-  edge("integration-gate", "verification", "gate"), edge("a11y-sweep", "verification"), edge("resource-ledger", "conflict-debug", "conflict"), edge("verification", "release-gate", "gate"), edge("conflict-debug", "release-gate", "gate"),
-];
-
-for (const source of tasks) source.dependents = [];
-for (const item of edges) tasks.find((task) => task.id === item.fromTaskId)?.dependents.push(item.toTaskId);
-
-const workers: WorkerExecution[] = [
-  { id: "lead", role: "lead", label: "Lead", status: "active", provider: "Command Code", model: "Muse Spark 1.3 Contributor", variant: "mid", currentTaskId: "integration-gate", completedTaskIds: ["foundation", "design-system", "runtime-boundary"], invocationCount: 7, retryCount: 0, elapsedMs: 2940000, usageSummary: { tokens: 42600, cost: 0.18 } },
-  { id: "explore", role: "worker", label: "Explore", status: "completed", provider: "OpenCode Go", model: "Space Bunny Free", variant: "standard", completedTaskIds: ["recon", "a11y-sweep"], invocationCount: 2, retryCount: 0, elapsedMs: 930000, usageSummary: { tokens: 24900, cost: 0.07 } },
-  { id: "explore-deep", role: "worker", label: "Explore Deep", status: "completed", provider: "OpenCode Go", model: "Space Bunny Free", variant: "deep", completedTaskIds: ["inventory"], invocationCount: 1, retryCount: 0, elapsedMs: 510000, usageSummary: { tokens: 16400, cost: 0.05 } },
-  { id: "build", role: "worker", label: "Build", status: "active", provider: "Command Code", model: "DeepSeek V4.1 Flash", variant: "flash", currentTaskId: "resource-ledger", completedTaskIds: ["mission-inspector", "onboarding"], invocationCount: 5, retryCount: 1, elapsedMs: 2490000, usageSummary: { tokens: 58200, cost: 0.37 } },
-  { id: "verify", role: "worker", label: "Verify", status: "active", provider: "OpenCode Zen", model: "Muse Spark 1.3 Contributor Free", variant: "standard", currentTaskId: "integration-gate", completedTaskIds: [], invocationCount: 2, retryCount: 0, elapsedMs: 240000, usageSummary: { tokens: 8100, cost: 0 } },
-  { id: "debug", role: "worker", label: "Debug", status: "blocked", provider: "OpenCode Go", model: "Space Bunny Free", variant: "deep", currentTaskId: "conflict-debug", completedTaskIds: [], invocationCount: 0, retryCount: 0, usageSummary: { tokens: 0, cost: 0 } },
-];
-
-const activities: ExecutionActivityItem[] = [
-  { id: "activity-1", elapsedMs: 0, timestamp: "00:00", missionId, kind: "mission-started", message: "Mission started", status: "running" },
-  { id: "activity-2", elapsedMs: 12000, timestamp: "00:12", missionId, kind: "planner", message: "Planner created 15 Tasks across 6 waves" },
-  { id: "activity-3", elapsedMs: 30000, timestamp: "00:30", missionId, kind: "wave-started", message: "Wave 1 started · Recon and State inventory can run in parallel" },
-  { id: "activity-4", elapsedMs: 510000, timestamp: "08:30", missionId, taskId: "recon", workerId: "explore", kind: "task-completed", message: "Explore completed Recon current surfaces", status: "completed" },
-  { id: "activity-5", elapsedMs: 1260000, timestamp: "21:00", missionId, taskId: "foundation", workerId: "lead", kind: "task-completed", message: "Lead completed Define execution foundation", status: "completed" },
-  { id: "activity-6", elapsedMs: 1800000, timestamp: "30:00", missionId, kind: "wave-started", message: "Wave 3 started · Mission Inspector, Onboarding, Ledger, and Responsive branches" },
-  { id: "activity-7", elapsedMs: 1920000, timestamp: "32:00", missionId, taskId: "resource-ledger", workerId: "build", kind: "worker-assigned", message: "Build assigned Connect Ledger context", status: "retrying" },
-  { id: "activity-8", elapsedMs: 2340000, timestamp: "39:00", missionId, taskId: "resource-ledger", workerId: "build", kind: "retry-scheduled", message: "Retry scheduled · escalated DeepSeek V4.1 Flash → Sol", status: "retrying" },
-  { id: "activity-9", elapsedMs: 2820000, timestamp: "47:00", missionId, taskId: "integration-gate", workerId: "verify", kind: "gate", message: "Verify started Integration check", status: "verifying" },
-  { id: "activity-10", elapsedMs: 2940000, timestamp: "49:00", missionId, kind: "wave-started", message: "Wave 4 active · independent quality work completed alongside verification" },
-  { id: "activity-11", elapsedMs: 3000000, timestamp: "50:00", missionId, taskId: "verification", workerId: "verify", kind: "task-waiting", message: "Verification follow-up waiting for Integration check", status: "waiting" },
-  { id: "activity-12", elapsedMs: 3060000, timestamp: "51:00", missionId, taskId: "conflict-debug", workerId: "debug", kind: "task-blocked", message: "Debug blocked · files overlap with active Ledger context", status: "blocked" },
-  { id: "activity-13", elapsedMs: 3180000, timestamp: "53:00", missionId, kind: "planner", message: "Scheduled after Build API because it depends on generated schema" },
-  { id: "activity-14", elapsedMs: 3300000, timestamp: "55:00", missionId, kind: "gate", message: "Integration gate holding progress · independent verification required", status: "verifying" },
-];
-
-export function createMissionControlExecution(): MissionExecution {
-  const waves = [
-    { index: 1, taskIds: ["recon", "inventory"], status: "completed" as const },
-    { index: 2, taskIds: ["foundation", "design-system", "runtime-boundary"], status: "completed" as const },
-    { index: 3, taskIds: ["mission-inspector", "onboarding", "resource-ledger", "responsive"], status: "active" as const },
-    { index: 4, taskIds: ["integration-gate", "a11y-sweep"], status: "active" as const },
-    { index: 5, taskIds: ["verification", "conflict-debug"], status: "planned" as const },
-    { index: 6, taskIds: ["release-gate"], status: "planned" as const },
-  ];
+function job(seed: JobSeed): CanonicalJob {
+  const createdAt = seed.createdAt ?? T0;
   return {
-    missionId,
-    title: "Consolidate OCG frontend architecture",
-    status: "running",
-    currentWave: 4,
-    totalWaves: 6,
-    startedAt: "00:00",
-    taskIds: tasks.map((item) => item.id),
-    edgeIds: edges.map((item) => item.id),
-    workerIds: workers.map((item) => item.id),
-    tasks: tasks.map((item) => ({ ...item, dependencies: [...item.dependencies], dependents: [...item.dependents] })),
-    edges: edges.map((item) => ({ ...item })),
-    workers: workers.map((item) => ({ ...item, completedTaskIds: [...item.completedTaskIds] })),
-    waves,
-    gates: [
-      { id: "gate-integration", taskId: "integration-gate", type: "integration", status: "running", reason: "Independent verification is checking projection consistency." },
-      { id: "gate-follow-up", taskId: "verification", type: "verification", status: "pending", reason: "Waiting for Integration check." },
-      { id: "gate-release", taskId: "release-gate", type: "approval", status: "pending", reason: "Queued until all wave-five work is resolved." },
-    ],
-    activities,
-    summary: taskStatusCounts(tasks),
-    budget: { spent: 4.2, limit: 25, tokens: 139300, commitmentPercent: 62 },
-    nextTaskIds: ["verification", "conflict-debug"],
-    criticalPathTaskIds: ["recon", "foundation", "mission-inspector", "integration-gate", "verification", "release-gate"],
+    id: seed.id,
+    project_id: seed.projectId,
+    state: seed.state,
+    generation: seed.generation,
+    authoritative_attempt_id: seed.authoritativeAttemptId,
+    payload: JSON.stringify({ objective: OBJECTIVE }),
+    created_at: createdAt,
+    updated_at: seed.updatedAt ?? createdAt,
   };
+}
+
+function attempt(
+  id: string,
+  jobId: string,
+  generation: number,
+  state: CanonicalAttempt["state"],
+  authoritative: boolean,
+  createdAt: number,
+  finishedAt: number | null,
+): CanonicalAttempt {
+  return { id, job_id: jobId, generation, state, authoritative, created_at: createdAt, finished_at: finishedAt };
+}
+
+type CallSeed = {
+  id: string;
+  attempt: CanonicalAttempt;
+  generation: number;
+  executorId: string | null;
+  effectKind: CanonicalEffectKind | "read" | "search" | "write" | "validate" | "resource_control" | "message";
+  state: string;
+  createdAt: number;
+  finishedAt: number | null;
+  sideEffect?: boolean;
+  request?: string;
+  response?: string | null;
+};
+
+/** `generation` on a Call is the generation of the Attempt it belongs to. */
+function call(seed: CallSeed): CanonicalCall {
+  const effectKind: CanonicalEffectKind = seed.effectKind === "read"
+    ? "idempotent"
+    : seed.effectKind === "search"
+      ? "reconcilable"
+      : seed.effectKind === "write" || seed.effectKind === "resource_control"
+        ? "strict_fenced"
+        : seed.effectKind === "validate" || seed.effectKind === "message"
+          ? "non_retryable"
+          : seed.effectKind;
+  const sideEffect = seed.sideEffect ?? (effectKind === "strict_fenced" || effectKind === "non_retryable");
+  return {
+    id: seed.id,
+    attempt_id: seed.attempt.id,
+    executor_id: seed.executorId,
+    generation: seed.attempt.generation,
+    side_effect: sideEffect,
+    effect_kind: effectKind,
+    state: seed.state,
+    request: seed.request ?? JSON.stringify({ call: seed.id }),
+    response: seed.response ?? null,
+    created_at: seed.createdAt,
+    finished_at: seed.finishedAt,
+  };
+}
+
+const GRAPH_NOTE = "canonical state projection";
+
+/* -------------------------------------------------------------------------- */
+/* Canonical execution states                                                 */
+/* -------------------------------------------------------------------------- */
+
+/** Two generations: a failed first Attempt retained as history, a live second. */
+const jobMain = job({ id: "job-main", projectId: "zhuju", state: "running", generation: 2, authoritativeAttemptId: "attempt-main-2", updatedAt: T0 + 480 });
+const attemptMain1 = attempt("attempt-main-1", jobMain.id, 1, "failed", false, T0, T0 + 120);
+const attemptMain2 = attempt("attempt-main-2", jobMain.id, 2, "running", true, T0 + 120, null);
+const mainExecution: CanonicalExecutionState = {
+  job: jobMain,
+  attempts: [attemptMain1, attemptMain2],
+  calls: [
+    call({ id: "call-main-1", attempt: attemptMain1, generation: 1, executorId: null, effectKind: "idempotent", state: "completed", createdAt: T0 + 10, finishedAt: T0 + 30 }),
+    call({ id: "call-main-2", attempt: attemptMain1, generation: 1, executorId: null, effectKind: "strict_fenced", state: "failed", createdAt: T0 + 30, finishedAt: T0 + 50, response: "Sandbox rejected the resource control before the Attempt was replaced." }),
+    call({ id: "call-main-3", attempt: attemptMain2, generation: 2, executorId: "executor-main-a", effectKind: "idempotent", state: "completed", createdAt: T0 + 130, finishedAt: T0 + 150 }),
+    call({ id: "call-main-4", attempt: attemptMain2, generation: 2, executorId: "executor-main-a", effectKind: "reconcilable", state: "running", createdAt: T0 + 150, finishedAt: null }),
+    call({ id: "call-main-5", attempt: attemptMain2, generation: 2, executorId: "executor-main-b", effectKind: "non_retryable", state: "created", createdAt: T0 + 160, finishedAt: null }),
+  ],
+  executionGraph: GRAPH_NOTE,
+};
+
+const jobCompleted = job({ id: "job-completed", projectId: "zhuju", state: "completed", generation: 1, authoritativeAttemptId: "attempt-completed-1", updatedAt: T0 + 600 });
+const attemptCompleted = attempt("attempt-completed-1", jobCompleted.id, 1, "completed", true, T0, T0 + 600);
+const completedExecution: CanonicalExecutionState = {
+  job: jobCompleted,
+  attempts: [attemptCompleted],
+  calls: [
+    call({ id: "call-completed-1", attempt: attemptCompleted, generation: 1, executorId: "executor-completed-a", effectKind: "read", state: "completed", createdAt: T0 + 10, finishedAt: T0 + 40 }),
+    call({ id: "call-completed-2", attempt: attemptCompleted, generation: 1, executorId: "executor-completed-a", effectKind: "write", state: "completed", createdAt: T0 + 40, finishedAt: T0 + 120, response: "Settled the selected change." }),
+  ],
+  executionGraph: GRAPH_NOTE,
+};
+
+/** Every Call shape the snapshot admits: settled, live, and unstarted. */
+const jobCallHeavy = job({ id: "job-call-heavy", projectId: "ocg", state: "running", generation: 1, authoritativeAttemptId: "attempt-call-heavy-1", updatedAt: T0 + 900 });
+const attemptCallHeavy = attempt("attempt-call-heavy-1", jobCallHeavy.id, 1, "running", true, T0, null);
+const callHeavyExecution: CanonicalExecutionState = {
+  job: jobCallHeavy,
+  attempts: [attemptCallHeavy],
+  calls: [
+    call({ id: "call-heavy-1", attempt: attemptCallHeavy, generation: 1, executorId: "executor-heavy-a", effectKind: "read", state: "completed", createdAt: T0 + 10, finishedAt: T0 + 30 }),
+    call({ id: "call-heavy-2", attempt: attemptCallHeavy, generation: 1, executorId: "executor-heavy-a", effectKind: "resource_control", state: "completed", createdAt: T0 + 30, finishedAt: T0 + 50 }),
+    call({ id: "call-heavy-3", attempt: attemptCallHeavy, generation: 1, executorId: "executor-heavy-b", effectKind: "write", state: "completed", createdAt: T0 + 50, finishedAt: T0 + 70 }),
+    call({ id: "call-heavy-4", attempt: attemptCallHeavy, generation: 1, executorId: "executor-heavy-b", effectKind: "resource_control", state: "running", createdAt: T0 + 70, finishedAt: null }),
+    call({ id: "call-heavy-5", attempt: attemptCallHeavy, generation: 1, executorId: "executor-heavy-c", effectKind: "read", state: "completed", createdAt: T0 + 80, finishedAt: T0 + 90 }),
+    call({ id: "call-heavy-6", attempt: attemptCallHeavy, generation: 1, executorId: "executor-heavy-c", effectKind: "search", state: "created", createdAt: T0 + 90, finishedAt: null }),
+    call({ id: "call-heavy-7", attempt: attemptCallHeavy, generation: 1, executorId: null, effectKind: "message", state: "cancelled", createdAt: T0 + 95, finishedAt: T0 + 100 }),
+  ],
+  executionGraph: GRAPH_NOTE,
+};
+
+/** One Attempt whose Calls are spread across four distinct Executors. */
+const jobParallel = job({ id: "job-parallel", projectId: "ocg", state: "running", generation: 1, authoritativeAttemptId: "attempt-parallel-1", updatedAt: T0 + 300 });
+const attemptParallel = attempt("attempt-parallel-1", jobParallel.id, 1, "running", true, T0, null);
+const parallelExecution: CanonicalExecutionState = {
+  job: jobParallel,
+  attempts: [attemptParallel],
+  calls: [
+    call({ id: "call-parallel-1", attempt: attemptParallel, generation: 1, executorId: "executor-lead", effectKind: "read", state: "completed", createdAt: T0 + 10, finishedAt: T0 + 40 }),
+    call({ id: "call-parallel-2", attempt: attemptParallel, generation: 1, executorId: "executor-explore", effectKind: "search", state: "completed", createdAt: T0 + 10, finishedAt: T0 + 50 }),
+    call({ id: "call-parallel-3", attempt: attemptParallel, generation: 1, executorId: "executor-build", effectKind: "write", state: "running", createdAt: T0 + 20, finishedAt: null }),
+    call({ id: "call-parallel-4", attempt: attemptParallel, generation: 1, executorId: "executor-verify", effectKind: "validate", state: "queued", createdAt: T0 + 30, finishedAt: null }),
+    call({ id: "call-parallel-5", attempt: attemptParallel, generation: 1, executorId: "executor-lead", effectKind: "resource_control", state: "created", createdAt: T0 + 40, finishedAt: null }),
+  ],
+  executionGraph: GRAPH_NOTE,
+};
+
+/** A live Call in an uninterpretable state, to keep the unknown path visible. */
+const jobUnknownState = job({ id: "job-unknown-state", projectId: "zhuju", state: "running", generation: 1, authoritativeAttemptId: "attempt-unknown-1", updatedAt: T0 + 240 });
+const attemptUnknown = attempt("attempt-unknown-1", jobUnknownState.id, 1, "running", true, T0, null);
+const unknownStateExecution: CanonicalExecutionState = {
+  job: jobUnknownState,
+  attempts: [attemptUnknown],
+  calls: [
+    call({ id: "call-unknown-1", attempt: attemptUnknown, generation: 1, executorId: "executor-unknown-a", effectKind: "read", state: "completed", createdAt: T0 + 10, finishedAt: T0 + 40 }),
+    call({ id: "call-unknown-2", attempt: attemptUnknown, generation: 1, executorId: "executor-unknown-a", effectKind: "write", state: "reconciling", createdAt: T0 + 40, finishedAt: null }),
+  ],
+  executionGraph: GRAPH_NOTE,
+};
+
+const jobFailed = job({ id: "job-failed", projectId: "zhuju", state: "failed", generation: 1, authoritativeAttemptId: "attempt-failed-1", updatedAt: T0 + 180 });
+const attemptFailed = attempt("attempt-failed-1", jobFailed.id, 1, "failed", true, T0, T0 + 180);
+const failedExecution: CanonicalExecutionState = {
+  job: jobFailed,
+  attempts: [attemptFailed],
+  calls: [
+    call({ id: "call-failed-1", attempt: attemptFailed, generation: 1, executorId: "executor-failed-a", effectKind: "validate", state: "failed", createdAt: T0 + 10, finishedAt: T0 + 50, response: "Sandbox capability check failed." }),
+  ],
+  executionGraph: GRAPH_NOTE,
+};
+
+const jobCecece = job({ id: "job-cecece", projectId: "cecece", state: "failed", generation: 1, authoritativeAttemptId: "attempt-cecece-1", updatedAt: T0 + 150 });
+const attemptCecece = attempt("attempt-cecece-1", jobCecece.id, 1, "failed", true, T0, T0 + 150);
+const cececeExecution: CanonicalExecutionState = {
+  job: jobCecece,
+  attempts: [attemptCecece],
+  calls: [
+    call({ id: "call-cecece-1", attempt: attemptCecece, generation: 1, executorId: "executor-cecece-a", effectKind: "message", state: "failed", createdAt: T0 + 10, finishedAt: T0 + 40, response: "Provider requirement is not satisfied for this Project." }),
+  ],
+  executionGraph: GRAPH_NOTE,
+};
+
+/* -------------------------------------------------------------------------- */
+/* Session fixtures                                                           */
+/* -------------------------------------------------------------------------- */
+
+const EXECUTION_BY_SESSION: Record<string, CanonicalExecutionState> = {
+  "chat-zhuju-main": mainExecution,
+  "chat-route-1": completedExecution,
+  "chat-tool-gateway": callHeavyExecution,
+  "chat-design-system": parallelExecution,
+  "chat-worker-pool": parallelExecution,
+  "chat-paused-budget": unknownStateExecution,
+  "chat-cecece-billing": failedExecution,
+  "chat-cecece-1": cececeExecution,
+};
+
+/** The canonical execution the session's Job records, or `null` for none. */
+export function executionFixtureForSession(sessionId: string): CanonicalExecutionState | null {
+  return EXECUTION_BY_SESSION[sessionId] ?? null;
+}
+
+/** Legacy scenario adapter; canonical fixtures remain the source of truth. */
+export function createMissionControlExecution(): import("./domain").MissionExecution {
+  return {
+    missionId: "job-main",
+    title: "Canonical Job",
+    status: "running",
+    taskIds: [],
+    edgeIds: [],
+    workerIds: [],
+    tasks: [],
+    edges: [],
+    workers: [],
+    waves: [],
+    gates: [],
+    activities: [],
+    summary: { completed: 0, total: 0, running: 0, waiting: 0, blocked: 0, failed: 0, retrying: 0 },
+  };
+}
+
+/** Project-scoped ceilings the configuration surface records. */
+const PROJECT_CEILING: Partial<Record<ProjectId, JobAccounting["ceiling"]>> = {
+  zhuju: { amount: 25, unit: "USD", source: "project-default" },
+  ocg: { amount: 100, unit: "USD", source: "global-default" },
+  "route-lace": { amount: 40, unit: "USD", source: "project-default" },
+  cecece: { amount: 5, unit: "USD", source: "job-configuration" },
+};
+
+/**
+ * The accounting context for a session's Job.
+ *
+ * Only the ceiling is populated. A Project with no recorded ceiling, and every
+ * session with no Job, report `emptyAccounting()` rather than a zero budget.
+ */
+export function accountingFixtureForSession(sessionId: string, projectId: ProjectId): JobAccounting {
+  if (executionFixtureForSession(sessionId) === null) return emptyAccounting();
+  const ceiling = PROJECT_CEILING[projectId] ?? null;
+  return { ceiling, consumption: null };
 }

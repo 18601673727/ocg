@@ -19,6 +19,7 @@ pub mod config;
 pub mod config_command;
 pub mod context;
 pub mod contracts;
+pub mod control_server;
 pub mod core_contract;
 pub mod defaults;
 pub mod edit;

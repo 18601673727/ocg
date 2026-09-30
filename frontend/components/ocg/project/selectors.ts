@@ -78,6 +78,7 @@ export function selectProjectSnapshot(
     missionsBySession: keepBySession(snapshot.missionsBySession),
     observabilityBySession: keepBySession(snapshot.observabilityBySession),
     executionBySession: keepBySession(snapshot.executionBySession),
+    accountingBySession: keepBySession(snapshot.accountingBySession),
     resourceLedger,
     ...(snapshot.attentionItems !== undefined ? { attentionItems } : {}),
     ...(snapshot.logs !== undefined ? { logs } : {}),

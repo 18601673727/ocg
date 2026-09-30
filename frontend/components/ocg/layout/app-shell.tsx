@@ -10,7 +10,7 @@ import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
 import { ControlCenterSurface } from "../control-center/control-center-surface";
-import { MissionControlSurface } from "../mission-control/mission-control-surface";
+import { JobExecutionSurface } from "../execution/job-execution-surface";
 import { LogsSurface } from "../logs/logs-surface";
 import { SettingsSurface } from "../settings/settings-surface";
 import { CanonicalControlSurface } from "../canonical/canonical-control-surface";
@@ -492,7 +492,7 @@ export function RuntimeWorkspace({
         ) : isMissionControl ? (
           <main aria-label="Mission Control" className="flex min-h-0 flex-1 overflow-hidden">
             {snapshot.executionBySession[activeSession.id] ? (
-              <MissionControlSurface
+              <JobExecutionSurface
                 key={`${activeProjectId}:${activeSession.id}`}
                 execution={snapshot.executionBySession[activeSession.id]!}
                 onOpenInspector={() => navigate("chat")}

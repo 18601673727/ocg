@@ -167,7 +167,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
   const tool = message.tool;
   const [open, setOpen] = useState(true);
   if (!tool) return null;
-  const tone = TOOL_STATUS[tool.status].tone;
+  const tone = Object.entries(TOOL_STATUS).find(([status]) => status === tool.status)?.[1].tone ?? "slate";
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
       <div className="overflow-hidden rounded-md border border-border bg-muted/30">

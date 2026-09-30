@@ -9,6 +9,9 @@
 import type { BootstrapState } from "../bootstrap/types";
 import { isRecord, isNonEmptyString, isNonNegativeInteger } from "@/lib/narrow";
 import { createBootstrapFixture } from "../bootstrap/fixtures";
+import { executionFixtureForSession, accountingFixtureForSession } from "../execution/fixtures";
+import { assembleJobExecution } from "../execution/domain";
+import { CANONICAL_API_VERSION } from "../contracts";
 import { isProjectId, type ProjectId } from "../project/domain";
 import { selectProjectSnapshot } from "../project/selectors";
 import type { RuntimeSnapshot, ScenarioId } from "./runtime-types";
@@ -116,6 +119,7 @@ export function emptyRuntimeSnapshot(scenario: ScenarioId): RuntimeSnapshot {
     missionsBySession: {},
     observabilityBySession: {},
     executionBySession: {},
+    accountingBySession: {},
     resourceLedger: null,
     attentionItems: [],
     logs: [],
@@ -125,6 +129,18 @@ export function emptyRuntimeSnapshot(scenario: ScenarioId): RuntimeSnapshot {
 
 /** Deep clone a fixture into the canonical snapshot shape. */
 export function createRuntimeSnapshotFromFixture(fixture: ScenarioFixture): RuntimeSnapshot {
+  const executionBySession: RuntimeSnapshot["executionBySession"] = {};
+  const accountingBySession: RuntimeSnapshot["accountingBySession"] = {};
+  for (const session of fixture.sessions) {
+    const state = executionFixtureForSession(session.id);
+    if (state && isProjectId(state.job.project_id) && fixture.executionBySession[session.id]) {
+      executionBySession[session.id] = assembleJobExecution({ ...state, apiVersion: CANONICAL_API_VERSION, projectId: state.job.project_id, cursor: 0 });
+      accountingBySession[session.id] = accountingFixtureForSession(session.id, state.job.project_id);
+    } else {
+      executionBySession[session.id] = null;
+      accountingBySession[session.id] = null;
+    }
+  }
   return {
     scenario: fixture.id,
     status: JSON.parse(JSON.stringify(fixture.runtimeStatus)),
@@ -132,7 +148,8 @@ export function createRuntimeSnapshotFromFixture(fixture: ScenarioFixture): Runt
     messagesBySession: JSON.parse(JSON.stringify(fixture.messagesBySession)),
     missionsBySession: JSON.parse(JSON.stringify(fixture.missionsBySession)),
     observabilityBySession: JSON.parse(JSON.stringify(fixture.observabilityBySession)),
-    executionBySession: JSON.parse(JSON.stringify(fixture.executionBySession)),
+    executionBySession,
+    accountingBySession,
     resourceLedger: JSON.parse(JSON.stringify(fixture.resourceLedger)),
     attentionItems: [],
     logs: [],

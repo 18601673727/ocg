@@ -2,8 +2,8 @@
 //!
 //! This is the small boundary between durable OCG control-plane semantics and
 //! a concrete execution engine. It contains only operations that the current
-//! controller and bridge already need. OpenCode HTTP, session routes, agent
-//! names, and plugin event shapes belong to the concrete adapter, not here.
+//! control surface already needs. OpenCode HTTP, session routes and agent names
+//! belong to the concrete adapter, not here.
 
 use crate::telemetry::task::redact;
 use serde::{Deserialize, Serialize};
@@ -436,8 +436,8 @@ pub struct RuntimeModelMetadata {
     pub source: Option<String>,
 }
 
-/// A safe boundary event supplied by a plugin/bridge and interpreted by the
-/// runtime adapter.
+/// A safe boundary event supplied to the runtime adapter by whichever
+/// component observed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeContextEvent {
     pub execution_id: RuntimeExecutionId,
