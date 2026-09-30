@@ -35,10 +35,10 @@ rewrite for a local task.
 Preserve the existing runtime implementation and its tests. In particular,
 `components/ocg/runtime/` owns snapshot/event reconciliation, generation and
 sequence ordering, deduplication, stale-event rejection, project isolation,
-transport, and command correlation. Mission, execution, logs, ledger,
+transport, and command correlation. Job, execution, logs, ledger,
 attention, project, layout, sidebar, and topbar components consume those
 projections. Extend those canonical modules instead of creating a second
-runtime store or a parallel Mission representation.
+runtime store or a parallel Job representation.
 
 Keep local `.env*`, `.next/`, `node_modules/`, build output, TypeScript build
 metadata, and `.ocg/` out of commits. Do not copy a nested `.git`

@@ -23,7 +23,7 @@ The UI currently runs against a local OCG-owned mock runtime. Inspect a fixture 
 
 ```text
 normal-chat · long-stream · tool-heavy · worker-parallel
-build-failed · retry-success · mission-complete · budget-exhausted
+build-failed · retry-success · job-completed · budget-exhausted
 runtime-disconnected · runtime-connecting · runtime-failed · permission-required
 observability-live · resource-ledger
 ```
@@ -50,7 +50,7 @@ For example: `http://localhost:3000/?scenario=worker-parallel`.
 
 ## Resource ledger
 
-The `resource-ledger` scenario adds a cross-mission usage and cost ledger on top
+The `resource-ledger` scenario adds a cross-job usage and cost ledger on top
 of the workspace. Open it directly at `/resource-ledger`, which defaults to the
 ledger scenario, or via the ledger action in the topbar. A scenario can still be
 selected explicitly with `?scenario=`, for example

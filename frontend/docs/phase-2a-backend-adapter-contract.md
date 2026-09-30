@@ -49,18 +49,21 @@ browser-facing application server. Its current boundaries are:
   persist a replay log.
 - `src/orchestration/state.rs` stores bounded session orchestration state in
   local ignored JSON. It retains up to 16 session records and is fail-soft.
-- `src/orchestration/mission.rs` stores durable Missions in separate versioned
-  JSON files. A Mission has a deterministic identity, revision, generation,
-  task/goal/constraints, lifecycle status, orchestration phase, attempts,
-  execution binding, bounded findings/failures/evidence/checkpoints, history,
-  reconcile state, and budget accounting.
-- `src/orchestration/policy.rs` stores generation-bound approval records. The
-  current durable approval lifecycle is only `pending`, `approved`, or
-  `rejected`; an approval is bound to `(mission_id, generation, action,
-  current_execution_id)`.
+- `src/orchestration/domain.rs` is the durable canonical execution authority. A
+  Job has a deterministic identity, a generation counter, an authoritative
+  Attempt, and owned Executors, Calls, and DispatchIntents. `substrate.sqlite3`
+  is the only execution authority.
+- `src/orchestration/journal.rs` is the canonical durable execution event
+  journal: every lifecycle change of a Job, Attempt, Executor, Call, or
+  DispatchIntent leaves exactly one append-only record that a reconnect replays
+  from a cursor.
+- `src/core_contract.rs` defines the durable approval records the journal
+  records. The current durable approval lifecycle is `pending`, `approved`,
+  `rejected`, `cancelled`, or `expired`; an approval names a Project scope, a
+  subject reference, and a subject fingerprint.
 - `ocg approvals`, `ocg approve`, and `ocg reject` are CLI operations. There is
   no OCG-owned HTTP approval API.
-- Mission budget accounting uses integer micro-units, one currency, durable
+- Project budget accounting uses integer micro-units, one currency, durable
   reservations, settled/reserved/unresolved amounts, and explicit statuses. It
   does not use floating-point money.
 
@@ -91,17 +94,17 @@ The current frontend abstraction is in
 - runtime status;
 - session listing/detail;
 - message history;
-- Mission lookup;
+- Job execution lookup;
 - session creation;
 - sending a message;
 - normalized event subscription;
 - local snapshot access for React's external-store subscription;
 - optional cancellation by session.
 
-The current domain model in `components/ocg/types.ts` is a presentation model,
-not a wire schema. In particular, its `Mission` has display-oriented progress,
-workers, resource commitment, and formatted budget values that are not all
-authoritative fields in the current Rust Mission record.
+The current domain model in `components/ocg/execution/domain.ts` is a
+presentation model, not a wire schema. In particular, its `JobExecution` has
+display-oriented progress, executors, dispatch intents, and formatted budget
+values that are not all authoritative fields in the canonical Rust Job record.
 
 ## 2. Contract shape
 
@@ -144,7 +147,7 @@ major version 1. Unknown event types are ignored after their envelope is
 validated, with a diagnostic retained for observability.
 
 `schemaVersion` is separate from `protocolVersion` when a durable projection
-has its own migration lifecycle, for example the Mission projection.
+has its own migration lifecycle, for example the Job projection.
 
 ## 3. Minimum HTTP operations
 
@@ -158,7 +161,7 @@ These are the smallest operations justified by the existing UI and
 | List sessions | `GET /api/ocg/v1/sessions` | Sidebar grouping and selection | OCG session summaries, newest first, bounded/paginated if needed |
 | Session detail | `GET /api/ocg/v1/sessions/{sessionId}` | Topbar/session selection | One session summary and authoritative revision metadata |
 | Message history | `GET /api/ocg/v1/sessions/{sessionId}/messages` | ChatView history and resync | Ordered normalized message records |
-| Mission snapshot | `GET /api/ocg/v1/sessions/{sessionId}/mission` | MissionView and resync | Mission projection or explicit `null` |
+| Job snapshot | `GET /api/ocg/v1/sessions/{sessionId}/job` | JobInspector and resync | Job projection or explicit `null` |
 | Create session | `POST /api/ocg/v1/sessions` | New chat | OCG session identity and initial revision |
 | Send message | `POST /api/ocg/v1/sessions/{sessionId}/messages` | Composer submission | Accepted command identity and initial message/turn identity |
 | Cancel message work | `POST /api/ocg/v1/sessions/{sessionId}/active-work/cancel` | Stop the current assistant turn | Accepted command identity; the later authoritative cancelled event confirms state |
@@ -180,7 +183,7 @@ resource revision/generation when a command changes durable state:
   "commandId": "cmd_01...",
   "expected": {
     "sessionRevision": 12,
-    "missionId": "mission_...",
+    "jobId": "job_...",
     "generation": 3
   },
   "text": "Please inspect the failing build"
@@ -217,9 +220,9 @@ detection primitive.
 Global per-stream ordering is preferred over independent per-session counters:
 
 - it gives a snapshot one unambiguous high-watermark;
-- it orders Mission, session, message, activity, and runtime changes together;
+- it orders Job, session, message, activity, and runtime changes together;
 - the client can detect a missing event while switching sessions;
-- the event payload still carries optional `sessionId` and `missionId` scope.
+- the event payload still carries optional `sessionId` and `jobId` scope.
 
 The backend must commit the state mutation and append the corresponding event
 under one durable ordering boundary. An event must never be published before
@@ -238,7 +241,7 @@ The snapshot response is conceptually:
     "selectedSession": {
       "session": null,
       "messages": [],
-      "mission": null
+      "job": null
     }
   },
   "cursor": {
@@ -259,8 +262,8 @@ The backend must guarantee:
    explicit cursor-expired response;
 3. the cursor and snapshot are produced from one consistent read boundary.
 
-If the current file-backed Mission/session stores cannot provide that boundary,
-the future OCG server needs a projection/read model or a short lock/transaction
+If the current canonical Job/session stores cannot provide that boundary, the
+future OCG server needs a projection/read model or a short lock/transaction
 around snapshot creation. The browser must not try to assemble an authoritative
 snapshot from several independent HTTP requests.
 
@@ -343,7 +346,7 @@ The proposed OCG-owned envelope is:
   "occurredAt": "2026-09-25T12:34:56.123Z",
   "commandId": "cmd_01...",
   "sessionId": "ses_01...",
-  "missionId": "mission_01...",
+  "jobId": "job_01...",
   "type": "conversation.message_delta",
   "payload": {}
 }
@@ -353,8 +356,8 @@ Rules:
 
 - `eventId`, `streamId`, and `sequence` are OCG identifiers, not OpenCode IDs.
 - `commandId` correlates an event with a browser command when applicable.
-- `sessionId` and `missionId` are optional scope, not a promise that every
-  event belongs to both.
+- `sessionId` and `jobId` are optional scope, not a promise that every event
+  belongs to both.
 - `payload` is type-specific and contains only normalized OCG semantics.
 - Raw OpenCode `type`, `data`, `assistantMessageID`, `ordinal`, provider
   objects, and executor-specific objects do not cross this boundary.
@@ -375,8 +378,8 @@ conversation.message_cancelled
 activity.started
 activity.updated
 activity.completed
-mission.updated
-worker.updated
+job.execution_updated
+observability.updated
 approval.requested
 approval.updated
 command.accepted
@@ -501,7 +504,7 @@ an OpenCode permission prompt. It is bound to:
 
 ```text
 approvalId
-missionId
+jobId
 generation
 action
 currentExecutionId
@@ -512,14 +515,14 @@ The proposed request projection is:
 ```json
 {
   "approvalId": "approval_01...",
-  "missionId": "mission_01...",
+  "jobId": "job_01...",
   "generation": 3,
   "action": "continue_execution",
   "currentExecutionId": "exec_01...",
   "status": "pending",
   "requestedAt": "...",
   "expiresAt": null,
-  "summary": "Resume the current Mission execution"
+  "summary": "Resume the current Job execution"
 }
 ```
 
@@ -530,7 +533,7 @@ The response command is:
   "commandId": "cmd_01...",
   "decision": "approve",
   "expected": {
-    "missionId": "mission_01...",
+    "jobId": "job_01...",
     "generation": 3,
     "action": "continue_execution",
     "currentExecutionId": "exec_01..."
@@ -550,9 +553,9 @@ The approval request must not be auto-approved, auto-rejected, or treated as
 dismissed when the browser disconnects. Dismissal is a UI action only unless
 OCG defines an explicit reject/cancel policy.
 
-If Mission state changes while approval is pending, the backend revalidates the
-exact binding at command time. A terminal Mission or changed generation makes
-the approval stale.
+If Job state changes while approval is pending, the backend revalidates the
+exact binding at command time. A terminal Job or changed generation makes the
+approval stale.
 
 Whether an OpenCode runtime permission request should share this approval
 primitive is unresolved. The current repositories do not expose such a
@@ -566,88 +569,82 @@ Cancellation must be explicit about its target:
    session. This is the current frontend `cancel(sessionId)` use case; Phase 2B
    should add the turn/command identity once the HTTP adapter exists.
 2. **Worker cancellation** stops one OCG worker activity. It must not imply the
-   Mission is terminal.
-3. **Mission cancellation** is a separate durable terminal transition bound to
-   Mission ID and generation. It requires an explicit product command and is
-   not the implementation of the current session cancel button.
+   Job is terminal.
+3. **Job cancellation** is a separate durable terminal transition bound to Job
+   ID and generation. It requires an explicit product command and is not the
+   implementation of the current session cancel button.
 4. **Browser disconnect** only tears down event delivery. It never sends a
-   cancellation command and never changes Mission state.
+   cancellation command and never changes Job state.
 
 The cancel command returns `command.accepted` when OCG accepted the request.
 Only a later `conversation.message_cancelled`, `activity.completed` with
-`cancelled`, or explicit Mission cancellation event is authoritative. If the
+`cancelled`, or explicit Job cancellation event is authoritative. If the
 runtime cannot prove that work stopped, it must report a typed failure or
 `cancellation_pending` state rather than claiming cancelled.
 
-The existing Rust Mission rule supports an explicit durable `Cancelled`
-terminal state, but the current runtime lifecycle trait has no cancel method and
-the OpenCode adapter has no verified cancel route. The backend gap must be
-closed before exposing Mission cancellation in the browser.
+The canonical Job rule supports an explicit durable `Cancelled` terminal state,
+but the current runtime lifecycle trait has no cancel method and the OpenCode
+adapter has no verified cancel route. The backend gap must be closed before
+exposing Job cancellation in the browser.
 
-## 10. Mission and worker projection
+## 10. Job and executor projection
 
-The OCG wire Mission projection should contain the minimum authoritative facts
-needed by MissionView:
+The OCG wire Job projection should contain the minimum authoritative facts
+needed by the Job inspector:
 
 ```json
 {
+  "apiVersion": "ocg.canonical.v1",
   "schemaVersion": 1,
-  "missionId": "mission_01...",
-  "revision": 18,
+  "projectId": "zhuju",
+  "jobId": "job_01...",
+  "cursor": 1842,
+  "state": "running",
   "generation": 3,
-  "goal": "...",
-  "status": "active",
-  "phase": "build",
-  "currentTaskId": "task_02",
-  "progress": { "completed": 3, "total": 7 },
-  "tasks": [],
-  "workers": [],
-  "attempts": { "build": 1, "verify": 1, "debug": 0 },
-  "warnings": [],
-  "resourceCommitment": null,
-  "budget": {
-    "currency": "USD",
-    "hardLimitMicros": 5000000,
-    "settledMicros": 1200000,
-    "reservedMicros": 100000,
-    "unresolvedMicros": 0,
-    "status": "active"
-  },
+  "authoritativeAttemptId": "attempt_01...",
+  "progress": { "settled": 3, "total": 7, "percent": 43 },
+  "attempts": [],
+  "calls": [],
+  "executors": [],
+  "dispatchIntents": [],
   "createdAt": "...",
-  "updatedAt": "...",
-  "elapsedMs": 2520000
+  "updatedAt": "..."
 }
 ```
 
 Authority rules:
 
-- `missionId`, `revision`, `generation`, `status`, `phase`, task facts,
-  attempts, warnings, and budget accounting are backend facts.
-- `revision` is the optimistic-concurrency witness. The frontend does not
-  increment it.
-- `progress` and `tasks` must be explicitly supplied if the UI is expected to
-  show exact totals. The current Rust Mission stores phase/checkpoints/findings,
-  but does not currently expose a task list or completed/total projection.
-  The adapter must not invent totals from checkpoint count.
-- `workers` and `resourceCommitment` are optional until OCG owns durable worker
-  and resource semantics. An absent value means unknown/not exposed, not zero.
-- budget values are integer micro-units. The current frontend's display number
-  fields are presentation-only and cannot be the long-term accounting schema.
-- `elapsedMs` is a backend timestamp projection. The browser may format it but
-  must not turn a disconnected wall clock into Mission progress.
-- `currentTaskId`/`phase` should map to the current frontend `current` label in
-  the adapter. Raw Rust role/transition internals remain out of React.
+- `projectId`, `jobId`, `cursor`, `state`, `generation`, the authoritative
+  Attempt, and the Executor/Call/DispatchIntent facts are backend facts.
+- `cursor` is the canonical journal cursor the snapshot was taken at. It is the
+  optimistic-concurrency and replay witness; the frontend does not increment
+  it.
+- `progress` is derived from the authoritative Attempt's Calls
+  (`settled`/`total`/`percent`) and is `null`, not zero, when the authoritative
+  Attempt carries no Calls. The adapter must not invent totals from checkpoint
+  count.
+- `executors` and `dispatchIntents` are canonical Executor and DispatchIntent
+  projections. An executor `kind` and each raw state word are shown verbatim
+  rather than coerced into a status the projection cannot justify.
+- accounting values are integer micro-units in one currency with a display
+  ceiling. The current frontend's display number fields are presentation-only
+  and cannot be the long-term accounting schema.
+- `createdAt`/`updatedAt` are backend instants. `updatedAt - createdAt` is the
+  only honest elapsed; the browser must not turn a disconnected wall clock into
+  Job progress.
+- the current Call should map to the current frontend `current` label in the
+  adapter. Raw Rust role/transition internals remain out of React.
 
-Terminal Mission statuses are authoritative and distinct: `completed`,
-`failed`, and `cancelled`. `budget_exhausted` is best represented as a budget
-status/reason plus an active or blocked Mission unless OCG core explicitly
-adopts it as a durable Mission lifecycle status. The current Rust Mission
-status set does not include `budget_exhausted`.
+The canonical Job state set is `pending`, `eligible`, `running`, `cancelling`,
+`completed`, `failed`, `cancelled`, `unknown`, and `orphaned`. The terminal
+states are authoritative and distinct. `budget_exhausted` is best represented as
+an accounting reason plus an active or blocked Job unless OCG core explicitly
+adopts it as a durable Job state; the canonical state set does not include it.
 
-Worker events should be OCG worker projections (`workerId`, label, status,
-taskId, attempt, summary), not OpenCode agent names. The current OCG code has
-worker role/plugin knowledge but no durable worker registry or scheduler; that
-is a backend gap.
+Executor events should be OCG Executor projections (`executorId`, kind, status,
+attemptId, summary), not OpenCode agent names. The canonical substrate records
+Executors and DispatchIntents, but scheduling and resource placement remain
+deferred; there is no durable worker registry or scheduler.
 
 ## 11. Errors
 
@@ -677,10 +674,10 @@ on `code`:
 | `authentication_required` / `forbidden` | Browser is not authorized; auth is outside Phase 2A |
 | `runtime_unavailable` | OCG cannot reach or has no usable executor |
 | `provider_failure` | Executor/provider failed an admitted operation |
-| `mission_failed` | Durable Mission transition reached failed state |
+| `job_failed` | Durable Job transition reached failed state |
 | `transport_unavailable` | Temporary OCG transport failure; safe to retry/reconnect |
 | `stale_command` / `conflict` | Revision/generation/owner precondition failed |
-| `unknown_resource` | Session, Mission, turn, activity, or approval does not exist |
+| `unknown_resource` | Session, Job, turn, activity, or approval does not exist |
 | `approval_stale` | Approval no longer matches the exact action binding |
 | `cursor_expired` | Event replay is outside the retention window |
 | `protocol_incompatible` | Major protocol mismatch |
@@ -698,7 +695,7 @@ OCG wire snapshot/event DTO
         ↓ validate protocol, revisions, enums, bounds
 wire mapper
         ↓ map only supported semantics
-frontend ChatSession / ChatMessage / Mission / ToolActivity
+frontend ChatSession / ChatMessage / JobExecution / ToolActivity
         ↓
 OcgRuntimeEvent and RuntimeSnapshot
         ↓
@@ -713,7 +710,7 @@ Initial mapping rules:
 | OCG message | `ChatMessage` | Map stable id, role, content, created time, and normalized status |
 | message delta | `conversation.message-delta` | Apply only once per turn/delta sequence; do not expose executor event names |
 | OCG activity | `ToolActivity` | Map allowlisted label/kind/status/duration/summary/result preview/error |
-| Mission projection | `Mission` | Map backend-authoritative fields; format presentation labels in the mapper/view |
+| Job projection | `JobExecution` | Map backend-authoritative fields; format presentation labels in the mapper/view |
 | integer budget micros | current budget display | Format for display only; do not use frontend float as accounting authority |
 | `runtime.status_changed` | `RuntimeStatus` | Preserve connected/connecting/disconnected/failed semantics |
 | structured error | warning/error event | Branch on stable code; retain safe message only for display |
@@ -729,19 +726,19 @@ must receive only the existing normalized frontend event union.
 
 The current `cancel?(sessionId)` is underspecified for a real backend. Before
 HTTP integration, it should become a message-turn cancellation command carrying
-`commandId` and `turnId`, while Mission and worker cancellation remain separate
+`commandId` and `turnId`, while Job and worker cancellation remain separate
 operations.
 
 Approval response is not currently represented in `OcgRuntimeClient`. Before
 an approval control is wired, add a frontend-owned method such as
 `respondToApproval(input)` whose input contains `approvalId`, decision, and the
-expected Mission binding. Do not make React call an arbitrary URL.
+expected Job binding. Do not make React call an arbitrary URL.
 
 ## 13. Security boundary
 
 The browser may receive:
 
-- opaque session/Mission/turn/activity IDs;
+- opaque session/Job/turn/activity IDs;
 - safe runtime state and capability names;
 - bounded display labels and summaries;
 - safe provider/model display metadata only if product requires it;
@@ -768,7 +765,7 @@ These require OCG core/product decisions before a production adapter:
 1. Where does the OCG-owned browser server run and how is it attached to an
    invocation-scoped OpenCode runtime without exposing the loopback secret?
 2. What durable projection/read model provides an atomic snapshot plus event
-   high-watermark across file-backed session and Mission state?
+   high-watermark across session and canonical Job state?
 3. What event journal is retained, and are the proposed 10,000/24-hour replay
    defaults acceptable?
 4. How does OCG send a normal user message through the runtime? The current
@@ -779,10 +776,10 @@ These require OCG core/product decisions before a production adapter:
 6. Which OpenCode permission prompts, if any, become OCG approval requests?
    Current OCG approvals are control-plane policy approvals only.
 7. Does OCG own a task list/progress model and worker registry, or should the
-   frontend Mission projection show unknown values until one exists?
+   frontend Job projection show unknown values until one exists?
 8. Which resource commitment facts are authoritative while Resource Broker,
    placement, and scheduling remain deferred?
-9. Does the product want a Mission cancellation endpoint separate from message
+9. Does the product want a Job cancellation endpoint separate from message
    cancellation, and what confirmation/authorization is required?
 10. What safe provider/model metadata is useful enough to expose to the
     browser?
@@ -797,7 +794,7 @@ namespace:
 
 1. define the protocol/error schemas and protocol-version handshake;
 2. create an authoritative snapshot projection for runtime, sessions, one
-   message history, and one Mission projection;
+   message history, and one Job projection;
 3. add a durable/global event cursor with a bounded replay window;
 4. expose read-only snapshot + replay first;
 5. prove duplicate delivery, cursor expiry, sequence gaps, and snapshot/resume
