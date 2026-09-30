@@ -551,12 +551,6 @@ impl DomainRepository {
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
             [],
         ).map_err(sql)?;
-        connection
-            .execute(
-                "INSERT INTO domain_dispatch_intents(id,call_id,job_id,attempt_id,executor_id,generation,state,effect_kind,effect_state,request,reservation_id,budget_admitted,failure,created_at,updated_at) SELECT 'intent-' || c.id,c.id,a.job_id,c.attempt_id,c.executor_id,c.generation,CASE WHEN c.state='created' THEN 'pending' WHEN c.state='running' THEN 'running' ELSE 'completed' END,CASE WHEN c.side_effect=1 THEN 'strict_fenced' ELSE 'idempotent' END,CASE WHEN c.state='running' THEN 'unknown' ELSE 'settled' END,c.request,NULL,1,NULL,c.created_at,COALESCE(c.finished_at,c.created_at) FROM domain_calls c JOIN domain_attempts a ON a.id=c.attempt_id WHERE NOT EXISTS(SELECT 1 FROM domain_dispatch_intents i WHERE i.call_id=c.id)",
-                [],
-            )
-            .map_err(sql)?;
         let repository = Self { connection, path };
         repository.ensure_project(root)?;
         Ok(repository)

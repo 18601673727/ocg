@@ -57,12 +57,6 @@ pub const ENV_ENABLED: &str = "OCG_ORCHESTRATION";
 pub struct OrchestrationConfig {
     /// Allow orchestration. When false no plugin is emitted and no state is kept.
     pub enabled: bool,
-    /// Route admitted/delegated execution through the canonical Job/Attempt
-    /// substrate. This remains explicit opt-in until admission, result delivery,
-    /// recovery and terminal transitions share one authority. The default
-    /// legacy lane must not silently create a second competing decision source.
-    #[serde(default)]
-    pub canonical_execution: bool,
     /// Build retries after a failed verification, before Debug is recommended.
     pub max_build_retries: usize,
     /// Debug hand-offs after the build budget is exhausted.
@@ -82,7 +76,6 @@ impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            canonical_execution: true,
             max_build_retries: DEFAULT_MAX_BUILD_RETRIES,
             max_debug_retries: DEFAULT_MAX_DEBUG_RETRIES,
             max_handoff_bytes: DEFAULT_MAX_HANDOFF_BYTES,
@@ -109,14 +102,6 @@ impl OrchestrationConfig {
             config.enabled = enabled
                 .as_bool()
                 .ok_or_else(|| OcgError::config("orchestration.enabled must be a boolean"))?;
-        }
-        if let Some(canonical) = object
-            .get("canonicalExecution")
-            .or_else(|| object.get("canonical_execution"))
-        {
-            config.canonical_execution = canonical.as_bool().ok_or_else(|| {
-                OcgError::config("orchestration.canonicalExecution must be a boolean")
-            })?;
         }
         for (key, slot, label) in [
             (
