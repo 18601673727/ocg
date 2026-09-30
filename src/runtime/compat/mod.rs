@@ -267,7 +267,7 @@ pub struct EffectiveLead {
 ///
 /// New orchestration code uses [`crate::runtime::lifecycle::RuntimeAdapter`].
 /// This trait remains for the existing V2 client contract and older callers;
-/// its JSON-shaped methods are not part of the Mission-facing boundary.
+/// its JSON-shaped methods are not part of the Job-facing boundary.
 /// Implementations are invocation-scoped; no operation here restarts a
 /// runtime or reads provider credentials.
 pub trait SessionLifecycleClient {
@@ -288,7 +288,7 @@ pub trait SessionLifecycleClient {
     ) -> Result<crate::runtime::lifecycle::RuntimeModelMetadata>;
     /// Add a durable synthetic continuation message. Synthetic input is used
     /// instead of a normal prompt so it cannot be mistaken for a new user task
-    /// and cannot reset Mission identity.
+    /// and cannot reset Job identity.
     fn inject_continuation(
         &self,
         session: &str,
@@ -346,7 +346,7 @@ pub trait SessionClient {
     fn effective_lead(&self, session: &str) -> Result<EffectiveLead>;
 }
 
-/// Legacy composition retained for compatibility callers. Mission-facing
+/// Legacy composition retained for compatibility callers. Job-facing
 /// orchestration now depends on [`crate::runtime::lifecycle::RuntimeAdapter`].
 pub trait RolloverRuntime: SessionClient + SessionLifecycleClient {}
 

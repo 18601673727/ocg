@@ -171,7 +171,7 @@ impl<T> Fact<T> {
 
 /// A deterministic, filesystem-safe resource identifier.
 ///
-/// It is derived from the known identity dimensions, never from a Mission,
+/// It is derived from the known identity dimensions, never from a Job,
 /// execution or OpenCode session id, and never from a raw agent label.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

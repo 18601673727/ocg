@@ -13,9 +13,9 @@ use std::fmt;
 
 /// An opaque execution identity owned by a runtime adapter.
 ///
-/// It is intentionally not a Mission identity. A Mission may outlive many
-/// execution objects, and a rollover replaces this value without changing the
-/// Mission ID or generation.
+/// It is intentionally not a Job identity. A Job may outlive many execution
+/// objects, and a rollover replaces this value without changing the Job ID or
+/// generation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RuntimeExecutionId(String);
@@ -49,7 +49,7 @@ impl From<&str> for RuntimeExecutionId {
 }
 
 /// Maximum number of parent edges accepted from a runtime. A longer chain
-/// cannot be used as evidence of Mission ownership.
+/// cannot be used as evidence of Job ownership.
 pub const MAX_EXECUTION_LINEAGE_DEPTH: usize = 32;
 
 /// Verified, runtime-neutral ancestry for a single execution.
@@ -128,19 +128,19 @@ pub fn resolve_execution_lineage(
 /// or selecting an unrelated root session.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuntimeRecoveryKey {
-    pub mission_id: String,
+    pub job_id: String,
     pub generation: u32,
     pub operation_id: String,
 }
 
 impl RuntimeRecoveryKey {
     pub fn new(
-        mission_id: impl Into<String>,
+        job_id: impl Into<String>,
         generation: u32,
         operation_id: impl Into<String>,
     ) -> Self {
         Self {
-            mission_id: mission_id.into(),
+            job_id: job_id.into(),
             generation,
             operation_id: operation_id.into(),
         }
@@ -492,7 +492,7 @@ impl RuntimeContextObservation {
     }
 }
 
-/// A continuation is an execution request, not a Mission identity transition.
+/// A continuation is an execution request, not a Job identity transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeContinuation {
     pub id: String,

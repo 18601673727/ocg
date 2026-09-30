@@ -70,7 +70,7 @@ pub struct Env {
     /// redacted while the child process receives the raw value through env.
     pub v2_server_password: Option<Secret>,
     /// The session selected by the launch preflight. It is a target identity,
-    /// not a Mission identity.
+    /// not a Job identity.
     pub v2_target_session: Option<String>,
     /// Exact directory used to create the invocation's V2 sessions.
     pub v2_directory: Option<String>,
@@ -178,12 +178,12 @@ pub enum Command {
     Verify(Vec<OsString>),
     Tools(Vec<OsString>),
     Checkpoint(Vec<OsString>),
-    /// Explicitly reconcile durable Missions once.
+    /// Explicitly reconcile durable Jobs once.
     Reconcile(Vec<OsString>),
     /// Read-only inspection of the descriptive Resource Registry.
     Resources(Vec<OsString>),
-    /// Inspect the mandatory economic configuration and durable Mission budget,
-    /// or explicitly set a hard Mission budget (the only way past a hard cap).
+    /// Inspect the mandatory economic configuration and durable Project budget,
+    /// or explicitly set a hard Project budget (the only way past a hard cap).
     Budget(Vec<OsString>),
     /// Run the loopback-only HTTP/SSE control server.
     Serve(Vec<OsString>),
@@ -844,10 +844,10 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> std::result::Result<i32, F
 }
 
 /// `ocg reconcile [--once]`: one bounded, explicit convergence pass over the
-/// durable Mission store. The command does not start a daemon or a background
+/// durable Job store. The command does not start a daemon or a background
 /// worker. A live V2 client is used only when the invocation already has a
 /// runtime endpoint or OpenCode's registered service is available; otherwise
-/// Missions are reported as runtime-unavailable and no replacement is made.
+/// Jobs are reported as runtime-unavailable and no replacement is made.
 fn reconcile_command(
     _effective: &config::Effective,
     project_root: &Path,
@@ -1995,7 +1995,7 @@ fn launch(
         ));
         // These values exist only in this invocation's child environment. The
         // runtime passes them onward for context observation;
-        // none is written to Mission, telemetry, rollover or continuation
+        // none is written to telemetry, rollover or continuation
         // artifacts. The target id also makes the launched OpenCode client
         // select the session whose Lead was verified above.
         private_env.push((

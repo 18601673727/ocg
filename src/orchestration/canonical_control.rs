@@ -3,7 +3,7 @@
 //! This module is deliberately transport-neutral. The PWA and loopback server
 //! consume these DTOs; neither owns execution state. The SQLite substrate is
 //! the authority, and every response includes a protocol version and the
-//! canonical Mission snapshot needed to reconcile a reconnect.
+//! canonical Job snapshot needed to reconcile a reconnect.
 
 use crate::error::{OcgError, Result};
 use crate::orchestration::domain::{Attempt, Call, DispatchIntent, DomainRepository, Executor};

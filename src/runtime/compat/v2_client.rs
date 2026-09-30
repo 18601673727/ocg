@@ -4,7 +4,7 @@
 //! implements the runtime-neutral contract in
 //! [`crate::runtime::lifecycle::RuntimeAdapter`] while retaining the existing
 //! OpenCode compatibility traits for launch/effective-state callers. Every
-//! HTTP route, JSON shape and discovery detail lives here, so Mission-facing
+//! HTTP route, JSON shape and discovery detail lives here, so Job-facing
 //! orchestration does not parse V2 responses.
 //!
 //! The routes below were read from the running OpenCode 2.0.x server's own
@@ -947,8 +947,8 @@ impl RuntimeAdapter for V2SessionClient {
                     return false;
                 };
                 metadata.get("marker").and_then(Value::as_str) == Some("OCG_RECONCILIATION")
-                    && metadata.get("mission_id").and_then(Value::as_str)
-                        == Some(key.mission_id.as_str())
+                    && metadata.get("job_id").and_then(Value::as_str)
+                        == Some(key.job_id.as_str())
                     && metadata.get("generation").and_then(Value::as_u64)
                         == Some(key.generation as u64)
                     && metadata.get("operation_id").and_then(Value::as_str)

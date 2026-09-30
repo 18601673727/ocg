@@ -128,7 +128,7 @@ impl Profile {
     pub fn require_runnable(&self) -> Result<()> {
         self.validate()?;
         if self.runnable_models().next().is_none() {
-            return Err(OcgError::config("No runnable provider/model configured; replace the Profile placeholders before executing a Mission"));
+            return Err(OcgError::config("No runnable provider/model configured; replace the Profile placeholders before executing a Job"));
         }
         Ok(())
     }

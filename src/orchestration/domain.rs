@@ -939,8 +939,8 @@ impl DomainRepository {
     }
 
     /// Evaluate and persist the canonical provider-spend admission. The
-    /// budget is stored beside the Project/Job/Attempt authority so replay's
-    /// Mission ledger cannot authorize a provider Call.
+    /// budget is stored beside the Project/Job/Attempt authority so a replayed
+    /// ledger cannot authorize a provider Call.
     pub fn admit_dispatch(
         &mut self,
         project_id: &str,
@@ -2008,7 +2008,7 @@ impl DomainRepository {
     ///
     /// The binding key is the stable session/runtime identity supplied by the
     /// caller. Re-admission is idempotent and returns the existing authority;
-    /// no legacy Mission, Job, Attempt, or JSON recovery record participates.
+    /// no legacy Job, Attempt, or JSON recovery record participates.
     pub fn admit_job(
         &mut self,
         project: Project,
@@ -3843,8 +3843,8 @@ fn store_budget(
 }
 
 /// Resolve the intent a settlement operates on, together with the Project that
-/// owns its budget. Project is the budget authority scope: there is no Mission
-/// budget that could authorize or account for a provider Call.
+/// owns its budget. Project is the budget authority scope: there is no separate
+/// Job budget that could authorize or account for a provider Call.
 fn read_accounting_target(
     connection: &Connection,
     call_id: &str,

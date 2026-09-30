@@ -1,7 +1,7 @@
 //! Managed OpenCode runtime and the runtime-neutral execution lifecycle seam.
 //!
 //! `compat` describes OpenCode family/config behavior. `lifecycle` is the
-//! stateful per-invocation contract consumed by Mission orchestration; OpenCode
+//! stateful per-invocation contract consumed by Job orchestration; OpenCode
 //! V2 is its first concrete adapter.
 //!
 //! The runtime layer answers one question for a launch: which `opencode`

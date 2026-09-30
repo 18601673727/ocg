@@ -608,7 +608,7 @@ pub fn decide(
 /// The directory containing context/rollover artifacts.
 /// Persist one bounded context observation atomically. Telemetry is an
 /// artifact, not a second state authority: it contains no transcript and is
-/// never consulted to reconstruct a Mission.
+/// never consulted to reconstruct a Job.
 pub fn save_observation(root: &Path, observation: &ContextObservation) -> Result<PathBuf> {
     if observation.schema_version != CONTEXT_ARTIFACT_SCHEMA_VERSION {
         return Err(OcgError::config(format!(
