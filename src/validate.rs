@@ -21,7 +21,6 @@ pub fn validate(effective: &Effective) -> Vec<String> {
     errors.extend(crate::orchestration::OrchestrationConfig::validate(data));
     errors.extend(crate::orchestration::policy::PolicyConfig::validate(data));
     errors.extend(crate::orchestration::budget::BudgetConfig::validate(data));
-    errors.extend(crate::reports::ReportsConfig::validate(data));
 
     if let Err(error) = crate::profile::Profile::from_ocg_config(data) {
         errors.push(error.to_string());

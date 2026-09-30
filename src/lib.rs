@@ -42,7 +42,6 @@ pub mod provider_transport;
 pub mod proxy;
 pub mod pwa;
 pub mod report;
-pub mod reports;
 pub mod resources;
 pub mod runtime;
 pub mod telemetry;
