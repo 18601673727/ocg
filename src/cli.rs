@@ -1240,61 +1240,46 @@ fn budget_command(
 
 /// `ocg budget set --project-id <id> --limit <micros> --currency <CUR>`: the
 /// only supported way past a hard cap. It is an explicit operator change to the
-/// durable Project hard budget itself, never an approval. `--mission` is
-/// accepted as a legacy alias for the same Project identity.
+/// durable Project hard budget itself, never an approval.
 fn budget_set_command(
     effective: &config::Effective,
     project_root: &Path,
     args: &[OsString],
     pretty: bool,
 ) -> std::result::Result<i32, Failure> {
-    // `--mission` remains a legacy alias for the same canonical Project
-    // identity; normalize the flag before parsing so both the `--flag value`
-    // and `--flag=value` forms behave identically.
-    let normalized: Vec<OsString> = args
-        .iter()
-        .map(|arg| {
-            let text = arg.to_string_lossy();
-            if text.starts_with("--mission") {
-                OsString::from(text.replacen("--mission", "--project-id", 1))
-            } else {
-                arg.clone()
-            }
-        })
-        .collect();
     let mut json = false;
     let mut project_id: Option<String> = None;
     let mut limit: Option<i64> = None;
     let mut currency: Option<String> = None;
     let mut index = 0;
-    while index < normalized.len() {
-        let text = normalized[index].to_string_lossy().into_owned();
+    while index < args.len() {
+        let text = args[index].to_string_lossy().into_owned();
         match text.as_str() {
             "--json" => {
                 json = true;
                 index += 1;
             }
             "--project-id" => {
-                project_id = Some(option_value(&normalized, "--project-id", &mut index)?)
+                project_id = Some(option_value(args, "--project-id", &mut index)?)
             }
             "--limit" => {
-                let value = option_value(&normalized, "--limit", &mut index)?;
+                let value = option_value(args, "--limit", &mut index)?;
                 limit = Some(value.parse::<i64>().map_err(|_| {
                     usage_failure(format!("--limit must be an integer, got '{value}'"))
                 })?);
             }
-            "--currency" => currency = Some(option_value(&normalized, "--currency", &mut index)?),
+            "--currency" => currency = Some(option_value(args, "--currency", &mut index)?),
             _ if text.starts_with("--project-id=") => {
-                project_id = Some(option_value(&normalized, "--project-id", &mut index)?)
+                project_id = Some(option_value(args, "--project-id", &mut index)?)
             }
             _ if text.starts_with("--limit=") => {
-                let value = option_value(&normalized, "--limit", &mut index)?;
+                let value = option_value(args, "--limit", &mut index)?;
                 limit = Some(value.parse::<i64>().map_err(|_| {
                     usage_failure(format!("--limit must be an integer, got '{value}'"))
                 })?);
             }
             _ if text.starts_with("--currency=") => {
-                currency = Some(option_value(&normalized, "--currency", &mut index)?)
+                currency = Some(option_value(args, "--currency", &mut index)?)
             }
             _ => return Err(usage_failure(format!("unknown budget set option: {text}"))),
         }
