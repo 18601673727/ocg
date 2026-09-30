@@ -628,9 +628,10 @@ fn scaled_micros(tokens: u64, micros_per_million: i64) -> Option<i64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetOrigin {
-    /// No hard budget was ever configured for this Project.
+    /// No explicit or effective hard budget limit is configured for this
+    /// Project, so there is no origin to attribute a limit to.
     #[default]
-    LegacyUnconfigured,
+    Unconfigured,
     /// The limit was materialized from the effective `budget` configuration.
     SystemDefault,
     /// The limit was explicitly set by an operator (`ocg budget set`).
@@ -640,7 +641,7 @@ pub enum BudgetOrigin {
 impl BudgetOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::LegacyUnconfigured => "legacy_unconfigured",
+            Self::Unconfigured => "unconfigured",
             Self::SystemDefault => "system_default",
             Self::ExplicitUserLimit => "explicit_user_limit",
         }
@@ -1172,7 +1173,7 @@ impl Default for ProjectBudget {
             schema_version: BUDGET_SCHEMA_VERSION,
             currency: String::new(),
             hard_limit: None,
-            origin: BudgetOrigin::LegacyUnconfigured,
+            origin: BudgetOrigin::Unconfigured,
             settled: Money::default(),
             reserved: Money::default(),
             unresolved: Money::default(),

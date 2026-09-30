@@ -233,9 +233,6 @@ export function deriveRuntimeLogEntries(snapshot: RuntimeSnapshot, sessionId: st
       source: "Orchestration",
       category: "call",
       message: activity.message,
-      missionId: activity.missionId,
-      taskId: activity.taskId,
-      workerId: activity.workerId,
       sessionId,
     }));
   }

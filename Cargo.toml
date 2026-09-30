@@ -1,6 +1,6 @@
 [package]
 name = "ocg"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.88"
 description = "Project-agnostic orchestration Core and PWA control plane"
@@ -43,7 +43,6 @@ typed-index-collections = "3.5"
 petgraph = "0.8"
 compio = { version = "0.19", default-features = false, features = ["runtime"] }
 ntex = { version = "3.12", default-features = false, features = ["compio"] }
-rust-mcp-schema = { version = "2.0", default-features = false, features = ["2025_11_25", "schema_utils"] }
 flume = "0.11"
 strum = { version = "0.27", features = ["derive"] }
 derive_more = { version = "2", features = ["as_ref", "display", "deref", "from"] }

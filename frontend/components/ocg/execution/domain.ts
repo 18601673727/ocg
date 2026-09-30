@@ -27,55 +27,6 @@ import type {
 } from "../contracts";
 import type { ProjectId } from "../project/domain";
 import { formatTimestamp } from "@/lib/format";
-import type { MissionStatus } from "../types";
-
-/** Compatibility read shapes for the legacy mission-control surface. */
-export type ExecutionStatus = "planned" | "queued" | "waiting" | "ready" | "starting" | "running" | "blocked" | "verifying" | "retrying" | "completed" | "failed" | "cancelled" | "skipped";
-export type ExecutionTaskKind = "task" | "gate";
-export type ExecutionEdgeKind = "dependency" | "gate" | "conflict";
-export type ExecutionTask = { id: string; missionId: string; title: string; status: ExecutionStatus; dependencies: string[]; dependents: string[]; kind?: ExecutionTaskKind; description?: string; capabilityRequirement?: string; usageSummary?: ExecutionUsageSummary; attemptHistory?: ExecutionAttempt[]; escalationHistory?: { provider: string; model: string; reason: string }[]; schedulingReason?: string; wave?: number; workerId?: string; workerRole?: string; provider?: string; model?: string; variant?: string; startedAt?: string; finishedAt?: string; elapsedMs?: number; attempt?: number; maxAttempts?: number; retryCount?: number; progress?: number; blockedReason?: string; waitingReason?: string; outputSummary?: string; verificationSummary?: string; priority?: "low" | "normal" | "high" };
-export type ExecutionUsageSummary = { tokens?: number; cost?: number };
-export type ExecutionActivityItem = { id: string; elapsedMs: number; timestamp: string; missionId: string; taskId?: string; workerId?: string; kind: string; message: string; status?: ExecutionStatus };
-export type WorkerExecutionStatus = "queued" | "active" | "waiting" | "idle" | "completed" | "blocked";
-export type WorkerExecution = { id: string; role: "lead" | "worker"; label: string; status: WorkerExecutionStatus; provider?: string; model?: string; variant?: string; currentTaskId?: string; completedTaskIds: string[]; invocationCount?: number; retryCount?: number; elapsedMs?: number; usageSummary?: ExecutionUsageSummary };
-export type ExecutionWave = { index: number; taskIds: string[]; status: "planned" | "active" | "completed" };
-export type ExecutionEdge = { id: string; fromTaskId: string; toTaskId: string; kind: ExecutionEdgeKind; status?: "pending" | "active" | "completed" | "blocked" };
-export type ExecutionGate = { id: string; taskId?: string; type: "verification" | "review" | "approval" | "integration"; status: "pending" | "running" | "passed" | "failed" | "blocked"; reason?: string };
-export type ExecutionSummary = { completed: number; total: number; running: number; waiting: number; blocked: number; failed: number; retrying: number };
-export type MissionExecution = {
-  missionId: string;
-  title: string;
-  status: MissionStatus | "waiting" | "blocked" | "cancelled";
-  currentWave?: number;
-  totalWaves?: number;
-  startedAt?: string;
-  finishedAt?: string;
-  taskIds: string[];
-  edgeIds: string[];
-  workerIds: string[];
-  tasks: ExecutionTask[];
-  edges: ExecutionEdge[];
-  workers: WorkerExecution[];
-  waves: ExecutionWave[];
-  gates: ExecutionGate[];
-  activities: ExecutionActivityItem[];
-  summary: ExecutionSummary;
-  budget?: { spent: number; limit: number; tokens: number; commitmentPercent: number };
-  nextTaskIds?: string[];
-  criticalPathTaskIds?: string[];
-};
-export type ExecutionTaskFilters = { query?: string; status?: ExecutionStatus; wave?: number; workerRole?: string; provider?: string; model?: string };
-export type GraphNode = { id: string; task: ExecutionTask; x: number; y: number; width: number; height: number };
-export type GraphEdge = ExecutionEdge & { source: GraphNode; target: GraphNode };
-export type ExecutionGraph = { nodes: GraphNode[]; edges: GraphEdge[]; width: number; height: number };
-export function formatExecutionStatus(status: ExecutionStatus | MissionExecution["status"]): string { return status.replaceAll("-", " "); }
-export function taskStatusCounts(tasks: ExecutionTask[]): ExecutionSummary { return { completed: tasks.filter((task) => task.status === "completed").length, total: tasks.length, running: tasks.filter((task) => ["starting", "running", "verifying"].includes(task.status)).length, waiting: tasks.filter((task) => ["waiting", "queued", "planned", "ready"].includes(task.status)).length, blocked: tasks.filter((task) => task.status === "blocked").length, failed: tasks.filter((task) => ["failed", "cancelled", "skipped"].includes(task.status)).length, retrying: tasks.filter((task) => task.status === "retrying").length }; }
-export function filterExecutionTasks(tasks: ExecutionTask[], filters: ExecutionTaskFilters = {}): ExecutionTask[] { const query = filters.query?.trim().toLowerCase(); return tasks.filter((task) => (!query || task.title.toLowerCase().includes(query)) && (filters.status === undefined || task.status === filters.status) && (filters.wave === undefined || task.wave === filters.wave) && (filters.workerRole === undefined || task.workerRole === filters.workerRole) && (filters.provider === undefined || task.provider === filters.provider) && (filters.model === undefined || task.model === filters.model)); }
-export function executionWaves(execution: MissionExecution): ExecutionWave[] { return execution.waves; }
-export function currentWave(execution: MissionExecution): number | undefined { return execution.currentWave; }
-export function dependencyClosure(execution: MissionExecution, taskId: string): Set<string> { const byId = new Map<string, ExecutionTask>(execution.tasks.map((task: ExecutionTask) => [task.id, task])); const found = new Set<string>(); const visit = (id: string) => { if (found.has(id)) return; found.add(id); for (const dependency of byId.get(id)?.dependencies ?? []) visit(dependency); }; visit(taskId); return found; }
-export function dependentClosure(execution: MissionExecution, taskId: string): Set<string> { const found = new Set<string>(); const visit = (id: string) => { if (found.has(id)) return; found.add(id); for (const dependent of execution.tasks.find((task: ExecutionTask) => task.id === id)?.dependents ?? []) visit(dependent); }; visit(taskId); return found; }
-export function deriveExecutionGraph(execution: MissionExecution): ExecutionGraph { const nodes: GraphNode[] = execution.tasks.map((task: ExecutionTask, index: number) => ({ id: task.id, task, x: 28, y: 56 + index * 118, width: 188, height: 92 })); const byId = new Map<string, GraphNode>(nodes.map((node: GraphNode) => [node.id, node])); const edges = execution.edges.flatMap((edge: ExecutionEdge) => { const source = byId.get(edge.fromTaskId); const target = byId.get(edge.toTaskId); return source && target ? [{ ...edge, source, target }] : []; }); return { nodes, edges, width: 680, height: Math.max(310, 56 + nodes.length * 118) }; }
 
 /* -------------------------------------------------------------------------- */
 /* Identity                                                                   */
@@ -222,12 +173,6 @@ export type ExecutionAttempt = {
   finishedAt: number | null;
   callCount: number;
   settledCallCount: number;
-  number?: number;
-  status?: "failed" | "running" | "completed";
-  model?: string;
-  provider?: string;
-  elapsedMs?: number;
-  reason?: string;
 };
 
 /** The Attempt history of one Job, ordered by generation. */
@@ -440,10 +385,6 @@ export type CallActivityItem = {
   timestamp: string;
   message: string;
   elapsedMs?: number;
-  kind?: string;
-  missionId?: string;
-  taskId?: string;
-  workerId?: string;
 };
 
 function callActivity(call: ExecutionCall, jobId: string): CallActivityItem {

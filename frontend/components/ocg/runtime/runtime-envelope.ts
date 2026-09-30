@@ -21,7 +21,6 @@ import type {
 } from "../types";
 import { RUNTIME_CONNECTION_STATES } from "../types";
 import type { BootstrapState } from "../bootstrap/types";
-import type { MissionExecution } from "../execution/domain";
 import { isProjectId, type ProjectId } from "../project/domain";
 import type { MissionLaunchResult } from "./runtime-types";
 import { isNonEmptyString, isNonNegativeInteger, isOneOf, isRecord } from "@/lib/narrow";
@@ -68,7 +67,6 @@ export type RuntimeEnvelopePayloads = {
   "activity.updated": { messageId: string; activity: ToolActivity };
   "mission.updated": { mission: Mission };
   "observability.updated": { observability: RuntimeObservability };
-  "execution.updated": { execution: MissionExecution };
   "mission.launch-updated": { result: MissionLaunchResult };
   "attention.updated": { item: AttentionItem };
   "ledger.entry-added": { entry: ResourceLedgerEntry };
@@ -95,7 +93,6 @@ export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
   "activity.updated",
   "mission.updated",
   "observability.updated",
-  "execution.updated",
   "mission.launch-updated",
   "attention.updated",
   "ledger.entry-added",
@@ -269,8 +266,6 @@ export function envelopeFromRuntimeEvent(
       return { ...base, type: event.type, payload: { mission: event.mission } };
     case "observability.updated":
       return { ...base, type: event.type, payload: { observability: event.observability } };
-    case "execution.updated":
-      return { ...base, type: event.type, payload: { execution: event.execution } };
     case "mission.launch-updated":
       return { ...base, type: event.type, payload: { result: event.result } };
     case "attention.updated":
@@ -401,8 +396,6 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
       return { type: envelope.type, sessionId, mission: envelope.payload.mission };
     case "observability.updated":
       return { type: envelope.type, sessionId, observability: envelope.payload.observability };
-    case "execution.updated":
-      return { type: envelope.type, sessionId, execution: envelope.payload.execution };
     case "mission.launch-updated":
       return { type: envelope.type, sessionId, result: envelope.payload.result };
     case "attention.updated":
@@ -503,11 +496,6 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       if (!isRecord(observability)) return "observability must be an object.";
       if (!Array.isArray(observability.workers)) return "observability.workers must be an array.";
       if (!isRecord(observability.mission)) return "observability.mission must be an object.";
-      return null;
-    }
-    case "execution.updated": {
-      const execution = payload.execution;
-      if (!isRecord(execution) || !isNonEmptyString(execution.missionId)) return "execution.missionId is required.";
       return null;
     }
     case "job.launch-updated":

@@ -657,9 +657,6 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
       };
     }
 
-    case "execution.updated":
-      return { snapshot, diagnostics: [diag("schema-invalid", "Legacy Mission execution requires a canonical Job snapshot.", { sessionId })] };
-
     case "worker.updated": {
       if (!sessionExists(snapshot, sessionId)) {
         return { snapshot, diagnostics: [diag("unknown-session", `Worker update for unknown session "${sessionId ?? ""}".`, { sessionId })] };

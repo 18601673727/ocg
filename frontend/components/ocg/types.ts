@@ -129,7 +129,6 @@ export type OcgRuntimeEvent =
   | { type: "job.launch-updated"; sessionId: string; result: import("./runtime/runtime-types").JobLaunchResult }
   | { type: "mission.updated"; sessionId: string; mission: Mission }
   | { type: "observability.updated"; sessionId: string; observability: import("./runtime/observability").RuntimeObservability }
-  | { type: "execution.updated"; sessionId: string; execution: import("./execution/domain").MissionExecution }
   | { type: "mission.launch-updated"; sessionId: string; result: import("./runtime/runtime-types").MissionLaunchResult }
   | { type: "attention.updated"; item: import("./attention/domain").AttentionItem }
   | { type: "ledger.entry-added"; entry: import("./resource-ledger/types").ResourceLedgerEntry }

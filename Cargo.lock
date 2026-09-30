@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "ocg"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "aimux-core",
  "aimux-provider-utils",
@@ -2596,7 +2596,6 @@ dependencies = [
  "ring",
  "rpassword",
  "rusqlite",
- "rust-mcp-schema",
  "schemars",
  "semver",
  "serde",
@@ -3107,16 +3106,6 @@ dependencies = [
  "libsqlite3-sys",
  "smallvec",
  "sqlite-wasm-rs",
-]
-
-[[package]]
-name = "rust-mcp-schema"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a66664d256795cdd61b7d4d6516d8afe041c947bedd1d10aff9e41e15771b43"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]

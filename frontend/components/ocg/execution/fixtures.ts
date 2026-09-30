@@ -270,25 +270,6 @@ export function executionFixtureForSession(sessionId: string): CanonicalExecutio
   return EXECUTION_BY_SESSION[sessionId] ?? null;
 }
 
-/** Legacy scenario adapter; canonical fixtures remain the source of truth. */
-export function createMissionControlExecution(): import("./domain").MissionExecution {
-  return {
-    missionId: "job-main",
-    title: "Canonical Job",
-    status: "running",
-    taskIds: [],
-    edgeIds: [],
-    workerIds: [],
-    tasks: [],
-    edges: [],
-    workers: [],
-    waves: [],
-    gates: [],
-    activities: [],
-    summary: { completed: 0, total: 0, running: 0, waiting: 0, blocked: 0, failed: 0, retrying: 0 },
-  };
-}
-
 /** Project-scoped ceilings the configuration surface records. */
 const PROJECT_CEILING: Partial<Record<ProjectId, JobAccounting["ceiling"]>> = {
   zhuju: { amount: 25, unit: "USD", source: "project-default" },

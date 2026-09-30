@@ -133,7 +133,7 @@ export function createRuntimeSnapshotFromFixture(fixture: ScenarioFixture): Runt
   const accountingBySession: RuntimeSnapshot["accountingBySession"] = {};
   for (const session of fixture.sessions) {
     const state = executionFixtureForSession(session.id);
-    if (state && isProjectId(state.job.project_id) && fixture.executionBySession[session.id]) {
+    if (state && isProjectId(state.job.project_id)) {
       executionBySession[session.id] = assembleJobExecution({ ...state, apiVersion: CANONICAL_API_VERSION, projectId: state.job.project_id, cursor: 0 });
       accountingBySession[session.id] = accountingFixtureForSession(session.id, state.job.project_id);
     } else {
