@@ -8,18 +8,18 @@
 use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
 use crate::native_tools::{
-    execute_canonical_tool_call, openai_projection::OpenAiToolProjection, tool_permission_for,
-    NativeCallRequest, PermissionPolicy,
+    openai_projection::OpenAiToolProjection, tool_permission_for, PermissionPolicy,
 };
 use crate::openai_compatible::{
-    ChatFinishReason, ChatStreamEvent, ChatStreamSummary, NormalizedUsage, ToolCallNormalizer,
+    ChatFinishReason, ChatStreamSummary, CompletedToolCall,
 };
 use crate::orchestration::budget::{BudgetConfig, QuotaFacts};
 use crate::orchestration::domain::{
-    AccountingAuthority, AttemptAuthority, DispatchAccounting, DomainRepository, Executor,
+    AccountingAuthority, AttemptAuthority, DispatchAccounting, DomainRepository, EffectIntentKind, Executor,
 };
 use crate::orchestration::execution_dispatch::{
-    BoundedDispatcher, CompioExecutor, ExecutionEnvelope, ValidatedCompioCallHandler,
+    admit_call, BoundedDispatcher, CompioExecutor, ExecutionEnvelope,
+    ValidatedCompioCallHandler,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -78,6 +78,7 @@ pub struct ProviderHandlerConfig {
     pub project_root: std::path::PathBuf,
     pub permission_policy: PermissionPolicy,
     pub cancelled: Arc<AtomicBool>,
+    pub native_tool_dispatcher: BoundedDispatcher,
 }
 
 pub struct CanonicalProviderCallHandler {
@@ -118,12 +119,13 @@ pub fn admit_provider_call(
         &authority.attempt_id,
         Some(executor_id),
         authority.generation,
-        crate::orchestration::domain::EffectIntentKind::StrictFenced,
+        EffectIntentKind::StrictFenced,
         &payload.to_string(),
     )?;
 
     // Resolve canonical Project identity from Job ownership
-    let job = domain.job(&authority.job_id)?
+    let job = domain
+        .job(&authority.job_id)?
         .ok_or_else(|| OcgError::config("provider Call Job no longer exists"))?;
     let project_id = &job.project_id;
 
@@ -183,31 +185,94 @@ pub fn admit_provider_call(
     Ok(call)
 }
 
+/// Requeue one recovered provider DispatchIntent back to the bounded
+/// dispatcher. The Call and DispatchIntent already exist; this only
+/// redelivers the execution envelope.
+fn requeue_recovered_provider_call(
+    domain: &mut DomainRepository,
+    intent: &crate::orchestration::domain::DispatchIntent,
+    dispatcher: &BoundedDispatcher,
+) -> Result<()> {
+    // Revalidate current Attempt authority
+    let authority = domain
+        .authority(&intent.attempt_id)?
+        .filter(|authority| {
+            authority.job_id == intent.job_id && authority.generation == intent.generation
+        })
+        .ok_or_else(|| {
+            OcgError::config("recovered provider Call has stale Attempt authority")
+        })?;
+
+    // Requeue using existing Call identity
+    let (events, _receiver) = flume::unbounded();
+    dispatcher.send(ExecutionEnvelope {
+        call_id: intent.call_id.clone(),
+        job_id: intent.job_id.clone(),
+        attempt_id: intent.attempt_id.clone(),
+        executor_id: intent.executor_id.clone(),
+        generation: authority.generation,
+        payload: intent.request.clone(),
+        dispatch_id: None,
+        events,
+    })?;
+
+    Ok(())
+}
+
 /// Run provider envelopes through the existing bounded Compio executor. This
 /// is the production handoff from canonical admission to provider/tool work.
 ///
 /// On startup, this recovers any incomplete provider dispatches from prior
-/// crashes or interruptions by fencing them as unknown.
+/// crashes or interruptions by fencing them as unknown, then requeues safe
+/// recovered intents after the consumer starts.
 pub fn run_provider_dispatcher(
     project_root: &Path,
     dispatcher: &BoundedDispatcher,
     config: ProviderHandlerConfig,
 ) -> Result<()> {
-    // Recover any incomplete provider calls from previous runs before starting
-    // the dispatcher. This ensures provider intents left in 'running' state
-    // are properly fenced as unknown.
-    {
+    // Recover provider dispatches: fence unsafe ones, collect ready ones
+    let recovered = {
         let mut domain = DomainRepository::open(project_root)?;
-        let recovered = domain.recover_provider_dispatches()?;
-        if !recovered.is_empty() {
+        let ready = domain.recover_provider_dispatches()?;
+        if !ready.is_empty() {
             eprintln!(
-                "Provider dispatcher recovered {} incomplete call(s) from previous run",
-                recovered.len()
+                "Provider dispatcher found {} recoverable call(s) from previous run",
+                ready.len()
             );
         }
-    } // Release domain lock before starting executor
+        ready
+    };
 
+    // Start the bounded consumer first, so it can process recovered work
     let handler = CanonicalProviderCallHandler::new(config);
+    let dispatcher_clone = dispatcher.clone();
+    let project_root = project_root.to_path_buf();
+
+    // Spawn recovery requeue in background after consumer starts
+    std::thread::spawn(move || {
+        // Give consumer a moment to start accepting work
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut domain = match DomainRepository::open(&project_root) {
+            Ok(domain) => domain,
+            Err(error) => {
+                eprintln!("Failed to open domain for recovery requeue: {error}");
+                return;
+            }
+        };
+
+        for intent in &recovered {
+            if let Err(error) =
+                requeue_recovered_provider_call(&mut domain, intent, &dispatcher_clone)
+            {
+                eprintln!(
+                    "Failed to requeue recovered provider Call {}: {error}",
+                    intent.call_id
+                );
+            }
+        }
+    });
+
     CompioExecutor::run(dispatcher, &handler)
 }
 
@@ -278,219 +343,180 @@ impl ValidatedCompioCallHandler for CanonicalProviderCallHandler {
             let mut request = match input.get("arguments").cloned() {
                 Some(request) => request,
                 None => {
-                    let message = "provider Call payload has no arguments";
+                    let message = "provider Call payload missing 'arguments'";
                     fail_provider_envelope(&config.project_root, &envelope, message);
                     return Err(OcgError::config(message));
                 }
             };
-            if let Err(error) = inject_native_tools(&mut request) {
-                let message = error.to_string();
-                fail_provider_envelope(&config.project_root, &envelope, &message);
-                return Err(error);
-            }
-            let executor = match envelope.executor_id.as_deref() {
-                Some(id) => domain
-                    .executor(id)?
-                    .ok_or_else(|| OcgError::config("provider Call executor no longer exists"))?,
-                None => {
-                    let message = "provider Call has no Executor";
-                    fail_provider_envelope(&config.project_root, &envelope, message);
-                    return Err(OcgError::config(message));
-                }
-            };
+            let executor = domain.executor(envelope.executor_id.as_deref().unwrap_or(""))?
+                .ok_or_else(|| OcgError::config("provider Call executor not found"))?;
+            drop(domain);
             let provider = NativeOpenAiCompatibleProvider::new(
                 config.transport.as_ref(),
                 config.endpoint.clone(),
                 config.bearer.clone(),
             );
-            let mut loop_runner = ProviderToolLoop {
-                provider,
-                domain: &mut domain,
-                authority,
-                executor,
-                project_root: &config.project_root,
-                permission_policy: config.permission_policy,
-                cancelled: config.cancelled.as_ref(),
-            };
-            let final_response = match loop_runner.run(request) {
-                Ok(response) => response,
-                Err(error) => {
-                    fail_provider_envelope(&config.project_root, &envelope, &error.to_string());
-                    return Err(error);
-                }
-            };
-            let result = json!({
-                "content": final_response.content,
-                "reasoning": final_response.reasoning,
-                "rounds": final_response.rounds
-            });
+            let response = execute_provider_loop(
+                &provider,
+                &config.project_root,
+                &envelope,
+                &authority,
+                &executor,
+                &mut request,
+                config.permission_policy,
+                &config.cancelled,
+                &config.native_tool_dispatcher,
+            )?;
+            let mut domain = DomainRepository::open(&config.project_root)?;
+            let serialized = serde_json::to_string(&json!({
+                "content": response.content,
+                "reasoning": response.reasoning,
+                "rounds": response.rounds
+            }))
+            .map_err(|error| OcgError::config(format!("serialize provider response: {error}")))?;
             domain.finish_call(
                 &envelope.call_id,
                 &envelope.attempt_id,
                 envelope.generation,
-                &result.to_string(),
+                &serialized,
             )?;
-            Ok(json!({"result":result}))
+            Ok(json!({"content": response.content, "reasoning": response.reasoning, "rounds": response.rounds}))
         })
     }
 }
 
-fn fail_provider_envelope(root: &Path, envelope: &ExecutionEnvelope, message: &str) {
-    let bounded = if message.len() > 4096 {
-        &message[..message
-            .char_indices()
-            .take_while(|(index, _)| *index < 4096)
-            .last()
-            .map(|(index, character)| index + character.len_utf8())
-            .unwrap_or(4096)]
-    } else {
-        message
-    };
-    let Ok(mut domain) = DomainRepository::open(root) else {
-        return;
-    };
-    if domain
-        .fail_call(
-            &envelope.call_id,
-            &envelope.attempt_id,
-            envelope.generation,
-            bounded,
-        )
-        .is_err()
-    {
-        let _ = domain.fence_dispatch_intent(&envelope.call_id, bounded);
-    }
-}
-
-fn inject_native_tools(request: &mut Value) -> Result<()> {
+fn execute_provider_loop(
+    provider: &dyn OpenAiCompatibleProvider,
+    project_root: &Path,
+    _envelope: &ExecutionEnvelope,
+    authority: &AttemptAuthority,
+    executor: &Executor,
+    request: &mut Value,
+    _permission_policy: PermissionPolicy,
+    cancelled: &AtomicBool,
+    native_tool_dispatcher: &BoundedDispatcher,
+) -> Result<ProviderFinalResponse> {
     let projection = OpenAiToolProjection::from_registry()?;
+
+    // Inject native tools into request
     let object = request
         .as_object_mut()
         .ok_or_else(|| OcgError::config("provider request must be an object"))?;
     object.insert("tools".to_string(), Value::Array(projection.tools()));
-    Ok(())
-}
-
-impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
-    fn complete(&self, request: &Value) -> Result<ProviderRound> {
-        let body = if request.get("stream").is_none() {
-            let mut body = request.clone();
-            body["stream"] = Value::Bool(true);
-            body
-        } else {
-            request.clone()
-        };
-        let bearer = self.bearer.as_deref().unwrap_or("");
-        let mut headers = vec![("Content-Type", "application/json")];
-        if !bearer.is_empty() {
-            headers.push(("Authorization", bearer));
+    for round in 0..MAX_PROVIDER_ROUNDS {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(OcgError::config("provider loop cancelled"));
         }
-        let response = self.transport.post_json(&self.endpoint, &headers, &body)?;
-        if !response.is_success() {
-            return Err(OcgError::config(format!(
-                "OpenAI-compatible provider returned HTTP {}: {}",
-                response.status,
-                bounded_message(&response.body)
-            )));
+        if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+            if tools.is_empty() {
+                request.as_object_mut().and_then(|obj| obj.remove("tools"));
+            }
         }
-        decode_provider_response(&response.body)
-    }
-}
+        let round_response = provider.complete(request)?;
+        if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
+            || round_response.summary.tool_calls.is_empty()
+        {
+            return Ok(ProviderFinalResponse {
+                content: round_response.summary.text,
+                reasoning: round_response.summary.reasoning,
+                rounds: round + 1,
+            });
+        }
+        if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
+            return Err(OcgError::config("provider exceeded token limit"));
+        }
+        request
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| OcgError::config("provider request messages are missing"))?
+            .push(round_response.assistant);
+        for call in &round_response.summary.tool_calls {
+            let tool = projection.resolve(&call.name)?;
+            let canonical_name = tool.canonical_name();
+            let wire_arguments: Value = serde_json::from_str(&call.arguments)
+                .map_err(|error| OcgError::config(format!("invalid tool arguments JSON: {error}")))?;
+            let permission = tool_permission_for(canonical_name)
+                .ok_or_else(|| OcgError::config(format!("unknown tool permission: {canonical_name}")))?;
+            tool.validate_wire_arguments(&wire_arguments)?;
+            let arguments = tool.canonical_arguments(&wire_arguments);
 
-pub struct ProviderToolLoop<'a, P> {
-    pub provider: P,
-    pub domain: &'a mut DomainRepository,
-    pub authority: AttemptAuthority,
-    pub executor: Executor,
-    pub project_root: &'a Path,
-    pub permission_policy: PermissionPolicy,
-    pub cancelled: &'a AtomicBool,
-}
+            // Admit and queue Native Tool Call to separate bounded dispatcher
+            let payload = json!({
+                "kind": "native_tool",
+                "tool_call_id": call.id,
+                "name": canonical_name,
+                "arguments": arguments
+            });
+            let mut domain = DomainRepository::open(project_root)?;
+            let side_effect = permission != crate::native_tools::PermissionClass::ReadOnly;
 
-impl<'a, P: OpenAiCompatibleProvider> ProviderToolLoop<'a, P> {
-    /// Run until a normal assistant response is returned. Tool calls are
-    /// executed in provider order, preserving ids and order in the next
-    /// request. Each tool call gets its own canonical Call.
-    pub fn run(&mut self, mut request: Value) -> Result<ProviderFinalResponse> {
-        let projection = OpenAiToolProjection::from_registry()?;
-        for round in 0..MAX_PROVIDER_ROUNDS {
-            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(OcgError::config("provider tool loop cancelled"));
-            }
-            let provider_round = self.provider.complete(&request)?;
-            if provider_round.summary.tool_calls.is_empty() {
-                return Ok(ProviderFinalResponse {
-                    content: provider_round.summary.text,
-                    reasoning: provider_round.summary.reasoning,
-                    rounds: round + 1,
-                });
-            }
-            let calls = &provider_round.summary.tool_calls;
+            let tool_call = admit_call(
+                &mut domain,
+                authority,
+                &executor.id,
+                side_effect,
+                &payload.to_string(),
+                native_tool_dispatcher,
+            )?;
+
+            drop(domain);
+
+            // Wait for child Call completion by polling (blocking is acceptable
+            // here because provider and native tool use separate dispatchers)
+            let result = wait_for_call_completion(project_root, &tool_call.id)?;
+
             request
                 .get_mut("messages")
                 .and_then(Value::as_array_mut)
                 .ok_or_else(|| OcgError::config("provider request messages are missing"))?
-                .push(provider_round.assistant.clone());
-            for call in calls {
-                let tool = projection.resolve(&call.name)?;
-                let canonical_name = tool.canonical_name().to_string();
-                let permission = tool_permission_for(&canonical_name).ok_or_else(|| {
-                    OcgError::config(format!(
-                        "provider requested unknown native tool '{}'",
-                        call.name
-                    ))
-                })?;
-                let wire_arguments: Value =
-                    serde_json::from_str(&call.arguments).map_err(|error| {
-                        OcgError::config(format!(
-                            "tool call '{}' has invalid arguments JSON: {error}",
-                            call.name
-                        ))
-                    })?;
-                // Strict wire validation must precede normalization so a
-                // payload outside the projected contract never reaches the
-                // canonical layer or the executor.
-                tool.validate_wire_arguments(&wire_arguments)?;
-                let arguments = tool.canonical_arguments(&wire_arguments);
-                let result = execute_canonical_tool_call(
-                    self.domain,
-                    &self.authority,
-                    &self.executor.id,
-                    self.project_root,
-                    NativeCallRequest {
-                        tool_call_id: call.id.clone(),
-                        name: canonical_name,
-                        arguments,
-                        permission,
-                    },
-                    self.permission_policy,
-                    self.cancelled,
-                )?;
-                request
-                    .get_mut("messages")
-                    .and_then(Value::as_array_mut)
-                    .ok_or_else(|| OcgError::config("provider request messages are missing"))?
-                    .push(json!({
-                        "role":"tool",
-                        "tool_call_id":call.id,
-                        "content":result.tool_message_content()
-                    }));
-            }
+                .push(json!({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": result
+                }));
         }
-        Err(OcgError::config(format!(
-            "provider exceeded the {MAX_PROVIDER_ROUNDS}-round native tool loop limit"
-        )))
     }
+    Err(OcgError::config(format!(
+        "provider exceeded the {MAX_PROVIDER_ROUNDS}-round native tool loop limit"
+    )))
+}
+
+/// Poll for Call completion. This blocks the provider handler but does not
+/// block the native tool consumer since they use separate dispatchers.
+fn wait_for_call_completion(project_root: &Path, call_id: &str) -> Result<String> {
+    for _ in 0..600 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let domain = DomainRepository::open(project_root)?;
+        let call = domain.call(call_id)?;
+        match call.state.as_str() {
+            "completed" => {
+                return call.response.ok_or_else(|| {
+                    OcgError::config("completed native tool Call has no response")
+                })
+            }
+            "failed" => {
+                return Err(OcgError::config(format!(
+                    "native tool Call failed: {}",
+                    call.response.unwrap_or_else(|| "unknown error".to_string())
+                )))
+            }
+            "fenced" => {
+                return Err(OcgError::config("native tool Call fenced"))
+            }
+            _ => continue,
+        }
+    }
+    Err(OcgError::config("native tool Call timeout"))
 }
 
 fn decode_provider_response(body: &[u8]) -> Result<ProviderRound> {
     let text = String::from_utf8_lossy(body);
     let mut summary = ChatStreamSummary::default();
-    let mut normalizer = ToolCallNormalizer::default();
     let mut assistant_tool_calls = Vec::new();
     let mut assistant_content = String::new();
     let mut assistant_reasoning = String::new();
     if text.lines().any(|line| line.starts_with("data:")) {
+        // SSE format - parse manually
         for line in text.lines().filter_map(|line| line.strip_prefix("data:")) {
             let payload = line.trim();
             if payload == "[DONE]" || payload.is_empty() {
@@ -498,158 +524,162 @@ fn decode_provider_response(body: &[u8]) -> Result<ProviderRound> {
             }
             let value: Value = serde_json::from_str(payload)
                 .map_err(|error| OcgError::config(format!("invalid provider SSE JSON: {error}")))?;
-            fold_chunk(&mut summary, &mut normalizer, &value);
+
+            // Manually extract content and tool calls from delta
+            if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+                if let Some(first) = choices.first() {
+                    if let Some(delta) = first.get("delta") {
+                        if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                            assistant_content.push_str(content);
+                            summary.text.push_str(content);
+                        }
+                        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                            assistant_reasoning.push_str(reasoning);
+                            summary.reasoning.push_str(reasoning);
+                        }
+                        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                            for call in tool_calls {
+                                if let Some(function) = call.get("function") {
+                                    if let (Some(id), Some(name)) = (
+                                        call.get("id").and_then(Value::as_str),
+                                        function.get("name").and_then(Value::as_str),
+                                    ) {
+                                        // Check if this tool call already exists
+                                        if !summary.tool_calls.iter().any(|tc| tc.id == id) {
+                                            summary.tool_calls.push(CompletedToolCall {
+                                                index: summary.tool_calls.len() as u32,
+                                                id: id.to_string(),
+                                                name: name.to_string(),
+                                                arguments: String::new(),
+                                            });
+                                        }
+                                    }
+                                    if let (Some(id), Some(arguments)) = (
+                                        call.get("id").and_then(Value::as_str),
+                                        function.get("arguments").and_then(Value::as_str),
+                                    ) {
+                                        if let Some(tc) = summary.tool_calls.iter_mut().find(|tc| tc.id == id) {
+                                            tc.arguments.push_str(arguments);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(finish_reason) = first.get("finish_reason").and_then(Value::as_str) {
+                        summary.finish_reason = match finish_reason {
+                            "stop" => Some(ChatFinishReason::Stop),
+                            "length" => Some(ChatFinishReason::Length),
+                            "tool_calls" => Some(ChatFinishReason::ToolCalls),
+                            _ => Some(ChatFinishReason::Stop),
+                        };
+                    }
+                }
+            }
         }
-        assistant_content.clone_from(&summary.text);
-        assistant_reasoning.clone_from(&summary.reasoning);
         assistant_tool_calls.extend(summary.tool_calls.iter().map(|call| {
             json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}})
         }));
     } else {
         let value: Value = serde_json::from_slice(body).map_err(|error| {
-            OcgError::config(format!("invalid provider JSON response: {error}"))
+            OcgError::config(format!("invalid provider non-SSE JSON: {error}"))
         })?;
-        let choice = value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .ok_or_else(|| OcgError::config("provider response has no assistant message"))?;
-        assistant_content = choice
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        assistant_reasoning = choice
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if let Some(calls) = choice.get("tool_calls").and_then(Value::as_array) {
-            for call in calls {
-                let id = call.get("id").and_then(Value::as_str).unwrap_or("");
-                let function = call.get("function").unwrap_or(&Value::Null);
-                let name = function.get("name").and_then(Value::as_str).unwrap_or("");
-                let arguments = function
-                    .get("arguments")
+        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+            if let Some(first) = choices.first() {
+                if let Some(message) = first.get("message") {
+                    if let Some(content) = message.get("content").and_then(Value::as_str) {
+                        assistant_content = content.to_string();
+                    }
+                    if let Some(reasoning_content) = message
+                        .get("reasoning_content")
+                        .and_then(Value::as_str)
+                    {
+                        assistant_reasoning = reasoning_content.to_string();
+                    }
+                    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                        for call in tool_calls {
+                            if let (Some(id), Some(function)) = (
+                                call.get("id").and_then(Value::as_str),
+                                call.get("function"),
+                            ) {
+                                if let (Some(name), Some(arguments)) = (
+                                    function.get("name").and_then(Value::as_str),
+                                    function.get("arguments").and_then(Value::as_str),
+                                ) {
+                                    summary.tool_calls.push(
+                                        crate::openai_compatible::stream::CompletedToolCall {
+                                            index: 0,
+                                            id: id.to_string(),
+                                            name: name.to_string(),
+                                            arguments: arguments.to_string(),
+                                        },
+                                    );
+                                    assistant_tool_calls.push(call.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(finish_reason) = first
+                    .get("finish_reason")
                     .and_then(Value::as_str)
-                    .unwrap_or("{}");
-                let index = normalizer.index_for(id, Some(name));
-                summary
-                    .tool_calls
-                    .push(crate::openai_compatible::CompletedToolCall {
-                        index,
-                        id: id.to_string(),
-                        name: name.to_string(),
-                        arguments: arguments.to_string(),
-                    });
-                assistant_tool_calls.push(call.clone());
+                {
+                    summary.finish_reason = match finish_reason {
+                        "stop" => Some(ChatFinishReason::Stop),
+                        "length" => Some(ChatFinishReason::Length),
+                        "tool_calls" => Some(ChatFinishReason::ToolCalls),
+                        _ => Some(ChatFinishReason::Stop),
+                    };
+                }
             }
         }
         summary.text = assistant_content.clone();
         summary.reasoning = assistant_reasoning.clone();
-        summary.finish_reason = value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("finish_reason"))
-            .and_then(Value::as_str)
-            .map(|reason| {
-                if reason == "tool_calls" {
-                    ChatFinishReason::ToolCalls
-                } else {
-                    ChatFinishReason::Stop
-                }
-            });
     }
-    let assistant = json!({"role":"assistant","content":if assistant_content.is_empty(){Value::Null}else{Value::String(assistant_content)},"reasoning_content":if assistant_reasoning.is_empty(){Value::Null}else{Value::String(assistant_reasoning)},"tool_calls":if assistant_tool_calls.is_empty(){Value::Null}else{Value::Array(assistant_tool_calls)}});
+    let assistant = if !assistant_tool_calls.is_empty() {
+        let mut message = json!({"role":"assistant","content":assistant_content,"tool_calls":assistant_tool_calls});
+        if !assistant_reasoning.is_empty() {
+            message["reasoning_content"] = json!(assistant_reasoning);
+        }
+        message
+    } else {
+        let mut message = json!({"role":"assistant","content":assistant_content});
+        if !assistant_reasoning.is_empty() {
+            message["reasoning_content"] = json!(assistant_reasoning);
+        }
+        message
+    };
     Ok(ProviderRound { assistant, summary })
 }
 
-fn fold_chunk(summary: &mut ChatStreamSummary, normalizer: &mut ToolCallNormalizer, chunk: &Value) {
-    let choice = chunk
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first());
-    let Some(choice) = choice else { return };
-    let delta = choice.get("delta").unwrap_or(&Value::Null);
-    if let Some(text) = delta.get("content").and_then(Value::as_str) {
-        summary.apply(&ChatStreamEvent::TextDelta {
-            delta: text.to_string(),
-        });
-    }
-    if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
-        summary.apply(&ChatStreamEvent::ReasoningDelta {
-            delta: text.to_string(),
-        });
-    }
-    if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-        for call in calls {
-            let id = call.get("id").and_then(Value::as_str).unwrap_or("");
-            let index = call
-                .get("index")
-                .and_then(Value::as_u64)
-                .map(|index| index as u32)
-                .unwrap_or_else(|| normalizer.index_for(id, None));
-            let function = call.get("function").unwrap_or(&Value::Null);
-            let name = function.get("name").and_then(Value::as_str).unwrap_or("");
-            let arguments = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let index = if id.is_empty() {
-                index
-            } else {
-                normalizer.index_for(id, Some(name))
-            };
-            let existing = summary
-                .tool_calls
-                .iter()
-                .find(|existing| existing.index == index)
-                .cloned();
-            if existing.is_none() {
-                summary.apply(&ChatStreamEvent::ToolCallStart {
-                    index,
-                    id: id.to_string(),
-                    name: name.to_string(),
-                });
-            } else if let Some(existing) = existing.as_ref() {
-                if !name.is_empty() && existing.name.is_empty() {
-                    summary.apply(&ChatStreamEvent::ToolCallComplete {
-                        index,
-                        id: if id.is_empty() {
-                            existing.id.clone()
-                        } else {
-                            id.to_string()
-                        },
-                        name: name.to_string(),
-                        arguments: existing.arguments.clone(),
-                    });
-                }
-            }
-            if !arguments.is_empty() {
-                summary.apply(&ChatStreamEvent::ToolCallArgumentsDelta {
-                    index,
-                    id: id.to_string(),
-                    delta: arguments.to_string(),
-                });
-            }
-        }
-    }
-    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-        let finish_reason = if reason == "tool_calls" {
-            ChatFinishReason::ToolCalls
+impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
+    fn complete(&self, request: &Value) -> Result<ProviderRound> {
+        let headers = &[
+            ("Content-Type", "application/json"),
+            ("Accept", "application/json"),
+        ];
+        let response = if let Some(bearer) = &self.bearer {
+            // Create headers with authorization
+            let mut headers_with_auth = headers.to_vec();
+            let auth_value = format!("Bearer {bearer}");
+            headers_with_auth.push(("Authorization", &auth_value));
+            self.transport.post_json(&self.endpoint, &headers_with_auth, request)?
         } else {
-            ChatFinishReason::Stop
+            self.transport.post_json(&self.endpoint, headers, request)?
         };
-        summary.apply(&ChatStreamEvent::Finish {
-            reason: finish_reason,
-            raw_reason: Some(reason.to_string()),
-            usage: NormalizedUsage::default(),
-        });
+        decode_provider_response(&response.body)
     }
 }
 
-fn bounded_message(body: &[u8]) -> String {
-    String::from_utf8_lossy(&body[..body.len().min(4096)]).into_owned()
+fn fail_provider_envelope(project_root: &Path, envelope: &ExecutionEnvelope, reason: &str) {
+    let _ = (|| -> Result<()> {
+        let mut domain = DomainRepository::open(project_root)?;
+        domain.fail_call(
+            &envelope.call_id,
+            &envelope.attempt_id,
+            envelope.generation,
+            reason,
+        )?;
+        Ok(())
+    })();
 }
