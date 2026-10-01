@@ -81,6 +81,25 @@ impl ProjectedTool {
         self.definition.name
     }
 
+    /// Validate wire arguments against the strict schema this projection
+    /// generated. This must run before canonical normalization.
+    pub fn validate_wire_arguments(&self, wire_arguments: &Value) -> Result<()> {
+        let validator = jsonschema::options()
+            .build(&self.strict_parameters)
+            .map_err(|error| {
+                OcgError::config(format!(
+                    "compile strict wire schema for tool '{}': {error}",
+                    self.wire_name
+                ))
+            })?;
+        validator.validate(wire_arguments).map_err(|error| {
+            OcgError::config(format!(
+                "wire arguments for tool '{}' violate OpenAI strict schema: {error}",
+                self.wire_name
+            ))
+        })
+    }
+
     /// Undo the strict-mode nullable widening. Only a `null` this projection
     /// introduced is dropped; a `null` the canonical schema itself does not
     /// accept is kept so canonical validation rejects it.
@@ -105,9 +124,9 @@ fn wire_name_for(canonical_name: &str) -> Result<String> {
     let wire_name = canonical_name.replace('.', "_");
     let valid = !wire_name.is_empty()
         && wire_name.len() <= WIRE_NAME_MAX_LEN
-        && wire_name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-');
+        && wire_name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        });
     if valid {
         Ok(wire_name)
     } else {
@@ -141,7 +160,10 @@ fn strict_schema(schema: &Value, tool: &str) -> Result<Value> {
         .as_object()
         .ok_or_else(|| unsupported(tool, "properties must be an object"))?;
     if object.get("additionalProperties") != Some(&Value::Bool(false)) {
-        return Err(unsupported(tool, "object schema must set additionalProperties to false"));
+        return Err(unsupported(
+            tool,
+            "object schema must set additionalProperties to false",
+        ));
     }
     let required = required_names(object, properties, tool)?;
     let mut strict_properties = Map::new();
@@ -175,7 +197,10 @@ fn required_names<'a>(
         .iter()
         .map(|name| match name.as_str() {
             Some(name) if properties.contains_key(name) => Ok(name),
-            Some(name) => Err(unsupported(tool, &format!("required property '{name}' is not declared"))),
+            Some(name) => Err(unsupported(
+                tool,
+                &format!("required property '{name}' is not declared"),
+            )),
             None => Err(unsupported(tool, "required entries must be strings")),
         })
         .collect()
@@ -319,7 +344,9 @@ mod tests {
         let wire = json!({"path": null, "offset": null, "limit": null});
         let canonical = tool.canonical_arguments(&wire);
         assert_eq!(canonical, json!({"path": null}));
-        assert!(super::super::validate_parameters(&tool.definition.parameters, &canonical).is_err());
+        assert!(
+            super::super::validate_parameters(&tool.definition.parameters, &canonical).is_err()
+        );
     }
 
     #[test]
@@ -349,11 +376,125 @@ mod tests {
             for (name, canonical_property) in canonical_properties {
                 let strict_property = &strict["properties"][name];
                 if canonical_required.contains(&name.as_str()) {
-                    assert_eq!(strict_property, canonical_property, "{}.{name}", tool.wire_name);
+                    assert_eq!(
+                        strict_property, canonical_property,
+                        "{}.{name}",
+                        tool.wire_name
+                    );
                 } else {
                     assert!(allows_null(strict_property), "{}.{name}", tool.wire_name);
                 }
             }
         }
+    }
+
+    #[test]
+    fn wire_validation_succeeds_with_complete_strict_arguments() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        let wire = json!({"path": "test.txt", "offset": null, "limit": null});
+        assert!(tool.validate_wire_arguments(&wire).is_ok());
+    }
+
+    #[test]
+    fn wire_validation_succeeds_with_explicit_null_for_optional() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        let wire = json!({"path": "test.txt", "offset": 100, "limit": null});
+        assert!(tool.validate_wire_arguments(&wire).is_ok());
+    }
+
+    #[test]
+    fn wire_validation_fails_when_optional_field_missing() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        let wire = json!({"path": "test.txt"});
+        assert!(tool.validate_wire_arguments(&wire).is_err());
+    }
+
+    #[test]
+    fn wire_validation_fails_when_required_field_is_null() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        let wire = json!({"path": null, "offset": null, "limit": null});
+        assert!(tool.validate_wire_arguments(&wire).is_err());
+    }
+
+    #[test]
+    fn wire_validation_fails_with_unknown_property() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        let wire = json!({"path": "test.txt", "offset": null, "limit": null, "unknown": "value"});
+        assert!(tool.validate_wire_arguments(&wire).is_err());
+    }
+
+    #[test]
+    fn wire_validation_fails_with_wrong_scalar_type() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        let wire = json!({"path": 123, "offset": null, "limit": null});
+        assert!(tool.validate_wire_arguments(&wire).is_err());
+    }
+
+    #[test]
+    fn wire_validation_fails_with_wrong_array_item_type() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("process_exec").unwrap();
+        let valid = json!({"program": "ls", "args": ["-la"], "cwd": null});
+        assert!(tool.validate_wire_arguments(&valid).is_ok());
+        let wire = json!({"program": "ls", "args": [123], "cwd": null});
+        let error = tool.validate_wire_arguments(&wire).unwrap_err().to_string();
+        assert!(error.contains("process_exec"), "{error}");
+    }
+
+    #[test]
+    fn wire_validation_fails_with_invalid_enum() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_edit").unwrap();
+        let mut wire = json!({
+            "operation": "append",
+            "file": "test.txt",
+            "expectedRevision": null,
+            "oldString": null,
+            "old_string": null,
+            "anchor": null,
+            "newString": null,
+            "content": null
+        });
+        assert!(tool.validate_wire_arguments(&wire).is_ok());
+        wire["operation"] = json!("invalid_op");
+        assert!(tool.validate_wire_arguments(&wire).is_err());
+    }
+
+    #[test]
+    fn wire_validation_fails_with_violated_minimum() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        let wire = json!({"path": "test.txt", "offset": -1, "limit": null});
+        assert!(tool.validate_wire_arguments(&wire).is_err());
+    }
+
+    #[test]
+    fn canonical_arguments_drops_projection_nulls_after_wire_validation() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        let wire = json!({"path": "test.txt", "offset": null, "limit": null});
+        assert!(tool.validate_wire_arguments(&wire).is_ok());
+        let canonical = tool.canonical_arguments(&wire);
+        assert_eq!(canonical, json!({"path": "test.txt"}));
+        assert!(super::super::validate_parameters(&tool.definition.parameters, &canonical).is_ok());
+    }
+
+    #[test]
+    fn wire_invalid_payload_not_rescued_by_normalization() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_read").unwrap();
+        // The normalized form would pass canonical validation, which is why
+        // the wire check has to run first.
+        let wire = json!({"path": "test.txt"});
+        assert!(tool.validate_wire_arguments(&wire).is_err());
+        let canonical = tool.canonical_arguments(&wire);
+        assert_eq!(canonical, json!({"path": "test.txt"}));
+        assert!(super::super::validate_parameters(&tool.definition.parameters, &canonical).is_ok());
     }
 }

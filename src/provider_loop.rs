@@ -114,17 +114,17 @@ pub fn admit_provider_call(
         &payload.to_string(),
         dispatcher,
     )?;
-    
+
     // Mark budget admitted before execution. Provider calls have metered usage
     // and must go through economic admission before dispatch.
     domain.mark_budget_admitted(&call.id)?;
-    
+
     Ok(call)
 }
 
 /// Run provider envelopes through the existing bounded Compio executor. This
 /// is the production handoff from canonical admission to provider/tool work.
-/// 
+///
 /// On startup, this recovers any incomplete provider dispatches from prior
 /// crashes or interruptions by fencing them as unknown.
 pub fn run_provider_dispatcher(
@@ -145,7 +145,7 @@ pub fn run_provider_dispatcher(
             );
         }
     } // Release domain lock before starting executor
-    
+
     let handler = CanonicalProviderCallHandler::new(config);
     CompioExecutor::run(dispatcher, &handler)
 }
@@ -359,12 +359,17 @@ impl<'a, P: OpenAiCompatibleProvider> ProviderToolLoop<'a, P> {
                         call.name
                     ))
                 })?;
-                let wire_arguments: Value = serde_json::from_str(&call.arguments).map_err(|error| {
-                    OcgError::config(format!(
-                        "tool call '{}' has invalid arguments: {error}",
-                        call.name
-                    ))
-                })?;
+                let wire_arguments: Value =
+                    serde_json::from_str(&call.arguments).map_err(|error| {
+                        OcgError::config(format!(
+                            "tool call '{}' has invalid arguments JSON: {error}",
+                            call.name
+                        ))
+                    })?;
+                // Strict wire validation must precede normalization so a
+                // payload outside the projected contract never reaches the
+                // canonical layer or the executor.
+                tool.validate_wire_arguments(&wire_arguments)?;
                 let arguments = tool.canonical_arguments(&wire_arguments);
                 let result = execute_canonical_tool_call(
                     self.domain,
