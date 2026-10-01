@@ -24,6 +24,7 @@
 //! context decision.
 
 use crate::error::{OcgError, Result};
+use crate::compaction::config::CompactionConfig;
 use crate::orchestration::context_governor::ContextGovernorConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -69,6 +70,14 @@ pub struct OrchestrationConfig {
     /// token usage.
     #[serde(default)]
     pub context_governor: ContextGovernorConfig,
+    /// Session compaction policy: token-budget trigger, recent-tail retention,
+    /// deterministic reduction and semantic summary construction.
+    ///
+    /// It is a sibling of the governor rather than part of it: the governor
+    /// *observes* context usage and decides whether to roll a session over,
+    /// while compaction *reduces* an existing history without discarding it.
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 impl Default for OrchestrationConfig {
@@ -80,6 +89,7 @@ impl Default for OrchestrationConfig {
             max_handoff_bytes: DEFAULT_MAX_HANDOFF_BYTES,
             max_handoff_ratio_percent: DEFAULT_MAX_HANDOFF_RATIO_PERCENT,
             context_governor: ContextGovernorConfig::default(),
+            compaction: CompactionConfig::default(),
         }
     }
 }
@@ -138,6 +148,13 @@ impl OrchestrationConfig {
         {
             config.context_governor = ContextGovernorConfig::from_value(value)?;
         }
+        if let Some(value) = object
+            .get("compaction")
+            .or_else(|| object.get("sessionCompaction"))
+            .or_else(|| object.get("session_compaction"))
+        {
+            config.compaction = CompactionConfig::from_value(value)?;
+        }
         config.validate_values()?;
         Ok(config)
     }
@@ -174,6 +191,7 @@ impl OrchestrationConfig {
             ));
         }
         self.context_governor.validate_values()?;
+        self.compaction.validate_values()?;
         Ok(())
     }
 

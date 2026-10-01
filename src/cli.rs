@@ -434,7 +434,11 @@ fn native_verify(effective: &config::Effective, root: &Path, args: &[OsString], 
     let runner = crate::process::SystemCaptureRunner;
     let report = crate::verification::runner::execute(&crate::verification::runner::VerifyRequest { root, config: &verify_config, stage, runner: &runner, clock: &clock, test_proposal: None })?;
     if pretty { let value = serde_json::to_value(&report).map_err(|error| OcgError::config(format!("cannot serialize verification report: {error}")))?; print_json(&value, true)?; }
-    else { println!("verification stage: {} ({})", report.stage, report.overall().as_str()); for result in &report.results { println!("  [{}] {} ({})", if result.success { "ok" } else { "fail" }, result.display(), result.duration_ms); } for note in &report.notes { println!("note: {note}"); } }
+    else { println!("verification stage: {} ({})", report.stage, report.overall().as_str()); for result in &report.results { println!("  [{}] {} ({})", if result.success { "ok" } else { "fail" }, result.display(), result.duration_ms); // A failing command's feedback is what the stage exists to report; for a
+            // Rust compile this is the structured diagnostic delta, which is
+            // already bounded and is not the re-sent compiler output. Print
+            // indented so it reads as belonging to the command above it.
+            if !result.success { for line in result.output.render().lines() { println!("      {line}"); } } } for note in &report.notes { println!("note: {note}"); } }
     Ok(if report.failed() { 1 } else { 0 })
 }
 fn native_tools(effective: &config::Effective, args: &[OsString], pretty: bool) -> Result<i32, Failure> {

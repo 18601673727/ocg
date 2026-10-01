@@ -19,9 +19,12 @@
 //!
 //! OCG does not depend on any external agent runtime to work.
 
+pub mod call_recovery;
 pub mod capabilities;
 pub mod cli;
 pub mod clock;
+pub mod compiler_feedback;
+pub mod compaction;
 pub mod config;
 pub mod config_command;
 pub mod context;
@@ -29,12 +32,14 @@ pub mod contracts;
 pub mod control_server;
 pub mod core_contract;
 pub mod defaults;
+pub mod derived;
 pub mod edit;
 pub mod error;
 pub mod fingerprint;
 pub mod hash;
 pub mod http;
 pub mod install;
+pub mod instructions;
 pub mod json;
 pub mod model;
 pub mod native_tools;
@@ -49,11 +54,13 @@ pub mod profile;
 pub mod project;
 pub mod prompt;
 pub mod proxy;
+pub mod provider_context;
 pub mod pwa;
 pub mod release;
 pub mod report;
 pub mod resources;
 pub mod self_update;
+pub mod skills;
 pub mod telemetry;
 pub mod ui_assets;
 pub mod validate;

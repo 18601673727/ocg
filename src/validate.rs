@@ -16,6 +16,8 @@ pub fn validate(effective: &Effective) -> Vec<String> {
     errors.extend(crate::context::ContextConfig::validate(data));
     errors.extend(crate::verification::Config::validate(data));
     errors.extend(crate::capabilities::CapabilityConfig::validate(data));
+    errors.extend(crate::instructions::InstructionsConfig::validate(data));
+    errors.extend(crate::skills::SkillsConfig::validate(data));
     errors.extend(crate::telemetry::TelemetryConfig::validate(data));
     errors.extend(crate::orchestration::OrchestrationConfig::validate(data));
     errors.extend(crate::orchestration::budget::BudgetConfig::validate(data));

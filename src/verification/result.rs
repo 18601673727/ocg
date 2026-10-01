@@ -30,6 +30,15 @@ pub struct VerificationResult {
     /// Convenience copy of the source locations the distiller found.
     #[serde(default)]
     pub source_locations: Vec<SourceLocation>,
+    /// The structured compiler feedback projection, when the command produced
+    /// machine-readable diagnostics.
+    ///
+    /// This is a projection for a reader, not a replacement for the run: the
+    /// captured streams are still written to `raw_log` in full, and `output`
+    /// still holds the distilled text. It exists so consecutive Rust compiles
+    /// report what changed instead of re-sending everything rustc already said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler: Option<crate::compiler_feedback::DiagnosticDelta>,
 }
 
 impl VerificationResult {
