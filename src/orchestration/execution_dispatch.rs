@@ -287,6 +287,14 @@ impl BoundedDispatcher {
         Ok(())
     }
 
+    /// Shutdown the dispatcher by dropping the sender, which unblocks all
+    /// consumers waiting on recv().
+    pub fn shutdown(&self) {
+        if let Ok(mut sender) = self.sender.lock() {
+            sender.take();
+        }
+    }
+
     pub fn len(&self) -> Result<usize> {
         Ok(self.receiver.len())
     }

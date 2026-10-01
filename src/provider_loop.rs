@@ -260,8 +260,15 @@ pub fn run_execution_runtime(
     // Run provider dispatcher in main thread (with recovery)
     let result = run_provider_dispatcher(project_root, &provider_dispatcher, provider_config);
 
-    // Wait for native tool thread to finish
-    let _ = native_tool_thread.join();
+    // Shutdown dispatcher to unblock native tool consumer
+    provider_dispatcher.shutdown();
+    native_tool_dispatcher.shutdown();
+
+    // Wait for native tool thread and propagate any panic
+    let native_result = native_tool_thread.join();
+    if let Err(panic) = native_result {
+        std::panic::resume_unwind(panic);
+    }
 
     result
 }
@@ -290,37 +297,68 @@ pub fn run_provider_dispatcher(
         ready
     };
 
-    // Start the bounded consumer first, so it can process recovered work
     let handler = CanonicalProviderCallHandler::new(config);
     let dispatcher_clone = dispatcher.clone();
-    let project_root = project_root.to_path_buf();
+    let project_root_clone = project_root.to_path_buf();
 
-    // Spawn recovery requeue in background after consumer starts
-    std::thread::spawn(move || {
-        // Give consumer a moment to start accepting work
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // Use a channel to coordinate consumer startup with recovery producer
+    let (ready_tx, ready_rx) = flume::bounded::<()>(1);
 
-        let mut domain = match DomainRepository::open(&project_root) {
-            Ok(domain) => domain,
-            Err(error) => {
-                eprintln!("Failed to open domain for recovery requeue: {error}");
-                return;
+    // Start bounded consumer in separate thread
+    let consumer_thread = std::thread::Builder::new()
+        .name("provider-consumer".to_string())
+        .spawn(move || {
+            // Signal that consumer is ready to receive
+            let _ = ready_tx.send(());
+            CompioExecutor::run(&dispatcher_clone, &handler)
+        })
+        .map_err(|error| OcgError::config(format!("spawn consumer thread: {error}")))?;
+
+    // Wait for consumer to signal readiness before starting recovery producer
+    let _ = ready_rx.recv();
+
+    // Start recovery producer in separate thread with explicit ownership
+    let recovery_dispatcher = dispatcher.clone();
+    let recovery_thread = std::thread::Builder::new()
+        .name("provider-recovery".to_string())
+        .spawn(move || -> Result<()> {
+            let mut domain = DomainRepository::open(&project_root_clone)?;
+            for intent in &recovered {
+                requeue_recovered_provider_call(&mut domain, intent, &recovery_dispatcher)?;
             }
-        };
+            Ok(())
+        })
+        .map_err(|error| OcgError::config(format!("spawn recovery thread: {error}")))?;
 
-        for intent in &recovered {
-            if let Err(error) =
-                requeue_recovered_provider_call(&mut domain, intent, &dispatcher_clone)
-            {
-                eprintln!(
-                    "Failed to requeue recovered provider Call {}: {error}",
-                    intent.call_id
-                );
-            }
+    // Join recovery thread and propagate errors
+    let recovery_result = recovery_thread.join();
+    let recovery_error = match recovery_result {
+        Ok(result) => result.err(),
+        Err(panic) => {
+            // Recovery thread panicked; propagate it
+            std::panic::resume_unwind(panic);
         }
-    });
+    };
 
-    CompioExecutor::run(dispatcher, &handler)
+    // Join consumer thread and propagate errors
+    let consumer_result = consumer_thread.join();
+    let consumer_error = match consumer_result {
+        Ok(result) => result.err(),
+        Err(panic) => {
+            // Consumer thread panicked; propagate it
+            std::panic::resume_unwind(panic);
+        }
+    };
+
+    // Return first error encountered, if any
+    if let Some(error) = recovery_error {
+        return Err(error);
+    }
+    if let Some(error) = consumer_error {
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 impl ValidatedCompioCallHandler for CanonicalProviderCallHandler {
