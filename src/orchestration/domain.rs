@@ -464,6 +464,16 @@ CREATE TABLE IF NOT EXISTS domain_job_configs (
     revision INTEGER NOT NULL CHECK(revision >= 0),
     updated_at INTEGER NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS domain_launch_commands (
+    command_id TEXT NOT NULL,
+    project_id TEXT NOT NULL REFERENCES domain_projects(id),
+    request_hash TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('accepted','rejected','failed')),
+    job_id TEXT REFERENCES domain_jobs(id),
+    message TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(command_id, project_id)
+) STRICT;
 "#;
 
 /// In-memory dependency view. The SQLite revision determines whether it is current.
@@ -3179,6 +3189,87 @@ impl DomainRepository {
             self.call(&id)
         })
         .collect()
+    }
+
+    /// Check for an existing launch command and return its outcome if found.
+    pub fn check_launch_command(
+        &self,
+        command_id: &str,
+        project_id: &str,
+        request_hash: &str,
+    ) -> Result<Option<(String, Option<String>, String)>> {
+        self.connection
+            .query_row(
+                "SELECT outcome,job_id,message FROM domain_launch_commands WHERE command_id=?1 AND project_id=?2",
+                params![command_id, project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql)?
+            .map(|(outcome, job_id, message)| {
+                // Verify request hash matches to detect conflicting retries
+                let stored_hash: String = self.connection
+                    .query_row(
+                        "SELECT request_hash FROM domain_launch_commands WHERE command_id=?1 AND project_id=?2",
+                        params![command_id, project_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)?;
+                if stored_hash != request_hash {
+                    return Err(invalid("command_id reused with different request content"));
+                }
+                Ok((outcome, job_id, message))
+            })
+            .transpose()
+    }
+
+    /// Record a launch command outcome for idempotency.
+    pub fn lookup_launch_command(
+        &self,
+        command_id: &str,
+        project_id: &str,
+    ) -> Result<Option<(String, Option<String>, String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT request_hash, job_id, outcome, message FROM domain_launch_commands WHERE command_id = ?1 AND project_id = ?2")
+            .map_err(sql)?;
+        let result = statement
+            .query_row(params![command_id, project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(sql)?;
+        Ok(result)
+    }
+
+    pub fn record_launch_command(
+        &mut self,
+        command_id: &str,
+        project_id: &str,
+        request_hash: &str,
+        outcome: &str,
+        job_id: Option<&str>,
+        message: &str,
+    ) -> Result<()> {
+        validate_id(command_id)?;
+        validate_id(project_id)?;
+        let timestamp = now();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        transaction
+            .execute(
+                "INSERT INTO domain_launch_commands(command_id,project_id,request_hash,outcome,job_id,message,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![command_id, project_id, request_hash, outcome, job_id, message, timestamp],
+            )
+            .map_err(sql)?;
+        transaction.commit().map_err(sql)
     }
 }
 

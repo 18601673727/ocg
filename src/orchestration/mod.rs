@@ -10,6 +10,7 @@ pub mod config;
 pub mod context_governor;
 pub mod domain;
 pub mod execution_dispatch;
+pub mod execution_runtime;
 pub mod handoff;
 pub mod journal;
 pub mod projection;

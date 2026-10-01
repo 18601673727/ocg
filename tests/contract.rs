@@ -24,7 +24,7 @@ fn admitted(repository: &mut DomainRepository, binding: &str) -> CanonicalAdmiss
         .ensure_project(repository.path().parent().expect("state parent"))
         .expect("ensure project");
     repository
-        .admit_job(project, binding, "{\"tool\":\"value\"}", "compio")
+        .admit_job(project, binding, "{\"tool\":\"value\"}", "test")
         .expect("admit canonical job")
 }
 

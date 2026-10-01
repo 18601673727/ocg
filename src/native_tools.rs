@@ -983,89 +983,81 @@ impl NativeToolCallHandler {
             cancelled,
         }
     }
-}
 
-impl crate::orchestration::execution_dispatch::ValidatedCompioCallHandler
-    for NativeToolCallHandler
-{
-    fn execute_validated(
+    pub fn execute_validated_sync(
         &self,
         envelope: crate::orchestration::execution_dispatch::ExecutionEnvelope,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + '_>,
-    > {
-        Box::pin(async move {
-            if self.cancelled.load(Ordering::SeqCst) {
-                return Err(OcgError::config("cancelled before native tool execution"));
-            }
+    ) -> Result<serde_json::Value> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(OcgError::config("cancelled before native tool execution"));
+        }
 
-            let mut domain = DomainRepository::open(&self.project_root)?;
+        let mut domain = DomainRepository::open(&self.project_root)?;
 
-            // Verify authority
-            let _authority = domain
-                .authority(&envelope.attempt_id)?
-                .filter(|authority| {
-                    authority.job_id == envelope.job_id
-                        && authority.generation == envelope.generation
-                })
-                .ok_or_else(|| OcgError::config("native tool Call has stale Attempt authority"))?;
+        // Verify authority
+        let _authority = domain
+            .authority(&envelope.attempt_id)?
+            .filter(|authority| {
+                authority.job_id == envelope.job_id
+                    && authority.generation == envelope.generation
+            })
+            .ok_or_else(|| OcgError::config("native tool Call has stale Attempt authority"))?;
 
-            domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)?;
+        domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)?;
 
-            let input: Value = serde_json::from_str(&envelope.payload)
-                .map_err(|error| OcgError::config(format!("invalid native tool payload: {error}")))?;
+        let input: Value = serde_json::from_str(&envelope.payload)
+            .map_err(|error| OcgError::config(format!("invalid native tool payload: {error}")))?;
 
-            let name = input
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| OcgError::config("native tool payload missing 'name'"))?;
+        let name = input
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| OcgError::config("native tool payload missing 'name'"))?;
 
-            let arguments = input
-                .get("arguments")
-                .ok_or_else(|| OcgError::config("native tool payload missing 'arguments'"))?
-                .clone();
+        let arguments = input
+            .get("arguments")
+            .ok_or_else(|| OcgError::config("native tool payload missing 'arguments'"))?
+            .clone();
 
-            let definition = NativeToolRegistry::get(name)
-                .ok_or_else(|| OcgError::config(format!("unknown native tool: {name}")))?;
+        let definition = NativeToolRegistry::get(name)
+            .ok_or_else(|| OcgError::config(format!("unknown native tool: {name}")))?;
 
-            let permission = definition.permission;
+        let permission = definition.permission;
 
-            drop(domain);
+        drop(domain);
 
-            let executor = NativeToolExecutor::new(&self.project_root)?;
-            let result = executor.execute(
-                name,
-                &arguments,
-                permission,
-                self.permission_policy,
-                &self.cancelled,
-            );
+        let executor = NativeToolExecutor::new(&self.project_root)?;
+        let result = executor.execute(
+            name,
+            &arguments,
+            permission,
+            self.permission_policy,
+            &self.cancelled,
+        );
 
-            let mut domain = DomainRepository::open(&self.project_root)?;
-            let serialized = result.to_value().to_string();
+        let mut domain = DomainRepository::open(&self.project_root)?;
+        let serialized = result.to_value().to_string();
 
-            if result.success {
-                domain.finish_call(
-                    &envelope.call_id,
-                    &envelope.attempt_id,
-                    envelope.generation,
-                    &serialized,
-                )?;
-                Ok(result.to_value())
-            } else {
-                let failure = result
-                    .error
-                    .as_ref()
-                    .map(|error| format!("{}: {}", error.kind.as_str(), error.message))
-                    .unwrap_or_else(|| "native tool failed".to_string());
-                domain.fail_call(
-                    &envelope.call_id,
-                    &envelope.attempt_id,
-                    envelope.generation,
-                    &failure,
-                )?;
-                Err(OcgError::config(failure))
-            }
-        })
+        if result.success {
+            domain.finish_call(
+                &envelope.call_id,
+                &envelope.attempt_id,
+                envelope.generation,
+                &serialized,
+            )?;
+            Ok(result.to_value())
+        } else {
+            let failure = result
+                .error
+                .as_ref()
+                .map(|error| format!("{}: {}", error.kind.as_str(), error.message))
+                .unwrap_or_else(|| "native tool failed".to_string());
+            domain.fail_call(
+                &envelope.call_id,
+                &envelope.attempt_id,
+                envelope.generation,
+                &failure,
+            )?;
+            Err(OcgError::config(failure))
+        }
     }
 }

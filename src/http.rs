@@ -331,7 +331,7 @@ pub trait HttpTransport: Send + Sync {
     }
 }
 
-/// The production transport uses OCG's ntex/Compio HTTP stack.
+/// The production transport uses OCG's ntex HTTP stack on the native ntex runtime.
 ///
 /// Automatic (hidden) proxy discovery is always disabled first; only the
 /// typed endpoints of the resolved [`ProxyPlan`] are installed. Only
@@ -374,9 +374,8 @@ impl HttpTransport for NativeHttp {
         }
         let token = self.token.clone();
         let url = url.to_owned();
-        compio::runtime::Runtime::new()
-            .map_err(|error| OcgError::config(format!("cannot start native HTTP runtime: {error}")))?
-            .block_on(async move { native_get(&url, token.as_ref()).await })
+        let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
+        runtime.block_on(async move { native_get(&url, token.as_ref()).await })
     }
 
     fn post_json(
@@ -395,9 +394,8 @@ impl HttpTransport for NativeHttp {
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect::<Vec<_>>();
-        compio::runtime::Runtime::new()
-            .map_err(|error| OcgError::config(format!("cannot start native HTTP runtime: {error}")))?
-            .block_on(async move { native_post_json(&url, &headers, &body).await })
+        let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
+        runtime.block_on(async move { native_post_json(&url, &headers, &body).await })
     }
 }
 

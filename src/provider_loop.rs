@@ -18,8 +18,7 @@ use crate::orchestration::domain::{
     AccountingAuthority, AttemptAuthority, DispatchAccounting, DomainRepository, EffectIntentKind, Executor,
 };
 use crate::orchestration::execution_dispatch::{
-    admit_call, BoundedDispatcher, CompioExecutor, ExecutionEnvelope,
-    ValidatedCompioCallHandler,
+    admit_call, BoundedDispatcher, ExecutionEnvelope,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -45,7 +44,7 @@ pub trait OpenAiCompatibleProvider: Send + Sync {
     fn complete(&self, request: &Value) -> Result<ProviderRound>;
 }
 
-/// A provider client using the repository's native ntex/Compio HTTP surface.
+/// A provider client using the repository's native ntex HTTP surface.
 /// It decodes OpenAI-compatible response JSON/SSE and uses the existing
 /// `ToolCallNormalizer`/`ChatStreamSummary` path for tool-call assembly.
 pub struct NativeOpenAiCompatibleProvider<'a> {
@@ -85,11 +84,121 @@ pub struct CanonicalProviderCallHandler {
     config: Arc<ProviderHandlerConfig>,
 }
 
+impl Clone for CanonicalProviderCallHandler {
+    fn clone(&self) -> Self {
+        Self {
+            config: Arc::clone(&self.config),
+        }
+    }
+}
+
 impl CanonicalProviderCallHandler {
     pub fn new(config: ProviderHandlerConfig) -> Self {
         Self {
             config: Arc::new(config),
         }
+    }
+
+    async fn execute_validated(&self, envelope: ExecutionEnvelope) -> Result<Value> {
+        let config = Arc::clone(&self.config);
+        if config.cancelled.load(Ordering::SeqCst) {
+            fail_provider_envelope(
+                &config.project_root,
+                &envelope,
+                "cancelled before provider execution",
+            );
+            return Err(OcgError::config("provider Call cancelled before execution"));
+        }
+        let mut domain = DomainRepository::open(&config.project_root)?;
+
+        // Verify economic authority before execution
+        let intent = domain.dispatch_intent(&envelope.call_id)?
+            .ok_or_else(|| {
+                fail_provider_envelope(
+                    &config.project_root,
+                    &envelope,
+                    "provider Call has no durable dispatch intent",
+                );
+                OcgError::config("provider Call has no durable dispatch intent")
+            })?;
+        if !intent.budget_admitted {
+            fail_provider_envelope(
+                &config.project_root,
+                &envelope,
+                "provider Call has no economic admission",
+            );
+            return Err(OcgError::config("provider Call lacks economic admission authority"));
+        }
+
+        let authority = domain
+            .authority(&envelope.attempt_id)?
+            .filter(|authority| {
+                authority.job_id == envelope.job_id
+                    && authority.generation == envelope.generation
+            })
+            .ok_or_else(|| {
+                fail_provider_envelope(
+                    &config.project_root,
+                    &envelope,
+                    "stale Attempt authority",
+                );
+                OcgError::config("provider Call has stale Attempt authority")
+            })?;
+        if let Err(error) =
+            domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)
+        {
+            fail_provider_envelope(&config.project_root, &envelope, &error.to_string());
+            return Err(error);
+        }
+        let input: Value = match serde_json::from_str(&envelope.payload) {
+            Ok(input) => input,
+            Err(error) => {
+                let message = format!("invalid provider Call payload: {error}");
+                fail_provider_envelope(&config.project_root, &envelope, &message);
+                return Err(OcgError::config(message));
+            }
+        };
+        let mut request = match input.get("arguments").cloned() {
+            Some(request) => request,
+            None => {
+                let message = "provider Call payload missing 'arguments'";
+                fail_provider_envelope(&config.project_root, &envelope, message);
+                return Err(OcgError::config(message));
+            }
+        };
+        let executor = domain.executor(envelope.executor_id.as_deref().unwrap_or(""))?
+            .ok_or_else(|| OcgError::config("provider Call executor not found"))?;
+        drop(domain);
+        let provider = NativeOpenAiCompatibleProvider::new(
+            config.transport.as_ref(),
+            config.endpoint.clone(),
+            config.bearer.clone(),
+        );
+        let response = execute_provider_loop(
+            &provider,
+            &config.project_root,
+            &envelope,
+            &authority,
+            &executor,
+            &mut request,
+            config.permission_policy,
+            &config.cancelled,
+            &config.native_tool_dispatcher,
+        )?;
+        let mut domain = DomainRepository::open(&config.project_root)?;
+        let serialized = serde_json::to_string(&json!({
+            "content": response.content,
+            "reasoning": response.reasoning,
+            "rounds": response.rounds
+        }))
+        .map_err(|error| OcgError::config(format!("serialize provider response: {error}")))?;
+        domain.finish_call(
+            &envelope.call_id,
+            &envelope.attempt_id,
+            envelope.generation,
+            &serialized,
+        )?;
+        Ok(json!({"content": response.content, "reasoning": response.reasoning, "rounds": response.rounds}))
     }
 }
 
@@ -188,7 +297,7 @@ pub fn admit_provider_call(
 /// Requeue one recovered provider DispatchIntent back to the bounded
 /// dispatcher. The Call and DispatchIntent already exist; this only
 /// redelivers the execution envelope.
-fn requeue_recovered_provider_call(
+pub fn requeue_recovered_provider_call(
     domain: &mut DomainRepository,
     intent: &crate::orchestration::domain::DispatchIntent,
     dispatcher: &BoundedDispatcher,
@@ -254,7 +363,7 @@ pub fn run_execution_runtime(
     // Start native tool consumer in separate thread
     let native_tool_dispatcher_clone = native_tool_dispatcher.clone();
     let native_tool_thread = std::thread::spawn(move || {
-        CompioExecutor::run(&native_tool_dispatcher_clone, &native_tool_handler)
+        run_native_tool_worker(&native_tool_dispatcher_clone, &native_tool_handler)
     });
 
     // Run provider dispatcher in main thread (with recovery)
@@ -273,7 +382,7 @@ pub fn run_execution_runtime(
     result
 }
 
-/// Run provider envelopes through the existing bounded Compio executor. This
+/// Run provider envelopes through the bounded execution worker. This
 /// is the production handoff from canonical admission to provider/tool work.
 ///
 /// On startup, this recovers any incomplete provider dispatches from prior
@@ -310,7 +419,7 @@ pub fn run_provider_dispatcher(
         .spawn(move || {
             // Signal that consumer is ready to receive
             let _ = ready_tx.send(());
-            CompioExecutor::run(&dispatcher_clone, &handler)
+            run_provider_worker(&dispatcher_clone, &handler)
         })
         .map_err(|error| OcgError::config(format!("spawn consumer thread: {error}")))?;
 
@@ -361,113 +470,52 @@ pub fn run_provider_dispatcher(
     Ok(())
 }
 
-impl ValidatedCompioCallHandler for CanonicalProviderCallHandler {
-    fn execute_validated(
-        &self,
-        envelope: ExecutionEnvelope,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + '_>> {
-        let config = Arc::clone(&self.config);
-        Box::pin(async move {
-            if config.cancelled.load(Ordering::SeqCst) {
-                fail_provider_envelope(
-                    &config.project_root,
-                    &envelope,
-                    "cancelled before provider execution",
-                );
-                return Err(OcgError::config("provider Call cancelled before execution"));
-            }
-            let mut domain = DomainRepository::open(&config.project_root)?;
-
-            // Verify economic authority before execution
-            let intent = domain.dispatch_intent(&envelope.call_id)?
-                .ok_or_else(|| {
-                    fail_provider_envelope(
-                        &config.project_root,
-                        &envelope,
-                        "provider Call has no durable dispatch intent",
-                    );
-                    OcgError::config("provider Call has no durable dispatch intent")
-                })?;
-            if !intent.budget_admitted {
-                fail_provider_envelope(
-                    &config.project_root,
-                    &envelope,
-                    "provider Call has no economic admission",
-                );
-                return Err(OcgError::config("provider Call lacks economic admission authority"));
-            }
-
-            let authority = domain
-                .authority(&envelope.attempt_id)?
-                .filter(|authority| {
-                    authority.job_id == envelope.job_id
-                        && authority.generation == envelope.generation
-                })
-                .ok_or_else(|| {
-                    fail_provider_envelope(
-                        &config.project_root,
-                        &envelope,
-                        "stale Attempt authority",
-                    );
-                    OcgError::config("provider Call has stale Attempt authority")
-                })?;
-            if let Err(error) =
-                domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)
-            {
-                fail_provider_envelope(&config.project_root, &envelope, &error.to_string());
-                return Err(error);
-            }
-            let input: Value = match serde_json::from_str(&envelope.payload) {
-                Ok(input) => input,
-                Err(error) => {
-                    let message = format!("invalid provider Call payload: {error}");
-                    fail_provider_envelope(&config.project_root, &envelope, &message);
-                    return Err(OcgError::config(message));
-                }
-            };
-            let mut request = match input.get("arguments").cloned() {
-                Some(request) => request,
-                None => {
-                    let message = "provider Call payload missing 'arguments'";
-                    fail_provider_envelope(&config.project_root, &envelope, message);
-                    return Err(OcgError::config(message));
-                }
-            };
-            let executor = domain.executor(envelope.executor_id.as_deref().unwrap_or(""))?
-                .ok_or_else(|| OcgError::config("provider Call executor not found"))?;
-            drop(domain);
-            let provider = NativeOpenAiCompatibleProvider::new(
-                config.transport.as_ref(),
-                config.endpoint.clone(),
-                config.bearer.clone(),
-            );
-            let response = execute_provider_loop(
-                &provider,
-                &config.project_root,
-                &envelope,
-                &authority,
-                &executor,
-                &mut request,
-                config.permission_policy,
-                &config.cancelled,
-                &config.native_tool_dispatcher,
-            )?;
-            let mut domain = DomainRepository::open(&config.project_root)?;
-            let serialized = serde_json::to_string(&json!({
-                "content": response.content,
-                "reasoning": response.reasoning,
-                "rounds": response.rounds
-            }))
-            .map_err(|error| OcgError::config(format!("serialize provider response: {error}")))?;
-            domain.finish_call(
-                &envelope.call_id,
-                &envelope.attempt_id,
-                envelope.generation,
-                &serialized,
-            )?;
-            Ok(json!({"content": response.content, "reasoning": response.reasoning, "rounds": response.rounds}))
-        })
+/// Run the provider worker loop using ntex runtime for async execution.
+pub fn run_provider_worker(dispatcher: &BoundedDispatcher, handler: &CanonicalProviderCallHandler) -> Result<()> {
+    loop {
+        let Some(envelope) = dispatcher.recv()? else {
+            return Ok(());
+        };
+        if let Err(error) = execute_provider_envelope_sync(handler, envelope) {
+            tracing::error!(error = %error, "canonical provider Call execution failed; continuing with next bounded item");
+        }
     }
+}
+
+/// Execute one provider envelope synchronously by blocking on the ntex runtime.
+fn execute_provider_envelope_sync(handler: &CanonicalProviderCallHandler, envelope: ExecutionEnvelope) -> Result<()> {
+    let handler = handler.clone();
+    let runtime = ntex::rt::System::new("ocg-provider", ntex::rt::DefaultRuntime);
+    runtime.block_on(async move {
+        let input: serde_json::Value = serde_json::from_str(&envelope.payload)
+            .map_err(|error| OcgError::config(format!("invalid Call input JSON: {error}")))?;
+        crate::orchestration::call_schema::validate_input(&input)?;
+        let output = handler.execute_validated(envelope).await?;
+        crate::orchestration::call_schema::validate_output(&output)?;
+        Ok(())
+    })
+}
+
+/// Run the native tool worker loop synchronously without an async runtime.
+pub fn run_native_tool_worker(dispatcher: &BoundedDispatcher, handler: &crate::native_tools::NativeToolCallHandler) -> Result<()> {
+    loop {
+        let Some(envelope) = dispatcher.recv()? else {
+            return Ok(());
+        };
+        if let Err(error) = execute_native_tool_envelope_sync(handler, envelope) {
+            tracing::error!(error = %error, "canonical native tool Call execution failed; continuing with next bounded item");
+        }
+    }
+}
+
+/// Execute one native tool envelope synchronously.
+fn execute_native_tool_envelope_sync(handler: &crate::native_tools::NativeToolCallHandler, envelope: ExecutionEnvelope) -> Result<()> {
+    let input: serde_json::Value = serde_json::from_str(&envelope.payload)
+        .map_err(|error| OcgError::config(format!("invalid Call input JSON: {error}")))?;
+    crate::orchestration::call_schema::validate_input(&input)?;
+    let output = handler.execute_validated_sync(envelope)?;
+    crate::orchestration::call_schema::validate_output(&output)?;
+    Ok(())
 }
 
 fn execute_provider_loop(
