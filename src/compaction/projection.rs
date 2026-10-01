@@ -70,7 +70,7 @@ impl History {
 /// `through` is the exclusive transcript position the summary represents; the
 /// summary stands in for every message before it. `tail_start` is the first
 /// position retained verbatim.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionPoint {
     /// Stable id, derived from the boundary, so replanning the same boundary

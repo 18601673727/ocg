@@ -48,6 +48,15 @@ pub struct VerificationConfig {
     pub max_log_storage_bytes: u64,
     /// Include the advisory targeted-test proposal in verification reports.
     pub include_test_proposal: bool,
+    /// Ask cargo subcommands for machine-readable diagnostics.
+    ///
+    /// Off by default. Enabling it adds `--message-format=json` to `cargo
+    /// check`/`build`/`clippy`/`test`/`bench`/`rustc`, which is what lets
+    /// compiler feedback be reported as a structured diagnostic delta instead of
+    /// re-sent output. It changes what those commands print, so it is never
+    /// applied to a command the user did not opt in, and never to a command that
+    /// already names a message format.
+    pub machine_readable_diagnostics: bool,
     /// The three stages, always present.
     pub stages: BTreeMap<String, StageConfig>,
 }
@@ -65,6 +74,7 @@ impl Default for VerificationConfig {
             max_raw_log_bytes: DEFAULT_MAX_RAW_LOG_BYTES,
             max_log_storage_bytes: DEFAULT_MAX_LOG_STORAGE_BYTES,
             include_test_proposal: true,
+            machine_readable_diagnostics: false,
             stages,
         }
     }
@@ -103,6 +113,11 @@ impl VerificationConfig {
         if let Some(value) = object.get("includeTestProposal") {
             config.include_test_proposal = value.as_bool().ok_or_else(|| {
                 OcgError::config("verification.includeTestProposal must be a boolean")
+            })?;
+        }
+        if let Some(value) = object.get("machineReadableDiagnostics") {
+            config.machine_readable_diagnostics = value.as_bool().ok_or_else(|| {
+                OcgError::config("verification.machineReadableDiagnostics must be a boolean")
             })?;
         }
         if let Some(value) = object.get("maxRawLogBytes") {

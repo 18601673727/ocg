@@ -5,10 +5,11 @@
 //! admitted and completed as a canonical Call before its tool message is sent
 //! back to the provider.
 
+use crate::call_recovery as recovery;
 use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
 use crate::native_tools::{
-    openai_projection::OpenAiToolProjection, tool_permission_for, PermissionPolicy,
+    openai_projection::OpenAiToolProjection, PermissionPolicy,
 };
 use crate::openai_compatible::{
     ChatFinishReason, ChatStreamSummary, CompletedToolCall,
@@ -189,8 +190,11 @@ impl CanonicalProviderCallHandler {
             OcgError::config("provider Call missing provider_config")
         })?;
         
-        // Resolve credential from Vault at execution time
-        let vault = crate::vault::Vault::new(&config.project_root);
+        // Resolve credential from the user-global Vault at execution time, the
+        // same store `ocg auth` writes and the same one admission validated the
+        // reference against. The project root is a directory and is not a
+        // credential store.
+        let vault = crate::vault::Vault::user_global()?;
         let bearer = vault.get(&provider_config.credential_ref)?.ok_or_else(|| {
             fail_provider_envelope(&config.project_root, &envelope, "credential not found in Vault");
             OcgError::config(format!("credential not found: {}", provider_config.credential_ref))
@@ -524,7 +528,7 @@ fn execute_native_tool_envelope_sync(handler: &crate::native_tools::NativeToolCa
 fn execute_provider_loop(
     provider: &dyn OpenAiCompatibleProvider,
     project_root: &Path,
-    _envelope: &ExecutionEnvelope,
+    envelope: &ExecutionEnvelope,
     authority: &AttemptAuthority,
     executor: &Executor,
     request: &mut Value,
@@ -533,12 +537,23 @@ fn execute_provider_loop(
     native_tool_dispatcher: &BoundedDispatcher,
 ) -> Result<ProviderFinalResponse> {
     let projection = OpenAiToolProjection::from_registry()?;
+    let model = envelope
+        .provider_config
+        .as_ref()
+        .map(|config| config.model.clone())
+        .unwrap_or_default();
 
     // Inject native tools into request
     let object = request
         .as_object_mut()
         .ok_or_else(|| OcgError::config("provider request must be an object"))?;
     object.insert("tools".to_string(), Value::Array(projection.tools()));
+
+    // Assemble the active context once, before any round: the structured
+    // projection and the compacted conversation together form the request this
+    // provider Call carries. Every later round appends to that same request
+    // rather than re-deciding what context it has.
+    apply_active_context(request, project_root, &authority.attempt_id, provider, &model)?;
     
     for round in 0..MAX_PROVIDER_ROUNDS {
         if cancelled.load(Ordering::SeqCst) {
@@ -570,49 +585,63 @@ fn execute_provider_loop(
             .ok_or_else(|| OcgError::config("provider request messages are missing"))?
             .push(round_response.assistant);
         for call in &round_response.summary.tool_calls {
-            let tool = projection.resolve(&call.name)?;
-            let canonical_name = tool.canonical_name();
-            let wire_arguments: Value = serde_json::from_str(&call.arguments)
-                .map_err(|error| OcgError::config(format!("invalid tool arguments JSON: {error}")))?;
-            let permission = tool_permission_for(canonical_name)
-                .ok_or_else(|| OcgError::config(format!("unknown tool permission: {canonical_name}")))?;
-            tool.validate_wire_arguments(&wire_arguments)?;
-            let arguments = tool.canonical_arguments(&wire_arguments);
+            // A tool call is admitted, executed and completed as a canonical
+            // Call. That authority is unchanged here; what changes is what
+            // happens when the Runtime can already tell the Call is invalid.
+            // Recovery decides, and only a Call that genuinely needs new
+            // reasoning is reported as such. See `crate::call_recovery`.
+            match resolve_call(project_root, authority, call, &projection)? {
+                ResolvedCall::Admitted {
+                    name: canonical_name,
+                    arguments,
+                    permission,
+                    repairs,
+                } => {
+                    for repair in &repairs {
+                        tracing::debug!(
+                            tool_call_id = %call.id,
+                            ?repair,
+                            "deterministically recovered native tool Call before dispatch"
+                        );
+                    }
+                    // Admit and queue Native Tool Call to separate bounded
+                    // dispatcher.
+                    let payload = json!({
+                        "kind": "native_tool",
+                        "tool_call_id": call.id,
+                        "name": canonical_name,
+                        "arguments": arguments
+                    });
+                    let mut domain = DomainRepository::open(project_root)?;
+                    let side_effect = permission != crate::native_tools::PermissionClass::ReadOnly;
 
-            // Admit and queue Native Tool Call to separate bounded dispatcher
-            let payload = json!({
-                "kind": "native_tool",
-                "tool_call_id": call.id,
-                "name": canonical_name,
-                "arguments": arguments
-            });
-            let mut domain = DomainRepository::open(project_root)?;
-            let side_effect = permission != crate::native_tools::PermissionClass::ReadOnly;
+                    let tool_call = admit_call(
+                        &mut domain,
+                        authority,
+                        &executor.id,
+                        side_effect,
+                        &payload.to_string(),
+                        native_tool_dispatcher,
+                    )?;
 
-            let tool_call = admit_call(
-                &mut domain,
-                authority,
-                &executor.id,
-                side_effect,
-                &payload.to_string(),
-                native_tool_dispatcher,
-            )?;
+                    drop(domain);
 
-            drop(domain);
+                    // Wait for child Call completion by polling (blocking is
+                    // acceptable here because provider and native tool use
+                    // separate dispatchers).
+                    let result = wait_for_call_completion(project_root, &tool_call.id)?;
 
-            // Wait for child Call completion by polling (blocking is acceptable
-            // here because provider and native tool use separate dispatchers)
-            let result = wait_for_call_completion(project_root, &tool_call.id)?;
-
-            request
-                .get_mut("messages")
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| OcgError::config("provider request messages are missing"))?
-                .push(json!({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": result
-                }));
+                    push_tool_message(request, call, result)?;
+                }
+                ResolvedCall::Rejected(content) => {
+                    // The Call failed before dispatch. It is reported as a
+                    // corrective tool result carrying a compact observation, so
+                    // the model can repair in place rather than the Runtime
+                    // discarding the round and paying for a fresh one. The full
+                    // arguments stay in the provider Call record and journal.
+                    push_tool_message(request, call, content)?;
+                }
+            }
         }
     }
     Err(OcgError::config(format!(
@@ -620,8 +649,318 @@ fn execute_provider_loop(
     )))
 }
 
+/// What recovery decided about one provider-emitted tool call.
+enum ResolvedCall {
+    /// Dispatchable, with any deterministic repairs already applied.
+    Admitted {
+        name: &'static str,
+        arguments: Value,
+        permission: crate::native_tools::PermissionClass,
+        repairs: Vec<crate::call_recovery::Repair>,
+    },
+    /// Not dispatchable. The payload is the compact observation to feed back.
+    Rejected(String),
+}
+
+/// Run one tool call through schema validation and recovery.
+///
+/// This is the single point where a provider tool call becomes a canonical Call,
+/// so it is the only place a dispatch failure can be characterized before any
+/// side effect is possible.
+fn resolve_call(
+    project_root: &Path,
+    authority: &AttemptAuthority,
+    call: &CompletedToolCall,
+    projection: &OpenAiToolProjection,
+) -> Result<ResolvedCall> {
+    let reference = format!("tool_call {}", call.id);
+    let bindings = recovery::TargetBindings::from_calls(
+        &DomainRepository::open(project_root)?.calls_for_attempt(&authority.attempt_id)?,
+    );
+
+    // Parse first. A malformed argument blob is not a schema failure and has no
+    // field to repair, so it never enters the recovery flow.
+    let wire_arguments: Value = match serde_json::from_str(&call.arguments) {
+        Ok(value) => value,
+        Err(error) => {
+            let failure = recovery::CallFailure::MalformedArguments {
+                tool: call.name.clone(),
+                reason: format!("arguments are not valid JSON: {error}"),
+            };
+            return Ok(ResolvedCall::Rejected(
+                failure.compact_observation(&reference),
+            ));
+        }
+    };
+
+    // `confidence` is deliberately not consumed here: recovery records the match
+    // kind on the repair it emits, so the dispatch path stays the single
+    // authority on why a Call was allowed through.
+    let Some((definition, _confidence)) = recovery::resolve_tool(&call.name) else {
+        let failure = recovery::CallFailure::UnknownTool {
+            requested: call.name.clone(),
+            candidates: recovery::tool_candidates(&call.name),
+        };
+        return Ok(ResolvedCall::Rejected(failure.compact_observation(&reference)));
+    };
+
+    // The provider was offered the OpenAI wire name, and a strict-schema wire
+    // shape, not the canonical schema. Undoing that widening happens before
+    // preflight so the failure the model sees names canonical fields. Strict
+    // validation still runs first: normalization on its own would hide a wire
+    // violation, because dropping a null optional field makes the canonical form
+    // valid.
+    let canonical =
+        match normalize_wire_arguments(projection, &call.name, &definition, &wire_arguments) {
+            Ok(canonical) => canonical,
+            Err(message) => {
+                // The validator's own error text interpolates the offending
+                // value, so it is never forwarded to the model: a wrongly-typed
+                // `oldString` would otherwise drag its own body back into the
+                // context that already holds it. The classified observation
+                // replaces it, and the validator text stays in the trace.
+                let failure = recovery::CallFailure::InvalidArguments(
+                    wire_failure(&definition, &wire_arguments),
+                );
+                tracing::debug!(
+                    tool = %call.name,
+                    tool_call_id = %call.id,
+                    %message,
+                    "native tool wire arguments rejected before dispatch"
+                );
+                return Ok(ResolvedCall::Rejected(
+                    failure.compact_observation(&reference),
+                ));
+            }
+        };
+
+    // Recovery is registry-driven: the tool name is resolved and the arguments
+    // validated against the tool's own schema, then only what Runtime state can
+    // settle is settled here. Everything still outstanding becomes a field-scoped
+    // repair request rather than a fresh round.
+    match recovery::recover(&call.name, &canonical, &bindings, &reference) {
+        recovery::RecoveryAction::Dispatch {
+            definition,
+            arguments,
+            repairs,
+        } => {
+            let permission = crate::native_tools::tool_permission_for(definition.name).ok_or_else(
+                || {
+                    OcgError::config(format!("unknown tool permission: {}", definition.name))
+                },
+            )?;
+            Ok(ResolvedCall::Admitted {
+                name: definition.name,
+                arguments,
+                permission,
+                repairs,
+            })
+        }
+        recovery::RecoveryAction::ConstrainedRepair(repair) => {
+            Ok(ResolvedCall::Rejected(repair.instruction()))
+        }
+        recovery::RecoveryAction::NeedsReasoning(failure) => {
+            Ok(ResolvedCall::Rejected(failure.compact_observation(&reference)))
+        }
+    }
+}
+
+/// Classify a wire-schema rejection without echoing the offending values.
+///
+/// The provider is held to the strict schema it was offered, which lists every
+/// property as required and widens optional ones to nullable. A field sent as
+/// `null` is therefore a wire defect, not a canonical one, and is reported
+/// against the canonical schema the tool actually owns.
+fn wire_failure(
+    definition: &crate::native_tools::NativeToolDefinition,
+    wire_arguments: &Value,
+) -> recovery::InvalidArguments {
+    // Validate against the canonical schema after stripping the widening nulls,
+    // so the reported field names and types are the ones a repair must satisfy.
+    let canonical = match recovery::preflight(definition, wire_arguments) {
+        Ok(Some(recovery::CallFailure::InvalidArguments(invalid))) => invalid,
+        _ => recovery::InvalidArguments {
+            tool: definition.name.to_string(),
+            missing: Vec::new(),
+            invalid: Vec::new(),
+            unexpected: wire_unexpected(definition, wire_arguments),
+        },
+    };
+    recovery::InvalidArguments {
+        tool: definition.name.to_string(),
+        missing: canonical.missing,
+        invalid: canonical.invalid,
+        unexpected: if canonical.unexpected.is_empty() {
+            wire_unexpected(definition, wire_arguments)
+        } else {
+            canonical.unexpected
+        },
+    }
+}
+
+/// Fields the provider sent that the strict schema does not declare.
+fn wire_unexpected(
+    definition: &crate::native_tools::NativeToolDefinition,
+    wire_arguments: &Value,
+) -> Vec<recovery::FieldIssue> {
+    let Some(declared) = definition.parameters.get("properties").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    wire_arguments
+        .as_object()
+        .map(|fields| {
+            fields
+                .keys()
+                .filter(|name| !declared.contains_key(name.as_str()))
+                .map(|name| recovery::FieldIssue {
+                    field: name.clone(),
+                    instance_path: String::new(),
+                    defect: recovery::ArgumentDefect::Unexpected,
+                    observed: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Undo strict-mode widening after the wire schema is satisfied.
+///
+/// The projection owns this transform for the exact wire name the provider was
+/// given. An alias-resolved Call did not arrive under a wire name the projection
+/// offered, so its wire shape is the canonical one with nulls already dropped by
+/// the provider's own emission — nothing to undo.
+fn normalize_wire_arguments(
+    projection: &OpenAiToolProjection,
+    requested: &str,
+    definition: &crate::native_tools::NativeToolDefinition,
+    wire_arguments: &Value,
+) -> std::result::Result<Value, String> {
+    if requested == wire_name_of(definition.name) {
+        return Ok(projection
+            .resolve(requested)
+            .map_err(|error| error.to_string())?
+            .canonical_arguments(wire_arguments));
+    }
+    // An alias Call still has to satisfy the strict schema of the tool it
+    // resolved to, otherwise a name substitution would be a way to bypass
+    // validation.
+    let tool = projection
+        .resolve(&wire_name_of(definition.name))
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = tool.validate_wire_arguments(wire_arguments) {
+        return Err(error.to_string());
+    }
+    Ok(tool.canonical_arguments(wire_arguments))
+}
+
+fn wire_name_of(canonical_name: &str) -> String {
+    canonical_name.replace('.', "_")
+}
+
+/// Replace the request's messages with the assembled active context.
+///
+/// This is the single boundary at which context enters a provider request. The
+/// Context Engine, verification and Call recovery do not each reach into the
+/// request; they are read here and rendered once, by
+/// [`crate::provider_context`]. A projection that cannot be assembled leaves the
+/// conversation exactly as the caller built it, because losing context must not
+/// cost the Call.
+///
+/// `provider` and `model` are handed to the projection so a compaction that
+/// needs a summary can reach a model. The summarizing call runs under the
+/// authority of the provider Call being executed: it is one step in assembling
+/// that Call's context, so it is not a separate execution and gets no admission
+/// of its own.
+fn apply_active_context(
+    request: &mut Value,
+    project_root: &Path,
+    attempt_id: &str,
+    provider: &dyn OpenAiCompatibleProvider,
+    model: &str,
+) -> Result<()> {
+    let conversation = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let task = objective_of(&conversation);
+    let summarize = |prompt: &str, max_tokens: u64| -> Result<String> {
+        let summary_request = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "stream": false,
+        });
+        Ok(provider.complete(&summary_request)?.summary.text)
+    };
+    let assembled = match crate::provider_context::assemble(
+        project_root,
+        crate::provider_context::ContextInputs {
+            task: &task,
+            attempt_id,
+            tools: request.get("tools"),
+            conversation: conversation.clone(),
+            summarize: Some(&summarize),
+        },
+    ) {
+        Ok(assembled) => assembled,
+        Err(error) => {
+            tracing::warn!(%error, "active context projection failed; sending the conversation as assembled");
+            return Ok(());
+        }
+    };
+    tracing::debug!(
+        sources = ?assembled.sources,
+        projection_bytes = assembled.bytes,
+        conversation_messages = assembled.messages.len(),
+        "provider request context assembled"
+    );
+    let mut messages = Vec::with_capacity(assembled.messages.len() + 1);
+    messages.extend(assembled.system);
+    messages.extend(assembled.messages);
+    request
+        .as_object_mut()
+        .ok_or_else(|| OcgError::config("provider request must be an object"))?
+        .insert("messages".to_string(), Value::Array(messages));
+    Ok(())
+}
+
+/// The task text a context plan is ranked against.
+///
+/// The objective is the opening user message, which is where
+/// `canonical_control` puts it. Only that message is read: the rest of the
+/// conversation is work in progress, not a description of the task.
+fn objective_of(conversation: &[Value]) -> String {
+    conversation
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Append a tool result to the request.
+fn push_tool_message(request: &mut Value, call: &CompletedToolCall, content: String) -> Result<()> {
+    request
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| OcgError::config("provider request messages are missing"))?
+        .push(json!({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": content
+        }));
+    Ok(())
+}
+
 /// Poll for Call completion. This blocks the provider handler but does not
 /// block the native tool consumer since they use separate dispatchers.
+///
+/// A failed Call is returned as its recorded result rather than raised as an
+/// error. A tool that failed — a stale revision, an ambiguous target, a denied
+/// permission — is a fact the model needs to correct, and raising it aborted the
+/// entire provider Call, discarding the round and every fact in it.
 fn wait_for_call_completion(project_root: &Path, call_id: &str) -> Result<String> {
     for _ in 0..600 {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -634,13 +973,19 @@ fn wait_for_call_completion(project_root: &Path, call_id: &str) -> Result<String
                 })
             }
             "failed" => {
-                return Err(OcgError::config(format!(
-                    "native tool Call failed: {}",
-                    call.response.unwrap_or_else(|| "unknown error".to_string())
-                )))
+                return Ok(call.response.unwrap_or_else(|| {
+                    json!({"success": false, "error": {"kind": "unknown", "message": "native tool Call failed"}}).to_string()
+                }))
             }
             "fenced" => {
-                return Err(OcgError::config("native tool Call fenced"))
+                return Ok(json!({
+                    "success": false,
+                    "error": {
+                        "kind": "fenced",
+                        "message": "native tool Call was fenced; its effect is unknown and it will not be retried automatically"
+                    }
+                })
+                .to_string())
             }
             _ => continue,
         }

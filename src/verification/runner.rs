@@ -1,6 +1,7 @@
 //! Verification execution: run a stage's trusted commands in order.
 
 use crate::clock::Clock;
+use crate::compiler_feedback as compiler;
 use crate::error::Result;
 use crate::process::CaptureRunner;
 use crate::verification::config::VerificationConfig;
@@ -72,7 +73,28 @@ pub fn execute(request: &VerifyRequest<'_>) -> Result<VerificationReport> {
     let mut results: Vec<VerificationResult> = Vec::new();
     let mut stopped_early = false;
 
-    for command in stage.commands.iter() {
+    // The previous compile's diagnostics per command. Loaded fail-soft: a
+    // missing or corrupt state file simply means there is no baseline, which the
+    // delta reports as `baseline_known: false` rather than as everything being
+    // new.
+    let loaded = crate::orchestration::state::load(request.root);
+    let mut state = loaded.state;
+    if loaded.corrupt {
+        notes.push(
+            "orchestration state could not be read; this run has no compiler diagnostic baseline"
+                .to_string(),
+        );
+    }
+    let mut live_commands: Vec<String> = Vec::new();
+
+    for configured in stage.commands.iter() {
+        // Only an explicitly enabled flag changes what a command prints, and
+        // only for cargo subcommands that emit diagnostics.
+        let command = if config.machine_readable_diagnostics {
+            configured.with_machine_readable_diagnostics()
+        } else {
+            configured.clone()
+        };
         let captured = match request.runner.run(
             &command.program,
             &command.args,
@@ -97,6 +119,7 @@ pub fn execute(request: &VerifyRequest<'_>) -> Result<VerificationReport> {
                     raw_truncated: false,
                     failed_tests: Vec::new(),
                     source_locations: Vec::new(),
+                    compiler: None,
                 });
                 if config.stop_on_failure {
                     stopped_early = true;
@@ -116,9 +139,40 @@ pub fn execute(request: &VerifyRequest<'_>) -> Result<VerificationReport> {
                     .to_string(),
             );
         }
+
+        // Structured compiler feedback, when this run actually produced
+        // machine-readable diagnostics. Detection is by evidence, not by command
+        // name: cargo's message stream is proof, so a non-Rust command never
+        // enters this path by accident.
+        //
+        // A clean compile still records a baseline. Leaving the previous one in
+        // place would make the next compile report reintroduced diagnostics as
+        // carried over rather than new.
+        let key = command.display();
+        let machine_readable =
+            compiler::is_machine_readable_output(&stdout) || compiler::is_machine_readable_output(&stderr);
+        let compiler_delta = if !machine_readable {
+            None
+        } else {
+            let mut current = compiler::from_json_lines(&stdout);
+            if current.is_empty() {
+                current = compiler::from_json_lines(&stderr);
+            }
+            let previous = state.compiler_baseline(&key).map(|baseline| baseline.current.clone());
+            let delta = compiler::delta(previous.as_ref(), current);
+            live_commands.push(key.clone());
+            state.record_compiler_baseline(&key, delta.clone(), now, &live_commands);
+            // The distilled text for a JSON compile is the raw message stream,
+            // which is exactly the re-sending this projection exists to stop. The
+            // delta replaces it as the summary a reader sees; the captured
+            // streams remain in the raw log below.
+            output.summary = delta.observation().lines().map(str::to_string).collect();
+            Some(delta)
+        };
+
         let raw = store.store(&RawLogInput {
             created_at: now,
-            label: &command.display(),
+            label: &key,
             stdout: &captured.stdout,
             stderr: &captured.stderr,
             stdout_truncated: captured.stdout_truncated,
@@ -145,11 +199,22 @@ pub fn execute(request: &VerifyRequest<'_>) -> Result<VerificationReport> {
             output,
             raw_log: Some(raw.path),
             raw_truncated: raw.truncated || captured.truncated(),
+            compiler: compiler_delta,
         });
 
         if !captured.success && config.stop_on_failure {
             stopped_early = true;
             break;
+        }
+    }
+
+    // Persisting the baseline is best effort. Losing it only costs the next
+    // compile its delta, so it never turns a verification run into a failure.
+    if !live_commands.is_empty() {
+        if let Err(error) = crate::orchestration::state::save(request.root, &state) {
+            notes.push(format!(
+                "compiler diagnostic baseline was not persisted: {error}"
+            ));
         }
     }
 

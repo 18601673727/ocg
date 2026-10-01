@@ -114,6 +114,61 @@ impl CommandSpec {
         }
         format!("{} {}", self.program, self.args.join(" "))
     }
+
+    /// Add `--message-format=json` when this is a cargo subcommand that
+    /// produces compiler diagnostics and the caller has not already chosen a
+    /// message format.
+    ///
+    /// This is opt-in, never automatic. Changing the format a configured
+    /// command produces is a change to what the user asked to run, so it only
+    /// happens when they enabled it. A command that already names a format is
+    /// left exactly as written, because overriding it would discard their
+    /// choice.
+    pub fn with_machine_readable_diagnostics(&self) -> Self {
+        if !is_cargo_diagnostics_subcommand(self) {
+            return self.clone();
+        }
+        let already_chosen = self
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("--message-format") || arg.starts_with("--error-format"));
+        if already_chosen {
+            return self.clone();
+        }
+        // `--message-format` is a build-options flag that cargo accepts on the
+        // subcommand, not before it, so it is inserted directly after the
+        // subcommand and after any leading cargo options.
+        let mut args = self.args.clone();
+        let insertion = args
+            .iter()
+            .position(|arg| !arg.starts_with('-'))
+            .map(|index| index + 1)
+            .unwrap_or(args.len());
+        args.insert(insertion, "--message-format=json".to_string());
+        Self {
+            program: self.program.clone(),
+            args,
+        }
+    }
+}
+
+/// Cargo subcommands whose output is compiler diagnostics.
+const CARGO_DIAGNOSTIC_SUBCOMMANDS: [&str; 6] = ["check", "build", "clippy", "test", "bench", "rustc"];
+
+/// Whether this command is a cargo invocation that emits compiler diagnostics.
+///
+/// Scoped to cargo deliberately: `rustc` uses `--error-format` rather than
+/// `--message-format`, and every other program is opaque to this check.
+fn is_cargo_diagnostics_subcommand(command: &CommandSpec) -> bool {
+    if interpreter_basename(&command.program) != "cargo" {
+        return false;
+    }
+    command
+        .args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(|arg| CARGO_DIAGNOSTIC_SUBCOMMANDS.contains(&arg.as_str()))
+        .unwrap_or(false)
 }
 
 /// Split a command string into words with shell-like quoting but no shell.

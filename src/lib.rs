@@ -19,9 +19,11 @@
 //!
 //! OCG does not depend on any external agent runtime to work.
 
+pub mod call_recovery;
 pub mod capabilities;
 pub mod cli;
 pub mod clock;
+pub mod compiler_feedback;
 pub mod compaction;
 pub mod config;
 pub mod config_command;
@@ -52,6 +54,7 @@ pub mod profile;
 pub mod project;
 pub mod prompt;
 pub mod proxy;
+pub mod provider_context;
 pub mod pwa;
 pub mod release;
 pub mod report;

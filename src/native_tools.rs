@@ -229,11 +229,34 @@ pub struct NativeToolDefinition {
     pub permission: PermissionClass,
     pub capability: &'static str,
     pub executor: NativeToolExecutorBinding,
+    /// Other names a model plausibly emits for this tool, in addition to the
+    /// canonical name and its OpenAI wire name.
+    ///
+    /// The registry owns this list because the registry owns every other tool
+    /// fact. Recovery never learns a tool name from anywhere else, so it holds
+    /// no knowledge of any specific alias and cannot drift from the registry.
+    pub aliases: &'static [&'static str],
+    /// The argument field naming the resource this tool acts on, when it has
+    /// one.
+    ///
+    /// Declaring it is what makes deterministic argument recovery sound: a
+    /// resource may only be recovered for a field the registry identifies as
+    /// that tool's target. No other field is ever inferred.
+    pub target_field: Option<&'static str>,
+    /// Argument fields this tool also answers to, mapping the accepted
+    /// spelling to the canonical one.
+    ///
+    /// Models carry tool conventions from other agents, so a model may send
+    /// `path` to a tool whose schema says `file`. Declaring the accepted
+    /// spelling lets the Runtime normalize it deterministically instead of
+    /// spending a reasoning turn to learn a field name.
+    pub argument_aliases: &'static [(&'static str, &'static str)],
 }
 
 pub struct NativeToolRegistry;
 
 impl NativeToolRegistry {
+    /// The one definition of every built-in tool.
     pub fn definitions() -> Vec<NativeToolDefinition> {
         vec![
             NativeToolDefinition {
@@ -243,6 +266,9 @@ impl NativeToolRegistry {
                 permission: PermissionClass::ReadOnly,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemRead,
+                aliases: &["read", "read_file", "view", "cat"],
+                target_field: Some("path"),
+                argument_aliases: &[("file", "path"), ("filePath", "path")],
             },
             NativeToolDefinition {
                 name: "filesystem.list",
@@ -251,6 +277,9 @@ impl NativeToolRegistry {
                 permission: PermissionClass::ReadOnly,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemList,
+                aliases: &["list", "ls", "list_dir", "list_directory", "readdir"],
+                target_field: Some("path"),
+                argument_aliases: &[("directory", "path"), ("dir", "path")],
             },
             NativeToolDefinition {
                 name: "filesystem.search",
@@ -259,6 +288,9 @@ impl NativeToolRegistry {
                 permission: PermissionClass::ReadOnly,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemSearch,
+                aliases: &["search", "grep", "ripgrep", "find_in_files"],
+                target_field: Some("path"),
+                argument_aliases: &[("directory", "path"), ("dir", "path"), ("pattern", "query")],
             },
             NativeToolDefinition {
                 name: "filesystem.edit",
@@ -267,6 +299,12 @@ impl NativeToolRegistry {
                 permission: PermissionClass::FilesystemWrite,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemEdit,
+                aliases: &["edit", "edit_file", "patch", "write_file"],
+                target_field: Some("file"),
+                // `path` is the field name other coding agents use for the
+                // edited file, and it is the one models most often send instead
+                // of `file`.
+                argument_aliases: &[("path", "file"), ("filename", "file"), ("target", "file")],
             },
             NativeToolDefinition {
                 name: "process.exec",
@@ -275,15 +313,91 @@ impl NativeToolRegistry {
                 permission: PermissionClass::ProcessExec,
                 capability: "process",
                 executor: NativeToolExecutorBinding::ProcessExec,
+                aliases: &["bash", "shell", "sh", "run", "run_command", "execute"],
+                target_field: None,
+                argument_aliases: &[("command", "program"), ("cmd", "program")],
             },
         ]
     }
 
+    /// Look a tool up by its exact canonical name.
     pub fn get(name: &str) -> Option<NativeToolDefinition> {
         Self::definitions()
             .into_iter()
             .find(|tool| tool.name == name)
     }
+
+    /// Look a tool up by its canonical name or by any registry-declared alias.
+    ///
+    /// This is the only name lookup that is allowed to succeed on something
+    /// other than the canonical name, so the accepted surface stays owned by
+    /// the registry.
+    pub fn get_by_alias(name: &str) -> Option<(NativeToolDefinition, NameMatch)> {
+        let definitions = Self::definitions();
+        let exact = definitions
+            .iter()
+            .find(|tool| tool.name == name)
+            .cloned();
+        if let Some(definition) = exact {
+            return Some((definition, NameMatch::Exact));
+        }
+        let alias = definitions
+            .iter()
+            .find(|tool| tool.aliases.contains(&name))
+            .cloned();
+        if let Some(definition) = alias {
+            return Some((definition, NameMatch::Alias));
+        }
+        // A normalized match is accepted only when it is unique. Two tools that
+        // fold to the same spelling are not a match at all; picking one would be
+        // a guess about which tool a model meant.
+        let normalized = normalize_name(name);
+        let mut folded: Vec<_> = definitions
+            .into_iter()
+            .filter(|tool| {
+                normalize_name(tool.name) == normalized
+                    || tool
+                        .aliases
+                        .iter()
+                        .any(|alias| normalize_name(alias) == normalized)
+            })
+            .collect();
+        if folded.len() == 1 {
+            return Some((folded.remove(0), NameMatch::Normalized));
+        }
+        None
+    }
+
+    /// Every canonical tool name, in registry order.
+    pub fn names() -> Vec<&'static str> {
+        Self::definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+}
+
+/// How confidently a requested tool name matched a registry entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameMatch {
+    /// The requested name is the canonical name.
+    Exact,
+    /// The requested name is a registry-declared alias.
+    Alias,
+    /// The requested name matched only after case and separator folding.
+    Normalized,
+}
+
+/// Fold case and the separators models vary on, so `FileSystem.Edit`,
+/// `filesystem-edit` and `filesystem_edit` resolve to one registry entry.
+///
+/// Folding is symmetric and total: it never invents a name, it only refuses to
+/// treat spelling variants as different tools.
+fn normalize_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
