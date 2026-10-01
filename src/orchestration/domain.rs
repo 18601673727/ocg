@@ -1103,6 +1103,10 @@ impl DomainRepository {
         Ok(())
     }
 
+    pub fn dispatch_intent(&self, call_id: &str) -> Result<Option<DispatchIntent>> {
+        read_dispatch_intent_by_call(&self.connection, call_id)
+    }
+
     pub fn mark_budget_admitted(&mut self, call_id: &str) -> Result<()> {
         let transaction = self.begin()?;
         let before = read_dispatch_intent_by_call(&transaction, call_id)?
@@ -1124,6 +1128,7 @@ impl DomainRepository {
         transaction.commit().map_err(sql)?;
         Ok(())
     }
+
 
     /// Freeze the pricing basis for one dispatch, durably, before the provider
     /// is asked to do anything.

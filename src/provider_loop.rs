@@ -14,9 +14,13 @@ use crate::native_tools::{
 use crate::openai_compatible::{
     ChatFinishReason, ChatStreamEvent, ChatStreamSummary, NormalizedUsage, ToolCallNormalizer,
 };
-use crate::orchestration::domain::{AttemptAuthority, DomainRepository, Executor};
+use crate::orchestration::budget::{BudgetConfig, QuotaFacts};
+use crate::orchestration::domain::{
+    AccountingAuthority, AttemptAuthority, DispatchAccounting, DomainRepository,
+    EffectIntentState, Executor,
+};
 use crate::orchestration::execution_dispatch::{
-    admit_call, BoundedDispatcher, CompioExecutor, ExecutionEnvelope, ValidatedCompioCallHandler,
+    BoundedDispatcher, CompioExecutor, ExecutionEnvelope, ValidatedCompioCallHandler,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -89,35 +93,97 @@ impl CanonicalProviderCallHandler {
     }
 }
 
-/// Admit one provider request into the same bounded dispatcher used by other
-/// canonical Calls. The returned Call is the durable owner of the provider
-/// request; a queue item alone never authorizes execution.
+/// Admit one provider request through canonical economic admission before
+/// placing it on the bounded dispatcher. The returned Call is the durable owner
+/// of the provider request; a queue item alone never authorizes execution.
 ///
-/// Budget admission is marked immediately after Call creation, ensuring provider
-/// usage goes through economic admission before execution.
+/// Economic admission must succeed before the Call enters the bounded queue.
+/// If queue handoff fails after successful admission, the reservation is
+/// released as NotDispatched.
 pub fn admit_provider_call(
     domain: &mut DomainRepository,
     authority: &AttemptAuthority,
     executor_id: &str,
     request: Value,
+    config: &BudgetConfig,
+    quota: QuotaFacts,
     dispatcher: &BoundedDispatcher,
 ) -> Result<crate::orchestration::domain::Call> {
     let payload = json!({
         "executor_transport": "provider",
         "arguments": request
     });
-    let call = admit_call(
-        domain,
-        authority,
-        executor_id,
-        true,
+
+    // Create Call and DispatchIntent without queueing
+    let call = domain.create_call_with_effect(
+        &authority.attempt_id,
+        Some(executor_id),
+        authority.generation,
+        crate::orchestration::domain::EffectIntentKind::StrictFenced,
         &payload.to_string(),
-        dispatcher,
     )?;
 
-    // Mark budget admitted before execution. Provider calls have metered usage
-    // and must go through economic admission before dispatch.
-    domain.mark_budget_admitted(&call.id)?;
+    // Resolve canonical Project identity from Job ownership
+    let job = domain.job(&authority.job_id)?
+        .ok_or_else(|| OcgError::config("provider Call Job no longer exists"))?;
+    let project_id = &job.project_id;
+
+    // Execute true economic admission through canonical DomainRepository API
+    let assessment = domain.admit_dispatch(
+        project_id,
+        authority.generation,
+        &call.id,
+        config,
+        quota,
+    )?;
+
+    // Fail closed: denied admission terminates the Call before queue/execution
+    if !assessment.is_allowed() {
+        domain.finish_dispatch_intent(
+            &call.id,
+            "failed",
+            EffectIntentState::NotStarted,
+            Some(&format!("economic_admission_denied: {}", assessment.reason_code)),
+        )?;
+        return Err(OcgError::config(format!(
+            "provider Call denied by economic admission: {}",
+            assessment.reason
+        )));
+    }
+
+    // Economic admission succeeded; now queue
+    domain.mark_dispatch_queued(&call.id)?;
+    let (events, _receiver) = flume::unbounded();
+    if let Err(error) = dispatcher.send(ExecutionEnvelope {
+        call_id: call.id.clone(),
+        job_id: authority.job_id.clone(),
+        attempt_id: authority.attempt_id.clone(),
+        executor_id: Some(executor_id.to_string()),
+        generation: authority.generation,
+        payload: payload.to_string(),
+        dispatch_id: None,
+        events,
+    }) {
+        // Queue handoff failed after successful economic admission.
+        // The provider request never left OCG, so release the reservation
+        // via NotDispatched disposition.
+        domain.finish_dispatch_intent(
+            &call.id,
+            "failed",
+            EffectIntentState::NotStarted,
+            Some("bounded_dispatch_disconnected"),
+        )?;
+        let claim = AccountingAuthority {
+            attempt_id: authority.attempt_id.clone(),
+            generation: authority.generation,
+        };
+        let _ = domain.settle_dispatch_accounting(
+            &call.id,
+            &claim,
+            &DispatchAccounting::NotDispatched,
+        );
+        return Err(error);
+    }
 
     Ok(call)
 }
@@ -166,6 +232,26 @@ impl ValidatedCompioCallHandler for CanonicalProviderCallHandler {
                 return Err(OcgError::config("provider Call cancelled before execution"));
             }
             let mut domain = DomainRepository::open(&config.project_root)?;
+
+            // Verify economic authority before execution
+            let intent = domain.dispatch_intent(&envelope.call_id)?
+                .ok_or_else(|| {
+                    fail_provider_envelope(
+                        &config.project_root,
+                        &envelope,
+                        "provider Call has no durable dispatch intent",
+                    );
+                    OcgError::config("provider Call has no durable dispatch intent")
+                })?;
+            if !intent.budget_admitted {
+                fail_provider_envelope(
+                    &config.project_root,
+                    &envelope,
+                    "provider Call has no economic admission",
+                );
+                return Err(OcgError::config("provider Call lacks economic admission authority"));
+            }
+
             let authority = domain
                 .authority(&envelope.attempt_id)?
                 .filter(|authority| {
