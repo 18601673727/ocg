@@ -16,8 +16,7 @@ use crate::openai_compatible::{
 };
 use crate::orchestration::budget::{BudgetConfig, QuotaFacts};
 use crate::orchestration::domain::{
-    AccountingAuthority, AttemptAuthority, DispatchAccounting, DomainRepository,
-    EffectIntentState, Executor,
+    AccountingAuthority, AttemptAuthority, DispatchAccounting, DomainRepository, Executor,
 };
 use crate::orchestration::execution_dispatch::{
     BoundedDispatcher, CompioExecutor, ExecutionEnvelope, ValidatedCompioCallHandler,
@@ -139,12 +138,8 @@ pub fn admit_provider_call(
 
     // Fail closed: denied admission terminates the Call before queue/execution
     if !assessment.is_allowed() {
-        domain.finish_dispatch_intent(
-            &call.id,
-            "failed",
-            EffectIntentState::NotStarted,
-            Some(&format!("economic_admission_denied: {}", assessment.reason_code)),
-        )?;
+        let failure = format!("economic_admission_denied: {}", assessment.reason_code);
+        domain.fail_call(&call.id, &authority.attempt_id, authority.generation, &failure)?;
         return Err(OcgError::config(format!(
             "provider Call denied by economic admission: {}",
             assessment.reason
@@ -167,11 +162,11 @@ pub fn admit_provider_call(
         // Queue handoff failed after successful economic admission.
         // The provider request never left OCG, so release the reservation
         // via NotDispatched disposition.
-        domain.finish_dispatch_intent(
+        domain.fail_call(
             &call.id,
-            "failed",
-            EffectIntentState::NotStarted,
-            Some("bounded_dispatch_disconnected"),
+            &authority.attempt_id,
+            authority.generation,
+            "bounded_dispatch_disconnected",
         )?;
         let claim = AccountingAuthority {
             attempt_id: authority.attempt_id.clone(),
