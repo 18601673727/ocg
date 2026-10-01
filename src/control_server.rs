@@ -121,6 +121,9 @@ pub struct ControlServer {
     profile: crate::profile::ProfileService,
     config: ServerConfig,
     active: Arc<AtomicUsize>,
+    /// Long-lived execution runtime owning provider and native tool workers.
+    /// Only present when canonical control service is available.
+    execution_runtime: Option<crate::orchestration::execution_runtime::ExecutionRuntime>,
 }
 
 impl ControlServer {
@@ -169,14 +172,50 @@ impl ControlServer {
                 "control server bound a non-loopback address {bound}; refusing to serve"
             )));
         }
+        
+        // Try to open canonical control service
+        let mut canonical = crate::orchestration::canonical_control::CanonicalControlService::open(root).ok();
+        
+        // Wire the profile service if canonical service exists
+        if let Some(ref mut service) = canonical {
+            *service = service.clone().with_profile_service(
+                crate::profile::ProfileService::with_workspace(profile_path, root)
+            );
+        }
+        
+        // If canonical service exists, start execution runtime and wire the handle
+        let execution_runtime = if canonical.is_some() {
+            match crate::orchestration::execution_runtime::ExecutionRuntime::start(
+                root,
+                16, // provider_capacity
+                16, // native_tool_capacity
+                Arc::new(crate::http::NativeHttp::new()?),
+                crate::native_tools::PermissionPolicy::default(),
+            ) {
+                Ok(runtime) => {
+                    let handle = crate::orchestration::execution_runtime::ExecutionRuntimeHandle::new(&runtime);
+                    if let Some(ref mut service) = canonical {
+                        *service = service.clone().with_runtime_handle(handle);
+                    }
+                    Some(runtime)
+                }
+                Err(error) => {
+                    eprintln!("ocg: failed to start execution runtime: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
         Ok(Self {
             listener,
             addr: bound,
-            canonical: crate::orchestration::canonical_control::CanonicalControlService::open(root)
-                .ok(),
+            canonical,
             profile: crate::profile::ProfileService::with_workspace(profile_path, root),
             config,
             active: Arc::new(AtomicUsize::new(0)),
+            execution_runtime,
         })
     }
 
@@ -256,6 +295,14 @@ struct ClientGuard(Arc<AtomicUsize>);
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for ControlServer {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.execution_runtime.take() {
+            let _ = runtime.shutdown();
+        }
     }
 }
 

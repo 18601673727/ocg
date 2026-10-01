@@ -206,6 +206,12 @@ pub struct DispatchIntent {
     /// The pricing basis frozen for this dispatch before the provider ran, and
     /// the only pricing a settlement of this Call may consult.
     pub pricing_basis: Option<budget::PricingBasis>,
+    /// Frozen provider execution configuration for provider Calls.
+    /// None for native tool Calls.
+    pub provider_key: Option<String>,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub credential_ref: Option<String>,
     pub failure: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -413,6 +419,12 @@ CREATE TABLE IF NOT EXISTS domain_dispatch_intents (
     -- the only pricing a settlement of this Call may consult: the current
     -- configuration is never re-resolved at completion time.
     pricing_basis TEXT,
+    -- Frozen provider execution configuration for provider Calls.
+    -- NULL for native tool Calls.
+    provider_key TEXT,
+    model TEXT,
+    endpoint TEXT,
+    credential_ref TEXT,
     failure TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -2722,7 +2734,7 @@ impl DomainRepository {
             )
             .map_err(sql)?;
         transaction.execute(
-            "INSERT INTO domain_dispatch_intents(id,call_id,job_id,attempt_id,executor_id,generation,state,effect_kind,effect_state,request,reservation_id,failure,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,'not_started',?8,NULL,NULL,?9,?9)",
+            "INSERT INTO domain_dispatch_intents(id,call_id,job_id,attempt_id,executor_id,generation,state,effect_kind,effect_state,request,reservation_id,provider_key,model,endpoint,credential_ref,failure,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,'not_started',?8,NULL,NULL,NULL,NULL,NULL,NULL,?9,?9)",
             params![intent_id, id, job_id, attempt_id, executor_id, generation_i64, effect_kind.to_string(), request, timestamp],
         ).map_err(sql)?;
         let call = Call {
@@ -2887,50 +2899,43 @@ impl DomainRepository {
         Ok(())
     }
 
+    /// Freeze provider execution configuration for a specific Call.
+    /// This must be called after create_call_with_effect and before mark_dispatch_queued.
+    pub fn set_provider_config(
+        &mut self,
+        call_id: &str,
+        provider_key: &str,
+        model: &str,
+        endpoint: &str,
+        credential_ref: &str,
+    ) -> Result<()> {
+        validate_id(call_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let changed = transaction
+            .execute(
+                "UPDATE domain_dispatch_intents SET provider_key=?2,model=?3,endpoint=?4,credential_ref=?5,updated_at=?6 WHERE call_id=?1",
+                params![call_id, provider_key, model, endpoint, credential_ref, now()],
+            )
+            .map_err(sql)?;
+        if changed != 1 {
+            return Err(invalid("dispatch intent not found for provider config"));
+        }
+        transaction.commit().map_err(sql)?;
+        Ok(())
+    }
+
     /// Return durable work that was not terminally settled, for restart
     /// recovery. Call and Attempt authority are rechecked by the caller before
     /// handing each row back to the bounded dispatcher.
     pub fn pending_dispatch_intents(&self) -> Result<Vec<DispatchIntent>> {
-        let mut statement = self.connection.prepare(
-            "SELECT id,call_id,job_id,attempt_id,executor_id,generation,state,effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,failure,created_at,updated_at FROM domain_dispatch_intents WHERE state IN ('pending','queued','running') ORDER BY created_at,id"
-        ).map_err(sql)?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents WHERE state IN ('pending','queued','running') ORDER BY created_at,id"
+        )).map_err(sql)?;
         let rows = statement
-            .query_map([], |row| {
-                let effect_kind: String = row.get(7)?;
-                let effect_state: String = row.get(8)?;
-                Ok(DispatchIntent {
-                    id: row.get(0)?,
-                    call_id: row.get(1)?,
-                    job_id: row.get(2)?,
-                    attempt_id: row.get(3)?,
-                    executor_id: row.get(4)?,
-                    generation: u64::try_from(row.get::<_, i64>(5)?)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    state: row.get(6)?,
-                    effect_kind: effect_kind
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    effect_state: effect_state
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    request: row.get(9)?,
-                    reservation_id: row.get(10)?,
-                    budget_admitted: row.get(11)?,
-                    pricing_basis: match row.get::<_, Option<String>>(12)? {
-                        Some(raw) => Some(serde_json::from_str(&raw).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                raw.len(),
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?),
-                        None => None,
-                    },
-                    failure: row.get(13)?,
-                    created_at: row.get(14)?,
-                    updated_at: row.get(15)?,
-                })
-            })
+            .query_map([], dispatch_intent_from_row)
             .map_err(sql)?;
         rows.map(|row| row.map_err(sql)).collect()
     }
@@ -3270,6 +3275,73 @@ impl DomainRepository {
             )
             .map_err(sql)?;
         transaction.commit().map_err(sql)
+    }
+
+    /// Atomically claim a command_id and create a Job, ensuring exactly one Job
+    /// per (command_id, project_id) even under concurrent requests.
+    /// 
+    /// Returns:
+    /// - Ok(Some(job_id)) if this call created the Job
+    /// - Ok(None) if command_id already exists (duplicate/conflict detected)
+    /// - Err if validation or database error
+    pub fn try_claim_command_and_create_job(
+        &mut self,
+        command_id: &str,
+        project_id: &str,
+        request_hash: &str,
+        payload: &str,
+    ) -> Result<Option<Job>> {
+        validate_id(command_id)?;
+        validate_id(project_id)?;
+        
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        
+        // Try to claim the command_id
+        let claim_result = transaction.execute(
+            "INSERT INTO domain_launch_commands(command_id,project_id,request_hash,outcome,job_id,message,created_at) VALUES(?1,?2,?3,'pending',NULL,'job creation in progress',?4)",
+            params![command_id, project_id, request_hash, now()],
+        );
+        
+        match claim_result {
+            Ok(_) => {
+                // Successfully claimed; now create the Job
+                let job_id = new_id("job");
+                let timestamp = now();
+                
+                transaction
+                    .execute(
+                        "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?4)",
+                        params![job_id, project_id, payload, timestamp],
+                    )
+                    .map_err(sql)?;
+                
+                let job = Job {
+                    id: job_id.clone(),
+                    project_id: project_id.to_string(),
+                    state: JobState::Pending,
+                    generation: 0,
+                    authoritative_attempt_id: None,
+                    spec: payload.to_string(),
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                };
+                
+                emit_job(&transaction, EventKind::JobCreated, &job, None)?;
+                
+                transaction.commit().map_err(sql)?;
+                Ok(Some(job))
+            }
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                // Command_id already exists; this is a duplicate or conflict
+                Ok(None)
+            }
+            Err(e) => Err(sql(e)),
+        }
     }
 }
 
@@ -3694,14 +3766,18 @@ fn dispatch_intent_from_row(row: &Row<'_>) -> rusqlite::Result<DispatchIntent> {
             })?),
             None => None,
         },
-        failure: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        provider_key: row.get(13)?,
+        model: row.get(14)?,
+        endpoint: row.get(15)?,
+        credential_ref: row.get(16)?,
+        failure: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
     })
 }
 
 const DISPATCH_INTENT_COLUMNS: &str = "id,call_id,job_id,attempt_id,executor_id,generation,state,\
-effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,failure,created_at,updated_at";
+effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,provider_key,model,endpoint,credential_ref,failure,created_at,updated_at";
 
 fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
     let state: String = row.get(3)?;

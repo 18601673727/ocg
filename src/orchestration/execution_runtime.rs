@@ -26,8 +26,6 @@ impl ExecutionRuntime {
         provider_capacity: usize,
         native_tool_capacity: usize,
         transport: Arc<dyn HttpTransport>,
-        endpoint: String,
-        bearer: Option<String>,
         permission_policy: PermissionPolicy,
     ) -> Result<Self> {
         let provider_dispatcher = BoundedDispatcher::new(provider_capacity)?;
@@ -36,8 +34,6 @@ impl ExecutionRuntime {
 
         let provider_config = ProviderHandlerConfig {
             transport,
-            endpoint,
-            bearer,
             project_root: project_root.to_path_buf(),
             permission_policy,
             cancelled: cancelled.clone(),
