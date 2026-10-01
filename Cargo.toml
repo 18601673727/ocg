@@ -1,8 +1,8 @@
 [package]
 name = "ocg"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.98"
 description = "Project-agnostic orchestration Core and PWA control plane"
 license = "MIT"
 readme = "README.md"
@@ -33,32 +33,15 @@ sha2 = "0.10"
 # Rust is the single source of truth for the loopback control wire contract;
 # `ts-rs` projects those definitions into the TypeScript PWA.
 ts-rs = { version = "12.0.1", features = ["serde-json-impl"] }
-tar = "0.4"
-flate2 = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde_yaml_ng = "0.10.0"
 fs2 = "0.4"
-typed-index-collections = "3.5"
 petgraph = "0.8"
-compio = { version = "0.19", default-features = false, features = ["runtime"] }
-ntex = { version = "3.12", default-features = false, features = ["compio"] }
+ntex = { version = "3.12", default-features = false, features = ["rustls"] }
 flume = "0.11"
 strum = { version = "0.27", features = ["derive"] }
-derive_more = { version = "2", features = ["as_ref", "display", "deref", "from"] }
 schemars = "1.2"
 jsonschema = { version = "0.58", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
-# Phase 3B-1 provider transport substrate. Pinned to the exact versions the
-# aimux 0.3.0 conformance probe was run against; `default-features = false`
-# drops the realtime/WebSocket surface (chat completions only).
-aimux-core = "=0.3.0"
-aimux-providers = { version = "=0.3.0", default-features = false }
-# `RetryConfig` is only re-exported transitively; the transport disables retries
-# at construction as well as per call.
-aimux-provider-utils = "=0.3.0"
-futures = "0.3"
-anyhow = "1"
 # Incremental architecture dependencies. Keep features narrow until the
 # corresponding runtime, diagnostics, error, parsing, and identifier layers
 # are migrated in later steps.

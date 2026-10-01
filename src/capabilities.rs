@@ -4,7 +4,7 @@
 //! The planner decides which capability groups a task plausibly needs so the
 //! context planner and the CLI can describe an explicit boundary. Nothing here
 //! activates a runtime tool schema, grants a provider permission or blocks an
-//! actual call; enforcement remains OpenCode's job. The honesty of that
+//! actual call; enforcement remains OCG's execution authority. The honesty of that
 //! boundary is part of the contract.
 //!
 //! The planning rules are conservative:
@@ -158,7 +158,7 @@ impl CapabilityConfig {
     /// A stable fingerprint of the policy, usable in cache keys.
     pub fn fingerprint(&self) -> String {
         let value = serde_json::to_value(self).unwrap_or(Value::Null);
-        crate::runtime::hash::sha256_hex(value.to_string().as_bytes())
+        crate::hash::sha256_hex(value.to_string().as_bytes())
     }
 }
 
@@ -428,7 +428,7 @@ impl CapabilityPlan {
         }
         out.push_str(
             "boundary: this is a context/config plan and diagnostic only; it does not activate or\n\
-             enforce runtime tool schemas. OpenCode owns execution, conversation, provider and tool\n\
+             enforce runtime tool schemas. OCG owns execution, conversation, provider and tool\n\
              semantics.\n",
         );
         out

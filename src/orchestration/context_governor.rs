@@ -9,13 +9,11 @@
 //!
 //! The durable telemetry types here are local and deliberately boring. Runtime
 //! adapters normalize their engine-specific response shapes before conversion
-//! through `ContextObservation::from_runtime`; network/API details remain in
-//! the concrete OpenCode adapter.
+//! through `ContextObservation::from_observation`; network/API details remain in
+//! the concrete provider execution plane.
 
 use crate::error::{OcgError, Result};
-use crate::runtime::lifecycle::{
-    RuntimeContextObservation, RuntimeContextUsage, RuntimeModelMetadata, RuntimeProvenance,
-};
+use crate::observation::{ContextUsage, ObservedModelMetadata, ObservationProvenance};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -325,8 +323,8 @@ pub struct TokenUsage {
     pub cache_write: Option<u64>,
 }
 
-impl From<RuntimeContextUsage> for TokenUsage {
-    fn from(usage: RuntimeContextUsage) -> Self {
+impl From<ContextUsage> for TokenUsage {
+    fn from(usage: ContextUsage) -> Self {
         Self {
             input: usage.input,
             output: usage.output,
@@ -337,18 +335,18 @@ impl From<RuntimeContextUsage> for TokenUsage {
     }
 }
 
-impl From<RuntimeProvenance> for TelemetryProvenance {
-    fn from(provenance: RuntimeProvenance) -> Self {
+impl From<ObservationProvenance> for TelemetryProvenance {
+    fn from(provenance: ObservationProvenance) -> Self {
         match provenance {
-            RuntimeProvenance::Exact => Self::Exact,
-            RuntimeProvenance::Estimated => Self::Estimated,
-            RuntimeProvenance::Unknown => Self::Unknown,
+            ObservationProvenance::Exact => Self::Exact,
+            ObservationProvenance::Estimated => Self::Estimated,
+            ObservationProvenance::Unknown => Self::Unknown,
         }
     }
 }
 
-impl From<RuntimeModelMetadata> for ModelMetadata {
-    fn from(model: RuntimeModelMetadata) -> Self {
+impl From<ObservedModelMetadata> for ModelMetadata {
+    fn from(model: ObservedModelMetadata) -> Self {
         Self {
             provider_id: model.provider_id,
             model_id: model.model_id,
@@ -385,7 +383,7 @@ impl TokenUsage {
             (Some(input), Some(cache_read)) => {
                 input.checked_add(cache_read).map(Some).ok_or_else(|| {
                     OcgError::config(
-                        "OpenCode V2 context token projection overflowed; telemetry is unknown",
+                        "provider context token projection overflowed; telemetry is unknown",
                     )
                 })
             }
@@ -400,7 +398,7 @@ impl TokenUsage {
     }
 }
 
-/// Model limits normalized by the runtime adapter.
+/// Model limits normalized by the execution transport.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelMetadata {
@@ -410,7 +408,7 @@ pub struct ModelMetadata {
     pub input_limit: Option<u64>,
     pub output_limit: Option<u64>,
     /// The limit OCG uses for the active-context comparison.  It is present
-    /// only when the runtime supplied a real model limit.
+    /// only when the provider supplied a real model limit.
     pub effective_limit: Option<u64>,
     pub source: Option<String>,
 }
@@ -421,7 +419,7 @@ impl ModelMetadata {
     }
 }
 
-/// A compact, privacy-safe observation of one runtime step.
+/// A compact, privacy-safe observation of one provider step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextObservation {
@@ -444,7 +442,7 @@ pub struct ContextObservation {
     /// Provenance of the raw usage fields.
     pub usage_provenance: TelemetryProvenance,
     /// Provenance of the active-context projection. A present value is
-    /// conservatively marked estimated when the runtime reports message-level
+    /// conservatively marked estimated when the provider reports message-level
     /// usage rather than a separate active-context counter.
     pub context_provenance: TelemetryProvenance,
     pub note: Option<String>,
@@ -474,12 +472,12 @@ impl Default for ContextObservation {
 }
 
 impl ContextObservation {
-    /// Convert the runtime-neutral observation into the durable telemetry
-    /// shape. No OpenCode response fields cross this boundary.
-    pub fn from_runtime(observation: RuntimeContextObservation) -> Self {
+    /// Convert the provider-neutral observation into the durable telemetry
+    /// shape. No provider response fields cross this boundary.
+    pub fn from_observation(observation: crate::observation::ContextObservation) -> Self {
         Self {
             schema_version: CONTEXT_ARTIFACT_SCHEMA_VERSION,
-            session_id: observation.execution_id.to_string(),
+            session_id: observation.execution_id,
             event_id: observation.event_id,
             observed_at: observation.observed_at,
             assistant_message_id: observation.assistant_message_id,
@@ -629,7 +627,7 @@ pub fn save_observation(root: &Path, observation: &ContextObservation) -> Result
         ));
     }
     let id = safe_artifact_id(&observation.event_id);
-    crate::runtime::install::ensure_gitignore(root)?;
+    crate::install::ensure_gitignore(root)?;
     let path = telemetry_dir(root).join(format!("{id}.json"));
     if path.is_file() {
         let existing = load_observation(root, &observation.event_id)?;
@@ -643,7 +641,7 @@ pub fn save_observation(root: &Path, observation: &ContextObservation) -> Result
     let value = serde_json::to_value(observation).map_err(|error| {
         OcgError::config(format!("cannot serialize context observation: {error}"))
     })?;
-    crate::runtime::install::write_json_atomic(&path, &value)?;
+    crate::install::write_json_atomic(&path, &value)?;
     prune_observations(&telemetry_dir(root), &path);
     Ok(path)
 }
@@ -752,7 +750,7 @@ pub fn continuation_dir(root: &Path) -> PathBuf {
 }
 
 pub fn safe_artifact_id(id: &str) -> String {
-    let digest = crate::runtime::hash::sha256_hex(id.as_bytes());
+    let digest = crate::hash::sha256_hex(id.as_bytes());
     format!("a-{}", digest.get(..24).unwrap_or(&digest))
 }
 

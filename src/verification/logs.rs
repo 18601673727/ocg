@@ -73,7 +73,7 @@ impl LogStore {
     /// process id, a monotonic sequence and a content hash, so two runs in the
     /// same second cannot silently overwrite each other.
     pub fn store(&self, input: &RawLogInput<'_>) -> Result<RawLogRef> {
-        crate::runtime::install::ensure_gitignore(&self.root)?;
+        crate::install::ensure_gitignore(&self.root)?;
         fs::create_dir_all(&self.dir).map_err(|error| {
             OcgError::io(format!("cannot create {}", self.dir.display()), error)
         })?;
@@ -107,7 +107,7 @@ impl LogStore {
         }
 
         let sequence = NEXT_LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let digest = crate::runtime::hash::sha256_hex(&content);
+        let digest = crate::hash::sha256_hex(&content);
         let short = digest.get(..12).unwrap_or(&digest);
         let name = format!(
             "verify-{}-{}-{sequence:06}-{short}.log",

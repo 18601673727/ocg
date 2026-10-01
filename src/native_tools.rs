@@ -1,0 +1,1063 @@
+//! OCG-owned Native Tool Plane.
+//!
+//! The registry in this module is the only definition of the built-in tools.
+//! It owns their schemas, permission classes, capability requirements and
+//! executor bindings. OpenAI-compatible function definitions are projections
+//! of those definitions; they are not the canonical tool model.
+
+pub mod openai_projection;
+
+use crate::edit;
+use crate::error::{OcgError, Result};
+use crate::orchestration::call_schema;
+use crate::orchestration::domain::{AttemptAuthority, DomainRepository, EffectIntentKind};
+use crate::process::{CaptureRunner, ProcessExit, SystemCaptureRunner};
+use serde_json::{json, Map, Value};
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+pub const TOOL_OUTPUT_CAP: usize = 64 * 1024;
+pub const TOOL_STDERR_CAP: usize = 32 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionClass {
+    ReadOnly,
+    FilesystemWrite,
+    ProcessExec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeToolExecutorBinding {
+    FilesystemRead,
+    FilesystemList,
+    FilesystemSearch,
+    FilesystemEdit,
+    ProcessExec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionPolicy {
+    pub read_only: bool,
+    pub filesystem_write: bool,
+    pub process_exec: bool,
+    pub filesystem_capability: bool,
+    pub process_capability: bool,
+}
+
+impl PermissionPolicy {
+    pub const fn allow_all() -> Self {
+        Self {
+            read_only: true,
+            filesystem_write: true,
+            process_exec: true,
+            filesystem_capability: true,
+            process_capability: true,
+        }
+    }
+
+    pub const fn read_only() -> Self {
+        Self {
+            read_only: true,
+            filesystem_write: false,
+            process_exec: false,
+            filesystem_capability: true,
+            process_capability: false,
+        }
+    }
+
+    pub fn allows(self, permission: PermissionClass) -> bool {
+        match permission {
+            PermissionClass::ReadOnly => self.read_only,
+            PermissionClass::FilesystemWrite => self.filesystem_write,
+            PermissionClass::ProcessExec => self.process_exec,
+        }
+    }
+
+    pub fn allows_capability(self, capability: &str) -> bool {
+        match capability {
+            "filesystem" => self.filesystem_capability,
+            "process" => self.process_capability,
+            _ => false,
+        }
+    }
+}
+
+impl Default for PermissionPolicy {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+impl PermissionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::FilesystemWrite => "filesystem_write",
+            Self::ProcessExec => "process_exec",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolErrorKind {
+    InvalidInput,
+    PermissionDenied,
+    PathEscape,
+    Unavailable,
+    ExecutionFailure,
+    Cancelled,
+    OutputLimit,
+}
+
+impl ToolErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "invalid_input",
+            Self::PermissionDenied => "permission_denied",
+            Self::PathEscape => "path_escape",
+            Self::Unavailable => "unavailable",
+            Self::ExecutionFailure => "execution_failure",
+            Self::Cancelled => "cancelled",
+            Self::OutputLimit => "output_limit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolError {
+    pub kind: ToolErrorKind,
+    pub message: String,
+    pub metadata: Value,
+}
+
+impl ToolError {
+    fn new(kind: ToolErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            metadata: Value::Object(Map::new()),
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "kind": self.kind.as_str(),
+            "message": self.message,
+            "metadata": self.metadata,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResult {
+    pub success: bool,
+    pub output: Value,
+    pub truncated: bool,
+    pub metadata: Value,
+    pub error: Option<ToolError>,
+}
+
+impl ToolResult {
+    pub fn success(output: Value) -> Self {
+        Self {
+            success: true,
+            output,
+            truncated: false,
+            metadata: Value::Object(Map::new()),
+            error: None,
+        }
+    }
+
+    fn failure(error: ToolError) -> Self {
+        Self {
+            success: false,
+            output: Value::Null,
+            truncated: false,
+            metadata: Value::Object(Map::new()),
+            error: Some(error),
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        json!({
+            "success": self.success,
+            "output": self.output,
+            "truncated": self.truncated,
+            "metadata": self.metadata,
+            "error": self.error.as_ref().map(ToolError::json),
+        })
+    }
+
+    pub fn tool_message_content(&self) -> String {
+        self.to_value().to_string()
+    }
+
+    /// Bound the complete canonical result, including structured metadata and
+    /// error details. Individual executors cap their streams too, but this
+    /// final boundary prevents a combination of bounded fields from growing
+    /// beyond the single result budget sent back to an LLM.
+    pub fn bounded(mut self) -> Self {
+        let encoded = self.to_value().to_string();
+        if encoded.len() <= TOOL_OUTPUT_CAP {
+            return self;
+        }
+        let preview_cap = TOOL_OUTPUT_CAP / 2;
+        let (preview, _) = bounded_text(encoded.as_bytes(), preview_cap);
+        self.output = json!({
+            "preview": preview,
+            "original_bytes": encoded.len(),
+            "truncated": true,
+            "remaining": true
+        });
+        self.truncated = true;
+        self.metadata = json!({
+            "remaining": true,
+            "output_cap": TOOL_OUTPUT_CAP
+        });
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeToolDefinition {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: Value,
+    pub permission: PermissionClass,
+    pub capability: &'static str,
+    pub executor: NativeToolExecutorBinding,
+}
+
+pub struct NativeToolRegistry;
+
+impl NativeToolRegistry {
+    pub fn definitions() -> Vec<NativeToolDefinition> {
+        vec![
+            NativeToolDefinition {
+                name: "filesystem.read",
+                description: "Read a bounded UTF-8 file inside the current Project root.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::FilesystemRead,
+            },
+            NativeToolDefinition {
+                name: "filesystem.list",
+                description: "List bounded structured entries in a directory inside the current Project root.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::FilesystemList,
+            },
+            NativeToolDefinition {
+                name: "filesystem.search",
+                description: "Search Project files with rg using argv-only execution.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{"query":{"type":"string"},"path":{"type":"string"}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::FilesystemSearch,
+            },
+            NativeToolDefinition {
+                name: "filesystem.edit",
+                description: "Apply a transactional Robust Edit inside the current Project root.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["operation","file"],"properties":{"operation":{"type":"string","enum":["replace","insertBefore","insertAfter","append"]},"file":{"type":"string"},"expectedRevision":{"type":"string"},"oldString":{"type":"string"},"old_string":{"type":"string"},"anchor":{"type":"string"},"newString":{"type":"string"},"content":{"type":"string"}}}),
+                permission: PermissionClass::FilesystemWrite,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::FilesystemEdit,
+            },
+            NativeToolDefinition {
+                name: "process.exec",
+                description: "Execute one program with argv directly inside the current Project root.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["program"],"properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"}}}),
+                permission: PermissionClass::ProcessExec,
+                capability: "process",
+                executor: NativeToolExecutorBinding::ProcessExec,
+            },
+        ]
+    }
+
+    pub fn get(name: &str) -> Option<NativeToolDefinition> {
+        Self::definitions()
+            .into_iter()
+            .find(|tool| tool.name == name)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectRoot {
+    root: PathBuf,
+}
+
+impl ProjectRoot {
+    pub fn new(root: &Path) -> Result<Self> {
+        let root = root
+            .canonicalize()
+            .map_err(|error| OcgError::io("cannot canonicalize Project root", error))?;
+        if !root.is_dir() {
+            return Err(OcgError::config("Project root is not a directory"));
+        }
+        Ok(Self { root })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn resolve_existing(&self, raw: &str) -> std::result::Result<PathBuf, ToolError> {
+        let relative = relative_path(raw)?;
+        let path = self.root.join(relative);
+        let resolved = path
+            .canonicalize()
+            .map_err(|_| ToolError::new(ToolErrorKind::ExecutionFailure, "path does not exist"))?;
+        if !resolved.starts_with(&self.root) {
+            return Err(ToolError::new(
+                ToolErrorKind::PathEscape,
+                "path escapes the Project root",
+            ));
+        }
+        Ok(resolved)
+    }
+
+    pub fn resolve_for_create(&self, raw: &str) -> std::result::Result<PathBuf, ToolError> {
+        let relative = relative_path(raw)?;
+        let path = self.root.join(relative);
+        let parent = path.parent().ok_or_else(|| {
+            ToolError::new(ToolErrorKind::PathEscape, "path has no Project parent")
+        })?;
+        let parent = parent.canonicalize().map_err(|_| {
+            ToolError::new(
+                ToolErrorKind::ExecutionFailure,
+                "parent directory does not exist",
+            )
+        })?;
+        if !parent.starts_with(&self.root) {
+            return Err(ToolError::new(
+                ToolErrorKind::PathEscape,
+                "path escapes the Project root",
+            ));
+        }
+        if path.exists() {
+            let resolved = path.canonicalize().map_err(|_| {
+                ToolError::new(ToolErrorKind::PathEscape, "path cannot be resolved")
+            })?;
+            if !resolved.starts_with(&self.root) {
+                return Err(ToolError::new(
+                    ToolErrorKind::PathEscape,
+                    "path escapes the Project root",
+                ));
+            }
+        }
+        Ok(path)
+    }
+}
+
+fn relative_path(raw: &str) -> std::result::Result<PathBuf, ToolError> {
+    if raw.trim().is_empty() {
+        return Err(ToolError::new(
+            ToolErrorKind::InvalidInput,
+            "path must not be empty",
+        ));
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Err(ToolError::new(
+            ToolErrorKind::PathEscape,
+            "path must be relative and contain no '..' components",
+        ));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ToolError::new(
+                    ToolErrorKind::PathEscape,
+                    "path must be relative and contain no '..' components",
+                ));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    Ok(normalized)
+}
+
+fn bounded_text(bytes: &[u8], cap: usize) -> (String, bool) {
+    let truncated = bytes.len() > cap;
+    let bytes = &bytes[..bytes.len().min(cap)];
+    (String::from_utf8_lossy(bytes).into_owned(), truncated)
+}
+
+pub struct NativeToolExecutor {
+    root: ProjectRoot,
+    runner: Box<dyn CaptureRunner>,
+}
+
+impl NativeToolExecutor {
+    pub fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
+            root: ProjectRoot::new(root)?,
+            runner: Box::new(SystemCaptureRunner),
+        })
+    }
+
+    pub fn with_runner(root: &Path, runner: Box<dyn CaptureRunner>) -> Result<Self> {
+        Ok(Self {
+            root: ProjectRoot::new(root)?,
+            runner,
+        })
+    }
+
+    pub fn execute(
+        &self,
+        name: &str,
+        arguments: &Value,
+        permission: PermissionClass,
+        policy: PermissionPolicy,
+        cancelled: &AtomicBool,
+    ) -> ToolResult {
+        let Some(definition) = NativeToolRegistry::get(name) else {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "unknown native tool",
+            ));
+        };
+        if definition.permission != permission {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::PermissionDenied,
+                "tool permission class mismatch",
+            ));
+        }
+        if !policy.allows(permission) || !policy.allows_capability(definition.capability) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::PermissionDenied,
+                format!(
+                    "permission or capability '{}' is not granted",
+                    definition.capability
+                ),
+            ));
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::Cancelled,
+                "Attempt was cancelled before tool execution",
+            ));
+        }
+        if let Err(error) = validate_parameters(&definition.parameters, arguments) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                error.to_string(),
+            ));
+        }
+        let result = match definition.executor {
+            NativeToolExecutorBinding::FilesystemRead => self.read(arguments),
+            NativeToolExecutorBinding::FilesystemList => self.list(arguments),
+            NativeToolExecutorBinding::FilesystemSearch => self.search(arguments, cancelled),
+            NativeToolExecutorBinding::FilesystemEdit => self.edit(arguments, cancelled),
+            NativeToolExecutorBinding::ProcessExec => self.exec(arguments, cancelled),
+        };
+        result.bounded()
+    }
+
+    fn read(&self, arguments: &Value) -> ToolResult {
+        let path = match arguments.get("path").and_then(Value::as_str) {
+            Some(path) => match self.root.resolve_existing(path) {
+                Ok(path) => path,
+                Err(error) => return ToolResult::failure(error),
+            },
+            None => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::InvalidInput,
+                    "path is required",
+                ))
+            }
+        };
+        if !path.is_file() {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "filesystem.read requires a file",
+            ));
+        }
+        let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(TOOL_OUTPUT_CAP);
+        let cap = limit.min(TOOL_OUTPUT_CAP);
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::ExecutionFailure,
+                    error.to_string(),
+                ))
+            }
+        };
+        let file_len = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::ExecutionFailure,
+                    error.to_string(),
+                ))
+            }
+        };
+        let start = (offset as u64).min(file_len);
+        if let Err(error) = file.seek(SeekFrom::Start(start)) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::ExecutionFailure,
+                error.to_string(),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(cap.saturating_add(1));
+        if let Err(error) = file.take(cap as u64 + 1).read_to_end(&mut bytes) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::ExecutionFailure,
+                error.to_string(),
+            ));
+        }
+        let truncated = bytes.len() > cap || start.saturating_add(bytes.len() as u64) < file_len;
+        let (content, _) = bounded_text(&bytes, cap);
+        ToolResult {
+            success: true,
+            output: json!({"path": relative_display(&self.root, &path), "content": content}),
+            truncated,
+            metadata: json!({"remaining": truncated}),
+            error: None,
+        }
+    }
+
+    fn list(&self, arguments: &Value) -> ToolResult {
+        let raw = match arguments.get("path").and_then(Value::as_str) {
+            Some(raw) => raw,
+            None => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::InvalidInput,
+                    "path is required",
+                ))
+            }
+        };
+        let path = match self.root.resolve_existing(raw) {
+            Ok(path) => path,
+            Err(error) => return ToolResult::failure(error),
+        };
+        if !path.is_dir() {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "filesystem.list requires a directory",
+            ));
+        }
+        let mut entries = Vec::new();
+        let iterator = match fs::read_dir(&path) {
+            Ok(iterator) => iterator,
+            Err(error) => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::ExecutionFailure,
+                    error.to_string(),
+                ))
+            }
+        };
+        let mut truncated = false;
+        for entry in iterator {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return ToolResult::failure(ToolError::new(
+                        ToolErrorKind::ExecutionFailure,
+                        error.to_string(),
+                    ))
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    return ToolResult::failure(ToolError::new(
+                        ToolErrorKind::ExecutionFailure,
+                        error.to_string(),
+                    ))
+                }
+            };
+            let kind = if file_type.is_symlink() {
+                "symlink"
+            } else if file_type.is_dir() {
+                "directory"
+            } else {
+                "file"
+            };
+            let target_within_root = if file_type.is_symlink() {
+                entry
+                    .path()
+                    .canonicalize()
+                    .map(|target| target.starts_with(self.root.path()))
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            let value = json!({"path": relative_display(&self.root, &entry.path()), "name": entry.file_name().to_string_lossy(), "kind": kind, "accessible": target_within_root});
+            if serde_json::to_vec(&entries)
+                .map(|bytes| bytes.len())
+                .unwrap_or(TOOL_OUTPUT_CAP + 1)
+                + value.to_string().len()
+                > TOOL_OUTPUT_CAP
+            {
+                truncated = true;
+                break;
+            }
+            entries.push(value);
+        }
+        ToolResult {
+            success: true,
+            output: json!({"path": relative_display(&self.root, &path), "entries": entries}),
+            truncated,
+            metadata: json!({"remaining": truncated}),
+            error: None,
+        }
+    }
+
+    fn search(&self, arguments: &Value, cancelled: &AtomicBool) -> ToolResult {
+        let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+        if query.is_empty() {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "query must not be empty",
+            ));
+        }
+        let cwd = match arguments.get("path").and_then(Value::as_str) {
+            Some(raw) => match self.root.resolve_existing(raw) {
+                Ok(path) => path,
+                Err(error) => return ToolResult::failure(error),
+            },
+            None => self.root.path().to_path_buf(),
+        };
+        if !cwd.is_dir() {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "search path must be a directory",
+            ));
+        }
+        let args = vec![
+            "--json".to_string(),
+            "--no-heading".to_string(),
+            "--color=never".to_string(),
+            query.to_string(),
+            ".".to_string(),
+        ];
+        let output =
+            match self
+                .runner
+                .run_cancellable("rg", &args, &cwd, TOOL_OUTPUT_CAP, cancelled)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    return ToolResult::failure(ToolError::new(
+                        ToolErrorKind::Unavailable,
+                        error.to_string(),
+                    ))
+                }
+            };
+        let (stdout, stdout_truncated) = bounded_text(&output.stdout, TOOL_OUTPUT_CAP);
+        let (stderr, stderr_truncated) = bounded_text(&output.stderr, TOOL_STDERR_CAP);
+        let mut matches = Vec::new();
+        for line in stdout.lines() {
+            if let Ok(value) = serde_json::from_str::<Value>(line) {
+                matches.push(value);
+            }
+        }
+        let truncated = output.truncated() || stdout_truncated || stderr_truncated;
+        if cancelled.load(Ordering::SeqCst) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::Cancelled,
+                "Attempt was cancelled during search",
+            ));
+        }
+        let no_match = matches!(output.exit, ProcessExit::Code(1));
+        let success = output.success || no_match;
+        ToolResult {
+            success,
+            output: json!({"matches":matches,"stderr":stderr,"exit":output.exit.label()}),
+            truncated,
+            metadata: json!({"remaining":truncated,"stderr_truncated":stderr_truncated}),
+            error: if success {
+                None
+            } else {
+                Some(ToolError::new(
+                    ToolErrorKind::ExecutionFailure,
+                    "rg returned a non-zero exit status",
+                ))
+            },
+        }
+    }
+
+    fn edit(&self, arguments: &Value, cancelled: &AtomicBool) -> ToolResult {
+        let file = match arguments.get("file").and_then(Value::as_str) {
+            Some(file) => file,
+            None => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::InvalidInput,
+                    "file is required",
+                ))
+            }
+        };
+        if let Err(error) = self.root.resolve_existing(file) {
+            return ToolResult::failure(error);
+        }
+        let call = match edit::construct_call(arguments) {
+            Ok(call) => call,
+            Err(error) => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::InvalidInput,
+                    format!("Robust Edit construction failed: {error:?}"),
+                ))
+            }
+        };
+        if cancelled.load(Ordering::SeqCst) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::Cancelled,
+                "Attempt was cancelled before filesystem.edit persistence",
+            ));
+        }
+        match edit::apply_call(self.root.path(), call) {
+            Ok(outcome) => ToolResult::success(
+                json!({"file":file,"operation":format!("{:?}", outcome.kind),"previousRevision":outcome.previous_revision,"newRevision":outcome.new_revision,"rebased":outcome.rebased,"retries":outcome.retries,"mechanicallyRepaired":outcome.mechanically_repaired}),
+            ),
+            Err(error) => ToolResult::failure(ToolError::new(
+                ToolErrorKind::ExecutionFailure,
+                format!("Robust Edit execution failed: {error:?}"),
+            )),
+        }
+    }
+
+    fn exec(&self, arguments: &Value, cancelled: &AtomicBool) -> ToolResult {
+        let program = match arguments.get("program").and_then(Value::as_str) {
+            Some(program) if !program.is_empty() => program,
+            _ => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::InvalidInput,
+                    "program is required",
+                ))
+            }
+        };
+        if is_shell_program(program) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "process.exec does not invoke a shell; provide a direct executable and argv",
+            ));
+        }
+        let args = arguments
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let cwd = match arguments.get("cwd").and_then(Value::as_str) {
+            Some(raw) => match self.root.resolve_existing(raw) {
+                Ok(path) => path,
+                Err(error) => return ToolResult::failure(error),
+            },
+            None => self.root.path().to_path_buf(),
+        };
+        if !cwd.is_dir() {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "cwd must be a directory",
+            ));
+        }
+        let output =
+            match self
+                .runner
+                .run_cancellable(program, &args, &cwd, TOOL_OUTPUT_CAP, cancelled)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    return ToolResult::failure(ToolError::new(
+                        ToolErrorKind::Unavailable,
+                        error.to_string(),
+                    ))
+                }
+            };
+        if cancelled.load(Ordering::SeqCst) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::Cancelled,
+                "Attempt was cancelled during process execution",
+            ));
+        }
+        let stdout = output.stdout_lossy();
+        let stderr = output.stderr_lossy();
+        ToolResult {
+            success: output.success,
+            output: json!({"program":program,"args":args,"cwd":relative_display(&self.root, &cwd),"exit":output.exit.label(),"stdout":stdout,"stderr":stderr}),
+            truncated: output.truncated(),
+            metadata: json!({"remaining":output.truncated(),"durationMs":output.duration_ms,"exitSuccess":output.success}),
+            error: if output.success {
+                None
+            } else {
+                Some(ToolError::new(
+                    ToolErrorKind::ExecutionFailure,
+                    "process exited with a non-zero status",
+                ))
+            },
+        }
+    }
+}
+
+fn relative_display(root: &ProjectRoot, path: &Path) -> String {
+    let value = path
+        .strip_prefix(root.path())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    if value.is_empty() {
+        ".".to_string()
+    } else {
+        value
+    }
+}
+
+fn is_shell_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "sh" | "bash" | "zsh" | "fish" | "csh" | "ksh"))
+}
+
+fn validate_parameters(schema: &Value, value: &Value) -> Result<()> {
+    let validator = jsonschema::options()
+        .build(schema)
+        .map_err(|error| OcgError::config(format!("compile native tool schema: {error}")))?;
+    validator
+        .validate(value)
+        .map_err(|error| OcgError::config(format!("native tool schema validation failed: {error}")))
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeCallRequest {
+    pub tool_call_id: String,
+    pub name: String,
+    pub arguments: Value,
+    pub permission: PermissionClass,
+}
+
+/// Admit, claim, execute and complete one Native Tool Call through the
+/// canonical Call substrate. Multiple requests are intentionally processed in
+/// provider order; no second parallel scheduler is introduced.
+pub fn execute_canonical_tool_call(
+    domain: &mut DomainRepository,
+    authority: &AttemptAuthority,
+    executor_id: &str,
+    project_root: &Path,
+    request: NativeCallRequest,
+    policy: PermissionPolicy,
+    cancelled: &AtomicBool,
+) -> Result<ToolResult> {
+    let definition = NativeToolRegistry::get(&request.name);
+    let permission = request.permission;
+    let effect_kind = if permission == PermissionClass::ReadOnly {
+        EffectIntentKind::Idempotent
+    } else {
+        EffectIntentKind::StrictFenced
+    };
+    let payload = json!({"kind":"native_tool","tool_call_id":request.tool_call_id,"name":request.name,"arguments":request.arguments}).to_string();
+    let payload_value = serde_json::from_str::<Value>(&payload)
+        .map_err(|error| OcgError::config(format!("serialize native Call input: {error}")))?;
+    call_schema::validate_input(&json!({"arguments":payload_value}))?;
+    let call = domain.create_call_with_effect(
+        &authority.attempt_id,
+        Some(executor_id),
+        authority.generation,
+        effect_kind,
+        &payload,
+    )?;
+    domain.mark_dispatch_queued(&call.id)?;
+    let result = if definition.is_none() {
+        ToolResult::failure(ToolError::new(
+            ToolErrorKind::InvalidInput,
+            "unknown native tool",
+        ))
+    } else if definition
+        .as_ref()
+        .is_some_and(|definition| definition.permission != permission)
+    {
+        ToolResult::failure(ToolError::new(
+            ToolErrorKind::PermissionDenied,
+            "tool permission class mismatch",
+        ))
+    } else if definition.as_ref().is_some_and(|definition| {
+        !policy.allows(permission) || !policy.allows_capability(definition.capability)
+    }) {
+        ToolResult::failure(ToolError::new(
+            ToolErrorKind::PermissionDenied,
+            "permission or capability is not granted",
+        ))
+    } else if let Some(definition) = definition.as_ref() {
+        if let Err(error) = validate_parameters(&definition.parameters, &request.arguments) {
+            ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                error.to_string(),
+            ))
+        } else if domain.authority(&authority.attempt_id)?.as_ref() != Some(authority) {
+            ToolResult::failure(ToolError::new(
+                ToolErrorKind::Cancelled,
+                "Attempt authority was revoked before side effect",
+            ))
+        } else {
+            domain.start_call(&call.id, &authority.attempt_id, authority.generation)?;
+            match NativeToolExecutor::new(project_root) {
+                Ok(executor) => executor.execute(
+                    &request.name,
+                    &request.arguments,
+                    permission,
+                    policy,
+                    cancelled,
+                ),
+                Err(error) => ToolResult::failure(ToolError::new(
+                    ToolErrorKind::ExecutionFailure,
+                    error.to_string(),
+                )),
+            }
+        }
+    } else {
+        ToolResult::failure(ToolError::new(
+            ToolErrorKind::InvalidInput,
+            "unknown native tool",
+        ))
+    };
+    let serialized = result.to_value().to_string();
+    if result.success {
+        domain.finish_call(
+            &call.id,
+            &authority.attempt_id,
+            authority.generation,
+            &serialized,
+        )?;
+    } else {
+        let failure = result
+            .error
+            .as_ref()
+            .map(|error| format!("{}: {}", error.kind.as_str(), error.message))
+            .unwrap_or_else(|| "native tool failed".to_string());
+        if domain
+            .fail_call(
+                &call.id,
+                &authority.attempt_id,
+                authority.generation,
+                &failure,
+            )
+            .is_err()
+        {
+            domain.fence_dispatch_intent(&call.id, &failure)?;
+        }
+    }
+    Ok(result.bounded())
+}
+
+pub fn tool_permission_for(name: &str) -> Option<PermissionClass> {
+    NativeToolRegistry::get(name).map(|definition| definition.permission)
+}
+
+/// Handler for Native Tool Calls running through bounded execution.
+pub struct NativeToolCallHandler {
+    project_root: PathBuf,
+    permission_policy: PermissionPolicy,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl NativeToolCallHandler {
+    pub fn new(
+        project_root: PathBuf,
+        permission_policy: PermissionPolicy,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            project_root,
+            permission_policy,
+            cancelled,
+        }
+    }
+
+    pub fn execute_validated_sync(
+        &self,
+        envelope: crate::orchestration::execution_dispatch::ExecutionEnvelope,
+    ) -> Result<serde_json::Value> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(OcgError::config("cancelled before native tool execution"));
+        }
+
+        let mut domain = DomainRepository::open(&self.project_root)?;
+
+        // Verify authority
+        let _authority = domain
+            .authority(&envelope.attempt_id)?
+            .filter(|authority| {
+                authority.job_id == envelope.job_id
+                    && authority.generation == envelope.generation
+            })
+            .ok_or_else(|| OcgError::config("native tool Call has stale Attempt authority"))?;
+
+        domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)?;
+
+        let input: Value = serde_json::from_str(&envelope.payload)
+            .map_err(|error| OcgError::config(format!("invalid native tool payload: {error}")))?;
+
+        let name = input
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| OcgError::config("native tool payload missing 'name'"))?;
+
+        let arguments = input
+            .get("arguments")
+            .ok_or_else(|| OcgError::config("native tool payload missing 'arguments'"))?
+            .clone();
+
+        let definition = NativeToolRegistry::get(name)
+            .ok_or_else(|| OcgError::config(format!("unknown native tool: {name}")))?;
+
+        let permission = definition.permission;
+
+        drop(domain);
+
+        let executor = NativeToolExecutor::new(&self.project_root)?;
+        let result = executor.execute(
+            name,
+            &arguments,
+            permission,
+            self.permission_policy,
+            &self.cancelled,
+        );
+
+        let mut domain = DomainRepository::open(&self.project_root)?;
+        let serialized = result.to_value().to_string();
+
+        if result.success {
+            domain.finish_call(
+                &envelope.call_id,
+                &envelope.attempt_id,
+                envelope.generation,
+                &serialized,
+            )?;
+            Ok(result.to_value())
+        } else {
+            let failure = result
+                .error
+                .as_ref()
+                .map(|error| format!("{}: {}", error.kind.as_str(), error.message))
+                .unwrap_or_else(|| "native tool failed".to_string());
+            domain.fail_call(
+                &envelope.call_id,
+                &envelope.attempt_id,
+                envelope.generation,
+                &failure,
+            )?;
+            Err(OcgError::config(failure))
+        }
+    }
+}

@@ -48,7 +48,7 @@ pub fn model_entry<'a>(data: &'a Value, key: &str) -> Result<&'a Map<String, Val
 ///
 /// This resolves the registry entry only. Placeholder and runnability checks
 /// belong to the *selection* paths (`Profile::select`, `lead_contract`,
-/// `build_opencode_config_for`), so diagnostics, worker routing and validation
+/// provider configuration), so diagnostics, worker routing and validation
 /// can still read every configured resource, including placeholders.
 pub fn model_full_id(data: &Value, key: &str) -> Result<(String, String)> {
     let entry = model_entry(data, key)?;
@@ -89,7 +89,7 @@ pub fn worker_agent_id(role: &str) -> String {
 /// The primary Lead request contract selected from the OCG Profile.
 ///
 /// This value is resolved in Rust and exported to the launched runtime, so the
-/// Lead is fixed after OpenCode has applied any sticky UI/session selection but
+/// Lead is fixed after OCG has applied any sticky UI/session selection but
 /// before the user message is saved or sent to a provider.
 ///
 /// The Lead is provider-agnostic: `provider_id`/`model_id` come from the
@@ -148,7 +148,7 @@ pub enum ModelRequirementKind {
     Worker,
 }
 
-/// One provider/model that must be exposed by the active OpenCode runtime.
+/// One provider/model exposed by the active execution configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequirement {
     pub label: String,

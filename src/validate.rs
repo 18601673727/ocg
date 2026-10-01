@@ -13,7 +13,6 @@ pub fn validate(effective: &Effective) -> Vec<String> {
     let data = &effective.data;
     let mut errors = Vec::new();
 
-    errors.extend(crate::runtime::policy::RuntimePolicy::validate(data));
     errors.extend(crate::context::ContextConfig::validate(data));
     errors.extend(crate::verification::Config::validate(data));
     errors.extend(crate::capabilities::CapabilityConfig::validate(data));

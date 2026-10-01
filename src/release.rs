@@ -1,8 +1,7 @@
 //! GitHub release metadata.
 //!
-//! The standalone OpenCode release source is `anomalyco/opencode`; OCG
-//! releases come from this repository. Both use the same GitHub release API
-//! shape, so one parser handles them.
+//! OCG releases come from this repository. The GitHub release API shape
+//! is parsed here.
 
 use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
@@ -62,35 +61,6 @@ pub fn fetch_latest_release(
     parse_release(&text)
 }
 
-/// Fetch a release for an exact version, trying the `v`-prefixed tag first.
-pub fn fetch_release_by_version(
-    http: &dyn HttpTransport,
-    api_base: &str,
-    repo: &str,
-    version: &Version,
-) -> Result<Release> {
-    let mut last_error = None;
-    for tag in [format!("v{version}"), version.to_string()] {
-        let url = tag_release_url(api_base, repo, &tag);
-        match http.get_text(&url) {
-            Ok(text) => match parse_release(&text) {
-                Ok(release) if release.version == *version => return Ok(release),
-                Ok(release) => {
-                    last_error = Some(OcgError::config(format!(
-                        "release tag '{}' resolved to {}, expected {version}",
-                        release.tag, release.version
-                    )))
-                }
-                Err(error) => last_error = Some(error),
-            },
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        OcgError::config(format!("release for OpenCode {version} was not found"))
-    }))
-}
-
 /// Parse a GitHub release document.
 pub fn parse_release(text: &str) -> Result<Release> {
     let value: Value = serde_json::from_str(text).map_err(|error| {
@@ -133,22 +103,9 @@ fn parse_asset(value: &Value) -> Option<ReleaseAsset> {
     Some(ReleaseAsset { name, url, sha256 })
 }
 
-/// Extract a version from `opencode --version` output.
-///
-/// Accepts plain `1.18.31`, a `v` prefix, and decorated output such as
-/// `opencode 1.18.31`.
-pub fn parse_version_output(output: &str) -> Option<Version> {
-    for token in output.split_whitespace() {
-        let token = token
-            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '+');
-        if let Some(version) = parse_exact_version(token) {
-            return Some(version);
-        }
-    }
-    None
-}
-
 /// Parse a tag or pin string into an exact semver.
 pub fn parse_exact_version(raw: &str) -> Option<Version> {
-    super::policy::parse_exact_version(raw)
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    Version::parse(trimmed).ok()
 }

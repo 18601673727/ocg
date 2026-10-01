@@ -180,15 +180,51 @@ pub struct CanonicalDashboardResponse {
 #[derive(Debug, Clone)]
 pub struct CanonicalControlService {
     root: PathBuf,
+    runtime_handle: Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>,
+    profile_service: crate::profile::ProfileService,
 }
 
 impl CanonicalControlService {
     pub fn open(root: &Path) -> Result<Self> {
         let boundary = project::resolve(root);
         boundary.require(root)?;
+        
+        // Use user-global profile path
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        let profile_path = crate::config::user_config_path(
+            None,
+            std::env::var_os("OCG_USER_CONFIG")
+                .as_deref()
+                .map(Path::new),
+            std::env::var_os("XDG_CONFIG_HOME")
+                .as_deref()
+                .map(Path::new),
+            home.as_deref(),
+        );
+        
         Ok(Self {
             root: boundary.root().to_path_buf(),
+            runtime_handle: None,
+            profile_service: crate::profile::ProfileService::with_workspace(&profile_path, root),
         })
+    }
+
+    pub fn with_runtime_handle(
+        mut self,
+        handle: crate::orchestration::execution_runtime::ExecutionRuntimeHandle,
+    ) -> Self {
+        self.runtime_handle = Some(handle);
+        self
+    }
+    
+    pub fn with_profile_service(
+        mut self,
+        profile_service: crate::profile::ProfileService,
+    ) -> Self {
+        self.profile_service = profile_service;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -616,5 +652,451 @@ impl CanonicalControlService {
             jobs,
             selected_job,
         })
+    }
+
+    pub fn launch_job(
+        &self,
+        request: crate::contracts::JobLaunchRequest,
+        _now: i64,
+    ) -> Result<crate::contracts::JobLaunchResponse> {
+        use sha2::{Sha256, Digest};
+        
+        if !safe_id(&request.command_id) {
+            return Ok(crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: request.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: None,
+                message: "invalid command_id".to_string(),
+                duplicate: false,
+            });
+        }
+        if !safe_id(&request.project_id) {
+            return Ok(crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: request.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: None,
+                message: "invalid project_id".to_string(),
+                duplicate: false,
+            });
+        }
+
+        // Compute request hash for idempotency conflict detection
+        let request_canonical = serde_json::to_string(&request)
+            .map_err(|e| invalid(format!("cannot serialize request: {e}")))?;
+        let mut hasher = Sha256::new();
+        hasher.update(request_canonical.as_bytes());
+        let request_hash = format!("{:x}", hasher.finalize());
+
+        // Check for existing command
+        let mut domain = crate::orchestration::domain::DomainRepository::open(&self.root)?;
+        if let Some((stored_hash, job_id, outcome, message)) = domain.lookup_launch_command(
+            &request.command_id,
+            &request.project_id,
+        )? {
+            if stored_hash != request_hash {
+                return Ok(crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: request.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: "command_id already used with different request content".to_string(),
+                    duplicate: false,
+                });
+            }
+            return Ok(crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome,
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: request.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id,
+                message,
+                duplicate: true,
+            });
+        }
+
+        // Early validation: Verify project is registered with this control service
+        // This check does not record outcomes to avoid claiming command_id on invalid input
+        let project = match self
+            .read_projects()?
+            .into_iter()
+            .find(|p| p.project_id == request.project_id)
+        {
+            Some(p) => p,
+            None => {
+                return Ok(crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: request.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: format!("unknown project: {}", request.project_id),
+                    duplicate: false,
+                });
+            }
+        };
+
+        // Early validation: Verify execution runtime is available
+        let runtime_handle = match &self.runtime_handle {
+            Some(h) => h,
+            None => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "failed".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: "execution runtime is not available; Job was not created".to_string(),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "failed",
+                    None,
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        // Resolve configuration
+        let (global_config, project_configs, _revision) = self.read_configuration()?;
+        let project_config = project_configs
+            .get(&project.project_id)
+            .cloned()
+            .unwrap_or_default();
+
+        // Resolve provider and model from project configuration defaults
+        let provider_key = match project_config.defaults.get("provider").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: "provider not configured".to_string(),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "rejected",
+                    None,
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        let model = match project_config.defaults.get("model").and_then(|v| v.as_str()) {
+            Some(m) => m,
+            None => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: "model not configured".to_string(),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "rejected",
+                    None,
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        // Resolve profile from the user-global profile service
+        let (profile, _) = match self.profile_service.current()? {
+            Some(p) => p,
+            None => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: "profile not configured".to_string(),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "rejected",
+                    None,
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        let provider_entry = match profile.providers.get(provider_key) {
+            Some(p) => p,
+            None => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: format!("provider not found: {}", provider_key),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "rejected",
+                    None,
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        if provider_entry.placeholder {
+            let response = crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: project.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: None,
+                message: format!("provider is placeholder: {}", provider_key),
+                duplicate: false,
+            };
+            domain.record_launch_command(
+                &request.command_id,
+                &request.project_id,
+                &request_hash,
+                "rejected",
+                None,
+                &response.message,
+            )?;
+            return Ok(response);
+        }
+
+        // Validate endpoint
+        let endpoint = match &provider_entry.endpoint {
+            Some(e) if !e.is_empty() => e.clone(),
+            _ => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: format!("provider {} has no endpoint configured", provider_key),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "rejected",
+                    None,
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        // Resolve credential
+        let credential_ref = match &provider_entry.credential_ref {
+            Some(c) => c,
+            None => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: format!("provider {} has no credential configured", provider_key),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "rejected",
+                    None,
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        // Verify credential exists (without keeping it in memory)
+        let vault = crate::vault::Vault::user_global()?;
+        if vault.get(credential_ref)?.is_none() {
+            let response = crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: project.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: None,
+                message: format!("credential not found: {}", credential_ref),
+                duplicate: false,
+            };
+            domain.record_launch_command(
+                &request.command_id,
+                &request.project_id,
+                &request_hash,
+                "rejected",
+                None,
+                &response.message,
+            )?;
+            return Ok(response);
+        }
+
+        // Build budget config from resource_budget if present
+        let budget_config = if let Some(resource_budget) = &global_config.resource_budget {
+            let budget_data = serde_json::json!({
+                "budget": {
+                    "currency": &resource_budget.unit,
+                    "hardLimitMicros": (resource_budget.hard_limit * 1_000_000.0) as i64,
+                }
+            });
+            crate::orchestration::budget::BudgetConfig::from_config(&budget_data)?
+        } else {
+            crate::orchestration::budget::BudgetConfig::default()
+        };
+
+        // Create canonical Job/Attempt/Executor
+        let canonical_project = domain.ensure_project(Path::new(&project.root))?;
+        let job_payload = serde_json::to_string(&serde_json::json!({
+            "provider": provider_key,
+            "model": model,
+            "objective": request.objective,
+        }))
+        .map_err(|e| invalid(format!("cannot serialize job payload: {e}")))?;
+
+        let job = domain.create_job(&canonical_project.id, &job_payload)?;
+        let attempt = domain.create_attempt(&job.id)?;
+        let executor = domain.create_executor(&attempt.id, "provider")?;
+
+        // Construct initial provider request
+        let provider_request = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": request.objective}],
+            "stream": true,
+        });
+
+        // Resolve quota facts for economic admission
+        let quota_facts = crate::orchestration::budget::QuotaFacts::unknown();
+
+        // Admit the provider call
+        let authority = domain.authority(&attempt.id)?.ok_or_else(|| invalid("attempt authority disappeared"))?;
+        
+        // Freeze provider execution configuration for this Call
+        let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
+            provider_key: provider_key.to_string(),
+            model: model.to_string(),
+            endpoint: endpoint.clone(),
+            credential_ref: credential_ref.to_string(),
+        };
+        
+        let _call = match crate::provider_loop::admit_provider_call(
+            &mut domain,
+            &authority,
+            &executor.id,
+            provider_request,
+            &budget_config,
+            quota_facts,
+            runtime_handle.provider_dispatcher(),
+            provider_config,
+        ) {
+            Ok(call) => call,
+            Err(e) => {
+                // Economic admission failed; finish the attempt as failed
+                domain.finish_attempt(&attempt.id, false)?;
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "failed".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: Some(job.id.clone()),
+                    message: format!("economic admission failed: {}", e),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "failed",
+                    Some(&job.id),
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        // Record successful launch
+        let response = crate::contracts::JobLaunchResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            outcome: "accepted".to_string(),
+            command_id: request.command_id.clone(),
+            draft_id: request.draft_id.clone(),
+            project_id: project.project_id.clone(),
+            session_id: request.session_id.clone(),
+            job_id: Some(job.id.clone()),
+            message: format!("job launched: {}", job.id),
+            duplicate: false,
+        };
+        domain.record_launch_command(
+            &request.command_id,
+            &request.project_id,
+            &request_hash,
+            "accepted",
+            Some(&job.id),
+            &response.message,
+        )?;
+
+        Ok(response)
     }
 }

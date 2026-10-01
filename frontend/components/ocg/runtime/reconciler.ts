@@ -18,8 +18,7 @@
 
 import type { ChatMessage } from "../types";
 import type { ProjectId } from "../project/domain";
-import { PROJECTS } from "../project/domain";
-import { projectLedgerJobIds, projectSessionIds } from "../project/fixtures";
+import { FIXTURE_PROJECT_IDS, projectLedgerJobIds, projectSessionIds } from "../project/fixtures";
 import type { JobLaunchResult, RuntimeSnapshot, ScenarioId } from "./runtime-types";
 import { boundActivities, boundTimeline } from "./observability";
 import { normalizeLogEntry } from "../logs/domain";
@@ -196,15 +195,15 @@ function deltaDedupKey(envelope: AnyRuntimeEnvelope): string | undefined {
 }
 
 function ownerProjectForSession(sessionId: string): ProjectId | null {
-  for (const project of PROJECTS) {
-    if (projectSessionIds(project.id).includes(sessionId)) return project.id;
+  for (const projectId of FIXTURE_PROJECT_IDS) {
+    if (projectSessionIds(projectId).includes(sessionId)) return projectId;
   }
   return null;
 }
 
 function ownerProjectForJob(jobId: string): ProjectId | null {
-  for (const project of PROJECTS) {
-    if (projectLedgerJobIds(project.id).includes(jobId)) return project.id;
+  for (const projectId of FIXTURE_PROJECT_IDS) {
+    if (projectLedgerJobIds(projectId).includes(jobId)) return projectId;
   }
   return null;
 }

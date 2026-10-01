@@ -189,7 +189,7 @@ impl VerificationConfig {
     /// A stable fingerprint of the policy, usable in cache keys.
     pub fn fingerprint(&self) -> String {
         let value = serde_json::to_value(self).unwrap_or(Value::Null);
-        crate::runtime::hash::sha256_hex(value.to_string().as_bytes())
+        crate::hash::sha256_hex(value.to_string().as_bytes())
     }
 }
 

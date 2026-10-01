@@ -189,7 +189,7 @@ fn string<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 /// a subsequent tool call; a missing revision never authorizes a blind rewrite.
 pub fn read_revision(path: &Path) -> std::io::Result<(String, Vec<u8>)> {
     let bytes = fs::read(path)?;
-    Ok((crate::runtime::hash::sha256_hex(&bytes), bytes))
+    Ok((crate::hash::sha256_hex(&bytes), bytes))
 }
 
 pub fn apply_call(root: &Path, call: CanonicalCall) -> Result<EditOutcome, EditFailure> {
@@ -231,7 +231,7 @@ fn apply_inner(
     // Per-file cooperative lock, placed under the project's ignored state dir.
     let lock_dir = root.join(".ocg/edit-locks");
     fs::create_dir_all(&lock_dir).map_err(|_| fail(Conflict::IOFailure))?;
-    let lock_name = crate::runtime::hash::sha256_hex(path.to_string_lossy().as_bytes());
+    let lock_name = crate::hash::sha256_hex(path.to_string_lossy().as_bytes());
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -316,7 +316,7 @@ fn apply_inner(
             rebased: stale || retries > 0,
             retries,
             previous_revision: revision,
-            new_revision: crate::runtime::hash::sha256_hex(next.as_bytes()),
+            new_revision: crate::hash::sha256_hex(next.as_bytes()),
         });
     }
 }

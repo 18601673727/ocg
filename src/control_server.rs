@@ -121,6 +121,9 @@ pub struct ControlServer {
     profile: crate::profile::ProfileService,
     config: ServerConfig,
     active: Arc<AtomicUsize>,
+    /// Long-lived execution runtime owning provider and native tool workers.
+    /// Only present when canonical control service is available.
+    execution_runtime: Option<crate::orchestration::execution_runtime::ExecutionRuntime>,
 }
 
 impl ControlServer {
@@ -169,14 +172,50 @@ impl ControlServer {
                 "control server bound a non-loopback address {bound}; refusing to serve"
             )));
         }
+        
+        // Try to open canonical control service
+        let mut canonical = crate::orchestration::canonical_control::CanonicalControlService::open(root).ok();
+        
+        // Wire the profile service if canonical service exists
+        if let Some(ref mut service) = canonical {
+            *service = service.clone().with_profile_service(
+                crate::profile::ProfileService::with_workspace(profile_path, root)
+            );
+        }
+        
+        // If canonical service exists, start execution runtime and wire the handle
+        let execution_runtime = if canonical.is_some() {
+            match crate::orchestration::execution_runtime::ExecutionRuntime::start(
+                root,
+                16, // provider_capacity
+                16, // native_tool_capacity
+                Arc::new(crate::http::NativeHttp::new()?),
+                crate::native_tools::PermissionPolicy::default(),
+            ) {
+                Ok(runtime) => {
+                    let handle = crate::orchestration::execution_runtime::ExecutionRuntimeHandle::new(&runtime);
+                    if let Some(ref mut service) = canonical {
+                        *service = service.clone().with_runtime_handle(handle);
+                    }
+                    Some(runtime)
+                }
+                Err(error) => {
+                    eprintln!("ocg: failed to start execution runtime: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
         Ok(Self {
             listener,
             addr: bound,
-            canonical: crate::orchestration::canonical_control::CanonicalControlService::open(root)
-                .ok(),
+            canonical,
             profile: crate::profile::ProfileService::with_workspace(profile_path, root),
             config,
             active: Arc::new(AtomicUsize::new(0)),
+            execution_runtime,
         })
     }
 
@@ -256,6 +295,14 @@ struct ClientGuard(Arc<AtomicUsize>);
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for ControlServer {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.execution_runtime.take() {
+            let _ = runtime.shutdown();
+        }
     }
 }
 
@@ -504,28 +551,14 @@ fn handle_profile(
         );
     }
     let operation = || -> Result<Value> {
-        let xdg = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
-            })
-            .ok_or_else(|| {
-                OcgError::config("HOME or XDG_CONFIG_HOME is required to discover external config")
-            })?;
         let view = || -> Result<Value> {
             let current = service.current()?;
-            let candidates = if current.is_none() {
-                service.candidates(&xdg)?
-            } else {
-                vec![]
-            };
             // A declared struct, so the generated TypeScript describes the
             // response the PWA actually receives.
             serde_json::to_value(ProfileView {
                 api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
                 profile: current.as_ref().map(|(profile, _)| profile.clone()),
                 revision: current.as_ref().map(|(_, revision)| revision.clone()),
-                candidates,
             })
             .map_err(|error| OcgError::config(error.to_string()))
         };
@@ -536,25 +569,13 @@ fn handle_profile(
                     .json_body()
                     .map_err(|_| OcgError::config("invalid Profile bootstrap body"))?;
                 let choice = body.get("choice").and_then(Value::as_str).ok_or_else(|| {
-                    OcgError::config("explicit choice is required: new or import")
+                    OcgError::config("explicit choice is required: new")
                 })?;
                 match choice {
                     "new" => {
-                        service.bootstrap(None, &xdg)?;
+                        service.bootstrap()?;
                     }
-                    "import" => {
-                        let path =
-                            body.get("location")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| {
-                                    OcgError::config("selected candidate location is required")
-                                })?;
-                        let hash = body.get("sha256").and_then(Value::as_str).ok_or_else(|| {
-                            OcgError::config("selected candidate sha256 is required")
-                        })?;
-                        service.bootstrap(Some((Path::new(path), hash)), &xdg)?;
-                    }
-                    _ => return Err(OcgError::config("choice must be new or import")),
+                    _ => return Err(OcgError::config("choice must be new")),
                 }
                 view()
             }
@@ -712,6 +733,12 @@ fn handle_canonical(
                     .ok_or_else(|| OcgError::config("configuration is required"))?;
                 answer!(service.set_job_configuration(&id, job, config, now)?)
             }
+            Route::CanonicalJobLaunch => {
+                let body = body()?;
+                let request: crate::contracts::JobLaunchRequest = serde_json::from_value(body)
+                    .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.launch_job(request, now)?)
+            }
             Route::CanonicalSnapshot => {
                 let project = query("project_id")?;
                 let job = query("job_id")?;
@@ -735,6 +762,7 @@ fn handle_canonical(
             | Route::CanonicalConfigurationProjectPut { .. }
             | Route::CanonicalJobConfigGet { .. }
             | Route::CanonicalJobConfigPut { .. }
+            | Route::CanonicalJobLaunch
             | Route::CanonicalSnapshot
             | Route::CanonicalEvents
             | Route::CanonicalDashboard
@@ -1112,6 +1140,7 @@ enum Route {
     CanonicalConfigurationProjectPut { project: String },
     CanonicalJobConfigGet { job: String },
     CanonicalJobConfigPut { job: String },
+    CanonicalJobLaunch,
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
@@ -1155,6 +1184,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 )
                 | ("GET", ["api", "v1", "canonical", "jobs"])
                 | ("GET", ["api", "v1", "canonical", "jobs", "events"])
+                | ("POST", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("GET", ["api", "v1", "canonical", "dashboard"])
                 // A browser preflight is answered by the canonical CORS
                 // handler, which is the only place that echoes an origin.
@@ -1166,6 +1196,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", _, "configuration"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
+                | ("OPTIONS", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
         );
         if !is_route {
@@ -1203,6 +1234,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         }
         ("PUT", ["api", "v1", "canonical", "jobs", job, "configuration"]) => {
             Ok(Route::CanonicalJobConfigPut { job: safe_id(job)? })
+        }
+        ("POST", ["api", "v1", "canonical", "jobs", "launch"]) => {
+            Ok(Route::CanonicalJobLaunch)
         }
         ("GET", ["api", "v1", "canonical", "jobs"]) => Ok(Route::CanonicalSnapshot),
         ("GET", ["api", "v1", "canonical", "jobs", "events"]) => Ok(Route::CanonicalEvents),
@@ -1279,6 +1313,7 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         | ["api", "v1", "canonical", "dashboard"]
         | ["api", "v1", "canonical", "projects"] => Some("GET"),
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
+        ["api", "v1", "canonical", "jobs", "launch"] => Some("POST"),
         ["api", "v1", "canonical", "projects", _] => Some("GET"),
         _ => None,
     }

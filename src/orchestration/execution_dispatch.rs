@@ -1,8 +1,6 @@
-//! Bounded handoff between canonical admission and Compio executors.
+//! Bounded handoff between canonical admission and execution workers.
 
 use crate::error::{OcgError, Result};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 fn invalid(message: &str) -> OcgError {
@@ -13,16 +11,30 @@ pub struct ExecutionEnvelope {
     pub call_id: String,
     pub job_id: String,
     pub attempt_id: String,
+    pub executor_id: Option<String>,
     pub generation: u64,
     pub payload: String,
     pub dispatch_id: Option<String>,
     pub events: flume::Sender<ExecutionEvent>,
+    /// Frozen provider execution configuration for this Call.
+    /// Only populated for provider Calls; None for native tool Calls.
+    pub provider_config: Option<ProviderExecutionConfig>,
+}
+
+/// Frozen provider execution configuration associated with a specific Call.
+/// This is durably stored and never includes the raw credential/token.
+#[derive(Debug, Clone)]
+pub struct ProviderExecutionConfig {
+    pub provider_key: String,
+    pub model: String,
+    pub endpoint: String,
+    pub credential_ref: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
     Started,
-    Provider(crate::provider_transport::ChatStreamEvent),
+    Provider(crate::openai_compatible::stream::ChatStreamEvent),
     Failed(String),
     Finished,
 }
@@ -80,10 +92,12 @@ pub fn admit_call_with_events(
         call_id: call.id.clone(),
         job_id: authority.job_id.clone(),
         attempt_id: authority.attempt_id.clone(),
+        executor_id: Some(executor_id.to_string()),
         generation: authority.generation,
         payload: request.to_string(),
         dispatch_id: None,
         events,
+        provider_config: None,
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,
@@ -114,10 +128,12 @@ pub fn queue_call(
         call_id: call.id.clone(),
         job_id: authority.job_id.clone(),
         attempt_id: authority.attempt_id.clone(),
+        executor_id: call.executor_id.clone(),
         generation: authority.generation,
         payload: request.to_string(),
         dispatch_id,
         events,
+        provider_config: None,
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,
@@ -170,64 +186,20 @@ pub fn cancel_attempt(
     Ok(outcome)
 }
 
-pub trait CompioCallHandler: Send + Sync + 'static {
-    fn execute(
-        &self,
-        envelope: ExecutionEnvelope,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
-}
-
-pub trait ValidatedCompioCallHandler: Send + Sync + 'static {
-    fn execute_validated(
-        &self,
-        envelope: ExecutionEnvelope,
-    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value>> + Send + '_>>;
-}
-
-impl<H> CompioCallHandler for H
-where
-    H: ValidatedCompioCallHandler,
-{
-    fn execute(
-        &self,
-        envelope: ExecutionEnvelope,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            let input: serde_json::Value = serde_json::from_str(&envelope.payload)
-                .map_err(|error| invalid(&format!("invalid Call input JSON: {error}")))?;
-            crate::orchestration::call_schema::validate_input(&input)?;
-            let output = self.execute_validated(envelope).await?;
-            crate::orchestration::call_schema::validate_output(&output)
-        })
-    }
-}
-
-pub struct CompioExecutor;
-
-impl CompioExecutor {
-    pub fn run<H>(dispatcher: &BoundedDispatcher, handler: &H) -> Result<()>
-    where
-        H: CompioCallHandler,
-    {
-        let runtime = compio::runtime::Runtime::new()
-            .map_err(|error| invalid(&format!("create Compio runtime: {error}")))?;
-        loop {
-            let Some(envelope) = dispatcher.recv()? else {
-                return Ok(());
-            };
-            if let Err(error) = runtime.block_on(handler.execute(envelope)) {
-                tracing::error!(error = %error, "canonical Call executor failed; continuing with next bounded item");
-            }
-        }
-    }
-}
-
 /// A bounded handoff. `send` blocks when full, so execution admission cannot
-/// outrun the Compio executor and no cache silently becomes a second queue.
+/// outrun the execution worker and no cache silently becomes a second queue.
 pub struct BoundedDispatcher {
     capacity: usize,
     sender: Arc<Mutex<Option<flume::Sender<ExecutionEnvelope>>>>,
     receiver: flume::Receiver<ExecutionEnvelope>,
+}
+
+impl std::fmt::Debug for BoundedDispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedDispatcher")
+            .field("capacity", &self.capacity)
+            .finish()
+    }
 }
 
 impl Clone for BoundedDispatcher {
@@ -253,7 +225,7 @@ impl BoundedDispatcher {
         })
     }
 
-    /// Blocking producer operation used by Fang's blocking worker.
+    /// Blocking producer operation used by the blocking worker.
     pub fn send(&self, value: ExecutionEnvelope) -> Result<()> {
         let sender = self
             .sender
@@ -266,8 +238,7 @@ impl BoundedDispatcher {
             .map_err(|_| invalid("dispatcher is closed"))
     }
 
-    /// Blocking consumer operation intended to run inside Compio's blocking
-    /// bridge or a dedicated executor-facing adapter.
+    /// Blocking consumer operation intended to run inside a dedicated execution thread.
     pub fn recv(&self) -> Result<Option<ExecutionEnvelope>> {
         match self.receiver.recv() {
             Ok(value) => Ok(Some(value)),
@@ -282,6 +253,14 @@ impl BoundedDispatcher {
             .map_err(|_| invalid("dispatcher lock poisoned"))?;
         sender.take();
         Ok(())
+    }
+
+    /// Shutdown the dispatcher by dropping the sender, which unblocks all
+    /// consumers waiting on recv().
+    pub fn shutdown(&self) {
+        if let Ok(mut sender) = self.sender.lock() {
+            sender.take();
+        }
     }
 
     pub fn len(&self) -> Result<usize> {

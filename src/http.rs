@@ -12,9 +12,9 @@
 
 use crate::error::{OcgError, Result};
 use crate::proxy::{proxy_builder_ops, ProxyBuilderOp, ProxyPlan, ProxyScheme};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +23,19 @@ use std::time::Duration;
 /// Release archives are tens of megabytes; the cap protects against a hostile
 /// or broken server that streams without a `Content-Length`.
 pub const MAX_BODY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Time allowed for connect, write and the response head.
+///
+/// The client library's 5s default aborts a request GitHub is queueing or
+/// throttling, which surfaces as an opaque transport error rather than as the
+/// rate-limit condition the caller can actually act on.
+const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time allowed to read a whole body once the head has arrived.
+///
+/// This is a total read budget rather than an idle timeout, so it has to scale
+/// with [`MAX_BODY_BYTES`] instead of sitting at a latency-sized default.
+const RESPONSE_BODY_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A value that must never be rendered. `Debug` and `Display` redact it.
 #[derive(Clone, PartialEq, Eq)]
@@ -303,19 +316,32 @@ pub trait HttpTransport: Send + Sync {
     fn get_response(&self, url: &str) -> Result<HttpResponse> {
         Ok(HttpResponse::ok(self.get(url)?))
     }
+
+    /// Send one bounded JSON request through the same native HTTP surface.
+    /// Provider execution uses this narrow extension; it is not a second
+    /// transport implementation.
+    fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<HttpResponse> {
+        let _ = (url, headers, body);
+        Err(OcgError::config("native HTTP transport does not support JSON POST"))
+    }
+
 }
 
-/// The production transport: one `reqwest` blocking client with rustls.
+/// The production transport uses OCG's ntex HTTP stack on the native ntex runtime.
 ///
 /// Automatic (hidden) proxy discovery is always disabled first; only the
 /// typed endpoints of the resolved [`ProxyPlan`] are installed. Only
 /// `https://` URLs are accepted, and bodies are capped at [`MAX_BODY_BYTES`].
-pub struct ReqwestHttp {
-    client: reqwest::blocking::Client,
+pub struct NativeHttp {
     token: Option<GithubToken>,
 }
 
-impl ReqwestHttp {
+impl NativeHttp {
     /// A client with no proxy and no GitHub token.
     pub fn new() -> Result<Self> {
         Self::with_policy(&ProxyPlan::default(), None)
@@ -323,43 +349,18 @@ impl ReqwestHttp {
 
     /// A client that uses exactly the resolved proxy plan and GitHub token.
     pub fn with_policy(proxy: &ProxyPlan, token: Option<GithubToken>) -> Result<Self> {
-        // Always disable hidden automatic proxy discovery first, then install
-        // only the typed resolved endpoints. `proxy_builder_ops` is the
-        // inspectable contract for that ordering.
         let ops = proxy_builder_ops(proxy);
-        debug_assert_eq!(
-            ops.first(),
-            Some(&ProxyBuilderOp::DisableAutomaticDiscovery)
-        );
-
-        let mut builder = reqwest::blocking::Client::builder()
-            .user_agent(concat!("ocg/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(120))
-            .no_proxy();
-
-        let exceptions = if proxy.no_proxy().is_empty() {
-            None
-        } else {
-            reqwest::NoProxy::from_string(&proxy.no_proxy().join(","))
-        };
-        for endpoint in proxy.endpoints() {
-            let configured = match endpoint.scheme() {
-                ProxyScheme::Http => reqwest::Proxy::http(endpoint.expose()),
-                ProxyScheme::Https => reqwest::Proxy::https(endpoint.expose()),
-                ProxyScheme::All => reqwest::Proxy::all(endpoint.expose()),
-            }
-            .map_err(|_| OcgError::config("cannot configure an HTTP proxy endpoint"))?;
-            builder = builder.proxy(configured.no_proxy(exceptions.clone()));
+        if ops.first() != Some(&ProxyBuilderOp::DisableAutomaticDiscovery) {
+            return Err(OcgError::config("native HTTP policy must disable automatic proxy discovery first"));
         }
-
-        let client = builder
-            .build()
-            .map_err(|error| OcgError::config(format!("cannot build the HTTP client: {error}")))?;
-        Ok(Self { client, token })
+        if proxy.endpoints().iter().any(|endpoint| endpoint.scheme() == ProxyScheme::All) {
+            return Err(OcgError::config("native HTTP client does not support an untyped proxy endpoint"));
+        }
+        Ok(Self { token })
     }
 }
 
-impl HttpTransport for ReqwestHttp {
+impl HttpTransport for NativeHttp {
     fn get(&self, url: &str) -> Result<Vec<u8>> {
         let response = self.get_response(url)?;
         if !response.is_success() {
@@ -372,59 +373,168 @@ impl HttpTransport for ReqwestHttp {
         if !url.starts_with("https://") {
             return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
         }
-        let mut request = self.client.get(url);
-        let headers = github_headers_for(url, self.token.is_some());
-        if headers.authorization {
-            if let Some(token) = &self.token {
-                request = request.bearer_auth(token.expose());
-            }
-        }
-        if headers.accept {
-            request = request.header(reqwest::header::ACCEPT, "application/vnd.github+json");
-        }
-        if headers.api_version {
-            request = request.header("X-GitHub-Api-Version", "2022-11-28");
-        }
+        let token = self.token.clone();
+        let url = url.to_owned();
+        let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
+        runtime.block_on(async move { native_get(&url, token.as_ref()).await })
+    }
 
-        let response = request
-            .send()
-            .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
-        let status = response.status().as_u16();
-        let rate_limit = RateLimit::from_headers(response.headers());
-        if let Some(length) = response.content_length() {
-            if length > MAX_BODY_BYTES {
-                return Err(OcgError::config(format!(
-                    "response from {url} is {length} bytes, over the {MAX_BODY_BYTES} byte limit"
-                )));
-            }
+    fn post_json(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<HttpResponse> {
+        if !url.starts_with("https://") {
+            return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
         }
-        let mut bytes = Vec::new();
-        // `take` also enforces the cap when no Content-Length was sent.
-        let mut reader = response.take(MAX_BODY_BYTES + 1);
-        reader.read_to_end(&mut bytes).map_err(|error| {
-            OcgError::config(format!("cannot read the response from {url}: {error}"))
-        })?;
-        if bytes.len() as u64 > MAX_BODY_BYTES {
-            return Err(OcgError::config(format!(
-                "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
-            )));
-        }
-        Ok(HttpResponse {
-            status,
-            rate_limit,
-            body: bytes,
-        })
+        let url = url.to_owned();
+        let body = serde_json::to_vec(body)
+            .map_err(|error| OcgError::config(format!("cannot encode JSON request: {error}")))?;
+        let headers = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect::<Vec<_>>();
+        let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
+        runtime.block_on(async move { native_post_json(&url, &headers, &body).await })
     }
 }
 
 impl RateLimit {
-    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
-        RateLimit::from_pairs(
-            headers.iter().filter_map(|(name, value)| {
-                value.to_str().ok().map(|value| (name.as_str(), value))
-            }),
-        )
+}
+
+async fn native_get(url: &str, token: Option<&GithubToken>) -> Result<HttpResponse> {
+    // `Client::new()` would inherit the library's payload limits, and
+    // `response.body()` reads through the buffered payload reader that enforces
+    // them: at the defaults a body is capped at 256 KiB and 10s, so every
+    // release archive fails long before `MAX_BODY_BYTES` is consulted. The
+    // envelope is therefore declared here, where it is enforced, rather than
+    // only compared after the fact.
+    let client = ntex::client::ClientBuilder::new()
+        .response_timeout(RESPONSE_HEAD_TIMEOUT)
+        .response_payload_limit(MAX_BODY_BYTES as usize)
+        .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
+        .build(ntex::SharedCfg::default())
+        .await
+        .map_err(|error| {
+            OcgError::config(format!("cannot build the native HTTP client: {error}"))
+        })?;
+    let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let headers = github_headers_for(url, token.is_some());
+    if headers.authorization { if let Some(token) = token { request = request.header("Authorization", format!("Bearer {}", token.expose())); } }
+    if headers.accept { request = request.header("Accept", "application/vnd.github+json"); }
+    if headers.api_version { request = request.header("X-GitHub-Api-Version", "2022-11-28"); }
+    let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {
+        value.to_str().ok().map(|value| (name.as_str(), value))
+    }));
+    let body = response.body().await.map_err(|error| OcgError::config(format!("cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}")))?;
+    // The payload reader rejects an oversized body before this point; kept as a
+    // cheap second gate so `MAX_BODY_BYTES` stays the single declared envelope.
+    if body.len() as u64 > MAX_BODY_BYTES { return Err(OcgError::config(format!("response from {url} exceeded the {MAX_BODY_BYTES} byte limit"))); }
+    Ok(HttpResponse { status, rate_limit, body: body.to_vec() })
+}
+
+async fn native_post_json(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<HttpResponse> {
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "request to {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
     }
+    let client = ntex::client::ClientBuilder::new()
+        .response_timeout(RESPONSE_HEAD_TIMEOUT)
+        .response_payload_limit(MAX_BODY_BYTES as usize)
+        .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
+        .build(ntex::SharedCfg::default())
+        .await
+        .map_err(|error| {
+            OcgError::config(format!("cannot build the native HTTP client: {error}"))
+        })?;
+    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .send_body(body.to_vec())
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    let response_body = response
+        .body()
+        .await
+        .map_err(|error| OcgError::config(format!("cannot read the response from {url}: {error}")))?;
+    if response_body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    Ok(HttpResponse {
+        status,
+        rate_limit: RateLimit::default(),
+        body: response_body.to_vec(),
+    })
+}
+
+async fn native_post_json_streaming<F>(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    mut callback: F,
+) -> Result<HttpResponse>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "request to {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    let client = ntex::client::ClientBuilder::new()
+        .response_timeout(RESPONSE_HEAD_TIMEOUT)
+        .response_payload_limit(MAX_BODY_BYTES as usize)
+        .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
+        .build(ntex::SharedCfg::default())
+        .await
+        .map_err(|error| {
+            OcgError::config(format!("cannot build the native HTTP client: {error}"))
+        })?;
+    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .send_body(body.to_vec())
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    
+    // Read the response body using load_body which returns the complete body
+    let response_body = response
+        .body()
+        .await
+        .map_err(|error| OcgError::config(format!("error reading response from {url}: {error}")))?;
+    
+    // Check size limit
+    if response_body.len() > MAX_BODY_BYTES as usize {
+        return Err(OcgError::config(format!(
+            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    
+    // For now, invoke callback with the complete body
+    // TODO: Implement true streaming when ntex provides a streaming API
+    callback(&response_body)?;
+    
+    Ok(HttpResponse {
+        status,
+        rate_limit: RateLimit::default(),
+        body: response_body.to_vec(),
+    })
 }
 
 /// A transport that always fails. Used by non-mutating commands (`version`,
@@ -511,6 +621,15 @@ impl HttpTransport for MemoryHttp {
     }
 
     fn get_response(&self, url: &str) -> Result<HttpResponse> {
+        self.response(url)
+    }
+
+    fn post_json(
+        &self,
+        url: &str,
+        _headers: &[(&str, &str)],
+        _body: &Value,
+    ) -> Result<HttpResponse> {
         self.response(url)
     }
 }

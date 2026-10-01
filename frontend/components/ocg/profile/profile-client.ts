@@ -1,13 +1,12 @@
-/** The backend's OCG-owned Profile projection. OpenCode documents are import
- * candidates only; this is the only provider/model edit schema in the PWA.
+/** The backend's OCG-owned Profile projection.
  *
  * The types are the generated projection of `src/contracts.rs`, so Rust is the
  * single source of truth for this schema: a field added, renamed or retyped on
  * the Rust side surfaces here as a type error rather than as `undefined` in a
  * rendered Profile. */
-export type { Candidate, Model, Origin, Profile, Provider, ProfileView } from "../contracts";
+export type { Model, Origin, Profile, Provider, ProfileView } from "../contracts";
 
-import type { Candidate, Profile, ProfileView } from "../contracts";
+import type { Profile, ProfileView } from "../contracts";
 import { decodeProfileView, ContractError } from "../contracts";
 import { PROFILE_API_VERSION } from "../contracts";
 
@@ -64,9 +63,6 @@ export function createProfileClient(baseUrl: string, fetchImpl: typeof fetch) {
   return {
     read: () => request("/api/v1/profile"),
     createNew: () => request("/api/v1/profile/bootstrap", { method: "POST", body: JSON.stringify({ choice: "new" }) }),
-    importCandidate: (candidate: Candidate) => request("/api/v1/profile/bootstrap", {
-      method: "POST", body: JSON.stringify({ choice: "import", location: candidate.location, sha256: candidate.sha256 }),
-    }),
     replace: (revision: string, profile: Profile) => request("/api/v1/profile", {
       method: "PUT", body: JSON.stringify({ revision, profile }),
     }),

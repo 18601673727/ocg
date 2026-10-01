@@ -94,7 +94,7 @@ impl Role {
         }
     }
 
-    /// The generated OpenCode worker agent for this role. The Lead is not a
+    /// The generated OCG worker agent for this role. The Lead is not a
     /// worker route, so it returns `None`.
     pub fn agent(self) -> Option<String> {
         match self {

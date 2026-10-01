@@ -1,7 +1,7 @@
 /**
  * Pure Project selectors.
  *
- * Every selector resolves an unknown/missing project ID to Zhuju before
+ * Every selector resolves an unknown/missing project ID to an empty selection before
  * filtering, so callers can pass raw URL or storage values safely. Filtering
  * is projection-only: inputs are never mutated.
  */

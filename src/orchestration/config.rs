@@ -1,9 +1,9 @@
 //! Typed top-level `orchestration` policy.
 //!
 //! Orchestration is the layer that prepares dynamic, *bounded* context for a
-//! running OpenCode session and moves a task through Explore → Build → Verify
+//! running OCG attempt and moves a task through Explore → Build → Verify
 //! (→ Debug). It is configured under its own top-level key, like `context` and
-//! `verification`, so the raw `opencode` config is never overloaded.
+//! `verification`, so provider configuration is never overloaded.
 //!
 //! The policy is deliberately conservative:
 //!
@@ -213,7 +213,7 @@ impl OrchestrationConfig {
     /// A stable fingerprint of the policy.
     pub fn fingerprint(&self) -> String {
         let value = serde_json::to_value(self).unwrap_or(Value::Null);
-        crate::runtime::hash::sha256_hex(value.to_string().as_bytes())
+        crate::hash::sha256_hex(value.to_string().as_bytes())
     }
 }
 

@@ -5,7 +5,7 @@ import { Plus, RefreshCcw, Save, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useOcgControlUrl } from "./control-url";
-import { createProfileClient, runnableChoices, type Candidate, type Profile, type ProfileView } from "./profile-client";
+import { createProfileClient, runnableChoices, type Profile, type ProfileView } from "./profile-client";
 
 /** Shared backend-backed editor for onboarding and Configuration. A draft is
  * never authoritative: every successful mutation installs the backend reply. */
@@ -78,26 +78,15 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
         <div><h2 className="text-sm font-semibold">OCG Profile</h2><p className="text-xs text-muted-foreground">Owned by .ocg.yaml; external configuration is a one-time import source.</p></div>
         <Button size="sm" variant="outline" onClick={() => void refresh()} disabled={busy}><RefreshCcw className="size-3" /> Refresh</Button>
       </div>
-      {error && <p role="alert" className="text-xs text-destructive">{error} Refresh and compare again before retrying an import or edit.</p>}
+      {error && <p role="alert" className="text-xs text-destructive">{error} Refresh and compare again before retrying an edit.</p>}
       {!view ? <p role="status" className="text-xs">Loading Profile…</p> : !draft ? (
         <div className="space-y-3">
-          <p className="text-xs">No OCG Profile exists. Choose one source; Global and Local are never merged automatically.</p>
-          {view.candidates.map((candidate: Candidate) => (
-            <div key={`${candidate.location}:${candidate.sha256}`} className="rounded border border-border p-3 text-xs">
-              <p className="font-medium">{candidate.source} · {candidate.scope}</p>
-              <p className="break-all text-muted-foreground">{candidate.location}</p>
-              <p>Providers ({candidate.provider_names.length}): {candidate.provider_names.join(", ") || "none"}</p>
-              <p>Models ({candidate.model_ids.length}): {candidate.model_ids.join(", ") || "none"}</p>
-              {Object.entries(candidate.variants).map(([model, variants]) => <p key={model}>{model}: {variants.join(", ")}</p>)}
-              <p>Importable: {candidate.importable_fields.join(", ") || "none"} · Ignored: {candidate.ignored_fields.join(", ") || "none"}</p>
-              <Button size="sm" variant="outline" disabled={busy} onClick={() => void mutate(() => client!.importCandidate(candidate))}>Import this snapshot</Button>
-            </div>
-          ))}
-          <Button size="sm" disabled={busy} onClick={() => void mutate(() => client!.createNew())}>Create New Profile (non-runnable placeholders)</Button>
+          <p className="text-xs">No OCG Profile exists. Create an OCG-owned profile to continue.</p>
+          <Button size="sm" disabled={busy} onClick={() => void mutate(() => client!.createNew())}>Create New Profile</Button>
         </div>
       ) : (
         <div className="space-y-3 text-xs">
-          <p>Origin: {draft.origin === "new" ? "New" : `Imported ${draft.origin.imported.scope} from ${draft.origin.imported.source}`}</p>
+          <p>Origin: New</p>
           <p>Providers: {Object.keys(draft.providers).length} · Models: {Object.keys(draft.models).length} · Runnable choices: {runnableChoices(draft).length}</p>
           {runnableChoices(draft).length === 0 && <p role="status">Placeholder-only Profile: configuration is valid, inference is unavailable.</p>}
           <div className="space-y-1"><h3 className="font-medium">Providers</h3>

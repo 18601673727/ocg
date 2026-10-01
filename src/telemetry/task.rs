@@ -268,7 +268,7 @@ impl Event {
 /// A deterministic task id derived from a seed (usually task text plus role).
 /// The seed itself is never stored.
 pub fn safe_task_id(seed: &str) -> String {
-    let digest = crate::runtime::hash::sha256_hex(seed.as_bytes());
+    let digest = crate::hash::sha256_hex(seed.as_bytes());
     let short = digest.get(..16).unwrap_or(&digest);
     format!("task-{short}")
 }

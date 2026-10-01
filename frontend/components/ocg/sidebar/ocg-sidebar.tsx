@@ -31,7 +31,7 @@ import type { ChatSession, RuntimeStatus, WorkType } from "../types";
 import { WORK_TYPE_LABEL } from "../types";
 import { ProjectSwitcher } from "../project/project-switcher";
 import type { ProjectId, ProjectSummary } from "../project/domain";
-import { DEFAULT_PROJECT_ID, PROJECTS } from "../project/domain";
+import { DEFAULT_PROJECT_ID } from "../project/domain";
 import {
   RUNTIME_CONNECTION,
   RUNTIME_CONNECTION_LABEL,
@@ -126,7 +126,7 @@ export function OcgSidebar({
   onNewChat,
   runtimeStatus,
   activeView = "chat",
-  projects = PROJECTS,
+  projects = [],
   activeProjectId = DEFAULT_PROJECT_ID,
   onProjectChange,
   attentionCount = 0,

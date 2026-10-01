@@ -10,7 +10,7 @@
 //! - a bounded number of sessions is retained (newest first) so the file cannot
 //!   grow without limit.
 //!
-//! This module never contacts a model, a network or OpenCode. It stores the
+//! This module never contacts a model or a network. It stores the
 //! controller's phase, retry budgets and the latest bounded findings so a later
 //! bridge call can resume the same task.
 
@@ -72,10 +72,10 @@ pub struct Attempts {
     pub debug: usize,
 }
 
-/// The retained session repository baseline for the OpenCode V2
+/// The retained session repository baseline for the native control plane
 /// model-dispatch path.
 ///
-/// The V2 adapter injects the baseline into the outgoing model request's
+/// The execution adapter injects the baseline into the outgoing model request's
 /// system context, which is never persisted, so every root-Lead dispatch must
 /// receive the full body again. The baseline *body* is retained here, keyed by
 /// `repository_generation_id`: an unchanged generation reuses the stored body
@@ -133,7 +133,7 @@ pub struct SessionState {
     #[serde(default)]
     pub repository_generation_id: Option<String>,
     /// The retained baseline body for `repository_generation_id`, used by the
-    /// V2 model-dispatch path so an unchanged generation is reused without
+    /// model-dispatch path so an unchanged generation is reused without
     /// re-rendering while still being supplied to every outgoing request.
     #[serde(default)]
     pub repository_baseline: Option<RepositoryBaseline>,
@@ -270,7 +270,7 @@ pub fn safe_id(seed: &str) -> String {
     {
         return trimmed.to_string();
     }
-    let digest = crate::runtime::hash::sha256_hex(seed.as_bytes());
+    let digest = crate::hash::sha256_hex(seed.as_bytes());
     format!("s-{}", digest.get(..16).unwrap_or(&digest))
 }
 
@@ -327,12 +327,12 @@ pub fn load(root: &Path) -> LoadedState {
 
 /// Persist state atomically. Ensures the state tree stays git-ignored.
 pub fn save(root: &Path, state: &OrchestrationState) -> crate::error::Result<PathBuf> {
-    crate::runtime::install::ensure_gitignore(root)?;
+    crate::install::ensure_gitignore(root)?;
     let path = state_path(root);
     let value = serde_json::to_value(state).map_err(|error| {
         crate::error::OcgError::config(format!("cannot serialize orchestration state: {error}"))
     })?;
-    crate::runtime::install::write_json_atomic(&path, &value)?;
+    crate::install::write_json_atomic(&path, &value)?;
     Ok(path)
 }
 

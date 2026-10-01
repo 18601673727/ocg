@@ -69,15 +69,6 @@ export type CallLifecycle = "created" | "queued" | "running" | "succeeded" | "fa
 
 
 /**
- * A reusable, redacted comparison record; neither original JSON nor credentials are exposed.
- *
- * Round-trippable on purpose: a comparison the client can deserialize is a
- * comparison the client can actually validate.
- */
-export type Candidate = { source: string, scope: string, location: string, sha256: string, provider_names: Array<string>, model_ids: Array<string>, variants: { [key in string]: Array<string> }, importable_fields: Array<string>, ignored_fields: Array<string>, };
-
-
-/**
  * The `configuration` envelope shared by the three configuration read routes.
  */
 export type CanonicalConfigurationEnvelope = { api_version: CanonicalApiVersion, configuration: ProjectConfigurationView, };
@@ -271,6 +262,19 @@ export type GlobalConfiguration = { provider: string | null, model: string | nul
 export type JobBlocker = { kind: BlockerKind, blocking_ref: EntityRef | null, reason_code: string, };
 
 
+/**
+ * `POST /api/v1/canonical/jobs/launch`
+ */
+export type JobLaunchRequest = { command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
+
+
+export type JobLaunchResponse = { api_version: CanonicalApiVersion, 
+/**
+ * "accepted" | "rejected" | "failed"
+ */
+outcome: string, command_id: string, draft_id: string, project_id: string, session_id: string, job_id: string | null, message: string, duplicate: boolean, };
+
+
 export type JobLifecycle = "pending" | "ready" | "settling" | "blocked" | "completed" | "failed" | "cancelled";
 
 
@@ -302,7 +306,7 @@ export type Model = { placeholder: boolean, provider: string, id: string,
 variant?: string | null, variants?: Array<string>, };
 
 
-export type Origin = "new" | { "imported": { source: string, scope: string, location: string, sha256: string, } };
+export type Origin = "new";
 
 
 export type PostImagePolicy = "required" | "forbidden";
@@ -317,9 +321,9 @@ export type Profile = { origin: Origin, defaultModel?: string | null, providers:
  */
 export type ProfileBootstrapRequest = { 
 /**
- * `"new"` or `"import"`.
+ * The explicit bootstrap action, currently `"new"`.
  */
-choice: string, location?: string | null, sha256?: string | null, };
+choice: string, };
 
 
 export type ProfileReplaceRequest = { revision: string, profile: Profile, };
@@ -333,11 +337,10 @@ export type ProfileReplaceRequest = { revision: string, profile: Profile, };
  */
 export type ProfileView = { api_version: ProfileApiVersion, profile: Profile | null, 
 /**
- * SHA-256 of the project YAML the response was derived from. A write must
- * present the same value; a mismatch is rejected instead of overwriting a
- * concurrent edit.
+ * SHA-256 of the Profile document. A write must present the same value;
+ * a mismatch is rejected instead of overwriting a concurrent edit.
  */
-revision: string | null, candidates: Array<Candidate>, };
+revision: string | null, };
 
 
 export type ProjectConfiguration = { defaults: JsonValue, };
@@ -362,7 +365,17 @@ export type ProjectionEffect = "reducible" | "snapshot_barrier";
 export type ProjectionEffectPolicy = "reducible_only" | "barrier_allowed";
 
 
-export type Provider = { placeholder: boolean, label: string, };
+export type Provider = { placeholder: boolean, label: string, 
+/**
+ * HTTPS endpoint for provider API calls. Must not include userinfo.
+ */
+endpoint?: string | null, 
+/**
+ * Reference to a Vault credential name. The credential value is the raw
+ * bearer token (without "Bearer " prefix); OCG constructs the Authorization
+ * header at runtime.
+ */
+credential_ref?: string | null, };
 
 
 /**

@@ -37,7 +37,7 @@ pub struct PlanSection {
 }
 
 /// The deterministic OCG-instruction block of a plan. It lists only stable
-/// OCG commands; it does not inject anything into OpenCode's own config.
+/// OCG commands; it does not inject provider execution configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GearInstructions {
     pub engine_version: String,
@@ -434,7 +434,7 @@ pub fn provenance(
             let bytes = fs::read(root.join(&slice.path)).ok()?;
             Some(SourceFingerprint {
                 path: slice.path.clone(),
-                fingerprint: format!("sha256:{}", crate::runtime::hash::sha256_hex(&bytes)),
+                fingerprint: format!("sha256:{}", crate::hash::sha256_hex(&bytes)),
                 size: bytes.len() as u64,
             })
         })
@@ -459,7 +459,7 @@ pub fn provenance(
 pub fn fingerprint_text(text: &str) -> String {
     format!(
         "sha256:{}",
-        crate::runtime::hash::sha256_hex(text.as_bytes())
+        crate::hash::sha256_hex(text.as_bytes())
     )
 }
 
@@ -538,7 +538,7 @@ pub fn assemble(
             "ocg tools <task>".to_string(),
             "ocg checkpoint list".to_string(),
         ],
-        note: "OCG produces deterministic plans and artifacts; OpenCode owns execution, conversation, provider and tool semantics.".to_string(),
+        note: "OCG produces deterministic plans and artifacts; OCG owns execution, conversation, provider and tool semantics.".to_string(),
     };
     let capsule = build_capsule(task, index, &ranked, diff, &enrichment, provenance.clone());
     Ok(ContextPlan {

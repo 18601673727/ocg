@@ -24,7 +24,6 @@ export type {
   CanonicalJobSnapshot,
   CanonicalProjectResponse,
   CanonicalProjectsResponse,
-  Candidate,
   GlobalConfiguration,
   JsonValue,
   Model,
@@ -46,7 +45,6 @@ export { ContractError, decode } from "./decode";
 export type { DecodeResult, Decoder } from "./decode";
 
 export {
-  decodeCandidate,
   decodeProfile,
   decodeProfileView,
   decodeProvider,

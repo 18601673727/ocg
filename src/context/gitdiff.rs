@@ -193,7 +193,7 @@ pub fn snapshot_fingerprint(snapshot: &GitSnapshot) -> String {
     }
     format!(
         "sha256:{}",
-        crate::runtime::hash::sha256_hex(material.as_bytes())
+        crate::hash::sha256_hex(material.as_bytes())
     )
 }
 
