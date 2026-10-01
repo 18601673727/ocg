@@ -21,6 +21,14 @@ pub enum Origin {
 pub struct Provider {
     pub placeholder: bool,
     pub label: String,
+    /// HTTPS endpoint for provider API calls. Must not include userinfo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Reference to a Vault credential name. The credential value is the raw
+    /// bearer token (without "Bearer " prefix); OCG constructs the Authorization
+    /// header at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -58,6 +66,8 @@ impl Profile {
                 Provider {
                     placeholder: true,
                     label: "Configure a provider".into(),
+                    endpoint: None,
+                    credential_ref: None,
                 },
             )]),
             models: BTreeMap::from([(
@@ -79,6 +89,42 @@ impl Profile {
             return Err(OcgError::config(
                 "Profile requires at least one provider and one model",
             ));
+        }
+        for (provider_key, provider) in &self.providers {
+            // Validate endpoint if present
+            if let Some(endpoint) = &provider.endpoint {
+                if endpoint.is_empty() {
+                    return Err(OcgError::config(format!(
+                        "Profile provider '{provider_key}' endpoint cannot be empty"
+                    )));
+                }
+                // Parse endpoint and validate HTTPS scheme
+                if !endpoint.starts_with("https://") {
+                    return Err(OcgError::config(format!(
+                        "Profile provider '{provider_key}' endpoint must use HTTPS"
+                    )));
+                }
+                // Reject embedded credentials (check for @ in the authority section)
+                if let Some(authority_start) = endpoint.strip_prefix("https://") {
+                    if let Some(at_pos) = authority_start.find('@') {
+                        // Check if @ comes before the first / (path start)
+                        let path_start = authority_start.find('/').unwrap_or(authority_start.len());
+                        if at_pos < path_start {
+                            return Err(OcgError::config(format!(
+                                "Profile provider '{provider_key}' endpoint must not contain userinfo (username/password)"
+                            )));
+                        }
+                    }
+                }
+            }
+            // Validate credential_ref if present (just non-empty check; Vault validates name format)
+            if let Some(credential_ref) = &provider.credential_ref {
+                if credential_ref.is_empty() {
+                    return Err(OcgError::config(format!(
+                        "Profile provider '{provider_key}' credential_ref cannot be empty"
+                    )));
+                }
+            }
         }
         for (key, model) in &self.models {
             if model.id.is_empty() || !self.providers.contains_key(&model.provider) {

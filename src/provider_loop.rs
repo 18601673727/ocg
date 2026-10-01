@@ -739,19 +739,40 @@ fn decode_provider_response(body: &[u8]) -> Result<ProviderRound> {
 
 impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
     fn complete(&self, request: &Value) -> Result<ProviderRound> {
-        let headers = &[
-            ("Content-Type", "application/json"),
-            ("Accept", "application/json"),
-        ];
-        let response = if let Some(bearer) = &self.bearer {
-            // Create headers with authorization
-            let mut headers_with_auth = headers.to_vec();
-            let auth_value = format!("Bearer {bearer}");
-            headers_with_auth.push(("Authorization", &auth_value));
-            self.transport.post_json(&self.endpoint, &headers_with_auth, request)?
+        // Inject stream: true if not already present
+        let body = if request.get("stream").is_none() {
+            let mut body = request.clone();
+            body["stream"] = Value::Bool(true);
+            body
         } else {
-            self.transport.post_json(&self.endpoint, headers, request)?
+            request.clone()
         };
+
+        let accept = if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let mut headers = vec![("Content-Type", "application/json"), ("Accept", accept)];
+
+        // Vault stores the raw token; the header value is built only here.
+        let authorization = self.bearer.as_ref().map(|token| format!("Bearer {token}"));
+        if let Some(value) = &authorization {
+            headers.push(("Authorization", value.as_str()));
+        }
+
+        let response = self.transport.post_json(&self.endpoint, &headers, &body)?;
+
+        if !response.is_success() {
+            const MAX_ERROR_BODY: usize = 2048;
+            let excerpt = &response.body[..response.body.len().min(MAX_ERROR_BODY)];
+            return Err(OcgError::config(format!(
+                "OpenAI-compatible provider returned HTTP {}: {}",
+                response.status,
+                String::from_utf8_lossy(excerpt)
+            )));
+        }
+
         decode_provider_response(&response.body)
     }
 }

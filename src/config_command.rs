@@ -79,7 +79,7 @@ pub fn execute(
         Request::Provider { key, label } => {
             let (mut profile, revision) = service.current()?.ok_or_else(missing_profile)?;
             if key.is_empty() || profile.providers.contains_key(key) { return Err(OcgError::config("provider key must be non-empty and unique")); }
-            profile.providers.insert(key.clone(), Provider { placeholder: false, label: label.clone() });
+            profile.providers.insert(key.clone(), Provider { placeholder: false, label: label.clone(), endpoint: None, credential_ref: None });
             service.replace(&revision, &profile)?;
             print_current(&service, output)?;
         }

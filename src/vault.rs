@@ -65,6 +65,12 @@ impl Vault {
         Ok(removed)
     }
 
+    /// Get a single credential value by name.
+    pub fn get(&self, name: &str) -> Result<Option<String>> {
+        validate_name(name)?;
+        Ok(self.read()?.0.get(name).cloned())
+    }
+
     /// Return credential values only for the child process environment.
     pub fn child_environment(&self) -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
         self.read()?

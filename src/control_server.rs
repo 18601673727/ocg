@@ -686,6 +686,12 @@ fn handle_canonical(
                     .ok_or_else(|| OcgError::config("configuration is required"))?;
                 answer!(service.set_job_configuration(&id, job, config, now)?)
             }
+            Route::CanonicalJobLaunch => {
+                let body = body()?;
+                let request: crate::contracts::JobLaunchRequest = serde_json::from_value(body)
+                    .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.launch_job(request, now)?)
+            }
             Route::CanonicalSnapshot => {
                 let project = query("project_id")?;
                 let job = query("job_id")?;
@@ -709,6 +715,7 @@ fn handle_canonical(
             | Route::CanonicalConfigurationProjectPut { .. }
             | Route::CanonicalJobConfigGet { .. }
             | Route::CanonicalJobConfigPut { .. }
+            | Route::CanonicalJobLaunch
             | Route::CanonicalSnapshot
             | Route::CanonicalEvents
             | Route::CanonicalDashboard
@@ -1086,6 +1093,7 @@ enum Route {
     CanonicalConfigurationProjectPut { project: String },
     CanonicalJobConfigGet { job: String },
     CanonicalJobConfigPut { job: String },
+    CanonicalJobLaunch,
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
@@ -1129,6 +1137,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 )
                 | ("GET", ["api", "v1", "canonical", "jobs"])
                 | ("GET", ["api", "v1", "canonical", "jobs", "events"])
+                | ("POST", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("GET", ["api", "v1", "canonical", "dashboard"])
                 // A browser preflight is answered by the canonical CORS
                 // handler, which is the only place that echoes an origin.
@@ -1140,6 +1149,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", _, "configuration"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
+                | ("OPTIONS", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
         );
         if !is_route {
@@ -1177,6 +1187,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         }
         ("PUT", ["api", "v1", "canonical", "jobs", job, "configuration"]) => {
             Ok(Route::CanonicalJobConfigPut { job: safe_id(job)? })
+        }
+        ("POST", ["api", "v1", "canonical", "jobs", "launch"]) => {
+            Ok(Route::CanonicalJobLaunch)
         }
         ("GET", ["api", "v1", "canonical", "jobs"]) => Ok(Route::CanonicalSnapshot),
         ("GET", ["api", "v1", "canonical", "jobs", "events"]) => Ok(Route::CanonicalEvents),
@@ -1253,6 +1266,7 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         | ["api", "v1", "canonical", "dashboard"]
         | ["api", "v1", "canonical", "projects"] => Some("GET"),
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
+        ["api", "v1", "canonical", "jobs", "launch"] => Some("POST"),
         ["api", "v1", "canonical", "projects", _] => Some("GET"),
         _ => None,
     }

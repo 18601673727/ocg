@@ -617,4 +617,74 @@ impl CanonicalControlService {
             selected_job,
         })
     }
+
+    pub fn launch_job(
+        &self,
+        request: crate::contracts::JobLaunchRequest,
+        _now: i64,
+    ) -> Result<crate::contracts::JobLaunchResponse> {
+        if !safe_id(&request.command_id) {
+            return Ok(crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: request.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: None,
+                message: "invalid command_id".to_string(),
+                duplicate: false,
+            });
+        }
+        if !safe_id(&request.project_id) {
+            return Ok(crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: request.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: None,
+                message: "invalid project_id".to_string(),
+                duplicate: false,
+            });
+        }
+        
+        // Verify project is registered with this control service
+        let project = match self
+            .read_projects()?
+            .into_iter()
+            .find(|p| p.project_id == request.project_id)
+        {
+            Some(p) => p,
+            None => {
+                return Ok(crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: request.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: format!("unknown project: {}", request.project_id),
+                    duplicate: false,
+                });
+            }
+        };
+
+        // Fail closed: no execution runtime is owned by the control server yet,
+        // so no Job/Attempt/Executor is created that could never dispatch a
+        // provider Call.
+        Ok(crate::contracts::JobLaunchResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            outcome: "failed".to_string(),
+            command_id: request.command_id,
+            draft_id: request.draft_id,
+            project_id: project.project_id,
+            session_id: request.session_id,
+            job_id: None,
+            message: "execution runtime is not available; Job was not created".to_string(),
+            duplicate: false,
+        })
+    }
 }

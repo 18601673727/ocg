@@ -135,6 +135,35 @@ pub struct ProfileReplaceRequest {
     pub profile: Profile,
 }
 
+/// `POST /api/v1/canonical/jobs/launch`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct JobLaunchRequest {
+    pub command_id: String,
+    pub draft_id: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub objective: String,
+    pub success_criteria: Option<String>,
+    pub constraints: Option<String>,
+    pub hard_budget_micros: i64,
+    pub resource_commitment: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct JobLaunchResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    /// "accepted" | "rejected" | "failed"
+    pub outcome: String,
+    pub command_id: String,
+    pub draft_id: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub job_id: Option<String>,
+    pub message: String,
+    pub duplicate: bool,
+}
+
 // -- generation ---------------------------------------------------------------
 
 /// One generation config for the whole file.
@@ -165,6 +194,8 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     ExecutionWitness::export_all(cfg)?;
     CanonicalJobSnapshot::export_all(cfg)?;
     CanonicalJobEvent::export_all(cfg)?;
+    JobLaunchRequest::export_all(cfg)?;
+    JobLaunchResponse::export_all(cfg)?;
     ProfileView::export_all(cfg)?;
     ProfileBootstrapRequest::export_all(cfg)?;
     ProfileReplaceRequest::export_all(cfg)?;

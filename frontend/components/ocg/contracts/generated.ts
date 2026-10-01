@@ -262,6 +262,19 @@ export type GlobalConfiguration = { provider: string | null, model: string | nul
 export type JobBlocker = { kind: BlockerKind, blocking_ref: EntityRef | null, reason_code: string, };
 
 
+/**
+ * `POST /api/v1/canonical/jobs/launch`
+ */
+export type JobLaunchRequest = { command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
+
+
+export type JobLaunchResponse = { api_version: CanonicalApiVersion, 
+/**
+ * "accepted" | "rejected" | "failed"
+ */
+outcome: string, command_id: string, draft_id: string, project_id: string, session_id: string, job_id: string | null, message: string, duplicate: boolean, };
+
+
 export type JobLifecycle = "pending" | "ready" | "settling" | "blocked" | "completed" | "failed" | "cancelled";
 
 
@@ -352,7 +365,17 @@ export type ProjectionEffect = "reducible" | "snapshot_barrier";
 export type ProjectionEffectPolicy = "reducible_only" | "barrier_allowed";
 
 
-export type Provider = { placeholder: boolean, label: string, };
+export type Provider = { placeholder: boolean, label: string, 
+/**
+ * HTTPS endpoint for provider API calls. Must not include userinfo.
+ */
+endpoint?: string | null, 
+/**
+ * Reference to a Vault credential name. The credential value is the raw
+ * bearer token (without "Bearer " prefix); OCG constructs the Authorization
+ * header at runtime.
+ */
+credential_ref?: string | null, };
 
 
 /**
