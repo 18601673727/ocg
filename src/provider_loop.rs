@@ -219,6 +219,53 @@ fn requeue_recovered_provider_call(
     Ok(())
 }
 
+/// Start the complete execution runtime with provider and native tool dispatchers.
+/// This creates two bounded dispatchers under the same execution authority,
+/// starts both consumers, and handles recovery.
+pub fn run_execution_runtime(
+    project_root: &Path,
+    provider_capacity: usize,
+    native_tool_capacity: usize,
+    transport: Arc<dyn HttpTransport>,
+    endpoint: String,
+    bearer: Option<String>,
+    permission_policy: PermissionPolicy,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    let provider_dispatcher = BoundedDispatcher::new(provider_capacity)?;
+    let native_tool_dispatcher = BoundedDispatcher::new(native_tool_capacity)?;
+
+    let provider_config = ProviderHandlerConfig {
+        transport,
+        endpoint,
+        bearer,
+        project_root: project_root.to_path_buf(),
+        permission_policy,
+        cancelled: cancelled.clone(),
+        native_tool_dispatcher: native_tool_dispatcher.clone(),
+    };
+
+    let native_tool_handler = crate::native_tools::NativeToolCallHandler::new(
+        project_root.to_path_buf(),
+        permission_policy,
+        cancelled,
+    );
+
+    // Start native tool consumer in separate thread
+    let native_tool_dispatcher_clone = native_tool_dispatcher.clone();
+    let native_tool_thread = std::thread::spawn(move || {
+        CompioExecutor::run(&native_tool_dispatcher_clone, &native_tool_handler)
+    });
+
+    // Run provider dispatcher in main thread (with recovery)
+    let result = run_provider_dispatcher(project_root, &provider_dispatcher, provider_config);
+
+    // Wait for native tool thread to finish
+    let _ = native_tool_thread.join();
+
+    result
+}
+
 /// Run provider envelopes through the existing bounded Compio executor. This
 /// is the production handoff from canonical admission to provider/tool work.
 ///
