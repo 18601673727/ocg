@@ -8,8 +8,8 @@
 use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
 use crate::native_tools::{
-    execute_canonical_tool_call, tool_permission_for, NativeCallRequest, NativeToolRegistry,
-    PermissionPolicy,
+    execute_canonical_tool_call, openai_projection::OpenAiToolProjection, tool_permission_for,
+    NativeCallRequest, PermissionPolicy,
 };
 use crate::openai_compatible::{
     ChatFinishReason, ChatStreamEvent, ChatStreamSummary, NormalizedUsage, ToolCallNormalizer,
@@ -282,65 +282,12 @@ fn fail_provider_envelope(root: &Path, envelope: &ExecutionEnvelope, message: &s
 }
 
 fn inject_native_tools(request: &mut Value) -> Result<()> {
+    let projection = OpenAiToolProjection::from_registry()?;
     let object = request
         .as_object_mut()
         .ok_or_else(|| OcgError::config("provider request must be an object"))?;
-    object.insert(
-        "tools".to_string(),
-        Value::Array(NativeToolRegistry::openai_tools()),
-    );
+    object.insert("tools".to_string(), Value::Array(projection.tools()));
     Ok(())
-}
-
-/// Map an OpenAI-compatible wire tool name back to its canonical Native Tool name.
-fn wire_name_to_canonical(wire_name: &str) -> Result<String> {
-    NativeToolRegistry::get_by_wire_name(wire_name)
-        .map(|def| def.name.to_string())
-        .ok_or_else(|| {
-            OcgError::config(format!(
-                "provider requested unknown native tool wire name '{wire_name}'"
-            ))
-        })
-}
-
-/// Normalize nullable optional fields from OpenAI-compatible wire format to canonical.
-///
-/// For each property in the tool's schema that allows null, if the value is null,
-/// remove the field entirely so the canonical executor sees "field not provided".
-fn normalize_nullable_arguments(canonical_name: &str, arguments: &Value) -> Result<Value> {
-    let Some(definition) = NativeToolRegistry::get(canonical_name) else {
-        return Ok(arguments.clone());
-    };
-    let Some(schema) = definition.parameters.as_object() else {
-        return Ok(arguments.clone());
-    };
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-        return Ok(arguments.clone());
-    };
-    let Some(args_object) = arguments.as_object() else {
-        return Ok(arguments.clone());
-    };
-    let mut normalized = serde_json::Map::new();
-    for (key, value) in args_object {
-        if value.is_null() {
-            // Check if this property allows null in the schema
-            if let Some(prop_schema) = properties.get(key) {
-                if let Some(type_value) = prop_schema.get("type") {
-                    let allows_null = match type_value {
-                        Value::String(s) => s == "null",
-                        Value::Array(arr) => arr.iter().any(|v| v == "null"),
-                        _ => false,
-                    };
-                    if allows_null {
-                        // Skip null fields - canonical executor treats as "not provided"
-                        continue;
-                    }
-                }
-            }
-        }
-        normalized.insert(key.clone(), value.clone());
-    }
-    Ok(Value::Object(normalized))
 }
 
 impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
@@ -384,6 +331,7 @@ impl<'a, P: OpenAiCompatibleProvider> ProviderToolLoop<'a, P> {
     /// executed in provider order, preserving ids and order in the next
     /// request. Each tool call gets its own canonical Call.
     pub fn run(&mut self, mut request: Value) -> Result<ProviderFinalResponse> {
+        let projection = OpenAiToolProjection::from_registry()?;
         for round in 0..MAX_PROVIDER_ROUNDS {
             if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(OcgError::config("provider tool loop cancelled"));
@@ -403,20 +351,21 @@ impl<'a, P: OpenAiCompatibleProvider> ProviderToolLoop<'a, P> {
                 .ok_or_else(|| OcgError::config("provider request messages are missing"))?
                 .push(provider_round.assistant.clone());
             for call in calls {
-                let canonical_name = wire_name_to_canonical(&call.name)?;
+                let tool = projection.resolve(&call.name)?;
+                let canonical_name = tool.canonical_name().to_string();
                 let permission = tool_permission_for(&canonical_name).ok_or_else(|| {
                     OcgError::config(format!(
                         "provider requested unknown native tool '{}'",
                         call.name
                     ))
                 })?;
-                let raw_arguments: Value = serde_json::from_str(&call.arguments).map_err(|error| {
+                let wire_arguments: Value = serde_json::from_str(&call.arguments).map_err(|error| {
                     OcgError::config(format!(
                         "tool call '{}' has invalid arguments: {error}",
                         call.name
                     ))
                 })?;
-                let arguments = normalize_nullable_arguments(&canonical_name, &raw_arguments)?;
+                let arguments = tool.canonical_arguments(&wire_arguments);
                 let result = execute_canonical_tool_call(
                     self.domain,
                     &self.authority,
