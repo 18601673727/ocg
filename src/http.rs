@@ -329,6 +329,7 @@ pub trait HttpTransport: Send + Sync {
         let _ = (url, headers, body);
         Err(OcgError::config("native HTTP transport does not support JSON POST"))
     }
+
 }
 
 /// The production transport uses OCG's ntex HTTP stack on the native ntex runtime.
@@ -472,6 +473,63 @@ async fn native_post_json(
             "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
         )));
     }
+    Ok(HttpResponse {
+        status,
+        rate_limit: RateLimit::default(),
+        body: response_body.to_vec(),
+    })
+}
+
+async fn native_post_json_streaming<F>(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    mut callback: F,
+) -> Result<HttpResponse>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "request to {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    let client = ntex::client::ClientBuilder::new()
+        .response_timeout(RESPONSE_HEAD_TIMEOUT)
+        .response_payload_limit(MAX_BODY_BYTES as usize)
+        .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
+        .build(ntex::SharedCfg::default())
+        .await
+        .map_err(|error| {
+            OcgError::config(format!("cannot build the native HTTP client: {error}"))
+        })?;
+    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .send_body(body.to_vec())
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    
+    // Read the response body using load_body which returns the complete body
+    let response_body = response
+        .body()
+        .await
+        .map_err(|error| OcgError::config(format!("error reading response from {url}: {error}")))?;
+    
+    // Check size limit
+    if response_body.len() > MAX_BODY_BYTES as usize {
+        return Err(OcgError::config(format!(
+            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    
+    // For now, invoke callback with the complete body
+    // TODO: Implement true streaming when ntex provides a streaming API
+    callback(&response_body)?;
+    
     Ok(HttpResponse {
         status,
         rate_limit: RateLimit::default(),

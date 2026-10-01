@@ -181,15 +181,33 @@ pub struct CanonicalDashboardResponse {
 pub struct CanonicalControlService {
     root: PathBuf,
     runtime_handle: Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>,
+    profile_service: crate::profile::ProfileService,
 }
 
 impl CanonicalControlService {
     pub fn open(root: &Path) -> Result<Self> {
         let boundary = project::resolve(root);
         boundary.require(root)?;
+        
+        // Use user-global profile path
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        let profile_path = crate::config::user_config_path(
+            None,
+            std::env::var_os("OCG_USER_CONFIG")
+                .as_deref()
+                .map(Path::new),
+            std::env::var_os("XDG_CONFIG_HOME")
+                .as_deref()
+                .map(Path::new),
+            home.as_deref(),
+        );
+        
         Ok(Self {
             root: boundary.root().to_path_buf(),
             runtime_handle: None,
+            profile_service: crate::profile::ProfileService::with_workspace(&profile_path, root),
         })
     }
 
@@ -198,6 +216,14 @@ impl CanonicalControlService {
         handle: crate::orchestration::execution_runtime::ExecutionRuntimeHandle,
     ) -> Self {
         self.runtime_handle = Some(handle);
+        self
+    }
+    
+    pub fn with_profile_service(
+        mut self,
+        profile_service: crate::profile::ProfileService,
+    ) -> Self {
+        self.profile_service = profile_service;
         self
     }
 
@@ -701,7 +727,8 @@ impl CanonicalControlService {
             });
         }
 
-        // Verify project is registered with this control service
+        // Early validation: Verify project is registered with this control service
+        // This check does not record outcomes to avoid claiming command_id on invalid input
         let project = match self
             .read_projects()?
             .into_iter()
@@ -709,7 +736,7 @@ impl CanonicalControlService {
         {
             Some(p) => p,
             None => {
-                let response = crate::contracts::JobLaunchResponse {
+                return Ok(crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                     outcome: "rejected".to_string(),
                     command_id: request.command_id.clone(),
@@ -719,20 +746,11 @@ impl CanonicalControlService {
                     job_id: None,
                     message: format!("unknown project: {}", request.project_id),
                     duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    None,
-                    &response.message,
-                )?;
-                return Ok(response);
+                });
             }
         };
 
-        // Verify execution runtime is available
+        // Early validation: Verify execution runtime is available
         let runtime_handle = match &self.runtime_handle {
             Some(h) => h,
             None => {
@@ -819,10 +837,8 @@ impl CanonicalControlService {
             }
         };
 
-        // Resolve profile
-        let config_path = crate::orchestration::state::state_dir(&self.root).join("profiles.json");
-        let profile_service = crate::profile::ProfileService::new(&config_path);
-        let (profile, _) = match profile_service.current()? {
+        // Resolve profile from the user-global profile service
+        let (profile, _) = match self.profile_service.current()? {
             Some(p) => p,
             None => {
                 let response = crate::contracts::JobLaunchResponse {
@@ -898,7 +914,7 @@ impl CanonicalControlService {
         }
 
         // Validate endpoint
-        let _endpoint = match &provider_entry.endpoint {
+        let endpoint = match &provider_entry.endpoint {
             Some(e) if !e.is_empty() => e.clone(),
             _ => {
                 let response = crate::contracts::JobLaunchResponse {
@@ -1015,7 +1031,15 @@ impl CanonicalControlService {
         // Admit the provider call
         let authority = domain.authority(&attempt.id)?.ok_or_else(|| invalid("attempt authority disappeared"))?;
         
-        let call = match crate::provider_loop::admit_provider_call(
+        // Freeze provider execution configuration for this Call
+        let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
+            provider_key: provider_key.to_string(),
+            model: model.to_string(),
+            endpoint: endpoint.clone(),
+            credential_ref: credential_ref.to_string(),
+        };
+        
+        let _call = match crate::provider_loop::admit_provider_call(
             &mut domain,
             &authority,
             &executor.id,
@@ -1023,6 +1047,7 @@ impl CanonicalControlService {
             &budget_config,
             quota_facts,
             runtime_handle.provider_dispatcher(),
+            provider_config,
         ) {
             Ok(call) => call,
             Err(e) => {
@@ -1050,9 +1075,6 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
-
-        // Mark call as queued
-        domain.mark_dispatch_queued(&call.id)?;
 
         // Record successful launch
         let response = crate::contracts::JobLaunchResponse {

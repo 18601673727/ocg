@@ -16,6 +16,19 @@ pub struct ExecutionEnvelope {
     pub payload: String,
     pub dispatch_id: Option<String>,
     pub events: flume::Sender<ExecutionEvent>,
+    /// Frozen provider execution configuration for this Call.
+    /// Only populated for provider Calls; None for native tool Calls.
+    pub provider_config: Option<ProviderExecutionConfig>,
+}
+
+/// Frozen provider execution configuration associated with a specific Call.
+/// This is durably stored and never includes the raw credential/token.
+#[derive(Debug, Clone)]
+pub struct ProviderExecutionConfig {
+    pub provider_key: String,
+    pub model: String,
+    pub endpoint: String,
+    pub credential_ref: String,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +97,7 @@ pub fn admit_call_with_events(
         payload: request.to_string(),
         dispatch_id: None,
         events,
+        provider_config: None,
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,
@@ -119,6 +133,7 @@ pub fn queue_call(
         payload: request.to_string(),
         dispatch_id,
         events,
+        provider_config: None,
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,

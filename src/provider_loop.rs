@@ -27,6 +27,21 @@ use std::sync::Arc;
 
 pub const MAX_PROVIDER_ROUNDS: usize = 32;
 
+/// Events emitted during provider streaming.
+#[derive(Debug, Clone)]
+pub enum ProviderStreamEvent {
+    /// Text delta from the assistant
+    TextDelta(String),
+    /// Reasoning content delta
+    ReasoningDelta(String),
+    /// A tool call has started (id and name known)
+    ToolCallStart { id: String, name: String, index: u32 },
+    /// Tool call arguments delta
+    ToolCallArgumentsDelta { id: String, arguments: String, index: u32 },
+    /// Finish reason received
+    FinishReason(ChatFinishReason),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderRound {
     pub assistant: Value,
@@ -69,11 +84,10 @@ impl<'a> NativeOpenAiCompatibleProvider<'a> {
 
 /// Configuration for the canonical provider handler. The handler owns the
 /// provider transport and project boundary, while each envelope supplies the
-/// Attempt/Call identity that must be revalidated before execution.
+/// Attempt/Call identity and frozen provider configuration that must be 
+/// revalidated before execution.
 pub struct ProviderHandlerConfig {
     pub transport: Arc<dyn HttpTransport>,
-    pub endpoint: String,
-    pub bearer: Option<String>,
     pub project_root: std::path::PathBuf,
     pub permission_policy: PermissionPolicy,
     pub cancelled: Arc<AtomicBool>,
@@ -168,11 +182,25 @@ impl CanonicalProviderCallHandler {
         };
         let executor = domain.executor(envelope.executor_id.as_deref().unwrap_or(""))?
             .ok_or_else(|| OcgError::config("provider Call executor not found"))?;
+        
+        // Resolve provider configuration from envelope
+        let provider_config = envelope.provider_config.as_ref().ok_or_else(|| {
+            fail_provider_envelope(&config.project_root, &envelope, "provider Call missing provider_config");
+            OcgError::config("provider Call missing provider_config")
+        })?;
+        
+        // Resolve credential from Vault at execution time
+        let vault = crate::vault::Vault::new(&config.project_root);
+        let bearer = vault.get(&provider_config.credential_ref)?.ok_or_else(|| {
+            fail_provider_envelope(&config.project_root, &envelope, "credential not found in Vault");
+            OcgError::config(format!("credential not found: {}", provider_config.credential_ref))
+        })?;
+        
         drop(domain);
         let provider = NativeOpenAiCompatibleProvider::new(
             config.transport.as_ref(),
-            config.endpoint.clone(),
-            config.bearer.clone(),
+            provider_config.endpoint.clone(),
+            Some(bearer),
         );
         let response = execute_provider_loop(
             &provider,
@@ -217,6 +245,7 @@ pub fn admit_provider_call(
     config: &BudgetConfig,
     quota: QuotaFacts,
     dispatcher: &BoundedDispatcher,
+    provider_config: crate::orchestration::execution_dispatch::ProviderExecutionConfig,
 ) -> Result<crate::orchestration::domain::Call> {
     let payload = json!({
         "executor_transport": "provider",
@@ -230,6 +259,15 @@ pub fn admit_provider_call(
         authority.generation,
         EffectIntentKind::StrictFenced,
         &payload.to_string(),
+    )?;
+
+    // Freeze provider execution configuration for this Call
+    domain.set_provider_config(
+        &call.id,
+        &provider_config.provider_key,
+        &provider_config.model,
+        &provider_config.endpoint,
+        &provider_config.credential_ref,
     )?;
 
     // Resolve canonical Project identity from Job ownership
@@ -269,6 +307,7 @@ pub fn admit_provider_call(
         payload: payload.to_string(),
         dispatch_id: None,
         events,
+        provider_config: Some(provider_config),
     }) {
         // Queue handoff failed after successful economic admission.
         // The provider request never left OCG, so release the reservation
@@ -313,6 +352,22 @@ pub fn requeue_recovered_provider_call(
         })?;
 
     // Requeue using existing Call identity
+    let provider_config = if let (Some(pk), Some(m), Some(ep), Some(cr)) = (
+        intent.provider_key.as_ref(),
+        intent.model.as_ref(),
+        intent.endpoint.as_ref(),
+        intent.credential_ref.as_ref(),
+    ) {
+        Some(crate::orchestration::execution_dispatch::ProviderExecutionConfig {
+            provider_key: pk.clone(),
+            model: m.clone(),
+            endpoint: ep.clone(),
+            credential_ref: cr.clone(),
+        })
+    } else {
+        None
+    };
+    
     let (events, _receiver) = flume::unbounded();
     dispatcher.send(ExecutionEnvelope {
         call_id: intent.call_id.clone(),
@@ -323,63 +378,10 @@ pub fn requeue_recovered_provider_call(
         payload: intent.request.clone(),
         dispatch_id: None,
         events,
+        provider_config,
     })?;
 
     Ok(())
-}
-
-/// Start the complete execution runtime with provider and native tool dispatchers.
-/// This creates two bounded dispatchers under the same execution authority,
-/// starts both consumers, and handles recovery.
-pub fn run_execution_runtime(
-    project_root: &Path,
-    provider_capacity: usize,
-    native_tool_capacity: usize,
-    transport: Arc<dyn HttpTransport>,
-    endpoint: String,
-    bearer: Option<String>,
-    permission_policy: PermissionPolicy,
-    cancelled: Arc<AtomicBool>,
-) -> Result<()> {
-    let provider_dispatcher = BoundedDispatcher::new(provider_capacity)?;
-    let native_tool_dispatcher = BoundedDispatcher::new(native_tool_capacity)?;
-
-    let provider_config = ProviderHandlerConfig {
-        transport,
-        endpoint,
-        bearer,
-        project_root: project_root.to_path_buf(),
-        permission_policy,
-        cancelled: cancelled.clone(),
-        native_tool_dispatcher: native_tool_dispatcher.clone(),
-    };
-
-    let native_tool_handler = crate::native_tools::NativeToolCallHandler::new(
-        project_root.to_path_buf(),
-        permission_policy,
-        cancelled,
-    );
-
-    // Start native tool consumer in separate thread
-    let native_tool_dispatcher_clone = native_tool_dispatcher.clone();
-    let native_tool_thread = std::thread::spawn(move || {
-        run_native_tool_worker(&native_tool_dispatcher_clone, &native_tool_handler)
-    });
-
-    // Run provider dispatcher in main thread (with recovery)
-    let result = run_provider_dispatcher(project_root, &provider_dispatcher, provider_config);
-
-    // Shutdown dispatcher to unblock native tool consumer
-    provider_dispatcher.shutdown();
-    native_tool_dispatcher.shutdown();
-
-    // Wait for native tool thread and propagate any panic
-    let native_result = native_tool_thread.join();
-    if let Err(panic) = native_result {
-        std::panic::resume_unwind(panic);
-    }
-
-    result
 }
 
 /// Run provider envelopes through the bounded execution worker. This
@@ -482,7 +484,8 @@ pub fn run_provider_worker(dispatcher: &BoundedDispatcher, handler: &CanonicalPr
     }
 }
 
-/// Execute one provider envelope synchronously by blocking on the ntex runtime.
+/// Execute one provider envelope synchronously by creating a runtime per request.
+/// This matches the pattern used in http.rs for native HTTP transport.
 fn execute_provider_envelope_sync(handler: &CanonicalProviderCallHandler, envelope: ExecutionEnvelope) -> Result<()> {
     let handler = handler.clone();
     let runtime = ntex::rt::System::new("ocg-provider", ntex::rt::DefaultRuntime);
@@ -536,6 +539,7 @@ fn execute_provider_loop(
         .as_object_mut()
         .ok_or_else(|| OcgError::config("provider request must be an object"))?;
     object.insert("tools".to_string(), Value::Array(projection.tools()));
+    
     for round in 0..MAX_PROVIDER_ROUNDS {
         if cancelled.load(Ordering::SeqCst) {
             return Err(OcgError::config("provider loop cancelled"));
@@ -545,7 +549,9 @@ fn execute_provider_loop(
                 request.as_object_mut().and_then(|obj| obj.remove("tools"));
             }
         }
+        
         let round_response = provider.complete(request)?;
+        
         if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
             || round_response.summary.tool_calls.is_empty()
         {
@@ -783,6 +789,142 @@ fn decode_provider_response(body: &[u8]) -> Result<ProviderRound> {
         message
     };
     Ok(ProviderRound { assistant, summary })
+}
+
+/// Stateful SSE chunk parser that handles cross-chunk boundaries.
+struct SseChunkParser {
+    buffer: String,
+}
+
+impl SseChunkParser {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+        }
+    }
+
+    /// Parse a chunk and invoke callback for each complete SSE event.
+    /// Handles partial UTF-8, partial SSE lines, and partial JSON.
+    fn parse_chunk<F>(&mut self, chunk: &[u8], callback: &mut F) -> Result<()>
+    where
+        F: FnMut(ProviderStreamEvent) -> Result<()>,
+    {
+        // Append chunk to buffer (may contain partial UTF-8)
+        match std::str::from_utf8(chunk) {
+            Ok(text) => self.buffer.push_str(text),
+            Err(error) => {
+                // Partial UTF-8 at end of chunk - buffer it
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    self.buffer.push_str(&String::from_utf8_lossy(&chunk[..valid_up_to]));
+                }
+                // The rest will be completed in the next chunk
+                return Ok(());
+            }
+        }
+
+        // Process complete lines
+        while let Some(newline_pos) = self.buffer.find('\n') {
+            let line = self.buffer[..newline_pos].trim_end_matches('\r').to_string();
+            self.buffer.drain(..=newline_pos);
+
+            if let Some(data) = line.strip_prefix("data:") {
+                let payload = data.trim();
+                if payload == "[DONE]" || payload.is_empty() {
+                    continue;
+                }
+
+                // Parse JSON and emit events
+                match serde_json::from_str::<Value>(payload) {
+                    Ok(value) => {
+                        self.parse_sse_event(&value, callback)?;
+                    }
+                    Err(_) => {
+                        // Incomplete JSON - put the line back and wait for more data
+                        self.buffer.insert_str(0, &format!("{}\n", line));
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_sse_event<F>(&self, value: &Value, callback: &mut F) -> Result<()>
+    where
+        F: FnMut(ProviderStreamEvent) -> Result<()>,
+    {
+        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+            if let Some(first) = choices.first() {
+                if let Some(delta) = first.get("delta") {
+                    // Text content delta
+                    if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                        if !content.is_empty() {
+                            callback(ProviderStreamEvent::TextDelta(content.to_string()))?;
+                        }
+                    }
+
+                    // Reasoning content delta
+                    if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                        if !reasoning.is_empty() {
+                            callback(ProviderStreamEvent::ReasoningDelta(reasoning.to_string()))?;
+                        }
+                    }
+
+                    // Tool calls
+                    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                        for call in tool_calls {
+                            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+
+                            if let Some(function) = call.get("function") {
+                                // Tool call start (id and name present)
+                                if let (Some(id), Some(name)) = (
+                                    call.get("id").and_then(Value::as_str),
+                                    function.get("name").and_then(Value::as_str),
+                                ) {
+                                    callback(ProviderStreamEvent::ToolCallStart {
+                                        id: id.to_string(),
+                                        name: name.to_string(),
+                                        index,
+                                    })?;
+                                }
+
+                                // Tool call arguments delta
+                                if let (Some(id), Some(arguments)) = (
+                                    call.get("id").and_then(Value::as_str),
+                                    function.get("arguments").and_then(Value::as_str),
+                                ) {
+                                    if !arguments.is_empty() {
+                                        callback(ProviderStreamEvent::ToolCallArgumentsDelta {
+                                            id: id.to_string(),
+                                            arguments: arguments.to_string(),
+                                            index,
+                                        })?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Finish reason
+                if let Some(finish_reason) = first.get("finish_reason").and_then(Value::as_str) {
+                    let reason = match finish_reason {
+                        "stop" => ChatFinishReason::Stop,
+                        "length" => ChatFinishReason::Length,
+                        "tool_calls" => ChatFinishReason::ToolCalls,
+                        "content_filter" => ChatFinishReason::ContentFilter,
+                        "error" => ChatFinishReason::Error,
+                        _ => ChatFinishReason::Other,
+                    };
+                    callback(ProviderStreamEvent::FinishReason(reason))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
