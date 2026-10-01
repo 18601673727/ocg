@@ -29,8 +29,6 @@ pub struct TokenTotals {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_reported: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub opencode_reported: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated: Option<u64>,
     /// Events whose count was explicitly unknown.
     pub unknown_events: usize,
@@ -43,12 +41,6 @@ impl TokenTotals {
                 if let Some(total) = count.total {
                     let sum = self.provider_reported.unwrap_or(0).saturating_add(total);
                     self.provider_reported = Some(sum);
-                }
-            }
-            TokenSource::OpencodeReported => {
-                if let Some(total) = count.total {
-                    let sum = self.opencode_reported.unwrap_or(0).saturating_add(total);
-                    self.opencode_reported = Some(sum);
                 }
             }
             TokenSource::Estimated => {
@@ -64,7 +56,6 @@ impl TokenTotals {
     /// Whether any count at all was recorded.
     pub fn has_any(&self) -> bool {
         self.provider_reported.is_some()
-            || self.opencode_reported.is_some()
             || self.estimated.is_some()
             || self.unknown_events > 0
     }
@@ -644,13 +635,6 @@ fn render_tokens(label: &str, totals: &TokenTotals) -> String {
     out.push_str(&format!(
         "    provider_reported: {}\n",
         match totals.provider_reported {
-            Some(total) => format!("{total} (exact)"),
-            None => "- (unavailable)".to_string(),
-        }
-    ));
-    out.push_str(&format!(
-        "    opencode_reported: {}\n",
-        match totals.opencode_reported {
             Some(total) => format!("{total} (exact)"),
             None => "- (unavailable)".to_string(),
         }

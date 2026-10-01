@@ -1075,7 +1075,7 @@ pub fn settlement_id(
         "ocg-settlement-v1|{reservation_id}|{attempt_id}|{generation}|{}|{reason_code}",
         disposition.as_str()
     );
-    let digest = crate::runtime::hash::sha256_hex(key.as_bytes());
+    let digest = crate::hash::sha256_hex(key.as_bytes());
     format!("stl-{}", digest.get(..16).unwrap_or(&digest))
 }
 
@@ -1112,7 +1112,7 @@ pub fn settlement_payload_digest(settlement: &Settlement) -> String {
     }
     let canonical =
         serde_json_canonicalizer::to_vec(&value).unwrap_or_else(|_| value.to_string().into_bytes());
-    crate::runtime::hash::sha256_hex(canonical.as_slice())
+    crate::hash::sha256_hex(canonical.as_slice())
 }
 
 /// The durable id of the record that retains one *rejected* settlement payload.
@@ -1123,7 +1123,7 @@ pub fn settlement_payload_digest(settlement: &Settlement) -> String {
 /// duplicate of the record that already retained it.
 pub fn conflict_settlement_id(settlement_id: &str, payload_digest: &str) -> String {
     let key = format!("ocg-settlement-conflict-v1|{settlement_id}|{payload_digest}");
-    let digest = crate::runtime::hash::sha256_hex(key.as_bytes());
+    let digest = crate::hash::sha256_hex(key.as_bytes());
     format!("stlc-{}", digest.get(..16).unwrap_or(&digest))
 }
 
@@ -1691,7 +1691,7 @@ pub fn reservation_id(
         "ocg-reservation-v1|{project_id}|{generation}|{}|{operation_id}",
         action.as_str()
     );
-    let digest = crate::runtime::hash::sha256_hex(key.as_bytes());
+    let digest = crate::hash::sha256_hex(key.as_bytes());
     format!("rsv-{}", digest.get(..16).unwrap_or(&digest))
 }
 
@@ -2003,7 +2003,7 @@ impl BudgetConfig {
     /// A stable fingerprint of the budget configuration.
     pub fn fingerprint(&self) -> String {
         let value = serde_json::to_value(self).unwrap_or(Value::Null);
-        crate::runtime::hash::sha256_hex(value.to_string().as_bytes())
+        crate::hash::sha256_hex(value.to_string().as_bytes())
     }
 
     /// A stable fingerprint of the pricing table alone: the revision a frozen
@@ -2014,7 +2014,7 @@ impl BudgetConfig {
         let value = serde_json::to_value(&self.pricing).unwrap_or(Value::Null);
         let canonical = serde_json_canonicalizer::to_vec(&value)
             .unwrap_or_else(|_| value.to_string().into_bytes());
-        crate::runtime::hash::sha256_hex(canonical.as_slice())
+        crate::hash::sha256_hex(canonical.as_slice())
     }
 }
 

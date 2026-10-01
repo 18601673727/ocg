@@ -57,7 +57,7 @@ impl CacheKey {
         let value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         format!(
             "{}.json",
-            crate::runtime::hash::sha256_hex(value.to_string().as_bytes())
+            crate::hash::sha256_hex(value.to_string().as_bytes())
         )
     }
 }
@@ -167,7 +167,7 @@ impl ContextCache {
             return Ok(false);
         }
         // Keep `.ocg/` out of the project's VCS, exactly once.
-        crate::runtime::install::ensure_gitignore(&self.root)?;
+        crate::install::ensure_gitignore(&self.root)?;
         let entry = CacheEntry {
             schema_version: SCHEMA_VERSION,
             engine_version: ENGINE_VERSION.to_string(),
@@ -179,7 +179,7 @@ impl ContextCache {
         let value = serde_json::to_value(&entry).map_err(|error| {
             OcgError::config(format!("cannot serialize the context cache entry: {error}"))
         })?;
-        crate::runtime::install::write_json_atomic(&self.dir.join(key.file_name()), &value)?;
+        crate::install::write_json_atomic(&self.dir.join(key.file_name()), &value)?;
         Ok(true)
     }
 

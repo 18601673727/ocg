@@ -11,8 +11,10 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { ProjectId, ProjectSummary } from "./domain";
-import { DEFAULT_PROJECT_ID, PROJECTS, isProjectId, resolveProjectId, selectProject } from "./domain";
+import { DEFAULT_PROJECT_ID, isProjectId, resolveProjectId, selectProject } from "./domain";
 import { projectSessionIds } from "./fixtures";
+import { createHttpCanonicalControlClient } from "../runtime/canonical-client";
+import { useOcgControlUrl } from "../profile/control-url";
 
 export const ACTIVE_PROJECT_STORAGE_KEY = "ocg.project.active.v1";
 
@@ -35,6 +37,12 @@ function writeStoredProjectId(id: ProjectId): void {
   }
 }
 
+function projectName(root: string, projectId: string): string {
+  const normalized = root.replace(/[\\/]+$/, "");
+  const name = normalized.split(/[\\/]/).pop();
+  return name || projectId;
+}
+
 export type ProjectContextValue = {
   activeProjectId: ProjectId;
   activeProject: ProjectSummary;
@@ -42,7 +50,7 @@ export type ProjectContextValue = {
   setActiveProject: (id: ProjectId) => void;
   /** Register a newly created session with a project (defaults to the active one). */
   registerProjectSession: (sessionId: string, projectId?: ProjectId) => void;
-  /** Fixture session IDs for the active project plus registered sessions. */
+  /** Mock session IDs for the active project plus registered sessions. */
   activeProjectSessionIds: readonly string[];
 };
 
@@ -61,6 +69,24 @@ export function ProjectProvider({
   const [registeredSessionIds, setRegisteredSessionIds] = useState<
     Partial<Record<string, readonly string[]>>
   >({});
+  const [projects, setProjects] = useState<readonly ProjectSummary[]>([]);
+  const controlUrl = useOcgControlUrl();
+
+  useEffect(() => {
+    if (!controlUrl) return;
+    let cancelled = false;
+    const client = createHttpCanonicalControlClient({ baseUrl: controlUrl, fetch });
+    void client.listProjects().then((records) => {
+      if (cancelled) return;
+      setProjects(records.map((record) => ({
+        id: record.project_id,
+        name: projectName(record.root, record.project_id),
+      })));
+    }).catch(() => {
+      if (!cancelled) setProjects([]);
+    });
+    return () => { cancelled = true; };
+  }, [controlUrl]);
 
   useEffect(() => {
     if (initialProjectId === undefined) return;
@@ -68,45 +94,50 @@ export function ProjectProvider({
     writeStoredProjectId(resolved);
   }, [initialProjectId]);
 
+  const selectedProjectId = projects.length > 0 && !projects.some((project) => project.id === activeProjectId)
+    ? projects[0]!.id
+    : activeProjectId;
+
   const setActiveProject = useCallback((id: ProjectId) => {
     const resolved = resolveProjectId(id);
+    if (projects.length > 0 && !projects.some((project) => project.id === resolved)) return;
     setActiveProjectIdState(resolved);
     writeStoredProjectId(resolved);
-  }, []);
+  }, [projects]);
 
   const registerProjectSession = useCallback(
     (sessionId: string, projectId?: ProjectId) => {
       if (!sessionId) return;
-      const target = resolveProjectId(projectId ?? activeProjectId);
+      const target = resolveProjectId(projectId ?? selectedProjectId);
       setRegisteredSessionIds((current) => {
         const existing = current[target] ?? [];
         if (existing.includes(sessionId)) return current;
         return { ...current, [target]: [...existing, sessionId] };
       });
     },
-    [activeProjectId],
+    [selectedProjectId],
   );
 
   const activeProjectSessionIds = useMemo(
     () => [
       ...new Set([
-        ...projectSessionIds(activeProjectId),
-        ...(registeredSessionIds[activeProjectId] ?? []),
+        ...projectSessionIds(selectedProjectId),
+        ...(registeredSessionIds[selectedProjectId] ?? []),
       ]),
     ],
-    [activeProjectId, registeredSessionIds],
+    [registeredSessionIds, selectedProjectId],
   );
 
   const value = useMemo<ProjectContextValue>(
     () => ({
-      activeProjectId,
-      activeProject: selectProject(activeProjectId),
-      projects: PROJECTS,
+      activeProjectId: selectedProjectId,
+      activeProject: selectProject(selectedProjectId, projects),
+      projects,
       setActiveProject,
       registerProjectSession,
       activeProjectSessionIds,
     }),
-    [activeProjectId, activeProjectSessionIds, registerProjectSession, setActiveProject],
+    [activeProjectSessionIds, projects, registerProjectSession, selectedProjectId, setActiveProject],
   );
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;

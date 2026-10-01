@@ -1,10 +1,6 @@
 //! Platform normalization.
 //!
-//! OCG only supports the standalone OpenCode release platforms:
-//! Linux and macOS on x86_64 and arm64. Everything that asks "what is this
-//! machine?" goes through [`Platform`], which keeps the mapping between the
-//! canonical platform, the OpenCode release archive and the OCG release
-//! artifact in one place.
+//! OCG release platform normalization for Linux and macOS on x86_64 and arm64.
 
 use crate::error::{OcgError, Result};
 
@@ -115,16 +111,6 @@ impl Platform {
     /// Stable machine-readable slug, e.g. `linux-x86_64`.
     pub fn slug(&self) -> String {
         format!("{}-{}", self.os_name(), self.arch_name())
-    }
-
-    /// The standalone OpenCode release asset for this platform.
-    pub fn opencode_asset(&self) -> &'static str {
-        match (self.os, self.arch) {
-            (Os::Linux, Arch::X86_64) => "opencode-linux-x64.tar.gz",
-            (Os::Linux, Arch::Arm64) => "opencode-linux-arm64.tar.gz",
-            (Os::Darwin, Arch::X86_64) => "opencode-darwin-x64.zip",
-            (Os::Darwin, Arch::Arm64) => "opencode-darwin-arm64.zip",
-        }
     }
 
     /// The OCG release artifact for this platform.

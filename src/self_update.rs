@@ -9,10 +9,8 @@ use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
 use crate::platform::Platform;
 use crate::process::ProcessHost;
-use crate::runtime::archive::make_executable;
-use crate::runtime::hash::{checksum_for, verify_sha256};
-use crate::runtime::release::{fetch_latest_release, parse_version_output, Release};
 use semver::Version;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -56,7 +54,7 @@ pub fn self_update(
     let bytes = http
         .get(&binary.url)
         .map_err(|error| OcgError::config(format!("cannot download {}: {error}", binary.name)))?;
-    verify_sha256(&bytes, &expected, &binary.name)?;
+    crate::hash::verify_sha256(&bytes, &expected, &binary.name)?;
 
     replace_executable(current_exe, &bytes, &release.version, process)?;
 
@@ -69,22 +67,22 @@ pub fn self_update(
 }
 
 fn expected_asset<'a>(
-    release: &'a Release,
+    release: &'a crate::release::Release,
     name: &str,
-) -> Result<&'a crate::runtime::release::ReleaseAsset> {
+) -> Result<&'a crate::release::ReleaseAsset> {
     release
         .asset(name)
         .ok_or_else(|| OcgError::config(format!("release {} has no asset '{name}'", release.tag)))
 }
 
-fn expected_checksum(http: &dyn HttpTransport, release: &Release, name: &str) -> Result<String> {
+fn expected_checksum(http: &dyn HttpTransport, release: &crate::release::Release, name: &str) -> Result<String> {
     let sums = release.asset("SHA256SUMS").ok_or_else(|| {
         OcgError::config(format!("release {} has no SHA256SUMS asset", release.tag))
     })?;
     let text = http
         .get_text(&sums.url)
         .map_err(|error| OcgError::config(format!("cannot download SHA256SUMS: {error}")))?;
-    checksum_for(&text, name)
+    crate::hash::checksum_for(&text, name)
         .ok_or_else(|| OcgError::config(format!("SHA256SUMS has no entry for {name}")))
 }
 
@@ -133,4 +131,47 @@ fn replace_executable(
         .persist(current_exe)
         .map_err(|error| OcgError::write(current_exe, error.error))?;
     Ok(())
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::metadata(path).map_err(|error| OcgError::read(path, error))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).map_err(|error| OcgError::write(path, error))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn parse_version_output(output: &str) -> Option<Version> {
+    for token in output.split_whitespace() {
+        let token = token
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-' && c != '+');
+        if let Some(version) = parse_exact_version(token) {
+            return Some(version);
+        }
+    }
+    None
+}
+
+fn parse_exact_version(raw: &str) -> Option<Version> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    Version::parse(trimmed).ok()
+}
+
+fn fetch_latest_release(
+    http: &dyn HttpTransport,
+    api_base: &str,
+    repo: &str,
+) -> Result<crate::release::Release> {
+    let url = crate::release::latest_release_url(api_base, repo);
+    let text = http.get_text(&url)?;
+    crate::release::parse_release(&text)
 }

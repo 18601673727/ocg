@@ -217,11 +217,11 @@ pub fn load(root: &Path) -> Option<ContextIndex> {
 /// Persist the index atomically, keeping `.ocg/` out of the project
 /// VCS with the same idempotent helper the runtime uses.
 pub fn save(root: &Path, index: &ContextIndex) -> Result<()> {
-    crate::runtime::install::ensure_gitignore(root)?;
+    crate::install::ensure_gitignore(root)?;
     let value = serde_json::to_value(index).map_err(|error| {
         OcgError::config(format!("cannot serialize the context index: {error}"))
     })?;
-    crate::runtime::install::write_json_atomic(&index_path(root), &value)
+    crate::install::write_json_atomic(&index_path(root), &value)
 }
 
 /// Compute a fresh index incrementally from `previous`.
@@ -302,7 +302,7 @@ pub fn update(
         } else {
             match fs::read(root.join(&entry.path)) {
                 Ok(bytes) => (
-                    format!("sha256:{}", crate::runtime::hash::sha256_hex(&bytes)),
+                    format!("sha256:{}", crate::hash::sha256_hex(&bytes)),
                     Some(bytes),
                 ),
                 Err(_) => ("unreadable".to_string(), None),
@@ -436,7 +436,7 @@ pub fn generation_id(
     }
     format!(
         "sha256:{}",
-        crate::runtime::hash::sha256_hex(material.as_bytes())
+        crate::hash::sha256_hex(material.as_bytes())
     )
 }
 
@@ -451,6 +451,6 @@ pub fn repo_id(root: &Path, git: &crate::context::gitdiff::GitState) -> String {
     }
     format!(
         "repo:{}",
-        crate::runtime::hash::sha256_hex(material.as_bytes())
+        crate::hash::sha256_hex(material.as_bytes())
     )
 }

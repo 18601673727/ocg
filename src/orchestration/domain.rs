@@ -499,7 +499,7 @@ pub struct DomainRepository {
 
 impl DomainRepository {
     pub fn open(root: &Path) -> Result<Self> {
-        crate::runtime::install::ensure_gitignore(root)?;
+        crate::install::ensure_gitignore(root)?;
         let path = crate::orchestration::state::state_dir(root).join("substrate.sqlite3");
         let parent = path
             .parent()

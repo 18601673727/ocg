@@ -4,15 +4,12 @@
  * A Project is the product-level grouping the operator switches between.
  * It is deliberately separate from the existing Home/session shell concepts.
  *
- * Project IDs are stable fixture-owned strings. Display names are labels
- * only and are never used to derive an ID.
+ * Project IDs are opaque backend-owned strings. Display names are labels only
+ * and are never used to derive an ID.
  */
 
-/** Opaque identity type; fixture IDs below are the currently known values. */
+/** Opaque identity type owned by the canonical backend. */
 export type ProjectId = string;
-
-export const PROJECT_IDS = ["zhuju", "route-lace", "ocg", "cecece"] as const;
-export type KnownProjectId = (typeof PROJECT_IDS)[number];
 
 export type ProjectSummary = {
   id: ProjectId;
@@ -22,32 +19,25 @@ export type ProjectSummary = {
 /** Project is the same product concept as ProjectSummary in this slice. */
 export type Project = ProjectSummary;
 
-/** Canonical project list. Names are stable display labels. */
-export const PROJECTS: readonly ProjectSummary[] = [
-  { id: "zhuju", name: "Zhuju" },
-  { id: "route-lace", name: "RouteLace" },
-  { id: "ocg", name: "OCG" },
-  { id: "cecece", name: "CECECE" },
-];
-
-export const DEFAULT_PROJECT_ID: KnownProjectId = "zhuju";
+/** Empty until the canonical backend supplies its first Project. */
+export const DEFAULT_PROJECT_ID: ProjectId = "";
 
 export function isProjectId(value: unknown): value is ProjectId {
-  return typeof value === "string" && PROJECT_IDS.includes(value as KnownProjectId);
+  return typeof value === "string" && value.length > 0;
 }
 
 /**
- * Unknown, missing, or malformed IDs fall back deterministically to Zhuju.
+ * Unknown, missing, or malformed IDs fall back deterministically to no project.
  * This is the single fallback used by both selectors and the context.
  */
-export function resolveProjectId(value: unknown): KnownProjectId {
-  return isProjectId(value) ? (value as KnownProjectId) : DEFAULT_PROJECT_ID;
+export function resolveProjectId(value: unknown): ProjectId {
+  return isProjectId(value) ? value : DEFAULT_PROJECT_ID;
 }
 
-/** Look up the canonical project for any value, falling back to Zhuju. */
-export function selectProject(value: unknown): ProjectSummary {
+/** Look up a canonical project, falling back to an explicit empty selection. */
+export function selectProject(value: unknown, projects: readonly ProjectSummary[] = []): ProjectSummary {
   const id = resolveProjectId(value);
-  return PROJECTS.find((project) => project.id === id) ?? PROJECTS[0]!;
+  return projects.find((project) => project.id === id) ?? { id, name: id || "No project" };
 }
 
 /**

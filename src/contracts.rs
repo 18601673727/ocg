@@ -50,7 +50,7 @@ pub use crate::orchestration::canonical_control::{
 /// the definition that actually confers authority.
 pub use crate::orchestration::domain::ExecutionWitness;
 pub use crate::profile::{
-    Candidate, Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION,
+    Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION,
 };
 
 /// The Profile control API version. Shared with the generated TypeScript, so a
@@ -116,23 +116,17 @@ pub struct ProfileView {
     #[ts(type = "ProfileApiVersion")]
     pub api_version: String,
     pub profile: Option<Profile>,
-    /// SHA-256 of the project YAML the response was derived from. A write must
-    /// present the same value; a mismatch is rejected instead of overwriting a
-    /// concurrent edit.
+    /// SHA-256 of the Profile document. A write must present the same value;
+    /// a mismatch is rejected instead of overwriting a concurrent edit.
     pub revision: Option<String>,
-    pub candidates: Vec<Candidate>,
 }
 
 /// The request bodies the PWA sends. Typed so a malformed body is a compile
 /// error in the client rather than a runtime surprise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ProfileBootstrapRequest {
-    /// `"new"` or `"import"`.
+    /// The explicit bootstrap action, currently `"new"`.
     pub choice: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub location: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

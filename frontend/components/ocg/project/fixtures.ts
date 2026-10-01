@@ -1,23 +1,16 @@
 /**
- * Deterministic Project fixtures.
+ * Deterministic session and ledger fixtures.
  *
- * Projects are a frontend-only grouping in this slice. The metadata below is
- * intentionally compact: it maps the existing session IDs and resource-ledger
- * Job IDs that already exist in the runtime fixtures to a project. No new
- * backend fields are implied.
+ * Canonical project identity comes from the backend. This file only maps the
+ * legacy mock runtime's session and ledger identifiers.
  */
 
 import {
-  PROJECTS,
-  type KnownProjectId,
   type ProjectId,
-  selectProject,
 } from "./domain";
 
-export { PROJECTS };
-
 export type ProjectFixture = {
-  id: KnownProjectId;
+  id: ProjectId;
   /** Existing runtime session IDs owned by this project. */
   sessionIds: readonly string[];
   /** Existing resource-ledger Job IDs owned by this project. */
@@ -25,12 +18,10 @@ export type ProjectFixture = {
 };
 
 /**
- * Stable mapping over existing fixture identifiers. Every project owns at
- * least one session so the shell always has an active session to fall back
- * to. Zhuju owns the spend/retry/runtime history; RouteLace owns the launch
- * approval and some history.
+ * Stable mapping over existing mock identifiers. These entries are not the
+ * canonical project registry and are used only by the mock runtime.
  */
-export const PROJECT_FIXTURES: Record<ProjectId, ProjectFixture> = {
+const PROJECT_FIXTURES: Record<ProjectId, ProjectFixture> = {
   zhuju: {
     id: "zhuju",
     sessionIds: ["design-pwa-shell", "coding-mission-runtime"],
@@ -53,9 +44,10 @@ export const PROJECT_FIXTURES: Record<ProjectId, ProjectFixture> = {
   },
 };
 
+export const FIXTURE_PROJECT_IDS = Object.keys(PROJECT_FIXTURES);
 
 export function projectFixture(id: ProjectId): ProjectFixture {
-  return PROJECT_FIXTURES[selectProject(id).id as KnownProjectId];
+  return PROJECT_FIXTURES[id] ?? { id, sessionIds: [], ledgerJobIds: [] };
 }
 
 export function projectSessionIds(id: ProjectId): readonly string[] {

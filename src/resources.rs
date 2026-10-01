@@ -12,7 +12,6 @@
 //! ```text
 //! JobId              durable work identity        (orchestration::domain)
 //! ResourceId         execution-capable resource   (this module)
-//! RuntimeExecutionId one concrete runtime         (runtime::lifecycle)
 //! ```
 //!
 //! Unknown is a first-class state. When OCG has no authoritative source for a
@@ -30,10 +29,7 @@
 
 use crate::error::{OcgError, Result};
 use crate::model;
-use crate::runtime::lifecycle::{
-    RuntimeAdapter, RuntimeCapabilities, RuntimeError, RuntimeErrorKind, RuntimeIdentity,
-    RuntimeModelMetadata, RuntimeProvenance,
-};
+use crate::observation::{ObservedModelMetadata, ObservationProvenance};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -57,7 +53,7 @@ pub const DEFAULT_STALE_AFTER_SECONDS: i64 = 3_600;
 /// Where a resource fact came from.
 ///
 /// This is the *source* dimension, distinct from the existing
-/// [`RuntimeProvenance`]/`TelemetryProvenance`, which describe how exact a token
+/// [`ObservationProvenance`]/`TelemetryProvenance`, which describe how exact a token
 /// measurement is. The two are not competing: a telemetry value converts into a
 /// source when it enters the registry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,12 +61,16 @@ pub const DEFAULT_STALE_AFTER_SECONDS: i64 = 3_600;
 pub enum ResourceProvenance {
     /// Declared by OCG configuration (shipped defaults, user or project layer).
     StaticConfig,
-    /// Reported by the runtime/provider catalogue as an authoritative fact.
+    /// Reported by the provider catalogue as an authoritative fact.
     ProviderReported,
-    /// Observed from a live runtime (inspection, activation, telemetry).
-    RuntimeObserved,
-    /// Declared by a runtime adapter (identity, capabilities).
-    RuntimeReported,
+    /// Observed from a live provider execution (inspection, activation, telemetry).
+    #[serde(
+        alias = "runtime_observed",
+        alias = "execution_observed",
+        alias = "runtime_reported",
+        alias = "execution_reported"
+    )]
+    Observed,
     /// A conservative projection of an observed value.
     Estimated,
     /// No source. Never carries a value.
@@ -83,8 +83,7 @@ impl ResourceProvenance {
         match self {
             Self::StaticConfig => "static_config",
             Self::ProviderReported => "provider_reported",
-            Self::RuntimeObserved => "runtime_observed",
-            Self::RuntimeReported => "runtime_reported",
+            Self::Observed => "observed",
             Self::Estimated => "estimated",
             Self::Unknown => "unknown",
         }
@@ -95,20 +94,19 @@ impl ResourceProvenance {
     pub fn rank(self) -> u8 {
         match self {
             Self::StaticConfig => 5,
-            Self::ProviderReported | Self::RuntimeObserved => 4,
-            Self::RuntimeReported => 3,
+            Self::ProviderReported | Self::Observed => 4,
             Self::Estimated => 2,
             Self::Unknown => 1,
         }
     }
 }
 
-impl From<RuntimeProvenance> for ResourceProvenance {
-    fn from(provenance: RuntimeProvenance) -> Self {
+impl From<ObservationProvenance> for ResourceProvenance {
+    fn from(provenance: ObservationProvenance) -> Self {
         match provenance {
-            RuntimeProvenance::Exact => Self::RuntimeObserved,
-            RuntimeProvenance::Estimated => Self::Estimated,
-            RuntimeProvenance::Unknown => Self::Unknown,
+            ObservationProvenance::Exact => Self::Observed,
+            ObservationProvenance::Estimated => Self::Estimated,
+            ObservationProvenance::Unknown => Self::Unknown,
         }
     }
 }
@@ -171,8 +169,8 @@ impl<T> Fact<T> {
 
 /// A deterministic, filesystem-safe resource identifier.
 ///
-/// It is derived from the known identity dimensions, never from a Job,
-/// execution or OpenCode session id, and never from a raw agent label.
+/// It is derived from the known identity dimensions, never from a Job or
+/// session id, and never from a raw agent label.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ResourceId(String);
@@ -180,7 +178,7 @@ pub struct ResourceId(String);
 impl ResourceId {
     /// Derive the stable id from the identity dimensions that are known.
     pub fn derive(identity: &ResourceIdentity) -> Self {
-        let digest = crate::runtime::hash::sha256_hex(identity.canonical_key().as_bytes());
+        let digest = crate::hash::sha256_hex(identity.canonical_key().as_bytes());
         Self(format!("res-{}", digest.get(..16).unwrap_or(&digest)))
     }
 
@@ -200,15 +198,11 @@ impl fmt::Display for ResourceId {
 /// `account_profile` and `protocol` are part of the model so that two accounts
 /// or protocols under the same provider/model can never be conflated, but no
 /// current OCG source populates them; they stay `None` (Unknown) rather than
-/// pretending multiple accounts are known. Raw OpenCode agent names are a
-/// descriptive *effective* fact and are never part of identity.
+/// pretending multiple accounts are known. Raw agent names are a descriptive
+/// *effective* fact and are never part of identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ResourceIdentity {
-    /// Runtime engine name (for example `opencode`).
-    pub runtime: Option<String>,
-    /// Runtime version family (for example `v2`). Never the process instance.
-    pub family: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     /// Non-secret account/profile label, when known. Currently always Unknown.
@@ -227,44 +221,10 @@ impl ResourceIdentity {
         }
     }
 
-    /// A resource named only by the runtime engine/family (no model yet).
-    pub fn for_runtime(runtime: &RuntimeIdentity) -> Self {
-        Self {
-            runtime: Some(runtime.runtime.clone()),
-            family: Some(runtime.family.clone()),
-            ..Self::default()
-        }
-    }
-
-    pub fn with_runtime(mut self, runtime: &RuntimeIdentity) -> Self {
-        self.runtime = Some(runtime.runtime.clone());
-        self.family = Some(runtime.family.clone());
-        self
-    }
-
-    pub fn with_runtime_family(
-        mut self,
-        runtime: impl Into<String>,
-        family: impl Into<String>,
-    ) -> Self {
-        self.runtime = Some(runtime.into());
-        self.family = Some(family.into());
-        self
-    }
-
-    pub fn with_optional_runtime(self, runtime: Option<&RuntimeIdentity>) -> Self {
-        match runtime {
-            Some(runtime) => self.with_runtime(runtime),
-            None => self,
-        }
-    }
-
     /// The canonical, unknown-skipping key the id is derived from.
     pub fn canonical_key(&self) -> String {
         let mut parts = Vec::new();
         for (name, value) in [
-            ("runtime", &self.runtime),
-            ("family", &self.family),
             ("provider", &self.provider),
             ("model", &self.model),
             ("account", &self.account_profile),
@@ -288,13 +248,6 @@ impl ResourceIdentity {
     /// A short non-secret description for reports.
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
-        if let (Some(runtime), Some(family)) = (&self.runtime, &self.family) {
-            parts.push(format!("{runtime}/{family}"));
-        } else if let Some(runtime) = &self.runtime {
-            parts.push(runtime.clone());
-        } else if let Some(family) = &self.family {
-            parts.push(format!("family {family}"));
-        }
         match (&self.provider, &self.model) {
             (Some(provider), Some(model)) => parts.push(format!("{provider}/{model}")),
             (None, Some(model)) => parts.push(model.clone()),
@@ -313,57 +266,6 @@ impl ResourceIdentity {
     }
 }
 
-/// A serializable mirror of [`RuntimeCapabilities`] plus the recover fact.
-///
-/// Capabilities are facts about the adapter, never a placement decision.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CapabilityFacts {
-    pub resolve_execution: bool,
-    pub create_execution: bool,
-    pub recover_execution: bool,
-    pub inspect_execution: bool,
-    pub select_profile: bool,
-    pub observe_context: bool,
-    pub stage_continuation: bool,
-    pub resume_continuation: bool,
-}
-
-impl CapabilityFacts {
-    pub fn from_runtime(capabilities: RuntimeCapabilities) -> Self {
-        Self {
-            resolve_execution: capabilities.resolve_execution,
-            create_execution: capabilities.create_execution,
-            recover_execution: capabilities.recover_execution,
-            inspect_execution: capabilities.inspect_execution,
-            select_profile: capabilities.select_profile,
-            observe_context: capabilities.observe_context,
-            stage_continuation: capabilities.stage_continuation,
-            resume_continuation: capabilities.resume_continuation,
-        }
-    }
-
-    /// Every supported capability name, in a stable order.
-    pub fn listed(&self) -> Vec<&'static str> {
-        let mut names = Vec::new();
-        for (supported, name) in [
-            (self.resolve_execution, "resolve_execution"),
-            (self.create_execution, "create_execution"),
-            (self.recover_execution, "recover_execution"),
-            (self.inspect_execution, "inspect_execution"),
-            (self.select_profile, "select_profile"),
-            (self.observe_context, "observe_context"),
-            (self.stage_continuation, "stage_continuation"),
-            (self.resume_continuation, "resume_continuation"),
-        ] {
-            if supported {
-                names.push(name);
-            }
-        }
-        names
-    }
-}
-
 /// One configured use of a resource (a selected Lead or a routing role).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -375,14 +277,14 @@ pub struct ConfiguredResource {
     pub variant: Option<String>,
 }
 
-/// Whether the resolved runtime catalogue currently exposes the model.
+/// Whether the resolved provider catalogue currently exposes the model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogueEvidence {
     Available,
     MissingProvider,
     MissingModel,
-    /// A runtime was probed but no trustworthy catalogue was collected.
+    /// An execution was probed but no trustworthy catalogue was collected.
     Unverified,
     /// No catalogue probe was attempted.
     #[default]
@@ -401,7 +303,7 @@ impl CatalogueEvidence {
     }
 }
 
-/// What a live runtime session reported as effective.
+/// What a live execution reported as effective.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EffectiveFacts {
@@ -460,54 +362,11 @@ impl HealthFacts {
         Self {
             state: ResourceHealth::Available,
             reason: Some(reason.into()),
-            provenance: ResourceProvenance::RuntimeObserved,
+            provenance: ResourceProvenance::Observed,
             observed_at: Some(now),
         }
     }
 
-    /// Classify a runtime error without turning a transient failure into
-    /// permanent absence and without claiming success from an unknown state.
-    pub fn from_error(error: &RuntimeError, now: i64) -> Self {
-        let (state, reason) = match error.kind() {
-            RuntimeErrorKind::Unavailable => {
-                (ResourceHealth::Unavailable, "runtime is unavailable")
-            }
-            RuntimeErrorKind::Authentication => (
-                ResourceHealth::Unavailable,
-                "runtime rejected its credentials or configuration",
-            ),
-            RuntimeErrorKind::Transport => {
-                (ResourceHealth::Degraded, "transient transport failure")
-            }
-            RuntimeErrorKind::ProviderCompletion => {
-                (ResourceHealth::Degraded, "provider completion failed")
-            }
-            RuntimeErrorKind::InvalidResponse => (
-                ResourceHealth::Degraded,
-                "runtime returned an untrustworthy response",
-            ),
-            RuntimeErrorKind::ObservationFailed => {
-                (ResourceHealth::Degraded, "runtime observation failed")
-            }
-            RuntimeErrorKind::ProfileSelection => {
-                (ResourceHealth::Degraded, "profile selection failed")
-            }
-            RuntimeErrorKind::Unsupported => (
-                ResourceHealth::Degraded,
-                "capability unsupported by the runtime",
-            ),
-            RuntimeErrorKind::ExecutionMissing => (
-                ResourceHealth::Available,
-                "runtime is reachable but the execution is missing",
-            ),
-        };
-        Self {
-            state,
-            reason: Some(reason.to_string()),
-            provenance: ResourceProvenance::RuntimeObserved,
-            observed_at: Some(now),
-        }
-    }
 }
 
 /// A bounded quota window, when an authoritative source exists.
@@ -542,15 +401,12 @@ pub struct CostValue {
 pub struct ResourceObservation {
     pub resource_id: ResourceId,
     pub identity: ResourceIdentity,
-    /// Runtime engine/family, from the adapter (not part of identity metadata).
-    pub runtime: Fact<RuntimeIdentity>,
-    pub capabilities: Fact<CapabilityFacts>,
-    /// Catalogue evidence that the runtime currently exposes the model.
+    /// Catalogue evidence that the provider currently exposes the model.
     pub resolved: Fact<CatalogueEvidence>,
     /// What a live session reported (Effective).
     pub effective: Fact<EffectiveFacts>,
     pub health: HealthFacts,
-    /// A trustworthy context limit, when the runtime reported a real one.
+    /// A trustworthy context limit, when the provider reported a real one.
     pub context_limit: Fact<u64>,
     /// Execution slots. Always Unknown today; no fabricated capacity.
     pub capacity: Fact<u64>,
@@ -581,8 +437,6 @@ impl ResourceObservation {
         if self.identity.is_empty() {
             self.identity = incoming.identity;
         }
-        self.runtime.merge_preferred(incoming.runtime);
-        self.capabilities.merge_preferred(incoming.capabilities);
         self.resolved.merge_preferred(incoming.resolved);
         self.effective.merge_preferred(incoming.effective);
         self.context_limit.merge_preferred(incoming.context_limit);
@@ -618,10 +472,6 @@ pub struct ResourceRecord {
     pub identity: ResourceIdentity,
     /// Every configured use that resolves to this resource (Configured).
     pub configured: Vec<ConfiguredResource>,
-    /// Runtime engine/family (RuntimeReported).
-    pub runtime: Fact<RuntimeIdentity>,
-    /// Lifecycle capabilities (RuntimeReported).
-    pub capabilities: Fact<CapabilityFacts>,
     /// Catalogue evidence (Resolved).
     pub resolved: Fact<CatalogueEvidence>,
     /// Live session report (Effective).
@@ -639,8 +489,6 @@ impl ResourceRecord {
     /// The most recent dynamic observation time, if any.
     pub fn observed_at(&self) -> Option<i64> {
         [
-            self.runtime.observed_at,
-            self.capabilities.observed_at,
             self.resolved.observed_at,
             self.effective.observed_at,
             self.health.observed_at,
@@ -673,20 +521,17 @@ pub struct ConfiguredEntry {
 
 /// Derive the configured resources from the effective configuration.
 ///
-/// The selected Lead and every explicit routing role are derived. `runtime` should be
-/// the resolved runtime identity when known so configured and observed facts
-/// attach to the same resource; it is never invented.
+/// The selected Lead and every explicit routing role are derived from the
+/// configured provider/model identity.
 pub fn configured_entries(
     data: &Value,
-    runtime: Option<&RuntimeIdentity>,
 ) -> Result<Vec<ConfiguredEntry>> {
     let mut entries = Vec::new();
     let profile = crate::profile::Profile::from_ocg_config(data)?;
     if let Some(selected) = profile.default_model.as_deref() {
         if profile.select(Some(selected)).is_ok() {
             let contract = model::lead_contract(data, selected)?;
-            let identity = ResourceIdentity::for_model(&contract.provider_id, &contract.model_id)
-                .with_optional_runtime(runtime);
+            let identity = ResourceIdentity::for_model(&contract.provider_id, &contract.model_id);
             entries.push(ConfiguredEntry {
                 identity,
                 configured: ConfiguredResource {
@@ -709,8 +554,7 @@ pub fn configured_entries(
             ) else {
                 continue;
             };
-            let identity =
-                ResourceIdentity::for_model(provider, model_id).with_optional_runtime(runtime);
+            let identity = ResourceIdentity::for_model(provider, model_id);
             entries.push(ConfiguredEntry {
                 identity,
                 configured: ConfiguredResource {
@@ -790,37 +634,6 @@ impl ResourceRegistry {
         id
     }
 
-    /// Ingest an adapter's identity and lifecycle capabilities.
-    ///
-    /// This is the RuntimeLifecycleAdapter normalization seam: it consumes only
-    /// neutral lifecycle types, never an OpenCode transport or response object.
-    pub fn observe_adapter(&mut self, adapter: &dyn RuntimeAdapter, now: i64) -> ResourceId {
-        self.observe_runtime_capabilities(adapter.identity(), adapter.capabilities(), now)
-    }
-
-    /// Ingest a runtime identity and its lifecycle capabilities directly.
-    ///
-    /// Used where a trait object is not available but the runtime family and
-    /// its `lifecycle_capabilities()` are known.
-    pub fn observe_runtime_capabilities(
-        &mut self,
-        runtime: RuntimeIdentity,
-        capabilities: RuntimeCapabilities,
-        now: i64,
-    ) -> ResourceId {
-        let identity = ResourceIdentity::for_runtime(&runtime);
-        let mut observation = ResourceObservation::for_identity(&identity, now);
-        observation.runtime = Fact::known(runtime, ResourceProvenance::RuntimeReported, Some(now));
-        observation.capabilities = Fact::known(
-            CapabilityFacts::from_runtime(capabilities),
-            ResourceProvenance::RuntimeReported,
-            Some(now),
-        );
-        let id = observation.resource_id.clone();
-        self.merge_observation(observation, now);
-        id
-    }
-
     /// Record a factual health observation.
     ///
     /// The reason is redacted on ingestion so no credential-shaped text can
@@ -839,16 +652,6 @@ impl ResourceRegistry {
         let id = observation.resource_id.clone();
         self.merge_observation(observation, now);
         id
-    }
-
-    /// Record a runtime error's availability classification.
-    pub fn observe_error(
-        &mut self,
-        identity: &ResourceIdentity,
-        error: &RuntimeError,
-        now: i64,
-    ) -> ResourceId {
-        self.observe_health(identity, HealthFacts::from_error(error, now), now)
     }
 
     /// Record a successful observation.
@@ -870,7 +673,7 @@ impl ResourceRegistry {
     ) -> ResourceId {
         let mut observation = ResourceObservation::for_identity(identity, now);
         observation.effective =
-            Fact::known(effective, ResourceProvenance::RuntimeObserved, Some(now));
+            Fact::known(effective, ResourceProvenance::Observed, Some(now));
         let id = observation.resource_id.clone();
         self.merge_observation(observation, now);
         id
@@ -892,11 +695,11 @@ impl ResourceRegistry {
     }
 
     /// Record a trustworthy context limit and effective model identity from
-    /// runtime model metadata. Missing limits stay Unknown.
+    /// execution model metadata. Missing limits stay Unknown.
     pub fn observe_model_metadata(
         &mut self,
         identity: &ResourceIdentity,
-        metadata: &RuntimeModelMetadata,
+        metadata: &ObservedModelMetadata,
         now: i64,
     ) -> ResourceId {
         let mut observation = ResourceObservation::for_identity(identity, now);
@@ -906,7 +709,7 @@ impl ResourceRegistry {
             .filter(|limit| *limit > 0)
         {
             observation.context_limit =
-                Fact::known(limit, ResourceProvenance::RuntimeObserved, Some(now));
+                Fact::known(limit, ResourceProvenance::Observed, Some(now));
         }
         if metadata.provider_id.is_some() || metadata.model_id.is_some() {
             observation.effective = Fact::known(
@@ -916,7 +719,7 @@ impl ResourceRegistry {
                     model: metadata.model_id.clone(),
                     variant: None,
                 },
-                ResourceProvenance::RuntimeObserved,
+                ResourceProvenance::Observed,
                 Some(now),
             );
         }
@@ -985,8 +788,6 @@ impl ResourceRegistry {
             resource_id: observation.resource_id.clone(),
             identity: observation.identity.clone(),
             configured: self.configured.get(key).cloned().unwrap_or_default(),
-            runtime: observation.runtime.clone(),
-            capabilities: observation.capabilities.clone(),
             resolved: observation.resolved.clone(),
             effective: observation.effective.clone(),
             health: observation.health.clone(),
@@ -1198,7 +999,7 @@ pub(crate) fn validate_observation(
 
 /// Persist the registry atomically. Only dynamic observations are written.
 pub fn save(root: &Path, registry: &ResourceRegistry) -> Result<PathBuf> {
-    crate::runtime::install::ensure_gitignore(root)?;
+    crate::install::ensure_gitignore(root)?;
     let path = registry_path(root);
     let document = RegistryDocument {
         schema_version: RESOURCE_SCHEMA_VERSION,
@@ -1208,6 +1009,6 @@ pub fn save(root: &Path, registry: &ResourceRegistry) -> Result<PathBuf> {
     let value = serde_json::to_value(&document).map_err(|error| {
         OcgError::config(format!("cannot serialize resource registry: {error}"))
     })?;
-    crate::runtime::install::write_json_atomic(&path, &value)?;
+    crate::install::write_json_atomic(&path, &value)?;
     Ok(path)
 }

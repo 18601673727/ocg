@@ -47,6 +47,64 @@ import { workspaceViewHref, type WorkspaceView } from "./view-domain";
 
 export type { WorkspaceView } from "./view-domain";
 
+function EmptyProjectWorkspace({
+  activeProjectId,
+  activeProjectName,
+  projects,
+  onProjectChange,
+  onNewChat,
+}: {
+  activeProjectId: ProjectId;
+  activeProjectName: string;
+  projects: readonly { id: ProjectId; name: string }[];
+  onProjectChange: (id: ProjectId) => void;
+  onNewChat: () => void;
+}) {
+  return (
+    <main aria-label="Project workspace" className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-6">
+      <section className="w-full max-w-lg space-y-4 rounded-lg border border-border bg-background p-6">
+        <div>
+          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Canonical Project</p>
+          <h1 className="mt-1 text-lg font-semibold">{activeProjectName}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            This Project has no local chat session yet. Create one to start working in this Project.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onNewChat}
+          className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+        >
+          New chat
+        </button>
+        {projects.length > 1 ? (
+          <div className="border-t border-border pt-4">
+            <p className="mb-2 text-xs font-medium text-muted-foreground">Registered Projects</p>
+            <div className="flex flex-wrap gap-2">
+              {projects.map((project) => (
+                <button
+                  key={project.id}
+                  type="button"
+                  aria-pressed={project.id === activeProjectId}
+                  onClick={() => onProjectChange(project.id)}
+                  className={cn(
+                    "rounded-md border px-2.5 py-1.5 text-xs",
+                    project.id === activeProjectId
+                      ? "border-foreground/30 bg-muted font-medium"
+                      : "border-border text-muted-foreground hover:bg-muted/60",
+                  )}
+                >
+                  {project.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </section>
+    </main>
+  );
+}
+
 export function RuntimeWorkspace({
   view = "chat",
   controlCenterView = "profiles",
@@ -153,6 +211,12 @@ export function RuntimeWorkspace({
     setActiveSessionId(session.id);
     setMobileNavOpen(false);
   }, [activeWorkType, createSession, registerProjectSession]);
+
+  const handleNewProjectChat = useCallback(async () => {
+    const session = await createSession({ workType: "coding" });
+    registerProjectSession(session.id, activeProjectId);
+    setActiveSessionId(session.id);
+  }, [activeProjectId, createSession, registerProjectSession]);
 
   /**
    * The one navigation path for every workspace control in the shell. Where a
@@ -387,7 +451,19 @@ export function RuntimeWorkspace({
     }
   }, [activeSessionKey, cancel, router, runtimeSnapshot.sessions, setActiveProject]);
 
-  if (!activeSession) return null;
+  if (!activeSession) {
+    return (
+      <div className="flex h-dvh overflow-hidden bg-background text-foreground">
+        <EmptyProjectWorkspace
+          activeProjectId={activeProjectId}
+          activeProjectName={activeProject.name}
+          projects={projects}
+          onProjectChange={setActiveProject}
+          onNewChat={() => void handleNewProjectChat()}
+        />
+      </div>
+    );
+  }
 
   const messages = snapshot.messagesBySession[activeSession.id] ?? [];
   const execution = snapshot.executionBySession[activeSession.id] ?? null;

@@ -1,7 +1,7 @@
 //! Token counts and where they came from.
 //!
 //! OCG never invents a token number. A count is either reported by a
-//! provider, reported by OpenCode, explicitly estimated (for example bytes / 4)
+//! provider-reported, explicitly estimated (for example bytes / 4)
 //! or unknown. [`TokenSource`] is part of the persisted schema so a later budget
 //! or routing feature can tell a measured number from a guess, and the
 //! `ocg stats` renderer can label estimates as estimates.
@@ -14,8 +14,6 @@ use serde::{Deserialize, Serialize};
 pub enum TokenSource {
     /// A real number reported by the model provider.
     ProviderReported,
-    /// A real number reported by OpenCode's own session accounting.
-    OpencodeReported,
     /// A deterministic estimate (for example context bytes / 4).
     Estimated,
     /// No number is available. The count is explicit `null`, never zero.
@@ -27,7 +25,6 @@ impl TokenSource {
     pub fn label(self) -> &'static str {
         match self {
             TokenSource::ProviderReported => "provider_reported",
-            TokenSource::OpencodeReported => "opencode_reported",
             TokenSource::Estimated => "estimated",
             TokenSource::Unknown => "unknown",
         }
@@ -37,7 +34,7 @@ impl TokenSource {
     pub fn is_exact(self) -> bool {
         matches!(
             self,
-            TokenSource::ProviderReported | TokenSource::OpencodeReported
+            TokenSource::ProviderReported
         )
     }
 }
@@ -80,14 +77,6 @@ impl TokenCount {
         Self {
             total: Some(total),
             source: TokenSource::ProviderReported,
-        }
-    }
-
-    /// An OpenCode-reported measurement.
-    pub fn opencode_reported(total: u64) -> Self {
-        Self {
-            total: Some(total),
-            source: TokenSource::OpencodeReported,
         }
     }
 

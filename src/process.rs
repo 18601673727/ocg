@@ -3,117 +3,16 @@
 //! This module is the only place that builds a [`std::process::Command`], so
 //! every child process the tool ever starts goes through one auditable path.
 //!
-//! [`ProcessRunner`] replaces the current process with OpenCode.
-//! [`ProcessHost`] is the runtime-facing side (PATH lookup, `--version`
-//! probing and OpenCode's own `upgrade`).
+//! `ProcessHost` provides generic executable discovery and version probing.
 
 use crate::error::{OcgError, Result};
-use crate::proxy::{ChildProxyEnv, StaticProxyProvider};
-use semver::Version;
+use crate::proxy::StaticProxyProvider;
 use serde::{Deserialize, Serialize};
-use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::Instant;
-
-const MAX_MODELS_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
-
-/// The `opencode` binary and how to run it.
-#[derive(Debug, Clone)]
-pub struct ProcessRunner {
-    program: OsString,
-}
-
-impl ProcessRunner {
-    pub fn new(program: OsString) -> Self {
-        Self { program }
-    }
-
-    pub fn program(&self) -> &OsStr {
-        &self.program
-    }
-
-    /// Replace the current process with the configured program.
-    ///
-    /// `OPENCODE_CONFIG_CONTENT` carries the generated config;
-    /// `OPENCODE_CONFIG` is removed so a stale file path cannot override it.
-    /// `extra_env` carries additional variables (for example the orchestration
-    /// bridge's executable and project); `proxy_env` is the resolved proxy
-    /// policy, which is applied last so it cannot be overridden. On Unix this
-    /// `exec`s so signals and exit codes behave exactly like the historical
-    /// shell wrapper.
-    pub fn exec(
-        &self,
-        args: &[OsString],
-        cwd: &Path,
-        config_content: &str,
-        extra_env: &[(OsString, OsString)],
-        proxy_env: &ChildProxyEnv,
-    ) -> Result<()> {
-        let mut command = Command::new(&self.program);
-        command
-            .args(args)
-            .current_dir(cwd)
-            .env("OPENCODE_CONFIG_CONTENT", config_content)
-            .env_remove("OPENCODE_CONFIG");
-        for (key, value) in extra_env {
-            command.env(key, value);
-        }
-        proxy_env.apply(&mut command);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            let error = command.exec();
-            Err(OcgError::io(
-                format!("cannot run {}", self.program.to_string_lossy()),
-                error,
-            ))
-        }
-
-        #[cfg(not(unix))]
-        {
-            let status = command.status().map_err(|error| {
-                OcgError::io(
-                    format!("cannot run {}", self.program.to_string_lossy()),
-                    error,
-                )
-            })?;
-            std::process::exit(status.code().unwrap_or(1));
-        }
-    }
-
-    /// Run OpenCode as a child and return its exit code. V2 uses this rather
-    /// than `exec` so the invocation-scoped private server can be reaped after
-    /// the OpenCode client exits. The v1 path deliberately continues to use
-    /// [`Self::exec`].
-    pub fn run(
-        &self,
-        args: &[OsString],
-        cwd: &Path,
-        config_content: &str,
-        extra_env: &[(OsString, OsString)],
-        proxy_env: &ChildProxyEnv,
-    ) -> Result<i32> {
-        let mut command = Command::new(&self.program);
-        command
-            .args(args)
-            .current_dir(cwd)
-            .env("OPENCODE_CONFIG_CONTENT", config_content)
-            .env_remove("OPENCODE_CONFIG");
-        for (key, value) in extra_env {
-            command.env(key, value);
-        }
-        proxy_env.apply(&mut command);
-        let status = command.status().map_err(|error| {
-            OcgError::io(
-                format!("cannot run {}", self.program.to_string_lossy()),
-                error,
-            )
-        })?;
-        Ok(status.code().unwrap_or(1))
-    }
-}
 
 /// Reads static macOS proxy configuration through `/usr/sbin/scutil --proxy`.
 ///
@@ -151,7 +50,7 @@ fn read_scutil_proxy() -> Option<String> {
     None
 }
 
-/// Process discovery, version probing and OpenCode's own upgrade command.
+/// Generic executable discovery and version probing.
 pub trait ProcessHost: Send + Sync {
     /// Resolve a bare program name against `PATH`.
     fn find_in_path(&self, program: &str) -> Option<PathBuf>;
@@ -159,29 +58,6 @@ pub trait ProcessHost: Send + Sync {
     /// Run `<program> --version` and return the trimmed output.
     fn version(&self, program: &Path) -> Result<String>;
 
-    /// Run `<program> models` with the exact generated configuration and
-    /// return its machine-oriented line output. This is the supported
-    /// OpenCode CLI surface used by runtime model preflight.
-    fn models(
-        &self,
-        program: &Path,
-        cwd: &Path,
-        config_content: &str,
-        proxy: &ChildProxyEnv,
-    ) -> Result<String>;
-
-    /// Run OpenCode's own `<program> upgrade [target]` and return its output.
-    ///
-    /// This is the only upgrade path for an existing system runtime; it must
-    /// never be replaced by a managed download. `target` is the concrete
-    /// version OCG resolved through its own transport, and `proxy`
-    /// is the resolved proxy policy for the child.
-    fn upgrade(
-        &self,
-        program: &Path,
-        target: Option<&Version>,
-        proxy: &ChildProxyEnv,
-    ) -> Result<String>;
 }
 
 /// The real host, backed by `PATH` and `std::process::Command`.
@@ -245,105 +121,6 @@ impl ProcessHost for SystemProcessHost {
         )))
     }
 
-    fn models(
-        &self,
-        program: &Path,
-        cwd: &Path,
-        config_content: &str,
-        proxy: &ChildProxyEnv,
-    ) -> Result<String> {
-        let mut command = Command::new(program);
-        command
-            .arg("models")
-            .current_dir(cwd)
-            .env("OPENCODE_CONFIG_CONTENT", config_content)
-            .env_remove("OPENCODE_CONFIG")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        for (key, value) in crate::vault::Vault::user_global()?.child_environment()? {
-            command.env(key, value);
-        }
-        proxy.apply(&mut command);
-        let mut child = command.spawn().map_err(|error| {
-            OcgError::io(format!("cannot run {} models", program.display()), error)
-        })?;
-        let stdout_handle = child.stdout.take().map(|stdout| {
-            std::thread::spawn(move || read_drain_bounded(stdout, MAX_MODELS_OUTPUT_BYTES))
-        });
-        let stderr_handle = child.stderr.take().map(|stderr| {
-            std::thread::spawn(move || read_drain_bounded(stderr, MAX_MODELS_OUTPUT_BYTES))
-        });
-        let status = child.wait().map_err(|error| {
-            OcgError::io(
-                format!("cannot wait for {} models", program.display()),
-                error,
-            )
-        })?;
-        let (stdout, stdout_truncated) = stdout_handle
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default();
-        let (_, stderr_truncated) = stderr_handle
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default();
-        if stdout_truncated || stderr_truncated {
-            return Err(OcgError::config(format!(
-                "{} models exceeded the {} byte output limit",
-                program.display(),
-                MAX_MODELS_OUTPUT_BYTES
-            )));
-        }
-        if !status.success() {
-            // OpenCode/provider diagnostics can contain arbitrary third-party
-            // text. Keep this probe failure actionable without echoing it.
-            return Err(OcgError::config(format!(
-                "{} models failed with {}",
-                program.display(),
-                status
-            )));
-        }
-        String::from_utf8(stdout).map_err(|_| {
-            OcgError::config(format!(
-                "{} models produced non-UTF-8 output",
-                program.display()
-            ))
-        })
-    }
-
-    fn upgrade(
-        &self,
-        program: &Path,
-        target: Option<&Version>,
-        proxy: &ChildProxyEnv,
-    ) -> Result<String> {
-        let mut command = Command::new(program);
-        command.arg("upgrade");
-        if let Some(version) = target {
-            command.arg(version.to_string());
-        }
-        proxy.apply(&mut command);
-        let output = command.output().map_err(|error| {
-            OcgError::io(format!("cannot run {} upgrade", program.display()), error)
-        })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            };
-            return Err(OcgError::config(format!(
-                "{} upgrade failed: {detail}",
-                program.display()
-            )));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Ok(if !stdout.is_empty() { stdout } else { stderr })
-    }
 }
 
 /// A captured `git` invocation.
@@ -594,6 +371,43 @@ pub trait CaptureRunner: Send + Sync {
         cwd: &Path,
         max_bytes: usize,
     ) -> Result<CapturedOutput>;
+
+    /// Run with an OCG-owned cancellation fence. Implementations that cannot
+    /// interrupt their child still get the pre/post check from this default;
+    /// the system implementation terminates the child when the fence closes.
+    fn run_cancellable(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        max_bytes: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<CapturedOutput> {
+        if cancelled.load(Ordering::SeqCst) {
+            return Ok(CapturedOutput {
+                exit: ProcessExit::Unknown,
+                success: false,
+                stdout: Vec::new(),
+                stderr: b"cancelled".to_vec(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration_ms: 0,
+            });
+        }
+        let output = self.run(program, args, cwd, max_bytes)?;
+        if cancelled.load(Ordering::SeqCst) {
+            return Ok(CapturedOutput {
+                exit: ProcessExit::Unknown,
+                success: false,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                stdout_truncated: output.stdout_truncated,
+                stderr_truncated: output.stderr_truncated,
+                duration_ms: output.duration_ms,
+            });
+        }
+        Ok(output)
+    }
 }
 
 /// The real capture runner, backed by `std::process::Command`.
@@ -662,6 +476,63 @@ impl CaptureRunner for SystemCaptureRunner {
             stdout_truncated,
             stderr_truncated,
             duration_ms,
+        })
+    }
+
+    fn run_cancellable(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        max_bytes: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<CapturedOutput> {
+        let max_bytes = max_bytes.max(1);
+        let start = Instant::now();
+        let mut child = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| OcgError::io(format!("cannot run {program}"), error))?;
+        let stdout_handle = child
+            .stdout
+            .take()
+            .map(|stdout| thread::spawn(move || read_drain_bounded(stdout, max_bytes)));
+        let stderr_handle = child
+            .stderr
+            .take()
+            .map(|stderr| thread::spawn(move || read_drain_bounded(stderr, max_bytes)));
+        let mut cancelled_child = false;
+        loop {
+            if cancelled.load(Ordering::SeqCst) && !cancelled_child {
+                cancelled_child = true;
+                let _ = child.kill();
+            }
+            if child.try_wait().map_err(|error| OcgError::io(format!("cannot poll {program}"), error))?.is_some() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let status = child
+            .wait()
+            .map_err(|error| OcgError::io(format!("cannot wait for {program}"), error))?;
+        let (stdout_bytes, stdout_truncated) = stdout_handle
+            .map(|handle| handle.join().unwrap_or_default())
+            .unwrap_or_default();
+        let (stderr_bytes, stderr_truncated) = stderr_handle
+            .map(|handle| handle.join().unwrap_or_default())
+            .unwrap_or_default();
+        Ok(CapturedOutput {
+            exit: if cancelled_child { ProcessExit::Unknown } else { process_exit(&status) },
+            success: !cancelled_child && status.success(),
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+            stdout_truncated,
+            stderr_truncated,
+            duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
         })
     }
 }

@@ -45,9 +45,6 @@ pub fn status_text(effective: &Effective, level: &str) -> Result<String> {
     let selected = if level.is_empty() { "(none)" } else { level };
     let origin = match &profile.origin {
         crate::profile::Origin::New => "New".to_string(),
-        crate::profile::Origin::Imported { source, scope, .. } => {
-            format!("Imported {scope} from {source}")
-        }
     };
 
     // A model that declares no variant is reported as `provider-default`; the

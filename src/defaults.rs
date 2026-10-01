@@ -136,16 +136,16 @@ pub fn default_context() -> Value {
     serde_json::to_value(crate::context::ContextConfig::default()).unwrap_or_else(|_| json!({}))
 }
 
-/// The built-in managed-runtime policy.
+/// The built-in runtime policy.
 ///
 /// Kept in code (like `observability`) so a disk OCG home does not need a new
 /// required file and existing OCG homes keep working.
 pub fn default_runtime() -> Value {
     json!({
-        "channel": crate::runtime::policy::Channel::Latest.as_str(),
+        "channel": "latest",
         "autoUpgrade": true,
-        "checkIntervalHours": crate::runtime::policy::DEFAULT_CHECK_INTERVAL_HOURS,
-        "fallback": crate::runtime::policy::Fallback::ProjectLocal.as_str(),
+        "checkIntervalHours": 24,
+        "fallback": "project-local",
     })
 }
 

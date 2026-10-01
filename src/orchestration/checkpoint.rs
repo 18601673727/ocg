@@ -139,11 +139,11 @@ impl Checkpoint {
 
     /// Persist atomically under `.ocg/checkpoints/`.
     pub fn save(&self, root: &Path) -> Result<PathBuf> {
-        crate::runtime::install::ensure_gitignore(root)?;
+        crate::install::ensure_gitignore(root)?;
         let path = checkpoint_path(root, &self.id)?;
         let value = serde_json::to_value(self)
             .map_err(|error| OcgError::config(format!("cannot serialize checkpoint: {error}")))?;
-        crate::runtime::install::write_json_atomic(&path, &value)?;
+        crate::install::write_json_atomic(&path, &value)?;
         Ok(path)
     }
 
@@ -212,7 +212,7 @@ pub struct LoadedCheckpoint {
 
 /// A safe, deterministic id. Only `[a-z0-9-]`, so it can never traverse paths.
 pub fn checkpoint_id(phase: Phase, task: &str, git_fingerprint: &str, created_at: i64) -> String {
-    let digest = crate::runtime::hash::sha256_hex(
+    let digest = crate::hash::sha256_hex(
         format!(
             "{}|{}|{}|{}",
             phase.as_str(),

@@ -432,7 +432,7 @@ fn boundary_digest(head: u64, floor: u64, anchor_event_id: Option<&str>) -> Resu
     bytes.extend_from_slice(floor.to_string().as_bytes());
     bytes.push(b'|');
     bytes.extend_from_slice(anchor_event_id.unwrap_or("").as_bytes());
-    Ok(crate::runtime::hash::sha256_hex(&bytes))
+    Ok(crate::hash::sha256_hex(&bytes))
 }
 
 fn read_boundary(connection: &Connection) -> Result<JournalBoundary> {

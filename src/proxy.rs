@@ -83,8 +83,8 @@ impl ProxyEnv for MapProxyEnv {
     }
 }
 
-/// Supplies the raw `/usr/sbin/scutil --proxy` output. The real provider only
-/// runs the command on macOS; tests inject fixed text.
+/// Supplies the raw `/usr/sbin/scutil --proxy` output. The system
+/// implementation runs the command on macOS; tests inject fixed text.
 pub trait StaticProxyProvider: Send + Sync {
     fn raw_scutil(&self) -> Option<String>;
 }
@@ -270,9 +270,8 @@ impl ProxySelection {
     ///
     /// Every recognized spelling is cleared first, then the resolved endpoints
     /// are exported under both the upper- and lower-case names. Clients differ
-    /// (curl and parts of the OpenCode runtime read the lower-case spelling,
-    /// others only the upper-case one), so exporting both keeps the resolved
-    /// policy authoritative for any convention. Disabling the proxy exports
+    /// in which spelling they read, so exporting both keeps the resolved
+    /// policy authoritative for either convention. Disabling the proxy exports
     /// nothing and still clears all eight spellings.
     pub fn child_env(&self) -> ChildProxyEnv {
         let mut env = ChildProxyEnv::default();
@@ -396,7 +395,7 @@ fn plan_from_env(env: &dyn ProxyEnv) -> (ProxyPlan, Vec<String>) {
                 // rather than silently removing a proxy that used to work.
                 if is_socks_scheme(&raw) {
                     warnings.push(format!(
-                        "{upper} uses a SOCKS scheme that OCG does not interpret; it is preserved for child OpenCode processes"
+                        "{upper} uses a SOCKS scheme that OCG does not interpret; it is preserved for child processes"
                     ));
                     plan.passthrough.push((name, SecretUrl::new(raw)));
                 } else {
@@ -412,7 +411,7 @@ fn plan_from_env(env: &dyn ProxyEnv) -> (ProxyPlan, Vec<String>) {
 }
 
 /// A SOCKS-family proxy scheme. Recognized so it can be preserved verbatim for
-/// children; deliberately not implemented for OCG's own HTTP client.
+/// child processes; deliberately not implemented for OCG's own HTTP client.
 fn is_socks_scheme(raw: &str) -> bool {
     match raw.trim().split_once("://") {
         Some((scheme, rest)) => {

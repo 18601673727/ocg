@@ -117,7 +117,7 @@ impl TelemetryStore {
                 "telemetry event was rejected: metadata still looks secret-shaped after redaction",
             ));
         }
-        crate::runtime::install::ensure_gitignore(&self.root)?;
+        crate::install::ensure_gitignore(&self.root)?;
         fs::create_dir_all(&self.dir).map_err(|error| {
             OcgError::io(format!("cannot create {}", self.dir.display()), error)
         })?;

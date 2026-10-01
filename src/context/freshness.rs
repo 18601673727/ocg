@@ -77,7 +77,7 @@ pub fn validate(root: &Path, sources: &[SourceFingerprint]) -> Result<FreshnessR
             continue;
         }
         let bytes = fs::read(&path).map_err(|error| crate::error::OcgError::read(&path, error))?;
-        let fingerprint = format!("sha256:{}", crate::runtime::hash::sha256_hex(&bytes));
+        let fingerprint = format!("sha256:{}", crate::hash::sha256_hex(&bytes));
         if fingerprint != source.fingerprint || metadata.len() != source.size {
             report.stale.push(source.path.clone());
         }

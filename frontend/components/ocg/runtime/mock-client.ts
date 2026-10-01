@@ -22,8 +22,8 @@ import type {
   RuntimeSnapshot,
   ScenarioId,
 } from "./runtime-types";
-import { PROJECTS, isProjectId, type ProjectId } from "../project/domain";
-import { projectSessionIds } from "../project/fixtures";
+import { isProjectId, type ProjectId } from "../project/domain";
+import { FIXTURE_PROJECT_IDS, projectSessionIds } from "../project/fixtures";
 import { createJobLaunchObservability } from "../job/launch-fixtures";
 import { assembleJobExecution } from "../execution/domain";
 import { CANONICAL_API_VERSION } from "../contracts";
@@ -372,8 +372,8 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   }
 
   private ownerProjectForSession(sessionId: string): ProjectId | null {
-    for (const project of PROJECTS) {
-      if (projectSessionIds(project.id).includes(sessionId)) return project.id;
+    for (const projectId of FIXTURE_PROJECT_IDS) {
+      if (projectSessionIds(projectId).includes(sessionId)) return projectId;
     }
     return null;
   }

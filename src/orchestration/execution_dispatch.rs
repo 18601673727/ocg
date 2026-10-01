@@ -13,6 +13,7 @@ pub struct ExecutionEnvelope {
     pub call_id: String,
     pub job_id: String,
     pub attempt_id: String,
+    pub executor_id: Option<String>,
     pub generation: u64,
     pub payload: String,
     pub dispatch_id: Option<String>,
@@ -22,7 +23,7 @@ pub struct ExecutionEnvelope {
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
     Started,
-    Provider(crate::provider_transport::ChatStreamEvent),
+    Provider(crate::openai_compatible::stream::ChatStreamEvent),
     Failed(String),
     Finished,
 }
@@ -80,6 +81,7 @@ pub fn admit_call_with_events(
         call_id: call.id.clone(),
         job_id: authority.job_id.clone(),
         attempt_id: authority.attempt_id.clone(),
+        executor_id: Some(executor_id.to_string()),
         generation: authority.generation,
         payload: request.to_string(),
         dispatch_id: None,
@@ -114,6 +116,7 @@ pub fn queue_call(
         call_id: call.id.clone(),
         job_id: authority.job_id.clone(),
         attempt_id: authority.attempt_id.clone(),
+        executor_id: call.executor_id.clone(),
         generation: authority.generation,
         payload: request.to_string(),
         dispatch_id,
@@ -253,7 +256,7 @@ impl BoundedDispatcher {
         })
     }
 
-    /// Blocking producer operation used by Fang's blocking worker.
+    /// Blocking producer operation used by the blocking worker.
     pub fn send(&self, value: ExecutionEnvelope) -> Result<()> {
         let sender = self
             .sender

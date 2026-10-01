@@ -7,7 +7,7 @@
  * a pure reducer step.
  */
 
-import { PROJECT_IDS, type ProjectId } from "../project/domain";
+import type { ProjectId } from "../project/domain";
 import type { JobLaunchCommand } from "../runtime/runtime-types";
 
 export type { JobLaunchCommand };
@@ -159,7 +159,7 @@ export function jobDraftHasErrors(issues: readonly JobDraftIssue[]): boolean {
 
 export function validateJobDraft(
   draft: JobDraft,
-  validProjectIds: readonly string[] = PROJECT_IDS,
+  validProjectIds: readonly string[] = [],
 ): JobDraftIssue[] {
   const issues: JobDraftIssue[] = [];
   const objective = draft.objective.trim();

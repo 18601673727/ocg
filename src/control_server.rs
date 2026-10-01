@@ -504,28 +504,14 @@ fn handle_profile(
         );
     }
     let operation = || -> Result<Value> {
-        let xdg = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
-            })
-            .ok_or_else(|| {
-                OcgError::config("HOME or XDG_CONFIG_HOME is required to discover external config")
-            })?;
         let view = || -> Result<Value> {
             let current = service.current()?;
-            let candidates = if current.is_none() {
-                service.candidates(&xdg)?
-            } else {
-                vec![]
-            };
             // A declared struct, so the generated TypeScript describes the
             // response the PWA actually receives.
             serde_json::to_value(ProfileView {
                 api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
                 profile: current.as_ref().map(|(profile, _)| profile.clone()),
                 revision: current.as_ref().map(|(_, revision)| revision.clone()),
-                candidates,
             })
             .map_err(|error| OcgError::config(error.to_string()))
         };
@@ -536,25 +522,13 @@ fn handle_profile(
                     .json_body()
                     .map_err(|_| OcgError::config("invalid Profile bootstrap body"))?;
                 let choice = body.get("choice").and_then(Value::as_str).ok_or_else(|| {
-                    OcgError::config("explicit choice is required: new or import")
+                    OcgError::config("explicit choice is required: new")
                 })?;
                 match choice {
                     "new" => {
-                        service.bootstrap(None, &xdg)?;
+                        service.bootstrap()?;
                     }
-                    "import" => {
-                        let path =
-                            body.get("location")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| {
-                                    OcgError::config("selected candidate location is required")
-                                })?;
-                        let hash = body.get("sha256").and_then(Value::as_str).ok_or_else(|| {
-                            OcgError::config("selected candidate sha256 is required")
-                        })?;
-                        service.bootstrap(Some((Path::new(path), hash)), &xdg)?;
-                    }
-                    _ => return Err(OcgError::config("choice must be new or import")),
+                    _ => return Err(OcgError::config("choice must be new")),
                 }
                 view()
             }

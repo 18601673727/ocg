@@ -1,17 +1,24 @@
 #![forbid(unsafe_code)]
-//! OCG: project-agnostic multi-model orchestration for OpenCode.
+//! OCG: project-agnostic multi-model orchestration Core and PWA control plane.
 //!
 //! The library resolves the OCG-owned Profile (project YAML), layers permitted
-//! user policy, validates it, assembles prompts and emits a deterministic
-//! OpenCode compatibility config. It also owns the managed OpenCode runtime
-//! (discovery, install, update checks and OCG self-update). The `ocg` binary
+//! user policy, validates it, assembles prompts and emits deterministic
+//! configuration. It also owns OCG self-update. The `ocg` binary
 //! is a thin CLI over these modules.
 //!
-//! Fixed execution tiers were removed in v0.4.1: `throttle`, `low`/`mid`/`high`
-//! and `lead-low`/`lead-mid`/`lead-high` are migration diagnostics and inert
-//! test labels, never canonical configuration.
+//! OCG owns:
+//! - Project
+//! - orchestration
+//! - execution authority
+//! - provider authority
+//! - Call lifecycle
+//! - OpenAI-compatible protocol boundary
+//! - tools (future)
+//! - conversation (future)
+//! - PWA/control plane
+//!
+//! OCG does not depend on any external agent runtime to work.
 
-pub mod build;
 pub mod capabilities;
 pub mod cli;
 pub mod clock;
@@ -25,24 +32,28 @@ pub mod defaults;
 pub mod edit;
 pub mod error;
 pub mod fingerprint;
+pub mod hash;
 pub mod http;
+pub mod install;
 pub mod json;
 pub mod model;
+pub mod native_tools;
 pub mod observability;
+pub mod observation;
+pub mod openai_compatible;
 pub mod orchestration;
 pub mod platform;
-pub mod preflight;
 pub mod process;
+pub mod provider_loop;
 pub mod profile;
 pub mod project;
 pub mod prompt;
-pub mod provider_gateway;
-pub mod provider_transport;
 pub mod proxy;
 pub mod pwa;
+pub mod release;
 pub mod report;
 pub mod resources;
-pub mod runtime;
+pub mod self_update;
 pub mod telemetry;
 pub mod ui_assets;
 pub mod validate;

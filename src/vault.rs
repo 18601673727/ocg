@@ -1,4 +1,4 @@
-//! Encrypted user-global credentials for OpenCode child processes.
+//! Encrypted user-global credentials for OCG-owned provider execution.
 
 use crate::error::{OcgError, Result};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
@@ -202,15 +202,10 @@ fn validate_name(name: &str) -> Result<()> {
         "HTTPS_PROXY",
         "ALL_PROXY",
         "NO_PROXY",
-        "OPENCODE_CONFIG",
-        "OPENCODE_CONFIG_CONTENT",
-        "OPENCODE_CONFIG_DIR",
-        "OPENCODE_SERVER_PASSWORD",
     ];
     if name.is_empty()
         || reserved.contains(&name)
         || name.starts_with("OCG_")
-        || name.starts_with("OPENCODE_")
         || name.len() > 128
         || !name
             .bytes()

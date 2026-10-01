@@ -1,7 +1,7 @@
 //! The small top-level `context` object.
 //!
 //! Like `runtime` and `observability`, the context engine is configured by its
-//! own top-level key so the raw `opencode` config key is never overloaded. All
+//! own top-level key so provider configuration is never overloaded. All
 //! fields are optional and the defaults are deliberately conservative: the
 //! engine must be safe to run on every launch without a user writing config.
 
@@ -138,7 +138,7 @@ impl ContextConfig {
     /// A stable fingerprint of the policy, used in cache keys.
     pub fn fingerprint(&self) -> String {
         let value = serde_json::to_value(self).unwrap_or(Value::Null);
-        crate::runtime::hash::sha256_hex(value.to_string().as_bytes())
+        crate::hash::sha256_hex(value.to_string().as_bytes())
     }
 
     /// The limits carried into a plan for transparency.
