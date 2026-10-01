@@ -419,7 +419,7 @@ impl<'a> NativeOpenAiCompatibleProvider<'a> {
 
 /// Configuration for the canonical provider handler. The handler owns the
 /// provider transport and project boundary, while each envelope supplies the
-/// Attempt/Call identity and frozen provider configuration that must be 
+/// Attempt/Call identity and frozen provider configuration that must be
 /// revalidated before execution.
 pub struct ProviderHandlerConfig {
     pub transport: Arc<dyn HttpTransport>,
@@ -747,7 +747,7 @@ pub fn requeue_recovered_provider_call(
     } else {
         None
     };
-    
+
     let (events, _receiver) = flume::unbounded();
     dispatcher.send(ExecutionEnvelope {
         call_id: intent.call_id.clone(),
@@ -930,7 +930,7 @@ fn execute_provider_loop(
     // provider Call carries. Every later round appends to that same request
     // rather than re-deciding what context it has.
     apply_active_context(request, project_root, &authority.attempt_id, provider, &model)?;
-    
+
     for round in 0..MAX_PROVIDER_ROUNDS {
         if cancelled.load(Ordering::SeqCst) {
             return Err(OcgError::config("provider loop cancelled"));
@@ -940,9 +940,9 @@ fn execute_provider_loop(
                 request.as_object_mut().and_then(|obj| obj.remove("tools"));
             }
         }
-        
+
         let round_response = provider.complete(request)?;
-        
+
         if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
             || round_response.summary.tool_calls.is_empty()
         {

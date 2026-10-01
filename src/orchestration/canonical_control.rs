@@ -188,7 +188,7 @@ impl CanonicalControlService {
     pub fn open(root: &Path) -> Result<Self> {
         let boundary = project::resolve(root);
         boundary.require(root)?;
-        
+
         // Use user-global profile path
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
@@ -203,7 +203,7 @@ impl CanonicalControlService {
                 .map(Path::new),
             home.as_deref(),
         );
-        
+
         Ok(Self {
             root: boundary.root().to_path_buf(),
             runtime_handle: None,
@@ -218,7 +218,7 @@ impl CanonicalControlService {
         self.runtime_handle = Some(handle);
         self
     }
-    
+
     pub fn with_profile_service(
         mut self,
         profile_service: crate::profile::ProfileService,
@@ -660,7 +660,7 @@ impl CanonicalControlService {
         _now: i64,
     ) -> Result<crate::contracts::JobLaunchResponse> {
         use sha2::{Sha256, Digest};
-        
+
         if !safe_id(&request.command_id) {
             return Ok(crate::contracts::JobLaunchResponse {
                 api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -1052,7 +1052,7 @@ impl CanonicalControlService {
 
         // Admit the provider call
         let authority = domain.authority(&attempt.id)?.ok_or_else(|| invalid("attempt authority disappeared"))?;
-        
+
         // Freeze provider execution configuration for this Call
         let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
             provider_key: provider_key.to_string(),
@@ -1061,7 +1061,7 @@ impl CanonicalControlService {
             endpoint: endpoint.clone(),
             credential_ref: Some(credential_ref.to_string()),
         };
-        
+
         let _call = match crate::provider_loop::admit_provider_call(
             &mut domain,
             &authority,

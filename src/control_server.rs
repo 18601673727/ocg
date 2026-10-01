@@ -172,17 +172,17 @@ impl ControlServer {
                 "control server bound a non-loopback address {bound}; refusing to serve"
             )));
         }
-        
+
         // Try to open canonical control service
         let mut canonical = crate::orchestration::canonical_control::CanonicalControlService::open(root).ok();
-        
+
         // Wire the profile service if canonical service exists
         if let Some(ref mut service) = canonical {
             *service = service.clone().with_profile_service(
                 crate::profile::ProfileService::with_workspace(profile_path, root)
             );
         }
-        
+
         // If canonical service exists, start execution runtime and wire the handle
         let execution_runtime = if canonical.is_some() {
             match crate::orchestration::execution_runtime::ExecutionRuntime::start(
@@ -207,7 +207,7 @@ impl ControlServer {
         } else {
             None
         };
-        
+
         Ok(Self {
             listener,
             addr: bound,

@@ -3288,7 +3288,7 @@ impl DomainRepository {
 
     /// Atomically claim a command_id and create a Job, ensuring exactly one Job
     /// per (command_id, project_id) even under concurrent requests.
-    /// 
+    ///
     /// Returns:
     /// - Ok(Some(job_id)) if this call created the Job
     /// - Ok(None) if command_id already exists (duplicate/conflict detected)
@@ -3302,31 +3302,31 @@ impl DomainRepository {
     ) -> Result<Option<Job>> {
         validate_id(command_id)?;
         validate_id(project_id)?;
-        
+
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        
+
         // Try to claim the command_id
         let claim_result = transaction.execute(
             "INSERT INTO domain_launch_commands(command_id,project_id,request_hash,outcome,job_id,message,created_at) VALUES(?1,?2,?3,'pending',NULL,'job creation in progress',?4)",
             params![command_id, project_id, request_hash, now()],
         );
-        
+
         match claim_result {
             Ok(_) => {
                 // Successfully claimed; now create the Job
                 let job_id = new_id("job");
                 let timestamp = now();
-                
+
                 transaction
                     .execute(
                         "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?4)",
                         params![job_id, project_id, payload, timestamp],
                     )
                     .map_err(sql)?;
-                
+
                 let job = Job {
                     id: job_id.clone(),
                     project_id: project_id.to_string(),
@@ -3337,9 +3337,9 @@ impl DomainRepository {
                     created_at: timestamp,
                     updated_at: timestamp,
                 };
-                
+
                 emit_job(&transaction, EventKind::JobCreated, &job, None)?;
-                
+
                 transaction.commit().map_err(sql)?;
                 Ok(Some(job))
             }
