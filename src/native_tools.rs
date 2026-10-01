@@ -221,6 +221,7 @@ impl ToolResult {
 #[derive(Debug, Clone)]
 pub struct NativeToolDefinition {
     pub name: &'static str,
+    pub wire_name: &'static str,
     pub description: &'static str,
     pub parameters: Value,
     pub permission: PermissionClass,
@@ -233,7 +234,7 @@ impl NativeToolDefinition {
         json!({
             "type": "function",
             "function": {
-                "name": self.name,
+                "name": self.wire_name,
                 "description": self.description,
                 "parameters": self.parameters,
                 "strict": true
@@ -249,14 +250,16 @@ impl NativeToolRegistry {
         vec![
             NativeToolDefinition {
                 name: "filesystem.read",
+                wire_name: "filesystem_read",
                 description: "Read a bounded UTF-8 file inside the current Project root.",
-                parameters: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}}}),
+                parameters: json!({"type":"object","additionalProperties":false,"required":["path","offset","limit"],"properties":{"path":{"type":"string"},"offset":{"type":["integer","null"],"minimum":0},"limit":{"type":["integer","null"],"minimum":1}}}),
                 permission: PermissionClass::ReadOnly,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemRead,
             },
             NativeToolDefinition {
                 name: "filesystem.list",
+                wire_name: "filesystem_list",
                 description: "List bounded structured entries in a directory inside the current Project root.",
                 parameters: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"}}}),
                 permission: PermissionClass::ReadOnly,
@@ -265,24 +268,27 @@ impl NativeToolRegistry {
             },
             NativeToolDefinition {
                 name: "filesystem.search",
+                wire_name: "filesystem_search",
                 description: "Search Project files with rg using argv-only execution.",
-                parameters: json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{"query":{"type":"string"},"path":{"type":"string"}}}),
+                parameters: json!({"type":"object","additionalProperties":false,"required":["query","path"],"properties":{"query":{"type":"string"},"path":{"type":["string","null"]}}}),
                 permission: PermissionClass::ReadOnly,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemSearch,
             },
             NativeToolDefinition {
                 name: "filesystem.edit",
+                wire_name: "filesystem_edit",
                 description: "Apply a transactional Robust Edit inside the current Project root.",
-                parameters: json!({"type":"object","additionalProperties":false,"required":["operation","file"],"properties":{"operation":{"type":"string","enum":["replace","insertBefore","insertAfter","append"]},"file":{"type":"string"},"expectedRevision":{"type":"string"},"oldString":{"type":"string"},"old_string":{"type":"string"},"anchor":{"type":"string"},"newString":{"type":"string"},"content":{"type":"string"}}}),
+                parameters: json!({"type":"object","additionalProperties":false,"required":["operation","file","expectedRevision","oldString","old_string","anchor","newString","content"],"properties":{"operation":{"type":"string","enum":["replace","insertBefore","insertAfter","append"]},"file":{"type":"string"},"expectedRevision":{"type":["string","null"]},"oldString":{"type":["string","null"]},"old_string":{"type":["string","null"]},"anchor":{"type":["string","null"]},"newString":{"type":["string","null"]},"content":{"type":["string","null"]}}}),
                 permission: PermissionClass::FilesystemWrite,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemEdit,
             },
             NativeToolDefinition {
                 name: "process.exec",
+                wire_name: "process_exec",
                 description: "Execute one program with argv directly inside the current Project root.",
-                parameters: json!({"type":"object","additionalProperties":false,"required":["program"],"properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"}}}),
+                parameters: json!({"type":"object","additionalProperties":false,"required":["program","args","cwd"],"properties":{"program":{"type":"string"},"args":{"type":["array","null"],"items":{"type":"string"}},"cwd":{"type":["string","null"]}}}),
                 permission: PermissionClass::ProcessExec,
                 capability: "process",
                 executor: NativeToolExecutorBinding::ProcessExec,
@@ -294,6 +300,12 @@ impl NativeToolRegistry {
         Self::definitions()
             .into_iter()
             .find(|tool| tool.name == name)
+    }
+
+    pub fn get_by_wire_name(wire_name: &str) -> Option<NativeToolDefinition> {
+        Self::definitions()
+            .into_iter()
+            .find(|tool| tool.wire_name == wire_name)
     }
 
     pub fn openai_tools() -> Vec<Value> {
