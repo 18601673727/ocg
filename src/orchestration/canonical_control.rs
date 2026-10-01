@@ -913,6 +913,28 @@ impl CanonicalControlService {
             return Ok(response);
         }
 
+        let upstream_model_id = match profile.models.get(model) {
+            Some(entry) if !entry.placeholder && entry.provider == provider_key && !entry.id.is_empty() => entry.id.clone(),
+            _ => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: format!("model {model} is not runnable for provider {provider_key}"),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id, &request.project_id, &request_hash,
+                    "rejected", None, &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
         // Validate endpoint
         let endpoint = match &provider_entry.endpoint {
             Some(e) if !e.is_empty() => e.clone(),
@@ -1035,8 +1057,9 @@ impl CanonicalControlService {
         let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
             provider_key: provider_key.to_string(),
             model: model.to_string(),
+            upstream_model_id,
             endpoint: endpoint.clone(),
-            credential_ref: credential_ref.to_string(),
+            credential_ref: Some(credential_ref.to_string()),
         };
         
         let _call = match crate::provider_loop::admit_provider_call(

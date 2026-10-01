@@ -22,13 +22,19 @@ pub struct ExecutionEnvelope {
 }
 
 /// Frozen provider execution configuration associated with a specific Call.
-/// This is durably stored and never includes the raw credential/token.
+/// This is durably stored and never includes the raw credential/token. The
+/// `upstream_model_id` is the provider-facing model id sent on the wire; it is
+/// frozen so recovery and re-execution always use the same identity.
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionConfig {
+    /// The Profile model key the Call was launched with.
     pub provider_key: String,
     pub model: String,
+    /// The provider-facing model id sent to the endpoint.
+    pub upstream_model_id: String,
     pub endpoint: String,
-    pub credential_ref: String,
+    /// The Vault credential reference. `None` means no Authorization header.
+    pub credential_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]

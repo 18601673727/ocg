@@ -210,6 +210,9 @@ pub struct DispatchIntent {
     /// None for native tool Calls.
     pub provider_key: Option<String>,
     pub model: Option<String>,
+    /// The provider-facing model id sent on the wire, frozen at admission.
+    #[serde(default)]
+    pub upstream_model_id: Option<String>,
     pub endpoint: Option<String>,
     pub credential_ref: Option<String>,
     pub failure: Option<String>,
@@ -423,6 +426,7 @@ CREATE TABLE IF NOT EXISTS domain_dispatch_intents (
     -- NULL for native tool Calls.
     provider_key TEXT,
     model TEXT,
+    upstream_model_id TEXT,
     endpoint TEXT,
     credential_ref TEXT,
     failure TEXT,
@@ -568,6 +572,7 @@ impl DomainRepository {
             "payload_digest",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        ensure_column(&connection, "domain_dispatch_intents", "upstream_model_id", "TEXT")?;
         ensure_column(&connection, "domain_job_bindings", "attempt_id", "TEXT")?;
         connection.execute(
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
@@ -2906,8 +2911,9 @@ impl DomainRepository {
         call_id: &str,
         provider_key: &str,
         model: &str,
+        upstream_model_id: &str,
         endpoint: &str,
-        credential_ref: &str,
+        credential_ref: Option<&str>,
     ) -> Result<()> {
         validate_id(call_id)?;
         let transaction = self
@@ -2916,13 +2922,16 @@ impl DomainRepository {
             .map_err(sql)?;
         let changed = transaction
             .execute(
-                "UPDATE domain_dispatch_intents SET provider_key=?2,model=?3,endpoint=?4,credential_ref=?5,updated_at=?6 WHERE call_id=?1",
-                params![call_id, provider_key, model, endpoint, credential_ref, now()],
+                "UPDATE domain_dispatch_intents SET provider_key=?2,model=?3,upstream_model_id=?4,endpoint=?5,credential_ref=?6,updated_at=?7 WHERE call_id=?1 AND state='pending' AND provider_key IS NULL",
+                params![call_id, provider_key, model, upstream_model_id, endpoint, credential_ref, now()],
             )
             .map_err(sql)?;
         if changed != 1 {
             return Err(invalid("dispatch intent not found for provider config"));
         }
+        let intent = read_dispatch_intent_by_call(&transaction, call_id)?
+            .ok_or_else(|| invalid("configured dispatch intent disappeared"))?;
+        emit_dispatch_intent(&transaction, EventKind::DispatchIntentUpdated, &intent, None)?;
         transaction.commit().map_err(sql)?;
         Ok(())
     }
@@ -3773,11 +3782,12 @@ fn dispatch_intent_from_row(row: &Row<'_>) -> rusqlite::Result<DispatchIntent> {
         failure: row.get(17)?,
         created_at: row.get(18)?,
         updated_at: row.get(19)?,
+        upstream_model_id: row.get(20)?,
     })
 }
 
 const DISPATCH_INTENT_COLUMNS: &str = "id,call_id,job_id,attempt_id,executor_id,generation,state,\
-effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,provider_key,model,endpoint,credential_ref,failure,created_at,updated_at";
+effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,provider_key,model,endpoint,credential_ref,failure,created_at,updated_at,upstream_model_id";
 
 fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
     let state: String = row.get(3)?;

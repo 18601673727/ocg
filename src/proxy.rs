@@ -213,6 +213,75 @@ impl ProxyPlan {
             && self.pac.is_none()
             && self.passthrough.is_empty()
     }
+
+    /// The endpoint the transport would use for a URL with this scheme, if any.
+    /// An untyped `All` endpoint matches any scheme.
+    pub fn endpoint_for(&self, scheme: &str) -> Option<&ProxyEndpoint> {
+        let wanted = match scheme {
+            "http" => ProxyScheme::Http,
+            "https" => ProxyScheme::Https,
+            _ => return None,
+        };
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.scheme() == wanted)
+            .or_else(|| {
+                self.endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.scheme() == ProxyScheme::All)
+            })
+    }
+
+    /// Whether `host` is covered by the resolved exception list (`NO_PROXY` or
+    /// the static system exceptions). Matching is the minimal safe subset of
+    /// `NO_PROXY` semantics; see [`no_proxy_matches`].
+    pub fn matches_no_proxy(&self, host: &str) -> bool {
+        no_proxy_matches(&self.no_proxy, host)
+    }
+}
+
+/// Minimal `NO_PROXY` matcher. Recognizes `*` (everything), a leading `.`
+/// suffix (`example.com` and its subdomains), a leading `*.` wildcard
+/// (`example.com` and its subdomains), and an exact host. A `:port` on either
+/// side is stripped before comparison. CIDR entries only ever match an exact
+/// host string; they are never interpreted as networks.
+pub fn no_proxy_matches(entries: &[String], host: &str) -> bool {
+    let host = strip_no_proxy_port(host.trim().to_ascii_lowercase());
+    if host.is_empty() {
+        return false;
+    }
+    entries.iter().any(|entry| {
+        let entry = strip_no_proxy_port(entry.trim().to_ascii_lowercase());
+        exception_entry_matches(&entry, &host)
+    })
+}
+
+fn exception_entry_matches(entry: &str, host: &str) -> bool {
+    if entry == "*" {
+        return true;
+    }
+    if let Some(suffix) = entry.strip_prefix("*.").or_else(|| entry.strip_prefix('.')) {
+        return host == suffix || host.ends_with(&format!(".{suffix}"));
+    }
+    entry == host
+}
+
+/// Drop a trailing `:port` from a host or exception entry. Bracketed IPv6
+/// literals keep their brackets and drop the port; anything malformed is
+/// returned unchanged rather than rejected.
+fn strip_no_proxy_port(mut value: String) -> String {
+    if value.starts_with('[') {
+        if let Some(end) = value.find(']') {
+            value.truncate(end + 1);
+        }
+        return value;
+    }
+    if value.matches(':').count() == 1 {
+        if let Some((host, _)) = value.split_once(':') {
+            return host.to_string();
+        }
+    }
+    value
 }
 
 impl fmt::Debug for ProxyPlan {

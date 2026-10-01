@@ -290,7 +290,7 @@ impl CanonicalBlock {
             references.push(attempt_id.clone());
         }
         if let Some(generation) = self.generation {
-            references.push(format!("generation {generation}"));
+            references.push(format!("generation={generation}"));
         }
         references.extend(self.calls.iter().map(|call| call.id.clone()));
         references.extend(

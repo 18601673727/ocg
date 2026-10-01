@@ -8,6 +8,7 @@
  */
 
 import type {
+  CanonicalApiVersion,
   CanonicalConfigurationEnvelope,
   CanonicalConfigurationResponse,
   CanonicalDashboardResponse,
@@ -205,6 +206,29 @@ export type CanonicalDispatchIntent = {
   failure: string | null;
   created_at: number;
   updated_at: number;
+};
+
+/**
+ * The three outcomes `JobLaunchResponse.outcome` can carry.
+ *
+ * Rust types the field as a bare `String`; the canonical launch path only ever
+ * writes these three, so the decoder admits exactly them and reports anything
+ * else rather than coercing it into a nearest known value.
+ */
+export const JOB_LAUNCH_OUTCOMES = ["accepted", "rejected", "failed"] as const;
+export type CanonicalJobLaunchOutcome = (typeof JOB_LAUNCH_OUTCOMES)[number];
+
+/** The `JobLaunchResponse` whose `outcome` is narrowed to its real vocabulary. */
+export type CanonicalJobLaunchAck = {
+  api_version: CanonicalApiVersion;
+  outcome: CanonicalJobLaunchOutcome;
+  command_id: string;
+  draft_id: string;
+  project_id: string;
+  session_id: string;
+  job_id: string | null;
+  message: string;
+  duplicate: boolean;
 };
 
 /** The `job` payload of a `CanonicalJobSnapshot`. */
@@ -679,6 +703,40 @@ const jobConfigResponse: Decoder<CanonicalJobConfigResponse> = (input, path) => 
   });
 };
 
+const jobLaunchAck: Decoder<CanonicalJobLaunchAck> = (input, path) => {
+  const rec = record(input, path, "a JobLaunchResponse");
+  if (!rec.ok) return rec;
+  const apiVersion = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
+  if (!apiVersion.ok) return apiVersion;
+  const outcome = req(rec.value, "outcome", oneOf(JOB_LAUNCH_OUTCOMES), path);
+  if (!outcome.ok) return outcome;
+  const commandId = req(rec.value, "command_id", string, path);
+  if (!commandId.ok) return commandId;
+  const draftId = req(rec.value, "draft_id", string, path);
+  if (!draftId.ok) return draftId;
+  const projectId = req(rec.value, "project_id", string, path);
+  if (!projectId.ok) return projectId;
+  const sessionId = req(rec.value, "session_id", string, path);
+  if (!sessionId.ok) return sessionId;
+  const jobId = req(rec.value, "job_id", nullable(string), path);
+  if (!jobId.ok) return jobId;
+  const message = req(rec.value, "message", string, path);
+  if (!message.ok) return message;
+  const duplicate = req(rec.value, "duplicate", boolean, path);
+  if (!duplicate.ok) return duplicate;
+  return yes({
+    api_version: apiVersion.value,
+    outcome: outcome.value,
+    command_id: commandId.value,
+    draft_id: draftId.value,
+    project_id: projectId.value,
+    session_id: sessionId.value,
+    job_id: jobId.value,
+    message: message.value,
+    duplicate: duplicate.value,
+  });
+};
+
 export const decodeProjectRecord = (input: unknown, path = "project"): ProjectRecord =>
   decode((value) => projectRecord(value, path), input);
 
@@ -704,6 +762,9 @@ export const decodeJobConfigEnvelope = (input: unknown): CanonicalJobConfigEnvel
 
 export const decodeJobConfigResponse = (input: unknown): CanonicalJobConfigResponse =>
   decode((value) => jobConfigResponse(value, ""), input);
+
+export const decodeJobLaunchResponse = (input: unknown): CanonicalJobLaunchAck =>
+  decode((value) => jobLaunchAck(value, ""), input);
 
 export const decodeEventsEnvelope = (input: unknown): CanonicalEventsEnvelope =>
   decode((value) => eventsEnvelope(value, ""), input);

@@ -3,6 +3,8 @@
 import { createContext, useCallback, useContext, useMemo, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { MockOcgRuntimeClient } from "./mock-client";
+import { CanonicalOcgRuntimeClient } from "./canonical-launch-client";
+import { useOcgControlUrl } from "../profile/control-url";
 import type { CreateSessionInput, JobLaunchResult, OcgRuntimeClient, ScenarioId } from "./runtime-types";
 import type { JobLaunchCommand } from "../job/draft-domain";
 import type { ChatSession, SendMessageInput } from "../types";
@@ -34,7 +36,16 @@ const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 const EMPTY_DIAGNOSTICS: readonly RuntimeDiagnostic[] = [];
 
 export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioId; children: ReactNode }) {
-  const client = useMemo(() => new MockOcgRuntimeClient(scenario), [scenario]);
+  // A loopback control URL means a real OCG backend is in the invocation. The
+  // shell projection stays fixture-backed, but Job launch must be real; the
+  // canonical launch client overrides only `launchJob` and projects the
+  // authoritative snapshot it returns. Without a control URL there is no
+  // backend to launch into, so the client reports that rather than fabricating.
+  const controlUrl = useOcgControlUrl();
+  const client = useMemo<OcgRuntimeClient>(() => {
+    if (controlUrl) return CanonicalOcgRuntimeClient.connect(scenario, controlUrl, fetch);
+    return new MockOcgRuntimeClient(scenario);
+  }, [scenario, controlUrl]);
   const subscribe = useCallback(
     (onStoreChange: () => void) => client.subscribe(() => onStoreChange()),
     [client],

@@ -12,9 +12,11 @@
 
 use crate::error::{OcgError, Result};
 use crate::proxy::{proxy_builder_ops, ProxyBuilderOp, ProxyPlan, ProxyScheme};
+use ntex::util::Stream;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,6 +25,12 @@ use std::time::Duration;
 /// Release archives are tens of megabytes; the cap protects against a hostile
 /// or broken server that streams without a `Content-Length`.
 pub const MAX_BODY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Upper bound on a non-2xx provider diagnostic body (4 KiB).
+///
+/// A refused provider request yields only this much of its body for the error
+/// message; it is small, and the caller redacts it before reporting.
+pub const MAX_PROVIDER_ERROR_BODY: usize = 4096;
 
 /// Time allowed for connect, write and the response head.
 ///
@@ -330,6 +338,32 @@ pub trait HttpTransport: Send + Sync {
         Err(OcgError::config("native HTTP transport does not support JSON POST"))
     }
 
+    /// Send one JSON request and deliver the response body incrementally.
+    ///
+    /// `on_chunk` runs once per received chunk, in order, before the next
+    /// chunk is read: there is no intermediate queue, so consumption is
+    /// backpressured by the caller. Returning `Ok(false)` stops the read early
+    /// (used for cancellation); returning `Err` aborts the request. The
+    /// default implementation buffers once via [`HttpTransport::post_json`]
+    /// and delivers the whole body in a single call, which is correct for
+    /// non-provider transports that do not stream.
+    ///
+    /// On success the returned [`HttpResponse`] carries the status and safe
+    /// headers with an empty `body`; the chunks already reached `on_chunk`. A
+    /// non-2xx response is never delivered to `on_chunk`; its bounded body is
+    /// returned on the [`HttpResponse`] so the caller can render a redacted
+    /// diagnostic.
+    fn post_json_stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        mut on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
+    ) -> Result<HttpResponse> {
+        let response = self.post_json(url, headers, body)?;
+        on_chunk(&response.body)?;
+        Ok(response)
+    }
 }
 
 /// The production transport uses OCG's ntex HTTP stack on the native ntex runtime.
@@ -339,6 +373,9 @@ pub trait HttpTransport: Send + Sync {
 /// `https://` URLs are accepted, and bodies are capped at [`MAX_BODY_BYTES`].
 pub struct NativeHttp {
     token: Option<GithubToken>,
+    /// The one proxy plan resolved at startup. The client never re-reads the
+    /// ambient proxy environment; this plan decides every route.
+    proxy: ProxyPlan,
 }
 
 impl NativeHttp {
@@ -356,8 +393,49 @@ impl NativeHttp {
         if proxy.endpoints().iter().any(|endpoint| endpoint.scheme() == ProxyScheme::All) {
             return Err(OcgError::config("native HTTP client does not support an untyped proxy endpoint"));
         }
-        Ok(Self { token })
+        Ok(Self { token, proxy: proxy.clone() })
     }
+
+    /// Decide the outbound route for one URL from the stored [`ProxyPlan`].
+    ///
+    /// A host covered by the resolved exception list connects directly. A host
+    /// the plan routes through a proxy cannot be served by ntex 3.12, which
+    /// exposes no client-side HTTP/HTTPS proxy connector: the call fails
+    /// closed rather than silently connecting directly. Every other host is
+    /// direct. The ambient proxy environment is never consulted again.
+    fn ensure_route(&self, url: &str) -> Result<()> {
+        let host = url_host(url)?;
+        if self.proxy.matches_no_proxy(&host) {
+            return Ok(());
+        }
+        let scheme = url.split_once("://").map(|(scheme, _)| scheme).unwrap_or("");
+        if self.proxy.endpoint_for(scheme).is_some() {
+            return Err(OcgError::config(format!(
+                "the resolved ProxyPlan routes {host} through a proxy, but ntex 3.12 provides no HTTP/HTTPS client proxy connector; refusing to connect directly"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The host of an absolute URL, lowercased and without userinfo, brackets or
+/// port. Only used to consult the stored proxy plan, never to attach secrets.
+fn url_host(url: &str) -> Result<String> {
+    let rest = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| OcgError::config(format!("cannot determine the host of URL: {url}")))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("").to_string()
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    };
+    if host.is_empty() {
+        return Err(OcgError::config(format!("URL has no host: {url}")));
+    }
+    Ok(host.to_ascii_lowercase())
 }
 
 impl HttpTransport for NativeHttp {
@@ -373,6 +451,7 @@ impl HttpTransport for NativeHttp {
         if !url.starts_with("https://") {
             return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
         }
+        self.ensure_route(url)?;
         let token = self.token.clone();
         let url = url.to_owned();
         let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
@@ -388,6 +467,7 @@ impl HttpTransport for NativeHttp {
         if !url.starts_with("https://") {
             return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
         }
+        self.ensure_route(url)?;
         let url = url.to_owned();
         let body = serde_json::to_vec(body)
             .map_err(|error| OcgError::config(format!("cannot encode JSON request: {error}")))?;
@@ -397,6 +477,28 @@ impl HttpTransport for NativeHttp {
             .collect::<Vec<_>>();
         let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
         runtime.block_on(async move { native_post_json(&url, &headers, &body).await })
+    }
+
+    fn post_json_stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
+    ) -> Result<HttpResponse> {
+        if !url.starts_with("https://") {
+            return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
+        }
+        self.ensure_route(url)?;
+        let url = url.to_owned();
+        let body = serde_json::to_vec(body)
+            .map_err(|error| OcgError::config(format!("cannot encode JSON request: {error}")))?;
+        let headers = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect::<Vec<_>>();
+        let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
+        runtime.block_on(async move { native_post_json_stream(&url, &headers, &body, on_chunk).await })
     }
 }
 
@@ -480,15 +582,20 @@ async fn native_post_json(
     })
 }
 
-async fn native_post_json_streaming<F>(
+/// Stream a JSON POST response chunk by chunk, delivering each to `on_chunk`.
+///
+/// This is the only provider execution path: the success body is never
+/// buffered whole. The ntex response payload is polled as a [`Stream`]; each
+/// chunk is handed to `on_chunk` synchronously before the next is requested,
+/// so the caller's consumption rate applies backpressure with no intermediate
+/// queue. A non-2xx status instead reads a small bounded body for diagnostics
+/// and returns it on the [`HttpResponse`].
+async fn native_post_json_stream(
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
-    mut callback: F,
-) -> Result<HttpResponse>
-where
-    F: FnMut(&[u8]) -> Result<()>,
-{
+    mut on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
+) -> Result<HttpResponse> {
     if body.len() as u64 > MAX_BODY_BYTES {
         return Err(OcgError::config(format!(
             "request to {url} exceeded the {MAX_BODY_BYTES} byte limit"
@@ -512,28 +619,52 @@ where
         .await
         .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
-    
-    // Read the response body using load_body which returns the complete body
-    let response_body = response
-        .body()
-        .await
-        .map_err(|error| OcgError::config(format!("error reading response from {url}: {error}")))?;
-    
-    // Check size limit
-    if response_body.len() > MAX_BODY_BYTES as usize {
-        return Err(OcgError::config(format!(
-            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
-        )));
+    let mut response = Box::pin(response);
+
+    if !(200..300).contains(&status) {
+        // Non-2xx: read a small bounded diagnostic body. It is never streamed
+        // to on_chunk and never carries OCG-attached headers back out.
+        let mut diagnostic = Vec::new();
+        while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
+            let chunk = chunk.map_err(|error| {
+                OcgError::config(format!("cannot read the error response from {url}: {error}"))
+            })?;
+            if diagnostic.len() + chunk.len() > MAX_PROVIDER_ERROR_BODY {
+                break;
+            }
+            diagnostic.extend_from_slice(&chunk);
+        }
+        return Ok(HttpResponse {
+            status,
+            rate_limit: RateLimit::default(),
+            body: diagnostic,
+        });
     }
-    
-    // For now, invoke callback with the complete body
-    // TODO: Implement true streaming when ntex provides a streaming API
-    callback(&response_body)?;
-    
+
+    // 2xx success: incremental delivery with backpressure. The total byte
+    // count is enforced here because polling the raw payload stream bypasses
+    // the buffered reader that applies the configured payload limit.
+    let mut total: u64 = 0;
+    while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
+        let chunk = chunk.map_err(|error| {
+            OcgError::config(format!("error reading streamed response from {url}: {error}"))
+        })?;
+        total += chunk.len() as u64;
+        if total > MAX_BODY_BYTES {
+            return Err(OcgError::config(format!(
+                "streamed response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+            )));
+        }
+        if !on_chunk(&chunk)? {
+            // The consumer asked to stop (cancellation): stop reading and let
+            // the caller treat the partial stream as not completed.
+            break;
+        }
+    }
     Ok(HttpResponse {
         status,
         rate_limit: RateLimit::default(),
-        body: response_body.to_vec(),
+        body: Vec::new(),
     })
 }
 

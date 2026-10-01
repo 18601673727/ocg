@@ -12,7 +12,7 @@ use crate::native_tools::{
     openai_projection::OpenAiToolProjection, PermissionPolicy,
 };
 use crate::openai_compatible::{
-    ChatFinishReason, ChatStreamSummary, CompletedToolCall,
+    ChatFinishReason, ChatStreamEvent, ChatStreamSummary, CompletedToolCall, NormalizedUsage,
 };
 use crate::orchestration::budget::{BudgetConfig, QuotaFacts};
 use crate::orchestration::domain::{
@@ -24,24 +24,9 @@ use crate::orchestration::execution_dispatch::{
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const MAX_PROVIDER_ROUNDS: usize = 32;
-
-/// Events emitted during provider streaming.
-#[derive(Debug, Clone)]
-pub enum ProviderStreamEvent {
-    /// Text delta from the assistant
-    TextDelta(String),
-    /// Reasoning content delta
-    ReasoningDelta(String),
-    /// A tool call has started (id and name known)
-    ToolCallStart { id: String, name: String, index: u32 },
-    /// Tool call arguments delta
-    ToolCallArgumentsDelta { id: String, arguments: String, index: u32 },
-    /// Finish reason received
-    FinishReason(ChatFinishReason),
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderRound {
@@ -60,13 +45,358 @@ pub trait OpenAiCompatibleProvider: Send + Sync {
     fn complete(&self, request: &Value) -> Result<ProviderRound>;
 }
 
+/// Shared, cancellation-aware state for one streamed provider round. The
+/// `on_chunk` callback runs inside the HTTP transport's async read, so the
+/// state lives behind an [`Arc`]/[`Mutex`] the callback can own.
+struct StreamedRoundState {
+    /// Undecoded bytes carried across chunks for UTF-8 / SSE framing.
+    accumulator: SseAccumulator,
+    /// Whole-body JSON buffer for a non-streamed completion response.
+    json_buffer: Vec<u8>,
+    mode: StreamMode,
+    summary: ChatStreamSummary,
+    done: bool,
+}
+
+impl StreamedRoundState {
+    fn new() -> Self {
+        Self {
+            accumulator: SseAccumulator::new(),
+            json_buffer: Vec::new(),
+            mode: StreamMode::Undetermined,
+            summary: ChatStreamSummary::default(),
+            done: false,
+        }
+    }
+
+    /// Feed one raw chunk. Returns `Ok(false)` when the stream is finished
+    /// (`[DONE]` or a complete JSON body) and reading should stop.
+    fn consume(&mut self, chunk: &[u8]) -> Result<bool> {
+        if self.mode == StreamMode::Undetermined {
+            self.mode = detect_stream_mode(chunk);
+        }
+        match self.mode {
+            StreamMode::Sse => {
+                for event in self.accumulator.consume(chunk)? {
+                    apply_chunk_json(&mut self.summary, &event)?;
+                }
+                self.done = self.accumulator.finished();
+                Ok(!self.done)
+            }
+            StreamMode::CompletionJson => {
+                self.json_buffer.extend_from_slice(chunk);
+                Ok(true)
+            }
+            StreamMode::Undetermined => Ok(true),
+        }
+    }
+
+    /// Called once the transport finished delivering chunks.
+    fn finish(&mut self) -> Result<ProviderRound> {
+        if self.mode == StreamMode::Sse {
+            for event in self.accumulator.finish()? {
+                apply_chunk_json(&mut self.summary, &event)?;
+            }
+        } else {
+            let value: Value = serde_json::from_slice(&self.json_buffer).map_err(|error| {
+                OcgError::config(format!("invalid provider completion JSON: {error}"))
+            })?;
+            apply_completion_json(&mut self.summary, &value)?;
+        }
+        Ok(ProviderRound {
+            assistant: build_assistant_message(&self.summary),
+            summary: self.summary.clone(),
+        })
+    }
+}
+
+/// Which wire shape the response uses. Decided lazily from the first chunk so
+/// both `stream: true` (SSE) and `stream: false` (one JSON completion) decode
+/// through the same incremental path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    Undetermined,
+    Sse,
+    CompletionJson,
+}
+
+fn detect_stream_mode(first_chunk: &[u8]) -> StreamMode {
+    let trimmed = first_chunk
+        .iter()
+        .copied()
+        .skip_while(|byte| byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    match trimmed.first() {
+        Some(b'{') | Some(b'[') => StreamMode::CompletionJson,
+        _ => StreamMode::Sse,
+    }
+}
+
+/// Incremental SSE frame decoder over raw response chunks. It preserves the
+/// undecoded byte remainder across chunks (a multi-byte UTF-8 codepoint can
+/// span chunks), buffers partial lines, and only emits an event once its
+/// terminating blank line has arrived, so events, JSON objects, and
+/// multi-`data:` payloads are never delivered partially.
+struct SseAccumulator {
+    /// Bytes not yet decodable as UTF-8 (partial codepoint at chunk boundary).
+    raw: Vec<u8>,
+    /// Decoded text not yet terminated by a newline.
+    line: String,
+    /// `data:` payloads of the event currently being assembled.
+    data: Vec<String>,
+    /// `[DONE]` was received.
+    done: bool,
+}
+
+impl SseAccumulator {
+    fn new() -> Self {
+        Self { raw: Vec::new(), line: String::new(), data: Vec::new(), done: false }
+    }
+
+    fn finished(&self) -> bool {
+        self.done
+    }
+
+    /// Feed one chunk and return every SSE event completed by it.
+    fn consume(&mut self, chunk: &[u8]) -> Result<Vec<Value>> {
+        self.raw.extend_from_slice(chunk);
+        let (decoded, consumed) = decode_utf8_prefix(&self.raw)?;
+        self.raw.drain(..consumed);
+        self.line.push_str(&decoded);
+        self.drain_complete_lines(false)
+    }
+
+    /// Flush any event left without a terminating blank line at end of stream.
+    fn finish(&mut self) -> Result<Vec<Value>> {
+        self.drain_complete_lines(true)
+    }
+
+    fn drain_complete_lines(&mut self, flush: bool) -> Result<Vec<Value>> {
+        let mut events = Vec::new();
+        loop {
+            match self.line.find('\n') {
+                Some(position) => {
+                    let text = self.line[..position].trim_end_matches('\r').to_string();
+                    self.line.drain(..=position);
+                    self.handle_line(&text, &mut events)?;
+                }
+                None => break,
+            }
+        }
+        if flush {
+            // No trailing newline: treat any residue as a final line, then
+            // emit any pending event that never got its blank line.
+            let residue = std::mem::take(&mut self.line);
+            if !residue.is_empty() {
+                let text = residue.trim_end_matches('\r').to_string();
+                self.handle_line(&text, &mut events)?;
+            }
+            self.end_event(&mut events)?;
+        }
+        Ok(events)
+    }
+
+    fn handle_line(&mut self, line: &str, events: &mut Vec<Value>) -> Result<()> {
+        if line.is_empty() {
+            // A blank line terminates the current event.
+            return self.end_event(events);
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            self.data.push(data.strip_prefix(' ').unwrap_or(data).to_string());
+        }
+        // Comment lines (`:`) and `event:`/`id:`/`retry:` fields are ignored.
+        Ok(())
+    }
+
+    fn end_event(&mut self, events: &mut Vec<Value>) -> Result<()> {
+        if self.data.is_empty() {
+            return Ok(());
+        }
+        let payload = self.data.join("\n");
+        self.data.clear();
+        if payload.trim() == "[DONE]" {
+            self.done = true;
+            return Ok(());
+        }
+        let value: Value = serde_json::from_str(&payload).map_err(|error| {
+            OcgError::config(format!("invalid provider SSE JSON: {error}"))
+        })?;
+        events.push(value);
+        Ok(())
+    }
+}
+
+/// Decode the longest valid UTF-8 prefix of `raw`, returning the decoded text
+/// and the number of input bytes consumed. Incomplete trailing codepoints stay
+/// in `raw` for the next chunk; invalid bytes are dropped so the remainder can
+/// never grow without bound.
+fn decode_utf8_prefix(raw: &[u8]) -> Result<(String, usize)> {
+    match std::str::from_utf8(raw) {
+        Ok(text) => Ok((text.to_string(), raw.len())),
+        Err(error) => {
+            let valid = error.valid_up_to();
+            let skip = error.error_len().unwrap_or(0);
+            let decoded = String::from_utf8_lossy(&raw[..valid]).into_owned();
+            Ok((decoded, valid + skip))
+        }
+    }
+}
+
+fn parse_finish_reason(raw: &str) -> ChatFinishReason {
+    match raw {
+        "stop" => ChatFinishReason::Stop,
+        "length" => ChatFinishReason::Length,
+        "tool_calls" => ChatFinishReason::ToolCalls,
+        "content_filter" => ChatFinishReason::ContentFilter,
+        "error" => ChatFinishReason::Error,
+        _ => ChatFinishReason::Other,
+    }
+}
+
+fn parse_usage(value: &Value) -> NormalizedUsage {
+    let mut usage = NormalizedUsage { raw: Some(value.clone()), ..NormalizedUsage::default() };
+    usage.input_tokens = value.get("prompt_tokens").and_then(Value::as_u64).map(|v| v as u32);
+    usage.output_tokens = value.get("completion_tokens").and_then(Value::as_u64).map(|v| v as u32);
+    usage
+}
+
+/// Fold one streamed chat-completion chunk into the summary. Tool-call
+/// argument deltas accumulate by the OpenAI `index` even when a fragment
+/// carries no `id` or `name`, matching [`ChatStreamSummary::apply`].
+fn apply_chunk_json(summary: &mut ChatStreamSummary, value: &Value) -> Result<()> {
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        if let Some(first) = choices.first() {
+            if let Some(delta) = first.get("delta") {
+                if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        summary.apply(&ChatStreamEvent::TextDelta { delta: content.to_string() });
+                    }
+                }
+                if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                    if !reasoning.is_empty() {
+                        summary.apply(&ChatStreamEvent::ReasoningDelta { delta: reasoning.to_string() });
+                    }
+                }
+                if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                    for call in tool_calls {
+                        let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                        if let Some(function) = call.get("function") {
+                            if let (Some(id), Some(name)) = (
+                                call.get("id").and_then(Value::as_str),
+                                function.get("name").and_then(Value::as_str),
+                            ) {
+                                summary.apply(&ChatStreamEvent::ToolCallStart {
+                                    index,
+                                    id: id.to_string(),
+                                    name: name.to_string(),
+                                });
+                            }
+                            if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                                if !arguments.is_empty() {
+                                    summary.apply(&ChatStreamEvent::ToolCallArgumentsDelta {
+                                        index,
+                                        id: id.to_string(),
+                                        delta: arguments.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(finish_reason) = first.get("finish_reason").and_then(Value::as_str) {
+                summary.finish_reason = Some(parse_finish_reason(finish_reason));
+                summary.raw_finish_reason = Some(finish_reason.to_string());
+            }
+        }
+    }
+    if let Some(usage) = value.get("usage") {
+        summary.usage = parse_usage(usage);
+    }
+    Ok(())
+}
+
+/// Fold one complete (non-streamed) chat-completion response into the summary.
+fn apply_completion_json(summary: &mut ChatStreamSummary, value: &Value) -> Result<()> {
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        if let Some(first) = choices.first() {
+            if let Some(message) = first.get("message") {
+                if let Some(content) = message.get("content").and_then(Value::as_str) {
+                    summary.text.push_str(content);
+                }
+                if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+                    summary.reasoning.push_str(reasoning);
+                }
+                if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for (position, call) in tool_calls.iter().enumerate() {
+                        let index = call
+                            .get("index")
+                            .and_then(Value::as_u64)
+                            .map(|v| v as u32)
+                            .unwrap_or(position as u32);
+                        if let (Some(id), Some(function)) = (
+                            call.get("id").and_then(Value::as_str),
+                            call.get("function"),
+                        ) {
+                            if let (Some(name), Some(arguments)) = (
+                                function.get("name").and_then(Value::as_str),
+                                function.get("arguments").and_then(Value::as_str),
+                            ) {
+                                summary.apply(&ChatStreamEvent::ToolCallComplete {
+                                    index,
+                                    id: id.to_string(),
+                                    name: name.to_string(),
+                                    arguments: arguments.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(finish_reason) = first.get("finish_reason").and_then(Value::as_str) {
+                summary.finish_reason = Some(parse_finish_reason(finish_reason));
+                summary.raw_finish_reason = Some(finish_reason.to_string());
+            }
+        }
+    }
+    if let Some(usage) = value.get("usage") {
+        summary.usage = parse_usage(usage);
+    }
+    Ok(())
+}
+
+/// Build the assistant message that goes back on the wire for the next round.
+fn build_assistant_message(summary: &ChatStreamSummary) -> Value {
+    let tool_calls: Vec<Value> = summary
+        .tool_calls
+        .iter()
+        .map(|call| {
+            json!({"id": call.id, "type": "function", "function": {"name": call.name, "arguments": call.arguments}})
+        })
+        .collect();
+    let mut message = if tool_calls.is_empty() {
+        json!({"role": "assistant", "content": summary.text})
+    } else {
+        json!({"role": "assistant", "content": summary.text, "tool_calls": tool_calls})
+    };
+    if !summary.reasoning.is_empty() {
+        message["reasoning_content"] = json!(summary.reasoning);
+    }
+    message
+}
+
 /// A provider client using the repository's native ntex HTTP surface.
-/// It decodes OpenAI-compatible response JSON/SSE and uses the existing
-/// `ToolCallNormalizer`/`ChatStreamSummary` path for tool-call assembly.
+/// It decodes OpenAI-compatible response JSON/SSE incrementally through the
+/// existing `ChatStreamEvent`/`ChatStreamSummary` path and uses the existing
+/// `ToolCallNormalizer` semantics (tool-call argument deltas accumulate by
+/// `index`).
 pub struct NativeOpenAiCompatibleProvider<'a> {
     transport: &'a dyn HttpTransport,
     endpoint: String,
     bearer: Option<String>,
+    upstream_model_id: String,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl<'a> NativeOpenAiCompatibleProvider<'a> {
@@ -74,11 +404,15 @@ impl<'a> NativeOpenAiCompatibleProvider<'a> {
         transport: &'a dyn HttpTransport,
         endpoint: impl Into<String>,
         bearer: Option<String>,
+        upstream_model_id: impl Into<String>,
+        cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             transport,
             endpoint: endpoint.into(),
             bearer,
+            upstream_model_id: upstream_model_id.into(),
+            cancelled,
         }
     }
 }
@@ -183,30 +517,60 @@ impl CanonicalProviderCallHandler {
         };
         let executor = domain.executor(envelope.executor_id.as_deref().unwrap_or(""))?
             .ok_or_else(|| OcgError::config("provider Call executor not found"))?;
-        
-        // Resolve provider configuration from envelope
+
+        // Resolve provider configuration from envelope. This is the frozen
+        // durable identity the Call was admitted with; it is revalidated, never
+        // re-resolved, so recovery and re-execution use the same provider,
+        // model, endpoint, and credential reference.
         let provider_config = envelope.provider_config.as_ref().ok_or_else(|| {
             fail_provider_envelope(&config.project_root, &envelope, "provider Call missing provider_config");
             OcgError::config("provider Call missing provider_config")
         })?;
-        
-        // Resolve credential from the user-global Vault at execution time, the
-        // same store `ocg auth` writes and the same one admission validated the
-        // reference against. The project root is a directory and is not a
-        // credential store.
+
+        if intent.job_id != envelope.job_id
+            || intent.attempt_id != envelope.attempt_id
+            || intent.generation != envelope.generation
+            || intent.executor_id != envelope.executor_id
+            || intent.request != envelope.payload
+            || intent.provider_key.as_deref() != Some(provider_config.provider_key.as_str())
+            || intent.model.as_deref() != Some(provider_config.model.as_str())
+            || intent.upstream_model_id.as_deref() != Some(provider_config.upstream_model_id.as_str())
+            || intent.endpoint.as_deref() != Some(provider_config.endpoint.as_str())
+            || intent.credential_ref != provider_config.credential_ref
+        {
+            fail_provider_envelope(&config.project_root, &envelope, "provider envelope differs from frozen dispatch intent");
+            return Err(OcgError::config("provider envelope differs from frozen dispatch intent"));
+        }
+
+        // The wire model id is the frozen upstream model id, not the Profile
+        // model key. It is set here, before any tool injection, so every round
+        // uses the frozen identity.
+        if let Some(object) = request.as_object_mut() {
+            object.insert("model".to_string(), Value::String(provider_config.upstream_model_id.clone()));
+        }
+
+        // Resolve credential from the user-global Vault at execution time,
+        // immediately before the side effect. `None` means no Authorization
+        // header; `Some(ref)` missing from the Vault fails closed. The raw
+        // token is held only in `bearer` and never persisted or logged.
         let vault = crate::vault::Vault::user_global()?;
-        let bearer = vault.get(&provider_config.credential_ref)?.ok_or_else(|| {
-            fail_provider_envelope(&config.project_root, &envelope, "credential not found in Vault");
-            OcgError::config(format!("credential not found: {}", provider_config.credential_ref))
-        })?;
-        
+        let bearer = match &provider_config.credential_ref {
+            Some(credential_ref) => Some(vault.get(credential_ref)?.ok_or_else(|| {
+                fail_provider_envelope(&config.project_root, &envelope, "credential not found in Vault");
+                OcgError::config("provider credential not found in the user-global Vault")
+            })?),
+            None => None,
+        };
+
         drop(domain);
         let provider = NativeOpenAiCompatibleProvider::new(
             config.transport.as_ref(),
             provider_config.endpoint.clone(),
-            Some(bearer),
+            bearer,
+            provider_config.upstream_model_id.clone(),
+            Arc::clone(&config.cancelled),
         );
-        let response = execute_provider_loop(
+        let response = match execute_provider_loop(
             &provider,
             &config.project_root,
             &envelope,
@@ -216,7 +580,15 @@ impl CanonicalProviderCallHandler {
             config.permission_policy,
             &config.cancelled,
             &config.native_tool_dispatcher,
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                // A failed or cancelled provider round is a terminal Call
+                // failure, never a completion.
+                fail_provider_envelope(&config.project_root, &envelope, &error.to_string());
+                return Err(error);
+            }
+        };
         let mut domain = DomainRepository::open(&config.project_root)?;
         let serialized = serde_json::to_string(&json!({
             "content": response.content,
@@ -270,8 +642,9 @@ pub fn admit_provider_call(
         &call.id,
         &provider_config.provider_key,
         &provider_config.model,
+        &provider_config.upstream_model_id,
         &provider_config.endpoint,
-        &provider_config.credential_ref,
+        provider_config.credential_ref.as_deref(),
     )?;
 
     // Resolve canonical Project identity from Job ownership
@@ -355,18 +728,21 @@ pub fn requeue_recovered_provider_call(
             OcgError::config("recovered provider Call has stale Attempt authority")
         })?;
 
-    // Requeue using existing Call identity
-    let provider_config = if let (Some(pk), Some(m), Some(ep), Some(cr)) = (
+    // Requeue using existing Call identity. The frozen provider configuration
+    // is reused exactly as admitted; the credential reference is optional and
+    // re-read from the user-global Vault at execution time.
+    let provider_config = if let (Some(pk), Some(m), Some(ep), Some(umi)) = (
         intent.provider_key.as_ref(),
         intent.model.as_ref(),
         intent.endpoint.as_ref(),
-        intent.credential_ref.as_ref(),
+        intent.upstream_model_id.as_ref(),
     ) {
         Some(crate::orchestration::execution_dispatch::ProviderExecutionConfig {
             provider_key: pk.clone(),
             model: m.clone(),
+            upstream_model_id: umi.clone(),
             endpoint: ep.clone(),
-            credential_ref: cr.clone(),
+            credential_ref: intent.credential_ref.clone(),
         })
     } else {
         None
@@ -540,7 +916,7 @@ fn execute_provider_loop(
     let model = envelope
         .provider_config
         .as_ref()
-        .map(|config| config.model.clone())
+        .map(|config| config.upstream_model_id.clone())
         .unwrap_or_default();
 
     // Inject native tools into request
@@ -993,322 +1369,73 @@ fn wait_for_call_completion(project_root: &Path, call_id: &str) -> Result<String
     Err(OcgError::config("native tool Call timeout"))
 }
 
-fn decode_provider_response(body: &[u8]) -> Result<ProviderRound> {
-    let text = String::from_utf8_lossy(body);
-    let mut summary = ChatStreamSummary::default();
-    let mut assistant_tool_calls = Vec::new();
-    let mut assistant_content = String::new();
-    let mut assistant_reasoning = String::new();
-    if text.lines().any(|line| line.starts_with("data:")) {
-        // SSE format - parse manually
-        for line in text.lines().filter_map(|line| line.strip_prefix("data:")) {
-            let payload = line.trim();
-            if payload == "[DONE]" || payload.is_empty() {
-                continue;
-            }
-            let value: Value = serde_json::from_str(payload)
-                .map_err(|error| OcgError::config(format!("invalid provider SSE JSON: {error}")))?;
-
-            // Manually extract content and tool calls from delta
-            if let Some(choices) = value.get("choices").and_then(Value::as_array) {
-                if let Some(first) = choices.first() {
-                    if let Some(delta) = first.get("delta") {
-                        if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                            assistant_content.push_str(content);
-                            summary.text.push_str(content);
-                        }
-                        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                            assistant_reasoning.push_str(reasoning);
-                            summary.reasoning.push_str(reasoning);
-                        }
-                        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                            for call in tool_calls {
-                                if let Some(function) = call.get("function") {
-                                    if let (Some(id), Some(name)) = (
-                                        call.get("id").and_then(Value::as_str),
-                                        function.get("name").and_then(Value::as_str),
-                                    ) {
-                                        // Check if this tool call already exists
-                                        if !summary.tool_calls.iter().any(|tc| tc.id == id) {
-                                            summary.tool_calls.push(CompletedToolCall {
-                                                index: summary.tool_calls.len() as u32,
-                                                id: id.to_string(),
-                                                name: name.to_string(),
-                                                arguments: String::new(),
-                                            });
-                                        }
-                                    }
-                                    if let (Some(id), Some(arguments)) = (
-                                        call.get("id").and_then(Value::as_str),
-                                        function.get("arguments").and_then(Value::as_str),
-                                    ) {
-                                        if let Some(tc) = summary.tool_calls.iter_mut().find(|tc| tc.id == id) {
-                                            tc.arguments.push_str(arguments);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(finish_reason) = first.get("finish_reason").and_then(Value::as_str) {
-                        summary.finish_reason = match finish_reason {
-                            "stop" => Some(ChatFinishReason::Stop),
-                            "length" => Some(ChatFinishReason::Length),
-                            "tool_calls" => Some(ChatFinishReason::ToolCalls),
-                            _ => Some(ChatFinishReason::Stop),
-                        };
-                    }
-                }
-            }
-        }
-        assistant_tool_calls.extend(summary.tool_calls.iter().map(|call| {
-            json!({"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}})
-        }));
-    } else {
-        let value: Value = serde_json::from_slice(body).map_err(|error| {
-            OcgError::config(format!("invalid provider non-SSE JSON: {error}"))
-        })?;
-        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
-            if let Some(first) = choices.first() {
-                if let Some(message) = first.get("message") {
-                    if let Some(content) = message.get("content").and_then(Value::as_str) {
-                        assistant_content = content.to_string();
-                    }
-                    if let Some(reasoning_content) = message
-                        .get("reasoning_content")
-                        .and_then(Value::as_str)
-                    {
-                        assistant_reasoning = reasoning_content.to_string();
-                    }
-                    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-                        for call in tool_calls {
-                            if let (Some(id), Some(function)) = (
-                                call.get("id").and_then(Value::as_str),
-                                call.get("function"),
-                            ) {
-                                if let (Some(name), Some(arguments)) = (
-                                    function.get("name").and_then(Value::as_str),
-                                    function.get("arguments").and_then(Value::as_str),
-                                ) {
-                                    summary.tool_calls.push(
-                                        crate::openai_compatible::stream::CompletedToolCall {
-                                            index: 0,
-                                            id: id.to_string(),
-                                            name: name.to_string(),
-                                            arguments: arguments.to_string(),
-                                        },
-                                    );
-                                    assistant_tool_calls.push(call.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(finish_reason) = first
-                    .get("finish_reason")
-                    .and_then(Value::as_str)
-                {
-                    summary.finish_reason = match finish_reason {
-                        "stop" => Some(ChatFinishReason::Stop),
-                        "length" => Some(ChatFinishReason::Length),
-                        "tool_calls" => Some(ChatFinishReason::ToolCalls),
-                        _ => Some(ChatFinishReason::Stop),
-                    };
-                }
-            }
-        }
-        summary.text = assistant_content.clone();
-        summary.reasoning = assistant_reasoning.clone();
-    }
-    let assistant = if !assistant_tool_calls.is_empty() {
-        let mut message = json!({"role":"assistant","content":assistant_content,"tool_calls":assistant_tool_calls});
-        if !assistant_reasoning.is_empty() {
-            message["reasoning_content"] = json!(assistant_reasoning);
-        }
-        message
-    } else {
-        let mut message = json!({"role":"assistant","content":assistant_content});
-        if !assistant_reasoning.is_empty() {
-            message["reasoning_content"] = json!(assistant_reasoning);
-        }
-        message
-    };
-    Ok(ProviderRound { assistant, summary })
-}
-
-/// Stateful SSE chunk parser that handles cross-chunk boundaries.
-struct SseChunkParser {
-    buffer: String,
-}
-
-impl SseChunkParser {
-    fn new() -> Self {
-        Self {
-            buffer: String::new(),
-        }
-    }
-
-    /// Parse a chunk and invoke callback for each complete SSE event.
-    /// Handles partial UTF-8, partial SSE lines, and partial JSON.
-    fn parse_chunk<F>(&mut self, chunk: &[u8], callback: &mut F) -> Result<()>
-    where
-        F: FnMut(ProviderStreamEvent) -> Result<()>,
-    {
-        // Append chunk to buffer (may contain partial UTF-8)
-        match std::str::from_utf8(chunk) {
-            Ok(text) => self.buffer.push_str(text),
-            Err(error) => {
-                // Partial UTF-8 at end of chunk - buffer it
-                let valid_up_to = error.valid_up_to();
-                if valid_up_to > 0 {
-                    self.buffer.push_str(&String::from_utf8_lossy(&chunk[..valid_up_to]));
-                }
-                // The rest will be completed in the next chunk
-                return Ok(());
-            }
-        }
-
-        // Process complete lines
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let line = self.buffer[..newline_pos].trim_end_matches('\r').to_string();
-            self.buffer.drain(..=newline_pos);
-
-            if let Some(data) = line.strip_prefix("data:") {
-                let payload = data.trim();
-                if payload == "[DONE]" || payload.is_empty() {
-                    continue;
-                }
-
-                // Parse JSON and emit events
-                match serde_json::from_str::<Value>(payload) {
-                    Ok(value) => {
-                        self.parse_sse_event(&value, callback)?;
-                    }
-                    Err(_) => {
-                        // Incomplete JSON - put the line back and wait for more data
-                        self.buffer.insert_str(0, &format!("{}\n", line));
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn parse_sse_event<F>(&self, value: &Value, callback: &mut F) -> Result<()>
-    where
-        F: FnMut(ProviderStreamEvent) -> Result<()>,
-    {
-        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
-            if let Some(first) = choices.first() {
-                if let Some(delta) = first.get("delta") {
-                    // Text content delta
-                    if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                        if !content.is_empty() {
-                            callback(ProviderStreamEvent::TextDelta(content.to_string()))?;
-                        }
-                    }
-
-                    // Reasoning content delta
-                    if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-                        if !reasoning.is_empty() {
-                            callback(ProviderStreamEvent::ReasoningDelta(reasoning.to_string()))?;
-                        }
-                    }
-
-                    // Tool calls
-                    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-                        for call in tool_calls {
-                            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-
-                            if let Some(function) = call.get("function") {
-                                // Tool call start (id and name present)
-                                if let (Some(id), Some(name)) = (
-                                    call.get("id").and_then(Value::as_str),
-                                    function.get("name").and_then(Value::as_str),
-                                ) {
-                                    callback(ProviderStreamEvent::ToolCallStart {
-                                        id: id.to_string(),
-                                        name: name.to_string(),
-                                        index,
-                                    })?;
-                                }
-
-                                // Tool call arguments delta
-                                if let (Some(id), Some(arguments)) = (
-                                    call.get("id").and_then(Value::as_str),
-                                    function.get("arguments").and_then(Value::as_str),
-                                ) {
-                                    if !arguments.is_empty() {
-                                        callback(ProviderStreamEvent::ToolCallArgumentsDelta {
-                                            id: id.to_string(),
-                                            arguments: arguments.to_string(),
-                                            index,
-                                        })?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Finish reason
-                if let Some(finish_reason) = first.get("finish_reason").and_then(Value::as_str) {
-                    let reason = match finish_reason {
-                        "stop" => ChatFinishReason::Stop,
-                        "length" => ChatFinishReason::Length,
-                        "tool_calls" => ChatFinishReason::ToolCalls,
-                        "content_filter" => ChatFinishReason::ContentFilter,
-                        "error" => ChatFinishReason::Error,
-                        _ => ChatFinishReason::Other,
-                    };
-                    callback(ProviderStreamEvent::FinishReason(reason))?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
 impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
     fn complete(&self, request: &Value) -> Result<ProviderRound> {
-        // Inject stream: true if not already present
-        let body = if request.get("stream").is_none() {
-            let mut body = request.clone();
+        // The frozen upstream model id is authoritative on the wire.
+        let mut body = request.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("model".to_string(), Value::String(self.upstream_model_id.clone()));
+        }
+        // Default to streaming so the success path is incremental.
+        let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(true);
+        if body.get("stream").is_none() {
             body["stream"] = Value::Bool(true);
-            body
-        } else {
-            request.clone()
-        };
+        }
 
-        let accept = if body.get("stream").and_then(Value::as_bool) == Some(true) {
-            "text/event-stream"
-        } else {
-            "application/json"
-        };
+        let accept = if streaming { "text/event-stream" } else { "application/json" };
         let mut headers = vec![("Content-Type", "application/json"), ("Accept", accept)];
-
-        // Vault stores the raw token; the header value is built only here.
+        // The Vault stores the raw token; the header value is built only here.
         let authorization = self.bearer.as_ref().map(|token| format!("Bearer {token}"));
         if let Some(value) = &authorization {
             headers.push(("Authorization", value.as_str()));
         }
 
-        let response = self.transport.post_json(&self.endpoint, &headers, &body)?;
+        // Shared state for the chunk callback. The callback runs inside the
+        // transport's async read, so it owns a handle to this state.
+        let state = Arc::new(Mutex::new(StreamedRoundState::new()));
+        let callback_state = Arc::clone(&state);
+        let cancelled = Arc::clone(&self.cancelled);
+        let on_chunk = Box::new(move |chunk: &[u8]| -> Result<bool> {
+            // Cancellation is checked during consumption; stop reading and let
+            // the caller close the Call as failed/cancelled, never completed.
+            if cancelled.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
+            let mut guard = callback_state
+                .lock()
+                .map_err(|_| OcgError::config("provider stream state poisoned"))?;
+            guard.consume(chunk)
+        });
+
+        let response = self
+            .transport
+            .post_json_stream(&self.endpoint, &headers, &body, on_chunk)?;
 
         if !response.is_success() {
-            const MAX_ERROR_BODY: usize = 2048;
-            let excerpt = &response.body[..response.body.len().min(MAX_ERROR_BODY)];
+            // Bounded, redacted diagnostic. The provider's error body is small
+            // and any occurrence of the bearer token is removed before the
+            // message leaves this function.
+            let body_limit = response.body.len().min(crate::http::MAX_PROVIDER_ERROR_BODY);
+            let mut excerpt = String::from_utf8_lossy(&response.body[..body_limit]).into_owned();
+            if let Some(token) = &self.bearer {
+                excerpt = excerpt.replace(token, "<redacted>");
+            }
             return Err(OcgError::config(format!(
                 "OpenAI-compatible provider returned HTTP {}: {}",
-                response.status,
-                String::from_utf8_lossy(excerpt)
+                response.status, excerpt
             )));
         }
 
-        decode_provider_response(&response.body)
+        // If cancellation interrupted the stream, this round is not a
+        // completion.
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(OcgError::config("provider Call cancelled during streaming"));
+        }
+
+        let mut state = state
+            .lock()
+            .map_err(|_| OcgError::config("provider stream state poisoned"))?;
+        state.finish()
     }
 }
 

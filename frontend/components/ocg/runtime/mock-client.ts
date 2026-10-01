@@ -16,17 +16,12 @@ import {
 import { ONBOARDING_STAGES, type BootstrapState, type OnboardingStageId } from "../bootstrap/types";
 import type {
   CreateSessionInput,
-  JobLaunchCommand,
-  JobLaunchResult,
   OcgRuntimeClient,
   RuntimeSnapshot,
   ScenarioId,
 } from "./runtime-types";
-import { isProjectId, type ProjectId } from "../project/domain";
+import { type ProjectId } from "../project/domain";
 import { FIXTURE_PROJECT_IDS, projectSessionIds } from "../project/fixtures";
-import { createJobLaunchObservability } from "../job/launch-fixtures";
-import { assembleJobExecution } from "../execution/domain";
-import { CANONICAL_API_VERSION } from "../contracts";
 import { RuntimeEnvelopeFactory, eventSessionId, type AnyRuntimeEnvelope } from "./runtime-envelope";
 import { createSnapshotEnvelopeFromFixture } from "./runtime-snapshot";
 import { RuntimeStore } from "./runtime-store";
@@ -48,11 +43,11 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   private readonly listeners = new Set<(event: OcgRuntimeEvent) => void>();
   private readonly timers = new Map<string, Timer[]>();
   private nextId = 0;
-  private readonly store: RuntimeStore;
+  /** The single runtime store. A backend-backed subclass projects real Job
+   * execution through it rather than keeping a second runtime store. */
+  protected readonly store: RuntimeStore;
   private readonly envelopes: RuntimeEnvelopeFactory;
   private liveScenarioStarted = false;
-  /** Accepted launch results keyed by stable command identity for idempotency. */
-  private readonly launchResults = new Map<string, JobLaunchResult>();
 
   constructor(scenario: ScenarioId) {
     this.scenario = scenario;
@@ -267,109 +262,11 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     }
   }
 
-  /**
-   * Deterministic, frontend-only Job launch.
-   *
-   * - disconnected runtimes fail without mutating the snapshot;
-   * - a session owned by another Project is rejected;
-   * - a repeated accepted command identity returns the previously recorded result;
-   * - rejected/failed attempts remain retryable if the runtime condition changes;
-   * - an accepted command projects execution/observability through the
-   *   canonical reconciler, never through a parallel UI mutation.
-   */
-  async launchJob(command: JobLaunchCommand): Promise<JobLaunchResult> {
-    const prior = this.launchResults.get(command.commandId);
-    if (prior) {
-      return { ...clone(prior), duplicate: true };
-    }
-
-    const result = this.resolveLaunch(command);
-    // Only an accepted projection is durable within this fixture. Adapter
-    // failures and rejections do not mutate state and must remain retryable;
-    // accepted commands are the ones that need duplicate protection.
-    if (result.outcome === "accepted") this.launchResults.set(command.commandId, clone(result));
-    this.emit(
-      { type: "job.launch-updated", sessionId: command.sessionId, result: clone(result) },
-      { projectId: command.projectId ?? null, commandId: command.commandId },
-    );
-    return clone(result);
-  }
-
-  private resolveLaunch(command: JobLaunchCommand): JobLaunchResult {
-    const base = {
-      commandId: command.commandId,
-      draftId: command.draftId,
-      projectId: command.projectId,
-      sessionId: command.sessionId,
-      duplicate: false,
-    };
-
-    const snapshot = this.store.getSnapshot();
-    if (snapshot.status.state !== "connected") {
-      return {
-        ...base,
-        outcome: "failed",
-        message: snapshot.status.detail ?? "The local runtime is not connected; launch not attempted.",
-      };
-    }
-
-    if (!isProjectId(command.projectId)) {
-      return { ...base, outcome: "rejected", message: `Unknown Project "${command.projectId}"; launch rejected.` };
-    }
-
-    const session = snapshot.sessions.find((item) => item.id === command.sessionId);
-    if (!session) {
-      return { ...base, outcome: "failed", message: `Unknown session "${command.sessionId}"; launch failed.` };
-    }
-
-    const owner = this.ownerProjectForSession(command.sessionId);
-    if (owner && owner !== command.projectId) {
-      return {
-        ...base,
-        outcome: "rejected",
-        message: `Project "${command.projectId}" does not own session "${command.sessionId}" (owned by "${owner}"); launch rejected.`,
-      };
-    }
-
-    if (!Number.isSafeInteger(command.hardBudgetMicros) || command.hardBudgetMicros <= 0) {
-      return { ...base, outcome: "rejected", message: "The hard budget must be a positive whole number of micros; launch rejected." };
-    }
-
-    const normalizedCommand = { ...command, successCriteria: command.successCriteria ?? "", constraints: command.constraints ?? "", resourceCommitment: command.resourceCommitment ?? 1 };
-    const jobId = `job-${command.draftId}`;
-    const execution = assembleJobExecution({
-      apiVersion: CANONICAL_API_VERSION,
-      projectId: command.projectId,
-      cursor: 0,
-      job: { id: jobId, state: "pending", generation: 0, authoritative_attempt_id: null, created_at: 1_750_000_000, updated_at: 1_750_000_000 },
-      attempts: [],
-      executors: [],
-      calls: [],
-      dispatchIntents: [],
-    });
-    const accounting = { ceiling: { amount: command.hardBudgetMicros / 1_000_000, unit: "USD", source: "job-configuration" as const }, consumption: null };
-    const observability = createJobLaunchObservability(normalizedCommand, jobId);
-    const projectId = command.projectId ?? null;
-    const result: JobLaunchResult = {
-      ...base,
-      outcome: "accepted",
-      jobId,
-      message: `Job "${jobId}" accepted for execution.`,
-    };
-
-    // Acknowledgement and entity projections share the same canonical path.
-    // The acknowledgement is first so command correlation is observable before
-    // the resulting execution projections arrive.
-    this.emit(
-      { type: "job.launch-updated", sessionId: command.sessionId, result: clone(result) },
-      { projectId, commandId: command.commandId },
-    );
-    const correlation = { projectId, commandId: command.commandId };
-    this.emit({ type: "job.execution-updated", sessionId: command.sessionId, execution: clone(execution), accounting }, correlation);
-    this.emit({ type: "observability.updated", sessionId: command.sessionId, observability: clone(observability) }, correlation);
-
-    return result;
-  }
+  // This client deliberately does not implement `launchJob`. A mock cannot
+  // create product execution: the normal path launches through the loopback
+  // control plane (`CanonicalOcgRuntimeClient`) and projects the authoritative
+  // canonical snapshot it returns. Fixture scenarios render the execution
+  // fixtures they were seeded with, not a fabricated launch result.
 
   private ownerProjectForSession(sessionId: string): ProjectId | null {
     for (const projectId of FIXTURE_PROJECT_IDS) {
@@ -386,7 +283,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
    * Stamp a deterministic envelope, apply it through the canonical store, then
    * notify raw listeners. State is always updated before listeners run.
    */
-  private emit(
+  protected emit(
     event: OcgRuntimeEvent,
     scope: { projectId?: ProjectId | null; commandId?: string } = {},
   ): void {

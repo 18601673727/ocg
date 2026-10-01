@@ -24,18 +24,22 @@ import {
   decodeDashboardResponse,
   decodeEventsEnvelope,
   decodeJobConfigResponse,
+  decodeJobLaunchResponse,
   decodeJobSnapshot,
   decodeProjectResponse,
   decodeProjectsResponse,
   type CanonicalDashboardResponse,
+  type CanonicalJobLaunchAck,
   type CanonicalJobSnapshot,
   type GlobalConfiguration,
+  type JobLaunchRequest,
   type JsonValue,
   type ProjectConfigurationView,
   type ProjectRecord,
 } from "../contracts";
 
 export type {
+  CanonicalJobLaunchAck,
   GlobalConfiguration as CanonicalGlobalConfiguration,
   ProjectConfigurationView as CanonicalConfigurationView,
   ProjectRecord as CanonicalProjectRecord,
@@ -114,6 +118,15 @@ export interface CanonicalControlClient {
     projectId: string,
     jobId?: string,
   ): Promise<CanonicalResult<CanonicalDashboardResponse>>;
+  /**
+   * Launch a real Job on the loopback control plane.
+   *
+   * This is the only path that starts product execution. The payload is the
+   * generated `JobLaunchRequest`, so a field the backend requires cannot be
+   * forgotten; the response is decoded against `JobLaunchResponse` before it
+   * can be read, so an unknown outcome is reported rather than rendered.
+   */
+  launchJob(request: JobLaunchRequest): Promise<CanonicalResult<CanonicalJobLaunchAck>>;
 }
 
 export type FetchLike = (
@@ -331,6 +344,20 @@ export function createHttpCanonicalControlClient(
         return decodeDashboardResponse(value);
       } catch (error) {
         return contractRejection("dashboard", error);
+      }
+    },
+
+    async launchJob(request) {
+      const { status, value, text } = await send(
+        "POST",
+        "/api/v1/canonical/jobs/launch",
+        request,
+      );
+      if (status !== 200) return rejection(request.command_id, status, text);
+      try {
+        return decodeJobLaunchResponse(value);
+      } catch (error) {
+        return contractRejection(request.command_id, error);
       }
     },
   };
