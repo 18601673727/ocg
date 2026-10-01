@@ -2776,7 +2776,7 @@ impl DomainRepository {
             return Err(invalid("Call start rejected: Attempt authority is stale"));
         }
         let intent_moved = transaction.execute(
-            "UPDATE domain_dispatch_intents SET state='running',effect_state=CASE WHEN effect_kind='idempotent' THEN 'started' ELSE 'started' END,updated_at=?2 WHERE call_id=?1 AND state IN ('queued','pending')",
+            "UPDATE domain_dispatch_intents SET state='running',effect_state='started',updated_at=?2 WHERE call_id=?1 AND state IN ('queued','pending')",
             params![call_id, now()],
         ).map_err(sql)?;
         // Claiming the Call is the fact that the external effect may now start.

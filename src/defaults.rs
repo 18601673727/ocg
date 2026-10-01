@@ -143,8 +143,7 @@ pub fn default_context() -> Value {
 pub fn default_runtime() -> Value {
     json!({
         "channel": "latest",
-        "autoUpgrade": true,
-        "checkIntervalHours": 24,
+
         "fallback": "project-local",
     })
 }

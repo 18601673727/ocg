@@ -92,6 +92,9 @@ impl CanonicalProviderCallHandler {
 /// Admit one provider request into the same bounded dispatcher used by other
 /// canonical Calls. The returned Call is the durable owner of the provider
 /// request; a queue item alone never authorizes execution.
+///
+/// Budget admission is marked immediately after Call creation, ensuring provider
+/// usage goes through economic admission before execution.
 pub fn admit_provider_call(
     domain: &mut DomainRepository,
     authority: &AttemptAuthority,
@@ -103,22 +106,46 @@ pub fn admit_provider_call(
         "executor_transport": "provider",
         "arguments": request
     });
-    admit_call(
+    let call = admit_call(
         domain,
         authority,
         executor_id,
         true,
         &payload.to_string(),
         dispatcher,
-    )
+    )?;
+    
+    // Mark budget admitted before execution. Provider calls have metered usage
+    // and must go through economic admission before dispatch.
+    domain.mark_budget_admitted(&call.id)?;
+    
+    Ok(call)
 }
 
 /// Run provider envelopes through the existing bounded Compio executor. This
 /// is the production handoff from canonical admission to provider/tool work.
+/// 
+/// On startup, this recovers any incomplete provider dispatches from prior
+/// crashes or interruptions by fencing them as unknown.
 pub fn run_provider_dispatcher(
+    project_root: &Path,
     dispatcher: &BoundedDispatcher,
     config: ProviderHandlerConfig,
 ) -> Result<()> {
+    // Recover any incomplete provider calls from previous runs before starting
+    // the dispatcher. This ensures provider intents left in 'running' state
+    // are properly fenced as unknown.
+    {
+        let mut domain = DomainRepository::open(project_root)?;
+        let recovered = domain.recover_provider_dispatches()?;
+        if !recovered.is_empty() {
+            eprintln!(
+                "Provider dispatcher recovered {} incomplete call(s) from previous run",
+                recovered.len()
+            );
+        }
+    } // Release domain lock before starting executor
+    
     let handler = CanonicalProviderCallHandler::new(config);
     CompioExecutor::run(dispatcher, &handler)
 }
