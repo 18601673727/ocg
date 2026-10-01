@@ -22,6 +22,7 @@
 pub mod capabilities;
 pub mod cli;
 pub mod clock;
+pub mod compaction;
 pub mod config;
 pub mod config_command;
 pub mod context;
