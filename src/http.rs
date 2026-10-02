@@ -345,6 +345,12 @@ pub trait HttpTransport: Send + Sync {
         Ok(HttpResponse::ok(self.get(url)?))
     }
 
+    /// Fetch a URL with custom headers and return the structured response.
+    /// The default uses `get` without custom headers.
+    fn get_with_headers(&self, url: &str, _headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        self.get_response(url)
+    }
+
     /// Send one bounded JSON request through the same native HTTP surface.
     /// Provider execution uses this narrow extension; it is not a second
     /// transport implementation.
@@ -728,8 +734,8 @@ impl HttpTransport for NativeHttp {
     }
 
     fn get_response(&self, url: &str) -> Result<HttpResponse> {
-        if !url.starts_with("https://") {
-            return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(OcgError::config(format!("refusing non-HTTP URL: {url}")));
         }
         let proxy = self.proxy_endpoint_for(url)?;
         let token = self.token.clone();
@@ -739,6 +745,25 @@ impl HttpTransport for NativeHttp {
             match proxy {
                 None => native_get(&url, token.as_ref()).await,
                 Some(endpoint) => native_get_via_proxy(&url, token.as_ref(), &endpoint).await,
+            }
+        })
+    }
+
+    fn get_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(OcgError::config(format!("refusing non-HTTP URL: {url}")));
+        }
+        let proxy = self.proxy_endpoint_for(url)?;
+        let url = url.to_owned();
+        let headers = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect::<Vec<_>>();
+        let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
+        runtime.block_on(async move {
+            match proxy {
+                None => native_get_with_headers(&url, &headers).await,
+                Some(endpoint) => native_get_with_headers_via_proxy(&url, &headers, &endpoint).await,
             }
         })
     }
@@ -1018,6 +1043,48 @@ async fn native_get_via_proxy(url: &str, token: Option<&GithubToken>, endpoint: 
     if headers.authorization { if let Some(token) = token { request = request.header("Authorization", format!("Bearer {}", token.expose())); } }
     if headers.accept { request = request.header("Accept", "application/vnd.github+json"); }
     if headers.api_version { request = request.header("X-GitHub-Api-Version", "2022-11-28"); }
+    let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {
+        value.to_str().ok().map(|value| (name.as_str(), value))
+    }));
+    let body = response.body().await.map_err(|error| OcgError::config(format!("cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}")))?;
+    if body.len() as u64 > MAX_BODY_BYTES { return Err(OcgError::config(format!("response from {url} exceeded the {MAX_BODY_BYTES} byte limit"))); }
+    Ok(HttpResponse { status, rate_limit, body: body.to_vec() })
+}
+
+async fn native_get_with_headers(url: &str, headers: &[(String, String)]) -> Result<HttpResponse> {
+    let client = ntex::client::ClientBuilder::new()
+        .response_timeout(RESPONSE_HEAD_TIMEOUT)
+        .response_payload_limit(MAX_BODY_BYTES as usize)
+        .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
+        .build(ntex::SharedCfg::default())
+        .await
+        .map_err(|error| OcgError::config(format!("cannot build the native HTTP client: {error}")))?;
+    let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {
+        value.to_str().ok().map(|value| (name.as_str(), value))
+    }));
+    let body = response.body().await.map_err(|error| OcgError::config(format!("cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}")))?;
+    if body.len() as u64 > MAX_BODY_BYTES { return Err(OcgError::config(format!("response from {url} exceeded the {MAX_BODY_BYTES} byte limit"))); }
+    Ok(HttpResponse { status, rate_limit, body: body.to_vec() })
+}
+
+async fn native_get_with_headers_via_proxy(
+    url: &str,
+    headers: &[(String, String)],
+    endpoint: &str,
+) -> Result<HttpResponse> {
+    let client = proxy_client_for(endpoint).await?;
+    let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
     let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
     let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {

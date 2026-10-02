@@ -418,6 +418,148 @@ hard_limit: number, unit: string, };
 export type ResumeCursor = { cursor_schema_version: string, contract_version: string, project_scope: ProjectScope, generation: string, sequence: string, last_event_id: EntityId | null, };
 
 
+/**
+ * Request to browse filesystem directories.
+ */
+export type SetupBrowseRequest = { 
+/**
+ * Path to browse (empty = home directory).
+ */
+path: string | null, };
+
+
+/**
+ * Response for directory listing.
+ */
+export type SetupBrowseResponse = { current: string, parent: string | null, entries: Array<SetupDirectoryEntry>, };
+
+
+/**
+ * Request to connect a new provider and discover models.
+ */
+export type SetupConnectRequest = { 
+/**
+ * Human-readable provider name.
+ */
+name: string, 
+/**
+ * Provider endpoint URL (base URL or full chat/completions URL).
+ */
+endpoint: string, 
+/**
+ * API key for the provider.
+ */
+api_key: string, };
+
+
+/**
+ * Response after connecting a provider and discovering models.
+ */
+export type SetupConnectResponse = { api_version: ProfileApiVersion, 
+/**
+ * Provider key assigned by the backend.
+ */
+provider_key: string, 
+/**
+ * Credential reference name used.
+ */
+credential_ref: string, 
+/**
+ * Normalized models from the provider.
+ */
+models: Array<SetupModel>, 
+/**
+ * Profile revision after the provider was persisted, for the model save.
+ */
+revision: string, };
+
+
+/**
+ * A directory entry.
+ */
+export type SetupDirectoryEntry = { name: string, path: string, is_dir: boolean, };
+
+
+/**
+ * A model discovered from a provider.
+ */
+export type SetupModel = { 
+/**
+ * OCG model key (provider_key/model_id normalized).
+ */
+key: string, 
+/**
+ * Upstream provider model id.
+ */
+id: string, 
+/**
+ * Display label.
+ */
+label: string, 
+/**
+ * Known metadata (may be empty).
+ */
+metadata: JsonValue, };
+
+
+/**
+ * A model selected by the user during setup.
+ */
+export type SetupModelSelection = { 
+/**
+ * OCG model key.
+ */
+key: string, 
+/**
+ * Upstream provider model id.
+ */
+id: string, };
+
+
+/**
+ * Request to save selected models.
+ */
+export type SetupModelsRequest = { 
+/**
+ * Provider key.
+ */
+provider_key: string, 
+/**
+ * Models to enable, each carrying the OCG key and the upstream provider model id.
+ */
+models: Array<SetupModelSelection>, 
+/**
+ * Default model key.
+ */
+default_model: string, 
+/**
+ * Profile revision for optimistic locking.
+ */
+revision: string, };
+
+
+/**
+ * Response after saving models.
+ */
+export type SetupModelsResponse = { api_version: ProfileApiVersion, runnable_choices: Array<string>, revision: string, };
+
+
+/**
+ * Request to initialize and import a project.
+ */
+export type SetupProjectRequest = { command_id: string, 
+/**
+ * Root path of the project.
+ */
+root: string, };
+
+
+/**
+ * Response after project initialization.
+ */
+export type SetupProjectResponse = { api_version: CanonicalApiVersion, project_id: string, name: string, root: string, };
+
+
 export type SideEffectMode = "idempotent" | "strict_fenced" | "reconcilable" | "non_retryable";
 
 

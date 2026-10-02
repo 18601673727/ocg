@@ -54,6 +54,21 @@ export {
 } from "./profile-decode";
 
 export {
+  decodeSetupConnectResponse,
+  decodeSetupModelsResponse,
+  decodeSetupBrowseResponse,
+  decodeSetupProjectResponse,
+} from "./setup-decode";
+export type {
+  SetupModel,
+  SetupConnectResponse,
+  SetupModelsResponse,
+  SetupDirectoryEntry,
+  SetupBrowseResponse,
+  SetupProjectResponse,
+} from "./setup-decode";
+
+export {
   decodeConfigurationAck,
   decodeConfigurationEnvelope,
   decodeConfigurationView,

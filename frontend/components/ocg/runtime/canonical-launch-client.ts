@@ -115,6 +115,28 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     return stop;
   }
 
+  /**
+   * The new setup wizard (SetupWizard) is a 3-step flow that completes without
+   * ever reaching the legacy "ready" stage. Override to mark onboarding done
+   * regardless of stage.
+   */
+  override async completeOnboarding(): Promise<void> {
+    const bootstrap = this.store.getSnapshot().bootstrap;
+    const onboarding = bootstrap.onboarding;
+    if (!onboarding) return;
+    this.updateBootstrap({
+      ...bootstrap,
+      ready: true,
+      onboarding: {
+        ...onboarding,
+        completedStages: onboarding.completedStages.includes("ready")
+          ? onboarding.completedStages
+          : [...onboarding.completedStages, "ready"],
+        failure: undefined,
+      },
+    });
+  }
+
   async launchJob(command: JobLaunchCommand): Promise<JobLaunchResult> {
     const response = await this.control.launchJob(toLaunchRequest(command));
     if (isCanonicalRejection(response)) {

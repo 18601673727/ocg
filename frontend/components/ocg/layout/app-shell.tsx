@@ -419,6 +419,7 @@ export function RuntimeWorkspace({
   const handleComposerIntent = useCallback((intent: ComposerIntent) => {
     dispatchComposerIntent(intent, {
       chat: ({ text }) => {
+        if (!activeProjectId) return;
         if (activeSessionKey) void sendMessage(activeSessionKey, { content: text, projectId: activeProjectId });
       },
       "job.create": ({ seed }) => handleCreateJobDraft(seed),
@@ -621,6 +622,22 @@ export function RuntimeWorkspace({
               queue={attentionQueue}
               onNavigate={navigate}
             />
+          </main>
+        ) : !activeProjectId ? (
+          <main aria-label="No project selected" className="flex min-h-0 flex-1 items-center justify-center">
+            <div className="flex flex-col items-center gap-3 text-center">
+              <p className="text-[14px] font-medium">No project selected</p>
+              <p className="max-w-sm text-[12px] text-muted-foreground">
+                Add a Project to start chatting. Projects define your working directory for OCG operations.
+              </p>
+              <button
+                type="button"
+                className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+                onClick={() => router.push("/onboarding?scenario=local-first-run")}
+              >
+                Add a Project
+              </button>
+            </div>
           </main>
         ) : (
           <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
