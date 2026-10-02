@@ -169,7 +169,7 @@ function overviewApprovals(): AttentionItem[] {
         taskTitle: "Connect Ledger context",
         requestedAt: "2026-09-25T09:12:00Z",
         estimatedImpact: "One costlier attempt; success unblocks the integration gate.",
-        requestedProvider: "Command Code",
+        requestedProvider: "Provider",
         requestedModel: "Sol",
         approveConsequence: "Attempt 3 may use Sol on failure.",
         rejectConsequence: "Retries stay on the current model only.",

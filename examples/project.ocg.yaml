@@ -11,12 +11,10 @@ models:
   providers:
     my-provider:
       label: My Provider
-      placeholder: false
   models:
     my-lead:
       provider: my-provider
       id: real-provider-model-id
-      placeholder: false
       # Optional selected reasoning variant. Omit it to run at the provider
       # default; OCG never fabricates one.
       # variant: medium

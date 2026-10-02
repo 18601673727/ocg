@@ -5,51 +5,12 @@
  * every result is built explicitly from checked parts, never cast.
  */
 
-import { decode, record, req, opt, string, array, boolean, jsonValue, yes } from "./decode";
+import { decode, record, req, nullable, string, array, boolean, literal, yes } from "./decode";
 import type { Decoder, DecodeResult } from "./decode";
-import type { JsonValue } from "./generated";
-
-// -- types -------------------------------------------------------------------
-
-export interface SetupModel {
-  key: string;
-  id: string;
-  label: string;
-  metadata: JsonValue;
-}
-
-export interface SetupConnectResponse {
-  api_version: string;
-  provider_key: string;
-  credential_ref: string;
-  models: SetupModel[];
-  revision: string;
-}
-
-export interface SetupModelsResponse {
-  api_version: string;
-  runnable_choices: string[];
-  revision: string;
-}
-
-export interface SetupDirectoryEntry {
-  name: string;
-  path: string;
-  is_dir: boolean;
-}
-
-export interface SetupBrowseResponse {
-  current: string;
-  parent: string | undefined;
-  entries: SetupDirectoryEntry[];
-}
-
-export interface SetupProjectResponse {
-  api_version: string;
-  project_id: string;
-  name: string;
-  root: string;
-}
+import { PROFILE_API_VERSION, CANONICAL_API_VERSION } from "./generated";
+import type { SetupModel, SetupConnectResponse, SetupModelsResponse, SetupDirectoryEntry, SetupBrowseResponse, SetupProjectResponse } from "./generated";
+import { modelMetadata } from "./profile-decode";
+export type { SetupModel, SetupConnectResponse, SetupModelsResponse, SetupDirectoryEntry, SetupBrowseResponse, SetupProjectResponse } from "./generated";
 
 // -- decoders ----------------------------------------------------------------
 
@@ -62,7 +23,7 @@ const setupModel: Decoder<SetupModel> = (input, path) => {
   if (!id.ok) return id;
   const label = req(rec.value, "label", string, path);
   if (!label.ok) return label;
-  const metadata = req(rec.value, "metadata", jsonValue, path);
+  const metadata = req(rec.value, "metadata", modelMetadata, path);
   if (!metadata.ok) return metadata;
   return yes({ key: key.value, id: id.value, label: label.value, metadata: metadata.value });
 };
@@ -70,12 +31,10 @@ const setupModel: Decoder<SetupModel> = (input, path) => {
 const setupConnectResponse: Decoder<SetupConnectResponse> = (input, path) => {
   const rec = record(input, path, "a SetupConnectResponse");
   if (!rec.ok) return rec;
-  const api_version = req(rec.value, "api_version", string, path);
+  const api_version = req(rec.value, "api_version", literal(PROFILE_API_VERSION), path);
   if (!api_version.ok) return api_version;
   const provider_key = req(rec.value, "provider_key", string, path);
   if (!provider_key.ok) return provider_key;
-  const credential_ref = req(rec.value, "credential_ref", string, path);
-  if (!credential_ref.ok) return credential_ref;
   const models = req(rec.value, "models", array(setupModel), path);
   if (!models.ok) return models;
   const revision = req(rec.value, "revision", string, path);
@@ -83,7 +42,6 @@ const setupConnectResponse: Decoder<SetupConnectResponse> = (input, path) => {
   return yes({
     api_version: api_version.value,
     provider_key: provider_key.value,
-    credential_ref: credential_ref.value,
     models: models.value,
     revision: revision.value,
   });
@@ -92,14 +50,20 @@ const setupConnectResponse: Decoder<SetupConnectResponse> = (input, path) => {
 const setupModelsResponse: Decoder<SetupModelsResponse> = (input, path) => {
   const rec = record(input, path, "a SetupModelsResponse");
   if (!rec.ok) return rec;
-  const api_version = req(rec.value, "api_version", string, path);
+  const api_version = req(rec.value, "api_version", literal(PROFILE_API_VERSION), path);
   if (!api_version.ok) return api_version;
+  const selected_models = req(rec.value, "selected_models", array(string), path);
+  if (!selected_models.ok) return selected_models;
+  const default_model = req(rec.value, "default_model", string, path);
+  if (!default_model.ok) return default_model;
   const runnable_choices = req(rec.value, "runnable_choices", array(string), path);
   if (!runnable_choices.ok) return runnable_choices;
   const revision = req(rec.value, "revision", string, path);
   if (!revision.ok) return revision;
   return yes({
     api_version: api_version.value,
+    selected_models: selected_models.value,
+    default_model: default_model.value,
     runnable_choices: runnable_choices.value,
     revision: revision.value,
   });
@@ -122,7 +86,7 @@ const setupBrowseResponse: Decoder<SetupBrowseResponse> = (input, path) => {
   if (!rec.ok) return rec;
   const current = req(rec.value, "current", string, path);
   if (!current.ok) return current;
-  const parent = opt(rec.value, "parent", string, path);
+  const parent = req(rec.value, "parent", nullable(string), path);
   if (!parent.ok) return parent;
   const entries = req(rec.value, "entries", array(setupDirectoryEntry), path);
   if (!entries.ok) return entries;
@@ -132,7 +96,7 @@ const setupBrowseResponse: Decoder<SetupBrowseResponse> = (input, path) => {
 const setupProjectResponse: Decoder<SetupProjectResponse> = (input, path) => {
   const rec = record(input, path, "a SetupProjectResponse");
   if (!rec.ok) return rec;
-  const api_version = req(rec.value, "api_version", string, path);
+  const api_version = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
   if (!api_version.ok) return api_version;
   const project_id = req(rec.value, "project_id", string, path);
   if (!project_id.ok) return project_id;

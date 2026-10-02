@@ -2,6 +2,7 @@
 
 use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
+use crate::profile::{CatalogModel, ModelMetadata, ProviderCatalog};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -103,9 +104,7 @@ fn api_base_url(endpoint: &str) -> Result<String> {
         return Err(OcgError::config("provider endpoint is empty"));
     }
     let Some((scheme, rest)) = trimmed.split_once("://") else {
-        return Err(OcgError::config(format!(
-            "provider endpoint has no scheme: {endpoint}"
-        )));
+        return Err(OcgError::config("provider endpoint has no scheme"));
     };
     if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
         return Err(OcgError::config(format!(
@@ -113,9 +112,16 @@ fn api_base_url(endpoint: &str) -> Result<String> {
         )));
     }
     if rest.split(['/', '?', '#']).next().unwrap_or("").is_empty() {
-        return Err(OcgError::config(format!(
-            "provider endpoint has no host: {endpoint}"
-        )));
+        return Err(OcgError::config("provider endpoint has no host"));
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('@')
+        || rest.contains(['?', '#'])
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return Err(OcgError::config(
+            "provider endpoint must not contain credentials, query, fragment or whitespace",
+        ));
     }
     // Already a full OpenAI-compatible path: use it verbatim as the base.
     for suffix in ["/chat/completions", "/completions", "/models"] {
@@ -133,19 +139,6 @@ fn api_base_url(endpoint: &str) -> Result<String> {
     Ok(format!("{}/v1", trimmed))
 }
 
-/// Normalized OCG model representation from discovery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveredModel {
-    /// Provider's model id (upstream)
-    pub id: String,
-    /// Display label (defaults to id if not available)
-    #[serde(default)]
-    pub label: Option<String>,
-    /// Known metadata (don't infer capabilities)
-    #[serde(default)]
-    pub metadata: Value,
-}
-
 /// The stable OCG identity for a discovered model.
 ///
 /// The upstream id is preserved verbatim; only the separator and the
@@ -153,12 +146,12 @@ pub struct DiscoveredModel {
 /// OCG key never becomes the thing that is sent upstream.
 pub fn model_key(provider_key: &str, upstream_model_id: &str) -> String {
     let suffix = upstream_model_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
-                c
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':') {
+                char::from(byte).to_string()
             } else {
-                '_'
+                format!("%{byte:02X}")
             }
         })
         .collect::<String>();
@@ -170,30 +163,46 @@ pub fn discover_models_url(
     transport: &dyn HttpTransport,
     models_url: &str,
     api_key: &str,
-) -> Result<Vec<DiscoveredModel>> {
+) -> Result<Vec<CatalogModel>> {
     let authorization = format!("Bearer {}", api_key.trim());
-    let headers = [
-        ("Accept", "application/json"),
-        ("Authorization", authorization.as_str()),
-    ];
-    let response = transport.get_with_headers(models_url, &headers)?;
+    let mut headers = vec![("Accept", "application/json")];
+    if !api_key.trim().is_empty() {
+        headers.push(("Authorization", authorization.as_str()));
+    }
+    let response = transport
+        .get_with_headers(models_url, &headers)
+        .map_err(|_| OcgError::config("could not reach provider model catalog"))?;
 
     if !response.is_success() {
-        let preview = String::from_utf8_lossy(&response.body);
-        let preview = preview.chars().take(200).collect::<String>();
         let detail = match response.status {
             401 | 403 => "the provider rejected the API key".to_string(),
             404 => "this endpoint does not expose /models".to_string(),
-            other => format!("HTTP {other}: {preview}"),
+            other => format!("HTTP {other}"),
         };
         return Err(OcgError::config(format!(
             "could not list models from {models_url}: {detail}"
         )));
     }
 
-    let value: Value = serde_json::from_slice(&response.body).map_err(|error| {
-        OcgError::config(format!("{models_url} returned a response that is not JSON: {error}"))
-    })?;
+    let mut value: Value = serde_json::from_slice(&response.body)
+        .map_err(|_| OcgError::config("provider returned a response that is not JSON"))?;
+    if value
+        .get("data")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !api_key.trim().is_empty() && id.contains(api_key.trim()))
+            })
+        })
+    {
+        return Err(OcgError::config(
+            "provider returned a credential in its model identity",
+        ));
+    }
+    redact_catalog_secret(&mut value, api_key.trim());
 
     // The OpenAI-compatible shape is `{"object":"list","data":[...]}`. Anything
     // else is reported rather than guessed at, because a wrong model id only
@@ -209,22 +218,26 @@ pub fn discover_models_url(
         let Some(id) = entry.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let id = id.trim();
-        if id.is_empty() {
+        if id.trim().is_empty() {
             continue;
         }
-        // Only fields the provider actually reported are carried through.
-        // Capabilities, context window and price are never inferred.
-        let mut metadata = serde_json::Map::new();
-        for field in ["created", "owned_by", "object", "permission"] {
-            if let Some(value) = entry.get(field) {
-                metadata.insert(field.to_string(), value.clone());
-            }
+        if models.iter().any(|model: &CatalogModel| model.id == id) {
+            continue;
         }
-        models.push(DiscoveredModel {
+        models.push(CatalogModel {
             id: id.to_string(),
-            label: Some(id.to_string()),
-            metadata: Value::Object(metadata),
+            label: ["label", "display_name", "name"]
+                .iter()
+                .find_map(|field| {
+                    entry
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .filter(|label| !label.is_empty())
+                })
+                .unwrap_or(id)
+                .to_string(),
+            metadata: normalize_model_metadata(entry),
+            raw: entry.clone(),
         });
     }
 
@@ -234,6 +247,133 @@ pub fn discover_models_url(
         )));
     }
     Ok(models)
+}
+
+fn redact_catalog_secret(value: &mut Value, secret: &str) {
+    if secret.is_empty() {
+        return;
+    }
+    match value {
+        Value::String(text) if !secret.is_empty() => *text = text.replace(secret, "[redacted]"),
+        Value::Array(values) => {
+            for value in values {
+                redact_catalog_secret(value, secret);
+            }
+        }
+        Value::Object(values) => {
+            values.retain(|key, _| {
+                !key.contains(secret) && !matches!(key.to_ascii_lowercase().as_str(),
+                    "api_key" | "apikey" | "authorization" | "access_token" | "secret" | "token")
+            });
+            for value in values.values_mut() {
+                redact_catalog_secret(value, secret);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn discover_catalog(
+    transport: &dyn HttpTransport,
+    endpoint: &str,
+    api_key: &str,
+) -> Result<ProviderCatalog> {
+    let models = discover_models_url(transport, &models_url_from_endpoint(endpoint)?, api_key)?;
+    let discovered_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| OcgError::config("system time precedes Unix epoch"))?
+        .as_secs();
+    Ok(ProviderCatalog {
+        discovered_at,
+        models,
+    })
+}
+
+fn normalize_model_metadata(entry: &Value) -> ModelMetadata {
+    let field = |names: &[&str]| -> Option<&Value> {
+        names.iter().find_map(|name| {
+            entry
+                .get(*name)
+                .filter(|value| !value.is_null())
+                .or_else(|| {
+                    entry
+                        .get("capabilities")
+                        .and_then(|caps| caps.get(*name))
+                        .filter(|value| !value.is_null())
+                })
+                .or_else(|| {
+                    entry
+                        .get("metadata")
+                        .and_then(|meta| meta.get(*name))
+                        .filter(|value| !value.is_null())
+                })
+        })
+    };
+    let strings = |names: &[&str]| -> Option<Vec<String>> {
+        let values = field(names)?.as_array()?;
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+    let string = |names: &[&str]| {
+        field(names)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let boolean = |names: &[&str]| field(names).and_then(Value::as_bool);
+    let modalities = strings(&["input_modalities"]).filter(|values| !values.is_empty());
+    ModelMetadata {
+        variant: string(&["variant"]),
+        variants: strings(&["variants"]),
+        effort: string(&["effort", "reasoning_effort"]),
+        efforts: strings(&["efforts", "reasoning_efforts"]),
+        reasoning: boolean(&["reasoning", "supports_reasoning"]),
+        fast_mode: boolean(&["fast_mode", "supports_fast_mode"]),
+        context_window: field(&["context_window", "context_length", "max_context_length"])
+            .and_then(Value::as_u64),
+        tools: boolean(&[
+            "tools",
+            "tool_calling",
+            "supports_tools",
+            "supports_function_calling",
+        ]),
+        images: boolean(&["images", "vision", "supports_vision"]).or_else(|| {
+            modalities
+                .as_ref()
+                .map(|values| values.iter().any(|value| value == "image"))
+        }),
+        multimodal: boolean(&["multimodal", "supports_multimodal"]).or_else(|| {
+            modalities
+                .as_ref()
+                .map(|values| values.iter().any(|value| value != "text"))
+        }),
+        pricing: field(&["pricing", "price"])
+            .filter(|value| value.is_object())
+            .cloned(),
+    }
+}
+
+pub fn catalog_models(
+    provider_key: &str,
+    catalog: &ProviderCatalog,
+) -> Vec<crate::contracts::SetupModel> {
+    catalog
+        .models
+        .iter()
+        .map(|model| crate::contracts::SetupModel {
+            key: model_key(provider_key, &model.id),
+            id: model.id.clone(),
+            label: model.label.clone(),
+            metadata: model.metadata.clone(),
+        })
+        .collect()
 }
 
 /// List directories in a given path for filesystem browsing.

@@ -15,6 +15,7 @@ import {
 } from "../contracts";
 import type {
   SetupConnectResponse,
+  SetupModelSelection,
   SetupModelsResponse,
   SetupBrowseResponse,
   SetupProjectResponse,
@@ -34,7 +35,8 @@ function errorMessage(value: unknown, fallback: string): string {
 
 export interface SetupClient {
   connectProvider(name: string, endpoint: string, apiKey: string): Promise<SetupConnectResponse>;
-  saveModels(providerKey: string, models: Array<{ key: string; id: string }>, defaultModel: string, revision: string): Promise<SetupModelsResponse>;
+  refreshModels(providerKey: string, revision: string): Promise<SetupConnectResponse>;
+  saveModels(providerKey: string, models: SetupModelSelection[], defaultModel: string, revision: string): Promise<SetupModelsResponse>;
   browseDirectory(path?: string): Promise<SetupBrowseResponse>;
   initProject(commandId: string, root: string): Promise<SetupProjectResponse>;
 }
@@ -61,6 +63,9 @@ export function createSetupClient(baseUrl: string, fetchImpl: typeof fetch): Set
   return {
     connectProvider(name, endpoint, apiKey) {
       return post("/api/v1/setup/connect", { name, endpoint, api_key: apiKey }, decodeSetupConnectResponse);
+    },
+    refreshModels(providerKey, revision) {
+      return post("/api/v1/setup/refresh", { provider_key: providerKey, revision }, decodeSetupConnectResponse);
     },
     saveModels(providerKey, models, defaultModel, revision) {
       return post("/api/v1/setup/models", {

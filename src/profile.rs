@@ -19,7 +19,6 @@ pub enum Origin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct Provider {
-    pub placeholder: bool,
     pub label: String,
     /// HTTPS endpoint for provider API calls. Must not include userinfo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29,11 +28,12 @@ pub struct Provider {
     /// header at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<ProviderCatalog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct Model {
-    pub placeholder: bool,
     pub provider: String,
     pub id: String,
     /// Optional selected reasoning variant; never inferred from a fixed tier.
@@ -41,6 +41,39 @@ pub struct Model {
     pub variant: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variants: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ModelMetadata>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ModelMetadata {
+    pub variant: Option<String>,
+    pub variants: Option<Vec<String>>,
+    pub effort: Option<String>,
+    pub efforts: Option<Vec<String>>,
+    pub reasoning: Option<bool>,
+    pub fast_mode: Option<bool>,
+    pub context_window: Option<u64>,
+    pub tools: Option<bool>,
+    pub images: Option<bool>,
+    pub multimodal: Option<bool>,
+    pub pricing: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CatalogModel {
+    pub id: String,
+    pub label: String,
+    pub metadata: ModelMetadata,
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ProviderCatalog {
+    pub discovered_at: u64,
+    pub models: Vec<CatalogModel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -61,35 +94,13 @@ impl Profile {
         Self {
             origin: Origin::New,
             default_model: None,
-            providers: BTreeMap::from([(
-                "placeholder".into(),
-                Provider {
-                    placeholder: true,
-                    label: "Configure a provider".into(),
-                    endpoint: None,
-                    credential_ref: None,
-                },
-            )]),
-            models: BTreeMap::from([(
-                "placeholder".into(),
-                Model {
-                    placeholder: true,
-                    provider: "placeholder".into(),
-                    id: "placeholder".into(),
-                    variant: None,
-                    variants: vec![],
-                },
-            )]),
+            providers: BTreeMap::new(),
+            models: BTreeMap::new(),
         }
     }
 
     /// Structural validity does not imply authorization to send an inference request.
     pub fn validate(&self) -> Result<()> {
-        if self.providers.is_empty() || self.models.is_empty() {
-            return Err(OcgError::config(
-                "Profile requires at least one provider and one model",
-            ));
-        }
         for (provider_key, provider) in &self.providers {
             // Validate endpoint if present
             if let Some(endpoint) = &provider.endpoint {
@@ -159,11 +170,7 @@ impl Profile {
 
     pub fn runnable_models(&self) -> impl Iterator<Item = (&String, &Model)> {
         self.models.iter().filter(|(_, model)| {
-            !model.placeholder
-                && self
-                    .providers
-                    .get(&model.provider)
-                    .is_some_and(|provider| !provider.placeholder)
+            !model.id.is_empty() && self.providers.contains_key(&model.provider)
         })
     }
 
@@ -176,15 +183,12 @@ impl Profile {
         self.models
             .iter()
             .filter(|(_, model)| {
-                if model.placeholder || model.id.is_empty() {
+                if model.id.is_empty() {
                     return false;
                 }
                 let Some(provider) = self.providers.get(&model.provider) else {
                     return false;
                 };
-                if provider.placeholder {
-                    return false;
-                }
                 if !endpoint_usable(provider.endpoint.as_deref()) {
                     return false;
                 }
@@ -208,7 +212,7 @@ impl Profile {
     pub fn require_runnable(&self) -> Result<()> {
         self.validate()?;
         if self.runnable_models().next().is_none() {
-            return Err(OcgError::config("No runnable provider/model configured; replace the Profile placeholders before executing a Job"));
+            return Err(OcgError::config("No provider/model configured; connect a provider and select models before executing a Job"));
         }
         Ok(())
     }
@@ -222,16 +226,6 @@ impl Profile {
             .models
             .get_key_value(key)
             .ok_or_else(|| OcgError::config(format!("unknown Profile model '{key}'")))?;
-        if model.placeholder
-            || self
-                .providers
-                .get(&model.provider)
-                .is_none_or(|provider| provider.placeholder)
-        {
-            return Err(OcgError::config(
-                "No runnable provider/model configured; selected Profile resource is a placeholder",
-            ));
-        }
         Ok((key, model))
     }
 
@@ -249,11 +243,12 @@ impl Profile {
             .ok_or_else(|| {
                 OcgError::config("OCG Profile requires models.providers and models.models")
             })?;
-        let value = json!({
+        let mut value = json!({
             "origin": profile.get("origin").cloned().unwrap_or(json!("new")),
             "defaultModel": profile.get("defaultModel"),
             "providers": models.get("providers"), "models": models.get("models")
         });
+        clean_legacy_resources(&mut value);
         let encoded = serde_json::to_vec(&value)
             .map_err(|error| OcgError::config(format!("invalid OCG Profile: {error}")))?;
         let mut deserializer = serde_json::Deserializer::from_slice(&encoded);
@@ -261,6 +256,52 @@ impl Profile {
             .map_err(|error| OcgError::config(format!("invalid OCG Profile: {error}")))?;
         parsed.validate()?;
         Ok(parsed)
+    }
+}
+
+fn clean_legacy_resources(value: &mut Value) {
+    let mut removed_providers = std::collections::BTreeSet::new();
+    if let Some(providers) = value.get_mut("providers").and_then(Value::as_object_mut) {
+        providers.retain(|key, entry| {
+            let legacy = entry.get("placeholder").and_then(Value::as_bool) == Some(true)
+                || (entry.get("placeholder").is_none()
+                    && key == "placeholder"
+                    && entry.get("label").and_then(Value::as_str) == Some("Configure a provider")
+                    && entry.get("endpoint").is_none_or(Value::is_null)
+                    && entry.get("credential_ref").is_none_or(Value::is_null));
+            if legacy {
+                removed_providers.insert(key.clone());
+            }
+            !legacy
+        });
+    }
+    let legacy_provider_missing = value.get("providers").and_then(Value::as_object)
+        .is_some_and(|providers| !providers.contains_key("placeholder"));
+    let mut removed_models = std::collections::BTreeSet::new();
+    if let Some(models) = value.get_mut("models").and_then(Value::as_object_mut) {
+        models.retain(|key, entry| {
+            let legacy = entry.get("placeholder").and_then(Value::as_bool) == Some(true)
+                || entry
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .is_some_and(|provider| removed_providers.contains(provider))
+                || (entry.get("placeholder").is_none()
+                    && legacy_provider_missing
+                    && key == "placeholder"
+                    && entry.get("provider").and_then(Value::as_str) == Some("placeholder")
+                    && entry.get("id").and_then(Value::as_str) == Some("placeholder"));
+            if legacy {
+                removed_models.insert(key.clone());
+            }
+            !legacy
+        });
+    }
+    if value
+        .get("defaultModel")
+        .and_then(Value::as_str)
+        .is_some_and(|key| removed_models.contains(key))
+    {
+        value["defaultModel"] = Value::Null;
     }
 }
 
@@ -408,6 +449,25 @@ impl ProfileService {
     pub fn replace(&self, expected_sha256: &str, profile: &Profile) -> Result<String> {
         profile.validate()?;
         let _lock = self.lock()?;
+        self.replace_locked(expected_sha256, profile)
+    }
+
+    pub fn replace_with_credential(
+        &self,
+        expected_sha256: &str,
+        profile: &Profile,
+        vault: &crate::vault::Vault,
+        reference: &str,
+        secret: &str,
+    ) -> Result<String> {
+        profile.validate()?;
+        let _lock = self.lock()?;
+        vault.insert_with(reference, secret, || {
+            self.replace_locked(expected_sha256, profile)
+        })
+    }
+
+    fn replace_locked(&self, expected_sha256: &str, profile: &Profile) -> Result<String> {
         let (.., actual) = self
             .current()?
             .ok_or_else(|| OcgError::config("OCG Profile is missing; bootstrap it explicitly"))?;

@@ -10,19 +10,6 @@ import type { Profile, ProfileView } from "../contracts";
 import { decodeProfileView, ContractError } from "../contracts";
 import { PROFILE_API_VERSION } from "../contracts";
 
-/**
- * Structural draft helper only: counts models whose provider is marked
- * non-placeholder. This is never execution or startup readiness; the single
- * readiness authority is the backend-computed `runnable_choices` on
- * `ProfileView`, which additionally requires a usable endpoint and a Vault
- * credential that exists.
- */
-export function runnableChoices(profile: Profile): string[] {
-  return Object.entries(profile.models)
-    .filter(([, model]) => !model.placeholder && profile.providers[model.provider]?.placeholder === false)
-    .map(([key]) => key);
-}
-
 export function isLoopbackControlUrl(raw: string): boolean {
   try {
     const url = new URL(raw);

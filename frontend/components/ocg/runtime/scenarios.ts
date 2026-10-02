@@ -188,7 +188,7 @@ function activity(
 
 function createDefaultObservability(jobId: string): RuntimeObservability {
   const workers = [
-    runtimeWorker("lead", "Lead-Mid", "Command Code", "Muse Spark 1.3 Contributor", {
+    runtimeWorker("lead", "Lead-Mid", "Provider", "example-model", {
       status: "active",
       variant: "mid",
       elapsedMs: 2520000,
@@ -201,7 +201,7 @@ function createDefaultObservability(jobId: string): RuntimeObservability {
       ttftMs: 180,
       tokensPerSecond: 18.2,
     }),
-    runtimeWorker("ocg-local", "Local worker", "OpenCode Zen", "Muse Spark 1.3 Contributor Free", {
+    runtimeWorker("ocg-local", "Local worker", "Catalog Provider", "example-model-free", {
       status: "completed",
       elapsedMs: 86000,
       invocationCount: 1,
@@ -251,25 +251,25 @@ function createLiveObservability(jobId: string): RuntimeObservability {
       estimatedFinalSpend: usage(10.4, "estimated"),
     },
     workers: [
-      runtimeWorker("lead", "Lead-Mid", "Command Code", "Muse Spark 1.3 Contributor", {
+      runtimeWorker("lead", "Lead-Mid", "Provider", "example-model", {
         role: "lead", status: "active", variant: "mid", elapsedMs: 18000, invocationCount: 1,
         tokenUsage: { input: usage(2400), output: usage(900), total: usage(3300, "estimated") },
         costMicros: usage(22000, "estimated"), latencyMs: 820, ttftMs: 140, tokensPerSecond: 34,
       }),
-      runtimeWorker("explore", "Explore", "OpenCode Go", "Space Bunny Free", {
+      runtimeWorker("explore", "Explore", "Fallback Provider", "Space Bunny Free", {
         status: "active", variant: "standard", elapsedMs: 14000, invocationCount: 1,
         tokenUsage: { input: usage(1900), output: usage(500), total: usage(2400, "estimated") },
         costMicros: usage(12000, "estimated"), latencyMs: 610, ttftMs: 110, tokensPerSecond: 36,
       }),
-      runtimeWorker("explore-deep", "Explore Deep", "OpenCode Go", "Space Bunny Free", {
+      runtimeWorker("explore-deep", "Explore Deep", "Fallback Provider", "Space Bunny Free", {
         status: "active", variant: "deep", elapsedMs: 9000, invocationCount: 1,
         tokenUsage: { input: usage(1300), output: usage(400), total: usage(1700, "estimated") },
         costMicros: usage(9000, "estimated"), latencyMs: 730, tokensPerSecond: 31,
       }),
-      runtimeWorker("build", "Build", "Command Code", "DeepSeek V4.1 Flash", { status: "queued" }),
-      runtimeWorker("verify", "Verify", "OpenCode Zen", "Muse Spark 1.3 Contributor Free", { status: "waiting" }),
-      runtimeWorker("debug", "Debug", "OpenCode Go", "Space Bunny Free", { status: "queued" }),
-      runtimeWorker("docs", "Docs", "Command Code", "Muse Spark 1.3 Contributor", { status: "queued" }),
+      runtimeWorker("build", "Build", "Provider", "DeepSeek V4.1 Flash", { status: "queued" }),
+      runtimeWorker("verify", "Verify", "Catalog Provider", "example-model-free", { status: "waiting" }),
+      runtimeWorker("debug", "Debug", "Fallback Provider", "Space Bunny Free", { status: "queued" }),
+      runtimeWorker("docs", "Docs", "Provider", "example-model", { status: "queued" }),
     ],
     timeline: timeline(
       { timestamp: "00:00", elapsedMs: 0, cumulativeUsage: { total: usage(0) } },
@@ -278,9 +278,9 @@ function createLiveObservability(jobId: string): RuntimeObservability {
       { timestamp: "00:18", elapsedMs: 18000, cumulativeUsage: { input: usage(6400), output: usage(1800), total: usage(8200, "estimated") } },
     ),
     activities: [
-      activity("live-lead-started", 0, "worker-started", "Lead started coordinating the Job", { workerId: "lead", label: "Lead-Mid", role: "lead", provider: "Command Code", model: "Muse Spark 1.3 Contributor", status: "active" }),
-      activity("live-explore-started", 4000, "worker-started", "Explore started runtime mapping", { workerId: "explore", label: "Explore", role: "worker", provider: "OpenCode Go", model: "Space Bunny Free", status: "active" }),
-      activity("live-deep-started", 9000, "worker-started", "Explore Deep started architecture review", { workerId: "explore-deep", label: "Explore Deep", role: "worker", provider: "OpenCode Go", model: "Space Bunny Free", status: "active" }),
+      activity("live-lead-started", 0, "worker-started", "Lead started coordinating the Job", { workerId: "lead", label: "Lead-Mid", role: "lead", provider: "Provider", model: "example-model", status: "active" }),
+      activity("live-explore-started", 4000, "worker-started", "Explore started runtime mapping", { workerId: "explore", label: "Explore", role: "worker", provider: "Fallback Provider", model: "Space Bunny Free", status: "active" }),
+      activity("live-deep-started", 9000, "worker-started", "Explore Deep started architecture review", { workerId: "explore-deep", label: "Explore Deep", role: "worker", provider: "Fallback Provider", model: "Space Bunny Free", status: "active" }),
       activity("live-usage-estimated", 18000, "invocation-started", "Streaming usage is estimated"),
     ],
   };

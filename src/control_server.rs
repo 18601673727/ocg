@@ -512,7 +512,11 @@ fn handle_client(
     }
     if matches!(
         route,
-        Route::SetupProviderConnect | Route::SetupModelsSave | Route::SetupBrowse | Route::SetupProjectInit
+        Route::SetupProviderConnect
+            | Route::SetupProviderRefresh
+            | Route::SetupModelsSave
+            | Route::SetupBrowse
+            | Route::SetupProjectInit
     ) {
         if request.method == "OPTIONS" {
             let _ = write_preflight(&mut stream, &request);
@@ -738,7 +742,7 @@ fn handle_setup(
                 let body: crate::contracts::SetupConnectRequest = serde_json::from_value(
                     request.json_body().map_err(|_| OcgError::config("invalid setup connect body"))?,
                 )
-                .map_err(|error| OcgError::config(format!("invalid setup connect: {error}")))?;
+                .map_err(|_| OcgError::config("invalid setup connect request"))?;
                 let name = body.name.trim();
                 if name.is_empty() {
                     return Err(OcgError::config("provider name is required"));
@@ -750,90 +754,108 @@ fn handle_setup(
                 // Both URLs are derived from the one operator-supplied value, so
                 // discovery and dispatch can never disagree about the base path.
                 let chat_endpoint = crate::setup::chat_endpoint_from_base(&body.endpoint)?;
-                let models_url = crate::setup::models_url_from_endpoint(&body.endpoint)?;
 
                 // Discover before writing anything: a provider that cannot be
                 // reached must not leave a half-configured Profile behind.
                 let http = crate::http::NativeHttp::new()?;
-                let discovered = crate::setup::discover_models_url(&http, &models_url, &body.api_key)?;
+                let catalog = crate::setup::discover_catalog(&http, &body.endpoint, &body.api_key)?;
 
                 let current = service.current()?;
                 let (mut profile, revision) = current.as_ref()
                     .ok_or_else(|| OcgError::config("profile must be bootstrapped first"))?
                     .clone();
 
-                let existing_keys: Vec<&str> = profile
-                    .providers
-                    .keys()
-                    .filter(|key| key.as_str() != "placeholder")
-                    .map(String::as_str)
-                    .collect();
+                let existing_keys: Vec<&str> =
+                    profile.providers.keys().map(String::as_str).collect();
+                let vault = crate::vault::Vault::user_global()?;
+                let vault_names = vault.list()?;
                 let existing_refs: Vec<&str> = profile
                     .providers
                     .values()
                     .filter_map(|p| p.credential_ref.as_deref())
+                    .chain(vault_names.iter().map(String::as_str))
                     .collect();
 
                 let provider_key = crate::setup::normalize_provider_key(name, &existing_keys);
                 let credential_ref = crate::setup::normalize_credential_ref(name, &existing_refs);
 
-                // The secret goes to the Vault only. It is never written into
-                // the Profile and never echoed back to the frontend.
-                crate::vault::Vault::user_global()?.set(&credential_ref, body.api_key.trim())?;
-
-                // Persist the provider with the canonical chat-completions
-                // endpoint, because the runtime dispatches to it verbatim.
-                profile.providers.retain(|key, _| key != "placeholder");
                 profile.providers.insert(
                     provider_key.clone(),
                     crate::profile::Provider {
-                        placeholder: false,
                         label: name.to_string(),
                         endpoint: Some(chat_endpoint),
                         credential_ref: Some(credential_ref.clone()),
+                        catalog: Some(catalog.clone()),
                     },
                 );
-                // The placeholder MODEL is left in place until the operator
-                // chooses models: `Profile::validate` requires at least one
-                // model, and stripping it here would make the Provider write
-                // fail with "requires at least one provider and one model".
-                // It is not executable anyway — it is filtered out of
-                // `executable_choices` — and the model-selection step replaces it.
-                service.replace(&revision, &profile)?;
-                let saved = service.current()?.ok_or_else(|| {
-                    OcgError::config("profile disappeared after provider save")
-                })?;
-                let new_revision = saved.1.clone();
+                let new_revision = service.replace_with_credential(
+                    &revision,
+                    &profile,
+                    &vault,
+                    &credential_ref,
+                    body.api_key.trim(),
+                )?;
+                let models = crate::setup::catalog_models(&provider_key, &catalog);
 
-                let models: Vec<crate::contracts::SetupModel> = {
-                    // A provider may list the same id twice; the Profile is a
-                    // map keyed by identity, so one entry per key is correct.
-                    let mut seen: std::collections::BTreeSet<String> =
-                        std::collections::BTreeSet::new();
-                    discovered
-                        .into_iter()
-                        .filter_map(|model| {
-                            let key = crate::setup::model_key(&provider_key, &model.id);
-                            if !seen.insert(key.clone()) {
-                                return None;
-                            }
-                            Some(crate::contracts::SetupModel {
-                                key,
-                                id: model.id.clone(),
-                                label: model.label.clone().unwrap_or_else(|| model.id.clone()),
-                                metadata: model.metadata,
-                            })
-                        })
-                        .collect()
+                Ok(
+                    serde_json::to_value(crate::contracts::SetupConnectResponse {
+                        api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
+                        provider_key,
+                        models,
+                        revision: new_revision,
+                    })
+                    .map_err(|error| OcgError::config(error.to_string()))?,
+                )
+            }
+
+            Route::SetupProviderRefresh => {
+                let body: crate::contracts::SetupRefreshRequest = serde_json::from_value(
+                    request
+                        .json_body()
+                        .map_err(|_| OcgError::config("invalid catalog refresh body"))?,
+                )
+                .map_err(|_| OcgError::config("invalid catalog refresh request"))?;
+                let (mut profile, revision) = service
+                    .current()?
+                    .ok_or_else(|| OcgError::config("Profile is missing"))?;
+                if revision != body.revision {
+                    return Err(OcgError::config(
+                        "Profile changed; refresh before discovering models",
+                    ));
+                }
+                let provider = profile
+                    .providers
+                    .get_mut(&body.provider_key)
+                    .ok_or_else(|| OcgError::config("provider is not configured"))?;
+                let endpoint = provider
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| OcgError::config("provider endpoint is missing"))?;
+                let vault = crate::vault::Vault::user_global()?;
+                let secret = match provider.credential_ref.as_deref() {
+                    Some(reference) => vault
+                        .get(reference)?
+                        .ok_or_else(|| OcgError::config("provider credential is missing"))?,
+                    None => String::new(),
                 };
-
-                Ok(serde_json::to_value(crate::contracts::SetupConnectResponse {
-                    api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
-                    provider_key,
-                    credential_ref,
-                    models,
-                    revision: new_revision,
-                }).map_err(|error| OcgError::config(error.to_string()))?)
+                // Setup discovery has no Project; scheduled discovery can invoke this same operation.
+                let catalog = crate::setup::discover_catalog(
+                    &crate::http::NativeHttp::new()?,
+                    endpoint,
+                    &secret,
+                )?;
+                let models = crate::setup::catalog_models(&body.provider_key, &catalog);
+                provider.catalog = Some(catalog);
+                let revision = service.replace(&body.revision, &profile)?;
+                Ok(
+                    serde_json::to_value(crate::contracts::SetupConnectResponse {
+                        api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
+                        provider_key: body.provider_key,
+                        models,
+                        revision,
+                    })
+                    .map_err(|error| OcgError::config(error.to_string()))?,
+                )
             }
 
             Route::SetupModelsSave => {
@@ -863,17 +885,25 @@ fn handle_setup(
                         "provider '{provider_key}' is not configured"
                     )));
                 }
-                // A model key must belong to the provider it is filed under,
-                // otherwise one provider could claim another's upstream id.
-                if let Some(foreign) = body
-                    .models
-                    .iter()
-                    .find(|selection| !selection.key.starts_with(&format!("{provider_key}:")))
-                {
-                    return Err(OcgError::config(format!(
-                        "model '{}' does not belong to provider '{provider_key}'",
-                        foreign.key
-                    )));
+                let catalog = profile
+                    .providers
+                    .get(&provider_key)
+                    .and_then(|provider| provider.catalog.as_ref())
+                    .ok_or_else(|| OcgError::config("refresh provider models before selecting"))?
+                    .clone();
+                let mut selected = std::collections::BTreeSet::new();
+                for selection in &body.models {
+                    if !selected.insert(&selection.key)
+                        || !catalog.models.iter().any(|model| {
+                            model.id == selection.id
+                                && crate::setup::model_key(&provider_key, &model.id)
+                                    == selection.key
+                        })
+                    {
+                        return Err(OcgError::config(
+                            "selected model does not belong to the current provider catalog",
+                        ));
+                    }
                 }
                 if !body.models.iter().any(|s| s.key == body.default_model) {
                     return Err(OcgError::config(
@@ -882,16 +912,24 @@ fn handle_setup(
                 }
 
                 // Replace this provider's models wholesale; keep other providers.
-                profile.models.retain(|_, m| !m.placeholder && m.provider != provider_key);
+                profile.models.retain(|_, m| m.provider != provider_key);
                 for selection in &body.models {
+                    let discovered = catalog
+                        .models
+                        .iter()
+                        .find(|model| model.id == selection.id)
+                        .ok_or_else(|| {
+                            OcgError::config("selected model is no longer in the catalog")
+                        })?;
                     profile.models.insert(
                         selection.key.clone(),
                         crate::profile::Model {
-                            placeholder: false,
                             provider: provider_key.clone(),
                             id: selection.id.clone(),
-                            variant: None,
-                            variants: vec![],
+                            variant: discovered.metadata.variant.clone(),
+                            variants: discovered.metadata.variants.clone().unwrap_or_default(),
+                            label: Some(discovered.label.clone()),
+                            metadata: Some(discovered.metadata.clone()),
                         },
                     );
                 }
@@ -899,25 +937,22 @@ fn handle_setup(
                 profile.default_model = Some(body.default_model.clone());
                 profile.validate()?;
 
-                service.replace(&body.revision, &profile)?;
-
                 // Backend readiness is the only authority on whether setup may
                 // continue. Anything less than one runnable choice is reported
                 // as a failure instead of a silent success.
-                let runnable = service.runnable_choices();
-                if runnable.is_empty() {
+                let runnable = profile.executable_choices(&crate::vault::Vault::user_global()?);
+                if !runnable.contains(&body.default_model) {
                     return Err(OcgError::config(
-                        "no runnable provider or model: configuration required",
+                        "selected default model is not executable: check provider configuration",
                     ));
                 }
 
-                // Return updated view
-                let current = service.current()?;
-                let (_new_profile, new_revision) = current.as_ref()
-                    .ok_or_else(|| OcgError::config("profile not found after save"))?;
+                let new_revision = service.replace(&body.revision, &profile)?;
 
                 Ok(serde_json::to_value(crate::contracts::SetupModelsResponse {
                     api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
+                    selected_models: selected.into_iter().cloned().collect(),
+                    default_model: body.default_model.clone(),
                     runnable_choices: runnable,
                     revision: new_revision.clone(),
                 }).map_err(|error| OcgError::config(error.to_string()))?)
@@ -1770,6 +1805,7 @@ enum Route {
     ProfilePreflight,
     // Setup / first-run
     SetupProviderConnect,
+    SetupProviderRefresh,
     SetupModelsSave,
     SetupBrowse,
     SetupProjectInit,
@@ -1874,6 +1910,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         ("OPTIONS", ["api", "v1", "profile", ..]) => Ok(Route::ProfilePreflight),
         // Setup routes
         ("POST", ["api", "v1", "setup", "connect"]) => Ok(Route::SetupProviderConnect),
+        ("POST", ["api", "v1", "setup", "refresh"]) => Ok(Route::SetupProviderRefresh),
         ("POST", ["api", "v1", "setup", "models"]) => Ok(Route::SetupModelsSave),
         ("POST", ["api", "v1", "setup", "browse"]) => Ok(Route::SetupBrowse),
         ("POST", ["api", "v1", "setup", "project"]) => Ok(Route::SetupProjectInit),

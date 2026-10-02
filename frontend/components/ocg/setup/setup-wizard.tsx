@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, ArrowRight, Check, Loader2, FolderOpen, ChevronRight, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -25,12 +25,10 @@ const STEPS: SetupStep[] = ["provider", "models", "projects"];
 interface ProviderState {
   name: string;
   endpoint: string;
-  apiKey: string;
 }
 
 interface ConnectResult {
   providerKey: string;
-  credentialRef: string;
   models: SetupModel[];
 }
 
@@ -48,8 +46,8 @@ export function SetupWizard() {
   const [provider, setProvider] = useState<ProviderState>({
     name: "",
     endpoint: "",
-    apiKey: "",
   });
+  const apiKeyInput = useRef<HTMLInputElement>(null);
   const [connectResult, setConnectResult] = useState<ConnectResult | null>(null);
 
   // Models state
@@ -70,7 +68,8 @@ export function SetupWizard() {
       setError("No loopback control endpoint available.");
       return;
     }
-    if (!provider.name.trim() || !provider.endpoint.trim() || !provider.apiKey.trim()) {
+    const apiKey = apiKeyInput.current?.value.trim() ?? "";
+    if (!provider.name.trim() || !provider.endpoint.trim() || !apiKey) {
       setError("All fields are required.");
       return;
     }
@@ -81,7 +80,7 @@ export function SetupWizard() {
       // The Profile must exist before a provider can be filed under it. On a
       // fresh machine there is nothing yet, so bootstrap it first.
       const profileClient = createProfileClient(controlUrl, fetch);
-      const existing = await profileClient.read().catch(() => null);
+      const existing = await profileClient.read();
       if (!existing?.profile) {
         await profileClient.createNew();
       }
@@ -93,13 +92,12 @@ export function SetupWizard() {
       const result = await setupClient.connectProvider(
         provider.name.trim(),
         provider.endpoint.trim(),
-        provider.apiKey.trim(),
+        apiKey,
       );
 
       setProfileRevision(result.revision);
       setConnectResult({
         providerKey: result.provider_key,
-        credentialRef: result.credential_ref,
         models: result.models,
       });
 
@@ -115,9 +113,29 @@ export function SetupWizard() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Failed to connect provider.");
     } finally {
+      if (apiKeyInput.current) apiKeyInput.current.value = "";
       setLoading(false);
     }
   }, [controlUrl, provider]);
+
+  const handleRefreshModels = useCallback(async () => {
+    if (!controlUrl || !connectResult) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await createSetupClient(controlUrl, fetch).refreshModels(connectResult.providerKey, profileRevision);
+      const retained = new Set(result.models.filter((model) => selectedModels.has(model.key)).map((model) => model.key));
+      if (retained.size === 0 && result.models[0]) retained.add(result.models[0].key);
+      setConnectResult({ providerKey: result.provider_key, models: result.models });
+      setProfileRevision(result.revision);
+      setSelectedModels(retained);
+      setDefaultModel(retained.has(defaultModel) ? defaultModel : retained.values().next().value ?? "");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Failed to refresh provider models.");
+    } finally {
+      setLoading(false);
+    }
+  }, [controlUrl, connectResult, profileRevision, selectedModels, defaultModel]);
 
   const handleSaveModels = useCallback(async () => {
     if (!controlUrl || !connectResult) return;
@@ -125,7 +143,7 @@ export function SetupWizard() {
       setError("Select at least one model.");
       return;
     }
-    if (!defaultModel) {
+    if (!defaultModel || !selectedModels.has(defaultModel)) {
       setError("Choose a default model.");
       return;
     }
@@ -136,7 +154,8 @@ export function SetupWizard() {
       const setupClient = createSetupClient(controlUrl, fetch);
       const modelsToSave = Array.from(selectedModels).map((key) => {
         const model = connectResult.models.find((m) => m.key === key);
-        return { key, id: model?.id ?? key };
+        if (!model) throw new Error("Refresh the provider model catalog before selecting.");
+        return { key: model.key, id: model.id };
       });
       const result = await setupClient.saveModels(
         connectResult.providerKey,
@@ -151,6 +170,8 @@ export function SetupWizard() {
       }
 
       setProfileRevision(result.revision);
+      setSelectedModels(new Set(result.selected_models));
+      setDefaultModel(result.default_model);
 
       // Browse home directory for project selection
       try {
@@ -293,26 +314,21 @@ export function SetupWizard() {
                 provider={provider}
                 onChange={setProvider}
                 loading={loading}
+                apiKeyInput={apiKeyInput}
               />
             )}
             {step === "models" && connectResult && (
               <ChooseModelsPanel
+                onRefresh={() => void handleRefreshModels()}
+                loading={loading}
                 models={connectResult.models}
                 selectedModels={selectedModels}
                 defaultModel={defaultModel}
                 onToggleModel={(key) => {
-                  setSelectedModels((current) => {
-                    const next = new Set(current);
-                    if (next.has(key)) {
-                      next.delete(key);
-                      if (defaultModel === key && next.size > 0) {
-                        setDefaultModel(Array.from(next)[0]);
-                      }
-                    } else {
-                      next.add(key);
-                    }
-                    return next;
-                  });
+                  const next = new Set(selectedModels);
+                  if (next.has(key)) next.delete(key); else next.add(key);
+                  setSelectedModels(next);
+                  if (!next.has(defaultModel)) setDefaultModel(next.values().next().value ?? "");
                 }}
                 onSetDefault={setDefaultModel}
               />
@@ -384,7 +400,9 @@ function ConnectProviderPanel({
   provider,
   onChange,
   loading,
+  apiKeyInput,
 }: {
+  apiKeyInput: React.RefObject<HTMLInputElement | null>;
   provider: ProviderState;
   onChange: (state: ProviderState) => void;
   loading: boolean;
@@ -399,7 +417,7 @@ function ConnectProviderPanel({
           id="setup-provider-name"
           type="text"
           className="rounded-md border border-border bg-background px-3 py-2 text-[13px]"
-          placeholder="VSLLM"
+          placeholder="Provider"
           value={provider.name}
           onChange={(event) => onChange({ ...provider, name: event.target.value })}
           disabled={loading}
@@ -413,7 +431,7 @@ function ConnectProviderPanel({
           id="setup-provider-endpoint"
           type="url"
           className="rounded-md border border-border bg-background px-3 py-2 text-[13px]"
-          placeholder="https://vsllm.cc/v1"
+          placeholder="https://api.example.com/v1"
           value={provider.endpoint}
           onChange={(event) => onChange({ ...provider, endpoint: event.target.value })}
           disabled={loading}
@@ -428,8 +446,7 @@ function ConnectProviderPanel({
           type="password"
           className="rounded-md border border-border bg-background px-3 py-2 text-[13px]"
           placeholder="••••••••••••••"
-          value={provider.apiKey}
-          onChange={(event) => onChange({ ...provider, apiKey: event.target.value })}
+          ref={apiKeyInput}
           disabled={loading}
           autoComplete="off"
         />
@@ -440,12 +457,16 @@ function ConnectProviderPanel({
 
 function ChooseModelsPanel({
   models,
+  onRefresh,
+  loading,
   selectedModels,
   defaultModel,
   onToggleModel,
   onSetDefault,
 }: {
   models: SetupModel[];
+  onRefresh: () => void;
+  loading: boolean;
   selectedModels: Set<string>;
   defaultModel: string;
   onToggleModel: (key: string) => void;
@@ -460,6 +481,7 @@ function ChooseModelsPanel({
       <p className="text-[12px] text-muted-foreground">
         Select the models you want to use. The default model is used for new chats.
       </p>
+      <Button size="sm" variant="outline" onClick={onRefresh} disabled={loading}>Refresh models</Button>
       <ul className="divide-y divide-border rounded-md border border-border">
         {models.map((model) => {
           const selected = selectedModels.has(model.key);
@@ -470,17 +492,18 @@ function ChooseModelsPanel({
                 type="checkbox"
                 className="size-4 shrink-0"
                 checked={selected}
+                disabled={loading}
                 onChange={() => onToggleModel(model.key)}
                 aria-label={`Select ${model.label}`}
               />
               <div className="min-w-0 flex-1">
                 <p className="truncate text-[12px] font-medium">{model.label}</p>
-                <p className="text-[11px] text-muted-foreground">{model.id}</p>
               </div>
               {selected && (
                 <Button
                   size="xs"
                   variant={isDefault ? "default" : "outline"}
+                  disabled={loading}
                   onClick={() => onSetDefault(model.key)}
                 >
                   {isDefault ? "Default" : "Set default"}

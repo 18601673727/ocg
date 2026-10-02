@@ -975,31 +975,10 @@ impl CanonicalControlService {
             }
         };
 
-        if provider_entry.placeholder {
-            let response = crate::contracts::JobLaunchResponse {
-                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                outcome: "rejected".to_string(),
-                command_id: request.command_id.clone(),
-                draft_id: request.draft_id.clone(),
-                project_id: project.project_id.clone(),
-                session_id: request.session_id.clone(),
-                job_id: None,
-                message: format!("provider is placeholder: {}", provider_key),
-                duplicate: false,
-            };
-            domain.record_launch_command(
-                &request.command_id,
-                &request.project_id,
-                &request_hash,
-                "rejected",
-                None,
-                &response.message,
-            )?;
-            return Ok(response);
-        }
-
         let upstream_model_id = match profile.models.get(model) {
-            Some(entry) if !entry.placeholder && entry.provider == provider_key && !entry.id.is_empty() => entry.id.clone(),
+            Some(entry) if entry.provider == provider_key && !entry.id.is_empty() => {
+                entry.id.clone()
+            }
             _ => {
                 let response = crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),

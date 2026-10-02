@@ -49,9 +49,7 @@ pub use crate::orchestration::canonical_control::{
 /// PWA reads it out of an opaque JSON value and must not be able to drift from
 /// the definition that actually confers authority.
 pub use crate::orchestration::domain::ExecutionWitness;
-pub use crate::profile::{
-    Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION,
-};
+pub use crate::profile::{Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION};
 
 /// The Profile control API version. Shared with the generated TypeScript, so a
 /// version bump is a compile-time mismatch rather than a runtime surprise.
@@ -198,8 +196,6 @@ pub struct SetupConnectResponse {
     pub api_version: String,
     /// Provider key assigned by the backend.
     pub provider_key: String,
-    /// Credential reference name used.
-    pub credential_ref: String,
     /// Normalized models from the provider.
     pub models: Vec<SetupModel>,
     /// Profile revision after the provider was persisted, for the model save.
@@ -216,7 +212,13 @@ pub struct SetupModel {
     /// Display label.
     pub label: String,
     /// Known metadata (may be empty).
-    pub metadata: Value,
+    pub metadata: crate::profile::ModelMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupRefreshRequest {
+    pub provider_key: String,
+    pub revision: String,
 }
 
 /// Request to save selected models.
@@ -246,6 +248,8 @@ pub struct SetupModelSelection {
 pub struct SetupModelsResponse {
     #[ts(type = "ProfileApiVersion")]
     pub api_version: String,
+    pub selected_models: Vec<String>,
+    pub default_model: String,
     pub runnable_choices: Vec<String>,
     pub revision: String,
 }
@@ -328,6 +332,7 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     ProfileReplaceRequest::export_all(cfg)?;
     ProfileCredentialRequest::export_all(cfg)?;
     SetupConnectRequest::export_all(cfg)?;
+    SetupRefreshRequest::export_all(cfg)?;
     SetupConnectResponse::export_all(cfg)?;
     SetupModel::export_all(cfg)?;
     SetupModelSelection::export_all(cfg)?;
@@ -525,7 +530,7 @@ fn clean(body: &str) -> String {
         if trimmed.starts_with("export type { ") && trimmed.ends_with(" };") {
             continue;
         }
-        out.push_str(line);
+        out.push_str(line.trim_end());
         out.push('\n');
     }
     while out.ends_with("\n\n") {

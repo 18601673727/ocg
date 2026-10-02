@@ -67,10 +67,6 @@ pub fn status_text(effective: &Effective, level: &str) -> Result<String> {
         format!("  provider count {}", profile.providers.len()),
         format!("  model count   {}", profile.models.len()),
         format!("  runnable models {}", profile.runnable_models().count()),
-        format!(
-            "  placeholder-only {}",
-            profile.runnable_models().next().is_none()
-        ),
         format!("  workers       {workers}"),
         format!("  cwd           {}", effective.cwd.display()),
         String::new(),
