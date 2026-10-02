@@ -119,6 +119,11 @@ pub struct ProfileView {
     /// SHA-256 of the Profile document. A write must present the same value;
     /// a mismatch is rejected instead of overwriting a concurrent edit.
     pub revision: Option<String>,
+    /// Backend-computed execution readiness: model keys that satisfy the
+    /// same provider/model/endpoint/credential rules as canonical launch.
+    /// The PWA decides onboarding vs workspace from this alone. Secrets are
+    /// never included.
+    pub runnable_choices: Vec<String>,
 }
 
 /// The request bodies the PWA sends. Typed so a malformed body is a compile
@@ -133,6 +138,15 @@ pub struct ProfileBootstrapRequest {
 pub struct ProfileReplaceRequest {
     pub revision: String,
     pub profile: Profile,
+}
+
+/// `POST /api/v1/profile/credentials`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ProfileCredentialRequest {
+    /// Vault credential name. Validated by the Vault, never logged.
+    pub name: String,
+    /// The secret value. Written to the Vault only; never returned.
+    pub value: String,
 }
 
 /// `POST /api/v1/canonical/jobs/launch`
@@ -199,6 +213,7 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     ProfileView::export_all(cfg)?;
     ProfileBootstrapRequest::export_all(cfg)?;
     ProfileReplaceRequest::export_all(cfg)?;
+    ProfileCredentialRequest::export_all(cfg)?;
     ActivityCursor::export_all(cfg)?;
     ChangeSetFingerprintInputV1::export_all(cfg)?;
     CommandFingerprintInputV1::export_all(cfg)?;

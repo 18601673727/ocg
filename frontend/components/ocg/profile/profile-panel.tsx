@@ -20,6 +20,11 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
   const [modelKey, setModelKey] = useState("");
   const [modelId, setModelId] = useState("");
   const [modelProvider, setModelProvider] = useState("");
+  // A Vault secret lives in this transient state only: it is POSTed once to
+  // the loopback credential endpoint, never stored elsewhere, and cleared
+  // after the save resolves.
+  const [credentialName, setCredentialName] = useState("");
+  const [credentialSecret, setCredentialSecret] = useState("");
 
   const install = useCallback((next: ProfileView) => {
     setView(next);
@@ -44,9 +49,9 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
     try {
       const next = await operation();
       install(next);
-       // Bootstrapping only creates the OCG-owned document. A placeholder
-       // profile is deliberately not an executable provider/model selection.
-       if (next.profile && runnableChoices(next.profile).length > 0) onEstablished?.();
+      // Execution readiness comes from the backend alone: only a
+      // backend-confirmed executable choice establishes the profile.
+      if (next.runnable_choices.length > 0) onEstablished?.();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally { setBusy(false); }
@@ -60,6 +65,15 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
     change(profile => { profile.providers[key] = { placeholder: false, label: key }; return profile; });
     setModelProvider(key);
     setProviderKey("");
+  }
+  function saveCredential() {
+    const name = credentialName.trim();
+    if (!client || !name || !credentialSecret || busy) return;
+    const secret = credentialSecret;
+    void mutate(() => client.saveCredential(name, secret)).finally(() => {
+      setCredentialSecret("");
+      setCredentialName("");
+    });
   }
   function addModel() {
     const key = modelKey.trim();
@@ -89,17 +103,22 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
       ) : (
         <div className="space-y-3 text-xs">
           <p>Origin: New</p>
-          <p>Providers: {Object.keys(draft.providers).length} · Models: {Object.keys(draft.models).length} · Runnable choices: {runnableChoices(draft).length}</p>
+          <p>Providers: {Object.keys(draft.providers).length} · Models: {Object.keys(draft.models).length} · Runnable choices: {runnableChoices(draft).length} · Executable choices (backend): {view.runnable_choices.length}</p>
           {runnableChoices(draft).length === 0 && <p role="status">Placeholder-only Profile: configuration is valid, inference is unavailable.</p>}
+          {view.runnable_choices.length === 0 && <p role="status">No executable provider/model: each provider needs an HTTPS endpoint, a credential reference, and a matching Vault credential.</p>}
           <div className="space-y-1"><h3 className="font-medium">Providers</h3>
-            {Object.entries(draft.providers).map(([key, provider]) => <div key={key} className="flex items-center gap-2"><span className="min-w-24">{key}{provider.placeholder ? " (placeholder)" : ""}</span><Input aria-label={`${key} label`} value={provider.label} onChange={event => change(profile => { profile.providers[key].label = event.target.value; return profile; })} /><Button size="xs" variant="outline" aria-label={`Remove provider ${key}`} onClick={() => change(profile => { delete profile.providers[key]; for (const [name, model] of Object.entries(profile.models)) if (model.provider === key) delete profile.models[name]; if (profile.defaultModel && !profile.models[profile.defaultModel]) profile.defaultModel = null; return profile; })}><Trash2 className="size-3" /></Button></div>)}
+            {Object.entries(draft.providers).map(([key, provider]) => <div key={key} className="flex flex-wrap items-center gap-2"><span className="min-w-24">{key}{provider.placeholder ? " (placeholder)" : ""}</span><Input aria-label={`${key} label`} value={provider.label} onChange={event => change(profile => { profile.providers[key].label = event.target.value; return profile; })} /><Input aria-label={`${key} endpoint`} placeholder="https:// provider endpoint" value={provider.endpoint ?? ""} onChange={event => change(profile => { profile.providers[key].endpoint = event.target.value || null; return profile; })} /><Input aria-label={`${key} credential reference`} placeholder="vault credential name" value={provider.credential_ref ?? ""} onChange={event => change(profile => { profile.providers[key].credential_ref = event.target.value || null; return profile; })} /><Button size="xs" variant="outline" aria-label={`Remove provider ${key}`} onClick={() => change(profile => { delete profile.providers[key]; for (const [name, model] of Object.entries(profile.models)) if (model.provider === key) delete profile.models[name]; if (profile.defaultModel && !profile.models[profile.defaultModel]) profile.defaultModel = null; return profile; })}><Trash2 className="size-3" /></Button></div>)}
             <div className="flex gap-2"><Input aria-label="New provider key" placeholder="provider key" value={providerKey} onChange={event => setProviderKey(event.target.value)} /><Button size="sm" variant="outline" onClick={addProvider}><Plus className="size-3" /> Provider</Button></div>
+          </div>
+          <div className="space-y-1"><h3 className="font-medium">Vault credential</h3>
+            <p className="text-muted-foreground">The secret is written to the user-global Vault only; it is never stored in the Profile or shown again.</p>
+            <div className="flex flex-wrap gap-2"><Input aria-label="Credential name" placeholder="credential name" value={credentialName} onChange={event => setCredentialName(event.target.value)} /><Input aria-label="Credential secret" placeholder="secret value" type="password" value={credentialSecret} onChange={event => setCredentialSecret(event.target.value)} /><Button size="sm" variant="outline" disabled={busy || !credentialName.trim() || !credentialSecret} onClick={saveCredential}><Save className="size-3" /> Save credential</Button></div>
           </div>
           <div className="space-y-1"><h3 className="font-medium">Models</h3>
             {Object.entries(draft.models).map(([key, model]) => <div key={key} className="flex flex-wrap items-center gap-2"><span className="min-w-24">{key}{model.placeholder ? " (placeholder)" : ""}</span><Input aria-label={`${key} model id`} value={model.id} onChange={event => change(profile => { profile.models[key].id = event.target.value; return profile; })} /><span>{model.provider}</span><Input aria-label={`${key} variant`} placeholder="provider default variant" value={model.variant ?? ""} onChange={event => change(profile => { profile.models[key].variant = event.target.value || null; return profile; })} />{model.variants?.length ? <span>Available: {model.variants.join(", ")}</span> : null}<Button size="xs" variant="outline" aria-label={`Remove model ${key}`} onClick={() => change(profile => { delete profile.models[key]; if (profile.defaultModel === key) profile.defaultModel = null; return profile; })}><Trash2 className="size-3" /></Button></div>)}
             <div className="flex flex-wrap gap-2"><Input aria-label="New model key" placeholder="model key" value={modelKey} onChange={event => setModelKey(event.target.value)} /><Input aria-label="New model id" placeholder="runtime model id" value={modelId} onChange={event => setModelId(event.target.value)} /><select aria-label="New model provider" className="rounded border border-border bg-background px-2" value={modelProvider} onChange={event => setModelProvider(event.target.value)}><option value="">Select provider</option>{Object.keys(draft.providers).map(key => <option key={key} value={key}>{key}</option>)}</select><Button size="sm" variant="outline" onClick={addModel}><Plus className="size-3" /> Model</Button></div>
           </div>
-          <label className="flex items-center gap-2">Default model <select className="rounded border border-border bg-background px-2 py-1" value={draft.defaultModel ?? ""} onChange={event => change(profile => { profile.defaultModel = event.target.value || null; return profile; })}><option value="">Select at execution</option>{runnableChoices(draft).map(key => <option key={key} value={key}>{key}</option>)}</select></label>
+          <label className="flex items-center gap-2">Default model <select className="rounded border border-border bg-background px-2 py-1" value={draft.defaultModel ?? ""} onChange={event => change(profile => { profile.defaultModel = event.target.value || null; return profile; })}><option value="">Select at execution</option>{view.runnable_choices.map(key => <option key={key} value={key}>{key}</option>)}</select></label>
           <Button size="sm" disabled={busy || !view.revision || Object.keys(draft.providers).length === 0 || Object.keys(draft.models).length === 0} onClick={() => void mutate(() => client!.replace(view.revision!, draft))}><Save className="size-3" /> Save OCG Profile</Button>
         </div>
       )}

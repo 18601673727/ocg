@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { createProfileClient, runnableChoices } from "../profile/profile-client";
+import { createProfileClient } from "../profile/profile-client";
 import { useOcgControlUrl } from "../profile/control-url";
 
 /**
@@ -31,7 +31,10 @@ export function BootstrapEntry() {
         const client = createProfileClient(controlUrl, fetch);
         const view = await client.read();
         if (cancelled) return;
-        const ready = view.profile !== null && runnableChoices(view.profile).length > 0;
+        // The one readiness authority is backend-computed: model keys that
+        // satisfy the same selection/endpoint/credential rules as canonical
+        // launch. No fixture scenario and no local re-derivation here.
+        const ready = view.runnable_choices.length > 0;
         router.replace(ready ? "/?scenario=local-ready" : "/onboarding?scenario=local-first-run");
       } catch (cause) {
         if (!cancelled) {

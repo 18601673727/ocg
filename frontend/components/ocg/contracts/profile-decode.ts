@@ -34,7 +34,19 @@ const provider: Decoder<Provider> = (input, path) => {
   if (!placeholder.ok) return placeholder;
   const label = req(rec.value, "label", string, path);
   if (!label.ok) return label;
-  return yes({ placeholder: placeholder.value, label: label.value });
+  // `endpoint` and `credential_ref` are `skip_serializing_if`, so absence is
+  // normal. They must be read (not dropped) so an edit round-trip preserves
+  // the provider's execution wiring.
+  const endpoint = opt(rec.value, "endpoint", string, path);
+  if (!endpoint.ok) return endpoint;
+  const credentialRef = opt(rec.value, "credential_ref", string, path);
+  if (!credentialRef.ok) return credentialRef;
+  return yes({
+    placeholder: placeholder.value,
+    label: label.value,
+    endpoint: endpoint.value,
+    credential_ref: credentialRef.value,
+  });
 };
 
 const model: Decoder<Model> = (input, path) => {
@@ -95,10 +107,15 @@ const profileView: Decoder<ProfileView> = (input, path) => {
   if (!value.ok) return value;
   const revision = req(rec.value, "revision", nullable(string), path);
   if (!revision.ok) return revision;
+  // Backend-computed execution readiness. Required: the PWA must decide
+  // onboarding vs workspace from the backend authority, never re-derived.
+  const runnableChoices = req(rec.value, "runnable_choices", array(string), path);
+  if (!runnableChoices.ok) return runnableChoices;
   return yes({
     api_version: apiVersion.value,
     profile: value.value,
     revision: revision.value,
+    runnable_choices: runnableChoices.value,
   });
 };
 

@@ -268,7 +268,7 @@ export type JobBlocker = { kind: BlockerKind, blocking_ref: EntityRef | null, re
 export type JobLaunchRequest = { command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
 
 
-export type JobLaunchResponse = { api_version: CanonicalApiVersion,
+export type JobLaunchResponse = { api_version: CanonicalApiVersion, 
 /**
  * "accepted" | "rejected" | "failed"
  */
@@ -326,6 +326,20 @@ export type ProfileBootstrapRequest = {
 choice: string, };
 
 
+/**
+ * `POST /api/v1/profile/credentials`
+ */
+export type ProfileCredentialRequest = { 
+/**
+ * Vault credential name. Validated by the Vault, never logged.
+ */
+name: string, 
+/**
+ * The secret value. Written to the Vault only; never returned.
+ */
+value: string, };
+
+
 export type ProfileReplaceRequest = { revision: string, profile: Profile, };
 
 
@@ -340,7 +354,14 @@ export type ProfileView = { api_version: ProfileApiVersion, profile: Profile | n
  * SHA-256 of the Profile document. A write must present the same value;
  * a mismatch is rejected instead of overwriting a concurrent edit.
  */
-revision: string | null, };
+revision: string | null, 
+/**
+ * Backend-computed execution readiness: model keys that satisfy the
+ * same provider/model/endpoint/credential rules as canonical launch.
+ * The PWA decides onboarding vs workspace from this alone. Secrets are
+ * never included.
+ */
+runnable_choices: Array<string>, };
 
 
 export type ProjectConfiguration = { defaults: JsonValue, };
@@ -365,11 +386,11 @@ export type ProjectionEffect = "reducible" | "snapshot_barrier";
 export type ProjectionEffectPolicy = "reducible_only" | "barrier_allowed";
 
 
-export type Provider = { placeholder: boolean, label: string,
+export type Provider = { placeholder: boolean, label: string, 
 /**
  * HTTPS endpoint for provider API calls. Must not include userinfo.
  */
-endpoint?: string | null,
+endpoint?: string | null, 
 /**
  * Reference to a Vault credential name. The credential value is the raw
  * bearer token (without "Bearer " prefix); OCG constructs the Authorization

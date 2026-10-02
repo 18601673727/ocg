@@ -486,7 +486,11 @@ fn handle_client(
 
     if matches!(
         route,
-        Route::ProfileGet | Route::ProfileBootstrap | Route::ProfilePut | Route::ProfilePreflight
+        Route::ProfileGet
+            | Route::ProfileBootstrap
+            | Route::ProfilePut
+            | Route::ProfileCredential
+            | Route::ProfilePreflight
     ) {
         if request.method == "OPTIONS" {
             let _ = write_preflight(&mut stream, &request);
@@ -619,6 +623,7 @@ fn handle_profile(
                 api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
                 profile: current.as_ref().map(|(profile, _)| profile.clone()),
                 revision: current.as_ref().map(|(_, revision)| revision.clone()),
+                runnable_choices: service.runnable_choices(),
             })
             .map_err(|error| OcgError::config(error.to_string()))
         };
@@ -654,6 +659,22 @@ fn handle_profile(
                 )
                 .map_err(|error| OcgError::config(format!("invalid edited Profile: {error}")))?;
                 service.replace(expected, &profile)?;
+                view()
+            }
+            Route::ProfileCredential => {
+                // The secret goes to the Vault only. The response is the
+                // recomputed ProfileView with fresh readiness; it never
+                // contains the secret.
+                let request: crate::contracts::ProfileCredentialRequest = serde_json::from_value(
+                    request
+                        .json_body()
+                        .map_err(|_| OcgError::config("invalid Profile credential body"))?,
+                )
+                .map_err(|error| {
+                    OcgError::config(format!("invalid Profile credential: {error}"))
+                })?;
+                let vault = crate::vault::Vault::user_global()?;
+                vault.set(&request.name, &request.value)?;
                 view()
             }
             _ => unreachable!("not a Profile route"),
@@ -964,7 +985,7 @@ fn handle_chat_stream(
             )
         }
     };
-    let Some(buffer) = service.chat_buffer_for(&session_id, &job_id) else {
+    let Some((buffer, started_at)) = service.chat_buffer_for(&session_id, &job_id) else {
         return write_api_error(
             stream,
             &ApiError::new(404, "unknown_chat", "chat stream unavailable"),
@@ -981,9 +1002,13 @@ fn handle_chat_stream(
     stream.write_all(head.as_bytes())?;
     stream.flush()?;
 
-    let start = std::time::Instant::now();
-    let mut last_heartbeat = std::time::Instant::now();
+    // The execution deadline belongs to the turn, not to this connection:
+    // `started_at` was fixed when the ActiveChat was created, so every
+    // attach and reconnect shares the same deadline and a reconnect can
+    // never extend the execution lifetime.
     let overall = Duration::from_secs(300);
+    let deadline = started_at + overall;
+    let mut last_heartbeat = std::time::Instant::now();
     let heartbeat = Duration::from_secs(10);
     let poll = Duration::from_millis(200);
     // Replay what arrived before attach, then go live. The provider body is
@@ -1010,7 +1035,7 @@ fn handle_chat_stream(
     let mut finished = false;
     let mut disconnected = false;
     while !finished {
-        if start.elapsed() > overall {
+        if std::time::Instant::now() >= deadline {
             let payload = json!({"error": "chat stream timed out"}).to_string();
             let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
             let _ = stream.flush();
@@ -1437,6 +1462,7 @@ enum Route {
     ProfileGet,
     ProfileBootstrap,
     ProfilePut,
+    ProfileCredential,
     ProfilePreflight,
     // Canonical Job/Attempt control surface (project import, configuration,
     // pre-attempt Job configuration, snapshots and the event tail).
@@ -1474,8 +1500,10 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
             ("GET", ["api", "v1", "profile"])
                 | ("POST", ["api", "v1", "profile", "bootstrap"])
                 | ("PUT", ["api", "v1", "profile"])
+                | ("POST", ["api", "v1", "profile", "credentials"])
                 | ("OPTIONS", ["api", "v1", "profile"])
                 | ("OPTIONS", ["api", "v1", "profile", "bootstrap"])
+                | ("OPTIONS", ["api", "v1", "profile", "credentials"])
                 | ("GET", ["api", "v1", "canonical", "projects"])
                 | ("POST", ["api", "v1", "canonical", "projects", "import"])
                 | ("GET", ["api", "v1", "canonical", "projects", _])
@@ -1525,6 +1553,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         ("GET", ["api", "v1", "profile"]) => Ok(Route::ProfileGet),
         ("POST", ["api", "v1", "profile", "bootstrap"]) => Ok(Route::ProfileBootstrap),
         ("PUT", ["api", "v1", "profile"]) => Ok(Route::ProfilePut),
+        ("POST", ["api", "v1", "profile", "credentials"]) => Ok(Route::ProfileCredential),
         ("OPTIONS", ["api", "v1", "profile", ..]) => Ok(Route::ProfilePreflight),
         ("GET", ["api", "v1", "canonical", "projects"]) => Ok(Route::CanonicalProjects),
         ("POST", ["api", "v1", "canonical", "projects", "import"]) => {
@@ -1625,6 +1654,7 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
     match segments {
         ["api", "v1", "profile"] => Some("GET, PUT"),
         ["api", "v1", "profile", "bootstrap"] => Some("POST"),
+        ["api", "v1", "profile", "credentials"] => Some("POST"),
         ["api", "v1", "canonical", "configuration"] => Some("GET, PUT"),
         ["api", "v1", "canonical", "configuration", "projects", _] => Some("PUT"),
         ["api", "v1", "canonical", "jobs", _, "configuration"] => Some("GET, PUT"),

@@ -10,6 +10,13 @@ import type { Profile, ProfileView } from "../contracts";
 import { decodeProfileView, ContractError } from "../contracts";
 import { PROFILE_API_VERSION } from "../contracts";
 
+/**
+ * Structural draft helper only: counts models whose provider is marked
+ * non-placeholder. This is never execution or startup readiness; the single
+ * readiness authority is the backend-computed `runnable_choices` on
+ * `ProfileView`, which additionally requires a usable endpoint and a Vault
+ * credential that exists.
+ */
 export function runnableChoices(profile: Profile): string[] {
   return Object.entries(profile.models)
     .filter(([, model]) => !model.placeholder && profile.providers[model.provider]?.placeholder === false)
@@ -65,6 +72,11 @@ export function createProfileClient(baseUrl: string, fetchImpl: typeof fetch) {
     createNew: () => request("/api/v1/profile/bootstrap", { method: "POST", body: JSON.stringify({ choice: "new" }) }),
     replace: (revision: string, profile: Profile) => request("/api/v1/profile", {
       method: "PUT", body: JSON.stringify({ revision, profile }),
+    }),
+    /** Write a credential secret to the user-global Vault. The backend
+     * response is the recomputed ProfileView; it never contains the secret. */
+    saveCredential: (name: string, value: string) => request("/api/v1/profile/credentials", {
+      method: "POST", body: JSON.stringify({ name, value }),
     }),
   };
 }

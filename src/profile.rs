@@ -163,6 +163,44 @@ impl Profile {
         })
     }
 
+    /// Model keys that can actually execute right now. This is the backend
+    /// execution-readiness authority: structural selection, plus a usable
+    /// endpoint, plus a credential that exists in the Vault. The secret value
+    /// is never read out, only its existence is checked. A Vault failure
+    /// closes the gate rather than guessing.
+    pub fn executable_choices(&self, vault: &crate::vault::Vault) -> Vec<String> {
+        self.models
+            .iter()
+            .filter(|(_, model)| {
+                if model.placeholder || model.id.is_empty() {
+                    return false;
+                }
+                let Some(provider) = self.providers.get(&model.provider) else {
+                    return false;
+                };
+                if provider.placeholder {
+                    return false;
+                }
+                if !endpoint_usable(provider.endpoint.as_deref()) {
+                    return false;
+                }
+                let Some(credential_ref) = provider
+                    .credential_ref
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                else {
+                    return false;
+                };
+                vault
+                    .get(credential_ref)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|value| !value.is_empty())
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     pub fn require_runnable(&self) -> Result<()> {
         self.validate()?;
         if self.runnable_models().next().is_none() {
@@ -226,6 +264,22 @@ impl Default for Profile {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether a provider endpoint is usable for execution. Mirrors the
+/// structural rules in `validate`: present, non-empty, HTTPS, no userinfo.
+fn endpoint_usable(endpoint: Option<&str>) -> bool {
+    let Some(endpoint) = endpoint.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if !endpoint.starts_with("https://") {
+        return false;
+    }
+    let Some(authority) = endpoint.strip_prefix("https://") else {
+        return false;
+    };
+    let path_start = authority.find('/').unwrap_or(authority.len());
+    !authority[..path_start].contains('@')
 }
 
 pub fn as_ocg_config(profile: &Profile) -> Result<Value> {
@@ -317,6 +371,19 @@ impl ProfileService {
             Profile::from_ocg_config(&data)?,
             format!("{:x}", Sha256::digest(&bytes)),
         )))
+    }
+
+    /// Backend-computed execution readiness: model keys that satisfy the
+    /// same selection, endpoint, and credential rules as canonical launch.
+    /// A missing Profile or an unreadable Vault yields no choices.
+    pub fn runnable_choices(&self) -> Vec<String> {
+        let Ok(Some((profile, _))) = self.current() else {
+            return Vec::new();
+        };
+        let Ok(vault) = crate::vault::Vault::user_global() else {
+            return Vec::new();
+        };
+        profile.executable_choices(&vault)
     }
 
     /// Create a new Profile without overwriting an existing one.

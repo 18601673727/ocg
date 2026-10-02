@@ -239,6 +239,9 @@ struct ActiveChat {
     cancelled: Arc<AtomicBool>,
     sender: flume::Sender<ExecutionEvent>,
     buffer: std::sync::Arc<ChatEventBuffer>,
+    /// When the turn started. The 300s execution deadline is anchored here,
+    /// so every SSE attach/reconnect of the same turn shares one deadline.
+    started_at: Instant,
 }
 
 impl CanonicalControlService {
@@ -1275,19 +1278,21 @@ impl CanonicalControlService {
                 cancelled,
                 sender,
                 buffer,
+                started_at: Instant::now(),
             });
         }
         Ok(response)
     }
 
-    /// Clone the retained tail for one SSE attach. The entry stays for
-    /// cancellation until `finish_chat` removes it. Late attach replays from
-    /// index zero; live events follow once the prefix is drained.
+    /// Clone the retained tail for one SSE attach, together with the turn's
+    /// start time. The entry stays for cancellation until `finish_chat`
+    /// removes it. Late attach replays from index zero; live events follow
+    /// once the prefix is drained.
     pub(crate) fn chat_buffer_for(
         &self,
         session_id: &str,
         job_id: &str,
-    ) -> Option<std::sync::Arc<ChatEventBuffer>> {
+    ) -> Option<(std::sync::Arc<ChatEventBuffer>, Instant)> {
         self.reap_expired_chats();
         let mut guard = self.active_chats.lock().ok()?;
         let entry = guard.get(session_id)?;
@@ -1305,7 +1310,7 @@ impl CanonicalControlService {
             guard.remove(session_id);
             return None;
         }
-        Some(entry.buffer.clone())
+        Some((entry.buffer.clone(), entry.started_at))
     }
 
     /// Opportunistically reap terminal transport buffers. Running chats are
