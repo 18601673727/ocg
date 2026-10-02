@@ -32,8 +32,8 @@ pub struct ExecutionEnvelope {
 /// woken: a provider socket read waiting for bytes that may never arrive cannot
 /// observe a flag, so without a wakeup, cancelling a turn would have to wait for
 /// the upstream to send another chunk. Cancelling sets the flag and posts on the
-/// channel; a waiter takes the receiving half once, so cancellation stays
-/// terminal for the Call it belongs to.
+/// channel; cancellation closes the sender, waking current waiters and leaving
+/// the receiver disconnected so later waiters return immediately.
 #[derive(Clone, Debug)]
 pub struct CallCancellation {
     inner: Arc<CancellationInner>,
@@ -43,8 +43,8 @@ pub struct CallCancellation {
 struct CancellationInner {
     flag: AtomicBool,
     /// Bounded to one post. A second cancel is already covered by the flag.
-    signal: flume::Sender<()>,
-    wake: Mutex<Option<flume::Receiver<()>>>,
+    signal: Mutex<Option<flume::Sender<()>>>,
+    wake: flume::Receiver<()>,
 }
 
 impl Default for CallCancellation {
@@ -59,8 +59,8 @@ impl CallCancellation {
         Self {
             inner: Arc::new(CancellationInner {
                 flag: AtomicBool::new(false),
-                signal,
-                wake: Mutex::new(Some(wake)),
+                signal: Mutex::new(Some(signal)),
+                wake,
             }),
         }
     }
@@ -75,7 +75,14 @@ impl CallCancellation {
     /// the authority and the bounded post is best effort.
     pub fn cancel(&self) {
         self.inner.flag.store(true, Ordering::SeqCst);
-        let _ = self.inner.signal.try_send(());
+        // Closing the channel wakes every waiter without consuming a wakeup.
+        let signal = self
+            .inner
+            .signal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(signal);
     }
 
     /// Resolve once this Call is cancelled.
@@ -86,9 +93,8 @@ impl CallCancellation {
         if self.is_cancelled() {
             return;
         }
-        let wake = self.inner.wake.lock().ok().and_then(|mut wake| wake.take());
-        if let Some(wake) = wake {
-            let _ = wake.recv_async().await;
+        match self.inner.wake.recv_async().await {
+            Ok(()) | Err(flume::RecvError::Disconnected) => {}
         }
     }
 }
