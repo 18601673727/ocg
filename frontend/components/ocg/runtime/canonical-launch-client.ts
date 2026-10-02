@@ -337,7 +337,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     try {
       const view = await this.profile.read();
       if (view.runnable_choices.length > 0) {
-        return { available: true, status: { state: "connected", detail: "canonical provider runtime" } };
+        return { available: true, status: { state: "connected", detail: "OCG provider runtime" } };
       }
       return {
         available: false,

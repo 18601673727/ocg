@@ -47,6 +47,7 @@ type HomeSurfaceProps = {
   snapshot: RuntimeSnapshot;
   /** Opens a workspace; the shell owns the address and the close-back-to-chat. */
   onNavigate: (view: WorkspaceView) => void;
+  onSelectSession?: (sessionId: string) => void;
 };
 
 /** Where a home attention row sends the operator. Onboarding lives in Settings. */
@@ -121,7 +122,7 @@ export function HomeSurface(props: HomeSurfaceProps) {
           {/* Left column */}
           <div className="flex flex-col gap-5">
             <ActiveJobsSection jobs={jobs} onNavigate={props.onNavigate} />
-            <ContinueWorkingSection entries={recentWork} />
+            <ContinueWorkingSection entries={recentWork} onSelectSession={props.onSelectSession ?? (() => props.onNavigate("chat"))} />
             <RecentActivitySection items={activity} />
           </div>
 
@@ -275,7 +276,7 @@ function JobCard({ job, onClick }: { job: ActiveJobProjection; onClick: () => vo
 // Continue working section
 // ---------------------------------------------------------------------------
 
-function ContinueWorkingSection({ entries }: { entries: ContinueWorkingEntry[] }) {
+function ContinueWorkingSection({ entries, onSelectSession }: { entries: ContinueWorkingEntry[]; onSelectSession: (sessionId: string) => void }) {
   if (entries.length === 0) return null;
 
   return (
@@ -286,6 +287,7 @@ function ContinueWorkingSection({ entries }: { entries: ContinueWorkingEntry[] }
           <button
             key={entry.id}
             type="button"
+            onClick={() => { if (entry.sessionId) onSelectSession(entry.sessionId); }}
             className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-muted/40"
           >
             <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted">

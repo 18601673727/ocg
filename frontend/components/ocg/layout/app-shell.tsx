@@ -56,7 +56,7 @@ function EmptyProjectWorkspace({
 }: {
   activeProjectId: ProjectId;
   activeProjectName: string;
-  projects: readonly { id: ProjectId; name: string }[];
+  projects: readonly { id: ProjectId; name: string; root?: string }[];
   onProjectChange: (id: ProjectId) => void;
   onNewChat: () => void;
 }) {
@@ -64,7 +64,7 @@ function EmptyProjectWorkspace({
     <main aria-label="Project workspace" className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-6">
       <section className="w-full max-w-lg space-y-4 rounded-lg border border-border bg-background p-6">
         <div>
-          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Canonical Project</p>
+          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Project</p>
           <h1 className="mt-1 text-lg font-semibold">{activeProjectName}</h1>
           <p className="mt-2 text-sm text-muted-foreground">
             This Project has no local chat session yet. Create one to start working in this Project.
@@ -94,7 +94,8 @@ function EmptyProjectWorkspace({
                       : "border-border text-muted-foreground hover:bg-muted/60",
                   )}
                 >
-                  {project.name}
+                  <span className="block">{project.name}</span>
+                  <span className="block break-all text-[11px] font-normal text-muted-foreground">{project.root ?? project.id}</span>
                 </button>
               ))}
             </div>
@@ -199,7 +200,7 @@ export function RuntimeWorkspace({
   );
 
   const withProject = useCallback(
-    (path: string, projectId: ProjectId = activeProjectId) => withProjectParam(path, projectId),
+    (path: string, projectId: ProjectId = activeProjectId) => projectId ? withProjectParam(path, projectId) : path,
     [activeProjectId],
   );
 
@@ -227,8 +228,12 @@ export function RuntimeWorkspace({
     setMobileNavOpen(false);
     setMobileInspectorOpen(false);
     const href = workspaceViewHref(view, target);
-    if (href !== null) router.push(withProject(href));
-  }, [router, view, withProject]);
+    if (href !== null) {
+      // Update the view without replacing the page and its runtime providers,
+      // including when the workspace was entered through a standalone route.
+      window.history.pushState(null, "", withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`));
+    }
+  }, [snapshot.scenario, view, withProject]);
 
   const selectSession = useCallback((id: string) => {
     setActiveSessionId(id);
@@ -391,10 +396,10 @@ export function RuntimeWorkspace({
       if (result.outcome === "accepted") {
         setVisibleDraftScopes((current) => ({ ...current, [activeDraftScope]: false }));
       }
-      if (result.outcome === "accepted" && activeDraftScopeRef.current === activeDraftScope) {
+      if (result.outcome === "accepted" && activeDraftScopeRef.current === activeDraftScope && view !== "job-execution") {
         // Keep the same scenario so the in-memory runtime instance (and its
         // freshly projected Job execution) survives the navigation.
-        router.push(withProject(`/?view=job-execution&scenario=${encodeURIComponent(snapshot.scenario)}`));
+        navigate("job-execution");
       }
     };
 
@@ -414,7 +419,7 @@ export function RuntimeWorkspace({
           duplicate: false,
         });
       });
-  }, [activeDraftScope, activeSession, launchJob, jobDrafts, router, snapshot.scenario, withProject]);
+  }, [activeDraftScope, activeSession, launchJob, jobDrafts, navigate, view]);
 
   const handleComposerIntent = useCallback((intent: ComposerIntent) => {
     dispatchComposerIntent(intent, {
@@ -448,38 +453,24 @@ export function RuntimeWorkspace({
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
       url.searchParams.set("project", id);
-      router.replace(`${url.pathname}${url.search}`);
+      window.history.replaceState(null, "", `${url.pathname}${url.search}`);
     }
-  }, [activeSessionKey, cancel, router, runtimeSnapshot.sessions, setActiveProject]);
+  }, [activeSessionKey, cancel, runtimeSnapshot.sessions, setActiveProject]);
 
-  if (!activeSession) {
-    return (
-      <div className="flex h-dvh overflow-hidden bg-background text-foreground">
-        <EmptyProjectWorkspace
-          activeProjectId={activeProjectId}
-          activeProjectName={activeProject.name}
-          projects={projects}
-          onProjectChange={setActiveProject}
-          onNewChat={() => void handleNewProjectChat()}
-        />
-      </div>
-    );
-  }
-
-  const messages = snapshot.messagesBySession[activeSession.id] ?? [];
-  const execution = snapshot.executionBySession[activeSession.id] ?? null;
-  const accounting = snapshot.accountingBySession[activeSession.id] ?? null;
-  const observability = snapshot.observabilityBySession[activeSession.id];
+  const messages = activeSession ? snapshot.messagesBySession[activeSession.id] ?? [] : [];
+  const execution = activeSession ? snapshot.executionBySession[activeSession.id] ?? null : null;
+  const accounting = activeSession ? snapshot.accountingBySession[activeSession.id] ?? null : null;
+  const observability = activeSession ? snapshot.observabilityBySession[activeSession.id] : undefined;
   const inspectorOpen = inspectorMode !== "collapsed";
 
   const sidebar = (
     <OcgSidebar
       sessions={snapshot.sessions}
-      activeSessionId={activeSession.id}
+      activeSessionId={activeSession?.id ?? ""}
       collapsed={sidebarCollapsed}
       onToggle={() => setSidebarCollapsed((value) => !value)}
       onSelect={selectSession}
-      onNewChat={handleNewChat}
+      onNewChat={activeSession ? handleNewChat : handleNewProjectChat}
       runtimeStatus={snapshot.status}
       runtimeAuthority={runtimeAuthority}
       projects={projects}
@@ -523,11 +514,11 @@ export function RuntimeWorkspace({
         >
           <OcgSidebar
             sessions={snapshot.sessions}
-            activeSessionId={activeSession.id}
+            activeSessionId={activeSession?.id ?? ""}
             collapsed={false}
             onToggle={() => setMobileNavOpen(false)}
             onSelect={selectSession}
-            onNewChat={handleNewChat}
+            onNewChat={activeSession ? handleNewChat : handleNewProjectChat}
             runtimeStatus={snapshot.status}
             runtimeAuthority={runtimeAuthority}
             projects={projects}
@@ -543,9 +534,10 @@ export function RuntimeWorkspace({
       <div className="flex min-w-0 flex-1 flex-col">
         <OcgTopbar
           session={activeSession}
+          projectName={activeProject.name}
           sidebarCollapsed={sidebarCollapsed}
           inspectorOpen={inspectorOpen}
-          inspectorControls={view === "chat" || view === "canonical"}
+          inspectorControls={Boolean(activeSession) && view === "chat"}
           activeView={view}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
           onToggleInspector={() => setInspectorMode((value) => value === "collapsed" ? "docked" : "collapsed")}
@@ -574,7 +566,7 @@ export function RuntimeWorkspace({
           <main aria-label="Job Execution" className="flex min-h-0 flex-1 overflow-hidden">
             {execution ? (
               <JobExecutionSurface
-                key={`${activeProjectId}:${activeSession.id}`}
+                key={`${activeProjectId}:${activeSession?.id}`}
                 execution={execution}
                 onOpenInspector={() => navigate("chat")}
               />
@@ -612,6 +604,7 @@ export function RuntimeWorkspace({
               key={activeProjectId}
               snapshot={snapshot}
               onNavigate={navigate}
+              onSelectSession={selectSession}
             />
           </main>
         ) : isAttention ? (
@@ -639,6 +632,14 @@ export function RuntimeWorkspace({
               </button>
             </div>
           </main>
+        ) : !activeSession ? (
+          <EmptyProjectWorkspace
+            activeProjectId={activeProjectId}
+            activeProjectName={activeProject.name}
+            projects={projects}
+            onProjectChange={handleProjectChange}
+            onNewChat={() => void handleNewProjectChat()}
+          />
         ) : (
           <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
             <div className="flex min-w-0 flex-1 flex-col">

@@ -6,7 +6,6 @@ import {
   FlaskConical,
   Home,
   Bell,
-  LifeBuoy,
   MessageSquare,
   PenTool,
   Plus,
@@ -140,6 +139,38 @@ export function OcgSidebar({
   const hasNav = Boolean(onNavigate);
   const connection = RUNTIME_CONNECTION[runtimeStatus.state];
 
+  const renderWorkspaceItem = (item: (typeof WORKSPACE_NAV)[number]) => {
+    const Icon = item.icon;
+    if (!onNavigate) return null;
+    const active = activeView === item.target;
+    return (
+      <li key={item.target}>
+        <button
+          type="button"
+          onClick={() => onNavigate(item.target)}
+          aria-current={active ? "page" : undefined}
+          className={cn(
+            "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 transition-colors",
+            active
+              ? "bg-muted font-medium text-foreground"
+              : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+          )}
+        >
+          <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate">{item.label}</span>
+          {item.target === "attention" && attentionCount > 0 && (
+            <span
+              aria-label={`${attentionCount} items need action`}
+              className="shrink-0 rounded-full bg-muted px-1.5 text-[10px] font-semibold tabular-nums text-muted-foreground"
+            >
+              {attentionCount > 99 ? "99+" : attentionCount}
+            </span>
+          )}
+        </button>
+      </li>
+    );
+  };
+
   if (collapsed) {
     return (
       <TooltipProvider delay={100}>
@@ -195,6 +226,7 @@ export function OcgSidebar({
                 (s) => s.workType === group && s.id === activeSessionId,
               );
               const firstInGroup = sessions.find((s) => s.workType === group);
+              if (!firstInGroup) return null;
               return (
                 <RailButton
                   key={group}
@@ -267,44 +299,20 @@ export function OcgSidebar({
         {hasNav && (
           <nav aria-label="Workspace navigation" className="px-2 pb-2">
             <ul className="flex flex-col gap-px">
-              {WORKSPACE_NAV.map((item) => {
-                const Icon = item.icon;
-                if (!onNavigate) return null;
-                const active = activeView === item.target;
-                return (
-                  <li key={item.target}>
-                    <button
-                      type="button"
-                      onClick={() => onNavigate(item.target)}
-                      aria-current={active ? "page" : undefined}
-                      className={cn(
-                        "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 transition-colors",
-                        active
-                          ? "bg-muted font-medium text-foreground"
-                          : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-                      )}
-                    >
-                      <Icon className="size-3.5 shrink-0" aria-hidden="true" />
-                      <span className="min-w-0 flex-1 truncate">{item.label}</span>
-                      {item.target === "attention" && attentionCount > 0 && (
-                        <span
-                          aria-label={`${attentionCount} items need action`}
-                          className="shrink-0 rounded-full bg-muted px-1.5 text-[10px] font-semibold tabular-nums text-muted-foreground"
-                        >
-                          {attentionCount > 99 ? "99+" : attentionCount}
-                        </span>
-                      )}
-                    </button>
-                  </li>
-                );
-              })}
+              {WORKSPACE_NAV.slice(0, 3).map(renderWorkspaceItem)}
             </ul>
+            <details open={WORKSPACE_NAV.slice(3).some((item) => item.target === activeView) || undefined} className="mt-1">
+              <summary className="cursor-pointer rounded-md px-2 py-1.5 text-[12px] text-muted-foreground hover:bg-muted/60">Tools</summary>
+              <ul className="flex flex-col gap-px pl-2">
+                {WORKSPACE_NAV.slice(3).map(renderWorkspaceItem)}
+              </ul>
+            </details>
           </nav>
         )}
 
         <div className="px-3 pb-2">
           <Button
-            variant="default"
+            variant="outline"
             size="sm"
             className="w-full justify-start"
             onClick={onNewChat}
@@ -312,16 +320,6 @@ export function OcgSidebar({
             <Plus className="size-3.5" data-icon="inline-start" />
             New chat
           </Button>
-          <div
-            className="mt-2 flex items-center gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-[12px] text-muted-foreground"
-            title="Session search is a placeholder in Phase 1"
-          >
-            <Search className="size-3.5 shrink-0" aria-hidden="true" />
-            <span className="truncate">Search sessions…</span>
-            <kbd className="ml-auto rounded border border-border bg-background px-1 text-[10px]">
-              ⌘K
-            </kbd>
-          </div>
         </div>
 
         <nav
@@ -331,6 +329,7 @@ export function OcgSidebar({
           {GROUP_ORDER.map((group) => {
             const Icon = GROUP_ICON[group];
             const items = sessions.filter((s) => s.workType === group);
+            if (items.length === 0) return null;
             return (
               <section key={group} aria-label={WORK_TYPE_LABEL[group]} className="mt-1">
                 <h2 className="flex items-center gap-1.5 px-2 pt-3 pb-1 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
@@ -403,21 +402,6 @@ export function OcgSidebar({
                 }
               />
               <TooltipContent side="top">Open settings</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    aria-label="Help (placeholder)"
-                    title="Help (placeholder)"
-                  >
-                    <LifeBuoy className="size-4" />
-                  </Button>
-                }
-              />
-              <TooltipContent side="top">Help (placeholder)</TooltipContent>
             </Tooltip>
           </div>
         </div>
