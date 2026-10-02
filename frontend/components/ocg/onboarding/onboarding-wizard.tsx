@@ -173,7 +173,7 @@ export function OnboardingWizard() {
         </header>
 
         <div className="mt-5 flex flex-col gap-3">
-          {controlUrl && <ProfilePanel onEstablished={() => router.push("/?scenario=local-ready")} />}
+          {controlUrl && <ProfilePanel />}
           {onboarding.failure && (
             <FailureBanner failure={onboarding.failure} onAction={handleFailureAction} />
           )}

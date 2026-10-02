@@ -2,6 +2,7 @@
 
 use crate::error::{OcgError, Result};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
 
 fn invalid(message: &str) -> OcgError {
     OcgError::config(message)
@@ -19,6 +20,9 @@ pub struct ExecutionEnvelope {
     /// Frozen provider execution configuration for this Call.
     /// Only populated for provider Calls; None for native tool Calls.
     pub provider_config: Option<ProviderExecutionConfig>,
+    /// Runtime shutdown and chat cancellation are separate concerns. This
+    /// token belongs to this dispatched Call and is never persisted.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 /// Frozen provider execution configuration associated with a specific Call.
@@ -104,6 +108,7 @@ pub fn admit_call_with_events(
         dispatch_id: None,
         events,
         provider_config: None,
+        cancelled: Arc::new(AtomicBool::new(false)),
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,
@@ -140,6 +145,7 @@ pub fn queue_call(
         dispatch_id,
         events,
         provider_config: None,
+        cancelled: Arc::new(AtomicBool::new(false)),
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,

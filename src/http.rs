@@ -399,23 +399,205 @@ impl NativeHttp {
     /// Decide the outbound route for one URL from the stored [`ProxyPlan`].
     ///
     /// A host covered by the resolved exception list connects directly. A host
-    /// the plan routes through a proxy cannot be served by ntex 3.12, which
-    /// exposes no client-side HTTP/HTTPS proxy connector: the call fails
-    /// closed rather than silently connecting directly. Every other host is
-    /// direct. The ambient proxy environment is never consulted again.
-    fn ensure_route(&self, url: &str) -> Result<()> {
+    /// the plan routes through a proxy tunnels via an async HTTP CONNECT
+    /// carried on ntex I/O (`TCP -> proxy -> CONNECT target -> 200 ->
+    /// TLS(target SNI) -> ntex HTTP`); the upper layer keeps the original
+    /// target URL. Every other host is direct. The ambient proxy environment
+    /// is never consulted again.
+    fn proxy_endpoint_for(&self, url: &str) -> Result<Option<String>> {
         let host = url_host(url)?;
         if self.proxy.matches_no_proxy(&host) {
-            return Ok(());
+            return Ok(None);
         }
         let scheme = url.split_once("://").map(|(scheme, _)| scheme).unwrap_or("");
-        if self.proxy.endpoint_for(scheme).is_some() {
-            return Err(OcgError::config(format!(
-                "the resolved ProxyPlan routes {host} through a proxy, but ntex 3.12 provides no HTTP/HTTPS client proxy connector; refusing to connect directly"
-            )));
+        if let Some(endpoint) = self.proxy.endpoint_for(scheme) {
+            return Ok(Some(endpoint.expose().to_string()));
         }
-        Ok(())
+        Ok(None)
     }
+}
+
+/// One parsed `http://` proxy endpoint. The raw URL and credential never
+/// leave this struct except as a `Proxy-Authorization` header value.
+struct ProxyDial {
+    host: String,
+    port: u16,
+    auth: Option<Secret>,
+}
+
+fn parse_proxy_dial(raw: &str) -> Result<ProxyDial> {
+    let raw = raw.trim();
+    let (scheme, rest) = raw
+        .split_once("://")
+        .ok_or_else(|| OcgError::config("proxy endpoint has no scheme"))?;
+    if !scheme.eq_ignore_ascii_case("http") {
+        return Err(OcgError::config(
+            "proxy endpoint uses an unsupported scheme; only http:// proxies tunnel CONNECT",
+        ));
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(OcgError::config("proxy endpoint has no authority"));
+    }
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, authority),
+    };
+    if hostport.is_empty() {
+        return Err(OcgError::config("proxy endpoint has no host"));
+    }
+    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+        let end = inner.find(']').ok_or_else(|| OcgError::config("proxy endpoint has a malformed IPv6 host"))?;
+        let host = inner[..end].to_string();
+        let port = inner[end + 1..].strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).unwrap_or(80);
+        (host, port)
+    } else if hostport.matches(':').count() == 1 {
+        let (host, port) = hostport.split_once(':').unwrap_or((hostport, ""));
+        let port = port.parse::<u16>().map_err(|_| OcgError::config("proxy endpoint has an invalid port"))?;
+        (host.to_string(), port)
+    } else {
+        (hostport.to_string(), 80)
+    };
+    if host.is_empty() {
+        return Err(OcgError::config("proxy endpoint has no host"));
+    }
+    let auth = match userinfo {
+        Some(credentials) if !credentials.is_empty() => {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+            Some(Secret::new(format!("Basic {encoded}")))
+        }
+        _ => None,
+    };
+    Ok(ProxyDial { host, port, auth })
+}
+
+fn proxy_tls_config() -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    let store = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(store)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(std::sync::Arc::new(config))
+}
+
+/// Secure connector that tunnels TLS to the original target through an
+/// `http://` proxy: plain TCP to the proxy, `CONNECT target:port`,
+/// expect `200`, then TLS with the target host as SNI. The ntex HTTP
+/// client above keeps the original target URL; only this connector dials
+/// the proxy.
+#[derive(Debug, Clone)]
+struct ProxySecureConnector {
+    proxy_host: String,
+    proxy_port: u16,
+    proxy_auth: Option<Secret>,
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct ProxySecureService {
+    proxy_host: String,
+    proxy_port: u16,
+    proxy_auth: Option<Secret>,
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
+}
+
+impl ntex::service::ServiceFactory<ntex::connect::Connect<ntex::http::Uri>, ntex::SharedCfg>
+    for ProxySecureConnector
+{
+    type Response = ntex::io::IoBoxed;
+    type Error = ntex::connect::ConnectError;
+    type Service = ProxySecureService;
+    type InitError = std::convert::Infallible;
+
+    async fn create(&self, _cfg: ntex::SharedCfg) -> std::result::Result<Self::Service, Self::InitError> {
+        Ok(ProxySecureService {
+            proxy_host: self.proxy_host.clone(),
+            proxy_port: self.proxy_port,
+            proxy_auth: self.proxy_auth.clone(),
+            tls_config: self.tls_config.clone(),
+        })
+    }
+}
+
+impl ntex::service::Service<ntex::connect::Connect<ntex::http::Uri>> for ProxySecureService {
+    type Response = ntex::io::IoBoxed;
+    type Error = ntex::connect::ConnectError;
+
+    async fn call(
+        &self,
+        req: ntex::connect::Connect<ntex::http::Uri>,
+        _ctx: ntex::service::ServiceCtx<'_, Self>,
+    ) -> std::result::Result<Self::Response, Self::Error> {
+        let target_host = req.host().to_string();
+        let target_port = req.port();
+        if target_host.is_empty() || target_port == 0 {
+            return Err(ntex::connect::ConnectError::InvalidInput);
+        }
+        let io_err = |message: String| {
+            ntex::connect::ConnectError::Io(std::io::Error::other(message))
+        };
+        // Plain TCP to the proxy; the target URL is untouched above.
+        let proxy_msg = ntex::connect::Connect::new(self.proxy_host.clone()).set_port(self.proxy_port);
+        let io = ntex::connect::connect(proxy_msg).await?;
+        // Minimal CONNECT. Only `Proxy-Authorization` is added when the
+        // proxy URL carried userinfo; the credential never enters a log.
+        let authority = format!("{target_host}:{target_port}");
+        let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+        if let Some(auth) = &self.proxy_auth {
+            request.push_str(&format!("Proxy-Authorization: {}\r\n", auth.expose()));
+        }
+        request.push_str("\r\n");
+        io.encode_slice(request.as_bytes())
+            .map_err(ntex::connect::ConnectError::Io)?;
+        io.flush(true).await.map_err(ntex::connect::ConnectError::Io)?;
+        // Read until the end of the proxy response head.
+        let mut head: Vec<u8> = Vec::new();
+        loop {
+            if head.len() > 16 * 1024 {
+                return Err(io_err(format!("proxy CONNECT response too large for {target_host}")));
+            }
+            let chunk = io
+                .recv(&ntex::codec::BytesCodec)
+                .await
+                .map_err(|error| io_err(format!("proxy CONNECT read failed for {target_host}: {error:?}")))?;
+            let Some(bytes) = chunk else {
+                return Err(io_err(format!("proxy closed CONNECT for {target_host}")));
+            };
+            head.extend_from_slice(&bytes);
+            if find_connect_head_end(&head).is_some() {
+                break;
+            }
+        }
+        let end = find_connect_head_end(&head)
+            .ok_or_else(|| io_err(format!("proxy CONNECT response incomplete for {target_host}")))?;
+        let header = String::from_utf8_lossy(&head[..end]);
+        let status = header
+            .split("\r\n")
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        if status != 200 {
+            return Err(io_err(format!("proxy CONNECT refused with HTTP {status} for {target_host}")));
+        }
+        if head.len() != end + 4 {
+            return Err(io_err(format!("proxy sent unexpected bytes after CONNECT for {target_host}")));
+        }
+        // TLS to the original target with its host as SNI, over the tunnel.
+        let domain = rustls::pki_types::ServerName::try_from(target_host.clone())
+            .map_err(|_| io_err(format!("invalid TLS server name for {target_host}")))?;
+        let tls = ntex::connect::rustls::TlsClientFilter::create(io, self.tls_config.clone(), domain)
+            .await
+            .map_err(ntex::connect::ConnectError::Io)?;
+        Ok(tls.boxed())
+    }
+}
+
+fn find_connect_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 /// The host of an absolute URL, lowercased and without userinfo, brackets or
@@ -451,11 +633,16 @@ impl HttpTransport for NativeHttp {
         if !url.starts_with("https://") {
             return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
         }
-        self.ensure_route(url)?;
+        let proxy = self.proxy_endpoint_for(url)?;
         let token = self.token.clone();
         let url = url.to_owned();
         let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
-        runtime.block_on(async move { native_get(&url, token.as_ref()).await })
+        runtime.block_on(async move {
+            match proxy {
+                None => native_get(&url, token.as_ref()).await,
+                Some(endpoint) => native_get_via_proxy(&url, token.as_ref(), &endpoint).await,
+            }
+        })
     }
 
     fn post_json(
@@ -467,7 +654,7 @@ impl HttpTransport for NativeHttp {
         if !url.starts_with("https://") {
             return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
         }
-        self.ensure_route(url)?;
+        let proxy = self.proxy_endpoint_for(url)?;
         let url = url.to_owned();
         let body = serde_json::to_vec(body)
             .map_err(|error| OcgError::config(format!("cannot encode JSON request: {error}")))?;
@@ -476,7 +663,12 @@ impl HttpTransport for NativeHttp {
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect::<Vec<_>>();
         let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
-        runtime.block_on(async move { native_post_json(&url, &headers, &body).await })
+        runtime.block_on(async move {
+            match proxy {
+                None => native_post_json(&url, &headers, &body).await,
+                Some(endpoint) => native_post_json_via_proxy(&url, &headers, &body, &endpoint).await,
+            }
+        })
     }
 
     fn post_json_stream(
@@ -489,7 +681,7 @@ impl HttpTransport for NativeHttp {
         if !url.starts_with("https://") {
             return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
         }
-        self.ensure_route(url)?;
+        let proxy = self.proxy_endpoint_for(url)?;
         let url = url.to_owned();
         let body = serde_json::to_vec(body)
             .map_err(|error| OcgError::config(format!("cannot encode JSON request: {error}")))?;
@@ -498,7 +690,14 @@ impl HttpTransport for NativeHttp {
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
             .collect::<Vec<_>>();
         let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
-        runtime.block_on(async move { native_post_json_stream(&url, &headers, &body, on_chunk).await })
+        runtime.block_on(async move {
+            match proxy {
+                None => native_post_json_stream(&url, &headers, &body, on_chunk).await,
+                Some(endpoint) => {
+                    native_post_json_stream_via_proxy(&url, &headers, &body, &endpoint, on_chunk).await
+                }
+            }
+        })
     }
 }
 
@@ -658,6 +857,149 @@ async fn native_post_json_stream(
         if !on_chunk(&chunk)? {
             // The consumer asked to stop (cancellation): stop reading and let
             // the caller treat the partial stream as not completed.
+            break;
+        }
+    }
+    Ok(HttpResponse {
+        status,
+        rate_limit: RateLimit::default(),
+        body: Vec::new(),
+    })
+}
+
+/// Build an ntex client whose secure connections tunnel through the given
+/// `http://` proxy endpoint. The caller keeps the original target URL; only
+/// this connector dials the proxy and performs `CONNECT`.
+async fn proxy_client_for(endpoint: &str) -> Result<ntex::client::Client> {
+    let dial = parse_proxy_dial(endpoint)?;
+    let tls_config = proxy_tls_config()?;
+    let connector = ProxySecureConnector {
+        proxy_host: dial.host,
+        proxy_port: dial.port,
+        proxy_auth: dial.auth,
+        tls_config,
+    };
+    let connector = ntex::client::Connector::default().secure_connector(connector);
+    ntex::client::ClientBuilder::new()
+        .response_timeout(RESPONSE_HEAD_TIMEOUT)
+        .response_payload_limit(MAX_BODY_BYTES as usize)
+        .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
+        .connector::<()>(connector)
+        .build(ntex::SharedCfg::default())
+        .await
+        .map_err(|error| {
+            OcgError::config(format!("cannot build the proxied HTTP client: {error}"))
+        })
+}
+
+async fn native_get_via_proxy(url: &str, token: Option<&GithubToken>, endpoint: &str) -> Result<HttpResponse> {
+    let client = proxy_client_for(endpoint).await?;
+    let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let headers = github_headers_for(url, token.is_some());
+    if headers.authorization { if let Some(token) = token { request = request.header("Authorization", format!("Bearer {}", token.expose())); } }
+    if headers.accept { request = request.header("Accept", "application/vnd.github+json"); }
+    if headers.api_version { request = request.header("X-GitHub-Api-Version", "2022-11-28"); }
+    let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {
+        value.to_str().ok().map(|value| (name.as_str(), value))
+    }));
+    let body = response.body().await.map_err(|error| OcgError::config(format!("cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}")))?;
+    if body.len() as u64 > MAX_BODY_BYTES { return Err(OcgError::config(format!("response from {url} exceeded the {MAX_BODY_BYTES} byte limit"))); }
+    Ok(HttpResponse { status, rate_limit, body: body.to_vec() })
+}
+
+async fn native_post_json_via_proxy(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    endpoint: &str,
+) -> Result<HttpResponse> {
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "request to {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    let client = proxy_client_for(endpoint).await?;
+    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .send_body(body.to_vec())
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    let response_body = response
+        .body()
+        .await
+        .map_err(|error| OcgError::config(format!("cannot read the response from {url}: {error}")))?;
+    if response_body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    Ok(HttpResponse {
+        status,
+        rate_limit: RateLimit::default(),
+        body: response_body.to_vec(),
+    })
+}
+
+async fn native_post_json_stream_via_proxy(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    endpoint: &str,
+    mut on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
+) -> Result<HttpResponse> {
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "request to {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    let client = proxy_client_for(endpoint).await?;
+    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let response = request
+        .send_body(body.to_vec())
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let status = response.status().as_u16();
+    let mut response = Box::pin(response);
+
+    if !(200..300).contains(&status) {
+        let mut diagnostic = Vec::new();
+        while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
+            let chunk = chunk.map_err(|error| {
+                OcgError::config(format!("cannot read the error response from {url}: {error}"))
+            })?;
+            if diagnostic.len() + chunk.len() > MAX_PROVIDER_ERROR_BODY {
+                break;
+            }
+            diagnostic.extend_from_slice(&chunk);
+        }
+        return Ok(HttpResponse {
+            status,
+            rate_limit: RateLimit::default(),
+            body: diagnostic,
+        });
+    }
+
+    let mut total: u64 = 0;
+    while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
+        let chunk = chunk.map_err(|error| {
+            OcgError::config(format!("error reading streamed response from {url}: {error}"))
+        })?;
+        total += chunk.len() as u64;
+        if total > MAX_BODY_BYTES {
+            return Err(OcgError::config(format!(
+                "streamed response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+            )));
+        }
+        if !on_chunk(&chunk)? {
             break;
         }
     }

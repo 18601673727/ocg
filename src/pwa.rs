@@ -26,16 +26,12 @@ fn open_browser(url: &str) -> bool {
             .is_ok()
 }
 
-fn entry_path(has_profile: bool) -> &'static str {
-    if has_profile {
-        "/?scenario=local-ready"
-    } else {
-        "/onboarding?scenario=local-first-run"
-    }
+fn entry_path() -> &'static str {
+    "/onboarding?scenario=local-first-run"
 }
 
 /// Bind the loopback server, serve the embedded UI, and wait for termination.
-pub fn run(root: &Path, profile_path: &Path, has_profile: bool) -> Result<()> {
+pub fn run(root: &Path, profile_path: &Path, _has_profile: bool) -> Result<()> {
     if !crate::ui_assets::is_packaged() {
         return Err(OcgError::config(format!(
             "the OCG product UI is not embedded; {}",
@@ -52,7 +48,7 @@ pub fn run(root: &Path, profile_path: &Path, has_profile: bool) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_server = Arc::clone(&stop);
     let control_thread = std::thread::spawn(move || control.serve(stop_server));
-    let page = entry_path(has_profile);
+    let page = entry_path();
     // The UI and control API share this loopback origin. Keeping the control
     // endpoint out of the address bar avoids turning a connection hint into a
     // query-string token and lets the frontend use same-origin requests.

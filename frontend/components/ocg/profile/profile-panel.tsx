@@ -44,7 +44,9 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
     try {
       const next = await operation();
       install(next);
-      if (next.profile) onEstablished?.();
+       // Bootstrapping only creates the OCG-owned document. A placeholder
+       // profile is deliberately not an executable provider/model selection.
+       if (next.profile && runnableChoices(next.profile).length > 0) onEstablished?.();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally { setBusy(false); }

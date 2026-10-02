@@ -127,6 +127,19 @@ export interface CanonicalControlClient {
    * can be read, so an unknown outcome is reported rather than rendered.
    */
   launchJob(request: JobLaunchRequest): Promise<CanonicalResult<CanonicalJobLaunchAck>>;
+  /**
+   * Start one plain chat turn on the canonical Job/Attempt/Call lane.
+   *
+   * The payload reuses `JobLaunchRequest` with `objective` carrying the plain
+   * user message, so no second wire contract is introduced. The response is
+   * the same `JobLaunchResponse` the Job lane returns; the live provider
+   * deltas arrive on `chatStreamUrl`, never from a fixture.
+   */
+  sendChatMessage(request: JobLaunchRequest): Promise<CanonicalResult<CanonicalJobLaunchAck>>;
+  /** Revoke one active chat turn. Returns whether a turn was stopped. */
+  cancelChatMessage(sessionId: string): Promise<CanonicalResult<{ sessionId: string; cancelled: boolean }>>;
+  /** SSE tail for one chat turn. Consumed with `EventSource`, not `fetch`. */
+  chatStreamUrl(sessionId: string, jobId: string): string;
 }
 
 export type FetchLike = (
@@ -359,6 +372,44 @@ export function createHttpCanonicalControlClient(
       } catch (error) {
         return contractRejection(request.command_id, error);
       }
+    },
+
+    async sendChatMessage(request) {
+      const { status, value, text } = await send(
+        "POST",
+        "/api/v1/canonical/chat/send",
+        request,
+      );
+      if (status !== 200) return rejection(request.command_id, status, text);
+      try {
+        return decodeJobLaunchResponse(value);
+      } catch (error) {
+        return contractRejection(request.command_id, error);
+      }
+    },
+
+    async cancelChatMessage(sessionId) {
+      const { status, value, text } = await send(
+        "POST",
+        "/api/v1/canonical/chat/cancel",
+        { session_id: sessionId },
+      );
+      if (status !== 200) return rejection(sessionId, status, text);
+      try {
+        if (!isRecord(value)) throw new ContractError("cancel", "object response");
+        const returnedSession = value["session_id"];
+        const cancelled = value["cancelled"];
+        if (typeof returnedSession !== "string" || typeof cancelled !== "boolean") {
+          throw new ContractError("cancel", "session_id/cancelled");
+        }
+        return { ok: true as const, sessionId: returnedSession, cancelled };
+      } catch (error) {
+        return contractRejection(sessionId, error);
+      }
+    },
+
+    chatStreamUrl(sessionId, jobId) {
+      return `${base}/api/v1/canonical/chat/stream?session_id=${encodeURIComponent(sessionId)}&job_id=${encodeURIComponent(jobId)}`;
     },
   };
 }

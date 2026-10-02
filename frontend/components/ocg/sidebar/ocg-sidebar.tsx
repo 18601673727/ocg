@@ -227,7 +227,7 @@ export function OcgSidebar({
               OCG Server
             </p>
             <p className="truncate text-[11px] text-muted-foreground">
-              local · mock state
+              local state
             </p>
           </div>
           <Tooltip>

@@ -71,23 +71,24 @@ impl StreamedRoundState {
 
     /// Feed one raw chunk. Returns `Ok(false)` when the stream is finished
     /// (`[DONE]` or a complete JSON body) and reading should stop.
-    fn consume(&mut self, chunk: &[u8]) -> Result<bool> {
+    fn consume(&mut self, chunk: &[u8]) -> Result<(bool, Vec<ChatStreamEvent>)> {
         if self.mode == StreamMode::Undetermined {
             self.mode = detect_stream_mode(chunk);
         }
         match self.mode {
             StreamMode::Sse => {
+                let mut emitted = Vec::new();
                 for event in self.accumulator.consume(chunk)? {
-                    apply_chunk_json(&mut self.summary, &event)?;
+                    emitted.extend(apply_chunk_json(&mut self.summary, &event)?);
                 }
                 self.done = self.accumulator.finished();
-                Ok(!self.done)
+                Ok((!self.done, emitted))
             }
             StreamMode::CompletionJson => {
                 self.json_buffer.extend_from_slice(chunk);
-                Ok(true)
+                Ok((true, Vec::new()))
             }
-            StreamMode::Undetermined => Ok(true),
+            StreamMode::Undetermined => Ok((true, Vec::new())),
         }
     }
 
@@ -95,7 +96,7 @@ impl StreamedRoundState {
     fn finish(&mut self) -> Result<ProviderRound> {
         if self.mode == StreamMode::Sse {
             for event in self.accumulator.finish()? {
-                apply_chunk_json(&mut self.summary, &event)?;
+                    let _ = apply_chunk_json(&mut self.summary, &event)?;
             }
         } else {
             let value: Value = serde_json::from_slice(&self.json_buffer).map_err(|error| {
@@ -263,18 +264,23 @@ fn parse_usage(value: &Value) -> NormalizedUsage {
 /// Fold one streamed chat-completion chunk into the summary. Tool-call
 /// argument deltas accumulate by the OpenAI `index` even when a fragment
 /// carries no `id` or `name`, matching [`ChatStreamSummary::apply`].
-fn apply_chunk_json(summary: &mut ChatStreamSummary, value: &Value) -> Result<()> {
+fn apply_chunk_json(summary: &mut ChatStreamSummary, value: &Value) -> Result<Vec<ChatStreamEvent>> {
+    let mut emitted = Vec::new();
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         if let Some(first) = choices.first() {
             if let Some(delta) = first.get("delta") {
                 if let Some(content) = delta.get("content").and_then(Value::as_str) {
                     if !content.is_empty() {
-                        summary.apply(&ChatStreamEvent::TextDelta { delta: content.to_string() });
+                        let event = ChatStreamEvent::TextDelta { delta: content.to_string() };
+                        summary.apply(&event);
+                        emitted.push(event);
                     }
                 }
                 if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
                     if !reasoning.is_empty() {
-                        summary.apply(&ChatStreamEvent::ReasoningDelta { delta: reasoning.to_string() });
+                        let event = ChatStreamEvent::ReasoningDelta { delta: reasoning.to_string() };
+                        summary.apply(&event);
+                        emitted.push(event);
                     }
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -286,19 +292,23 @@ fn apply_chunk_json(summary: &mut ChatStreamSummary, value: &Value) -> Result<()
                                 call.get("id").and_then(Value::as_str),
                                 function.get("name").and_then(Value::as_str),
                             ) {
-                                summary.apply(&ChatStreamEvent::ToolCallStart {
+                                let event = ChatStreamEvent::ToolCallStart {
                                     index,
                                     id: id.to_string(),
                                     name: name.to_string(),
-                                });
+                                };
+                                summary.apply(&event);
+                                emitted.push(event);
                             }
                             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                                 if !arguments.is_empty() {
-                                    summary.apply(&ChatStreamEvent::ToolCallArgumentsDelta {
+                                    let event = ChatStreamEvent::ToolCallArgumentsDelta {
                                         index,
                                         id: id.to_string(),
                                         delta: arguments.to_string(),
-                                    });
+                                    };
+                                    summary.apply(&event);
+                                    emitted.push(event);
                                 }
                             }
                         }
@@ -314,7 +324,7 @@ fn apply_chunk_json(summary: &mut ChatStreamSummary, value: &Value) -> Result<()
     if let Some(usage) = value.get("usage") {
         summary.usage = parse_usage(usage);
     }
-    Ok(())
+    Ok(emitted)
 }
 
 /// Fold one complete (non-streamed) chat-completion response into the summary.
@@ -397,6 +407,7 @@ pub struct NativeOpenAiCompatibleProvider<'a> {
     bearer: Option<String>,
     upstream_model_id: String,
     cancelled: Arc<AtomicBool>,
+    events: Option<flume::Sender<crate::orchestration::execution_dispatch::ExecutionEvent>>,
 }
 
 impl<'a> NativeOpenAiCompatibleProvider<'a> {
@@ -406,6 +417,7 @@ impl<'a> NativeOpenAiCompatibleProvider<'a> {
         bearer: Option<String>,
         upstream_model_id: impl Into<String>,
         cancelled: Arc<AtomicBool>,
+        events: Option<flume::Sender<crate::orchestration::execution_dispatch::ExecutionEvent>>,
     ) -> Self {
         Self {
             transport,
@@ -413,6 +425,7 @@ impl<'a> NativeOpenAiCompatibleProvider<'a> {
             bearer,
             upstream_model_id: upstream_model_id.into(),
             cancelled,
+            events,
         }
     }
 }
@@ -450,7 +463,9 @@ impl CanonicalProviderCallHandler {
 
     async fn execute_validated(&self, envelope: ExecutionEnvelope) -> Result<Value> {
         let config = Arc::clone(&self.config);
-        if config.cancelled.load(Ordering::SeqCst) {
+        if config.cancelled.load(Ordering::SeqCst)
+            || envelope.cancelled.load(Ordering::SeqCst)
+        {
             fail_provider_envelope(
                 &config.project_root,
                 &envelope,
@@ -568,7 +583,8 @@ impl CanonicalProviderCallHandler {
             provider_config.endpoint.clone(),
             bearer,
             provider_config.upstream_model_id.clone(),
-            Arc::clone(&config.cancelled),
+            Arc::clone(&envelope.cancelled),
+            Some(envelope.events.clone()),
         );
         let response = match execute_provider_loop(
             &provider,
@@ -602,6 +618,9 @@ impl CanonicalProviderCallHandler {
             envelope.generation,
             &serialized,
         )?;
+        let _ = envelope.events.send(
+            crate::orchestration::execution_dispatch::ExecutionEvent::Finished,
+        );
         Ok(json!({"content": response.content, "reasoning": response.reasoning, "rounds": response.rounds}))
     }
 }
@@ -623,6 +642,36 @@ pub fn admit_provider_call(
     dispatcher: &BoundedDispatcher,
     provider_config: crate::orchestration::execution_dispatch::ProviderExecutionConfig,
 ) -> Result<crate::orchestration::domain::Call> {
+    admit_provider_call_with_events(
+        domain,
+        authority,
+        executor_id,
+        request,
+        config,
+        quota,
+        dispatcher,
+        provider_config,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .map(|(call, _)| call)
+}
+
+/// Admit a provider Call and retain its live event receiver/cancellation token
+/// for a product chat stream. The durable Call remains the sole execution
+/// authority; these handles are only transport observability.
+pub fn admit_provider_call_with_events(
+    domain: &mut DomainRepository,
+    authority: &AttemptAuthority,
+    executor_id: &str,
+    request: Value,
+    config: &BudgetConfig,
+    quota: QuotaFacts,
+    dispatcher: &BoundedDispatcher,
+    provider_config: crate::orchestration::execution_dispatch::ProviderExecutionConfig,
+    event_sender: Option<flume::Sender<crate::orchestration::execution_dispatch::ExecutionEvent>>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(crate::orchestration::domain::Call, Arc<AtomicBool>)> {
     let payload = json!({
         "executor_transport": "provider",
         "arguments": request
@@ -674,7 +723,7 @@ pub fn admit_provider_call(
 
     // Economic admission succeeded; now queue
     domain.mark_dispatch_queued(&call.id)?;
-    let (events, _receiver) = flume::unbounded();
+    let (default_events, _receiver) = flume::unbounded();
     if let Err(error) = dispatcher.send(ExecutionEnvelope {
         call_id: call.id.clone(),
         job_id: authority.job_id.clone(),
@@ -683,8 +732,9 @@ pub fn admit_provider_call(
         generation: authority.generation,
         payload: payload.to_string(),
         dispatch_id: None,
-        events,
+        events: event_sender.unwrap_or(default_events),
         provider_config: Some(provider_config),
+        cancelled: cancelled.clone(),
     }) {
         // Queue handoff failed after successful economic admission.
         // The provider request never left OCG, so release the reservation
@@ -707,7 +757,7 @@ pub fn admit_provider_call(
         return Err(error);
     }
 
-    Ok(call)
+    Ok((call, cancelled))
 }
 
 /// Requeue one recovered provider DispatchIntent back to the bounded
@@ -759,6 +809,7 @@ pub fn requeue_recovered_provider_call(
         dispatch_id: None,
         events,
         provider_config,
+        cancelled: Arc::new(AtomicBool::new(false)),
     })?;
 
     Ok(())
@@ -932,7 +983,9 @@ fn execute_provider_loop(
     apply_active_context(request, project_root, &authority.attempt_id, provider, &model)?;
 
     for round in 0..MAX_PROVIDER_ROUNDS {
-        if cancelled.load(Ordering::SeqCst) {
+        if cancelled.load(Ordering::SeqCst)
+            || envelope.cancelled.load(Ordering::SeqCst)
+        {
             return Err(OcgError::config("provider loop cancelled"));
         }
         if let Some(tools) = request.get("tools").and_then(Value::as_array) {
@@ -1395,6 +1448,7 @@ impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
         let state = Arc::new(Mutex::new(StreamedRoundState::new()));
         let callback_state = Arc::clone(&state);
         let cancelled = Arc::clone(&self.cancelled);
+        let events = self.events.clone();
         let on_chunk = Box::new(move |chunk: &[u8]| -> Result<bool> {
             // Cancellation is checked during consumption; stop reading and let
             // the caller close the Call as failed/cancelled, never completed.
@@ -1404,7 +1458,13 @@ impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
             let mut guard = callback_state
                 .lock()
                 .map_err(|_| OcgError::config("provider stream state poisoned"))?;
-            guard.consume(chunk)
+            let (keep_reading, emitted) = guard.consume(chunk)?;
+            if let Some(sender) = &events {
+                for event in emitted {
+                    let _ = sender.send(crate::orchestration::execution_dispatch::ExecutionEvent::Provider(event));
+                }
+            }
+            Ok(keep_reading)
         });
 
         let response = self
@@ -1450,4 +1510,7 @@ fn fail_provider_envelope(project_root: &Path, envelope: &ExecutionEnvelope, rea
         )?;
         Ok(())
     })();
+    let _ = envelope.events.send(
+        crate::orchestration::execution_dispatch::ExecutionEvent::Failed(reason.to_string()),
+    );
 }

@@ -246,9 +246,6 @@ function MessageRow({ message }: { message: ChatMessage }) {
         <p className="mb-1 flex items-baseline gap-2">
           <span className="text-[12px] font-semibold">{isUser ? "You" : "Assistant"}</span>
           <span className="text-[11px] text-muted-foreground">{message.createdAt}</span>
-          {!isUser && (
-            <span className="text-[11px] text-muted-foreground">· mock</span>
-          )}
         </p>
          <div
            className={cn(
@@ -467,7 +464,7 @@ function Composer({
           </div>
         </div>
         <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
-          Mock composer — messages stay local. No backend, SSE, or model calls in Phase 1.
+          Replies stream from the connected runtime.
         </p>
       </form>
     </div>
@@ -518,8 +515,8 @@ export function ChatView({
               Start a new thread
             </h2>
             <p className="mt-1 max-w-md text-[13px] leading-6 text-muted-foreground">
-              This is the mock ChatView for <span className="font-medium text-foreground">{session.title}</span>.
-              Nothing leaves the browser — pick a suggestion or write below.
+              This is the ChatView for <span className="font-medium text-foreground">{session.title}</span>.
+              Pick a suggestion or write below.
             </p>
             <div className="mt-4 flex w-full max-w-md flex-col gap-1.5">
               {SUGGESTIONS.map((s) => (
@@ -539,7 +536,7 @@ export function ChatView({
             {messages.length > 0 && (
               <div className="flex items-center gap-2 text-[11px] text-muted-foreground" aria-hidden="true">
                 <span className="h-px flex-1 bg-border" />
-                <span>Today · mock history</span>
+                <span>Today</span>
                 <span className="h-px flex-1 bg-border" />
               </div>
             )}

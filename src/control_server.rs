@@ -46,6 +46,10 @@ pub const MAX_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// Default bound on concurrently handled clients.
 pub const DEFAULT_MAX_CLIENTS: usize = 16;
+/// Default bound on concurrently handled long-lived chat SSE streams. Streams
+/// are admitted from their own pool so a live stream can never occupy one of
+/// the short-request client slots.
+pub const DEFAULT_MAX_STREAMS: usize = 8;
 /// Default journal poll interval for an SSE tail.
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 200;
 /// Default SSE heartbeat interval.
@@ -61,6 +65,10 @@ pub struct ServerConfig {
     /// Maximum number of clients handled at once. Further connections receive a
     /// `503` and are closed.
     pub max_clients: usize,
+    /// Maximum number of concurrent long-lived chat SSE streams. Streams draw
+    /// from their own pool, so a full stream pool leaves every short-request
+    /// client slot untouched.
+    pub max_streams: usize,
     /// Replay journal retention used by the service this server opens.
     /// How often an SSE tail polls the authoritative journal.
     pub poll_interval: Duration,
@@ -76,6 +84,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             max_clients: DEFAULT_MAX_CLIENTS,
+            max_streams: DEFAULT_MAX_STREAMS,
             poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
             heartbeat: Duration::from_millis(DEFAULT_HEARTBEAT_MS),
             write_timeout: Duration::from_millis(DEFAULT_WRITE_TIMEOUT_MS),
@@ -89,6 +98,11 @@ impl ServerConfig {
         if self.max_clients == 0 || self.max_clients > 1024 {
             return Err(OcgError::config(
                 "control server max_clients must be between 1 and 1024",
+            ));
+        }
+        if self.max_streams == 0 || self.max_streams > 1024 {
+            return Err(OcgError::config(
+                "control server max_streams must be between 1 and 1024",
             ));
         }
         if self.poll_interval < Duration::from_millis(10) {
@@ -121,6 +135,8 @@ pub struct ControlServer {
     profile: crate::profile::ProfileService,
     config: ServerConfig,
     active: Arc<AtomicUsize>,
+    /// Long-lived chat SSE streams admitted from their own bounded pool.
+    active_streams: Arc<AtomicUsize>,
     /// Long-lived execution runtime owning provider and native tool workers.
     /// Only present when canonical control service is available.
     execution_runtime: Option<crate::orchestration::execution_runtime::ExecutionRuntime>,
@@ -176,6 +192,14 @@ impl ControlServer {
         // Try to open canonical control service
         let mut canonical = crate::orchestration::canonical_control::CanonicalControlService::open(root).ok();
 
+        // The invocation boundary is the canonical Project boundary. Register
+        // it before the server can answer a frontend listProjects() request;
+        // register_project is keyed by the backend Project identity, so this is
+        // idempotent across restarts and never derives identity from a label.
+        if let Some(service) = canonical.as_ref() {
+            service.register_project("startup-register", root, now_unix())?;
+        }
+
         // Wire the profile service if canonical service exists
         if let Some(ref mut service) = canonical {
             *service = service.clone().with_profile_service(
@@ -215,6 +239,7 @@ impl ControlServer {
             profile: crate::profile::ProfileService::with_workspace(profile_path, root),
             config,
             active: Arc::new(AtomicUsize::new(0)),
+            active_streams: Arc::new(AtomicUsize::new(0)),
             execution_runtime,
         })
     }
@@ -272,16 +297,27 @@ impl ControlServer {
             );
             return;
         }
+        // Admission is optimistic on the client lane; a long-lived chat SSE
+        // tail switches to its own bounded stream lane inside the handler, so
+        // it never occupies a short-request slot for its lifetime.
         let guard = ClientGuard(Arc::clone(&self.active));
         let canonical = self.canonical.clone();
         let profile = self.profile.clone();
         let config = self.config.clone();
         let stop = Arc::clone(stop);
+        let active_streams = Arc::clone(&self.active_streams);
         let spawned = thread::Builder::new()
             .name("ocg-control-client".to_string())
             .spawn(move || {
-                let _guard = guard;
-                handle_client(stream, canonical.as_ref(), &profile, &config, &stop);
+                handle_client(
+                    stream,
+                    canonical.as_ref(),
+                    &profile,
+                    &config,
+                    &stop,
+                    guard,
+                    active_streams,
+                );
             });
         if spawned.is_err() {
             // The closure (and its guard) is dropped, releasing the slot.
@@ -289,7 +325,8 @@ impl ControlServer {
     }
 }
 
-/// Decrements the active-client counter exactly once, even on panic.
+/// Decrements whichever lane counter it was created with, exactly once, even
+/// on panic.
 struct ClientGuard(Arc<AtomicUsize>);
 
 impl Drop for ClientGuard {
@@ -402,7 +439,10 @@ fn handle_client(
     profile: &crate::profile::ProfileService,
     config: &ServerConfig,
     _stop: &Arc<AtomicBool>,
+    guard: ClientGuard,
+    active_streams: Arc<AtomicUsize>,
 ) {
+    let mut lane_guard = Some(guard);
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(config.read_timeout));
     let _ = stream.set_write_timeout(Some(config.write_timeout));
@@ -423,6 +463,26 @@ fn handle_client(
             return;
         }
     };
+
+    // The request head is parsed on this per-connection thread, never on the
+    // accept loop. Only an actual GET stream switches lanes; OPTIONS and all
+    // ordinary control requests remain in the short-request pool.
+    if request.method == "GET" && matches!(route, Route::ChatStream) {
+        let current = active_streams.fetch_add(1, Ordering::SeqCst);
+        if current >= config.max_streams {
+            active_streams.fetch_sub(1, Ordering::SeqCst);
+            let _ = write_api_error(
+                &mut stream,
+                &ApiError::new(
+                    503,
+                    "overloaded",
+                    "the control server is at its concurrent chat stream limit",
+                ),
+            );
+            return;
+        }
+        let _ = lane_guard.replace(ClientGuard(active_streams));
+    }
 
     if matches!(
         route,
@@ -739,6 +799,26 @@ fn handle_canonical(
                     .map_err(|error| OcgError::config(error.to_string()))?;
                 answer!(service.launch_job(request, now)?)
             }
+            Route::ChatSend => {
+                let body = body()?;
+                let request: crate::contracts::JobLaunchRequest = serde_json::from_value(body)
+                    .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.launch_chat(request, now)?)
+            }
+            Route::ChatCancel => {
+                let body = body()?;
+                let session_id = body
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| OcgError::config("session_id is required"))?;
+                let cancelled = service.cancel_chat(session_id)?;
+                answer!(crate::orchestration::canonical_control::ChatCancelResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    session_id: session_id.to_string(),
+                    cancelled,
+                })
+            }
             Route::CanonicalSnapshot => {
                 let project = query("project_id")?;
                 let job = query("job_id")?;
@@ -766,8 +846,17 @@ fn handle_canonical(
             | Route::CanonicalSnapshot
             | Route::CanonicalEvents
             | Route::CanonicalDashboard
+            | Route::ChatSend
+            | Route::ChatStream
+            | Route::ChatCancel
     ) {
         return None;
+    }
+    // The chat tail streams live provider events as SSE. The durable Call
+    // remains the execution authority; this channel is transport observability
+    // only.
+    if let Route::ChatStream = route {
+        return Some(handle_chat_stream(stream, service, request));
     }
     // The event tail is answered outside the generic operation above, because a
     // resume position the journal can no longer serve is not a bad request. It
@@ -850,6 +939,171 @@ fn handle_canonical(
         ));
     }
     Some(respond(stream, operation()))
+}
+
+/// Stream one live chat turn as SSE from the real provider path.
+///
+/// The durable Call owns execution; this channel only carries normalized
+/// provider deltas for transport observability. Text deltas are forwarded,
+/// terminal `Finished`/`Failed` close the stream, and heartbeats keep the
+/// loopback socket inside its write timeout.
+fn handle_chat_stream(
+    stream: &mut TcpStream,
+    service: &crate::orchestration::canonical_control::CanonicalControlService,
+    request: &Request,
+) -> std::io::Result<()> {
+    let (session_id, job_id) = match (
+        request.query.get("session_id").cloned(),
+        request.query.get("job_id").cloned(),
+    ) {
+        (Some(session), Some(job)) if !session.is_empty() && !job.is_empty() => (session, job),
+        _ => {
+            return write_api_error(
+                stream,
+                &ApiError::new(400, "invalid_request", "session_id and job_id are required"),
+            )
+        }
+    };
+    let Some(buffer) = service.chat_buffer_for(&session_id, &job_id) else {
+        return write_api_error(
+            stream,
+            &ApiError::new(404, "unknown_chat", "chat stream unavailable"),
+        );
+    };
+    let origin = allowed_cors_origin(request);
+    let mut head = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n",
+    );
+    if let Some(origin) = origin.as_deref() {
+        head.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes())?;
+    stream.flush()?;
+
+    let start = std::time::Instant::now();
+    let mut last_heartbeat = std::time::Instant::now();
+    let overall = Duration::from_secs(300);
+    let heartbeat = Duration::from_secs(10);
+    let poll = Duration::from_millis(200);
+    // Replay what arrived before attach from index zero, then go live. The
+    // provider body is never buffered whole: buffered deltas are forwarded
+    // immediately in order, and the tail continues incrementally.
+    let mut index = 0usize;
+    let mut finished = false;
+    let mut disconnected = false;
+    while !finished {
+        if start.elapsed() > overall {
+            let payload = json!({"error": "chat stream timed out"}).to_string();
+            let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
+            let _ = stream.flush();
+            break;
+        }
+        let pending: Vec<crate::orchestration::execution_dispatch::ExecutionEvent> = {
+            let guard = buffer.state.lock().map_err(|_| std::io::Error::other("chat buffer poisoned"))?;
+            if index < guard.events.len() {
+                let pending = guard.events[index..].to_vec();
+                index = guard.events.len();
+                pending
+            } else {
+                if guard.terminal {
+                    break;
+                }
+                drop(guard);
+                let guard = buffer
+                    .cvar
+                    .wait_timeout(buffer.state.lock().map_err(|_| std::io::Error::other("chat buffer poisoned"))?, poll)
+                    .map_err(|_| std::io::Error::other("chat buffer poisoned"))?
+                    .0;
+                if index < guard.events.len() {
+                    let pending = guard.events[index..].to_vec();
+                    index = guard.events.len();
+                    pending
+                } else {
+                    if guard.terminal {
+                        break;
+                    }
+                    drop(guard);
+                    if last_heartbeat.elapsed() >= heartbeat {
+                        if stream.write_all(b": ping\n\n").is_err() {
+                            disconnected = true;
+                            break;
+                        }
+                        if stream.flush().is_err() {
+                            disconnected = true;
+                            break;
+                        }
+                        last_heartbeat = std::time::Instant::now();
+                    }
+                    continue;
+                }
+            }
+        };
+        for event in pending {
+            use crate::orchestration::execution_dispatch::ExecutionEvent as Live;
+            match event {
+                Live::Started => {}
+                Live::Provider(provider_event) => {
+                    use crate::openai_compatible::stream::ChatStreamEvent as Stream;
+                    let payload = match provider_event {
+                        Stream::TextDelta { delta } => Some(json!({"delta": delta}).to_string()),
+                        Stream::ReasoningDelta { delta } => {
+                            Some(json!({"reasoning": delta}).to_string())
+                        }
+                        Stream::ToolCallStart { .. }
+                        | Stream::ToolCallArgumentsDelta { .. }
+                        | Stream::ToolCallComplete { .. }
+                        | Stream::Metadata { .. }
+                        | Stream::Finish { .. } => None,
+                        Stream::Error(error) => {
+                            Some(json!({"error": error.to_string()}).to_string())
+                        }
+                    };
+                    if let Some(payload) = payload {
+                        if stream
+                            .write_all(format!("data: {payload}\n\n").as_bytes())
+                            .is_err()
+                        {
+                            disconnected = true;
+                            finished = true;
+                            break;
+                        }
+                        if stream.flush().is_err() {
+                            disconnected = true;
+                            finished = true;
+                            break;
+                        }
+                        // A provider transport error terminates the tail.
+                        if payload.contains("\"error\"") {
+                            finished = true;
+                            break;
+                        }
+                    }
+                }
+                Live::Failed(message) => {
+                    let payload = json!({"error": message}).to_string();
+                    let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
+                    let _ = stream.flush();
+                    finished = true;
+                    break;
+                }
+                Live::Finished => {
+                    let payload = json!({"done": true}).to_string();
+                    let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
+                    let _ = stream.flush();
+                    finished = true;
+                    break;
+                }
+            }
+        }
+    }
+    // A broken socket keeps the retained tail for a retry; only a consumed
+    // terminal (or timeout/error sent above) removes the entry.
+    if !disconnected {
+        service.finish_chat(&session_id, &job_id);
+    }
+    let _ = stream.flush();
+    Ok(())
 }
 
 fn write_api_error(stream: &mut TcpStream, error: &ApiError) -> std::io::Result<()> {
@@ -1144,6 +1398,9 @@ enum Route {
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
+    ChatSend,
+    ChatStream,
+    ChatCancel,
     CanonicalPreflight,
     Product { path: String },
 }
@@ -1186,6 +1443,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("GET", ["api", "v1", "canonical", "jobs", "events"])
                 | ("POST", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("GET", ["api", "v1", "canonical", "dashboard"])
+                | ("POST", ["api", "v1", "canonical", "chat", "send"])
+                | ("GET", ["api", "v1", "canonical", "chat", "stream"])
+                | ("POST", ["api", "v1", "canonical", "chat", "cancel"])
                 // A browser preflight is answered by the canonical CORS
                 // handler, which is the only place that echoes an origin.
                 | ("OPTIONS", ["api", "v1", "canonical", "projects"])
@@ -1198,6 +1458,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
+                | ("OPTIONS", ["api", "v1", "canonical", "chat", "send"])
+                | ("OPTIONS", ["api", "v1", "canonical", "chat", "stream"])
+                | ("OPTIONS", ["api", "v1", "canonical", "chat", "cancel"])
         );
         if !is_route {
             return Err(ApiError::method_not_allowed(methods));
@@ -1241,6 +1504,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         ("GET", ["api", "v1", "canonical", "jobs"]) => Ok(Route::CanonicalSnapshot),
         ("GET", ["api", "v1", "canonical", "jobs", "events"]) => Ok(Route::CanonicalEvents),
         ("GET", ["api", "v1", "canonical", "dashboard"]) => Ok(Route::CanonicalDashboard),
+        ("POST", ["api", "v1", "canonical", "chat", "send"]) => Ok(Route::ChatSend),
+        ("GET", ["api", "v1", "canonical", "chat", "stream"]) => Ok(Route::ChatStream),
+        ("POST", ["api", "v1", "canonical", "chat", "cancel"]) => Ok(Route::ChatCancel),
         ("OPTIONS", ["api", "v1", "canonical", ..]) => Ok(Route::CanonicalPreflight),
         ("GET", _) if !crate::ui_assets::is_control_path(&request.path) => Ok(Route::Product {
             path: request.path.clone(),
@@ -1311,9 +1577,12 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         ["api", "v1", "canonical", "jobs"]
         | ["api", "v1", "canonical", "jobs", "events"]
         | ["api", "v1", "canonical", "dashboard"]
+        | ["api", "v1", "canonical", "chat", "stream"]
         | ["api", "v1", "canonical", "projects"] => Some("GET"),
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
-        ["api", "v1", "canonical", "jobs", "launch"] => Some("POST"),
+        ["api", "v1", "canonical", "jobs", "launch"]
+        | ["api", "v1", "canonical", "chat", "send"]
+        | ["api", "v1", "canonical", "chat", "cancel"] => Some("POST"),
         ["api", "v1", "canonical", "projects", _] => Some("GET"),
         _ => None,
     }

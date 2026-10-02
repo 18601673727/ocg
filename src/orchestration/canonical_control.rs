@@ -12,11 +12,19 @@ use crate::project::{self, ProjectBoundary};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
+use crate::orchestration::execution_dispatch::ExecutionEvent;
 use ts_rs::TS;
 
 pub const CANONICAL_CONTROL_API_VERSION: &str = "ocg.canonical.v1";
 const PROJECTS_FILE: &str = "projects.json";
 const CONFIG_FILE: &str = "configuration.json";
+/// A terminal chat tail remains replayable for this bounded period after the
+/// provider terminal event is recorded. This is transport retention only, not
+/// durable chat history.
+const CHAT_REPLAY_LIFETIME: Duration = Duration::from_secs(300);
 
 fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
@@ -177,11 +185,60 @@ pub struct CanonicalDashboardResponse {
     pub selected_job: Option<CanonicalJobSnapshot>,
 }
 
+/// Acknowledgement for cancelling one active chat turn. Transport state only;
+///
+/// execution authority stays with the durable Attempt that was revoked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ChatCancelResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub session_id: String,
+    pub cancelled: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct CanonicalControlService {
     root: PathBuf,
     runtime_handle: Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>,
     profile_service: crate::profile::ProfileService,
+    chat_registrations: Arc<Mutex<std::collections::HashMap<String, ChatRegistration>>>,
+    active_chats: Arc<Mutex<std::collections::HashMap<String, ActiveChat>>>,
+}
+
+#[derive(Debug)]
+struct ChatRegistration {
+    sender: flume::Sender<ExecutionEvent>,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Retained provider tail for one chat turn. Events are appended in order
+/// by a forwarder the moment the provider produces them, so an EventSource
+/// that attaches after `POST /chat/send` replays the prefix before going
+/// live. Terminal `Finished`/`Failed` ends the tail; the entry lives until
+/// the stream consumes it or cancellation removes it.
+#[derive(Debug, Default)]
+pub(crate) struct ChatEventBuffer {
+    pub(crate) state: Mutex<ChatBufferState>,
+    pub(crate) cvar: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ChatBufferState {
+    pub(crate) events: Vec<ExecutionEvent>,
+    pub(crate) terminal: bool,
+    pub(crate) terminal_at: Option<Instant>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ActiveChat {
+    project_id: String,
+    session_id: String,
+    job_id: String,
+    attempt_id: String,
+    cancelled: Arc<AtomicBool>,
+    sender: flume::Sender<ExecutionEvent>,
+    buffer: std::sync::Arc<ChatEventBuffer>,
 }
 
 impl CanonicalControlService {
@@ -208,6 +265,8 @@ impl CanonicalControlService {
             root: boundary.root().to_path_buf(),
             runtime_handle: None,
             profile_service: crate::profile::ProfileService::with_workspace(&profile_path, root),
+            chat_registrations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            active_chats: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1062,7 +1121,12 @@ impl CanonicalControlService {
             credential_ref: Some(credential_ref.to_string()),
         };
 
-        let _call = match crate::provider_loop::admit_provider_call(
+        let chat = self.chat_registrations.lock().ok().and_then(|registrations| {
+            registrations.get(&request.command_id).map(|registration| {
+                (registration.sender.clone(), registration.cancelled.clone())
+            })
+        });
+        let _call = match crate::provider_loop::admit_provider_call_with_events(
             &mut domain,
             &authority,
             &executor.id,
@@ -1071,8 +1135,10 @@ impl CanonicalControlService {
             quota_facts,
             runtime_handle.provider_dispatcher(),
             provider_config,
+            chat.as_ref().map(|(sender, _)| sender.clone()),
+            chat.as_ref().map(|(_, cancelled)| cancelled.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
         ) {
-            Ok(call) => call,
+            Ok((call, _)) => call,
             Err(e) => {
                 // Economic admission failed; finish the attempt as failed
                 domain.finish_attempt(&attempt.id, false)?;
@@ -1121,5 +1187,178 @@ impl CanonicalControlService {
         )?;
 
         Ok(response)
+    }
+
+    /// Start a plain chat turn on the canonical Job/Attempt/Call lane.
+    /// Chat state is transport state; execution remains owned by the durable
+    /// canonical entities. The live provider receiver is retained for the
+    /// SSE tail; use `take_chat_receiver` to stream it once.
+    pub fn launch_chat(
+        &self,
+        request: crate::contracts::JobLaunchRequest,
+        now: i64,
+    ) -> Result<crate::contracts::JobLaunchResponse> {
+        self.reap_expired_chats();
+        let (sender, receiver) = flume::unbounded();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        if let Ok(mut registrations) = self.chat_registrations.lock() {
+            registrations.insert(request.command_id.clone(), ChatRegistration {
+                sender: sender.clone(),
+                cancelled: cancelled.clone(),
+            });
+        }
+        let response = self.launch_job(request.clone(), now);
+        // Registration is transient: launch_job has already cloned the sender
+        // into the dispatched provider envelope.
+        if let Ok(mut registrations) = self.chat_registrations.lock() {
+            registrations.remove(&request.command_id);
+        }
+        let response = response?;
+        if response.outcome != "accepted" {
+            return Ok(response);
+        }
+        let job_id = match response.job_id.clone() {
+            Some(id) => id,
+            None => return Ok(response),
+        };
+        // Resolve the Attempt that launch_job created for this Job. There is
+        // exactly one Attempt right after launch.
+        let attempt_id = {
+            let domain = DomainRepository::open(&self.root)?;
+            let attempts = domain.attempts_for_job(&job_id)?;
+            attempts.last().map(|attempt| attempt.id.clone()).unwrap_or_default()
+        };
+        if attempt_id.is_empty() {
+            return Ok(response);
+        }
+        // One active turn per session. Cancel a previous turn before
+        // overwriting so its provider transport cannot keep streaming.
+        let _ = self.cancel_chat(&request.session_id);
+        // Retain every provider event from this point on. The forwarder
+        // appends in order the moment the provider produces an event, so a
+        // later EventSource attach replays the prefix instead of losing it.
+        let buffer = std::sync::Arc::new(ChatEventBuffer::default());
+        {
+            let forward_buffer = buffer.clone();
+            std::thread::Builder::new()
+                .name("chat-forward".to_string())
+                .spawn(move || {
+                    for event in receiver.iter() {
+                        let terminal = matches!(
+                            &event,
+                            ExecutionEvent::Finished | ExecutionEvent::Failed(_)
+                        );
+                        if let Ok(state) = forward_buffer.state.lock() {
+                            // The mutex is only poisoned on panic; retain
+                            // what arrived rather than dropping the tail.
+                            let mut guard = state;
+                            guard.events.push(event);
+                            if terminal {
+                                guard.terminal = true;
+                                guard.terminal_at = Some(Instant::now());
+                            }
+                        }
+                        forward_buffer.cvar.notify_all();
+                        if terminal {
+                            break;
+                        }
+                    }
+                })
+                .ok();
+        }
+        if let Ok(mut active) = self.active_chats.lock() {
+            active.insert(request.session_id.clone(), ActiveChat {
+                project_id: request.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: job_id.clone(),
+                attempt_id,
+                cancelled,
+                sender,
+                buffer,
+            });
+        }
+        Ok(response)
+    }
+
+    /// Clone the retained tail for one SSE attach. The entry stays for
+    /// cancellation until `finish_chat` removes it. Late attach replays from
+    /// index zero; live events follow once the prefix is drained.
+    pub(crate) fn chat_buffer_for(
+        &self,
+        session_id: &str,
+        job_id: &str,
+    ) -> Option<std::sync::Arc<ChatEventBuffer>> {
+        self.reap_expired_chats();
+        let mut guard = self.active_chats.lock().ok()?;
+        let entry = guard.get(session_id)?;
+        if entry.job_id != job_id {
+            return None;
+        }
+        if entry
+            .buffer
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.terminal_at)
+            .is_some_and(|terminal_at| terminal_at.elapsed() >= CHAT_REPLAY_LIFETIME)
+        {
+            guard.remove(session_id);
+            return None;
+        }
+        Some(entry.buffer.clone())
+    }
+
+    /// Opportunistically reap terminal transport buffers. Running chats are
+    /// deliberately never touched; only completed tails past their replay
+    /// lifetime are eligible.
+    fn reap_expired_chats(&self) {
+        if let Ok(mut active) = self.active_chats.lock() {
+            let expired = active
+                .iter()
+                .filter_map(|(session_id, entry)| {
+                    let expired = entry
+                        .buffer
+                        .state
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.terminal_at)
+                        .is_some_and(|terminal_at| terminal_at.elapsed() >= CHAT_REPLAY_LIFETIME);
+                    expired.then(|| session_id.clone())
+                })
+                .collect::<Vec<_>>();
+            for session_id in expired {
+                active.remove(&session_id);
+            }
+        }
+    }
+
+    /// Remove a finished stream entry. Only removes when the job matches so a
+    /// newer turn cannot be dropped by a stale tail.
+    pub fn finish_chat(&self, session_id: &str, job_id: &str) {
+        if let Ok(mut active) = self.active_chats.lock() {
+            if let Some(entry) = active.get(session_id) {
+                if entry.job_id == job_id {
+                    active.remove(session_id);
+                }
+            }
+        }
+    }
+
+    /// Revoke the Attempt authority first, then stop the provider transport.
+    /// A turn that already finished is a no-op returning false.
+    pub fn cancel_chat(&self, session_id: &str) -> Result<bool> {
+        let active = self.active_chats.lock().ok().and_then(|mut active| active.remove(session_id));
+        let Some(active) = active else { return Ok(false); };
+        let mut domain = DomainRepository::open(&self.root)?;
+        // If authority is already gone (completed/failed), there is nothing
+        // to revoke; still stop the transport and report no active turn.
+        let revocable = domain.request_cancel(&active.attempt_id).is_ok();
+        active.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = active.sender.send(ExecutionEvent::Failed("chat cancelled".to_string()));
+        if revocable {
+            let _ = domain.confirm_cancel(&active.attempt_id, true);
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
