@@ -236,7 +236,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     crate::orchestration::OrchestrationConfig::apply_env_override(&mut effective.data, env.orchestration.as_deref());
     let level = cli.model_choice.clone().or_else(|| crate::profile::Profile::from_ocg_config(&effective.data).ok().and_then(|profile| profile.default_model)).unwrap_or_default();
     match cli.command {
-        Command::Launch => crate::pwa::run(&project_root, &user_path, user_path.is_file()).map(|_| 0).map_err(Into::into),
+        Command::Launch => crate::pwa::run(&project_root, &user_path, user_path.is_file(), cli.disable_proxy).map(|_| 0).map_err(Into::into),
         Command::Status => { validate::require_valid(&effective)?; println!("{}", report::status_text(&effective, &level)?); Ok(0) }
         Command::Routing => { validate::require_valid(&effective)?; println!("{}", report::routing_text(&effective)?); Ok(0) }
         Command::Config(args) => native_config(&args, &user_path, &project_root, &env),
@@ -253,7 +253,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         Command::Reconcile(args) => reconcile_command(&project_root, &args, cli.pretty),
         Command::Resources(args) => native_resources(&project_root, &args, cli.pretty),
         Command::Budget(args) => native_budget(&effective, &project_root, &args, cli.pretty),
-        Command::Serve(args) => serve_command(&project_root, &user_path, &args, cli.pretty),
+        Command::Serve(args) => serve_command(&project_root, &user_path, &args, cli.pretty, cli.disable_proxy),
         Command::Work(args) => work_command(&project_root, &args, cli.pretty),
         Command::Doctor => doctor_command(&effective, &project_root),
         Command::Help | Command::Version | Command::Init => unreachable!(),
@@ -336,9 +336,9 @@ fn reconcile_command(root: &Path, _args: &[OsString], pretty: bool) -> Result<i3
     print_json(&repository.reconcile_dispatches()?, pretty).map(|_| 0)
 }
 
-fn serve_command(root: &Path, profile: &Path, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
+fn serve_command(root: &Path, profile: &Path, args: &[OsString], pretty: bool, disable_proxy: bool) -> Result<i32, Failure> {
     let address = args.first().map(|value| value.to_string_lossy().into_owned()).unwrap_or_else(|| "127.0.0.1:0".into());
-    let server = crate::control_server::ControlServer::bind_with_profile(&address, root, profile, crate::control_server::ServerConfig::default())?;
+    let server = crate::control_server::ControlServer::bind_with_profile(&address, root, profile, crate::control_server::ServerConfig::default(), disable_proxy)?;
     if pretty { print_json(&json!({"listening": server.base_url()}), true)?; } else { println!("listening on {}", server.base_url()); }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     server.serve(stop)?;

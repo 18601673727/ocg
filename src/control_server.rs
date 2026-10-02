@@ -159,7 +159,7 @@ impl ControlServer {
                 .map(Path::new),
             home.as_deref(),
         );
-        Self::bind_with_profile(addr, root, &profile, config)
+        Self::bind_with_profile(addr, root, &profile, config, false)
     }
 
     /// Bind using a user-global profile while keeping durable project state at
@@ -169,6 +169,7 @@ impl ControlServer {
         root: &Path,
         profile_path: &Path,
         config: ServerConfig,
+        disable_proxy: bool,
     ) -> Result<Self> {
         let requested = parse_loopback_addr(addr)?;
         config.validate()?;
@@ -209,11 +210,21 @@ impl ControlServer {
 
         // If canonical service exists, start execution runtime and wire the handle
         let execution_runtime = if canonical.is_some() {
+            // Resolve the effective proxy exactly once, here. The provider
+            // transport never re-reads the ambient environment afterwards, so
+            // this stored plan is the only route policy any Call can use.
+            let selection = crate::proxy::resolve(
+                disable_proxy,
+                &crate::proxy::SystemProxyEnv,
+                &crate::process::SystemStaticProxy,
+            );
+            let transport =
+                Arc::new(crate::http::NativeHttp::with_policy(selection.plan(), None)?);
             match crate::orchestration::execution_runtime::ExecutionRuntime::start(
                 root,
                 16, // provider_capacity
                 16, // native_tool_capacity
-                Arc::new(crate::http::NativeHttp::new()?),
+                transport,
                 crate::native_tools::PermissionPolicy::default(),
             ) {
                 Ok(runtime) => {

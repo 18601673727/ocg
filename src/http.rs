@@ -410,11 +410,29 @@ impl NativeHttp {
             return Ok(None);
         }
         let scheme = url.split_once("://").map(|(scheme, _)| scheme).unwrap_or("");
+        // The proxy connector is a TLS CONNECT tunnel. Keep cleartext
+        // OpenAI-compatible endpoints on the direct ntex path rather than
+        // inventing a plaintext forward-proxy mode.
+        if !scheme.eq_ignore_ascii_case("https") {
+            return Ok(None);
+        }
         if let Some(endpoint) = self.proxy.endpoint_for(scheme) {
             return Ok(Some(endpoint.expose().to_string()));
         }
         Ok(None)
     }
+}
+
+fn validate_provider_url(url: &str) -> Result<()> {
+    let Some((scheme, _)) = url.split_once("://") else {
+        return Err(OcgError::config(format!("provider URL has no scheme: {url}")));
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(OcgError::config(format!(
+            "unsupported provider URL scheme: {scheme}"
+        )));
+    }
+    Ok(())
 }
 
 /// One parsed `http://` proxy endpoint. The raw URL and credential never
@@ -651,9 +669,7 @@ impl HttpTransport for NativeHttp {
         headers: &[(&str, &str)],
         body: &Value,
     ) -> Result<HttpResponse> {
-        if !url.starts_with("https://") {
-            return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
-        }
+        validate_provider_url(url)?;
         let proxy = self.proxy_endpoint_for(url)?;
         let url = url.to_owned();
         let body = serde_json::to_vec(body)
@@ -678,9 +694,7 @@ impl HttpTransport for NativeHttp {
         body: &Value,
         on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
     ) -> Result<HttpResponse> {
-        if !url.starts_with("https://") {
-            return Err(OcgError::config(format!("refusing non-HTTPS URL: {url}")));
-        }
+        validate_provider_url(url)?;
         let proxy = self.proxy_endpoint_for(url)?;
         let url = url.to_owned();
         let body = serde_json::to_vec(body)

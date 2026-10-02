@@ -30,6 +30,30 @@ fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
 }
 
+fn endpoint_has_userinfo(endpoint: &str) -> bool {
+    endpoint.split_once("://").is_some_and(|(_, rest)| {
+        rest.split(['/', '?', '#']).next().unwrap_or("").contains('@')
+    })
+}
+
+/// The deterministic first model input: the launch intent and nothing else.
+/// No persona and no system prompt is ever synthesized here.
+fn initial_user_message(request: &crate::contracts::JobLaunchRequest) -> String {
+    let mut message = request.objective.clone();
+    for (label, content) in [
+        ("Success criteria", request.success_criteria.as_deref()),
+        ("Constraints", request.constraints.as_deref()),
+    ] {
+        if let Some(content) = content.filter(|content| !content.trim().is_empty()) {
+            message.push_str("\n\n");
+            message.push_str(label);
+            message.push_str(":\n");
+            message.push_str(content);
+        }
+    }
+    message
+}
+
 fn safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -1024,10 +1048,37 @@ impl CanonicalControlService {
             }
         };
 
-        // Resolve credential
-        let credential_ref = match &provider_entry.credential_ref {
-            Some(c) => c,
-            None => {
+        // Credentials are optional: an endpoint that needs no bearer token is a
+        // legitimate provider, so only a declared reference has to resolve.
+        if endpoint_has_userinfo(&endpoint) {
+            let response = crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: project.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: None,
+                message: format!("provider {provider_key} endpoint must not contain userinfo"),
+                duplicate: false,
+            };
+            domain.record_launch_command(
+                &request.command_id,
+                &request.project_id,
+                &request_hash,
+                "rejected",
+                None,
+                &response.message,
+            )?;
+            return Ok(response);
+        }
+
+        let credential_ref = provider_entry.credential_ref.clone();
+        if let Some(reference) = credential_ref.as_deref() {
+            // Verify a declared credential exists without keeping it in memory;
+            // the raw value is only read again at execution time.
+            let vault = crate::vault::Vault::user_global()?;
+            if vault.get(reference)?.is_none() {
                 let response = crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                     outcome: "rejected".to_string(),
@@ -1036,7 +1087,7 @@ impl CanonicalControlService {
                     project_id: project.project_id.clone(),
                     session_id: request.session_id.clone(),
                     job_id: None,
-                    message: format!("provider {} has no credential configured", provider_key),
+                    message: format!("credential not found: {reference}"),
                     duplicate: false,
                 };
                 domain.record_launch_command(
@@ -1049,31 +1100,6 @@ impl CanonicalControlService {
                 )?;
                 return Ok(response);
             }
-        };
-
-        // Verify credential exists (without keeping it in memory)
-        let vault = crate::vault::Vault::user_global()?;
-        if vault.get(credential_ref)?.is_none() {
-            let response = crate::contracts::JobLaunchResponse {
-                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                outcome: "rejected".to_string(),
-                command_id: request.command_id.clone(),
-                draft_id: request.draft_id.clone(),
-                project_id: project.project_id.clone(),
-                session_id: request.session_id.clone(),
-                job_id: None,
-                message: format!("credential not found: {}", credential_ref),
-                duplicate: false,
-            };
-            domain.record_launch_command(
-                &request.command_id,
-                &request.project_id,
-                &request_hash,
-                "rejected",
-                None,
-                &response.message,
-            )?;
-            return Ok(response);
         }
 
         // Build budget config from resource_budget if present
@@ -1089,12 +1115,20 @@ impl CanonicalControlService {
             crate::orchestration::budget::BudgetConfig::default()
         };
 
-        // Create canonical Job/Attempt/Executor
+        // Create canonical Job/Attempt/Executor. The Job spec is the durable
+        // launch intent: what was asked, what success looks like, the
+        // constraints, and the declared budget commitment. Frozen provider
+        // transport identity (endpoint, upstream model id, credential
+        // reference) belongs to the Call's DispatchIntent, not to the Job.
         let canonical_project = domain.ensure_project(Path::new(&project.root))?;
         let job_payload = serde_json::to_string(&serde_json::json!({
             "provider": provider_key,
             "model": model,
             "objective": request.objective,
+            "success_criteria": request.success_criteria,
+            "constraints": request.constraints,
+            "hard_budget_micros": request.hard_budget_micros,
+            "resource_commitment": request.resource_commitment,
         }))
         .map_err(|e| invalid(format!("cannot serialize job payload: {e}")))?;
 
@@ -1105,7 +1139,7 @@ impl CanonicalControlService {
         // Construct initial provider request
         let provider_request = serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": request.objective}],
+            "messages": [{"role": "user", "content": initial_user_message(&request)}],
             "stream": true,
         });
 
@@ -1121,7 +1155,7 @@ impl CanonicalControlService {
             model: model.to_string(),
             upstream_model_id,
             endpoint: endpoint.clone(),
-            credential_ref: Some(credential_ref.to_string()),
+            credential_ref,
         };
 
         let chat = self.chat_registrations.lock().ok().and_then(|registrations| {

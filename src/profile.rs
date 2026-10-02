@@ -98,17 +98,21 @@ impl Profile {
                         "Profile provider '{provider_key}' endpoint cannot be empty"
                     )));
                 }
-                // Parse endpoint and validate HTTPS scheme
-                if !endpoint.starts_with("https://") {
+                // Cleartext HTTP stays allowed: a localhost or private-network
+                // OpenAI-compatible endpoint is a legitimate provider, and the
+                // transport routes it directly rather than through a proxy.
+                if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
                     return Err(OcgError::config(format!(
-                        "Profile provider '{provider_key}' endpoint must use HTTPS"
+                        "Profile provider '{provider_key}' endpoint must use HTTP or HTTPS"
                     )));
                 }
                 // Reject embedded credentials (check for @ in the authority section)
-                if let Some(authority_start) = endpoint.strip_prefix("https://") {
+                if let Some((_, authority_start)) = endpoint.split_once("://") {
                     if let Some(at_pos) = authority_start.find('@') {
-                        // Check if @ comes before the first / (path start)
-                        let path_start = authority_start.find('/').unwrap_or(authority_start.len());
+                        // Check if @ comes before the path/query/fragment
+                        let path_start = authority_start
+                            .find(['/', '?', '#'])
+                            .unwrap_or(authority_start.len());
                         if at_pos < path_start {
                             return Err(OcgError::config(format!(
                                 "Profile provider '{provider_key}' endpoint must not contain userinfo (username/password)"
@@ -184,18 +188,18 @@ impl Profile {
                 if !endpoint_usable(provider.endpoint.as_deref()) {
                     return false;
                 }
-                let Some(credential_ref) = provider
-                    .credential_ref
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                else {
-                    return false;
-                };
-                vault
-                    .get(credential_ref)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|value| !value.is_empty())
+                // A declared credential must resolve in the Vault; no declared
+                // credential means an unauthenticated endpoint, which is
+                // also executable.
+                match provider.credential_ref.as_deref() {
+                    None => true,
+                    Some(reference) if !reference.is_empty() => vault
+                        .get(reference)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|value| !value.is_empty()),
+                    Some(_) => false,
+                }
             })
             .map(|(key, _)| key.clone())
             .collect()
@@ -267,18 +271,18 @@ impl Default for Profile {
 }
 
 /// Whether a provider endpoint is usable for execution. Mirrors the
-/// structural rules in `validate`: present, non-empty, HTTPS, no userinfo.
+/// structural rules in `validate`: present, non-empty, HTTP(S), no userinfo.
 fn endpoint_usable(endpoint: Option<&str>) -> bool {
     let Some(endpoint) = endpoint.filter(|value| !value.is_empty()) else {
         return false;
     };
-    if !endpoint.starts_with("https://") {
+    if !endpoint.starts_with("https://") && !endpoint.starts_with("http://") {
         return false;
     }
-    let Some(authority) = endpoint.strip_prefix("https://") else {
+    let Some((_, authority)) = endpoint.split_once("://") else {
         return false;
     };
-    let path_start = authority.find('/').unwrap_or(authority.len());
+    let path_start = authority.find(['/', '?', '#']).unwrap_or(authority.len());
     !authority[..path_start].contains('@')
 }
 
