@@ -41,8 +41,11 @@ export function ProjectSwitcher({
   onChange,
 }: ProjectSwitcherProps) {
   const [open, setOpen] = useState(false);
-  const active = projects.find((project) => project.id === activeProjectId) ?? projects[0];
-  if (!active) return null;
+  const active = projects.find((project) => project.id === activeProjectId) ?? null;
+  if (projects.length === 0) return null;
+  // No silent selection: when nothing is selected, the trigger says so and
+  // no entry is marked active until the operator picks one explicitly.
+  const triggerLabel = active ?? { id: "" as ProjectId, name: "Select project" };
 
   const handleSelect = (id: ProjectId) => {
     setOpen(false);
@@ -56,11 +59,11 @@ export function ProjectSwitcher({
           variant="outline"
           size="sm"
           className="w-full justify-start"
-          aria-label={projectSwitcherLabel(active)}
+          aria-label={projectSwitcherLabel(triggerLabel)}
         >
           <FolderKanban className="size-3.5" data-icon="inline-start" aria-hidden="true" />
           <span className="min-w-0 flex-1 truncate text-left text-[12px] tracking-normal normal-case">
-            {active.name}
+            {triggerLabel.name}
           </span>
           <ChevronsUpDown className="size-3.5 opacity-60" aria-hidden="true" />
         </Button>
@@ -77,8 +80,8 @@ export function ProjectSwitcher({
               <Button
                 variant="ghost"
                 size="icon-sm"
-                aria-label={projectSwitcherLabel(active, true)}
-                title={projectSwitcherLabel(active, true)}
+                aria-label={projectSwitcherLabel(triggerLabel, true)}
+                title={projectSwitcherLabel(triggerLabel, true)}
               >
                 <FolderKanban className="size-4" aria-hidden="true" />
               </Button>
@@ -86,7 +89,7 @@ export function ProjectSwitcher({
           />
         }
       />
-      <TooltipContent side="right">{projectSwitcherLabel(active, true)}</TooltipContent>
+      <TooltipContent side="right">{projectSwitcherLabel(triggerLabel, true)}</TooltipContent>
     </Tooltip>
   );
 
@@ -102,7 +105,7 @@ export function ProjectSwitcher({
         </DialogHeader>
         <ul role="listbox" aria-label="Projects" className="flex flex-col gap-1">
           {projects.map((project) => {
-            const isActive = project.id === active.id;
+            const isActive = active !== null && project.id === active.id;
             return (
               <li key={project.id}>
                 <button

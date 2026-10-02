@@ -54,6 +54,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   private readonly scenarioId: ScenarioId;
   private chatCounter = 0;
   private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string }>();
+  private readonly sessionProjects = new Map<string, string>();
 
   constructor(scenario: ScenarioId, control: CanonicalControlClient) {
     super(scenario);
@@ -153,12 +154,12 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     };
     this.emit({ type: "conversation.message-started", sessionId, message: { ...assistant } });
 
-    const projectId = await this.resolveChatProject(sessionId);
+    const projectId = await this.resolveChatProject(sessionId, input.projectId);
     if (!projectId) {
       this.emit({
         type: "conversation.message-completed",
         sessionId,
-        message: { ...assistant, content: "Chat failed: no canonical Project is registered.", status: "failed" },
+        message: { ...assistant, content: "Chat failed: this session has no Project binding.", status: "failed" },
       });
       return;
     }
@@ -224,15 +225,29 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     }
   }
 
-  private async resolveChatProject(sessionId: string): Promise<string | null> {
-    const known = this.store.getSync().sessionProjects[sessionId];
+  private async resolveChatProject(sessionId: string, activeProjectId?: string): Promise<string | null> {
+    // Resolution order is explicit: the session's own recorded binding wins
+    // so an old turn never migrates when the project list ordering changes;
+    // otherwise the caller's current UI project applies and is recorded as
+    // the session's binding. Anything else fails clearly — never a silent
+    // first-project pick.
+    const known = this.sessionProjects.get(sessionId) ?? this.store.getSync().sessionProjects[sessionId];
     if (typeof known === "string" && known.length > 0) return known;
-    try {
-      const projects = await this.control.listProjects();
-      if (projects.length === 0) return null;
-      return projects[0]!.project_id;
-    } catch {
-      return null;
+    const active = activeProjectId?.trim();
+    if (active) {
+      if (!this.sessionProjects.has(sessionId)) {
+        this.sessionProjects.set(sessionId, active);
+      }
+      return active;
+    }
+    return null;
+  }
+
+  /** Record the Project a session belongs to (called at session creation). */
+  bindSessionProject(sessionId: string, projectId: string): void {
+    if (!sessionId || !projectId) return;
+    if (!this.sessionProjects.has(sessionId)) {
+      this.sessionProjects.set(sessionId, projectId);
     }
   }
 
@@ -285,6 +300,13 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     source.onerror = () => {
       const tracked = this.chatStreams.get(sessionId);
       if (!tracked || tracked.jobId !== jobId) return;
+      // A transient network error puts EventSource into CONNECTING and the
+      // browser resumes the tail itself, resending the standard
+      // `Last-Event-ID`. The runtime client must not close it or mark the
+      // message failed: replay continues from the next unconsumed sequence.
+      if (source.readyState === EventSource.CONNECTING) return;
+      // CLOSED means the browser gave up (HTTP error, expired session, or a
+      // server that closed without a resumable frame): this is terminal.
       const after = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
       if (after && after.status === "streaming") {
         this.emit({

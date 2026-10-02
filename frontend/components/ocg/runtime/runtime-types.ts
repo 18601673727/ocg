@@ -112,6 +112,8 @@ export interface OcgRuntimeClient {
   getSnapshot(): RuntimeSnapshot;
   getSyncState?(): RuntimeSyncState;
   cancel?(sessionId: string): Promise<void>;
+  /** Bind a session to its owning Project so a later send launches into that Project. */
+  bindSessionProject?(sessionId: string, projectId: string): void;
   /** Frontend-only Job launch boundary. Validates against the mock snapshot and projects canonical execution into the per-session maps. */
   launchJob?(command: JobLaunchCommand): Promise<JobLaunchResult>;
   requestAccessHandoff?(): Promise<void>;

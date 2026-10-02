@@ -419,11 +419,11 @@ export function RuntimeWorkspace({
   const handleComposerIntent = useCallback((intent: ComposerIntent) => {
     dispatchComposerIntent(intent, {
       chat: ({ text }) => {
-        if (activeSessionKey) void sendMessage(activeSessionKey, { content: text });
+        if (activeSessionKey) void sendMessage(activeSessionKey, { content: text, projectId: activeProjectId });
       },
       "job.create": ({ seed }) => handleCreateJobDraft(seed),
     });
-  }, [activeSessionKey, handleCreateJobDraft, sendMessage]);
+  }, [activeProjectId, activeSessionKey, handleCreateJobDraft, sendMessage]);
 
   const handleSelectProfile = useCallback((profileId: string) => {
     void setActiveProfile(profileId);

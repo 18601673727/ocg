@@ -27,7 +27,7 @@ fn open_browser(url: &str) -> bool {
 }
 
 fn entry_path() -> &'static str {
-    "/onboarding?scenario=local-first-run"
+    "/bootstrap"
 }
 
 /// Bind the loopback server, serve the embedded UI, and wait for termination.

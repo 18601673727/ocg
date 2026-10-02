@@ -14,6 +14,7 @@ import type { ProjectId, ProjectSummary } from "./domain";
 import { DEFAULT_PROJECT_ID, isProjectId, resolveProjectId, selectProject } from "./domain";
 import { projectSessionIds } from "./fixtures";
 import { createHttpCanonicalControlClient } from "../runtime/canonical-client";
+import { useOcgRuntime } from "../runtime/runtime-context";
 import { useOcgControlUrl } from "../profile/control-url";
 
 export const ACTIVE_PROJECT_STORAGE_KEY = "ocg.project.active.v1";
@@ -71,6 +72,7 @@ export function ProjectProvider({
   >({});
   const [projects, setProjects] = useState<readonly ProjectSummary[]>([]);
   const controlUrl = useOcgControlUrl();
+  const runtime = useOcgRuntime();
 
   useEffect(() => {
     if (!controlUrl) return;
@@ -94,9 +96,10 @@ export function ProjectProvider({
     writeStoredProjectId(resolved);
   }, [initialProjectId]);
 
-  const selectedProjectId = projects.length > 0 && !projects.some((project) => project.id === activeProjectId)
-    ? projects[0]!.id
-    : activeProjectId;
+  // No silent fallback: when the stored selection is absent or no longer
+  // registered, the active project stays empty and chat send fails clearly
+  // instead of silently executing against an unrelated Project.
+  const selectedProjectId = activeProjectId;
 
   const setActiveProject = useCallback((id: ProjectId) => {
     const resolved = resolveProjectId(id);
@@ -109,13 +112,14 @@ export function ProjectProvider({
     (sessionId: string, projectId?: ProjectId) => {
       if (!sessionId) return;
       const target = resolveProjectId(projectId ?? selectedProjectId);
+      runtime.client.bindSessionProject?.(sessionId, target);
       setRegisteredSessionIds((current) => {
         const existing = current[target] ?? [];
         if (existing.includes(sessionId)) return current;
         return { ...current, [target]: [...existing, sessionId] };
       });
     },
-    [selectedProjectId],
+    [runtime.client, selectedProjectId],
   );
 
   const activeProjectSessionIds = useMemo(

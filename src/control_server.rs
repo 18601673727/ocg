@@ -564,7 +564,7 @@ fn write_preflight(stream: &mut TcpStream, request: &Request) -> std::io::Result
     let methods = allowed_methods(&borrowed).unwrap_or("GET, PUT, POST, OPTIONS");
     let body = b"{}";
     let mut headers = cors_headers(origin.as_deref(), &format!("{methods}, OPTIONS"));
-    headers.push(("Access-Control-Allow-Headers", "content-type".to_string()));
+    headers.push(("Access-Control-Allow-Headers", "content-type, last-event-id".to_string()));
     headers.push(("Access-Control-Max-Age", "600".to_string()));
     write_response(stream, 204, "application/json", body, &headers)
 }
@@ -986,10 +986,27 @@ fn handle_chat_stream(
     let overall = Duration::from_secs(300);
     let heartbeat = Duration::from_secs(10);
     let poll = Duration::from_millis(200);
-    // Replay what arrived before attach from index zero, then go live. The
-    // provider body is never buffered whole: buffered deltas are forwarded
-    // immediately in order, and the tail continues incrementally.
-    let mut index = 0usize;
+    // Replay what arrived before attach, then go live. The provider body is
+    // never buffered whole: buffered deltas are forwarded immediately in
+    // order, and the tail continues incrementally. A reconnecting browser
+    // sends the standard `Last-Event-ID`; each buffered event has a stable
+    // append-only sequence (its position + 1), so replay resumes exactly at
+    // the first unconsumed event and never duplicates a delivered delta.
+    let resume_after: u64 = request
+        .headers
+        .get("last-event-id")
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0);
+    let mut index = resume_after as usize;
+    {
+        let guard = buffer
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("chat buffer poisoned"))?;
+        if index > guard.events.len() {
+            index = guard.events.len();
+        }
+    }
     let mut finished = false;
     let mut disconnected = false;
     while !finished {
@@ -1004,12 +1021,16 @@ fn handle_chat_stream(
             let _ = service.cancel_chat(&session_id);
             break;
         }
-        let pending: Vec<crate::orchestration::execution_dispatch::ExecutionEvent> = {
+        let (base_index, pending): (
+            usize,
+            Vec<crate::orchestration::execution_dispatch::ExecutionEvent>,
+        ) = {
             let guard = buffer.state.lock().map_err(|_| std::io::Error::other("chat buffer poisoned"))?;
             if index < guard.events.len() {
+                let base = index;
                 let pending = guard.events[index..].to_vec();
                 index = guard.events.len();
-                pending
+                (base, pending)
             } else {
                 if guard.terminal {
                     break;
@@ -1021,9 +1042,10 @@ fn handle_chat_stream(
                     .map_err(|_| std::io::Error::other("chat buffer poisoned"))?
                     .0;
                 if index < guard.events.len() {
+                    let base = index;
                     let pending = guard.events[index..].to_vec();
                     index = guard.events.len();
-                    pending
+                    (base, pending)
                 } else {
                     if guard.terminal {
                         break;
@@ -1044,7 +1066,10 @@ fn handle_chat_stream(
                 }
             }
         };
-        for event in pending {
+        for (offset, event) in pending.into_iter().enumerate() {
+            // Every buffered event carries its stable sequence as the SSE
+            // `id:`; reconnects resume from the next unconsumed sequence.
+            let seq = base_index as u64 + offset as u64 + 1;
             use crate::orchestration::execution_dispatch::ExecutionEvent as Live;
             match event {
                 Live::Started => {}
@@ -1066,7 +1091,7 @@ fn handle_chat_stream(
                     };
                     if let Some(payload) = payload {
                         if stream
-                            .write_all(format!("data: {payload}\n\n").as_bytes())
+                            .write_all(format!("id: {seq}\ndata: {payload}\n\n").as_bytes())
                             .is_err()
                         {
                             disconnected = true;
@@ -1088,7 +1113,7 @@ fn handle_chat_stream(
                 Live::Failed(message) => {
                     let payload = json!({"error": message}).to_string();
                     if stream
-                        .write_all(format!("data: {payload}\n\n").as_bytes())
+                        .write_all(format!("id: {seq}\ndata: {payload}\n\n").as_bytes())
                         .is_err()
                     {
                         // A failed terminal write is a disconnect: keep the
@@ -1108,7 +1133,7 @@ fn handle_chat_stream(
                 Live::Finished => {
                     let payload = json!({"done": true}).to_string();
                     if stream
-                        .write_all(format!("data: {payload}\n\n").as_bytes())
+                        .write_all(format!("id: {seq}\ndata: {payload}\n\n").as_bytes())
                         .is_err()
                     {
                         disconnected = true;

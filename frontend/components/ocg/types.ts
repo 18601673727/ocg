@@ -105,6 +105,8 @@ export type RuntimeStatus = {
 
 export type SendMessageInput = {
   content: string;
+  /** Explicit owning Project from real UI state (the active project at send time). */
+  projectId?: string;
 };
 
 export type OcgRuntimeEvent =
