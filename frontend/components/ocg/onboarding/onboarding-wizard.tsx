@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { ONBOARDING_STAGES, type BootstrapFailure } from "../bootstrap/types";
+import { ONBOARDING_STAGES, type BootstrapFailure, type BootstrapMode, type OnboardingStageId } from "../bootstrap/types";
 import {
   canResumeOnboarding,
   normalizeOnboardingMode,
@@ -18,8 +18,6 @@ import {
 } from "../bootstrap/selectors";
 import {
   BOOTSTRAP_MODE_DESCRIPTION,
-  BOOTSTRAP_MODE_LABEL,
-  ONBOARDING_STAGE_LABEL,
   ONBOARDING_STAGE_SUMMARY,
 } from "../bootstrap/presentation";
 import { StagePanel } from "./stage-panels";
@@ -31,7 +29,26 @@ import {
 import { useOcgControlUrl } from "../profile/control-url";
 import { useProject } from "../project/project-context";
 import { ProjectSwitcher } from "../project/project-switcher";
+import { useI18n, type I18nKey } from "../i18n";
 import type { Profile } from "../contracts";
+
+const STAGE_I18N_KEY: Record<OnboardingStageId, I18nKey> = {
+  welcome: "onboarding.stage.welcome",
+  resources: "onboarding.stage.resources",
+  connections: "onboarding.stage.connections",
+  discovery: "onboarding.stage.discovery",
+  overview: "onboarding.stage.overview",
+  profile: "onboarding.stage.profile",
+  ready: "onboarding.stage.ready",
+};
+
+const MODE_I18N_KEY: Record<BootstrapMode, I18nKey> = {
+  firstRun: "onboarding.mode.firstRun",
+  resume: "onboarding.mode.resume",
+  migrate: "onboarding.mode.migrate",
+  recover: "onboarding.mode.recover",
+  reconfigure: "onboarding.mode.reconfigure",
+};
 
 function FailureBanner({
   failure,
@@ -40,6 +57,7 @@ function FailureBanner({
   failure: BootstrapFailure;
   onAction: (failure: BootstrapFailure) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div role="alert" className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
       <div className="flex items-start gap-2">
@@ -47,7 +65,7 @@ function FailureBanner({
         <div className="min-w-0 flex-1">
           <p className="text-[12px] font-medium">{failure.summary}</p>
           <p className="mt-0.5 text-[11px] text-muted-foreground">
-            Setup is paused until this is resolved.
+            {t("onboarding.paused")}
           </p>
         </div>
         <Button
@@ -61,7 +79,7 @@ function FailureBanner({
       </div>
       {failure.detail && (
         <details className="mt-2 text-[11px] text-muted-foreground">
-          <summary className="cursor-pointer select-none">Advanced details</summary>
+          <summary className="cursor-pointer select-none">{t("onboarding.advancedDetails")}</summary>
           <p className="mt-1 break-words">{failure.detail}</p>
         </details>
       )}
@@ -70,11 +88,14 @@ function FailureBanner({
 }
 
 function StageStepper({ current, completed, onSelect }: { current: number; completed: string[]; onSelect: (stage: (typeof ONBOARDING_STAGES)[number]) => void }) {
+  const { t } = useI18n();
   return (
-    <ol className="mt-4 hidden grid-cols-7 gap-1 sm:grid" aria-label="Setup stages">
+    <ol className="mt-4 hidden grid-cols-7 gap-1 sm:grid" aria-label={t("onboarding.stages")}>
       {ONBOARDING_STAGES.map((stage, index) => {
         const isCurrent = index + 1 === current;
         const isDone = completed.includes(stage);
+        const label = t(STAGE_I18N_KEY[stage]);
+        const state = isDone ? t("onboarding.completed") : isCurrent ? t("onboarding.current") : t("onboarding.locked");
         return (
           <li key={stage} className="min-w-0">
             <button
@@ -85,7 +106,7 @@ function StageStepper({ current, completed, onSelect }: { current: number; compl
                 !isCurrent && !isDone && "cursor-not-allowed opacity-60",
               )}
               aria-current={isCurrent ? "step" : undefined}
-              aria-label={`${index + 1}. ${ONBOARDING_STAGE_LABEL[stage]}${isDone ? " (completed)" : isCurrent ? " (current)" : " (locked)"}`}
+              aria-label={`${index + 1}. ${label} ${state}`}
               disabled={!isCurrent && !isDone}
               onClick={() => onSelect(stage)}
             >
@@ -98,7 +119,7 @@ function StageStepper({ current, completed, onSelect }: { current: number; compl
               >
                 {isDone ? <Check className="size-2.5" /> : index + 1}
               </span>
-              <span className="truncate text-[10px] text-muted-foreground">{ONBOARDING_STAGE_LABEL[stage]}</span>
+              <span className="truncate text-[10px] text-muted-foreground">{label}</span>
             </button>
           </li>
         );
@@ -154,6 +175,7 @@ export function OnboardingWizard() {
   const [enterError, setEnterError] = useState<string | null>(null);
   const [entering, setEntering] = useState(false);
   const { activeProjectId, projects, setActiveProject } = useProject();
+  const { t } = useI18n();
   const projectResolved = projects.some((project) => project.id === activeProjectId);
 
   if (!onboarding) return null;
@@ -181,7 +203,7 @@ export function OnboardingWizard() {
       // executable provider/model, then an explicit Project defaults
       // selection persisted for the current Project. Nothing is guessed.
       if (!controlUrl) {
-        setEnterError("No loopback control endpoint is available; cannot confirm an executable provider.");
+        setEnterError(t("onboarding.enter.noEndpoint"));
         return;
       }
       setEntering(true);
@@ -191,7 +213,7 @@ export function OnboardingWizard() {
         const control = createHttpCanonicalControlClient({ baseUrl: controlUrl, fetch });
         const view = await profileClient.read();
         if (view.runnable_choices.length === 0) {
-          setEnterError("No executable provider/model yet: set an HTTPS endpoint, a credential reference, and save the matching Vault credential first.");
+          setEnterError(t("onboarding.enter.noRunnable"));
           return;
         }
         // The model is the user's explicit defaultModel, and only when the
@@ -199,7 +221,7 @@ export function OnboardingWizard() {
         // that model's own provider identity, never a label.
         const choice = executableDefaultModel(view.profile, view.runnable_choices);
         if (!choice) {
-          setEnterError("Choose an executable default model in the Profile panel before entering the workspace.");
+          setEnterError(t("onboarding.enter.chooseDefault"));
           return;
         }
         const listed = await control.listProjects();
@@ -207,12 +229,12 @@ export function OnboardingWizard() {
           ? activeProjectId
           : null;
         if (!projectId) {
-          setEnterError("Select a project to continue setup.");
+          setEnterError(t("onboarding.enter.selectProject"));
           return;
         }
         const stored = await control.readConfiguration(projectId);
         if (isCanonicalRejection(stored)) {
-          setEnterError(`Could not read the current Project configuration: ${stored.message}`);
+          setEnterError(t("onboarding.enter.readFailed", { message: stored.message }));
           return;
         }
         if (!isExecutablePair(view.profile, view.runnable_choices, stored.project_defaults.defaults)) {
@@ -222,11 +244,11 @@ export function OnboardingWizard() {
             model: choice.model,
           });
           if (isCanonicalRejection(written)) {
-            setEnterError(`Could not persist the Project provider/model selection: ${written.message}`);
+            setEnterError(t("onboarding.enter.persistFailed", { message: written.message }));
             return;
           }
           if (!isExecutablePair(view.profile, view.runnable_choices, written.configuration.project_defaults.defaults)) {
-            setEnterError("The Project provider/model selection did not persist; refresh and try again.");
+            setEnterError(t("onboarding.enter.notPersisted"));
             return;
           }
         }
@@ -234,7 +256,7 @@ export function OnboardingWizard() {
         router.push(bootstrap.access.remote ? "/?scenario=remote-authenticated-ready" : "/?scenario=local-ready");
       })()
         .catch((cause: unknown) => {
-          setEnterError(cause instanceof Error ? cause.message : "Could not confirm an executable provider.");
+          setEnterError(cause instanceof Error ? cause.message : t("onboarding.enter.confirmFailed"));
         })
         .finally(() => {
           setEntering(false);
@@ -250,16 +272,16 @@ export function OnboardingWizard() {
         <header>
           <div className="flex items-center gap-2">
             <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase">
-              OCG setup
+              {t("onboarding.title")}
             </span>
-            <span className="text-[11px] text-muted-foreground">{BOOTSTRAP_MODE_LABEL[mode]}</span>
+            <span className="text-[11px] text-muted-foreground">{t(MODE_I18N_KEY[mode])}</span>
           </div>
-          <h1 className="mt-3 text-[18px] font-semibold tracking-tight">{ONBOARDING_STAGE_LABEL[stage]}</h1>
+          <h1 className="mt-3 text-[18px] font-semibold tracking-tight">{t(STAGE_I18N_KEY[stage])}</h1>
           <p className="mt-1 text-[12px] leading-5 text-muted-foreground">{ONBOARDING_STAGE_SUMMARY[stage]}</p>
           <p className="mt-1 text-[11px] leading-4 text-muted-foreground">{BOOTSTRAP_MODE_DESCRIPTION[mode]}</p>
           {resumable && (
             <p role="status" className="mt-2 text-[11px] text-muted-foreground">
-              Saved progress found. Setup resumes where it stopped.
+              {t("onboarding.savedProgress")}
             </p>
           )}
            <StageStepper
@@ -272,17 +294,17 @@ export function OnboardingWizard() {
              }}
            />
           <p className="mt-3 text-[11px] text-muted-foreground sm:hidden">
-            Step {progress.current} of {progress.total} · {ONBOARDING_STAGE_LABEL[stage]}
+            {t("onboarding.stepOf", { current: progress.current, total: progress.total, label: t(STAGE_I18N_KEY[stage]) })}
           </p>
         </header>
 
         <div className="mt-5 flex flex-col gap-3">
-          <Button size="sm" onClick={() => router.push("/onboarding?scenario=local-first-run")}>Connect Provider & Choose Models</Button>
+          <Button size="sm" onClick={() => router.push("/onboarding?scenario=local-first-run")}>{t("onboarding.connectModels")}</Button>
           {onboarding.failure && (
             <FailureBanner failure={onboarding.failure} onAction={handleFailureAction} />
           )}
           <section
-            aria-label={ONBOARDING_STAGE_LABEL[stage]}
+            aria-label={t(STAGE_I18N_KEY[stage])}
             className="rounded-lg border border-border bg-muted/10 p-4"
           >
             <StagePanel
@@ -293,9 +315,9 @@ export function OnboardingWizard() {
             />
           </section>
           {!projectResolved && (
-            <section aria-label="Select project" className="rounded-lg border border-border bg-muted/10 p-4">
+            <section aria-label={t("onboarding.selectProject")} className="rounded-lg border border-border bg-muted/10 p-4">
               <p className="mb-2 text-[12px] text-muted-foreground">
-                Entering the workspace also needs an explicit project. Nothing is selected automatically.
+                {t("onboarding.projectNote")}
               </p>
               <ProjectSwitcher
                 projects={projects}
@@ -316,18 +338,18 @@ export function OnboardingWizard() {
             }}
           >
             <ArrowLeft className="size-3.5" aria-hidden="true" />
-            Back
+            {t("common.back")}
           </Button>
           <span className="text-[11px] text-muted-foreground">
-            {progress.completed} of {progress.total} stages complete
+            {t("onboarding.stagesComplete", { current: progress.completed, total: progress.total })}
           </span>
           <Button
             size="sm"
             onClick={handleNext}
             disabled={!gate.canAdvance || entering}
-            title={!gate.canAdvance ? `Blocked: ${gate.blockers.join(", ")}` : undefined}
+            title={!gate.canAdvance ? t("onboarding.blocked", { blockers: gate.blockers.join(", ") }) : undefined}
           >
-            {next ? "Next" : "Enter workspace"}
+            {next ? t("common.next") : t("onboarding.enterWorkspace")}
             <ArrowRight className="size-3.5" aria-hidden="true" />
           </Button>
         </footer>

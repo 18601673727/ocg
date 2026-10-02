@@ -21,6 +21,7 @@ import type { ResourceLedger } from "../resource-ledger/types";
 import { ModelsView } from "./models-view";
 import { ProfilesView } from "./profiles-view";
 import { ProvidersView } from "./providers-view";
+import { useI18n } from "../i18n";
 
 const VIEW_ICON: Record<ControlCenterView, typeof Layers> = {
   profiles: Users,
@@ -28,17 +29,11 @@ const VIEW_ICON: Record<ControlCenterView, typeof Layers> = {
   models: Cpu,
 };
 
-const VIEW_LABEL: Record<ControlCenterView, string> = {
-  profiles: "Profiles",
-  providers: "Providers",
-  models: "Models",
-};
-
-const TABS: TabItem<ControlCenterView>[] = CONTROL_CENTER_VIEWS.map((id) => ({
-  id,
-  label: VIEW_LABEL[id],
-  icon: VIEW_ICON[id],
-}));
+const VIEW_LABEL_KEY = {
+  profiles: "control.profiles",
+  providers: "control.providers",
+  models: "control.models",
+} as const;
 
 function LedgerStrip({ ledger }: { ledger: ResourceLedger | null }) {
   const summary = useMemo(() => (ledger ? summarize(ledger.entries) : null), [ledger]);
@@ -85,6 +80,7 @@ export function ControlCenterSurface({
   initialView = "profiles",
   onSelectProfile,
 }: ControlCenterSurfaceProps) {
+  const { t } = useI18n();
   const [view, setView] = useState<ControlCenterView>(initialView);
   const activeProfile = selectActiveProfile(bootstrap);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(activeProfile?.id ?? null);
@@ -98,14 +94,23 @@ export function ControlCenterSurface({
   const [modelAssignmentFilter, setModelAssignmentFilter] = useState<"assigned" | "unassigned" | "all">("all");
   const [modelCapabilityFilter, setModelCapabilityFilter] = useState("");
   const summary = useMemo(() => selectControlCenterSummary(bootstrap), [bootstrap]);
+  const tabs: TabItem<ControlCenterView>[] = useMemo(
+    () =>
+      CONTROL_CENTER_VIEWS.map((id) => ({
+        id,
+        label: t(VIEW_LABEL_KEY[id]),
+        icon: VIEW_ICON[id],
+      })),
+    [t],
+  );
 
   return (
     <div className="flex h-full min-h-0 w-full min-w-0 flex-col">
       <header className="shrink-0 border-b border-border px-3 py-2.5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <h1 className="text-[13px] font-semibold tracking-tight">Control Center</h1>
+          <h1 className="text-[13px] font-semibold tracking-tight">{t("control.title")}</h1>
           <Pill tone="sky" title="Active profile in the mock runtime">
-            {summary.activeProfileLabel ?? "No active profile"}
+            {summary.activeProfileLabel ?? t("control.noProfile")}
           </Pill>
           <span className="text-[10px] text-muted-foreground">
             {summary.profileCount} profiles · {summary.providerCount} providers · {summary.modelCount} models
@@ -116,8 +121,8 @@ export function ControlCenterSurface({
           </span>
         </div>
         <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-4">
-          <Metric label="Profiles" value={String(summary.profileCount)} detail={`${summary.activeProfileLabel ?? "none"} active`} />
-          <Metric label="Providers" value={String(summary.providerCount)} detail={`${summary.degradedProviderCount} degraded · ${summary.unavailableProviderCount} unavailable`} />
+          <Metric label={t("control.profiles")} value={String(summary.profileCount)} detail={`${summary.activeProfileLabel ?? "none"} active`} />
+          <Metric label={t("control.providers")} value={String(summary.providerCount)} detail={`${summary.degradedProviderCount} degraded · ${summary.unavailableProviderCount} unavailable`} />
           <Metric label="Auth required" value={String(summary.authRequiredProviderCount)} detail={`${summary.unknownProviderCount} unknown`} />
           <Metric label="Available models" value={String(summary.availableModelCount)} detail={`${summary.modelCount} total`} />
         </div>
@@ -128,10 +133,10 @@ export function ControlCenterSurface({
 
       <nav className="shrink-0 border-b border-border px-3 py-1.5">
         <SegmentedTabs
-          tabs={TABS}
+          tabs={tabs}
           value={view}
           onSelect={setView}
-          ariaLabel="Control Center surfaces"
+          ariaLabel={t("control.surfaces")}
           panelIdBase="control-center"
           className="grid-cols-3"
         />
@@ -140,7 +145,7 @@ export function ControlCenterSurface({
       <div
         id={`control-center-${view}`}
         role="tabpanel"
-        aria-label={VIEW_LABEL[view]}
+        aria-label={t(VIEW_LABEL_KEY[view])}
         className="min-h-0 min-w-0 flex-1 overflow-y-auto px-3 py-3"
       >
         {view === "profiles" && (

@@ -22,7 +22,6 @@ import {
 import {
   DEFAULT_LEDGER_FILTER,
   LEDGER_TABS,
-  LEDGER_TAB_LABEL,
   type LedgerFilter,
   type LedgerTab,
   type ResourceLedger,
@@ -65,6 +64,7 @@ import {
 } from "./ledger-primitives";
 import { CompositionSection, TrafficChart } from "./ledger-charts";
 import { LedgerFilters } from "./ledger-filters";
+import { useI18n, type I18nKey } from "../i18n";
 import {
   AggregateGroupList,
   AttributionBreakdown,
@@ -73,12 +73,19 @@ import {
 } from "./ledger-tables";
 import { CallDetail } from "./ledger-detail";
 
-const TABS: TabItem<LedgerTab>[] = LEDGER_TABS.map((id) => ({ id, label: LEDGER_TAB_LABEL[id] }));
+const TAB_LABEL_KEY: Record<LedgerTab, I18nKey> = {
+  overview: "ledger.overview",
+  ledger: "ledger.ledger",
+  attribution: "ledger.attribution",
+  providers: "ledger.providers",
+  models: "ledger.models",
+};
 
 function EmptyLedger() {
+  const { t } = useI18n();
   return (
     <div className="flex h-full min-h-0 flex-col items-center justify-center gap-2 px-6 text-center">
-      <h2 className="text-[13px] font-semibold tracking-tight">Resource Ledger</h2>
+      <h2 className="text-[13px] font-semibold tracking-tight">{t("ledger.title")}</h2>
       <p className="max-w-md text-[11px] text-muted-foreground">
         This scenario has no normalized resource ledger. Open{" "}
         <code className="rounded border border-border bg-muted px-1">?scenario=resource-ledger</code> to inspect
@@ -149,9 +156,14 @@ function ProvenanceMix({
 }
 
 export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | null }) {
+  const { t } = useI18n();
   const [tab, setTab] = useState<LedgerTab>("overview");
   const [filter, setFilter] = useState<LedgerFilter>(DEFAULT_LEDGER_FILTER);
   const [selectedEntry, setSelectedEntry] = useState<ResourceLedgerEntry | null>(null);
+  const tabs: TabItem<LedgerTab>[] = useMemo(
+    () => LEDGER_TABS.map((id) => ({ id, label: t(TAB_LABEL_KEY[id]) })),
+    [t],
+  );
 
   const entries = useMemo(() => ledger?.entries ?? [], [ledger]);
   const options = useMemo(() => filterOptions(entries), [entries]);
@@ -182,12 +194,12 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
     <div className="flex h-full min-h-0 w-full min-w-0 flex-col">
       <header className="shrink-0 border-b border-border px-3 py-2.5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <h2 className="text-[13px] font-semibold tracking-tight">Resource Ledger</h2>
-          <Pill tone="slate" title="Calls in the filtered dataset">
-            {formatCount(summary.entryCount)} calls
+          <h2 className="text-[13px] font-semibold tracking-tight">{t("ledger.title")}</h2>
+          <Pill tone="slate" title={t("ledger.filters")}>
+            {t("ledger.header.calls", { count: formatCount(summary.entryCount) })}
           </Pill>
           <span className="text-[10px] text-muted-foreground">
-            {summary.jobCount} jobs · {summary.workerCount} workers
+            {t("ledger.header.jobsWorkers", { jobs: summary.jobCount, workers: summary.workerCount })}
           </span>
           <span
             className="ml-auto shrink-0 text-[10px] text-muted-foreground"
@@ -200,10 +212,10 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
 
       <nav className="shrink-0 border-b border-border px-3 py-1.5">
         <SegmentedTabs
-          tabs={TABS}
+          tabs={tabs}
           value={tab}
           onSelect={setTab}
-          ariaLabel="Resource ledger surfaces"
+          ariaLabel={t("ledger.surfaces")}
           panelIdBase="resource-ledger"
           className="grid-cols-5"
           size="sm"
@@ -223,7 +235,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
       <div
         id={`resource-ledger-${tab}`}
         role="tabpanel"
-        aria-label={LEDGER_TAB_LABEL[tab]}
+        aria-label={t(TAB_LABEL_KEY[tab])}
         className="min-h-0 flex-1 overflow-y-auto px-3 py-3"
       >
         {tab === "overview" && (
@@ -236,14 +248,14 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
                 icon={Gauge}
               />
               <Metric
-                label="Cost"
+                label={t("ledger.cost")}
                 value={formatCostMicros(summary.costMicros)}
                 detail={`${summary.costProvenance} provenance`}
                 icon={Coins}
                 title="Integer micro-units of USD. $0.000000 is a known free call; — is unknown."
               />
               <Metric
-                label="Calls"
+                label={t("ledger.calls")}
                 value={formatCount(summary.entryCount)}
                 detail={`${summary.successCount} ok · ${summary.failureCount} failed · ${summary.retryCount} retries`}
                 icon={Layers}
@@ -304,7 +316,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
               tabs share this same filtered dataset.
             </p>
             {filtered.length === 0 ? (
-              <EmptyState className="px-2 py-4">No calls match the current filters.</EmptyState>
+              <EmptyState className="px-2 py-4">{t("ledger.noMatch")}</EmptyState>
             ) : (
               <ul className="flex flex-col gap-1.5">
                 {filtered.map((entry) => (

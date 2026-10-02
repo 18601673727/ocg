@@ -56,6 +56,7 @@ import {
 } from "./selectors";
 import { createAttentionQueue } from "./fixtures";
 import type { WorkspaceView } from "../layout/view-domain";
+import { useI18n } from "../i18n";
 
 type AttentionSurfaceProps = {
   snapshot: RuntimeSnapshot;
@@ -69,12 +70,12 @@ type AttentionSurfaceProps = {
   onNavigate: (view: WorkspaceView) => void;
 };
 
-const TAB_LABELS: Record<AttentionTab, string> = {
-  overview: "Overview",
-  approvals: "Approvals",
-  blocked: "Blocked",
-  resolved: "Resolved",
-};
+const TAB_LABEL_KEY = {
+  overview: "attention.overview",
+  approvals: "attention.approvals",
+  blocked: "attention.blocked",
+  resolved: "attention.resolved",
+} as const;
 
 /**
  * Attention's own scales, expressed in the shared tone vocabulary. There is no
@@ -125,6 +126,8 @@ const DECISION_CLOCK = "2026-09-25T10:00:00Z";
 
 export function AttentionSurface(props: AttentionSurfaceProps) {
   const { snapshot, initialTab = "overview", queue: queueProp, onNavigate } = props;
+  const { t } = useI18n();
+  const tabLabel = (tab: AttentionTab) => t(TAB_LABEL_KEY[tab]);
 
   // Fixture queue is stable per scenario; decisions mutate local state only.
   const queue = useMemo(
@@ -190,13 +193,13 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
       {/* List column */}
       <div className={cn("flex min-h-0 w-full min-w-0 flex-1 flex-col", selected && "lg:border-r lg:border-border")}>
         <div className="shrink-0 px-4 pt-4 sm:px-6 sm:pt-6">
-          <h1 className="text-[20px] font-semibold tracking-tight">Attention</h1>
+          <h1 className="text-[20px] font-semibold tracking-tight">{t("attention.title")}</h1>
           <p className="mt-0.5 text-[13px] text-muted-foreground">
-            Items that need your decision or intervention.
+            {t("attention.subtitle")}
           </p>
           <SummaryStrip summary={summary} />
           <SegmentedTabs
-            tabs={ATTENTION_TABS.map((tab) => ({ id: tab, label: TAB_LABELS[tab], count: tabbed[tab] }))}
+            tabs={ATTENTION_TABS.map((tab) => ({ id: tab, label: tabLabel(tab), count: tabbed[tab] }))}
             value={filters.tab}
             onSelect={(tab) => {
               setFilters((f) => ({ ...f, tab }));
@@ -212,35 +215,35 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
               <Input
                 value={filters.query}
                 onChange={(event) => setFilters((f) => ({ ...f, query: event.target.value }))}
-                placeholder="Search title, Job, provider…"
-                aria-label="Search attention items"
+                placeholder={t("attention.searchPlaceholder")}
+                aria-label={t("attention.searchLabel")}
                 className="pl-8"
               />
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <label className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
-                Kind
+                {t("attention.kind")}
                 <select
                   value={filters.kind}
                   onChange={(event) => setFilters((f) => ({ ...f, kind: event.target.value as AttentionFilters["kind"] }))}
-                  aria-label="Filter by kind"
+                  aria-label={t("attention.filterKind")}
                   className="rounded-md border border-border bg-background px-1.5 py-1 text-[12px] text-foreground"
                 >
-                  <option value="all">All</option>
+                  <option value="all">{t("common.all")}</option>
                   {ATTENTION_KINDS.map((kind) => (
                     <option key={kind} value={kind}>{ATTENTION_KIND_LABELS[kind]}</option>
                   ))}
                 </select>
               </label>
               <label className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
-                Severity
+                {t("attention.severity")}
                 <select
                   value={filters.severity}
                   onChange={(event) => setFilters((f) => ({ ...f, severity: event.target.value as AttentionFilters["severity"] }))}
-                  aria-label="Filter by severity"
+                  aria-label={t("attention.filterSeverity")}
                   className="rounded-md border border-border bg-background px-1.5 py-1 text-[12px] text-foreground"
                 >
-                  <option value="all">All</option>
+                  <option value="all">{t("common.all")}</option>
                   <option value="critical">Critical</option>
                   <option value="high">High</option>
                   <option value="warning">Warning</option>
@@ -248,14 +251,14 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
                 </select>
               </label>
               <label className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
-                Source
+                {t("attention.source")}
                 <select
                   value={filters.source}
                   onChange={(event) => setFilters((f) => ({ ...f, source: event.target.value as AttentionFilters["source"] }))}
-                  aria-label="Filter by source"
+                  aria-label={t("attention.filterSource")}
                   className="rounded-md border border-border bg-background px-1.5 py-1 text-[12px] text-foreground"
                 >
-                  <option value="all">All</option>
+                  <option value="all">{t("common.all")}</option>
                   {(Object.keys(ATTENTION_SOURCE_LABELS) as AttentionSource[]).map((source) => (
                     <option key={source} value={source}>{ATTENTION_SOURCE_LABELS[source]}</option>
                   ))}
@@ -267,14 +270,14 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
                   size="xs"
                   onClick={() => setFilters((f) => ({ ...f, query: "", kind: "all", severity: "all", source: "all" }))}
                 >
-                  Clear
+                  {t("common.clear")}
                 </Button>
               )}
             </div>
           </div>
         </div>
 
-        <div id="attention-panel" role="tabpanel" aria-label={`${TAB_LABELS[filters.tab]} items`} className="min-h-0 flex-1 overflow-y-auto px-4 py-3 sm:px-6">
+        <div id="attention-panel" role="tabpanel" aria-label={t("attention.detailsFor", { title: tabLabel(filters.tab) })} className="min-h-0 flex-1 overflow-y-auto px-4 py-3 sm:px-6">
           {visible.length === 0 ? (
             <EmptyState tab={filters.tab} hasItems={items.length > 0} />
           ) : (
@@ -307,7 +310,7 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
             aria-hidden="true"
           />
           <aside
-            aria-label={`Details for ${selected.title}`}
+            aria-label={t("attention.detailsFor", { title: selected.title })}
             className="fixed inset-y-0 right-0 z-50 flex w-full max-w-none flex-col border-l border-border bg-background sm:w-[480px] sm:max-w-[90vw] lg:static lg:z-auto lg:flex lg:min-h-0 lg:w-[420px] lg:max-w-none lg:shrink-0"
           >
             <AttentionInspector
@@ -385,13 +388,14 @@ function AttentionRow({ item, selected, onSelect }: { item: AttentionItem; selec
 }
 
 function EmptyState({ tab, hasItems }: { tab: AttentionTab; hasItems: boolean }) {
+  const { t } = useI18n();
   if (!hasItems) {
     return (
       <EmptyPanel
         icon={ShieldCheck}
         iconClassName="text-emerald-500"
-        title="All clear"
-        hint="OCG has progressed as far as it safely can and nothing needs your judgment right now."
+        title={t("attention.allClear")}
+        hint={t("attention.allClearBody")}
         className="px-6 py-12"
       />
     );
@@ -399,8 +403,8 @@ function EmptyState({ tab, hasItems }: { tab: AttentionTab; hasItems: boolean })
   return (
     <EmptyPanel
       icon={Inbox}
-      title={tab === "resolved" ? "No resolved history yet" : `Nothing in ${TAB_LABELS[tab].toLowerCase()}`}
-      hint="Try a different tab or clear the filters."
+      title={tab === "resolved" ? t("attention.emptyResolved") : t("attention.emptyFiltered", { tab: t(TAB_LABEL_KEY[tab]) })}
+      hint={t("attention.emptyHint")}
       className="px-6 py-12"
     />
   );
@@ -424,6 +428,7 @@ function AttentionInspector({
   const openDestination = () => onNavigate(DESTINATION_VIEWS[item.destination]);
   const unresolved = isUnresolved(item);
   const approval = item.approval;
+  const { t } = useI18n();
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -443,7 +448,7 @@ function AttentionInspector({
             {ATTENTION_SOURCE_LABELS[item.source]} · created {item.createdAt} · updated {item.updatedAt}
           </p>
         </div>
-        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label="Close details">
+        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("attention.closeDetails")}>
           <X className="size-4" />
         </Button>
       </div>
@@ -478,7 +483,7 @@ function AttentionInspector({
               onClick={() => onDecide(item.id, "approved")}
               aria-label={`Approve: ${approval.requestedAction}`}
             >
-              <Check className="size-3.5" data-icon="inline-start" /> Approve
+              <Check className="size-3.5" data-icon="inline-start" /> {t("attention.approve")}
             </Button>
             <Button
               variant="destructive"
@@ -487,22 +492,22 @@ function AttentionInspector({
               onClick={() => onDecide(item.id, "rejected")}
               aria-label={`Reject: ${approval.requestedAction}`}
             >
-              <X className="size-3.5" data-icon="inline-start" /> Reject
+              <X className="size-3.5" data-icon="inline-start" /> {t("attention.reject")}
             </Button>
           </div>
         ) : (
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="outline" size="sm" onClick={openDestination}>
-              Open {DESTINATION_LABELS[item.destination]} <ArrowRight className="size-3.5" data-icon="inline-end" />
+              {t("common.open")} {DESTINATION_LABELS[item.destination]} <ArrowRight className="size-3.5" data-icon="inline-end" />
             </Button>
             {unresolved && item.status === "pending" && (
               <Button variant="ghost" size="sm" onClick={() => onAcknowledge(item.id)} aria-label={`Acknowledge ${item.title}`}>
-                Acknowledge
+                {t("attention.acknowledge")}
               </Button>
             )}
             {unresolved && !approval && (
-              <Button variant="ghost" size="sm" onClick={() => onResolve(item.id)} aria-label={`Mark resolved: ${item.title}`}>
-                <CircleCheck className="size-3.5" data-icon="inline-start" /> Mark resolved
+              <Button variant="ghost" size="sm" onClick={() => onResolve(item.id)} aria-label={t("attention.detailsFor", { title: item.title })}>
+                <CircleCheck className="size-3.5" data-icon="inline-start" /> {t("attention.markResolved")}
               </Button>
             )}
             {!unresolved && (

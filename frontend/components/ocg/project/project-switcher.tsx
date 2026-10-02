@@ -24,7 +24,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { ProjectId, ProjectSummary } from "./domain";
-import { projectSwitcherLabel } from "./domain";
+import { useI18n } from "../i18n";
 
 export type ProjectSwitcherProps = {
   projects: readonly ProjectSummary[];
@@ -41,11 +41,18 @@ export function ProjectSwitcher({
   onChange,
 }: ProjectSwitcherProps) {
   const [open, setOpen] = useState(false);
+  const { t } = useI18n();
   const active = projects.find((project) => project.id === activeProjectId) ?? null;
   if (projects.length === 0) return null;
   // No silent selection: when nothing is selected, the trigger says so and
   // no entry is marked active until the operator picks one explicitly.
-  const triggerLabel = active ?? { id: "" as ProjectId, name: "Select project" };
+  const triggerLabel = active ?? { id: "" as ProjectId, name: t("project.select") };
+  const triggerAria = active
+    ? t("project.switchCurrent", { name: active.name })
+    : t("project.select");
+  const collapsedAria = active
+    ? t("project.switchCollapsed", { name: active.name })
+    : t("project.select");
 
   const handleSelect = (id: ProjectId) => {
     setOpen(false);
@@ -59,7 +66,7 @@ export function ProjectSwitcher({
           variant="outline"
           size="sm"
           className="w-full justify-start"
-          aria-label={projectSwitcherLabel(triggerLabel)}
+          aria-label={triggerAria}
         >
           <FolderKanban className="size-3.5" data-icon="inline-start" aria-hidden="true" />
           <span className="min-w-0 flex-1 truncate text-left text-[12px] tracking-normal normal-case">
@@ -80,8 +87,8 @@ export function ProjectSwitcher({
               <Button
                 variant="ghost"
                 size="icon-sm"
-                aria-label={projectSwitcherLabel(triggerLabel, true)}
-                title={projectSwitcherLabel(triggerLabel, true)}
+                aria-label={collapsedAria}
+                title={collapsedAria}
               >
                 <FolderKanban className="size-4" aria-hidden="true" />
               </Button>
@@ -89,7 +96,7 @@ export function ProjectSwitcher({
           />
         }
       />
-      <TooltipContent side="right">{projectSwitcherLabel(triggerLabel, true)}</TooltipContent>
+      <TooltipContent side="right">{collapsedAria}</TooltipContent>
     </Tooltip>
   );
 
@@ -98,12 +105,12 @@ export function ProjectSwitcher({
       {collapsed ? collapsedTrigger : expandedTrigger}
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Switch project</DialogTitle>
+          <DialogTitle>{t("project.switch")}</DialogTitle>
           <DialogDescription>
-            Project context scopes sessions, attention, and the resource ledger.
+            {t("project.contextNote")}
           </DialogDescription>
         </DialogHeader>
-        <ul role="listbox" aria-label="Projects" className="flex flex-col gap-1">
+        <ul role="listbox" aria-label={t("project.projects")} className="flex flex-col gap-1">
           {projects.map((project) => {
             const isActive = active !== null && project.id === active.id;
             return (

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createProfileClient } from "../profile/profile-client";
 import { useOcgControlUrl } from "../profile/control-url";
+import { useI18n } from "../i18n";
 
 /**
  * Neutral launch route: the PWA opener lands here and the frontend decides,
@@ -19,12 +20,13 @@ export function BootstrapEntry() {
   const controlUrl = useOcgControlUrl();
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const { t } = useI18n();
 
   useEffect(() => {
     let cancelled = false;
     const run = async () => {
       if (!controlUrl) {
-        if (!cancelled) setError("No loopback control endpoint is available for this session.");
+        if (!cancelled) setError(t("shell.noControlEndpoint"));
         return;
       }
       try {
@@ -38,7 +40,7 @@ export function BootstrapEntry() {
         router.replace(ready ? "/?scenario=local-ready" : "/onboarding?scenario=local-first-run");
       } catch (cause) {
         if (!cancelled) {
-          setError(cause instanceof Error ? cause.message : "Could not read the OCG Profile endpoint.");
+          setError(cause instanceof Error ? cause.message : t("shell.profileReadFailed"));
         }
       }
     };
@@ -46,21 +48,21 @@ export function BootstrapEntry() {
     return () => {
       cancelled = true;
     };
-  }, [controlUrl, router, attempt]);
+  }, [controlUrl, router, attempt, t]);
 
   if (error !== null) {
     return (
       <main className="flex min-h-screen flex-col items-center justify-center gap-3 p-6 text-sm">
-        <p role="alert">OCG startup could not determine readiness: {error}</p>
+        <p role="alert">{t("shell.readinessFailed", { error })}</p>
         <button type="button" onClick={() => { setError(null); setAttempt((value) => value + 1); }}>
-          Retry
+          {t("shell.retry")}
         </button>
       </main>
     );
   }
   return (
     <main className="flex min-h-screen items-center justify-center p-6 text-sm text-muted-foreground">
-      Starting OCG…
+      {t("shell.starting")}
     </main>
   );
 }

@@ -44,6 +44,7 @@ import {
 } from "../job/draft-domain";
 import type { JobLaunchResult } from "../runtime/runtime-types";
 import { workspaceViewHref, type WorkspaceView } from "./view-domain";
+import { useI18n } from "../i18n";
 
 export type { WorkspaceView } from "./view-domain";
 
@@ -60,14 +61,15 @@ function EmptyProjectWorkspace({
   onProjectChange: (id: ProjectId) => void;
   onNewChat: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <main aria-label="Project workspace" className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-6">
       <section className="w-full max-w-lg space-y-4 rounded-lg border border-border bg-background p-6">
         <div>
-          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Project</p>
+          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{t("project.emptyTitle")}</p>
           <h1 className="mt-1 text-lg font-semibold">{activeProjectName}</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            This Project has no local chat session yet. Create one to start working in this Project.
+            {t("project.emptyBody")}
           </p>
         </div>
         <button
@@ -75,11 +77,11 @@ function EmptyProjectWorkspace({
           onClick={onNewChat}
           className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
         >
-          New chat
+          {t("sidebar.newChat")}
         </button>
         {projects.length > 1 ? (
           <div className="border-t border-border pt-4">
-            <p className="mb-2 text-xs font-medium text-muted-foreground">Registered Projects</p>
+            <p className="mb-2 text-xs font-medium text-muted-foreground">{t("project.registered")}</p>
             <div className="flex flex-wrap gap-2">
               {projects.map((project) => (
                 <button
@@ -103,6 +105,41 @@ function EmptyProjectWorkspace({
         ) : null}
       </section>
     </main>
+  );
+}
+
+function NoExecutionNotice() {
+  const { t } = useI18n();
+  return (
+    <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">{t("execution.noExecution")}</div>
+  );
+}
+
+function NoEndpointNotice() {
+  const { t } = useI18n();
+  return (
+    <p className="max-w-md text-center text-[12px] text-muted-foreground">
+      {t("canonical.noEndpoint")}
+    </p>
+  );
+}
+
+function NoProjectNotice({ onAddProject }: { onAddProject: () => void }) {
+  const { t } = useI18n();
+  return (
+    <div className="flex flex-col items-center gap-3 text-center">
+      <p className="text-[14px] font-medium">{t("project.noSelectionTitle")}</p>
+      <p className="max-w-sm text-[12px] text-muted-foreground">
+        {t("project.noSelectionBody")}
+      </p>
+      <button
+        type="button"
+        className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+        onClick={onAddProject}
+      >
+        {t("project.addProject")}
+      </button>
+    </div>
   );
 }
 
@@ -570,7 +607,7 @@ export function RuntimeWorkspace({
                 onOpenInspector={() => navigate("chat")}
               />
             ) : (
-              <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">No Job execution is available.</div>
+              <NoExecutionNotice />
             )}
           </main>
         ) : isLogs ? (
@@ -591,11 +628,7 @@ export function RuntimeWorkspace({
           </main>
         ) : isCanonical ? (
           <main aria-label="OCG control" className="flex min-h-0 flex-1 items-center justify-center p-6">
-            <p className="max-w-md text-center text-[12px] text-muted-foreground">
-              No OCG control endpoint is configured. Start one with{" "}
-              <code className="rounded bg-muted px-1 py-0.5 text-[11px]">ocg serve --addr 127.0.0.1:8710</code> and
-              reload.
-            </p>
+            <NoEndpointNotice />
           </main>
         ) : isHome ? (
           <main aria-label="Workspace home" className="flex min-h-0 flex-1 overflow-hidden">
@@ -617,19 +650,7 @@ export function RuntimeWorkspace({
           </main>
         ) : !activeProjectId ? (
           <main aria-label="No project selected" className="flex min-h-0 flex-1 items-center justify-center">
-            <div className="flex flex-col items-center gap-3 text-center">
-              <p className="text-[14px] font-medium">No project selected</p>
-              <p className="max-w-sm text-[12px] text-muted-foreground">
-                Add a Project to start chatting. Projects define your working directory for OCG operations.
-              </p>
-              <button
-                type="button"
-                className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-                onClick={() => router.push("/onboarding?scenario=local-first-run")}
-              >
-                Add a Project
-              </button>
-            </div>
+            <NoProjectNotice onAddProject={() => router.push("/onboarding?scenario=local-first-run")} />
           </main>
         ) : !activeSession ? (
           <EmptyProjectWorkspace
