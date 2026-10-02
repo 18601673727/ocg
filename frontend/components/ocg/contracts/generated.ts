@@ -396,7 +396,20 @@ endpoint?: string | null,
  * bearer token (without "Bearer " prefix); OCG constructs the Authorization
  * header at runtime.
  */
-credential_ref?: string | null, };
+credential_ref?: string | null, 
+/**
+ * The wire protocol this provider speaks. `None` means the provider speaks
+ * OpenAI Chat Completions, which is what every Profile written before
+ * protocols were explicit does. A key, a label or an endpoint host never
+ * implies a protocol.
+ */
+protocol?: ProviderProtocol | null, };
+
+
+/**
+ * The protocol OCG speaks to a provider endpoint.
+ */
+export type ProviderProtocol = "anthropic" | "openai" | "openai_compatible";
 
 
 /**

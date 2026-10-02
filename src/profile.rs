@@ -1,5 +1,6 @@
 //! OCG-owned provider/model Profile.
 use crate::error::{OcgError, Result};
+use crate::provider_protocol::ProviderProtocol;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -29,6 +30,21 @@ pub struct Provider {
     /// header at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    /// The wire protocol this provider speaks. `None` means the provider speaks
+    /// OpenAI Chat Completions, which is what every Profile written before
+    /// protocols were explicit does. A key, a label or an endpoint host never
+    /// implies a protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<ProviderProtocol>,
+}
+
+impl Provider {
+    /// The protocol this provider speaks, resolving an absent declaration to the
+    /// OpenAI-compatible contract every existing Profile already speaks.
+    #[must_use]
+    pub fn wire_protocol(&self) -> ProviderProtocol {
+        self.protocol.unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -68,6 +84,7 @@ impl Profile {
                     label: "Configure a provider".into(),
                     endpoint: None,
                     credential_ref: None,
+                    protocol: None,
                 },
             )]),
             models: BTreeMap::from([(

@@ -12,19 +12,21 @@
 //! - execution authority
 //! - provider authority
 //! - Call lifecycle
-//! - OpenAI-compatible protocol boundary
+//! - provider protocol boundaries (OpenAI native, Anthropic native,
+//!   OpenAI-compatible)
 //! - tools (future)
 //! - conversation (future)
 //! - PWA/control plane
 //!
 //! OCG does not depend on any external agent runtime to work.
 
+pub mod anthropic;
 pub mod call_recovery;
 pub mod capabilities;
 pub mod cli;
 pub mod clock;
-pub mod compiler_feedback;
 pub mod compaction;
+pub mod compiler_feedback;
 pub mod config;
 pub mod config_command;
 pub mod context;
@@ -55,6 +57,7 @@ pub mod project;
 pub mod prompt;
 pub mod proxy;
 pub mod provider_context;
+pub mod provider_protocol;
 pub mod pwa;
 pub mod release;
 pub mod report;

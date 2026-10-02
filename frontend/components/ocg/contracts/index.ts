@@ -39,6 +39,7 @@ export type {
   ProjectConfigurationView,
   ProjectRecord,
   Provider,
+  ProviderProtocol,
 } from "./generated";
 
 export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./generated";

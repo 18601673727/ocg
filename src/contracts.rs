@@ -52,6 +52,7 @@ pub use crate::orchestration::domain::ExecutionWitness;
 pub use crate::profile::{
     Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION,
 };
+pub use crate::provider_protocol::ProviderProtocol;
 
 /// The Profile control API version. Shared with the generated TypeScript, so a
 /// version bump is a compile-time mismatch rather than a runtime surprise.
@@ -211,6 +212,7 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     JobLaunchRequest::export_all(cfg)?;
     JobLaunchResponse::export_all(cfg)?;
     ProfileView::export_all(cfg)?;
+    ProviderProtocol::export_all(cfg)?;
     ProfileBootstrapRequest::export_all(cfg)?;
     ProfileReplaceRequest::export_all(cfg)?;
     ProfileCredentialRequest::export_all(cfg)?;
