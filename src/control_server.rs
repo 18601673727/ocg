@@ -997,6 +997,11 @@ fn handle_chat_stream(
             let payload = json!({"error": "chat stream timed out"}).to_string();
             let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
             let _ = stream.flush();
+            // The timeout must enter the canonical cancellation path so the
+            // Attempt/Call/provider execution is actually revoked. It runs
+            // even when the frontend socket write above failed, and it precedes
+            // any ActiveChat removal so the cancel state is still findable.
+            let _ = service.cancel_chat(&session_id);
             break;
         }
         let pending: Vec<crate::orchestration::execution_dispatch::ExecutionEvent> = {
@@ -1082,15 +1087,39 @@ fn handle_chat_stream(
                 }
                 Live::Failed(message) => {
                     let payload = json!({"error": message}).to_string();
-                    let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
-                    let _ = stream.flush();
+                    if stream
+                        .write_all(format!("data: {payload}\n\n").as_bytes())
+                        .is_err()
+                    {
+                        // A failed terminal write is a disconnect: keep the
+                        // retained buffer for a later replay.
+                        disconnected = true;
+                        finished = true;
+                        break;
+                    }
+                    if stream.flush().is_err() {
+                        disconnected = true;
+                        finished = true;
+                        break;
+                    }
                     finished = true;
                     break;
                 }
                 Live::Finished => {
                     let payload = json!({"done": true}).to_string();
-                    let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
-                    let _ = stream.flush();
+                    if stream
+                        .write_all(format!("data: {payload}\n\n").as_bytes())
+                        .is_err()
+                    {
+                        disconnected = true;
+                        finished = true;
+                        break;
+                    }
+                    if stream.flush().is_err() {
+                        disconnected = true;
+                        finished = true;
+                        break;
+                    }
                     finished = true;
                     break;
                 }
