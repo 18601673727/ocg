@@ -165,11 +165,6 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       return;
     }
 
-    // Close a previous turn on the same session so only one provider stream
-    // owns the conversation. The backend already cancels the previous Attempt
-    // on send; this keeps the local EventSource from leaking.
-    this.closeChatStream(sessionId, true);
-
     const userMessage: ChatMessage = {
       id: `chat-user-${Date.now().toString(36)}-${this.chatCounter++}`,
       role: "user",
@@ -247,6 +242,9 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       return;
     }
 
+    // Only an accepted turn supersedes the previous Attempt on the backend.
+    // Keep its EventSource alive until then so failed sends leave it streaming.
+    this.closeChatStream(sessionId, true);
     this.openChatStream(sessionId, response.job_id, assistantId);
   }
 
