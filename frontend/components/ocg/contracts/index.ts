@@ -11,6 +11,10 @@
  */
 
 export type {
+  ChatConversationView,
+  ChatConversationsResponse,
+  ChatMessageView,
+  ChatMessagesResponse,
   ApiErrorBody,
   ApiErrorEnvelope,
   CanonicalApiVersion,
@@ -74,6 +78,8 @@ export type {
 
 export {
   decodeConfigurationAck,
+  decodeChatConversationsResponse,
+  decodeChatMessagesResponse,
   decodeConfigurationEnvelope,
   decodeConfigurationView,
   decodeDashboardResponse,

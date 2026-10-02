@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ChatView } from "../chat/chat-view";
 import { JobInspector } from "../execution/job-inspector";
@@ -121,9 +121,20 @@ export function RuntimeWorkspace({
     setActiveProject,
     registerProjectSession,
     activeProjectSessionIds,
+    historyStatus,
+    historyError,
+    retryHistory,
   } = useProject();
   const router = useRouter();
-  const [activeSessionId, setActiveSessionId] = useState("design-pwa-shell");
+  const searchParams = useSearchParams();
+  const [activeSessionId, setActiveSessionId] = useState(() => searchParams.get("session") ?? "");
+  const selectedSessions = useRef<Record<string, string>>({});
+  const rememberSession = useCallback((id: string) => {
+    selectedSessions.current[activeProjectId] = id;
+    const url = new URL(window.location.href);
+    url.searchParams.set("session", id);
+    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+  }, [activeProjectId]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [inspectorMode, setInspectorMode] = useState<InspectorMode>("collapsed");
@@ -161,6 +172,9 @@ export function RuntimeWorkspace({
   const activeSession = snapshot.sessions.find((session) => session.id === activeSessionId) ?? snapshot.sessions[0];
   const activeSessionKey = activeSession?.id;
   const activeWorkType = activeSession?.workType;
+  useEffect(() => {
+    if (runtimeAuthority === "canonical" && historyStatus === "ready" && activeSessionKey) rememberSession(activeSessionKey);
+  }, [activeSessionKey, historyStatus, rememberSession, runtimeAuthority]);
   const isLedger = view === "ledger";
   const isControlCenter = view === "control-center";
   const isJobExecution = view === "job-execution";
@@ -200,24 +214,29 @@ export function RuntimeWorkspace({
   );
 
   const withProject = useCallback(
-    (path: string, projectId: ProjectId = activeProjectId) => projectId ? withProjectParam(path, projectId) : path,
-    [activeProjectId],
+    (path: string, projectId: ProjectId = activeProjectId) => {
+      const scoped = projectId ? withProjectParam(path, projectId) : path;
+      return activeSessionKey ? `${scoped}${scoped.includes("?") ? "&" : "?"}session=${encodeURIComponent(activeSessionKey)}` : scoped;
+    },
+    [activeProjectId, activeSessionKey],
   );
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
-    const session = await createSession({ workType: activeWorkType });
+    const session = await createSession({ workType: activeWorkType, projectId: activeProjectId });
     // Register before selecting so the new chat stays in the current project.
     registerProjectSession(session.id);
     setActiveSessionId(session.id);
+    rememberSession(session.id);
     setMobileNavOpen(false);
-  }, [activeWorkType, createSession, registerProjectSession]);
+  }, [activeProjectId, activeWorkType, createSession, registerProjectSession, rememberSession]);
 
   const handleNewProjectChat = useCallback(async () => {
-    const session = await createSession({ workType: "coding" });
+    const session = await createSession({ workType: "coding", projectId: activeProjectId });
     registerProjectSession(session.id, activeProjectId);
     setActiveSessionId(session.id);
-  }, [activeProjectId, createSession, registerProjectSession]);
+    rememberSession(session.id);
+  }, [activeProjectId, createSession, registerProjectSession, rememberSession]);
 
   /**
    * The one navigation path for every workspace control in the shell. Where a
@@ -238,7 +257,8 @@ export function RuntimeWorkspace({
   const selectSession = useCallback((id: string) => {
     setActiveSessionId(id);
     navigate("chat");
-  }, [navigate]);
+    rememberSession(id);
+  }, [navigate, rememberSession]);
 
   // --- Job draft lifecycle (single pure reducer, scoped per Project) ----
 
@@ -445,14 +465,16 @@ export function RuntimeWorkspace({
     // Reset the active session to one the target project owns so a stale
     // selection cannot survive the switch.
     const nextSessionId = resolveSelectedSessionId(
-      null,
-      selectProjectSessions(runtimeSnapshot.sessions, id),
+      selectedSessions.current[id],
+      selectProjectSessions(runtimeSnapshot.sessions, id, runtimeSnapshot.sessions.filter((session) => session.projectId === id).map((session) => session.id)),
     );
     setActiveSessionId(nextSessionId ?? "");
     setActiveProject(id);
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
       url.searchParams.set("project", id);
+      if (nextSessionId) url.searchParams.set("session", nextSessionId);
+      else url.searchParams.delete("session");
       window.history.replaceState(null, "", `${url.pathname}${url.search}`);
     }
   }, [activeSessionKey, cancel, runtimeSnapshot.sessions, setActiveProject]);
@@ -630,6 +652,15 @@ export function RuntimeWorkspace({
                 Add a Project
               </button>
             </div>
+          </main>
+        ) : historyStatus !== "ready" ? (
+          <main aria-label="Chat history" className="flex min-h-0 flex-1 items-center justify-center p-6">
+            {historyStatus === "loading" ? <p>Loading chat history…</p> : (
+              <div role="alert" className="space-y-3 text-center">
+                <p>Chat history could not be loaded: {historyError}</p>
+                <button type="button" onClick={retryHistory} className="rounded-md border px-3 py-2">Retry</button>
+              </div>
+            )}
           </main>
         ) : !activeSession ? (
           <EmptyProjectWorkspace

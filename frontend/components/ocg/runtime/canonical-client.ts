@@ -19,6 +19,10 @@ import type { ProjectId } from "../project/domain";
 import type { CanonicalBackendEvent } from "./canonical-store";
 import {
   ContractError,
+  decodeChatConversationsResponse,
+  decodeChatMessagesResponse,
+  type ChatConversationsResponse,
+  type ChatMessagesResponse,
   decodeConfigurationAck,
   decodeConfigurationEnvelope,
   decodeDashboardResponse,
@@ -88,6 +92,8 @@ function isCanonicalRejection<T>(value: CanonicalResult<T>): value is CanonicalR
 export { isCanonicalRejection };
 
 export interface CanonicalControlClient {
+  readChatConversations(projectId: string): Promise<CanonicalResult<ChatConversationsResponse>>;
+  readChatMessages(projectId: string, sessionId: string): Promise<CanonicalResult<ChatMessagesResponse>>;
   listProjects(): Promise<ProjectRecord[]>;
   importProject(commandId: string, root: string): Promise<CanonicalResult<CanonicalProjectAck>>;
   readConfiguration(projectId: string): Promise<CanonicalResult<ProjectConfigurationView>>;
@@ -137,7 +143,7 @@ export interface CanonicalControlClient {
    */
   sendChatMessage(request: JobLaunchRequest): Promise<CanonicalResult<CanonicalJobLaunchAck>>;
   /** Revoke one active chat turn. Returns whether a turn was stopped. */
-  cancelChatMessage(sessionId: string): Promise<CanonicalResult<{ sessionId: string; cancelled: boolean }>>;
+  cancelChatMessage(sessionId: string, projectId?: string): Promise<CanonicalResult<{ sessionId: string; cancelled: boolean }>>;
   /** SSE tail for one chat turn. Consumed with `EventSource`, not `fetch`. */
   chatStreamUrl(sessionId: string, jobId: string): string;
 }
@@ -231,6 +237,18 @@ export function createHttpCanonicalControlClient(
   }
 
   return {
+    async readChatConversations(projectId) {
+      const { status, value, text } = await send("GET",
+        `/api/v1/canonical/chat/conversations?project_id=${encodeURIComponent(projectId)}`, undefined);
+      if (status !== 200) return rejection("conversations", status, text);
+      return decodeChatConversationsResponse(value);
+    },
+    async readChatMessages(projectId, sessionId) {
+      const { status, value, text } = await send("GET",
+        `/api/v1/canonical/chat/messages?project_id=${encodeURIComponent(projectId)}&session_id=${encodeURIComponent(sessionId)}`, undefined);
+      if (status !== 200) return rejection("messages", status, text);
+      return decodeChatMessagesResponse(value);
+    },
     async listProjects() {
       const { value } = await send("GET", "/api/v1/canonical/projects", undefined);
       return decodeProjectsResponse(value).projects;
@@ -389,11 +407,11 @@ export function createHttpCanonicalControlClient(
       }
     },
 
-    async cancelChatMessage(sessionId) {
+    async cancelChatMessage(sessionId, projectId) {
       const { status, value, text } = await send(
         "POST",
         "/api/v1/canonical/chat/cancel",
-        { session_id: sessionId },
+        { session_id: sessionId, ...(projectId ? { project_id: projectId } : {}) },
       );
       if (status !== 200) return rejection(sessionId, status, text);
       try {

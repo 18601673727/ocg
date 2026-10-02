@@ -149,6 +149,21 @@ export type CatalogModel = { id: string, label: string, metadata: ModelMetadata,
 export type ChangeSetFingerprintInputV1 = { schema_version: number, project_scope: ProjectScope, targets: Array<JsonValue>, preconditions: Array<JsonValue>, operations: Array<JsonValue>, };
 
 
+export type ChatConversationView = { conversation_id: string, session_id: string, title: string | null, created_at: string, updated_at: string, };
+
+
+export type ChatConversationsResponse = { api_version: CanonicalApiVersion, project_id: string, conversations: Array<ChatConversationView>, };
+
+
+export type ChatMessageRole = "user" | "assistant";
+
+
+export type ChatMessageView = { message_id: string, command_id: string, role: ChatMessageRole, state: MessageLifecycle, content: string, created_at: string, updated_at: string, attempt_state: string, replay_job_id: string | null, };
+
+
+export type ChatMessagesResponse = { api_version: CanonicalApiVersion, project_id: string, conversation: ChatConversationView, messages: Array<ChatMessageView>, };
+
+
 export type ChildCancellationPolicy = "cascade" | "soft_cascade" | "independent";
 
 

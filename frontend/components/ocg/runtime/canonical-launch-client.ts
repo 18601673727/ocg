@@ -43,7 +43,7 @@
  */
 
 import type { ProjectId } from "../project/domain";
-import type { JobLaunchRequest } from "../contracts";
+import type { ChatMessagesResponse, JobLaunchRequest } from "../contracts";
 import type {
   JobLaunchCommand,
   JobLaunchResult,
@@ -79,6 +79,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   private chatCounter = 0;
   private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string }>();
   private readonly sessionProjects = new Map<string, string>();
+  private readonly projectHydrations = new Map<string, Promise<void>>();
   private availabilityProbed = false;
   private reportedStatus: RuntimeStatus | null = null;
 
@@ -87,7 +88,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     control: CanonicalControlClient,
     profile: ReturnType<typeof createProfileClient>,
   ) {
-    super(scenario);
+    super(scenario, true);
     this.control = control;
     this.profile = profile;
   }
@@ -138,7 +139,8 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   }
 
   async launchJob(command: JobLaunchCommand): Promise<JobLaunchResult> {
-    const response = await this.control.launchJob(toLaunchRequest(command));
+    const session = this.store.getSnapshot().sessions.find((item) => item.id === command.sessionId);
+    const response = await this.control.launchJob(toLaunchRequest({ ...command, sessionId: session?.sessionId ?? command.sessionId }));
     if (isCanonicalRejection(response)) {
       const result = failedLaunch(command, response.message);
       this.emitLaunchResult(command, result);
@@ -165,15 +167,90 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   }
 
   override async createSession(input: CreateSessionInput): Promise<ChatSession> {
-    const id = `chat-${Date.now().toString(36)}-${this.chatCounter++}`;
+    if (!input.projectId) throw new Error("New Chat requires a Project.");
+    const sessionId = `chat-${crypto.randomUUID()}`;
+    const id = chatSessionKey(input.projectId, sessionId);
     const session: ChatSession = {
       id,
+      sessionId,
+      projectId: input.projectId,
       title: input.title?.trim() || "Untitled thread",
       workType: input.workType,
       updatedAt: "now",
     };
-    this.emit({ type: "conversation.session-created", session: { ...session } });
+    this.bindSessionProject(id, input.projectId);
+    this.emit({ type: "conversation.session-created", session: { ...session } }, { projectId: input.projectId });
     return { ...session };
+  }
+
+  hydrateProject(projectId: string): Promise<void> {
+    const existing = this.projectHydrations.get(projectId);
+    if (existing) return existing;
+    const hydration = this.loadProjectHistory(projectId).catch((cause: unknown) => {
+      this.projectHydrations.delete(projectId);
+      throw cause;
+    });
+    this.projectHydrations.set(projectId, hydration);
+    return hydration;
+  }
+
+  private async loadProjectHistory(projectId: string): Promise<void> {
+    const response = await this.control.readChatConversations(projectId);
+    if (isCanonicalRejection(response)) throw new Error(response.message);
+    if (response.project_id !== projectId) throw new Error("Conversation Project mismatch.");
+    const histories: ChatMessagesResponse[] = [];
+    for (let offset = 0; offset < response.conversations.length; offset += 4) {
+      histories.push(...await Promise.all(response.conversations.slice(offset, offset + 4).map((conversation) =>
+        this.readSessionHistory(projectId, conversation.session_id))));
+    }
+    // Session creation prepends, so install oldest first to retain backend order.
+    for (const history of histories.reverse()) this.installHistory(history);
+  }
+
+  private async readSessionHistory(projectId: string, sessionId: string): Promise<ChatMessagesResponse> {
+    const response = await this.control.readChatMessages(projectId, sessionId);
+    if (isCanonicalRejection(response)) throw new Error(response.message);
+    if (response.project_id !== projectId || response.conversation.session_id !== sessionId) {
+      throw new Error("Conversation scope mismatch.");
+    }
+    return response;
+  }
+
+  private installHistory(history: ChatMessagesResponse): void {
+    const projectId = history.project_id;
+    const id = chatSessionKey(projectId, history.conversation.session_id);
+    const session: ChatSession = {
+      id, projectId, sessionId: history.conversation.session_id,
+      title: history.conversation.title || "Untitled thread",
+      workType: "coding", updatedAt: chatTimestamp(history.conversation.updated_at),
+    };
+    this.bindSessionProject(id, projectId);
+    this.emit({ type: "conversation.session-created", session }, { projectId });
+    const messages: ChatMessage[] = history.messages.filter((message) => message.state !== "deleted").map((message) => ({
+      id: message.message_id, commandId: message.command_id, role: message.role,
+      content: message.content, createdAt: chatTimestamp(message.created_at),
+      status: message.state === "complete" ? "completed" :
+        message.state === "failed" && message.attempt_state === "cancelled" ? "cancelled" :
+        message.state === "failed" ? "failed" : "pending",
+    }));
+    this.emit({ type: "conversation.history-loaded", sessionId: id, messages }, { projectId });
+    if (this.chatStreams.has(id)) return;
+    const replay = history.messages.find((message) => message.replay_job_id !== null);
+    const assistant = replay && messages.find((message) => message.id === replay.message_id);
+    if (replay?.replay_job_id && assistant) {
+      this.emit({ type: "conversation.message-started", sessionId: id, message: { ...assistant, status: "streaming" } }, { projectId });
+      this.openChatStream(id, replay.replay_job_id, assistant.id);
+    }
+  }
+
+  private async refreshSessionHistory(sessionId: string): Promise<void> {
+    const session = this.store.getSnapshot().sessions.find((item) => item.id === sessionId);
+    if (!session?.projectId || !session.sessionId) return;
+    try {
+      this.installHistory(await this.readSessionHistory(session.projectId, session.sessionId));
+    } catch (cause) {
+      this.emit({ type: "error", message: `Chat history refresh failed: ${cause instanceof Error ? cause.message : String(cause)}` });
+    }
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
@@ -187,7 +264,10 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       return;
     }
 
+    const commandId = `cmd-chat-${crypto.randomUUID()}`;
     const userMessage: ChatMessage = {
+      commandId,
+      optimistic: true,
       id: `chat-user-${Date.now().toString(36)}-${this.chatCounter++}`,
       role: "user",
       content,
@@ -199,6 +279,8 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
 
     const assistantId = `chat-assistant-${Date.now().toString(36)}-${this.chatCounter++}`;
     const assistant: ChatMessage = {
+      commandId,
+      optimistic: true,
       id: assistantId,
       role: "assistant",
       content: "",
@@ -234,12 +316,11 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       return;
     }
 
-    const commandId = `cmd-chat-${Date.now().toString(36)}-${this.chatCounter++}`;
     const request: JobLaunchRequest = {
       command_id: commandId,
       draft_id: commandId,
       project_id: projectId,
-      session_id: sessionId,
+      session_id: session.sessionId ?? sessionId,
       objective: content,
       success_criteria: null,
       constraints: null,
@@ -287,7 +368,8 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   }
 
   override async cancel(sessionId: string): Promise<void> {
-    const response = await this.control.cancelChatMessage(sessionId);
+    const session = this.store.getSnapshot().sessions.find((item) => item.id === sessionId);
+    const response = await this.control.cancelChatMessage(session?.sessionId ?? sessionId, session?.projectId);
     if (isCanonicalRejection(response)) {
       const streaming = this.streamingMessage(sessionId);
       if (streaming) {
@@ -390,7 +472,8 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   }
 
   private openChatStream(sessionId: string, jobId: string, assistantId: string): void {
-    const url = this.control.chatStreamUrl(sessionId, jobId);
+    const session = this.store.getSnapshot().sessions.find((item) => item.id === sessionId);
+    const url = this.control.chatStreamUrl(session?.sessionId ?? sessionId, jobId);
     const source = new EventSource(url);
     this.chatStreams.set(sessionId, { source, assistantId, jobId });
     source.onmessage = (event) => {
@@ -415,6 +498,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
           this.emit({ type: "conversation.message-completed", sessionId, message: { ...after, status: "completed" } });
         }
         this.closeChatStream(sessionId, false);
+        void this.refreshSessionHistory(sessionId);
         return;
       }
       if (typeof record["error"] === "string") {
@@ -427,6 +511,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
           this.emit({ type: "conversation.message-completed", sessionId, message: { ...(after ?? { id: assistantId, role: "assistant" as const, createdAt: chatClockLabel() }), content, status: "failed" } });
         }
         this.closeChatStream(sessionId, false);
+        void this.refreshSessionHistory(sessionId);
       }
     };
     source.onerror = () => {
@@ -448,6 +533,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
         });
       }
       this.closeChatStream(sessionId, false);
+      void this.refreshSessionHistory(sessionId);
     };
   }
 
@@ -528,7 +614,7 @@ function launchResultFrom(command: JobLaunchCommand, response: CanonicalJobLaunc
     commandId: response.command_id,
     draftId: response.draft_id,
     projectId: response.project_id,
-    sessionId: response.session_id,
+    sessionId: command.sessionId,
     ...(response.job_id !== null ? { jobId: response.job_id } : {}),
     message: response.message,
     duplicate: response.duplicate,
@@ -550,4 +636,13 @@ function failedLaunch(command: JobLaunchCommand, message: string): JobLaunchResu
 function chatClockLabel(): string {
   const now = new Date();
   return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+}
+
+function chatSessionKey(projectId: string, sessionId: string): string {
+  return JSON.stringify([projectId, sessionId]);
+}
+
+function chatTimestamp(timestamp: string): string {
+  const seconds = Number(timestamp);
+  return Number.isFinite(seconds) ? new Date(seconds * 1000).toLocaleString() : timestamp;
 }

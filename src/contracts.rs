@@ -163,6 +163,52 @@ pub struct JobLaunchRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ChatConversationView {
+    pub conversation_id: String,
+    pub session_id: String,
+    pub title: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ChatConversationsResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub project_id: String,
+    pub conversations: Vec<ChatConversationView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatMessageRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ChatMessageView {
+    pub message_id: String,
+    pub command_id: String,
+    pub role: ChatMessageRole,
+    pub state: MessageLifecycle,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub attempt_state: String,
+    pub replay_job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ChatMessagesResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub project_id: String,
+    pub conversation: ChatConversationView,
+    pub messages: Vec<ChatMessageView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct JobLaunchResponse {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
@@ -327,6 +373,8 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     CanonicalJobSnapshot::export_all(cfg)?;
     CanonicalJobEvent::export_all(cfg)?;
     JobLaunchRequest::export_all(cfg)?;
+    ChatConversationsResponse::export_all(cfg)?;
+    ChatMessagesResponse::export_all(cfg)?;
     JobLaunchResponse::export_all(cfg)?;
     ProfileView::export_all(cfg)?;
     ProviderProtocol::export_all(cfg)?;

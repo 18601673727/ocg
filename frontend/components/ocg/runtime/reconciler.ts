@@ -488,6 +488,24 @@ function setMessages(snapshot: RuntimeSnapshot, sessionId: string, messages: Cha
 export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: AnyRuntimeEnvelope): ApplyResult {
   const sessionId = envelope.sessionId;
   switch (envelope.type) {
+    case "conversation.history-loaded": {
+      if (!sessionExists(snapshot, sessionId)) {
+        return { snapshot, diagnostics: [diag("unknown-session", "History for unknown session.", { sessionId })] };
+      }
+      const current = snapshot.messagesBySession[sessionId] ?? [];
+      const incoming = envelope.payload.messages;
+      const matches = (left: ChatMessage, right: ChatMessage) => left.id === right.id ||
+        (left.commandId !== undefined && left.commandId === right.commandId && left.role === right.role);
+      const messages = incoming.map((message) => {
+        const live = current.find((item) => matches(item, message));
+        // A read taken during admission must not reset a live replay cursor or
+        // downgrade a terminal optimistic message while settlement catches up.
+        return live && message.status === "pending" ? live : message;
+      });
+      messages.push(...current.filter((message) => message.optimistic && message.commandId !== undefined &&
+        !incoming.some((item) => matches(item, message))));
+      return { snapshot: setMessages(snapshot, sessionId, messages), diagnostics: [] };
+    }
     case "runtime.status-changed":
       return { snapshot: { ...snapshot, status: envelope.payload.status }, diagnostics: [] };
 

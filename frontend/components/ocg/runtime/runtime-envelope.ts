@@ -46,6 +46,7 @@ export type RuntimeResumeCursor = string;
 
 /** Per-event normalized payloads for every currently meaningful event. */
 export type RuntimeEnvelopePayloads = {
+  "conversation.history-loaded": { messages: ChatMessage[] };
   "job.execution-updated": { execution: import("../execution/domain").JobExecution; accounting: import("../execution/accounting").JobAccounting | null };
   "job.launch-updated": { result: import("./runtime-types").JobLaunchResult };
   "runtime.status-changed": { status: RuntimeStatus };
@@ -76,6 +77,7 @@ export type RuntimeEnvelopePayloads = {
 export type RuntimeEventType = keyof RuntimeEnvelopePayloads;
 
 export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
+  "conversation.history-loaded",
   "job.execution-updated",
   "job.launch-updated",
   "runtime.status-changed",
@@ -232,6 +234,8 @@ export function envelopeFromRuntimeEvent(
   };
 
   switch (event.type) {
+    case "conversation.history-loaded":
+      return { ...base, type: event.type, payload: { messages: event.messages } };
     case "runtime.status-changed":
       return { ...base, type: event.type, payload: { status: event.status } };
     case "conversation.session-created":
@@ -352,6 +356,8 @@ export class RuntimeEnvelopeFactory {
 export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
   const sessionId = envelope.sessionId ?? "";
   switch (envelope.type) {
+    case "conversation.history-loaded":
+      return { type: envelope.type, sessionId, messages: envelope.payload.messages };
     case "job.execution-updated":
       return { type: envelope.type, sessionId, execution: envelope.payload.execution, accounting: envelope.payload.accounting };
     case "job.launch-updated":
@@ -441,6 +447,14 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       if (!isNonEmptyString(message.role)) return "message.role is required.";
       if (!isNonEmptyString(message.status)) return "message.status is required.";
       if (typeof message.content !== "string") return "message.content must be a string.";
+      return null;
+    }
+    case "conversation.history-loaded": {
+      if (!Array.isArray(payload.messages) || payload.messages.some((message) =>
+        !isRecord(message) || !isNonEmptyString(message.id) ||
+        !isNonEmptyString(message.role) || !isNonEmptyString(message.status) ||
+        typeof message.content !== "string"
+      )) return "messages must contain valid chat messages.";
       return null;
     }
     case "conversation.message-delta": {

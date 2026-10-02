@@ -5,6 +5,8 @@ export type ChatSession = {
   title: string;
   workType: WorkType;
   updatedAt: string;
+  projectId?: string;
+  sessionId?: string;
 };
 
 /**
@@ -74,6 +76,8 @@ export type CallActivity = {
 
 export type ChatMessage = {
   id: string;
+  commandId?: string;
+  optimistic?: boolean;
   role: MessageRole;
   content: string;
   createdAt: string;
@@ -110,6 +114,7 @@ export type SendMessageInput = {
 };
 
 export type OcgRuntimeEvent =
+  | { type: "conversation.history-loaded"; sessionId: string; messages: ChatMessage[] }
   | { type: "runtime.status-changed"; status: RuntimeStatus }
   | { type: "conversation.session-created"; session: ChatSession }
   | { type: "conversation.session-updated"; session: ChatSession }

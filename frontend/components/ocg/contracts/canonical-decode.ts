@@ -8,6 +8,10 @@
  */
 
 import type {
+  ChatConversationView,
+  ChatConversationsResponse,
+  ChatMessageView,
+  ChatMessagesResponse,
   CanonicalApiVersion,
   CanonicalConfigurationEnvelope,
   CanonicalConfigurationResponse,
@@ -45,6 +49,107 @@ import {
   type DecodeResult,
   type Decoder,
 } from "./decode";
+
+
+
+const chatConversationView: Decoder<ChatConversationView> = (input, path) => {
+  const rec = record(input, path, "ChatConversationView");
+  if (!rec.ok) return rec;
+  const conversation_id = req(rec.value, "conversation_id", identity, path);
+  if (!conversation_id.ok) return conversation_id;
+  const session_id = req(rec.value, "session_id", identity, path);
+  if (!session_id.ok) return session_id;
+  const title = req(rec.value, "title", nullable(string), path);
+  if (!title.ok) return title;
+  const created_at = req(rec.value, "created_at", string, path);
+  if (!created_at.ok) return created_at;
+  const updated_at = req(rec.value, "updated_at", string, path);
+  if (!updated_at.ok) return updated_at;
+  return yes({
+    conversation_id: conversation_id.value,
+    session_id: session_id.value,
+    title: title.value,
+    created_at: created_at.value,
+    updated_at: updated_at.value,
+  });
+};
+
+const chatConversationsResponse: Decoder<ChatConversationsResponse> = (input, path) => {
+  const rec = record(input, path, "ChatConversationsResponse");
+  if (!rec.ok) return rec;
+  const api_version = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
+  if (!api_version.ok) return api_version;
+  const project_id = req(rec.value, "project_id", identity, path);
+  if (!project_id.ok) return project_id;
+  const conversations = req(rec.value, "conversations", array(chatConversationView), path);
+  if (!conversations.ok) return conversations;
+  return yes({
+    api_version: api_version.value,
+    project_id: project_id.value,
+    conversations: conversations.value,
+  });
+};
+
+export function decodeChatConversationsResponse(input: unknown): ChatConversationsResponse {
+  return decode((input) => chatConversationsResponse(input, ""), input);
+}
+
+const chatMessageView: Decoder<ChatMessageView> = (input, path) => {
+  const rec = record(input, path, "ChatMessageView");
+  if (!rec.ok) return rec;
+  const message_id = req(rec.value, "message_id", identity, path);
+  if (!message_id.ok) return message_id;
+  const command_id = req(rec.value, "command_id", identity, path);
+  if (!command_id.ok) return command_id;
+  const role = req(rec.value, "role", oneOf(["user", "assistant"] as const), path);
+  if (!role.ok) return role;
+  const state = req(rec.value, "state", oneOf(["pending", "streaming", "complete", "failed", "deleted"] as const), path);
+  if (!state.ok) return state;
+  const content = req(rec.value, "content", string, path);
+  if (!content.ok) return content;
+  const created_at = req(rec.value, "created_at", string, path);
+  if (!created_at.ok) return created_at;
+  const updated_at = req(rec.value, "updated_at", string, path);
+  if (!updated_at.ok) return updated_at;
+  const attempt_state = req(rec.value, "attempt_state", string, path);
+  if (!attempt_state.ok) return attempt_state;
+  const replay_job_id = req(rec.value, "replay_job_id", nullable(identity), path);
+  if (!replay_job_id.ok) return replay_job_id;
+  return yes({
+    message_id: message_id.value,
+    command_id: command_id.value,
+    role: role.value,
+    state: state.value,
+    content: content.value,
+    created_at: created_at.value,
+    updated_at: updated_at.value,
+    attempt_state: attempt_state.value,
+    replay_job_id: replay_job_id.value,
+  });
+};
+
+const chatMessagesResponse: Decoder<ChatMessagesResponse> = (input, path) => {
+  const rec = record(input, path, "ChatMessagesResponse");
+  if (!rec.ok) return rec;
+  const api_version = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
+  if (!api_version.ok) return api_version;
+  const project_id = req(rec.value, "project_id", identity, path);
+  if (!project_id.ok) return project_id;
+  const conversation = req(rec.value, "conversation", chatConversationView, path);
+  if (!conversation.ok) return conversation;
+  const messages = req(rec.value, "messages", array(chatMessageView), path);
+  if (!messages.ok) return messages;
+  return yes({
+    api_version: api_version.value,
+    project_id: project_id.value,
+    conversation: conversation.value,
+    messages: messages.value,
+  });
+};
+
+export function decodeChatMessagesResponse(input: unknown): ChatMessagesResponse {
+  return decode((input) => chatMessagesResponse(input, ""), input);
+}
 
 const projectRecord: Decoder<ProjectRecord> = (input, path) => {
   const rec = record(input, path, "a ProjectRecord");

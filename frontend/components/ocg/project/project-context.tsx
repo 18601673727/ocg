@@ -8,7 +8,7 @@
  * is involved.
  */
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { ProjectId, ProjectSummary } from "./domain";
 import { DEFAULT_PROJECT_ID, isProjectId, resolveProjectId, selectProject } from "./domain";
@@ -53,6 +53,9 @@ export type ProjectContextValue = {
   registerProjectSession: (sessionId: string, projectId?: ProjectId) => void;
   /** Mock session IDs for the active project plus registered sessions. */
   activeProjectSessionIds: readonly string[];
+  historyStatus: "loading" | "ready" | "failed";
+  historyError: string | null;
+  retryHistory: () => void;
 };
 
 const ProjectContext = createContext<ProjectContextValue | null>(null);
@@ -73,6 +76,25 @@ export function ProjectProvider({
   const [projects, setProjects] = useState<readonly ProjectSummary[]>([]);
   const controlUrl = useOcgControlUrl();
   const runtime = useOcgRuntime();
+  const [history, setHistory] = useState<{ projectId: string; error: string | null }>({ projectId: "", error: null });
+  const historyRequest = useRef(0);
+  const loadHistory = useCallback(() => {
+    const request = ++historyRequest.current;
+    if (!activeProjectId || !runtime.client.hydrateProject) return;
+    const projectId = activeProjectId;
+    void runtime.client.hydrateProject(projectId).then(() => {
+      if (request === historyRequest.current) setHistory({ projectId, error: null });
+    }).catch((cause: unknown) => {
+      if (request === historyRequest.current) setHistory({ projectId, error: cause instanceof Error ? cause.message : String(cause) });
+    });
+  }, [activeProjectId, runtime.client]);
+  useEffect(loadHistory, [loadHistory]);
+  const retryHistory = useCallback(() => {
+    setHistory({ projectId: "", error: null });
+    loadHistory();
+  }, [loadHistory]);
+  const historyStatus = runtime.authority !== "canonical" || !activeProjectId ? "ready" :
+    history.projectId !== activeProjectId ? "loading" : history.error ? "failed" : "ready";
 
   useEffect(() => {
     if (!controlUrl) return;
@@ -126,11 +148,12 @@ export function ProjectProvider({
   const activeProjectSessionIds = useMemo(
     () => [
       ...new Set([
-        ...projectSessionIds(selectedProjectId),
+        ...(runtime.authority === "mock" ? projectSessionIds(selectedProjectId) :
+          runtime.snapshot.sessions.filter((session) => session.projectId === selectedProjectId).map((session) => session.id)),
         ...(registeredSessionIds[selectedProjectId] ?? []),
       ]),
     ],
-    [registeredSessionIds, selectedProjectId],
+    [registeredSessionIds, selectedProjectId, runtime.authority, runtime.snapshot.sessions],
   );
 
   const value = useMemo<ProjectContextValue>(
@@ -141,8 +164,11 @@ export function ProjectProvider({
       setActiveProject,
       registerProjectSession,
       activeProjectSessionIds,
+      historyStatus,
+      historyError: history.projectId === selectedProjectId ? history.error : null,
+      retryHistory,
     }),
-    [activeProjectSessionIds, projects, registerProjectSession, selectedProjectId, setActiveProject],
+    [activeProjectSessionIds, history, historyStatus, projects, registerProjectSession, retryHistory, selectedProjectId, setActiveProject],
   );
 
   return <ProjectContext.Provider value={value}>{children}</ProjectContext.Provider>;

@@ -29,6 +29,19 @@ fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
 }
 
+fn chat_conversation_view(
+    session_id: String,
+    conversation: crate::core_contract::Conversation,
+) -> crate::contracts::ChatConversationView {
+    crate::contracts::ChatConversationView {
+        conversation_id: conversation.id.as_str().to_string(),
+        session_id,
+        title: conversation.title,
+        created_at: conversation.created_at,
+        updated_at: conversation.updated_at,
+    }
+}
+
 fn endpoint_has_userinfo(endpoint: &str) -> bool {
     endpoint.split_once("://").is_some_and(|(_, rest)| {
         rest.split(['/', '?', '#']).next().unwrap_or("").contains('@')
@@ -584,6 +597,106 @@ impl CanonicalControlService {
 
     pub fn job_configuration(&self, job_id: &str) -> Result<Option<(Value, u64)>> {
         DomainRepository::open(&self.root)?.job_configuration(job_id)
+    }
+
+    fn chat_repository(&self, project_id: &str) -> Result<DomainRepository> {
+        let project = self
+            .read_projects()?
+            .into_iter()
+            .find(|project| project.project_id == project_id)
+            .ok_or_else(|| invalid("unknown Project identity"))?;
+        let root = Path::new(&project.root);
+        if !root.is_dir() {
+            return Err(invalid("registered Project root is unavailable"));
+        }
+        let repository = DomainRepository::open(root)?;
+        if repository.ensure_project(root)?.id != project_id {
+            return Err(invalid(
+                "Project identity does not own this conversation boundary",
+            ));
+        }
+        Ok(repository)
+    }
+
+    pub fn chat_conversations(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::contracts::ChatConversationsResponse> {
+        let repository = self.chat_repository(project_id)?;
+        let conversations = repository
+            .conversations(project_id)?
+            .into_iter()
+            .filter(|(_, conversation)| conversation.archived_at.is_none())
+            .map(|(session_id, conversation)| chat_conversation_view(session_id, conversation))
+            .collect();
+        Ok(crate::contracts::ChatConversationsResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            project_id: project_id.to_string(),
+            conversations,
+        })
+    }
+
+    pub fn chat_messages(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<crate::contracts::ChatMessagesResponse> {
+        use crate::contracts::{ChatMessageRole, ChatMessageView, ChatMessagesResponse};
+        use crate::core_contract::{Actor, MessageBlockKind, MessageLifecycle};
+        let repository = self.chat_repository(project_id)?;
+        let history = repository
+            .conversation_history_with_origins(project_id, session_id)?
+            .ok_or_else(|| invalid("unknown conversation in this Project"))?;
+        let messages = history
+            .messages
+            .into_iter()
+            .filter(|message| message.state != MessageLifecycle::Deleted)
+            .map(|message| {
+                let role = match message.author {
+                    Actor::User { .. } => ChatMessageRole::User,
+                    Actor::Attempt { .. } => ChatMessageRole::Assistant,
+                    _ => return Err(invalid("unsupported chat message author")),
+                };
+                let origin = history
+                    .origins
+                    .get(message.id.as_str())
+                    .ok_or_else(|| invalid("chat message has no canonical turn"))?;
+                let replay_job_id = if role == ChatMessageRole::Assistant
+                    && matches!(
+                        message.state,
+                        MessageLifecycle::Pending | MessageLifecycle::Streaming
+                    )
+                    && self.chat_buffer_for(session_id, &origin.job_id).is_some()
+                {
+                    Some(origin.job_id.clone())
+                } else {
+                    None
+                };
+                Ok(ChatMessageView {
+                    message_id: message.id.as_str().to_string(),
+                    command_id: origin.command_id.clone(),
+                    role,
+                    state: message.state,
+                    content: message
+                        .blocks
+                        .into_iter()
+                        .filter(|block| block.kind == MessageBlockKind::Markdown)
+                        .filter_map(|block| block.content)
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                    created_at: message.created_at,
+                    updated_at: message.updated_at,
+                    attempt_state: origin.attempt_state.clone(),
+                    replay_job_id,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ChatMessagesResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            project_id: project_id.to_string(),
+            conversation: chat_conversation_view(session_id.to_string(), history.conversation),
+            messages,
+        })
     }
 
     /// The canonical snapshot of one Job, taken at the real journal cursor.

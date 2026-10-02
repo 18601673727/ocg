@@ -1169,6 +1169,12 @@ fn handle_canonical(
                     .map_err(|error| OcgError::config(error.to_string()))?;
                 answer!(service.launch_chat(request, now)?)
             }
+            Route::ChatConversations => {
+                answer!(service.chat_conversations(&query("project_id")?)?)
+            }
+            Route::ChatMessages => {
+                answer!(service.chat_messages(&query("project_id")?, &query("session_id")?)?)
+            }
             Route::ChatCancel => {
                 let body = body()?;
                 let session_id = body
@@ -1216,6 +1222,8 @@ fn handle_canonical(
             | Route::CanonicalEvents
             | Route::CanonicalDashboard
             | Route::ChatSend
+            | Route::ChatConversations
+            | Route::ChatMessages
             | Route::ChatStream
             | Route::ChatCancel
     ) {
@@ -1833,6 +1841,8 @@ enum Route {
     CanonicalEvents,
     CanonicalDashboard,
     ChatSend,
+    ChatConversations,
+    ChatMessages,
     ChatStream,
     ChatCancel,
     CanonicalPreflight,
@@ -1889,6 +1899,8 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("GET", ["api", "v1", "canonical", "dashboard"])
                 | ("POST", ["api", "v1", "canonical", "chat", "send"])
                 | ("GET", ["api", "v1", "canonical", "chat", "stream"])
+                | ("GET", ["api", "v1", "canonical", "chat", "conversations"])
+                | ("GET", ["api", "v1", "canonical", "chat", "messages"])
                 | ("POST", ["api", "v1", "canonical", "chat", "cancel"])
                 // A browser preflight is answered by the canonical CORS
                 // handler, which is the only place that echoes an origin.
@@ -1904,6 +1916,8 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "send"])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "stream"])
+                | ("OPTIONS", ["api", "v1", "canonical", "chat", "conversations"])
+                | ("OPTIONS", ["api", "v1", "canonical", "chat", "messages"])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "cancel"])
         );
         if !is_route {
@@ -1958,6 +1972,10 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         ("GET", ["api", "v1", "canonical", "dashboard"]) => Ok(Route::CanonicalDashboard),
         ("POST", ["api", "v1", "canonical", "chat", "send"]) => Ok(Route::ChatSend),
         ("GET", ["api", "v1", "canonical", "chat", "stream"]) => Ok(Route::ChatStream),
+        ("GET", ["api", "v1", "canonical", "chat", "conversations"]) => {
+            Ok(Route::ChatConversations)
+        }
+        ("GET", ["api", "v1", "canonical", "chat", "messages"]) => Ok(Route::ChatMessages),
         ("POST", ["api", "v1", "canonical", "chat", "cancel"]) => Ok(Route::ChatCancel),
         ("OPTIONS", ["api", "v1", "canonical", ..]) => Ok(Route::CanonicalPreflight),
         ("GET", _) if !crate::ui_assets::is_control_path(&request.path) => Ok(Route::Product {
@@ -2035,6 +2053,8 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         | ["api", "v1", "canonical", "jobs", "events"]
         | ["api", "v1", "canonical", "dashboard"]
         | ["api", "v1", "canonical", "chat", "stream"]
+        | ["api", "v1", "canonical", "chat", "conversations"]
+        | ["api", "v1", "canonical", "chat", "messages"]
         | ["api", "v1", "canonical", "projects"] => Some("GET"),
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
         ["api", "v1", "canonical", "jobs", "launch"]

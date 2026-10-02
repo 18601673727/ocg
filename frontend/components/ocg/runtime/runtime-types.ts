@@ -107,6 +107,7 @@ export type RuntimeSnapshot = {
 
 export type CreateSessionInput = {
   title?: string;
+  projectId?: string;
   workType: ChatSession["workType"];
 };
 
@@ -128,6 +129,7 @@ export interface OcgRuntimeClient {
   cancel?(sessionId: string): Promise<void>;
   /** Bind a session to its owning Project so a later send launches into that Project. */
   bindSessionProject?(sessionId: string, projectId: string): void;
+  hydrateProject?(projectId: string): Promise<void>;
   /** Frontend-only Job launch boundary. Validates against the mock snapshot and projects canonical execution into the per-session maps. */
   launchJob?(command: JobLaunchCommand): Promise<JobLaunchResult>;
   requestAccessHandoff?(): Promise<void>;

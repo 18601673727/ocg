@@ -58,10 +58,19 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   private readonly envelopes: RuntimeEnvelopeFactory;
   private liveScenarioStarted = false;
 
-  constructor(scenario: ScenarioId) {
+  constructor(scenario: ScenarioId, canonicalChat = false) {
     this.scenario = scenario;
     const fixture = createScenarioFixture(scenario);
     const seed = createSnapshotEnvelopeFromFixture(fixture, { streamId: `stream:${scenario}`, generation: 1 });
+    if (canonicalChat) {
+      this.liveScenarioStarted = true;
+      seed.snapshot = {
+        ...seed.snapshot,
+        status: { state: "connecting", detail: "Loading OCG runtime status" },
+        sessions: [], messagesBySession: {}, observabilityBySession: {},
+        executionBySession: {}, accountingBySession: {},
+      };
+    }
     this.store = new RuntimeStore(createUninitializedRuntimeState(scenario));
     this.store.installSnapshot(seed);
     this.envelopes = new RuntimeEnvelopeFactory(seed.streamId, seed.generation, {

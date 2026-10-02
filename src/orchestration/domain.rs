@@ -552,6 +552,18 @@ pub struct DomainRepository {
     path: PathBuf,
 }
 
+pub struct ChatMessageOrigin {
+    pub command_id: String,
+    pub job_id: String,
+    pub attempt_state: String,
+}
+
+pub struct ChatHistory {
+    pub conversation: Conversation,
+    pub messages: Vec<Message>,
+    pub origins: std::collections::HashMap<String, ChatMessageOrigin>,
+}
+
 impl DomainRepository {
     pub fn open(root: &Path) -> Result<Self> {
         crate::install::ensure_gitignore(root)?;
@@ -616,11 +628,41 @@ impl DomainRepository {
         &self.path
     }
 
+    pub fn conversations(&self, project_id: &str) -> Result<Vec<(String, Conversation)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT session_id,record FROM domain_conversations WHERE project_id=?1
+             ORDER BY CAST(json_extract(record,'$.updated_at') AS INTEGER) DESC,id DESC",
+            )
+            .map_err(sql)?;
+        let rows = statement
+            .query_map([project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql)?;
+        rows.map(|row| {
+            let (session_id, record) = row.map_err(sql)?;
+            Ok((session_id, decode_chat_record(&record)?))
+        })
+        .collect()
+    }
+
     pub fn conversation_history(
         &self,
         project_id: &str,
         session_id: &str,
     ) -> Result<Option<(Conversation, Vec<Message>)>> {
+        Ok(self
+            .conversation_history_with_origins(project_id, session_id)?
+            .map(|history| (history.conversation, history.messages)))
+    }
+
+    pub fn conversation_history_with_origins(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Option<ChatHistory>> {
         let transaction = self.connection.unchecked_transaction().map_err(sql)?;
         let record: Option<String> = transaction
             .query_row(
@@ -635,8 +677,35 @@ impl DomainRepository {
         };
         let conversation: Conversation = decode_chat_record(&record)?;
         let messages = read_conversation_messages(&transaction, conversation.id.as_str())?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT m.id,t.command_id,t.job_id,a.state FROM domain_messages m
+             JOIN domain_chat_turns t ON t.attempt_id=m.attempt_id
+             JOIN domain_conversations c ON c.id=t.conversation_id
+             JOIN domain_attempts a ON a.id=t.attempt_id
+             WHERE c.project_id=?1 AND c.session_id=?2",
+            )
+            .map_err(sql)?;
+        let rows = statement
+            .query_map(params![project_id, session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ChatMessageOrigin {
+                        command_id: row.get(1)?,
+                        job_id: row.get(2)?,
+                        attempt_state: row.get(3)?,
+                    },
+                ))
+            })
+            .map_err(sql)?;
+        let origins = rows.map(|row| row.map_err(sql)).collect::<Result<_>>()?;
+        drop(statement);
         transaction.commit().map_err(sql)?;
-        Ok(Some((conversation, messages)))
+        Ok(Some(ChatHistory {
+            conversation,
+            messages,
+            origins,
+        }))
     }
 
     pub fn prepare_chat_turn(
