@@ -246,7 +246,23 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       hard_budget_micros: 0,
       resource_commitment: null,
     };
-    const response = await this.control.sendChatMessage(request);
+    let response;
+    try {
+      response = await this.control.sendChatMessage(request);
+    } catch (cause) {
+      const current = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
+      if (!current || current.status !== "streaming") return;
+      this.emit({
+        type: "conversation.message-completed",
+        sessionId,
+        message: {
+          ...current,
+          content: `Chat failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+          status: "failed",
+        },
+      });
+      return;
+    }
     if (isCanonicalRejection(response)) {
       this.emit({
         type: "conversation.message-completed",

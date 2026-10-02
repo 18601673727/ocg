@@ -125,7 +125,7 @@ export function RuntimeWorkspace({
   const [activeSessionId, setActiveSessionId] = useState("design-pwa-shell");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [inspectorMode, setInspectorMode] = useState<InspectorMode>("docked");
+  const [inspectorMode, setInspectorMode] = useState<InspectorMode>("collapsed");
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   // Job drafts are held keyed by Project + session scope so one Project's
   // in-progress launch can never appear in another.

@@ -185,12 +185,13 @@ export function createHttpCanonicalControlClient(
   options: HttpCanonicalControlClientOptions,
 ): CanonicalControlClient {
   const base = options.baseUrl.replace(/\/$/, "");
+  const fetch = options.fetch.bind(globalThis);
   async function send(
     method: string,
     path: string,
     body: unknown,
   ): Promise<{ status: number; value: unknown; text: string }> {
-    const response = await options.fetch(`${base}${path}`, {
+    const response = await fetch(`${base}${path}`, {
       method,
       ...(body === undefined
         ? {}
