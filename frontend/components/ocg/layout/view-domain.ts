@@ -1,9 +1,9 @@
 /**
  * Pure Workspace view resolution for the root route.
  *
- * An explicit `view` search param wins so shell navigation can preserve the
- * active runtime scenario (and therefore the in-memory mock instance). When no
- * explicit view is present, the existing scenario-derived default is used.
+ * An explicit `view` search param wins, which is how shell navigation moves
+ * between surfaces without renaming the scenario behind it. When no explicit
+ * view is present, the scenario-derived default is used.
  */
 
 import type { ScenarioId } from "../runtime/runtime-types";
@@ -76,19 +76,21 @@ export type WorkspaceTarget = {
 /**
  * Where each workspace lives.
  *
- * Home, attention and the job execution surface share the root route and are
- * chosen by `scenario`, which keeps one in-memory runtime instance alive across
- * the switch. The ledger, settings and OCG control surfaces have their own
+ * Every root-route view is opened with `?view=` rather than `?scenario=`, so
+ * navigating inside the workspace keeps the active scenario — and therefore the
+ * one in-memory runtime instance and its authority — untouched. Naming a
+ * scenario selects a fixture, so it is left to whoever opened the URL to do it
+ * deliberately. The ledger, settings and OCG control surfaces have their own
  * route.
  */
 const WORKSPACE_TARGETS: Record<WorkspaceView, WorkspaceTarget> = {
   chat: { href: "/", toggles: false },
-  home: { href: "/?scenario=home-overview", toggles: false },
-  attention: { href: "/?scenario=attention-overview", toggles: false },
-  "control-center": { href: "/?scenario=profiles-models", toggles: true },
+  home: { href: "/?view=home", toggles: false },
+  attention: { href: "/?view=attention", toggles: false },
+  "control-center": { href: "/?view=control-center", toggles: true },
   ledger: { href: "/resource-ledger", toggles: true },
-  "job-execution": { href: "/?scenario=job-execution", toggles: true },
-  logs: { href: "/?scenario=logs-live", toggles: true },
+  "job-execution": { href: "/?view=job-execution", toggles: true },
+  logs: { href: "/?view=logs", toggles: true },
   settings: { href: "/settings", toggles: true },
   canonical: { href: "/canonical", toggles: false },
 };

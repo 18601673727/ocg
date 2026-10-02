@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 import { MockOcgRuntimeClient } from "./mock-client";
 import { CanonicalOcgRuntimeClient } from "./canonical-launch-client";
 import { useOcgControlUrl } from "../profile/control-url";
-import type { CreateSessionInput, JobLaunchResult, OcgRuntimeClient, ScenarioId } from "./runtime-types";
+import type { CreateSessionInput, JobLaunchResult, OcgRuntimeClient, RuntimeAuthority, ScenarioId } from "./runtime-types";
 import type { JobLaunchCommand } from "../job/draft-domain";
 import type { ChatSession, SendMessageInput } from "../types";
 import type { RuntimeSnapshot } from "./runtime-types";
@@ -15,6 +15,8 @@ import type { OnboardingStageId } from "../bootstrap/types";
 
 type RuntimeContextValue = {
   client: OcgRuntimeClient;
+  /** Which runtime answers Chat. Derived from the control endpoint, not a fixture name. */
+  authority: RuntimeAuthority;
   snapshot: RuntimeSnapshot;
   /** Canonical synchronization metadata for the runtime store, when available. */
   sync: RuntimeSyncState | null;
@@ -36,16 +38,17 @@ const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 const EMPTY_DIAGNOSTICS: readonly RuntimeDiagnostic[] = [];
 
 export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioId; children: ReactNode }) {
-  // A loopback control URL means a real OCG backend is in the invocation. The
-  // shell projection stays fixture-backed, but Job launch must be real; the
-  // canonical launch client overrides only `launchJob` and projects the
-  // authoritative snapshot it returns. Without a control URL there is no
-  // backend to launch into, so the client reports that rather than fabricating.
+  // A loopback control URL means a real OCG backend is in the invocation, and
+  // that backend owns Chat as well as Job launch. Without one there is nothing
+  // to be canonical for, so the fixture runtime is what is left — it is the
+  // explicit dev/mock path, never a silent product fallback. The scenario
+  // seeds the shell projection either way; it never decides this.
   const controlUrl = useOcgControlUrl();
   const client = useMemo<OcgRuntimeClient>(() => {
     if (controlUrl) return CanonicalOcgRuntimeClient.connect(scenario, controlUrl, fetch);
     return new MockOcgRuntimeClient(scenario);
   }, [scenario, controlUrl]);
+  const authority = client.authority;
   const subscribe = useCallback(
     (onStoreChange: () => void) => client.subscribe(() => onStoreChange()),
     [client],
@@ -98,6 +101,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   const value = useMemo(
     () => ({
       client,
+      authority,
       snapshot,
       sync,
       diagnostics,
@@ -111,7 +115,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       setActiveProfile,
       launchJob,
     }),
-    [cancel, client, completeOnboarding, createSession, diagnostics, launchJob, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
+    [authority, cancel, client, completeOnboarding, createSession, diagnostics, launchJob, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
   );
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

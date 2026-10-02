@@ -19,6 +19,7 @@ export { StatusDot } from "./status-dot";
 export {
   JOB_STATE,
   LOG_LEVEL,
+  RUNTIME_AUTHORITY_LABEL,
   RUNTIME_CONNECTION,
   RUNTIME_CONNECTION_LABEL,
   SYNC_STATUS,

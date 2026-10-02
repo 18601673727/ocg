@@ -17,6 +17,7 @@ import { ONBOARDING_STAGES, type BootstrapState, type OnboardingStageId } from "
 import type {
   CreateSessionInput,
   OcgRuntimeClient,
+  RuntimeAuthority,
   RuntimeSnapshot,
   ScenarioId,
 } from "./runtime-types";
@@ -39,6 +40,14 @@ function clockLabel(): string {
 }
 
 export class MockOcgRuntimeClient implements OcgRuntimeClient {
+  /**
+   * The fixture runtime never owns Chat for a session that has a loopback
+   * control endpoint: that path is the canonical backend's. This client is
+   * reached only when the invocation has no control endpoint to be canonical
+   * for, and it answers with the seeded fixtures rather than an execution.
+   */
+  readonly authority: RuntimeAuthority = "mock";
+
   private readonly scenario: ScenarioId;
   private readonly listeners = new Set<(event: OcgRuntimeEvent) => void>();
   private readonly timers = new Map<string, Timer[]>();

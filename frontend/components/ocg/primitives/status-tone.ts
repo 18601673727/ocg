@@ -10,6 +10,7 @@
 import type { LogLevel } from "../logs/domain";
 import type { CanonicalJobState } from "../contracts";
 import type { RuntimeSyncStatus } from "../runtime/reconciler";
+import type { RuntimeAuthority } from "../runtime/runtime-types";
 import type {
   RuntimeConnectionState,
   ToolActivityStatus,
@@ -32,6 +33,15 @@ export const RUNTIME_CONNECTION_LABEL: Record<RuntimeConnectionState, string> = 
   connecting: "connecting",
   disconnected: "disconnected",
   failed: "failed",
+};
+
+/**
+ * Which runtime actually answers Chat. The surfaces say this instead of
+ * naming a fixture, so a product session can never be read as the mock.
+ */
+export const RUNTIME_AUTHORITY_LABEL: Record<RuntimeAuthority, string> = {
+  canonical: "OCG backend",
+  mock: "mock runtime",
 };
 
 export const SYNC_STATUS: Record<RuntimeSyncStatus, StatusVisual> = {

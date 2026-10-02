@@ -56,10 +56,11 @@ const MAX_CALL_SECTION_BYTES: usize = 8_000;
 /// loop holds the provider. The call runs under the authority of the provider
 /// Call being executed: it is a step in assembling that Call's context, not a
 /// separate execution, so it needs no admission of its own.
-pub type Summarize<'a> = &'a dyn Fn(&str, u64) -> Result<String>;
+pub type Summarize<'f> =
+    Box<dyn Fn(String, u64) -> crate::http::BoxFuture<'f, Result<String>> + Send + Sync + 'f>;
 
 /// What the projection is built from.
-pub struct ContextInputs<'a> {
+pub struct ContextInputs<'a, 'f> {
     /// The task the plan is ranked against.
     pub task: &'a str,
     /// The Attempt whose Calls count as outstanding work, and whose compaction
@@ -70,7 +71,7 @@ pub struct ContextInputs<'a> {
     /// The conversation as assembled so far.
     pub conversation: Vec<Value>,
     /// How to reach a model, when one is available.
-    pub summarize: Option<Summarize<'a>>,
+    pub summarize: Option<Summarize<'f>>,
 }
 
 /// One assembled provider request context.
@@ -91,7 +92,10 @@ pub struct ActiveContext {
 /// network or mutates durable state. A source that cannot be read is reported as
 /// a bounded note in the projection rather than raised: losing repository
 /// context must not abort a Call the Runtime can otherwise complete.
-pub fn assemble(project_root: &Path, inputs: ContextInputs<'_>) -> Result<ActiveContext> {
+pub async fn assemble<'a, 'f>(
+    project_root: &Path,
+    inputs: ContextInputs<'a, 'f>,
+) -> Result<ActiveContext> {
     let config = config_data(project_root);
     // One fail-soft read of the orchestration state, shared by every canonical
     // source that lives in it: the compiler baseline and the compaction points.
@@ -147,7 +151,8 @@ pub fn assemble(project_root: &Path, inputs: ContextInputs<'_>) -> Result<Active
         &state.state,
         inputs.attempt_id,
         inputs.summarize,
-    );
+    )
+    .await;
     if let Some(point) = compacted {
         persist_compaction_point(project_root, inputs.attempt_id, &point);
     }
@@ -328,14 +333,14 @@ fn call_section(
 /// it. A point is only reported when the projection it produces actually fits:
 /// recording a summary that did not resolve the overflow would leave a durable
 /// claim that the history is covered when it is still being sent.
-fn compact_conversation(
+async fn compact_conversation<'f>(
     project_root: &Path,
     conversation: &[Value],
     tools: Option<&Value>,
     config: &Result<Value>,
     state: &crate::orchestration::state::OrchestrationState,
     attempt_id: &str,
-    summarize: Option<Summarize<'_>>,
+    summarize: Option<Summarize<'f>>,
 ) -> (Vec<Value>, Option<CompactionPoint>) {
     let history = History::new(conversation.to_vec());
     let canonical = canonical_block(project_root);
@@ -384,7 +389,9 @@ fn compact_conversation(
             ..
         }) => match summarize {
             Some(summarize) => {
-                match accept_summary(&context, summarize, &request, &prompt, max_summary_tokens) {
+                match accept_summary(&context, summarize, &request, &prompt, max_summary_tokens)
+                    .await
+                {
                     Ok(accepted) => {
                         // The point only stands in for history if it actually
                         // elides some. A point that covers nothing would be a
@@ -483,14 +490,14 @@ fn outcome_kind(outcome: &Result<CompactionOutcome>) -> &'static str {
 /// compaction module requires, so a lossy summary cannot be allowed to stand in
 /// for state the model must trust. The returned point is the pending request
 /// with its summary filled in.
-fn accept_summary(
+async fn accept_summary<'f>(
     context: &Context<'_>,
-    summarize: Summarize<'_>,
+    summarize: Summarize<'f>,
     request: &CompactionPoint,
     prompt: &str,
     max_summary_tokens: u64,
 ) -> Result<CompactionPoint> {
-    let candidate = summarize(prompt, max_summary_tokens)?;
+    let candidate = summarize(prompt.to_owned(), max_summary_tokens).await?;
     context.accept(request, &candidate)
 }
 

@@ -29,10 +29,12 @@ import {
 } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus, WorkType } from "../types";
 import { WORK_TYPE_LABEL } from "../types";
+import type { RuntimeAuthority } from "../runtime/runtime-types";
 import { ProjectSwitcher } from "../project/project-switcher";
 import type { ProjectId, ProjectSummary } from "../project/domain";
 import { DEFAULT_PROJECT_ID } from "../project/domain";
 import {
+  RUNTIME_AUTHORITY_LABEL,
   RUNTIME_CONNECTION,
   RUNTIME_CONNECTION_LABEL,
   StatusDot,
@@ -67,6 +69,8 @@ type OcgSidebarProps = {
   onSelect: (id: string) => void;
   onNewChat: () => void;
   runtimeStatus: RuntimeStatus;
+  /** Which runtime answers Chat, so the footer never claims a fixture runtime. */
+  runtimeAuthority: RuntimeAuthority;
   /** Active top-level workspace, used to highlight the navigation group. */
   activeView?: WorkspaceView;
   /** Project switcher inputs. The switcher renders only when onChange is given. */
@@ -125,6 +129,7 @@ export function OcgSidebar({
   onSelect,
   onNewChat,
   runtimeStatus,
+  runtimeAuthority,
   activeView = "chat",
   projects = [],
   activeProjectId = DEFAULT_PROJECT_ID,
@@ -371,7 +376,7 @@ export function OcgSidebar({
         <div className="border-t border-border px-3 py-2.5">
           <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
              <StatusDot tone={connection.tone} pulse={connection.pulse} />
-             <span className="truncate">Runtime {RUNTIME_CONNECTION_LABEL[runtimeStatus.state]} · local mock</span>
+             <span className="truncate">Runtime {RUNTIME_CONNECTION_LABEL[runtimeStatus.state]} · {RUNTIME_AUTHORITY_LABEL[runtimeAuthority]}</span>
           </div>
           <div className="mt-2 flex items-center gap-2">
             <Avatar size="sm">

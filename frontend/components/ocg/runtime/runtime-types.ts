@@ -40,6 +40,18 @@ export type JobLaunchCommand = {
   resourceCommitment?: number;
 };
 
+/**
+ * Which runtime owns Chat execution.
+ *
+ * The authority follows the loopback control endpoint, never a fixture name: a
+ * session attached to an OCG control endpoint is answered by the canonical
+ * backend, and the fixture runtime is what is left when the invocation has no
+ * backend to be canonical for. `?scenario=` selects the shell projection a
+ * fixture seeds; it never demotes a real session to the mock. A missing backend
+ * must never be reported as if it were the mock either.
+ */
+export type RuntimeAuthority = "canonical" | "mock";
+
 export type ScenarioId =
   | "normal-chat"
   | "long-stream"
@@ -99,6 +111,8 @@ export type CreateSessionInput = {
 };
 
 export interface OcgRuntimeClient {
+  /** The runtime that answers Chat for this client. Never inferred from a scenario name. */
+  readonly authority: RuntimeAuthority;
   getRuntimeStatus(): Promise<RuntimeStatus>;
   listSessions(): Promise<ChatSession[]>;
   getSession(id: string): Promise<ChatSession | null>;

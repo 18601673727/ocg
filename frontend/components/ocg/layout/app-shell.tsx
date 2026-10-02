@@ -112,7 +112,7 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, createSession, sendMessage, setActiveProfile, cancel, launchJob, sync } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, sendMessage, setActiveProfile, cancel, launchJob, sync } = useOcgRuntime();
   const {
     activeProjectId,
     activeProject,
@@ -480,6 +480,7 @@ export function RuntimeWorkspace({
       onSelect={selectSession}
       onNewChat={handleNewChat}
       runtimeStatus={snapshot.status}
+      runtimeAuthority={runtimeAuthority}
       projects={projects}
       activeProjectId={activeProjectId}
       onProjectChange={handleProjectChange}
@@ -527,6 +528,7 @@ export function RuntimeWorkspace({
             onSelect={selectSession}
             onNewChat={handleNewChat}
             runtimeStatus={snapshot.status}
+            runtimeAuthority={runtimeAuthority}
             projects={projects}
             activeProjectId={activeProjectId}
             onProjectChange={handleProjectChange}
@@ -550,6 +552,7 @@ export function RuntimeWorkspace({
           onOpenMobileInspector={() => setMobileInspectorOpen(true)}
           onNavigate={navigate}
           runtimeStatus={snapshot.status}
+          runtimeAuthority={runtimeAuthority}
           syncStatus={sync?.status ?? null}
         />
         {isLedger ? (

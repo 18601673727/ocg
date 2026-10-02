@@ -20,6 +20,7 @@ import type { ChatSession, RuntimeStatus } from "../types";
 import { WORK_TYPE_LABEL } from "../types";
 import { isDegradedSyncStatus, type RuntimeSyncStatus } from "../runtime/reconciler";
 import {
+  RUNTIME_AUTHORITY_LABEL,
   RUNTIME_CONNECTION,
   StatusDot,
   SURFACE_TONE,
@@ -27,6 +28,7 @@ import {
   TEXT_TONE,
   syncStatusLabel,
 } from "@/components/ocg/primitives";
+import type { RuntimeAuthority } from "../runtime/runtime-types";
 import type { WorkspaceView } from "../layout/view-domain";
 
 type OcgTopbarProps = {
@@ -48,6 +50,8 @@ type OcgTopbarProps = {
   /** Current workspace, used to highlight the matching shortcut. */
   activeView?: WorkspaceView;
   runtimeStatus: RuntimeStatus;
+  /** Which runtime answers Chat, so the pill never names a fixture. */
+  runtimeAuthority: RuntimeAuthority;
   /** Canonical reconciler sync status. Only degraded states are surfaced. */
   syncStatus?: RuntimeSyncStatus | null;
 };
@@ -119,6 +123,7 @@ export function OcgTopbar({
   onNavigate,
   activeView = "chat",
   runtimeStatus,
+  runtimeAuthority,
   syncStatus,
 }: OcgTopbarProps) {
   const connection = RUNTIME_CONNECTION[runtimeStatus.state];
@@ -168,10 +173,10 @@ export function OcgTopbar({
 
       <div
         className="hidden shrink-0 items-center gap-1.5 rounded-full border border-border bg-muted/40 px-2.5 py-1 text-[11px] text-muted-foreground md:flex"
-        title={runtimeStatus.detail ?? "Local mock runtime"}
+        title={runtimeStatus.detail ?? RUNTIME_AUTHORITY_LABEL[runtimeAuthority]}
       >
         <StatusDot tone={connection.tone} pulse={connection.pulse} />
-        <span className="font-medium">local mock</span>
+        <span className="font-medium">{RUNTIME_AUTHORITY_LABEL[runtimeAuthority]}</span>
         <span aria-hidden="true">·</span>
         <span>{runtimeStatus.state}</span>
       </div>

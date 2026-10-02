@@ -13,9 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
-use crate::orchestration::execution_dispatch::ExecutionEvent;
+use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use ts_rs::TS;
 
 pub const CANONICAL_CONTROL_API_VERSION: &str = "ocg.canonical.v1";
@@ -232,7 +231,7 @@ pub struct CanonicalControlService {
 #[derive(Debug)]
 struct ChatRegistration {
     sender: flume::Sender<ExecutionEvent>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: CallCancellation,
 }
 
 /// Retained provider tail for one chat turn. Events are appended in order
@@ -260,7 +259,7 @@ struct ActiveChat {
     session_id: String,
     job_id: String,
     attempt_id: String,
-    cancelled: Arc<AtomicBool>,
+    cancelled: CallCancellation,
     sender: flume::Sender<ExecutionEvent>,
     buffer: std::sync::Arc<ChatEventBuffer>,
     /// When the turn started. The 300s execution deadline is anchored here,
@@ -1133,8 +1132,16 @@ impl CanonicalControlService {
         .map_err(|e| invalid(format!("cannot serialize job payload: {e}")))?;
 
         let job = domain.create_job(&canonical_project.id, &job_payload)?;
-        let attempt = domain.create_attempt(&job.id)?;
-        let executor = domain.create_executor(&attempt.id, "provider")?;
+        // Admission is one canonical step, not three. `dispatch_job` is the
+        // domain operation that makes a newly created Job dispatchable: inside
+        // a single immediate transaction it performs the `pending -> eligible`
+        // transition, claims the authoritative Attempt (which carries the Job
+        // to `running` with its authoritative Attempt) and publishes the
+        // provider Executor. An Attempt may only be claimed out of `eligible`,
+        // so a launch cannot create the Attempt directly off `create_job`;
+        // reusing the transition keeps this lane on the same scheduler
+        // semantics `ocg work dispatch` and admission already use.
+        let (attempt, executor) = domain.dispatch_job(&job.id, "provider")?;
 
         // Construct initial provider request
         let provider_request = serde_json::json!({
@@ -1173,7 +1180,9 @@ impl CanonicalControlService {
             runtime_handle.provider_dispatcher(),
             provider_config,
             chat.as_ref().map(|(sender, _)| sender.clone()),
-            chat.as_ref().map(|(_, cancelled)| cancelled.clone()).unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            chat.as_ref()
+                .map(|(_, cancelled)| cancelled.clone())
+                .unwrap_or_else(CallCancellation::new),
         ) {
             Ok((call, _)) => call,
             Err(e) => {
@@ -1237,26 +1246,92 @@ impl CanonicalControlService {
     ) -> Result<crate::contracts::JobLaunchResponse> {
         self.reap_expired_chats();
         let (sender, receiver) = flume::unbounded();
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = CallCancellation::new();
         if let Ok(mut registrations) = self.chat_registrations.lock() {
             registrations.insert(request.command_id.clone(), ChatRegistration {
                 sender: sender.clone(),
                 cancelled: cancelled.clone(),
             });
         }
-        let response = self.launch_job(request.clone(), now);
+        let buffer = std::sync::Arc::new(ChatEventBuffer::default());
+        // One active turn per session. Detach the previous turn so this one can
+        // take the session's single registration slot, and register before
+        // launching: `launch_job` is what enqueues the provider envelope, so
+        // from here on an envelope can exist that only this registration can
+        // cancel. Registering after the launch would leave a window in which a
+        // queued turn has no reachable token.
+        //
+        // The detached turn is only ended once this launch is accepted, so a
+        // launch that fails leaves the previous turn exactly as it was.
+        let superseded = self
+            .active_chats
+            .lock()
+            .ok()
+            .and_then(|mut active| active.remove(&request.session_id));
+        let registered = self
+            .active_chats
+            .lock()
+            .map(|mut active| {
+                active.insert(
+                    request.session_id.clone(),
+                    ActiveChat {
+                        project_id: request.project_id.clone(),
+                        session_id: request.session_id.clone(),
+                        // Published once the launch resolves them.
+                        job_id: String::new(),
+                        attempt_id: String::new(),
+                        cancelled: cancelled.clone(),
+                        sender: sender.clone(),
+                        buffer: buffer.clone(),
+                        started_at: Instant::now(),
+                    },
+                );
+            })
+            .is_ok();
+
+        let launch = self.launch_job(request.clone(), now);
         // Registration is transient: launch_job has already cloned the sender
         // into the dispatched provider envelope.
         if let Ok(mut registrations) = self.chat_registrations.lock() {
             registrations.remove(&request.command_id);
         }
-        let response = response?;
+        let response = match launch {
+            Ok(response) => response,
+            Err(error) => {
+                // This turn never became addressable work: drop its registration
+                // rather than leave one claiming the session holds a turn that
+                // does not exist, and hand the session back to the turn it had.
+                if registered {
+                    self.discard_active_turn(&request.session_id);
+                }
+                if let Some(superseded) = superseded {
+                    self.restore_active_turn(superseded);
+                }
+                return Err(error);
+            }
+        };
         if response.outcome != "accepted" {
+            if registered {
+                self.discard_active_turn(&request.session_id);
+            }
+            if let Some(superseded) = superseded {
+                self.restore_active_turn(superseded);
+            }
             return Ok(response);
+        }
+        // This turn is accepted, so the previous one in this session is
+        // superseded: revoke its authority and stop its transport.
+        if let Some(superseded) = superseded {
+            let _ = self.end_active_chat(superseded);
         }
         let job_id = match response.job_id.clone() {
             Some(id) => id,
-            None => return Ok(response),
+            None => {
+                if registered {
+                    self.discard_active_turn(&request.session_id);
+                }
+                return Ok(response);
+            }
         };
         // Resolve the Attempt that launch_job created for this Job. There is
         // exactly one Attempt right after launch.
@@ -1266,15 +1341,25 @@ impl CanonicalControlService {
             attempts.last().map(|attempt| attempt.id.clone()).unwrap_or_default()
         };
         if attempt_id.is_empty() {
+            if registered {
+                self.discard_active_turn(&request.session_id);
+            }
             return Ok(response);
         }
-        // One active turn per session. Cancel a previous turn before
-        // overwriting so its provider transport cannot keep streaming.
-        let _ = self.cancel_chat(&request.session_id);
+        // The turn was cancelled while it was still launching, so this
+        // registration is already gone. Settle the Attempt the launch did
+        // create — `cancel_chat` could not, because it had no Attempt identity
+        // then — and let the queued envelope be fenced by the worker.
+        if cancelled.is_cancelled() {
+            let mut domain = DomainRepository::open(&self.root)?;
+            if domain.request_cancel(&attempt_id).is_ok() {
+                let _ = domain.confirm_cancel(&attempt_id, true);
+            }
+            return Ok(response);
+        }
         // Retain every provider event from this point on. The forwarder
         // appends in order the moment the provider produces an event, so a
         // later EventSource attach replays the prefix instead of losing it.
-        let buffer = std::sync::Arc::new(ChatEventBuffer::default());
         {
             let forward_buffer = buffer.clone();
             std::thread::Builder::new()
@@ -1303,19 +1388,53 @@ impl CanonicalControlService {
                 })
                 .ok();
         }
-        if let Ok(mut active) = self.active_chats.lock() {
-            active.insert(request.session_id.clone(), ActiveChat {
-                project_id: request.project_id.clone(),
-                session_id: request.session_id.clone(),
-                job_id: job_id.clone(),
-                attempt_id,
-                cancelled,
-                sender,
-                buffer,
-                started_at: Instant::now(),
-            });
+        // Publish the real identity onto the registration made before the
+        // launch, so cancellation can now settle the Attempt as well as the
+        // transport.
+        let published = self
+            .active_chats
+            .lock()
+            .map(|mut active| match active.get_mut(&request.session_id) {
+                Some(entry) => {
+                    entry.job_id = job_id.clone();
+                    entry.attempt_id = attempt_id.clone();
+                    true
+                }
+                None => false,
+            })
+            .unwrap_or(false);
+        if !published {
+            // The turn was cancelled between launch and publication. Settle the
+            // Attempt it created rather than leaving it live and unreachable.
+            let mut domain = DomainRepository::open(&self.root)?;
+            if domain.request_cancel(&attempt_id).is_ok() {
+                let _ = domain.confirm_cancel(&attempt_id, true);
+            }
         }
         Ok(response)
+    }
+
+    /// Drop this session's registration without settling anything: the turn it
+    /// described never became addressable work.
+    fn discard_active_turn(&self, session_id: &str) {
+        if let Ok(mut active) = self.active_chats.lock() {
+            if let Some(entry) = active.get(session_id) {
+                if entry.job_id.is_empty() {
+                    active.remove(session_id);
+                }
+            }
+        }
+    }
+
+    /// Put a detached turn back under its session, because the launch that was
+    /// going to supersede it did not happen. A turn that has meanwhile taken the
+    /// session over owns it again and is left alone.
+    fn restore_active_turn(&self, superseded: ActiveChat) {
+        if let Ok(mut active) = self.active_chats.lock() {
+            if !active.contains_key(&superseded.session_id) {
+                active.insert(superseded.session_id.clone(), superseded);
+            }
+        }
     }
 
     /// Clone the retained tail for one SSE attach, together with the turn's
@@ -1386,13 +1505,30 @@ impl CanonicalControlService {
     /// Revoke the Attempt authority first, then stop the provider transport.
     /// A turn that already finished is a no-op returning false.
     pub fn cancel_chat(&self, session_id: &str) -> Result<bool> {
-        let active = self.active_chats.lock().ok().and_then(|mut active| active.remove(session_id));
+        let active = self
+            .active_chats
+            .lock()
+            .ok()
+            .and_then(|mut active| active.remove(session_id));
         let Some(active) = active else { return Ok(false); };
+        self.end_active_chat(active)
+    }
+
+    /// End one active turn: revoke its Attempt authority, signal its
+    /// cancellation token and stop the provider transport.
+    ///
+    /// The Attempt is settled by the canonical cancellation lifecycle, never by
+    /// the transport, so a turn that has not published its Attempt identity yet
+    /// only has its token signalled — its queued envelope is then fenced by the
+    /// worker's own cancellation gate before any side effect.
+    fn end_active_chat(&self, active: ActiveChat) -> Result<bool> {
         let mut domain = DomainRepository::open(&self.root)?;
-        // If authority is already gone (completed/failed), there is nothing
-        // to revoke; still stop the transport and report no active turn.
-        let revocable = domain.request_cancel(&active.attempt_id).is_ok();
-        active.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        // If authority is already gone (completed/failed), or the turn has not
+        // resolved its Attempt yet, there is nothing to revoke; still stop the
+        // transport so a queued or running read cannot continue.
+        let revocable = !active.attempt_id.is_empty()
+            && domain.request_cancel(&active.attempt_id).is_ok();
+        active.cancelled.cancel();
         let _ = active.sender.send(ExecutionEvent::Failed("chat cancelled".to_string()));
         if revocable {
             let _ = domain.confirm_cancel(&active.attempt_id, true);

@@ -305,7 +305,27 @@ pub fn http_failure(url: &str, response: &HttpResponse) -> OcgError {
     ))
 }
 
+/// Called once per received body chunk, in order, before the next chunk is
+/// read, so consumption is backpressured by the caller. Returning `Ok(false)`
+/// stops the read early; returning `Err` aborts the request.
+pub type ChunkSink = Box<dyn FnMut(&[u8]) -> Result<bool> + Send>;
+
+/// A boxed future, so an async operation can stay part of a `dyn`-dispatched
+/// trait without pulling in an async-trait dependency.
+///
+/// The bound is deliberately not `Send`: ntex's client and its request types are
+/// `Rc`-backed and therefore not `Send`, and every caller drives the future on
+/// the one runtime that owns its thread. The trait itself stays `Send + Sync`;
+/// only the in-flight future is thread-confined.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
 /// A minimal blocking HTTP client.
+///
+/// The blocking methods (`get`, `get_text`, `get_response`, `post_json`,
+/// `post_json_stream`) serve callers that have no runtime of their own. A caller
+/// that is already running on an ntex runtime uses
+/// [`HttpTransport::post_json_stream_in_runtime`] instead, because blocking a
+/// thread that already has a reactor is not possible.
 pub trait HttpTransport: Send + Sync {
     /// Fetch a URL and return the raw body, erroring on non-success.
     fn get(&self, url: &str) -> Result<Vec<u8>>;
@@ -358,11 +378,37 @@ pub trait HttpTransport: Send + Sync {
         url: &str,
         headers: &[(&str, &str)],
         body: &Value,
-        mut on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
+        mut on_chunk: ChunkSink,
     ) -> Result<HttpResponse> {
         let response = self.post_json(url, headers, body)?;
         on_chunk(&response.body)?;
         Ok(response)
+    }
+
+    /// Send one JSON request and deliver the response body incrementally, from a
+    /// caller that is already running on an ntex runtime.
+    ///
+    /// This is the second of the two execution contexts this transport
+    /// distinguishes. Provider execution owns a runtime for the whole Call, so
+    /// the round is awaited on the ambient execution context: no runtime is
+    /// created and nothing is blocked on. Creating a runtime here would nest a
+    /// reactor on a thread that already has one.
+    ///
+    /// The blocking methods above stay for callers that genuinely have no
+    /// runtime, such as the release and self-update surfaces.
+    fn post_json_stream_in_runtime(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        on_chunk: ChunkSink,
+    ) -> BoxFuture<'static, Result<HttpResponse>> {
+        let _ = (url, headers, body, on_chunk);
+        Box::pin(async {
+            Err(OcgError::config(
+                "HTTP transport does not support in-runtime streaming",
+            ))
+        })
     }
 }
 
@@ -638,6 +684,40 @@ fn url_host(url: &str) -> Result<String> {
     Ok(host.to_ascii_lowercase())
 }
 
+/// One fully resolved provider request. Resolving it up front is what lets the
+/// in-runtime future own everything instead of borrowing the client.
+struct PreparedStream {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    proxy: Option<String>,
+}
+
+impl NativeHttp {
+    /// Validate the URL, encode the body and resolve the route for one request.
+    fn prepare_stream(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<PreparedStream> {
+        validate_provider_url(url)?;
+        let proxy = self.proxy_endpoint_for(url)?;
+        let body = serde_json::to_vec(body)
+            .map_err(|error| OcgError::config(format!("cannot encode JSON request: {error}")))?;
+        let headers = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect::<Vec<_>>();
+        Ok(PreparedStream {
+            url: url.to_owned(),
+            headers,
+            body,
+            proxy,
+        })
+    }
+}
+
 impl HttpTransport for NativeHttp {
     fn get(&self, url: &str) -> Result<Vec<u8>> {
         let response = self.get_response(url)?;
@@ -692,23 +772,48 @@ impl HttpTransport for NativeHttp {
         url: &str,
         headers: &[(&str, &str)],
         body: &Value,
-        on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
+        on_chunk: ChunkSink,
     ) -> Result<HttpResponse> {
-        validate_provider_url(url)?;
-        let proxy = self.proxy_endpoint_for(url)?;
-        let url = url.to_owned();
-        let body = serde_json::to_vec(body)
-            .map_err(|error| OcgError::config(format!("cannot encode JSON request: {error}")))?;
-        let headers = headers
-            .iter()
-            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-            .collect::<Vec<_>>();
+        // The blocking surface stands up its own runtime, because its callers
+        // have none. It is never used from inside the provider worker.
         let runtime = ntex::rt::System::new("ocg-http", ntex::rt::DefaultRuntime);
-        runtime.block_on(async move {
-            match proxy {
-                None => native_post_json_stream(&url, &headers, &body, on_chunk).await,
+        runtime.block_on(self.post_json_stream_in_runtime(url, headers, body, on_chunk))
+    }
+
+    fn post_json_stream_in_runtime(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        on_chunk: ChunkSink,
+    ) -> BoxFuture<'static, Result<HttpResponse>> {
+        // Everything that can fail is decided here, before the future exists.
+        // The request is then fully owned, so the future borrows nothing and
+        // can run on whichever runtime its caller is already on.
+        let prepared = match self.prepare_stream(url, headers, body) {
+            Ok(prepared) => prepared,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        Box::pin(async move {
+            match prepared.proxy {
+                None => {
+                    native_post_json_stream(
+                        &prepared.url,
+                        &prepared.headers,
+                        &prepared.body,
+                        on_chunk,
+                    )
+                    .await
+                }
                 Some(endpoint) => {
-                    native_post_json_stream_via_proxy(&url, &headers, &body, &endpoint, on_chunk).await
+                    native_post_json_stream_via_proxy(
+                        &prepared.url,
+                        &prepared.headers,
+                        &prepared.body,
+                        &endpoint,
+                        on_chunk,
+                    )
+                    .await
                 }
             }
         })
@@ -807,7 +912,7 @@ async fn native_post_json_stream(
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
-    mut on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
+    mut on_chunk: ChunkSink,
 ) -> Result<HttpResponse> {
     if body.len() as u64 > MAX_BODY_BYTES {
         return Err(OcgError::config(format!(
@@ -965,7 +1070,7 @@ async fn native_post_json_stream_via_proxy(
     headers: &[(String, String)],
     body: &[u8],
     endpoint: &str,
-    mut on_chunk: Box<dyn FnMut(&[u8]) -> Result<bool> + Send>,
+    mut on_chunk: ChunkSink,
 ) -> Result<HttpResponse> {
     if body.len() as u64 > MAX_BODY_BYTES {
         return Err(OcgError::config(format!(

@@ -3055,6 +3055,30 @@ impl DomainRepository {
         generation: u64,
         failure: &str,
     ) -> Result<Call> {
+        self.fail_call_checked(call_id, attempt_id, generation, failure, false)?
+            .ok_or_else(|| invalid("Call failure rejected: Attempt authority is stale"))
+    }
+
+    pub fn fail_unclaimed_call(
+        &mut self,
+        call_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        failure: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .fail_call_checked(call_id, attempt_id, generation, failure, true)?
+            .is_some())
+    }
+
+    fn fail_call_checked(
+        &mut self,
+        call_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        failure: &str,
+        unclaimed: bool,
+    ) -> Result<Option<Call>> {
         validate_id(call_id)?;
         validate_id(attempt_id)?;
         if failure.is_empty() || failure.len() > 4096 {
@@ -3068,12 +3092,15 @@ impl DomainRepository {
             .map_err(sql)?;
         let current: bool = transaction
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM domain_calls c JOIN domain_attempts a ON a.id=c.attempt_id JOIN domain_jobs j ON j.id=a.job_id WHERE c.id=?1 AND c.attempt_id=?2 AND c.generation=?3 AND c.state IN ('created','running') AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.state IN ('queued','running'))",
-                params![call_id, attempt_id, generation_i64],
+                "SELECT EXISTS(SELECT 1 FROM domain_calls c JOIN domain_attempts a ON a.id=c.attempt_id JOIN domain_jobs j ON j.id=a.job_id WHERE c.id=?1 AND c.attempt_id=?2 AND c.generation=?3 AND c.state IN ('created','running') AND (?4=0 OR c.state='created') AND a.generation=?3 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.state IN ('queued','running'))",
+                params![call_id, attempt_id, generation_i64, unclaimed],
                 |row| row.get(0),
             )
             .map_err(sql)?;
         if !current {
+            if unclaimed {
+                return Ok(None);
+            }
             return Err(invalid("Call failure rejected: Attempt authority is stale"));
         }
         let changed = transaction
@@ -3103,7 +3130,7 @@ impl DomainRepository {
             }
         }
         transaction.commit().map_err(sql)?;
-        Ok(call)
+        Ok(Some(call))
     }
 
     /// Revoke authority before asking any Executor to stop.
@@ -3169,7 +3196,7 @@ impl DomainRepository {
     pub fn call(&self, call_id: &str) -> Result<Call> {
         self.connection
             .query_row(
-                "SELECT c.id,c.attempt_id,c.executor_id,c.generation,c.side_effect,c.state,c.request,c.response,c.created_at,c.finished_at,i.effect_kind FROM domain_calls c JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.id=?1",
+                &format!("SELECT {CALL_COLUMNS} FROM domain_calls c LEFT JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.id=?1"),
                 [call_id],
                 |row| {
                     Ok(Call {
@@ -3740,9 +3767,10 @@ fn call_from_row(row: &Row<'_>) -> rusqlite::Result<Call> {
     })
 }
 
-/// `Call` needs its `effect_kind`, which lives on the durable DispatchIntent.
+// A missing intent must not hide its Call from failure settlement or its journal.
+// Without the frozen kind, a side-effecting Call is conservatively strict-fenced.
 const CALL_COLUMNS: &str = "c.id,c.attempt_id,c.executor_id,c.generation,c.side_effect,c.state,\
-c.request,c.response,c.created_at,c.finished_at,i.effect_kind";
+c.request,c.response,c.created_at,c.finished_at,COALESCE(i.effect_kind,CASE WHEN c.side_effect=1 THEN 'strict_fenced' ELSE 'idempotent' END)";
 
 fn dispatch_intent_from_row(row: &Row<'_>) -> rusqlite::Result<DispatchIntent> {
     Ok(DispatchIntent {
@@ -3940,7 +3968,7 @@ fn read_call(connection: &Connection, call_id: &str) -> Result<Option<Call>> {
     connection
         .query_row(
             &format!(
-                "SELECT {CALL_COLUMNS} FROM domain_calls c JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.id=?1"
+                "SELECT {CALL_COLUMNS} FROM domain_calls c LEFT JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.id=?1"
             ),
             [call_id],
             call_from_row,
@@ -4681,7 +4709,7 @@ fn all_calls(connection: &Connection) -> Result<Vec<Call>> {
     query_all(
         connection,
         &format!(
-            "SELECT {CALL_COLUMNS} FROM domain_calls c JOIN domain_dispatch_intents i ON i.call_id=c.id ORDER BY c.created_at,c.id"
+            "SELECT {CALL_COLUMNS} FROM domain_calls c LEFT JOIN domain_dispatch_intents i ON i.call_id=c.id ORDER BY c.created_at,c.id"
         ),
         &[],
         call_from_row,
@@ -4692,7 +4720,7 @@ fn attempt_calls(connection: &Connection, attempt_id: &str) -> Result<Vec<Call>>
     query_all(
         connection,
         &format!(
-            "SELECT {CALL_COLUMNS} FROM domain_calls c JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.attempt_id=?1 ORDER BY c.created_at,c.id"
+            "SELECT {CALL_COLUMNS} FROM domain_calls c LEFT JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.attempt_id=?1 ORDER BY c.created_at,c.id"
         ),
         &[&attempt_id],
         call_from_row,
@@ -5050,7 +5078,15 @@ fn finish_attempt_in(
     let timestamp = now();
     if state == "cancelling" {
         let attempt_moved = transaction.execute("UPDATE domain_attempts SET authoritative=0,state='cancelling' WHERE id=?1 AND authoritative=1", [attempt_id]).map_err(sql)?;
-        let job_moved = transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state='cancelling',updated_at=?2 WHERE id=?1 AND authoritative_attempt_id=?3", params![job_id,timestamp,attempt_id]).map_err(sql)?;
+        // Cancellation is two-phase: this step revokes the Attempt's authority
+        // to act, and a later `confirm_cancel` / `mark_orphaned` settles the
+        // outcome. The Job keeps naming the Attempt that is being cancelled, so
+        // that settlement still matches this Job and can carry it to its terminal
+        // state. Revoking action authority does not need that link cleared —
+        // `authority()` and `claim_call` already exclude an Attempt that is no
+        // longer `queued`/`running` and no longer `authoritative` — and clearing
+        // it here would strand the Job in `cancelling` forever.
+        let job_moved = transaction.execute("UPDATE domain_jobs SET state='cancelling',updated_at=?2 WHERE id=?1 AND authoritative_attempt_id=?3", params![job_id,timestamp,attempt_id]).map_err(sql)?;
         // Authority is revoked here, so every record that moved must keep
         // naming the authority it is revoking; the Job would otherwise lose it.
         if attempt_moved == 1 {

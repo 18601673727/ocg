@@ -273,15 +273,18 @@ function Composer({
   draft,
   onDraftChange,
   onIntent,
+  runtimeStatus,
 }: {
   draft: string;
   onDraftChange: (v: string) => void;
   onIntent: (intent: ComposerIntent) => void;
+  runtimeStatus: RuntimeStatus;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const [highlight, setHighlight] = useState<{ raw: string; index: number } | null>(null);
   const [dismissedFor, setDismissedFor] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<{ raw: string; message: string } | null>(null);
+  const chatReady = runtimeStatus.state === "connected";
 
   useEffect(() => {
     const el = ref.current;
@@ -456,7 +459,7 @@ function Composer({
               size="icon-sm"
               disabled={!canSend}
               aria-label="Send message"
-              title="Send message"
+              title={chatReady ? "Send message" : `Chat unavailable: ${runtimeStatus.detail ?? "the runtime cannot execute chat"}`}
               className="ml-auto rounded-md"
             >
               <ArrowUp className="size-4" />
@@ -464,7 +467,9 @@ function Composer({
           </div>
         </div>
         <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
-          Replies stream from the connected runtime.
+          {chatReady
+            ? "Replies stream from the connected runtime."
+            : `Chat unavailable · ${runtimeStatus.detail ?? "the runtime cannot execute chat"}`}
         </p>
       </form>
     </div>
@@ -551,8 +556,17 @@ export function ChatView({
                   <span className="size-1.5 rounded-full bg-muted-foreground" aria-hidden="true" />
                 )}
                 <span>
-                  Runtime <span className="font-medium">{runtimeStatus.state}</span>
-                  {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
+                  {runtimeStatus.state === "connected" ? (
+                    <>
+                      Runtime <span className="font-medium">ready</span>
+                      {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
+                    </>
+                  ) : (
+                    <>
+                      Chat <span className="font-medium">unavailable</span>
+                      {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : " · configuration required"}
+                    </>
+                  )}
                 </span>
               </div>
             )}
@@ -564,6 +578,7 @@ export function ChatView({
         draft={draft}
         onDraftChange={setDraft}
         onIntent={onComposerIntent}
+        runtimeStatus={runtimeStatus}
       />
     </div>
   );

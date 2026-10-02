@@ -1,8 +1,8 @@
 //! Bounded handoff between canonical admission and execution workers.
 
 use crate::error::{OcgError, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
 
 fn invalid(message: &str) -> OcgError {
     OcgError::config(message)
@@ -22,7 +22,75 @@ pub struct ExecutionEnvelope {
     pub provider_config: Option<ProviderExecutionConfig>,
     /// Runtime shutdown and chat cancellation are separate concerns. This
     /// token belongs to this dispatched Call and is never persisted.
-    pub cancelled: Arc<AtomicBool>,
+    pub cancelled: CallCancellation,
+}
+
+/// Cancellation for one dispatched Call.
+///
+/// The flag is the authority every existing poller reads, so nothing about who
+/// may still act changes. The channel is what lets a future that is *parked* be
+/// woken: a provider socket read waiting for bytes that may never arrive cannot
+/// observe a flag, so without a wakeup, cancelling a turn would have to wait for
+/// the upstream to send another chunk. Cancelling sets the flag and posts on the
+/// channel; a waiter takes the receiving half once, so cancellation stays
+/// terminal for the Call it belongs to.
+#[derive(Clone, Debug)]
+pub struct CallCancellation {
+    inner: Arc<CancellationInner>,
+}
+
+#[derive(Debug)]
+struct CancellationInner {
+    flag: AtomicBool,
+    /// Bounded to one post. A second cancel is already covered by the flag.
+    signal: flume::Sender<()>,
+    wake: Mutex<Option<flume::Receiver<()>>>,
+}
+
+impl Default for CallCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CallCancellation {
+    pub fn new() -> Self {
+        let (signal, wake) = flume::bounded::<()>(1);
+        Self {
+            inner: Arc::new(CancellationInner {
+                flag: AtomicBool::new(false),
+                signal,
+                wake: Mutex::new(Some(wake)),
+            }),
+        }
+    }
+
+    /// Whether this Call has been cancelled. Cheap enough for the existing
+    /// per-chunk and per-round checks.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.flag.load(Ordering::SeqCst)
+    }
+
+    /// Cancel the Call and wake anything waiting on it. Idempotent: the flag is
+    /// the authority and the bounded post is best effort.
+    pub fn cancel(&self) {
+        self.inner.flag.store(true, Ordering::SeqCst);
+        let _ = self.inner.signal.try_send(());
+    }
+
+    /// Resolve once this Call is cancelled.
+    ///
+    /// This is the transport-level interrupt: racing it against a provider read
+    /// ends that read without waiting for another byte from the upstream.
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let wake = self.inner.wake.lock().ok().and_then(|mut wake| wake.take());
+        if let Some(wake) = wake {
+            let _ = wake.recv_async().await;
+        }
+    }
 }
 
 /// Frozen provider execution configuration associated with a specific Call.
@@ -108,7 +176,7 @@ pub fn admit_call_with_events(
         dispatch_id: None,
         events,
         provider_config: None,
-        cancelled: Arc::new(AtomicBool::new(false)),
+        cancelled: CallCancellation::new(),
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,
@@ -145,7 +213,7 @@ pub fn queue_call(
         dispatch_id,
         events,
         provider_config: None,
-        cancelled: Arc::new(AtomicBool::new(false)),
+        cancelled: CallCancellation::new(),
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,

@@ -1,10 +1,10 @@
 /**
- * Backend-backed Job launch adapter.
+ * Backend-backed Chat and Job launch adapter.
  *
- * The shell runtime is a fixture projection, but a Job launch is a real
- * product side effect. This client extends `MockOcgRuntimeClient` so the shell
- * keeps its single runtime store, and overrides exactly one operation:
- * `launchJob`.
+ * The shell runtime is a fixture projection, but a Chat turn and a Job launch
+ * are real product side effects. This client extends `MockOcgRuntimeClient` so
+ * the shell keeps its single runtime store, and overrides only the operations
+ * that must reach the canonical backend.
  *
  * A launch is:
  *   1. `POST /api/v1/canonical/jobs/launch`, decoded against the generated
@@ -24,8 +24,18 @@
  *   3. `POST /api/v1/canonical/chat/cancel` revoking Attempt authority before
  *      stopping the provider transport.
  *
- * Fixture scenarios stay on the mock timers. Only ready/first-run workspaces
- * use the real chat lane; normal `ocg` startup must never default to mock.
+ * Chat is never simulated from a scenario name. Being this class at all means
+ * the invocation is attached to a loopback control endpoint, so this adapter
+ * always answers Chat from the backend: the scenario only seeds the shell
+ * projection, never the runtime authority. The fixture timers in
+ * `MockOcgRuntimeClient` stay reachable only where no control endpoint exists
+ * to be canonical for.
+ *
+ * Whether chat can execute at all is the backend's answer, not a frontend
+ * guess: the same `runnable_choices` readiness authority the bootstrap route
+ * uses is read once on subscription and again per attempt, and projected as the
+ * runtime status, so a workspace without an executable provider/model reports
+ * configuration required instead of a ready-looking runtime.
  *
  * No credential, provider selection, or execution identity is decided in the
  * client: the backend freezes all of it and this adapter only reports what it
@@ -34,10 +44,16 @@
 
 import type { ProjectId } from "../project/domain";
 import type { JobLaunchRequest } from "../contracts";
-import type { JobLaunchCommand, JobLaunchResult, ScenarioId } from "./runtime-types";
-import type { ChatMessage, ChatSession, SendMessageInput } from "../types";
+import type {
+  JobLaunchCommand,
+  JobLaunchResult,
+  RuntimeAuthority,
+  ScenarioId,
+} from "./runtime-types";
+import type { ChatMessage, ChatSession, OcgRuntimeEvent, RuntimeStatus, SendMessageInput } from "../types";
 import type { CreateSessionInput } from "./runtime-types";
 import { MockOcgRuntimeClient } from "./mock-client";
+import { createProfileClient } from "../profile/profile-client";
 import {
   createHttpCanonicalControlClient,
   isCanonicalRejection,
@@ -49,17 +65,31 @@ import type { JobExecution } from "../execution/domain";
 /** Bounds the snapshot/event refetch loop when the backend keeps demanding a resync. */
 const MAX_REFRESH_ROUNDS = 4;
 
+/** Backend-computed readiness for one chat turn, plus the status that reports it. */
+type ChatAvailability = {
+  available: boolean;
+  status: RuntimeStatus;
+};
+
 export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
+  readonly authority: RuntimeAuthority = "canonical";
+
   private readonly control: CanonicalControlClient;
-  private readonly scenarioId: ScenarioId;
+  private readonly profile: ReturnType<typeof createProfileClient>;
   private chatCounter = 0;
   private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string }>();
   private readonly sessionProjects = new Map<string, string>();
+  private availabilityProbed = false;
+  private reportedStatus: RuntimeStatus | null = null;
 
-  constructor(scenario: ScenarioId, control: CanonicalControlClient) {
+  constructor(
+    scenario: ScenarioId,
+    control: CanonicalControlClient,
+    profile: ReturnType<typeof createProfileClient>,
+  ) {
     super(scenario);
     this.control = control;
-    this.scenarioId = scenario;
+    this.profile = profile;
   }
 
   /** Build the adapter for a loopback control base URL. */
@@ -67,7 +97,22 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     return new CanonicalOcgRuntimeClient(
       scenario,
       createHttpCanonicalControlClient({ baseUrl, fetch: fetchImpl }),
+      createProfileClient(baseUrl, fetchImpl),
     );
+  }
+
+  /**
+   * The runtime status the Chat surfaces render is the backend's, so the first
+   * subscription asks for readiness once rather than reporting the seeded
+   * fixture status as if it were authoritative.
+   */
+  override subscribe(listener: (event: OcgRuntimeEvent) => void): () => void {
+    const stop = super.subscribe(listener);
+    if (!this.availabilityProbed) {
+      this.availabilityProbed = true;
+      void this.syncChatAvailability();
+    }
+    return stop;
   }
 
   async launchJob(command: JobLaunchCommand): Promise<JobLaunchResult> {
@@ -98,7 +143,6 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   }
 
   override async createSession(input: CreateSessionInput): Promise<ChatSession> {
-    if (!isRealChatScenario(this.scenarioId)) return super.createSession(input);
     const id = `chat-${Date.now().toString(36)}-${this.chatCounter++}`;
     const session: ChatSession = {
       id,
@@ -111,18 +155,10 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
-    if (!isRealChatScenario(this.scenarioId)) return super.sendMessage(sessionId, input);
     const content = input.content.trim();
     if (!content) return;
 
     const snapshot = this.store.getSnapshot();
-    if (snapshot.status.state !== "connected") {
-      this.emit({
-        type: "warning",
-        message: snapshot.status.detail ?? "The local runtime is not connected.",
-      });
-      return;
-    }
     const session = snapshot.sessions.find((item) => item.id === sessionId);
     if (!session) {
       this.emit({ type: "error", message: `Unknown chat session: ${sessionId}` });
@@ -164,6 +200,23 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       return;
     }
 
+    // Backend readiness authority. Without an executable provider/model the
+    // turn is reported as unavailable instead of being answered locally, and
+    // the same verdict replaces the runtime status the Chat surfaces render.
+    const availability = await this.syncChatAvailability();
+    if (!availability.available) {
+      this.emit({
+        type: "conversation.message-completed",
+        sessionId,
+        message: {
+          ...assistant,
+          content: `Chat unavailable: ${availability.status.detail ?? "the runtime cannot execute chat."}`,
+          status: "failed",
+        },
+      });
+      return;
+    }
+
     const commandId = `cmd-chat-${Date.now().toString(36)}-${this.chatCounter++}`;
     const request: JobLaunchRequest = {
       command_id: commandId,
@@ -198,7 +251,6 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
   }
 
   override async cancel(sessionId: string): Promise<void> {
-    if (!isRealChatScenario(this.scenarioId)) return super.cancel(sessionId);
     const response = await this.control.cancelChatMessage(sessionId);
     if (isCanonicalRejection(response)) {
       const streaming = this.streamingMessage(sessionId);
@@ -222,6 +274,50 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       this.emit({ type: "cancelled", sessionId, messageId: streaming.id });
     } else {
       this.emit({ type: "cancelled", sessionId });
+    }
+  }
+
+  /**
+   * Read the one backend readiness authority and project it as the runtime
+   * status.
+   *
+   * `runnable_choices` is the backend's own answer to "can this workspace
+   * execute anything", already computed against the same selection, endpoint
+   * and credential rules canonical launch enforces. The frontend never
+   * re-derives it, so a workspace with no executable provider/model reports
+   * configuration required instead of a runtime that looks ready.
+   */
+  private async syncChatAvailability(): Promise<ChatAvailability> {
+    const availability = await this.probeChatAvailability();
+    const current = this.reportedStatus;
+    if (current === null || current.state !== availability.status.state || current.detail !== availability.status.detail) {
+      this.reportedStatus = availability.status;
+      this.emit({ type: "runtime.status-changed", status: { ...availability.status } });
+    }
+    return availability;
+  }
+
+  private async probeChatAvailability(): Promise<ChatAvailability> {
+    try {
+      const view = await this.profile.read();
+      if (view.runnable_choices.length > 0) {
+        return { available: true, status: { state: "connected", detail: "canonical provider runtime" } };
+      }
+      return {
+        available: false,
+        status: {
+          state: "disconnected",
+          detail: "no runnable provider or model: configuration required",
+        },
+      };
+    } catch (cause) {
+      return {
+        available: false,
+        status: {
+          state: "failed",
+          detail: `OCG control endpoint unreachable: ${cause instanceof Error ? cause.message : String(cause)}`,
+        },
+      };
     }
   }
 
@@ -413,11 +509,6 @@ function failedLaunch(command: JobLaunchCommand, message: string): JobLaunchResu
     message,
     duplicate: false,
   };
-}
-
-/** Real chat only for ready/first-run workspaces; fixtures keep mock timers. */
-function isRealChatScenario(scenario: ScenarioId): boolean {
-  return scenario.endsWith("-ready") || scenario.endsWith("-first-run");
 }
 
 function chatClockLabel(): string {

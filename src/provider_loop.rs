@@ -7,7 +7,7 @@
 
 use crate::call_recovery as recovery;
 use crate::error::{OcgError, Result};
-use crate::http::HttpTransport;
+use crate::http::{BoxFuture, HttpTransport};
 use crate::native_tools::{
     openai_projection::OpenAiToolProjection, PermissionPolicy,
 };
@@ -16,15 +16,19 @@ use crate::openai_compatible::{
 };
 use crate::orchestration::budget::{BudgetConfig, QuotaFacts};
 use crate::orchestration::domain::{
-    AccountingAuthority, AttemptAuthority, DispatchAccounting, DomainRepository, EffectIntentKind, Executor,
+    AccountingAuthority, AttemptAuthority, DispatchAccounting, DomainRepository, EffectIntentKind,
+    EffectIntentState, Executor,
 };
 use crate::orchestration::execution_dispatch::{
-    admit_call, BoundedDispatcher, ExecutionEnvelope,
+    admit_call, BoundedDispatcher, CallCancellation, ExecutionEnvelope,
 };
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+mod tests;
 
 pub const MAX_PROVIDER_ROUNDS: usize = 32;
 
@@ -42,7 +46,12 @@ pub struct ProviderFinalResponse {
 }
 
 pub trait OpenAiCompatibleProvider: Send + Sync {
-    fn complete(&self, request: &Value) -> Result<ProviderRound>;
+    /// Run one provider round.
+    ///
+    /// A round is awaited on the ntex runtime the provider worker already owns,
+    /// so the transport performs its I/O on that ambient execution context
+    /// rather than blocking the worker thread on a runtime of its own.
+    fn complete(&self, request: &Value) -> BoxFuture<'_, Result<ProviderRound>>;
 }
 
 /// Shared, cancellation-aware state for one streamed provider round. The
@@ -406,7 +415,7 @@ pub struct NativeOpenAiCompatibleProvider<'a> {
     endpoint: String,
     bearer: Option<String>,
     upstream_model_id: String,
-    cancelled: Arc<AtomicBool>,
+    cancelled: CallCancellation,
     events: Option<flume::Sender<crate::orchestration::execution_dispatch::ExecutionEvent>>,
 }
 
@@ -416,7 +425,7 @@ impl<'a> NativeOpenAiCompatibleProvider<'a> {
         endpoint: impl Into<String>,
         bearer: Option<String>,
         upstream_model_id: impl Into<String>,
-        cancelled: Arc<AtomicBool>,
+        cancelled: CallCancellation,
         events: Option<flume::Sender<crate::orchestration::execution_dispatch::ExecutionEvent>>,
     ) -> Self {
         Self {
@@ -464,35 +473,17 @@ impl CanonicalProviderCallHandler {
     async fn execute_validated(&self, envelope: ExecutionEnvelope) -> Result<Value> {
         let config = Arc::clone(&self.config);
         if config.cancelled.load(Ordering::SeqCst)
-            || envelope.cancelled.load(Ordering::SeqCst)
+            || envelope.cancelled.is_cancelled()
         {
-            fail_provider_envelope(
+            fail_authoritative_provider_call(
                 &config.project_root,
                 &envelope,
                 "cancelled before provider execution",
+                false,
             );
             return Err(OcgError::config("provider Call cancelled before execution"));
         }
         let mut domain = DomainRepository::open(&config.project_root)?;
-
-        // Verify economic authority before execution
-        let intent = domain.dispatch_intent(&envelope.call_id)?
-            .ok_or_else(|| {
-                fail_provider_envelope(
-                    &config.project_root,
-                    &envelope,
-                    "provider Call has no durable dispatch intent",
-                );
-                OcgError::config("provider Call has no durable dispatch intent")
-            })?;
-        if !intent.budget_admitted {
-            fail_provider_envelope(
-                &config.project_root,
-                &envelope,
-                "provider Call has no economic admission",
-            );
-            return Err(OcgError::config("provider Call lacks economic admission authority"));
-        }
 
         let authority = domain
             .authority(&envelope.attempt_id)?
@@ -500,25 +491,68 @@ impl CanonicalProviderCallHandler {
                 authority.job_id == envelope.job_id
                     && authority.generation == envelope.generation
             })
+            .ok_or_else(|| OcgError::config("provider Call has stale Attempt authority"))?;
+        let call = domain.call(&envelope.call_id)?;
+        if call.attempt_id != envelope.attempt_id || call.generation != envelope.generation {
+            return Err(OcgError::config("provider Call has stale envelope identity"));
+        }
+        // Redelivery is not a failure of the actor that already claimed this Call.
+        if matches!(call.state.as_str(), "running" | "completed") {
+            return Err(OcgError::config("provider Call has already been delivered"));
+        }
+        if call.state != "created" {
+            let message = "provider Call is not executable";
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                message,
+                false,
+            );
+            return Err(OcgError::config(message));
+        }
+        if call.executor_id != envelope.executor_id || call.request != envelope.payload {
+            let message = "provider envelope differs from durable Call";
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                message,
+                false,
+            );
+            return Err(OcgError::config(message));
+        }
+
+        // Verify economic authority before execution
+        let intent = domain
+            .dispatch_intent(&envelope.call_id)?
             .ok_or_else(|| {
-                fail_provider_envelope(
+                fail_authoritative_provider_call(
                     &config.project_root,
                     &envelope,
-                    "stale Attempt authority",
+                    "provider Call has no durable dispatch intent",
+                    false,
                 );
-                OcgError::config("provider Call has stale Attempt authority")
+                OcgError::config("provider Call has no durable dispatch intent")
             })?;
-        if let Err(error) =
-            domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)
-        {
-            fail_provider_envelope(&config.project_root, &envelope, &error.to_string());
-            return Err(error);
+        if !intent.budget_admitted {
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                "provider Call has no economic admission",
+                false,
+            );
+            return Err(OcgError::config("provider Call lacks economic admission authority"));
         }
+
         let input: Value = match serde_json::from_str(&envelope.payload) {
             Ok(input) => input,
             Err(error) => {
                 let message = format!("invalid provider Call payload: {error}");
-                fail_provider_envelope(&config.project_root, &envelope, &message);
+                fail_authoritative_provider_call(
+                    &config.project_root,
+                    &envelope,
+                    &message,
+                    false,
+                );
                 return Err(OcgError::config(message));
             }
         };
@@ -526,19 +560,44 @@ impl CanonicalProviderCallHandler {
             Some(request) => request,
             None => {
                 let message = "provider Call payload missing 'arguments'";
-                fail_provider_envelope(&config.project_root, &envelope, message);
+                fail_authoritative_provider_call(
+                    &config.project_root,
+                    &envelope,
+                    message,
+                    false,
+                );
                 return Err(OcgError::config(message));
             }
         };
-        let executor = domain.executor(envelope.executor_id.as_deref().unwrap_or(""))?
-            .ok_or_else(|| OcgError::config("provider Call executor not found"))?;
+        let executor = match domain.executor(envelope.executor_id.as_deref().unwrap_or("")) {
+            Ok(Some(executor)) => executor,
+            resolved => {
+                let error = match resolved {
+                    Err(error) => error,
+                    Ok(None) => OcgError::config("provider Call executor not found"),
+                    Ok(Some(_)) => unreachable!("resolved above"),
+                };
+                fail_authoritative_provider_call(
+                    &config.project_root,
+                    &envelope,
+                    &error.to_string(),
+                    false,
+                );
+                return Err(error);
+            }
+        };
 
         // Resolve provider configuration from envelope. This is the frozen
         // durable identity the Call was admitted with; it is revalidated, never
         // re-resolved, so recovery and re-execution use the same provider,
         // model, endpoint, and credential reference.
         let provider_config = envelope.provider_config.as_ref().ok_or_else(|| {
-            fail_provider_envelope(&config.project_root, &envelope, "provider Call missing provider_config");
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                "provider Call missing provider_config",
+                false,
+            );
             OcgError::config("provider Call missing provider_config")
         })?;
 
@@ -553,8 +612,36 @@ impl CanonicalProviderCallHandler {
             || intent.endpoint.as_deref() != Some(provider_config.endpoint.as_str())
             || intent.credential_ref != provider_config.credential_ref
         {
-            fail_provider_envelope(&config.project_root, &envelope, "provider envelope differs from frozen dispatch intent");
-            return Err(OcgError::config("provider envelope differs from frozen dispatch intent"));
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                "provider envelope differs from frozen dispatch intent",
+                false,
+            );
+            return Err(OcgError::config(
+                "provider envelope differs from frozen dispatch intent",
+            ));
+        }
+        if !matches!(intent.state.as_str(), "pending" | "queued")
+            || intent.effect_state != EffectIntentState::NotStarted
+        {
+            let message = "provider dispatch intent is not executable";
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                message,
+                false,
+            );
+            return Err(OcgError::config(message));
+        }
+        if let Err(error) = crate::orchestration::call_schema::validate_input(&input) {
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                &error.to_string(),
+                false,
+            );
+            return Err(error);
         }
 
         // The wire model id is the frozen upstream model id, not the Profile
@@ -568,22 +655,47 @@ impl CanonicalProviderCallHandler {
         // immediately before the side effect. `None` means no Authorization
         // header; `Some(ref)` missing from the Vault fails closed. The raw
         // token is held only in `bearer` and never persisted or logged.
-        let vault = crate::vault::Vault::user_global()?;
-        let bearer = match &provider_config.credential_ref {
-            Some(credential_ref) => Some(vault.get(credential_ref)?.ok_or_else(|| {
-                fail_provider_envelope(&config.project_root, &envelope, "credential not found in Vault");
-                OcgError::config("provider credential not found in the user-global Vault")
-            })?),
-            None => None,
+        let bearer = match (|| -> Result<Option<String>> {
+            let vault = crate::vault::Vault::user_global()?;
+            match &provider_config.credential_ref {
+                Some(credential_ref) => vault.get(credential_ref)?.map(Some).ok_or_else(|| {
+                    OcgError::config("provider credential not found in the user-global Vault")
+                }),
+                None => Ok(None),
+            }
+        })() {
+            Ok(bearer) => bearer,
+            Err(error) => {
+                fail_authoritative_provider_call(
+                    &config.project_root,
+                    &envelope,
+                    &error.to_string(),
+                    false,
+                );
+                return Err(error);
+            }
         };
 
+        if let Err(error) =
+            domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)
+        {
+            // Re-read authority and Call state, not the ambiguous claim error:
+            // replacement, cancellation and an existing claimant are all no-ops.
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                &error.to_string(),
+                false,
+            );
+            return Err(error);
+        }
         drop(domain);
         let provider = NativeOpenAiCompatibleProvider::new(
             config.transport.as_ref(),
             provider_config.endpoint.clone(),
             bearer,
             provider_config.upstream_model_id.clone(),
-            Arc::clone(&envelope.cancelled),
+            envelope.cancelled.clone(),
             Some(envelope.events.clone()),
         );
         let response = match execute_provider_loop(
@@ -596,12 +708,29 @@ impl CanonicalProviderCallHandler {
             config.permission_policy,
             &config.cancelled,
             &config.native_tool_dispatcher,
-        ) {
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
-                // A failed or cancelled provider round is a terminal Call
-                // failure, never a completion.
-                fail_provider_envelope(&config.project_root, &envelope, &error.to_string());
+                // Cancellation is not a provider failure. The cancellation
+                // lifecycle already terminalized this Attempt and its Job, so
+                // settling it again here as a failure would overwrite `cancelled`
+                // with `failed`. The error is still returned so the worker logs
+                // the reason and moves on to the next bounded envelope.
+                if envelope.cancelled.is_cancelled() {
+                    return Err(error);
+                }
+                // A failed provider round is a terminal Call failure, never a
+                // completion. This worker still holds the Attempt authority it
+                // validated above, so the failure settles the whole execution
+                // rather than only the Call.
+                fail_authoritative_provider_call(
+                    &config.project_root,
+                    &envelope,
+                    &error.to_string(),
+                    true,
+                );
                 return Err(error);
             }
         };
@@ -618,10 +747,26 @@ impl CanonicalProviderCallHandler {
             envelope.generation,
             &serialized,
         )?;
+        // This provider round was this Attempt's last outstanding Call: the loop
+        // above returned a final answer, and every native tool Call it admitted
+        // was completed before it did. `finish_attempt` is the existing
+        // settlement authority for that fact, and it decides on its own terms
+        // whether the Attempt may close — it refuses unless every Call of this
+        // Attempt reached `completed`, fences anything still outstanding, moves
+        // the Attempt's Executors to the same terminal state, revokes the
+        // Attempt's authority, and carries the Job to the same terminal state in
+        // one transaction. Nothing here re-derives that rule.
+        domain.finish_attempt(&authority.attempt_id, true)?;
         let _ = envelope.events.send(
             crate::orchestration::execution_dispatch::ExecutionEvent::Finished,
         );
-        Ok(json!({"content": response.content, "reasoning": response.reasoning, "rounds": response.rounds}))
+        Ok(json!({
+            "result": {
+                "content": response.content,
+                "reasoning": response.reasoning,
+                "rounds": response.rounds
+            }
+        }))
     }
 }
 
@@ -652,7 +797,7 @@ pub fn admit_provider_call(
         dispatcher,
         provider_config,
         None,
-        Arc::new(AtomicBool::new(false)),
+        CallCancellation::new(),
     )
     .map(|(call, _)| call)
 }
@@ -670,8 +815,8 @@ pub fn admit_provider_call_with_events(
     dispatcher: &BoundedDispatcher,
     provider_config: crate::orchestration::execution_dispatch::ProviderExecutionConfig,
     event_sender: Option<flume::Sender<crate::orchestration::execution_dispatch::ExecutionEvent>>,
-    cancelled: Arc<AtomicBool>,
-) -> Result<(crate::orchestration::domain::Call, Arc<AtomicBool>)> {
+    cancelled: CallCancellation,
+) -> Result<(crate::orchestration::domain::Call, CallCancellation)> {
     let payload = json!({
         "executor_transport": "provider",
         "arguments": request
@@ -809,7 +954,7 @@ pub fn requeue_recovered_provider_call(
         dispatch_id: None,
         events,
         provider_config,
-        cancelled: Arc::new(AtomicBool::new(false)),
+        cancelled: CallCancellation::new(),
     })?;
 
     Ok(())
@@ -915,15 +1060,16 @@ pub fn run_provider_worker(dispatcher: &BoundedDispatcher, handler: &CanonicalPr
     }
 }
 
-/// Execute one provider envelope synchronously by creating a runtime per request.
-/// This matches the pattern used in http.rs for native HTTP transport.
+/// Execute one provider envelope on the runtime that owns this worker thread.
+///
+/// This is the only runtime boundary on the provider path. The `System` is
+/// entered once per Call and everything inside it — the provider round, its
+/// HTTP/streaming I/O, and any summarizing round — is awaited on that runtime.
+/// Nothing inside may stand up another runtime or block on one.
 fn execute_provider_envelope_sync(handler: &CanonicalProviderCallHandler, envelope: ExecutionEnvelope) -> Result<()> {
     let handler = handler.clone();
     let runtime = ntex::rt::System::new("ocg-provider", ntex::rt::DefaultRuntime);
     runtime.block_on(async move {
-        let input: serde_json::Value = serde_json::from_str(&envelope.payload)
-            .map_err(|error| OcgError::config(format!("invalid Call input JSON: {error}")))?;
-        crate::orchestration::call_schema::validate_input(&input)?;
         let output = handler.execute_validated(envelope).await?;
         crate::orchestration::call_schema::validate_output(&output)?;
         Ok(())
@@ -952,7 +1098,7 @@ fn execute_native_tool_envelope_sync(handler: &crate::native_tools::NativeToolCa
     Ok(())
 }
 
-fn execute_provider_loop(
+async fn execute_provider_loop(
     provider: &dyn OpenAiCompatibleProvider,
     project_root: &Path,
     envelope: &ExecutionEnvelope,
@@ -960,7 +1106,8 @@ fn execute_provider_loop(
     executor: &Executor,
     request: &mut Value,
     _permission_policy: PermissionPolicy,
-    cancelled: &AtomicBool,
+    // Runtime shutdown flag, distinct from this Call's cancellation token.
+    shutdown: &AtomicBool,
     native_tool_dispatcher: &BoundedDispatcher,
 ) -> Result<ProviderFinalResponse> {
     let projection = OpenAiToolProjection::from_registry()?;
@@ -980,11 +1127,18 @@ fn execute_provider_loop(
     // projection and the compacted conversation together form the request this
     // provider Call carries. Every later round appends to that same request
     // rather than re-deciding what context it has.
-    apply_active_context(request, project_root, &authority.attempt_id, provider, &model)?;
+    apply_active_context(
+        request,
+        project_root,
+        &authority.attempt_id,
+        provider,
+        &model,
+    )
+    .await?;
 
     for round in 0..MAX_PROVIDER_ROUNDS {
-        if cancelled.load(Ordering::SeqCst)
-            || envelope.cancelled.load(Ordering::SeqCst)
+        if shutdown.load(Ordering::SeqCst)
+            || envelope.cancelled.is_cancelled()
         {
             return Err(OcgError::config("provider loop cancelled"));
         }
@@ -994,7 +1148,7 @@ fn execute_provider_loop(
             }
         }
 
-        let round_response = provider.complete(request)?;
+        let round_response = provider.complete(request).await?;
 
         if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
             || round_response.summary.tool_calls.is_empty()
@@ -1300,11 +1454,11 @@ fn wire_name_of(canonical_name: &str) -> String {
 /// authority of the provider Call being executed: it is one step in assembling
 /// that Call's context, so it is not a separate execution and gets no admission
 /// of its own.
-fn apply_active_context(
+async fn apply_active_context<'p>(
     request: &mut Value,
     project_root: &Path,
     attempt_id: &str,
-    provider: &dyn OpenAiCompatibleProvider,
+    provider: &'p dyn OpenAiCompatibleProvider,
     model: &str,
 ) -> Result<()> {
     let conversation = request
@@ -1313,14 +1467,17 @@ fn apply_active_context(
         .cloned()
         .unwrap_or_default();
     let task = objective_of(&conversation);
-    let summarize = |prompt: &str, max_tokens: u64| -> Result<String> {
+    let model = model.to_owned();
+    // The summarizing call is awaited on the same runtime as the round itself,
+    // so it reuses that execution context instead of blocking for a new one.
+    let summarize = move |prompt: String, max_tokens: u64| -> BoxFuture<'p, Result<String>> {
         let summary_request = json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "stream": false,
         });
-        Ok(provider.complete(&summary_request)?.summary.text)
+        Box::pin(async move { Ok(provider.complete(&summary_request).await?.summary.text) })
     };
     let assembled = match crate::provider_context::assemble(
         project_root,
@@ -1329,9 +1486,11 @@ fn apply_active_context(
             attempt_id,
             tools: request.get("tools"),
             conversation: conversation.clone(),
-            summarize: Some(&summarize),
+            summarize: Some(Box::new(summarize)),
         },
-    ) {
+    )
+    .await
+    {
         Ok(assembled) => assembled,
         Err(error) => {
             tracing::warn!(%error, "active context projection failed; sending the conversation as assembled");
@@ -1423,11 +1582,14 @@ fn wait_for_call_completion(project_root: &Path, call_id: &str) -> Result<String
 }
 
 impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
-    fn complete(&self, request: &Value) -> Result<ProviderRound> {
+    fn complete(&self, request: &Value) -> BoxFuture<'_, Result<ProviderRound>> {
         // The frozen upstream model id is authoritative on the wire.
         let mut body = request.clone();
         if let Some(object) = body.as_object_mut() {
-            object.insert("model".to_string(), Value::String(self.upstream_model_id.clone()));
+            object.insert(
+                "model".to_string(),
+                Value::String(self.upstream_model_id.clone()),
+            );
         }
         // Default to streaming so the success path is incremental.
         let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(true);
@@ -1435,24 +1597,34 @@ impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
             body["stream"] = Value::Bool(true);
         }
 
-        let accept = if streaming { "text/event-stream" } else { "application/json" };
-        let mut headers = vec![("Content-Type", "application/json"), ("Accept", accept)];
+        let accept = if streaming {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
         // The Vault stores the raw token; the header value is built only here.
-        let authorization = self.bearer.as_ref().map(|token| format!("Bearer {token}"));
+        let authorization = self
+            .bearer
+            .as_ref()
+            .map(|token| format!("Bearer {token}"));
+        let mut headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Accept".to_string(), accept.to_string()),
+        ];
         if let Some(value) = &authorization {
-            headers.push(("Authorization", value.as_str()));
+            headers.push(("Authorization".to_string(), value.clone()));
         }
 
         // Shared state for the chunk callback. The callback runs inside the
         // transport's async read, so it owns a handle to this state.
         let state = Arc::new(Mutex::new(StreamedRoundState::new()));
         let callback_state = Arc::clone(&state);
-        let cancelled = Arc::clone(&self.cancelled);
+        let cancelled = self.cancelled.clone();
         let events = self.events.clone();
         let on_chunk = Box::new(move |chunk: &[u8]| -> Result<bool> {
             // Cancellation is checked during consumption; stop reading and let
             // the caller close the Call as failed/cancelled, never completed.
-            if cancelled.load(Ordering::SeqCst) {
+            if cancelled.is_cancelled() {
                 return Ok(false);
             }
             let mut guard = callback_state
@@ -1467,50 +1639,169 @@ impl OpenAiCompatibleProvider for NativeOpenAiCompatibleProvider<'_> {
             Ok(keep_reading)
         });
 
-        let response = self
-            .transport
-            .post_json_stream(&self.endpoint, &headers, &body, on_chunk)?;
+        // The round owns everything it needs, so the future borrows only `self`
+        // and runs on the runtime the provider worker already owns. The chunk
+        // callback is unchanged: the transport still delivers each chunk as it
+        // arrives, so this stays an incremental stream rather than a buffered
+        // body handed to the parser at the end.
+        Box::pin(async move {
+            let header_refs = headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            // The read is raced against this Call's cancellation token, so a
+            // turn can be ended even when the upstream has gone silent and no
+            // further byte will ever arrive. The chunk callback already stops
+            // at the next chunk; this ends the read when there is no next chunk.
+            // Losing the race drops the read future, which drops the response
+            // and closes the connection, so the worker returns and the next
+            // bounded envelope can start.
+            let response = match ntex::util::select(
+                self.transport
+                    .post_json_stream_in_runtime(&self.endpoint, &header_refs, &body, on_chunk),
+                self.cancelled.cancelled(),
+            )
+            .await
+            {
+                ntex::util::Either::Left(response) => response?,
+                ntex::util::Either::Right(()) => {
+                    // Cancellation owns terminalization; this is not a provider
+                    // failure and must not be reported as one.
+                    return Err(OcgError::config("provider Call cancelled during streaming"));
+                }
+            };
 
-        if !response.is_success() {
-            // Bounded, redacted diagnostic. The provider's error body is small
-            // and any occurrence of the bearer token is removed before the
-            // message leaves this function.
-            let body_limit = response.body.len().min(crate::http::MAX_PROVIDER_ERROR_BODY);
-            let mut excerpt = String::from_utf8_lossy(&response.body[..body_limit]).into_owned();
-            if let Some(token) = &self.bearer {
-                excerpt = excerpt.replace(token, "<redacted>");
+            if !response.is_success() {
+                // Bounded, redacted diagnostic. The provider's error body is small
+                // and any occurrence of the bearer token is removed before the
+                // message leaves this function.
+                let body_limit = response.body.len().min(crate::http::MAX_PROVIDER_ERROR_BODY);
+                let mut excerpt = String::from_utf8_lossy(&response.body[..body_limit]).into_owned();
+                if let Some(token) = &self.bearer {
+                    excerpt = excerpt.replace(token, "<redacted>");
+                }
+                return Err(OcgError::config(format!(
+                    "OpenAI-compatible provider returned HTTP {}: {}",
+                    response.status, excerpt
+                )));
             }
-            return Err(OcgError::config(format!(
-                "OpenAI-compatible provider returned HTTP {}: {}",
-                response.status, excerpt
-            )));
-        }
 
-        // If cancellation interrupted the stream, this round is not a
-        // completion.
-        if self.cancelled.load(Ordering::SeqCst) {
-            return Err(OcgError::config("provider Call cancelled during streaming"));
-        }
+            // If cancellation interrupted the stream, this round is not a
+            // completion.
+            if self.cancelled.is_cancelled() {
+                return Err(OcgError::config("provider Call cancelled during streaming"));
+            }
 
-        let mut state = state
-            .lock()
-            .map_err(|_| OcgError::config("provider stream state poisoned"))?;
-        state.finish()
+            let mut state = state
+                .lock()
+                .map_err(|_| OcgError::config("provider stream state poisoned"))?;
+            state.finish()
+        })
     }
 }
 
-fn fail_provider_envelope(project_root: &Path, envelope: &ExecutionEnvelope, reason: &str) {
-    let _ = (|| -> Result<()> {
-        let mut domain = DomainRepository::open(project_root)?;
+fn fail_provider_envelope(
+    domain: &mut DomainRepository,
+    envelope: &ExecutionEnvelope,
+    reason: &str,
+    call_claimed: bool,
+) -> Result<bool> {
+    if call_claimed {
         domain.fail_call(
             &envelope.call_id,
             &envelope.attempt_id,
             envelope.generation,
             reason,
         )?;
-        Ok(())
-    })();
-    let _ = envelope.events.send(
-        crate::orchestration::execution_dispatch::ExecutionEvent::Failed(reason.to_string()),
-    );
+    } else if !domain.fail_unclaimed_call(
+        &envelope.call_id,
+        &envelope.attempt_id,
+        envelope.generation,
+        reason,
+    )? {
+        return Ok(false);
+    }
+    if let Err(error) = envelope
+        .events
+        .send(crate::orchestration::execution_dispatch::ExecutionEvent::Failed(reason.to_string()))
+    {
+        tracing::debug!(error = %error, "provider failure receiver closed");
+    }
+    Ok(true)
+}
+
+/// Settle a provider execution that genuinely failed while this worker still
+/// held its Attempt authority.
+///
+/// It first settles the Call and its DispatchIntent exactly as
+/// [`fail_provider_envelope`] does, then closes the Attempt with the domain's
+/// existing failure settlement authority, which fences anything still
+/// outstanding, moves the Attempt's Executors to `failed`, revokes the
+/// Attempt's authority and carries the Job to `failed` in one transaction.
+///
+/// The authority is re-read immediately before settling, on the same terms the
+/// success path validates: the Attempt must still be authoritative, its Job must
+/// still point at it, and this envelope must still be that generation's work. A
+/// stale or replaced envelope is a durable no-op. Before a claim, an existing
+/// claimant is also left alone; only this worker's claimed Call may be failed
+/// while running. A signalled but still-current queued Call uses cancellation,
+/// not failure settlement.
+fn fail_authoritative_provider_call(
+    project_root: &Path,
+    envelope: &ExecutionEnvelope,
+    reason: &str,
+    call_claimed: bool,
+) {
+    if let Err(error) = (|| -> Result<()> {
+        let mut domain = DomainRepository::open(project_root)?;
+        let held = domain
+            .authority(&envelope.attempt_id)?
+            .filter(|authority| {
+                authority.job_id == envelope.job_id && authority.generation == envelope.generation
+            })
+            .is_some();
+        if !held {
+            return Ok(());
+        }
+        let call = domain.call(&envelope.call_id)?;
+        if call.attempt_id != envelope.attempt_id || call.generation != envelope.generation {
+            return Ok(());
+        }
+        // Before this worker claims the Call, running/completed means another
+        // actor owns it. A terminal unsuccessful Call has no actor left to settle
+        // its still-authoritative Attempt; it must not be mistaken for a claimant.
+        if !call_claimed && matches!(call.state.as_str(), "running" | "completed") {
+            return Ok(());
+        }
+        if envelope.cancelled.is_cancelled() {
+            domain.request_cancel(&envelope.attempt_id)?;
+            return domain.confirm_cancel(&envelope.attempt_id, true);
+        }
+        if matches!(call.state.as_str(), "created" | "running") {
+            if !fail_provider_envelope(&mut domain, envelope, reason, call_claimed)? {
+                // A concurrent claimant owns running/completed, but a concurrent
+                // Call failure may still have left this Attempt without an owner.
+                let current = domain.call(&envelope.call_id)?;
+                if current.attempt_id != envelope.attempt_id
+                    || current.generation != envelope.generation
+                    || !matches!(current.state.as_str(), "failed" | "unknown")
+                    || domain
+                        .authority(&envelope.attempt_id)?
+                        .is_none_or(|authority| {
+                            authority.job_id != envelope.job_id
+                                || authority.generation != envelope.generation
+                        })
+                {
+                    return Ok(());
+                }
+            }
+        } else if let Err(error) = envelope.events.send(
+            crate::orchestration::execution_dispatch::ExecutionEvent::Failed(reason.to_string()),
+        ) {
+            tracing::debug!(error = %error, "provider failure receiver closed");
+        }
+        domain.finish_attempt(&envelope.attempt_id, false)
+    })() {
+        tracing::error!(error = %error, call_id = %envelope.call_id, "provider Attempt failure could not be settled");
+    }
 }

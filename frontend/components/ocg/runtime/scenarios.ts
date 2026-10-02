@@ -17,7 +17,15 @@ import { createResourceLedgerFixture } from "../resource-ledger/fixtures";
 import type { BootstrapState } from "../bootstrap/types";
 import type { ResourceLedger } from "../resource-ledger/types";
 
-export const DEFAULT_SCENARIO: ScenarioId = "normal-chat";
+/**
+ * What a route opens when the URL does not name a scenario.
+ *
+ * `local-ready` is the workspace the loopback control endpoint serves for an
+ * operational backend, so an unattributed URL binds Chat to the canonical
+ * runtime instead of silently landing on a fixture. Mock scenarios stay
+ * reachable, but only by naming one explicitly with `?scenario=`.
+ */
+export const DEFAULT_SCENARIO: ScenarioId = "local-ready";
 export const SCENARIO_IDS: readonly ScenarioId[] = [
   "normal-chat",
   "long-stream",
