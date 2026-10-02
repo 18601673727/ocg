@@ -29,7 +29,7 @@ const PROJECT_FIXTURES: Record<ProjectId, ProjectFixture> = {
   },
   "route-lace": {
     id: "route-lace",
-    sessionIds: ["research-space-bunny", "research-rust-graph"],
+    sessionIds: ["research-example-model", "research-rust-graph"],
     ledgerJobIds: ["job-deploy"],
   },
   ocg: {

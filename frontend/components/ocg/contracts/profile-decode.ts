@@ -36,10 +36,6 @@ export const modelMetadata: Decoder<ModelMetadata> = (input, path) => {
   if (!variant.ok) return variant;
   const variants = req(rec.value, "variants", nullable(array(string)), path);
   if (!variants.ok) return variants;
-  const label = opt(rec.value, "label", string, path);
-  if (!label.ok) return label;
-  const metadata = opt(rec.value, "metadata", modelMetadata, path);
-  if (!metadata.ok) return metadata;
   const effort = req(rec.value, "effort", nullable(string), path);
   if (!effort.ok) return effort;
   const efforts = req(rec.value, "efforts", nullable(array(string)), path);
@@ -61,8 +57,6 @@ export const modelMetadata: Decoder<ModelMetadata> = (input, path) => {
   return yes({
     variant: variant.value,
     variants: variants.value,
-    label: label.value,
-    metadata: metadata.value,
     effort: effort.value,
     efforts: efforts.value,
     reasoning: reasoning.value,
@@ -133,11 +127,17 @@ const model: Decoder<Model> = (input, path) => {
   if (!variant.ok) return variant;
   const variants = opt(rec.value, "variants", array(string), path);
   if (!variants.ok) return variants;
+  const label = opt(rec.value, "label", string, path);
+  if (!label.ok) return label;
+  const metadata = opt(rec.value, "metadata", modelMetadata, path);
+  if (!metadata.ok) return metadata;
   return yes({
     provider: owner.value,
     id: id.value,
     variant: variant.value,
     variants: variants.value,
+    label: label.value,
+    metadata: metadata.value,
   });
 };
 

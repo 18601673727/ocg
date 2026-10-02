@@ -78,7 +78,7 @@ const baseSession: ChatSession = {
 
 const sessions: ChatSession[] = [
   baseSession,
-  { id: "research-space-bunny", title: "Space Bunny architecture study", workType: "research", updatedAt: "2h ago" },
+  { id: "research-example-model", title: "Example model architecture study", workType: "research", updatedAt: "2h ago" },
   { id: "research-rust-graph", title: "Rust graph storage options", workType: "research", updatedAt: "1d ago" },
   { id: "coding-mission-runtime", title: "OCG durable job runtime", workType: "coding", updatedAt: "12m ago" },
   { id: "coding-tool-gateway", title: "Tool Call Gateway", workType: "coding", updatedAt: "3h ago" },
@@ -256,19 +256,19 @@ function createLiveObservability(jobId: string): RuntimeObservability {
         tokenUsage: { input: usage(2400), output: usage(900), total: usage(3300, "estimated") },
         costMicros: usage(22000, "estimated"), latencyMs: 820, ttftMs: 140, tokensPerSecond: 34,
       }),
-      runtimeWorker("explore", "Explore", "Fallback Provider", "Space Bunny Free", {
+      runtimeWorker("explore", "Explore", "Fallback Provider", "fallback-example-model", {
         status: "active", variant: "standard", elapsedMs: 14000, invocationCount: 1,
         tokenUsage: { input: usage(1900), output: usage(500), total: usage(2400, "estimated") },
         costMicros: usage(12000, "estimated"), latencyMs: 610, ttftMs: 110, tokensPerSecond: 36,
       }),
-      runtimeWorker("explore-deep", "Explore Deep", "Fallback Provider", "Space Bunny Free", {
+      runtimeWorker("explore-deep", "Explore Deep", "Fallback Provider", "fallback-example-model", {
         status: "active", variant: "deep", elapsedMs: 9000, invocationCount: 1,
         tokenUsage: { input: usage(1300), output: usage(400), total: usage(1700, "estimated") },
         costMicros: usage(9000, "estimated"), latencyMs: 730, tokensPerSecond: 31,
       }),
       runtimeWorker("build", "Build", "Provider", "DeepSeek V4.1 Flash", { status: "queued" }),
       runtimeWorker("verify", "Verify", "Catalog Provider", "example-model-free", { status: "waiting" }),
-      runtimeWorker("debug", "Debug", "Fallback Provider", "Space Bunny Free", { status: "queued" }),
+      runtimeWorker("debug", "Debug", "Fallback Provider", "fallback-example-model", { status: "queued" }),
       runtimeWorker("docs", "Docs", "Provider", "example-model", { status: "queued" }),
     ],
     timeline: timeline(
@@ -279,8 +279,8 @@ function createLiveObservability(jobId: string): RuntimeObservability {
     ),
     activities: [
       activity("live-lead-started", 0, "worker-started", "Lead started coordinating the Job", { workerId: "lead", label: "Lead-Mid", role: "lead", provider: "Provider", model: "example-model", status: "active" }),
-      activity("live-explore-started", 4000, "worker-started", "Explore started runtime mapping", { workerId: "explore", label: "Explore", role: "worker", provider: "Fallback Provider", model: "Space Bunny Free", status: "active" }),
-      activity("live-deep-started", 9000, "worker-started", "Explore Deep started architecture review", { workerId: "explore-deep", label: "Explore Deep", role: "worker", provider: "Fallback Provider", model: "Space Bunny Free", status: "active" }),
+      activity("live-explore-started", 4000, "worker-started", "Explore started runtime mapping", { workerId: "explore", label: "Explore", role: "worker", provider: "Fallback Provider", model: "fallback-example-model", status: "active" }),
+      activity("live-deep-started", 9000, "worker-started", "Explore Deep started architecture review", { workerId: "explore-deep", label: "Explore Deep", role: "worker", provider: "Fallback Provider", model: "fallback-example-model", status: "active" }),
       activity("live-usage-estimated", 18000, "invocation-started", "Streaming usage is estimated"),
     ],
   };
