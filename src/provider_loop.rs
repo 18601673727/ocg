@@ -742,6 +742,19 @@ impl CanonicalProviderCallHandler {
             envelope.cancelled.clone(),
             Some(envelope.events.clone()),
         );
+        let task = input
+            .get("context_task")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                objective_of(
+                    request
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )
+            });
         let response = match execute_provider_loop(
             provider.as_ref(),
             &config.project_root,
@@ -754,6 +767,7 @@ impl CanonicalProviderCallHandler {
                 permission_policy: config.permission_policy,
                 shutdown: &config.cancelled,
                 native_tool_dispatcher: &config.native_tool_dispatcher,
+                task: &task,
             },
         )
         .await
@@ -866,6 +880,25 @@ pub fn admit_provider_call_with_events(
         provider_config,
         protocol,
     } = admission;
+    let job = domain
+        .job(&authority.job_id)?
+        .ok_or_else(|| OcgError::config("provider Call Job no longer exists"))?;
+    let context_task = serde_json::from_str::<Value>(&job.spec)
+        .ok()
+        .and_then(|spec| {
+            spec.get("objective")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            objective_of(
+                request
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )
+        });
     let payload = json!({
         "executor_transport": "provider",
         // The protocol travels in the durable Call payload. It is a property of
@@ -874,6 +907,7 @@ pub fn admit_provider_call_with_events(
         // provider Call replays the protocol it was admitted under instead of
         // re-deriving one from configuration that may since have changed.
         "provider_protocol": protocol.as_str(),
+        "context_task": context_task,
         "arguments": request
     });
 
@@ -897,9 +931,6 @@ pub fn admit_provider_call_with_events(
     )?;
 
     // Resolve canonical Project identity from Job ownership
-    let job = domain
-        .job(&authority.job_id)?
-        .ok_or_else(|| OcgError::config("provider Call Job no longer exists"))?;
     let project_id = &job.project_id;
 
     // Execute true economic admission through canonical DomainRepository API
@@ -923,6 +954,7 @@ pub fn admit_provider_call_with_events(
 
     // Economic admission succeeded; now queue
     domain.mark_dispatch_queued(&call.id)?;
+    domain.accept_chat_turn(&authority.attempt_id)?;
     let (default_events, _receiver) = flume::unbounded();
     if let Err(error) = dispatcher.send(ExecutionEnvelope {
         call_id: call.id.clone(),
@@ -999,6 +1031,7 @@ pub fn requeue_recovered_provider_call(
     // read back by the handler from that same payload, so a recovered dispatch
     // replays the protocol it was admitted under rather than one the Profile
     // happens to declare now.
+    domain.accept_chat_turn(&authority.attempt_id)?;
     let (events, _receiver) = flume::unbounded();
     dispatcher.send(ExecutionEnvelope {
         call_id: intent.call_id.clone(),
@@ -1177,6 +1210,7 @@ struct ProviderAdmission<'a> {
     permission_policy: PermissionPolicy,
     shutdown: &'a AtomicBool,
     native_tool_dispatcher: &'a BoundedDispatcher,
+    task: &'a str,
 }
 
 async fn execute_provider_loop(
@@ -1193,6 +1227,7 @@ async fn execute_provider_loop(
         permission_policy: _permission_policy,
         shutdown,
         native_tool_dispatcher,
+        task,
     } = admission;
     let protocol = binding.protocol;
     let projection = protocol
@@ -1237,6 +1272,7 @@ async fn execute_provider_loop(
         &authority.attempt_id,
         provider,
         &model,
+        task,
     )
     .await?;
 
@@ -1252,6 +1288,9 @@ async fn execute_provider_loop(
 
         let round_response = provider.complete(request).await?;
 
+        if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
+            return Err(OcgError::config("provider exceeded token limit"));
+        }
         if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
             || round_response.summary.tool_calls.is_empty()
         {
@@ -1260,9 +1299,6 @@ async fn execute_provider_loop(
                 reasoning: round_response.summary.reasoning,
                 rounds: round + 1,
             });
-        }
-        if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
-            return Err(OcgError::config("provider exceeded token limit"));
         }
         request
             .get_mut("messages")
@@ -1575,13 +1611,13 @@ async fn apply_active_context<'p>(
     attempt_id: &str,
     provider: &'p dyn ProviderClient,
     model: &str,
+    task: &str,
 ) -> Result<()> {
     let conversation = request
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let task = objective_of(&conversation);
     let model = model.to_owned();
     // The summarizing call is awaited on the same runtime as the round itself,
     // so it reuses that execution context instead of blocking for a new one.
@@ -1597,7 +1633,7 @@ async fn apply_active_context<'p>(
     let assembled = match crate::provider_context::assemble(
         project_root,
         crate::provider_context::ContextInputs {
-            task: &task,
+            task,
             attempt_id,
             tools: request.get("tools"),
             conversation: conversation.clone(),
@@ -1630,12 +1666,11 @@ async fn apply_active_context<'p>(
 
 /// The task text a context plan is ranked against.
 ///
-/// The objective is the opening user message, which is where
-/// `canonical_control` puts it. Only that message is read: the rest of the
-/// conversation is work in progress, not a description of the task.
+/// Compatibility fallback for Calls admitted without a frozen task.
 fn objective_of(conversation: &[Value]) -> String {
     conversation
         .iter()
+        .rev()
         .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)

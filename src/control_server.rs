@@ -1176,12 +1176,17 @@ fn handle_canonical(
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| OcgError::config("session_id is required"))?;
-                let cancelled = service.cancel_chat(session_id)?;
-                answer!(crate::orchestration::canonical_control::ChatCancelResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    session_id: session_id.to_string(),
-                    cancelled,
-                })
+                let cancelled = service.cancel_chat_in_project(
+                    body.get("project_id").and_then(Value::as_str),
+                    session_id,
+                )?;
+                answer!(
+                    crate::orchestration::canonical_control::ChatCancelResponse {
+                        api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                        session_id: session_id.to_string(),
+                        cancelled,
+                    }
+                )
             }
             Route::CanonicalSnapshot => {
                 let project = query("project_id")?;

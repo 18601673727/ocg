@@ -1,5 +1,9 @@
 //! SQLite-backed canonical Project, Job, Attempt, Executor and Call records.
 
+use crate::core_contract::{
+    Actor, Conversation, EntityId, EntityKind, EntityRef, Message, MessageBlock, MessageBlockKind,
+    MessageLifecycle, ProjectScope,
+};
 use crate::error::{OcgError, Result};
 use crate::orchestration::budget::{self, BudgetConfig, QuotaFacts, SpendAction, SpendAssessment};
 use crate::orchestration::journal::{
@@ -490,6 +494,31 @@ CREATE TABLE IF NOT EXISTS domain_launch_commands (
     created_at INTEGER NOT NULL,
     PRIMARY KEY(command_id, project_id)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS domain_conversations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES domain_projects(id),
+    session_id TEXT NOT NULL,
+    record TEXT NOT NULL,
+    UNIQUE(project_id,session_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS domain_chat_turns (
+    project_id TEXT NOT NULL REFERENCES domain_projects(id),
+    command_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES domain_conversations(id),
+    turn_order INTEGER NOT NULL CHECK(turn_order > 0),
+    job_id TEXT NOT NULL UNIQUE REFERENCES domain_jobs(id),
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES domain_attempts(id),
+    PRIMARY KEY(project_id,command_id),
+    UNIQUE(conversation_id,turn_order)
+) STRICT;
+CREATE TABLE IF NOT EXISTS domain_messages (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL REFERENCES domain_chat_turns(attempt_id),
+    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+    record TEXT NOT NULL,
+    UNIQUE(attempt_id,role)
+) STRICT;
 "#;
 
 /// In-memory dependency view. The SQLite revision determines whether it is current.
@@ -585,6 +614,195 @@ impl DomainRepository {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn conversation_history(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<Option<(Conversation, Vec<Message>)>> {
+        let transaction = self.connection.unchecked_transaction().map_err(sql)?;
+        let record: Option<String> = transaction
+            .query_row(
+                "SELECT record FROM domain_conversations WHERE project_id=?1 AND session_id=?2",
+                params![project_id, session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let conversation: Conversation = decode_chat_record(&record)?;
+        let messages = read_conversation_messages(&transaction, conversation.id.as_str())?;
+        transaction.commit().map_err(sql)?;
+        Ok(Some((conversation, messages)))
+    }
+
+    pub fn prepare_chat_turn(
+        &self,
+        request: &crate::contracts::JobLaunchRequest,
+        request_hash: &str,
+        attempt: &Attempt,
+        content: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        validate_id(&request.session_id)?;
+        let transaction = self.begin()?;
+        let owns_project: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM domain_jobs WHERE id=?1 AND project_id=?2)",
+                params![attempt.job_id, request.project_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if !owns_project {
+            return Err(invalid("chat Attempt belongs to another Project"));
+        }
+        let timestamp = now().to_string();
+        let candidate = Conversation {
+            id: EntityId::new(uuid::Uuid::now_v7().to_string())?,
+            project_scope: ProjectScope::new(&request.project_id)?,
+            title: None,
+            revision: 0,
+            created_at: timestamp.clone(),
+            updated_at: timestamp.clone(),
+            archived_at: None,
+        };
+        transaction.execute(
+            "INSERT INTO domain_conversations(id,project_id,session_id,record) VALUES(?1,?2,?3,?4) ON CONFLICT(project_id,session_id) DO NOTHING",
+            params![candidate.id.as_str(), request.project_id, request.session_id, encode_chat_record(&candidate)?],
+        ).map_err(sql)?;
+        let record: String = transaction
+            .query_row(
+                "SELECT record FROM domain_conversations WHERE project_id=?1 AND session_id=?2",
+                params![request.project_id, request.session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        let conversation: Conversation = decode_chat_record(&record)?;
+        let turn_order: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(turn_order),0)+1 FROM domain_chat_turns WHERE conversation_id=?1",
+            [conversation.id.as_str()], |row| row.get(0),
+        ).map_err(sql)?;
+        transaction.execute(
+            "INSERT INTO domain_chat_turns(project_id,command_id,request_hash,conversation_id,turn_order,job_id,attempt_id) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![request.project_id, request.command_id, request_hash, conversation.id.as_str(), turn_order, attempt.job_id, attempt.id],
+        ).map_err(sql)?;
+        let attempt_ref = EntityRef {
+            kind: EntityKind::Attempt,
+            id: EntityId::new(attempt.id.strip_prefix("att-").unwrap_or(&attempt.id))?,
+        };
+        let user = Message {
+            id: EntityId::new(uuid::Uuid::now_v7().to_string())?,
+            project_scope: conversation.project_scope.clone(),
+            conversation_ref: EntityRef {
+                kind: EntityKind::Conversation,
+                id: conversation.id.clone(),
+            },
+            author: Actor::User {
+                user_id: "local".to_string(),
+            },
+            produced_by_attempt_ref: None,
+            blocks: vec![chat_text_block(content)],
+            state: MessageLifecycle::Pending,
+            revision: 0,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+            deleted_at: None,
+        };
+        let assistant = Message {
+            id: EntityId::new(uuid::Uuid::now_v7().to_string())?,
+            author: Actor::Attempt {
+                attempt_ref: attempt_ref.clone(),
+            },
+            produced_by_attempt_ref: Some(attempt_ref),
+            blocks: Vec::new(),
+            ..user.clone()
+        };
+        for (role, message) in [("user", &user), ("assistant", &assistant)] {
+            transaction
+                .execute(
+                    "INSERT INTO domain_messages(id,attempt_id,role,record) VALUES(?1,?2,?3,?4)",
+                    params![
+                        message.id.as_str(),
+                        attempt.id,
+                        role,
+                        encode_chat_record(message)?
+                    ],
+                )
+                .map_err(sql)?;
+        }
+        // Only complete canonical messages enter history. The current staged
+        // user is included explicitly, before the immutable Call is admitted.
+        let mut history = Vec::new();
+        for message in read_conversation_messages(&transaction, conversation.id.as_str())? {
+            if message.state != MessageLifecycle::Complete && message.id != user.id {
+                continue;
+            }
+            let role = if matches!(message.author, Actor::User { .. }) {
+                "user"
+            } else {
+                "assistant"
+            };
+            let content = message
+                .blocks
+                .iter()
+                .filter(|block| block.kind == MessageBlockKind::Markdown)
+                .filter_map(|block| block.content.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            history.push(serde_json::json!({"role": role, "content": content}));
+        }
+        bump_conversation(&transaction, conversation.id.as_str())?;
+        transaction.commit().map_err(sql)?;
+        Ok(history)
+    }
+
+    pub fn accept_chat_turn(&self, attempt_id: &str) -> Result<()> {
+        let transaction = self.begin()?;
+        let turn: Option<(String, String, String, String)> = transaction.query_row(
+            "SELECT project_id,command_id,request_hash,job_id FROM domain_chat_turns WHERE attempt_id=?1",
+            [attempt_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).optional().map_err(sql)?;
+        if let Some((project_id, command_id, request_hash, job_id)) = turn {
+            update_chat_message(
+                &transaction,
+                attempt_id,
+                "user",
+                MessageLifecycle::Complete,
+                None,
+            )?;
+            transaction.execute(
+                "INSERT INTO domain_launch_commands(command_id,project_id,request_hash,outcome,job_id,message,created_at) VALUES(?1,?2,?3,'accepted',?4,?5,?6) ON CONFLICT(command_id,project_id) DO NOTHING",
+                params![command_id, project_id, request_hash, job_id, format!("job launched: {job_id}"), now()],
+            ).map_err(sql)?;
+        }
+        transaction.commit().map_err(sql)
+    }
+
+    pub fn discard_unaccepted_chat_turn(&self, attempt_id: &str) -> Result<()> {
+        let transaction = self.begin()?;
+        let record: Option<String> = transaction
+            .query_row(
+                "SELECT record FROM domain_messages WHERE attempt_id=?1 AND role='user'",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        if let Some(record) = record {
+            let message: Message = decode_chat_record(&record)?;
+            if message.state == MessageLifecycle::Complete {
+                update_chat_message(
+                    &transaction,
+                    attempt_id,
+                    "user",
+                    MessageLifecycle::Deleted,
+                    None,
+                )?;
+            }
+        }
+        transaction.commit().map_err(sql)
     }
 
     /// Begin the canonical writer transaction.
@@ -3285,7 +3503,16 @@ impl DomainRepository {
             })
             .optional()
             .map_err(sql)?;
-        Ok(result)
+        if result.is_some() {
+            return Ok(result);
+        }
+        // A crash during staging must not let the same command create another
+        // turn. Staged messages remain non-complete and cannot enter context.
+        self.connection.query_row(
+            "SELECT request_hash,job_id,'failed','chat admission was interrupted' FROM domain_chat_turns WHERE command_id=?1 AND project_id=?2",
+            params![command_id, project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(sql)
     }
 
     pub fn record_launch_command(
@@ -3304,12 +3531,15 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        transaction
+        let changed = transaction
             .execute(
-                "INSERT INTO domain_launch_commands(command_id,project_id,request_hash,outcome,job_id,message,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO domain_launch_commands(command_id,project_id,request_hash,outcome,job_id,message,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(command_id,project_id) DO UPDATE SET outcome=excluded.outcome,message=excluded.message WHERE domain_launch_commands.request_hash=excluded.request_hash AND domain_launch_commands.job_id IS excluded.job_id",
                 params![command_id, project_id, request_hash, outcome, job_id, message, timestamp],
             )
             .map_err(sql)?;
+        if changed != 1 {
+            return Err(invalid("launch command conflicts with recorded admission"));
+        }
         transaction.commit().map_err(sql)
     }
 
@@ -5041,6 +5271,171 @@ fn finish_call_in(
     Ok(Some(root))
 }
 
+fn encode_chat_record(value: &impl Serialize) -> Result<String> {
+    serde_json::to_string(value)
+        .map_err(|error| OcgError::config(format!("serialize canonical chat record: {error}")))
+}
+
+fn decode_chat_record<T: serde::de::DeserializeOwned>(record: &str) -> Result<T> {
+    serde_json::from_str(record)
+        .map_err(|error| OcgError::config(format!("decode canonical chat record: {error}")))
+}
+
+fn chat_text_block(content: &str) -> MessageBlock {
+    MessageBlock {
+        kind: MessageBlockKind::Markdown,
+        content: Some(content.to_string()),
+        entity_ref: None,
+        artifact_ref: None,
+        changeset_ref: None,
+        projection_kind: None,
+        raw: None,
+    }
+}
+
+fn read_conversation_messages(
+    connection: &Connection,
+    conversation_id: &str,
+) -> Result<Vec<Message>> {
+    let mut statement = connection.prepare(
+        "SELECT m.record FROM domain_chat_turns t JOIN domain_messages m ON m.attempt_id=t.attempt_id WHERE t.conversation_id=?1 ORDER BY t.turn_order,CASE m.role WHEN 'user' THEN 0 ELSE 1 END",
+    ).map_err(sql)?;
+    let records = statement
+        .query_map([conversation_id], |row| row.get::<_, String>(0))
+        .map_err(sql)?;
+    records
+        .map(|record| decode_chat_record(&record.map_err(sql)?))
+        .collect()
+}
+
+fn bump_conversation(transaction: &rusqlite::Transaction<'_>, conversation_id: &str) -> Result<()> {
+    let record: String = transaction
+        .query_row(
+            "SELECT record FROM domain_conversations WHERE id=?1",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    let mut conversation: Conversation = decode_chat_record(&record)?;
+    conversation.revision = conversation
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("Conversation revision overflow"))?;
+    conversation.updated_at = now().to_string();
+    transaction
+        .execute(
+            "UPDATE domain_conversations SET record=?2 WHERE id=?1",
+            params![conversation_id, encode_chat_record(&conversation)?],
+        )
+        .map_err(sql)?;
+    Ok(())
+}
+
+fn update_chat_message(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    role: &str,
+    state: MessageLifecycle,
+    content: Option<&str>,
+) -> Result<()> {
+    let record: Option<String> = transaction
+        .query_row(
+            "SELECT record FROM domain_messages WHERE attempt_id=?1 AND role=?2",
+            params![attempt_id, role],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some(record) = record else {
+        return Ok(());
+    };
+    let mut message: Message = decode_chat_record(&record)?;
+    if message.state == state {
+        return Ok(());
+    }
+    // An accepted user remains a fact even when its Attempt fails. Assistant
+    // placeholders never retain streaming text or hidden reasoning.
+    if role == "user"
+        && state == MessageLifecycle::Failed
+        && matches!(
+            message.state,
+            MessageLifecycle::Complete | MessageLifecycle::Deleted
+        )
+    {
+        return Ok(());
+    }
+    message.state = message.state.transition(state)?;
+    if let Some(content) = content {
+        message.blocks = vec![chat_text_block(content)];
+    }
+    message.revision = message
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("Message revision overflow"))?;
+    message.updated_at = now().to_string();
+    if state == MessageLifecycle::Deleted {
+        message.deleted_at = Some(message.updated_at.clone());
+    }
+    transaction
+        .execute(
+            "UPDATE domain_messages SET record=?2 WHERE id=?1",
+            params![message.id.as_str(), encode_chat_record(&message)?],
+        )
+        .map_err(sql)?;
+    bump_conversation(transaction, message.conversation_ref.id.as_str())
+}
+
+fn settle_chat_turn(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    state: &str,
+) -> Result<()> {
+    let is_chat: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM domain_chat_turns WHERE attempt_id=?1)",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if !is_chat {
+        return Ok(());
+    }
+    if state == "completed" {
+        let response: String = transaction.query_row(
+            "SELECT response FROM domain_calls WHERE attempt_id=?1 AND state='completed' AND json_extract(request,'$.executor_transport')='provider' ORDER BY created_at DESC,id DESC LIMIT 1",
+            [attempt_id], |row| row.get(0),
+        ).map_err(sql)?;
+        let response: serde_json::Value = decode_chat_record(&response)?;
+        let content = response
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid("completed chat Call has no final content"))?;
+        update_chat_message(
+            transaction,
+            attempt_id,
+            "assistant",
+            MessageLifecycle::Complete,
+            Some(content),
+        )?;
+    } else {
+        update_chat_message(
+            transaction,
+            attempt_id,
+            "user",
+            MessageLifecycle::Failed,
+            None,
+        )?;
+        update_chat_message(
+            transaction,
+            attempt_id,
+            "assistant",
+            MessageLifecycle::Failed,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 fn finish_attempt_in(
     transaction: &rusqlite::Transaction<'_>,
     attempt_id: &str,
@@ -5174,6 +5569,7 @@ fn finish_attempt_in(
             Some(root),
         )?;
     }
+    settle_chat_turn(transaction, attempt_id, state)?;
     Ok(())
 }
 

@@ -225,7 +225,8 @@ pub struct CanonicalControlService {
     runtime_handle: Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>,
     profile_service: crate::profile::ProfileService,
     chat_registrations: Arc<Mutex<std::collections::HashMap<String, ChatRegistration>>>,
-    active_chats: Arc<Mutex<std::collections::HashMap<String, ActiveChat>>>,
+    active_chats: Arc<Mutex<std::collections::HashMap<(String, String), ActiveChat>>>,
+    launch_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -293,6 +294,7 @@ impl CanonicalControlService {
             profile_service: crate::profile::ProfileService::with_workspace(&profile_path, root),
             chat_registrations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             active_chats: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            launch_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -744,6 +746,17 @@ impl CanonicalControlService {
         request: crate::contracts::JobLaunchRequest,
         _now: i64,
     ) -> Result<crate::contracts::JobLaunchResponse> {
+        let _launch = self
+            .launch_lock
+            .lock()
+            .map_err(|_| invalid("launch lock poisoned"))?;
+        self.launch_job_inner(request)
+    }
+
+    fn launch_job_inner(
+        &self,
+        request: crate::contracts::JobLaunchRequest,
+    ) -> Result<crate::contracts::JobLaunchResponse> {
         use sha2::{Sha256, Digest};
 
         if !safe_id(&request.command_id) {
@@ -834,6 +847,20 @@ impl CanonicalControlService {
                 });
             }
         };
+
+        if Path::new(&project.root) != self.root {
+            return Ok(crate::contracts::JobLaunchResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                draft_id: request.draft_id.clone(),
+                project_id: request.project_id.clone(),
+                session_id: request.session_id.clone(),
+                job_id: None,
+                message: "Project identity does not own this control boundary; connect to that Project's control server".to_string(),
+                duplicate: false,
+            });
+        }
 
         // Early validation: Verify execution runtime is available
         let runtime_handle = match &self.runtime_handle {
@@ -1141,10 +1168,23 @@ impl CanonicalControlService {
         // semantics `ocg work dispatch` and admission already use.
         let (attempt, executor) = domain.dispatch_job(&job.id, "provider")?;
 
-        // Construct initial provider request
+        let user_content = initial_user_message(&request);
+        let messages = if is_chat {
+            match domain.prepare_chat_turn(&request, &request_hash, &attempt, &user_content) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    domain.finish_attempt(&attempt.id, false)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            vec![json!({"role": "user", "content": user_content})]
+        };
+        // This snapshot becomes the immutable Call/DispatchIntent input. The
+        // worker compacts these messages without reading the Conversation again.
         let provider_request = serde_json::json!({
             "model": model,
-            "messages": [{"role": "user", "content": initial_user_message(&request)}],
+            "messages": messages,
             "stream": true,
         });
 
@@ -1193,6 +1233,7 @@ impl CanonicalControlService {
             Ok((call, _)) => call,
             Err(e) => {
                 // Economic admission failed; finish the attempt as failed
+                domain.discard_unaccepted_chat_turn(&attempt.id)?;
                 domain.finish_attempt(&attempt.id, false)?;
                 let response = crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -1248,8 +1289,13 @@ impl CanonicalControlService {
     pub fn launch_chat(
         &self,
         request: crate::contracts::JobLaunchRequest,
-        now: i64,
+        _now: i64,
     ) -> Result<crate::contracts::JobLaunchResponse> {
+        let _launch = self
+            .launch_lock
+            .lock()
+            .map_err(|_| invalid("launch lock poisoned"))?;
+        let session_key = (request.project_id.clone(), request.session_id.clone());
         self.reap_expired_chats();
         let (sender, receiver) = flume::unbounded();
         let cancelled = CallCancellation::new();
@@ -1273,13 +1319,13 @@ impl CanonicalControlService {
             .active_chats
             .lock()
             .ok()
-            .and_then(|mut active| active.remove(&request.session_id));
+            .and_then(|mut active| active.remove(&session_key));
         let registered = self
             .active_chats
             .lock()
             .map(|mut active| {
                 active.insert(
-                    request.session_id.clone(),
+                    session_key.clone(),
                     ActiveChat {
                         project_id: request.project_id.clone(),
                         session_id: request.session_id.clone(),
@@ -1295,7 +1341,7 @@ impl CanonicalControlService {
             })
             .is_ok();
 
-        let launch = self.launch_job(request.clone(), now);
+        let launch = self.launch_job_inner(request.clone());
         // Registration is transient: launch_job has already cloned the sender
         // into the dispatched provider envelope.
         if let Ok(mut registrations) = self.chat_registrations.lock() {
@@ -1308,7 +1354,7 @@ impl CanonicalControlService {
                 // rather than leave one claiming the session holds a turn that
                 // does not exist, and hand the session back to the turn it had.
                 if registered {
-                    self.discard_active_turn(&request.session_id);
+                    self.discard_active_turn(&session_key);
                 }
                 if let Some(superseded) = superseded {
                     self.restore_active_turn(superseded);
@@ -1316,9 +1362,9 @@ impl CanonicalControlService {
                 return Err(error);
             }
         };
-        if response.outcome != "accepted" {
+        if response.outcome != "accepted" || response.duplicate {
             if registered {
-                self.discard_active_turn(&request.session_id);
+                self.discard_active_turn(&session_key);
             }
             if let Some(superseded) = superseded {
                 self.restore_active_turn(superseded);
@@ -1334,7 +1380,7 @@ impl CanonicalControlService {
             Some(id) => id,
             None => {
                 if registered {
-                    self.discard_active_turn(&request.session_id);
+                    self.discard_active_turn(&session_key);
                 }
                 return Ok(response);
             }
@@ -1348,7 +1394,7 @@ impl CanonicalControlService {
         };
         if attempt_id.is_empty() {
             if registered {
-                self.discard_active_turn(&request.session_id);
+                self.discard_active_turn(&session_key);
             }
             return Ok(response);
         }
@@ -1400,7 +1446,7 @@ impl CanonicalControlService {
         let published = self
             .active_chats
             .lock()
-            .map(|mut active| match active.get_mut(&request.session_id) {
+            .map(|mut active| match active.get_mut(&session_key) {
                 Some(entry) => {
                     entry.job_id = job_id.clone();
                     entry.attempt_id = attempt_id.clone();
@@ -1422,11 +1468,11 @@ impl CanonicalControlService {
 
     /// Drop this session's registration without settling anything: the turn it
     /// described never became addressable work.
-    fn discard_active_turn(&self, session_id: &str) {
+    fn discard_active_turn(&self, session_key: &(String, String)) {
         if let Ok(mut active) = self.active_chats.lock() {
-            if let Some(entry) = active.get(session_id) {
+            if let Some(entry) = active.get(session_key) {
                 if entry.job_id.is_empty() {
-                    active.remove(session_id);
+                    active.remove(session_key);
                 }
             }
         }
@@ -1437,9 +1483,8 @@ impl CanonicalControlService {
     /// session over owns it again and is left alone.
     fn restore_active_turn(&self, superseded: ActiveChat) {
         if let Ok(mut active) = self.active_chats.lock() {
-            if !active.contains_key(&superseded.session_id) {
-                active.insert(superseded.session_id.clone(), superseded);
-            }
+            let key = (superseded.project_id.clone(), superseded.session_id.clone());
+            active.entry(key).or_insert(superseded);
         }
     }
 
@@ -1454,10 +1499,11 @@ impl CanonicalControlService {
     ) -> Option<(std::sync::Arc<ChatEventBuffer>, Instant)> {
         self.reap_expired_chats();
         let mut guard = self.active_chats.lock().ok()?;
-        let entry = guard.get(session_id)?;
-        if entry.job_id != job_id {
-            return None;
-        }
+        let key = guard
+            .iter()
+            .find(|(_, entry)| entry.session_id == session_id && entry.job_id == job_id)
+            .map(|(key, _)| key.clone())?;
+        let entry = guard.get(&key)?;
         if entry
             .buffer
             .state
@@ -1466,7 +1512,7 @@ impl CanonicalControlService {
             .and_then(|state| state.terminal_at)
             .is_some_and(|terminal_at| terminal_at.elapsed() >= CHAT_REPLAY_LIFETIME)
         {
-            guard.remove(session_id);
+            guard.remove(&key);
             return None;
         }
         Some((entry.buffer.clone(), entry.started_at))
@@ -1500,23 +1546,42 @@ impl CanonicalControlService {
     /// newer turn cannot be dropped by a stale tail.
     pub fn finish_chat(&self, session_id: &str, job_id: &str) {
         if let Ok(mut active) = self.active_chats.lock() {
-            if let Some(entry) = active.get(session_id) {
-                if entry.job_id == job_id {
-                    active.remove(session_id);
-                }
-            }
+            active.retain(|_, entry| entry.session_id != session_id || entry.job_id != job_id);
         }
     }
 
-    /// Revoke the Attempt authority first, then stop the provider transport.
-    /// A turn that already finished is a no-op returning false.
     pub fn cancel_chat(&self, session_id: &str) -> Result<bool> {
-        let active = self
-            .active_chats
-            .lock()
-            .ok()
-            .and_then(|mut active| active.remove(session_id));
-        let Some(active) = active else { return Ok(false); };
+        self.cancel_chat_in_project(None, session_id)
+    }
+
+    pub fn cancel_chat_in_project(
+        &self,
+        project_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<bool> {
+        let active = {
+            let mut chats = self
+                .active_chats
+                .lock()
+                .map_err(|_| invalid("active chats poisoned"))?;
+            let keys = chats
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.session_id == session_id
+                        && project_id.is_none_or(|project| entry.project_id == project)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            if keys.len() > 1 {
+                return Err(invalid(
+                    "project_id is required to cancel an ambiguous session",
+                ));
+            }
+            keys.first().and_then(|key| chats.remove(key))
+        };
+        let Some(active) = active else {
+            return Ok(false);
+        };
         self.end_active_chat(active)
     }
 
