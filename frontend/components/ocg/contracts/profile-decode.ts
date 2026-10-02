@@ -8,12 +8,14 @@
  * purpose; see `decode.ts` for the rule.
  */
 
-import type { Model, Origin, Profile, ProfileView, Provider, ProviderProtocol } from "./generated";
+import type { Model, ModelMetadata, CatalogModel, ProviderCatalog, Origin, Profile, ProfileView, Provider, ProviderProtocol } from "./generated";
 import { PROFILE_API_VERSION } from "./generated";
 import {
   array,
   bad,
   boolean,
+  index,
+  jsonValue,
   decode,
   literal,
   nullable,
@@ -27,8 +29,6 @@ import {
   type Decoder,
 } from "./decode";
 
-// An unrecognized protocol is rejected rather than defaulted: a PWA that cannot
-// name the wire contract must not present the provider as if it knew one.
 const providerProtocol: Decoder<ProviderProtocol> = (input, path) => {
   if (input === "anthropic") return yes("anthropic");
   if (input === "openai") return yes("openai");
@@ -36,11 +36,73 @@ const providerProtocol: Decoder<ProviderProtocol> = (input, path) => {
   return bad(path || "protocol", "a known ProviderProtocol");
 };
 
+export const modelMetadata: Decoder<ModelMetadata> = (input, path) => {
+  const rec = record(input, path, "model metadata");
+  if (!rec.ok) return rec;
+  const variant = req(rec.value, "variant", nullable(string), path);
+  if (!variant.ok) return variant;
+  const variants = req(rec.value, "variants", nullable(array(string)), path);
+  if (!variants.ok) return variants;
+  const effort = req(rec.value, "effort", nullable(string), path);
+  if (!effort.ok) return effort;
+  const efforts = req(rec.value, "efforts", nullable(array(string)), path);
+  if (!efforts.ok) return efforts;
+  const reasoning = req(rec.value, "reasoning", nullable(boolean), path);
+  if (!reasoning.ok) return reasoning;
+  const fast_mode = req(rec.value, "fast_mode", nullable(boolean), path);
+  if (!fast_mode.ok) return fast_mode;
+  const context_window = req(rec.value, "context_window", nullable(index), path);
+  if (!context_window.ok) return context_window;
+  const tools = req(rec.value, "tools", nullable(boolean), path);
+  if (!tools.ok) return tools;
+  const images = req(rec.value, "images", nullable(boolean), path);
+  if (!images.ok) return images;
+  const multimodal = req(rec.value, "multimodal", nullable(boolean), path);
+  if (!multimodal.ok) return multimodal;
+  const pricing = req(rec.value, "pricing", nullable(jsonValue), path);
+  if (!pricing.ok) return pricing;
+  return yes({
+    variant: variant.value,
+    variants: variants.value,
+    effort: effort.value,
+    efforts: efforts.value,
+    reasoning: reasoning.value,
+    fast_mode: fast_mode.value,
+    context_window: context_window.value,
+    tools: tools.value,
+    images: images.value,
+    multimodal: multimodal.value,
+    pricing: pricing.value,
+  });
+};
+
+const catalogModel: Decoder<CatalogModel> = (input, path) => {
+  const rec = record(input, path, "a catalog model");
+  if (!rec.ok) return rec;
+  const id = req(rec.value, "id", string, path);
+  if (!id.ok) return id;
+  const label = req(rec.value, "label", string, path);
+  if (!label.ok) return label;
+  const metadata = req(rec.value, "metadata", modelMetadata, path);
+  if (!metadata.ok) return metadata;
+  const raw = req(rec.value, "raw", jsonValue, path);
+  if (!raw.ok) return raw;
+  return yes({ id: id.value, label: label.value, metadata: metadata.value, raw: raw.value });
+};
+
+const catalog: Decoder<ProviderCatalog> = (input, path) => {
+  const rec = record(input, path, "a provider catalog");
+  if (!rec.ok) return rec;
+  const discoveredAt = req(rec.value, "discovered_at", index, path);
+  if (!discoveredAt.ok) return discoveredAt;
+  const models = req(rec.value, "models", array(catalogModel), path);
+  if (!models.ok) return models;
+  return yes({ discovered_at: discoveredAt.value, models: models.value });
+};
+
 const provider: Decoder<Provider> = (input, path) => {
   const rec = record(input, path, "a Provider");
   if (!rec.ok) return rec;
-  const placeholder = req(rec.value, "placeholder", boolean, path);
-  if (!placeholder.ok) return placeholder;
   const label = req(rec.value, "label", string, path);
   if (!label.ok) return label;
   // `endpoint` and `credential_ref` are `skip_serializing_if`, so absence is
@@ -50,25 +112,22 @@ const provider: Decoder<Provider> = (input, path) => {
   if (!endpoint.ok) return endpoint;
   const credentialRef = opt(rec.value, "credential_ref", string, path);
   if (!credentialRef.ok) return credentialRef;
-  // `protocol` is `skip_serializing_if`, so absence is normal and means the
-  // OpenAI-compatible contract. It must be read so an edit round-trip does not
-  // silently downgrade an Anthropic provider to that contract.
   const protocol = opt(rec.value, "protocol", providerProtocol, path);
   if (!protocol.ok) return protocol;
+  const observedCatalog = opt(rec.value, "catalog", catalog, path);
+  if (!observedCatalog.ok) return observedCatalog;
   return yes({
-    placeholder: placeholder.value,
     label: label.value,
     endpoint: endpoint.value,
     credential_ref: credentialRef.value,
     protocol: protocol.value,
+    catalog: observedCatalog.value,
   });
 };
 
 const model: Decoder<Model> = (input, path) => {
   const rec = record(input, path, "a Model");
   if (!rec.ok) return rec;
-  const placeholder = req(rec.value, "placeholder", boolean, path);
-  if (!placeholder.ok) return placeholder;
   const owner = req(rec.value, "provider", string, path);
   if (!owner.ok) return owner;
   const id = req(rec.value, "id", string, path);
@@ -78,12 +137,17 @@ const model: Decoder<Model> = (input, path) => {
   if (!variant.ok) return variant;
   const variants = opt(rec.value, "variants", array(string), path);
   if (!variants.ok) return variants;
+  const label = opt(rec.value, "label", string, path);
+  if (!label.ok) return label;
+  const metadata = opt(rec.value, "metadata", modelMetadata, path);
+  if (!metadata.ok) return metadata;
   return yes({
-    placeholder: placeholder.value,
     provider: owner.value,
     id: id.value,
     variant: variant.value,
     variants: variants.value,
+    label: label.value,
+    metadata: metadata.value,
   });
 };
 

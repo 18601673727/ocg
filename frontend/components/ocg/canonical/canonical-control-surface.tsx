@@ -412,19 +412,19 @@ export function CanonicalControlSurface({
               <dd>{state.projection?.calls.length ?? 0}</dd>
               <dt className="text-muted-foreground">Attempt history</dt>
               <dd>{selected.attemptHistory.length}</dd>
-              <dt className="text-muted-foreground">Canonical cursor</dt>
+              <dt className="text-muted-foreground">Event cursor</dt>
               <dd>{state.cursor}</dd>
             </dl>
           </Panel>
 
-          <Panel className="bg-background p-3" title="Running Job" detail="canonical projection">
+          <Panel className="bg-background p-3" title="Running Job" detail="Runtime state">
             {selected.execution ? (
               <div className="h-[420px] overflow-hidden rounded border border-border">
                 <JobExecutionSurface execution={selected.execution} />
               </div>
             ) : (
               <p className="text-[11px] text-muted-foreground">
-                Load a canonical Job to inspect its execution graph, Attempt history, Call states, and frozen
+                Load a Job to inspect its execution graph, Attempt history, Call states, and frozen
                 contracts.
               </p>
             )}

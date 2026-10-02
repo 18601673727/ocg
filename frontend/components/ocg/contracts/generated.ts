@@ -92,11 +92,11 @@ export type CanonicalEventsEnvelope = { api_version: CanonicalApiVersion, projec
 /**
  * `GET /api/v1/canonical/jobs/{job}/configuration`
  */
-export type CanonicalJobConfigEnvelope = { api_version: CanonicalApiVersion, job_id: string, 
+export type CanonicalJobConfigEnvelope = { api_version: CanonicalApiVersion, job_id: string,
 /**
  * `null` when the Job has no stored pre-attempt configuration yet.
  */
-configuration: JsonValue, 
+configuration: JsonValue,
 /**
  * The substrate revision the configuration was read at; `0` when unset.
  */
@@ -106,7 +106,7 @@ revision: number, };
 export type CanonicalJobConfigResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, job_id: string, revision: number, configuration: JsonValue, };
 
 
-export type CanonicalJobEvent = { api_version: CanonicalApiVersion, project_id: string, job_id: string, 
+export type CanonicalJobEvent = { api_version: CanonicalApiVersion, project_id: string, job_id: string,
 /**
  * The canonical execution journal cursor this event occupies.
  */
@@ -141,6 +141,9 @@ export type CapabilityRevocation = { id: EntityId, project_scope: ProjectScope, 
 
 
 export type CapabilityRevocationState = "active" | "lifted";
+
+
+export type CatalogModel = { id: string, label: string, metadata: ModelMetadata, raw: JsonValue, };
 
 
 export type ChangeSetFingerprintInputV1 = { schema_version: number, project_scope: ProjectScope, targets: Array<JsonValue>, preconditions: Array<JsonValue>, operations: Array<JsonValue>, };
@@ -268,7 +271,7 @@ export type JobBlocker = { kind: BlockerKind, blocking_ref: EntityRef | null, re
 export type JobLaunchRequest = { command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
 
 
-export type JobLaunchResponse = { api_version: CanonicalApiVersion, 
+export type JobLaunchResponse = { api_version: CanonicalApiVersion,
 /**
  * "accepted" | "rejected" | "failed"
  */
@@ -299,11 +302,14 @@ export type MessageBlockKind = "markdown" | "entity_ref" | "artifact_ref" | "dif
 export type MessageLifecycle = "pending" | "streaming" | "complete" | "failed" | "deleted";
 
 
-export type Model = { placeholder: boolean, provider: string, id: string, 
+export type Model = { provider: string, id: string,
 /**
  * Optional selected reasoning variant; never inferred from a fixed tier.
  */
-variant?: string | null, variants?: Array<string>, };
+variant?: string | null, variants?: Array<string>, label?: string | null, metadata?: ModelMetadata | null, };
+
+
+export type ModelMetadata = { variant: string | null, variants: Array<string> | null, effort: string | null, efforts: Array<string> | null, reasoning: boolean | null, fast_mode: boolean | null, context_window: number | null, tools: boolean | null, images: boolean | null, multimodal: boolean | null, pricing: JsonValue | null, };
 
 
 export type Origin = "new";
@@ -319,7 +325,7 @@ export type Profile = { origin: Origin, defaultModel?: string | null, providers:
  * The request bodies the PWA sends. Typed so a malformed body is a compile
  * error in the client rather than a runtime surprise.
  */
-export type ProfileBootstrapRequest = { 
+export type ProfileBootstrapRequest = {
 /**
  * The explicit bootstrap action, currently `"new"`.
  */
@@ -329,11 +335,11 @@ choice: string, };
 /**
  * `POST /api/v1/profile/credentials`
  */
-export type ProfileCredentialRequest = { 
+export type ProfileCredentialRequest = {
 /**
  * Vault credential name. Validated by the Vault, never logged.
  */
-name: string, 
+name: string,
 /**
  * The secret value. Written to the Vault only; never returned.
  */
@@ -349,12 +355,12 @@ export type ProfileReplaceRequest = { revision: string, profile: Profile, };
  * This response used to be an anonymous `json!` literal, which is exactly the
  * kind of shape a hand-written TypeScript mirror cannot be checked against.
  */
-export type ProfileView = { api_version: ProfileApiVersion, profile: Profile | null, 
+export type ProfileView = { api_version: ProfileApiVersion, profile: Profile | null,
 /**
  * SHA-256 of the Profile document. A write must present the same value;
  * a mismatch is rejected instead of overwriting a concurrent edit.
  */
-revision: string | null, 
+revision: string | null,
 /**
  * Backend-computed execution readiness: model keys that satisfy the
  * same provider/model/endpoint/credential rules as canonical launch.
@@ -386,24 +392,27 @@ export type ProjectionEffect = "reducible" | "snapshot_barrier";
 export type ProjectionEffectPolicy = "reducible_only" | "barrier_allowed";
 
 
-export type Provider = { placeholder: boolean, label: string, 
+export type Provider = { label: string,
 /**
  * HTTPS endpoint for provider API calls. Must not include userinfo.
  */
-endpoint?: string | null, 
+endpoint?: string | null,
 /**
  * Reference to a Vault credential name. The credential value is the raw
  * bearer token (without "Bearer " prefix); OCG constructs the Authorization
  * header at runtime.
  */
-credential_ref?: string | null, 
+credential_ref?: string | null,
 /**
  * The wire protocol this provider speaks. `None` means the provider speaks
  * OpenAI Chat Completions, which is what every Profile written before
  * protocols were explicit does. A key, a label or an endpoint host never
  * implies a protocol.
  */
-protocol?: ProviderProtocol | null, };
+protocol?: ProviderProtocol | null, catalog?: ProviderCatalog | null, };
+
+
+export type ProviderCatalog = { discovered_at: number, models: Array<CatalogModel>, };
 
 
 /**
@@ -421,7 +430,7 @@ export type ProviderProtocol = "anthropic" | "openai" | "openai_compatible";
  * surface sends is validated at the boundary and the shape the PWA reads is
  * the one the backend actually stores.
  */
-export type ResourceBudget = { 
+export type ResourceBudget = {
 /**
  * Zero records "no explicit hard limit", not "a budget of nothing".
  */
@@ -429,6 +438,147 @@ hard_limit: number, unit: string, };
 
 
 export type ResumeCursor = { cursor_schema_version: string, contract_version: string, project_scope: ProjectScope, generation: string, sequence: string, last_event_id: EntityId | null, };
+
+
+/**
+ * Request to browse filesystem directories.
+ */
+export type SetupBrowseRequest = {
+/**
+ * Path to browse (empty = home directory).
+ */
+path: string | null, };
+
+
+/**
+ * Response for directory listing.
+ */
+export type SetupBrowseResponse = { current: string, parent: string | null, entries: Array<SetupDirectoryEntry>, };
+
+
+/**
+ * Request to connect a new provider and discover models.
+ */
+export type SetupConnectRequest = {
+/**
+ * Human-readable provider name.
+ */
+name: string,
+/**
+ * Provider endpoint URL (base URL or full chat/completions URL).
+ */
+endpoint: string,
+/**
+ * API key for the provider.
+ */
+api_key: string, };
+
+
+/**
+ * Response after connecting a provider and discovering models.
+ */
+export type SetupConnectResponse = { api_version: ProfileApiVersion,
+/**
+ * Provider key assigned by the backend.
+ */
+provider_key: string,
+/**
+ * Normalized models from the provider.
+ */
+models: Array<SetupModel>,
+/**
+ * Profile revision after the provider was persisted, for the model save.
+ */
+revision: string, };
+
+
+/**
+ * A directory entry.
+ */
+export type SetupDirectoryEntry = { name: string, path: string, is_dir: boolean, };
+
+
+/**
+ * A model discovered from a provider.
+ */
+export type SetupModel = {
+/**
+ * OCG model key (provider_key/model_id normalized).
+ */
+key: string,
+/**
+ * Upstream provider model id.
+ */
+id: string,
+/**
+ * Display label.
+ */
+label: string,
+/**
+ * Known metadata (may be empty).
+ */
+metadata: ModelMetadata, };
+
+
+/**
+ * A model selected by the user during setup.
+ */
+export type SetupModelSelection = {
+/**
+ * OCG model key.
+ */
+key: string,
+/**
+ * Upstream provider model id.
+ */
+id: string, };
+
+
+/**
+ * Request to save selected models.
+ */
+export type SetupModelsRequest = {
+/**
+ * Provider key.
+ */
+provider_key: string,
+/**
+ * Models to enable, each carrying the OCG key and the upstream provider model id.
+ */
+models: Array<SetupModelSelection>,
+/**
+ * Default model key.
+ */
+default_model: string,
+/**
+ * Profile revision for optimistic locking.
+ */
+revision: string, };
+
+
+/**
+ * Response after saving models.
+ */
+export type SetupModelsResponse = { api_version: ProfileApiVersion, selected_models: Array<string>, default_model: string, runnable_choices: Array<string>, revision: string, };
+
+
+/**
+ * Request to initialize and import a project.
+ */
+export type SetupProjectRequest = { command_id: string,
+/**
+ * Root path of the project.
+ */
+root: string, };
+
+
+/**
+ * Response after project initialization.
+ */
+export type SetupProjectResponse = { api_version: CanonicalApiVersion, project_id: string, name: string, root: string, };
+
+
+export type SetupRefreshRequest = { provider_key: string, revision: string, };
 
 
 export type SideEffectMode = "idempotent" | "strict_fenced" | "reconcilable" | "non_retryable";

@@ -120,7 +120,10 @@ export function ProjectSwitcher({
                       : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
                   )}
                 >
-                  <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">{project.name}</span>
+                    <span className="block break-all text-[11px] font-normal text-muted-foreground">{project.root ?? project.id}</span>
+                  </span>
                   {isActive && <Check className="size-3.5 shrink-0" aria-hidden="true" />}
                 </button>
               </li>

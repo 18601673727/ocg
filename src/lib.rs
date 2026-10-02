@@ -63,6 +63,7 @@ pub mod release;
 pub mod report;
 pub mod resources;
 pub mod self_update;
+pub mod setup;
 pub mod skills;
 pub mod telemetry;
 pub mod ui_assets;

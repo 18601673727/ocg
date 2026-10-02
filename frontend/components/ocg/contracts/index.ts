@@ -29,6 +29,9 @@ export type {
   JobLaunchResponse,
   JsonValue,
   Model,
+  ModelMetadata,
+  SetupModelSelection,
+  SetupRefreshRequest,
   Origin,
   Profile,
   ProfileApiVersion,
@@ -53,6 +56,21 @@ export {
   decodeProvider,
   tryProfileView,
 } from "./profile-decode";
+
+export {
+  decodeSetupConnectResponse,
+  decodeSetupModelsResponse,
+  decodeSetupBrowseResponse,
+  decodeSetupProjectResponse,
+} from "./setup-decode";
+export type {
+  SetupModel,
+  SetupConnectResponse,
+  SetupModelsResponse,
+  SetupDirectoryEntry,
+  SetupBrowseResponse,
+  SetupProjectResponse,
+} from "./setup-decode";
 
 export {
   decodeConfigurationAck,

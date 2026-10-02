@@ -79,16 +79,16 @@ pub fn execute(
         Request::Provider { key, label } => {
             let (mut profile, revision) = service.current()?.ok_or_else(missing_profile)?;
             if key.is_empty() || profile.providers.contains_key(key) { return Err(OcgError::config("provider key must be non-empty and unique")); }
-            profile.providers.insert(key.clone(), Provider { placeholder: false, label: label.clone(), endpoint: None, credential_ref: None, protocol: None });
+            profile.providers.insert(key.clone(), Provider { label: label.clone(), endpoint: None, credential_ref: None, protocol: None, catalog: None });
             service.replace(&revision, &profile)?;
             print_current(&service, output)?;
         }
         Request::Model { key, provider, id, default } => {
             let (mut profile, revision) = service.current()?.ok_or_else(missing_profile)?;
-            if key.is_empty() || id.is_empty() || profile.models.contains_key(key) || !profile.providers.get(provider).is_some_and(|entry| !entry.placeholder) {
-                return Err(OcgError::config("model key/id must be non-empty and unique; choose a configured non-placeholder provider"));
+            if key.is_empty() || id.is_empty() || profile.models.contains_key(key) || !profile.providers.contains_key(provider) {
+                return Err(OcgError::config("model key/id must be non-empty and unique; choose a configured provider"));
             }
-            profile.models.insert(key.clone(), Model { placeholder: false, provider: provider.clone(), id: id.clone(), variant: None, variants: vec![] });
+            profile.models.insert(key.clone(), Model { provider: provider.clone(), id: id.clone(), variant: None, variants: vec![], label: None, metadata: None });
             if *default { profile.default_model = Some(key.clone()); }
             service.replace(&revision, &profile)?;
             print_current(&service, output)?;

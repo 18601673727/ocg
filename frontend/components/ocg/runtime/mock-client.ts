@@ -284,7 +284,7 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
     return null;
   }
 
-  private updateBootstrap(bootstrap: BootstrapState): void {
+  protected updateBootstrap(bootstrap: BootstrapState): void {
     this.emit({ type: "bootstrap.updated", bootstrap: clone(bootstrap) });
   }
 

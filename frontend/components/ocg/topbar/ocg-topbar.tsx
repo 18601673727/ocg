@@ -1,5 +1,6 @@
 "use client";
 
+import { Menu } from "@base-ui/react/menu";
 import {
   Bell,
   ChevronsLeft,
@@ -13,11 +14,11 @@ import {
   Settings,
   Table2,
   Workflow,
+  MessageSquare,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import type { ChatSession, RuntimeStatus } from "../types";
-import { WORK_TYPE_LABEL } from "../types";
 import { isDegradedSyncStatus, type RuntimeSyncStatus } from "../runtime/reconciler";
 import {
   RUNTIME_AUTHORITY_LABEL,
@@ -32,7 +33,8 @@ import type { RuntimeAuthority } from "../runtime/runtime-types";
 import type { WorkspaceView } from "../layout/view-domain";
 
 type OcgTopbarProps = {
-  session: ChatSession;
+  session?: ChatSession;
+  projectName?: string;
   sidebarCollapsed: boolean;
   inspectorOpen: boolean;
   /** When false, the job inspector toggles are hidden (for example on the ledger view). Defaults to true. */
@@ -56,53 +58,17 @@ type OcgTopbarProps = {
   syncStatus?: RuntimeSyncStatus | null;
 };
 
-/**
- * Workspace shortcuts, in bar order. The placeholder "more actions" control sat
- * between Attention and the surfaces, so the group is kept in two pieces.
- */
-const SHORTCUTS_BEFORE_MENU: WorkspaceShortcut[] = [
+const WORKSPACE_SHORTCUTS: { view: WorkspaceView; icon: typeof Home; label: string }[] = [
+  { view: "chat", icon: MessageSquare, label: "Chat" },
   { view: "home", icon: Home, label: "Home" },
   { view: "attention", icon: Bell, label: "Attention" },
-];
-
-const SHORTCUTS_AFTER_MENU: WorkspaceShortcut[] = [
-  { view: "ledger", icon: Table2, label: "Resource ledger" },
   { view: "control-center", icon: SlidersHorizontal, label: "Control Center" },
+  { view: "ledger", icon: Table2, label: "Resource Ledger" },
   { view: "job-execution", icon: Workflow, label: "Job Execution" },
-  { view: "logs", icon: ScrollText, label: "Logs and diagnostics" },
+  { view: "logs", icon: ScrollText, label: "Logs" },
   { view: "settings", icon: Settings, label: "Settings" },
+  { view: "canonical", icon: SlidersHorizontal, label: "OCG Control" },
 ];
-
-type WorkspaceShortcut = {
-  view: WorkspaceView;
-  icon: typeof Home;
-  label: string;
-};
-
-function Shortcut({
-  shortcut,
-  active,
-  onNavigate,
-}: {
-  shortcut: WorkspaceShortcut;
-  active: boolean;
-  onNavigate: (view: WorkspaceView) => void;
-}) {
-  const Icon = shortcut.icon;
-  const action = `${active ? "Close" : "Open"} ${shortcut.label}`;
-  return (
-    <Button
-      variant={active ? "secondary" : "ghost"}
-      size="icon-xs"
-      onClick={() => onNavigate(shortcut.view)}
-      aria-label={action}
-      aria-current={active ? "page" : undefined}
-      title={action}
-    >
-      <Icon className="size-4" />
-    </Button>
-  );
-}
 
 const WORK_TYPE_DOT: Record<ChatSession["workType"], string> = {
   research: "bg-sky-500",
@@ -113,6 +79,7 @@ const WORK_TYPE_DOT: Record<ChatSession["workType"], string> = {
 
 export function OcgTopbar({
   session,
+  projectName = "Workspace",
   sidebarCollapsed,
   inspectorOpen,
   inspectorControls = true,
@@ -159,16 +126,14 @@ export function OcgTopbar({
       <div className="mx-1 h-5 w-px bg-border" aria-hidden="true" />
 
       <div className="flex min-w-0 flex-1 items-center gap-2">
-        <span
-          aria-hidden="true"
-          className={cn("size-1.5 shrink-0 rounded-full", WORK_TYPE_DOT[session.workType])}
-        />
-        <h1 className="truncate text-[13px] font-semibold tracking-tight">
-          {session.title}
-        </h1>
-        <span className="hidden shrink-0 rounded border border-border bg-muted/60 px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground sm:inline">
-          {WORK_TYPE_LABEL[session.workType]}
-        </span>
+        {session && activeView === "chat" ? (
+          <>
+            <span aria-hidden="true" className={cn("size-1.5 shrink-0 rounded-full", WORK_TYPE_DOT[session.workType])} />
+            <h1 className="truncate text-[13px] font-semibold tracking-tight">{session.title}</h1>
+          </>
+        ) : (
+          <h1 className="truncate text-[13px] font-semibold tracking-tight">{projectName}</h1>
+        )}
       </div>
 
       <div
@@ -195,34 +160,33 @@ export function OcgTopbar({
         </div>
       )}
 
-      {onNavigate &&
-        SHORTCUTS_BEFORE_MENU.map((shortcut) => (
-          <Shortcut
-            key={shortcut.view}
-            shortcut={shortcut}
-            active={activeView === shortcut.view}
-            onNavigate={onNavigate}
-          />
-        ))}
-
-      <Button
-        variant="ghost"
-        size="icon-xs"
-        aria-label="More actions (placeholder)"
-        title="More actions (placeholder)"
-      >
-        <MoreHorizontal className="size-4" />
-      </Button>
-
-      {onNavigate &&
-        SHORTCUTS_AFTER_MENU.map((shortcut) => (
-          <Shortcut
-            key={shortcut.view}
-            shortcut={shortcut}
-            active={activeView === shortcut.view}
-            onNavigate={onNavigate}
-          />
-        ))}
+      {onNavigate && (
+        <Menu.Root>
+          <Menu.Trigger render={<Button variant="ghost" size="icon-xs" aria-label="Workspace views" title="Workspace views" />}>
+            <MoreHorizontal className="size-4" />
+          </Menu.Trigger>
+          <Menu.Portal>
+            <Menu.Positioner align="end" sideOffset={6} className="z-50">
+              <Menu.Popup className="min-w-52 rounded-lg border border-border bg-background p-1 shadow-lg">
+                {WORKSPACE_SHORTCUTS.map((shortcut) => {
+                  const Icon = shortcut.icon;
+                  return (
+                    <Menu.Item
+                      key={shortcut.view}
+                      onClick={() => { if (activeView !== shortcut.view) onNavigate(shortcut.view); }}
+                      aria-current={activeView === shortcut.view ? "page" : undefined}
+                      className={cn("flex cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-[13px] outline-none data-[highlighted]:bg-muted", activeView === shortcut.view && "bg-muted font-medium")}
+                    >
+                      <Icon className="size-3.5" aria-hidden="true" />
+                      {shortcut.label}
+                    </Menu.Item>
+                  );
+                })}
+              </Menu.Popup>
+            </Menu.Positioner>
+          </Menu.Portal>
+        </Menu.Root>
+      )}
 
       {inspectorControls && (
         <>

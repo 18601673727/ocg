@@ -188,7 +188,7 @@ export function AttentionSurface(props: AttentionSurfaceProps) {
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
       {/* List column */}
-      <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col lg:max-w-[560px] lg:border-r lg:border-border">
+      <div className={cn("flex min-h-0 w-full min-w-0 flex-1 flex-col", selected && "lg:border-r lg:border-border")}>
         <div className="shrink-0 px-4 pt-4 sm:px-6 sm:pt-6">
           <h1 className="text-[20px] font-semibold tracking-tight">Attention</h1>
           <p className="mt-0.5 text-[13px] text-muted-foreground">

@@ -151,10 +151,10 @@ export function preRunConfigurationState(state: CanonicalState): {
 } {
   const jobId = state.jobId;
   if (jobId === null) {
-    return { jobId: null, editable: false, reason: "No canonical Job is selected." };
+    return { jobId: null, editable: false, reason: "No Job is selected." };
   }
   if (state.projection === null) {
-    return { jobId, editable: false, reason: "Canonical state has not been loaded." };
+    return { jobId, editable: false, reason: "Runtime state has not been loaded." };
   }
   if (state.projection.attempts.length > 0) {
     return {

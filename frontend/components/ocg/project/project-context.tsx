@@ -83,6 +83,7 @@ export function ProjectProvider({
       setProjects(records.map((record) => ({
         id: record.project_id,
         name: projectName(record.root, record.project_id),
+        root: record.root,
       })));
     }).catch(() => {
       if (!cancelled) setProjects([]);

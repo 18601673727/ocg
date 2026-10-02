@@ -80,19 +80,19 @@ export type WorkspaceTarget = {
  * navigating inside the workspace keeps the active scenario — and therefore the
  * one in-memory runtime instance and its authority — untouched. Naming a
  * scenario selects a fixture, so it is left to whoever opened the URL to do it
- * deliberately. The ledger, settings and OCG control surfaces have their own
- * route.
+ * deliberately. Standalone routes remain direct entrypoints, while shell
+ * navigation switches the root workspace view.
  */
 const WORKSPACE_TARGETS: Record<WorkspaceView, WorkspaceTarget> = {
-  chat: { href: "/", toggles: false },
+  chat: { href: "/?view=chat", toggles: false },
   home: { href: "/?view=home", toggles: false },
   attention: { href: "/?view=attention", toggles: false },
   "control-center": { href: "/?view=control-center", toggles: true },
-  ledger: { href: "/resource-ledger", toggles: true },
+  ledger: { href: "/?view=ledger", toggles: true },
   "job-execution": { href: "/?view=job-execution", toggles: true },
   logs: { href: "/?view=logs", toggles: true },
-  settings: { href: "/settings", toggles: true },
-  canonical: { href: "/canonical", toggles: false },
+  settings: { href: "/?view=settings", toggles: true },
+  canonical: { href: "/?view=canonical", toggles: false },
 };
 
 /**

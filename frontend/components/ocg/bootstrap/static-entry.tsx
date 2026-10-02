@@ -61,23 +61,14 @@ function StaticEntryContent({ route }: { route: StaticEntryRoute }) {
 
   const entry = ROUTE_ENTRY[route];
 
-  if (entry === undefined) {
-    const scenario = resolveScenario(requestedScenario);
-    return (
-      <OcgEntryGate
-        scenario={scenario}
-        view={resolveWorkspaceView(scenario, requestedView)}
-        controlCenterView={resolveControlCenterView(requestedView)}
-        initialProjectId={project}
-      />
-    );
-  }
+  const scenario = resolveScenario(requestedScenario ?? entry?.scenario);
 
   return (
     <OcgEntryGate
-      scenario={resolveScenario(requestedScenario ?? entry.scenario)}
-      view={entry.view}
-      initialProjectId={entry.forwardsProject ? project : undefined}
+      scenario={scenario}
+      view={resolveWorkspaceView(scenario, requestedView ?? entry?.view)}
+      controlCenterView={resolveControlCenterView(requestedView)}
+      initialProjectId={entry === undefined || entry.forwardsProject ? project : undefined}
     />
   );
 }

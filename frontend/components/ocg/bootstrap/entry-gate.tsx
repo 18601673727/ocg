@@ -8,7 +8,7 @@ import type { ControlCenterView } from "../control-center/domain";
 import type { ProjectId } from "../project/domain";
 import { ProjectProvider } from "../project/project-context";
 import { LoginView } from "../login/login-view";
-import { OnboardingWizard } from "../onboarding/onboarding-wizard";
+import { SetupWizard } from "../setup/setup-wizard";
 import { selectBootstrapEntry } from "./selectors";
 
 /**
@@ -41,6 +41,6 @@ function BootstrapSurface({ view, controlCenterView }: { view: WorkspaceView; co
   const entry = selectBootstrapEntry(snapshot.bootstrap);
 
   if (entry === "login") return <LoginView />;
-  if (entry === "onboarding") return <OnboardingWizard />;
+  if (entry === "onboarding") return <SetupWizard />;
   return <RuntimeWorkspace view={view} controlCenterView={controlCenterView} />;
 }

@@ -115,6 +115,28 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     return stop;
   }
 
+  /**
+   * The new setup wizard (SetupWizard) is a 3-step flow that completes without
+   * ever reaching the legacy "ready" stage. Override to mark onboarding done
+   * regardless of stage.
+   */
+  override async completeOnboarding(): Promise<void> {
+    const bootstrap = this.store.getSnapshot().bootstrap;
+    const onboarding = bootstrap.onboarding;
+    if (!onboarding) return;
+    this.updateBootstrap({
+      ...bootstrap,
+      ready: true,
+      onboarding: {
+        ...onboarding,
+        completedStages: onboarding.completedStages.includes("ready")
+          ? onboarding.completedStages
+          : [...onboarding.completedStages, "ready"],
+        failure: undefined,
+      },
+    });
+  }
+
   async launchJob(command: JobLaunchCommand): Promise<JobLaunchResult> {
     const response = await this.control.launchJob(toLaunchRequest(command));
     if (isCanonicalRejection(response)) {
@@ -224,7 +246,23 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       hard_budget_micros: 0,
       resource_commitment: null,
     };
-    const response = await this.control.sendChatMessage(request);
+    let response;
+    try {
+      response = await this.control.sendChatMessage(request);
+    } catch (cause) {
+      const current = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
+      if (!current || current.status !== "streaming") return;
+      this.emit({
+        type: "conversation.message-completed",
+        sessionId,
+        message: {
+          ...current,
+          content: `Chat failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+          status: "failed",
+        },
+      });
+      return;
+    }
     if (isCanonicalRejection(response)) {
       this.emit({
         type: "conversation.message-completed",
@@ -299,7 +337,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     try {
       const view = await this.profile.read();
       if (view.runnable_choices.length > 0) {
-        return { available: true, status: { state: "connected", detail: "canonical provider runtime" } };
+        return { available: true, status: { state: "connected", detail: "OCG provider runtime" } };
       }
       return {
         available: false,

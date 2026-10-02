@@ -869,8 +869,52 @@ impl CanonicalControlService {
             .cloned()
             .unwrap_or_default();
 
+        // Resolve profile from the user-global profile service
+        let (profile, _) = match self.profile_service.current()? {
+            Some(p) => p,
+            None => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: "profile not configured".to_string(),
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "rejected",
+                    None,
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+
+        // Chat uses the Profile selection saved by setup unless this Project
+        // explicitly overrides it. Ordinary Job launch keeps its configured defaults.
+        let is_chat = self
+            .chat_registrations
+            .lock()
+            .map_err(|_| invalid("chat registrations poisoned"))?
+            .contains_key(&request.command_id);
+        let chat_selection = if is_chat {
+            Some(profile.select(
+                project_config.defaults.get("model").and_then(Value::as_str),
+            )?)
+        } else {
+            None
+        };
+
         // Resolve provider and model from project configuration defaults
-        let provider_key = match project_config.defaults.get("provider").and_then(|v| v.as_str()) {
+        let provider_key = match project_config.defaults.get("provider").and_then(Value::as_str)
+            .or_else(|| chat_selection.map(|(_, model)| model.provider.as_str()))
+        {
             Some(p) => p,
             None => {
                 let response = crate::contracts::JobLaunchResponse {
@@ -896,7 +940,9 @@ impl CanonicalControlService {
             }
         };
 
-        let model = match project_config.defaults.get("model").and_then(|v| v.as_str()) {
+        let model = match project_config.defaults.get("model").and_then(Value::as_str)
+            .or_else(|| chat_selection.map(|(key, _)| key))
+        {
             Some(m) => m,
             None => {
                 let response = crate::contracts::JobLaunchResponse {
@@ -908,33 +954,6 @@ impl CanonicalControlService {
                     session_id: request.session_id.clone(),
                     job_id: None,
                     message: "model not configured".to_string(),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    None,
-                    &response.message,
-                )?;
-                return Ok(response);
-            }
-        };
-
-        // Resolve profile from the user-global profile service
-        let (profile, _) = match self.profile_service.current()? {
-            Some(p) => p,
-            None => {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: "profile not configured".to_string(),
                     duplicate: false,
                 };
                 domain.record_launch_command(
@@ -975,31 +994,10 @@ impl CanonicalControlService {
             }
         };
 
-        if provider_entry.placeholder {
-            let response = crate::contracts::JobLaunchResponse {
-                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                outcome: "rejected".to_string(),
-                command_id: request.command_id.clone(),
-                draft_id: request.draft_id.clone(),
-                project_id: project.project_id.clone(),
-                session_id: request.session_id.clone(),
-                job_id: None,
-                message: format!("provider is placeholder: {}", provider_key),
-                duplicate: false,
-            };
-            domain.record_launch_command(
-                &request.command_id,
-                &request.project_id,
-                &request_hash,
-                "rejected",
-                None,
-                &response.message,
-            )?;
-            return Ok(response);
-        }
-
         let upstream_model_id = match profile.models.get(model) {
-            Some(entry) if !entry.placeholder && entry.provider == provider_key && !entry.id.is_empty() => entry.id.clone(),
+            Some(entry) if entry.provider == provider_key && !entry.id.is_empty() => {
+                entry.id.clone()
+            }
             _ => {
                 let response = crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),

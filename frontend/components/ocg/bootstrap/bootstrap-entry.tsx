@@ -8,9 +8,9 @@ import { useOcgControlUrl } from "../profile/control-url";
 /**
  * Neutral launch route: the PWA opener lands here and the frontend decides,
  * from the one backend readiness authority (`GET /api/v1/profile` decoded by
- * the profile client + `runnableChoices`), whether setup is incomplete.
+ * the profile client + backend `runnable_choices`), whether setup is incomplete.
  *
- * Exactly one readiness semantics exists: the same `runnableChoices` the
+ * Exactly one readiness semantics exists: the same backend `runnable_choices` the
  * onboarding/profile UI uses. The launcher never decides locally, and no
  * fixture scenario is involved.
  */

@@ -510,6 +510,21 @@ fn handle_client(
         }
         return;
     }
+    if matches!(
+        route,
+        Route::SetupProviderConnect
+            | Route::SetupProviderRefresh
+            | Route::SetupModelsSave
+            | Route::SetupBrowse
+            | Route::SetupProjectInit
+    ) {
+        if request.method == "OPTIONS" {
+            let _ = write_preflight(&mut stream, &request);
+        } else {
+            let _ = handle_setup(&mut stream, profile, &route, &request);
+        }
+        return;
+    }
     if let Route::Product { path } = &route {
         let _ = serve_product(&mut stream, &request, path);
         return;
@@ -698,6 +713,323 @@ fn handle_profile(
             stream,
             400,
             &ApiError::new(400, "invalid_profile", error.to_string()).to_json(),
+            origin.as_deref(),
+        ),
+    }
+}
+
+/// Handle setup/first-run endpoints: provider discovery, model selection, filesystem browse, project init.
+fn handle_setup(
+    stream: &mut TcpStream,
+    service: &crate::profile::ProfileService,
+    route: &Route,
+    request: &Request,
+) -> std::io::Result<()> {
+    if request.headers.contains_key("origin") && allowed_cors_origin(request).is_none() {
+        return write_api_error(
+            stream,
+            &ApiError::new(
+                403,
+                "origin_refused",
+                "Setup API accepts only loopback browser origins",
+            ),
+        );
+    }
+
+    let operation = || -> Result<Value> {
+        match route {
+            Route::SetupProviderConnect => {
+                let body: crate::contracts::SetupConnectRequest = serde_json::from_value(
+                    request.json_body().map_err(|_| OcgError::config("invalid setup connect body"))?,
+                )
+                .map_err(|_| OcgError::config("invalid setup connect request"))?;
+                let name = body.name.trim();
+                if name.is_empty() {
+                    return Err(OcgError::config("provider name is required"));
+                }
+                if body.api_key.trim().is_empty() {
+                    return Err(OcgError::config("api key is required"));
+                }
+
+                // Both URLs are derived from the one operator-supplied value, so
+                // discovery and dispatch can never disagree about the base path.
+                let chat_endpoint = crate::setup::chat_endpoint_from_base(&body.endpoint)?;
+
+                // Discover before writing anything: a provider that cannot be
+                // reached must not leave a half-configured Profile behind.
+                let http = crate::http::NativeHttp::new()?;
+                let catalog = crate::setup::discover_catalog(&http, &body.endpoint, &body.api_key)?;
+
+                let current = service.current()?;
+                let (mut profile, revision) = current.as_ref()
+                    .ok_or_else(|| OcgError::config("profile must be bootstrapped first"))?
+                    .clone();
+
+                let existing_keys: Vec<&str> =
+                    profile.providers.keys().map(String::as_str).collect();
+                let vault = crate::vault::Vault::user_global()?;
+                let vault_names = vault.list()?;
+                let existing_refs: Vec<&str> = profile
+                    .providers
+                    .values()
+                    .filter_map(|p| p.credential_ref.as_deref())
+                    .chain(vault_names.iter().map(String::as_str))
+                    .collect();
+
+                let provider_key = crate::setup::normalize_provider_key(name, &existing_keys);
+                let credential_ref = crate::setup::normalize_credential_ref(name, &existing_refs);
+
+                profile.providers.insert(
+                    provider_key.clone(),
+                    crate::profile::Provider {
+                        label: name.to_string(),
+                        endpoint: Some(chat_endpoint),
+                        credential_ref: Some(credential_ref.clone()),
+                        protocol: Some(crate::provider_protocol::ProviderProtocol::OpenAiCompatible),
+                        catalog: Some(catalog.clone()),
+                    },
+                );
+                let new_revision = service.replace_with_credential(
+                    &revision,
+                    &profile,
+                    &vault,
+                    &credential_ref,
+                    body.api_key.trim(),
+                )?;
+                let models = crate::setup::catalog_models(&provider_key, &catalog);
+
+                Ok(
+                    serde_json::to_value(crate::contracts::SetupConnectResponse {
+                        api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
+                        provider_key,
+                        models,
+                        revision: new_revision,
+                    })
+                    .map_err(|error| OcgError::config(error.to_string()))?,
+                )
+            }
+
+            Route::SetupProviderRefresh => {
+                let body: crate::contracts::SetupRefreshRequest = serde_json::from_value(
+                    request
+                        .json_body()
+                        .map_err(|_| OcgError::config("invalid catalog refresh body"))?,
+                )
+                .map_err(|_| OcgError::config("invalid catalog refresh request"))?;
+                let (mut profile, revision) = service
+                    .current()?
+                    .ok_or_else(|| OcgError::config("Profile is missing"))?;
+                if revision != body.revision {
+                    return Err(OcgError::config(
+                        "Profile changed; refresh before discovering models",
+                    ));
+                }
+                let provider = profile
+                    .providers
+                    .get_mut(&body.provider_key)
+                    .ok_or_else(|| OcgError::config("provider is not configured"))?;
+                if !provider.wire_protocol().is_openai_chat_completions() {
+                    return Err(OcgError::config("model catalog discovery requires an OpenAI Chat Completions provider"));
+                }
+                let endpoint = provider
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| OcgError::config("provider endpoint is missing"))?;
+                let vault = crate::vault::Vault::user_global()?;
+                let secret = match provider.credential_ref.as_deref() {
+                    Some(reference) => vault
+                        .get(reference)?
+                        .ok_or_else(|| OcgError::config("provider credential is missing"))?,
+                    None => String::new(),
+                };
+                // Setup discovery has no Project; scheduled discovery can invoke this same operation.
+                let catalog = crate::setup::discover_catalog(
+                    &crate::http::NativeHttp::new()?,
+                    endpoint,
+                    &secret,
+                )?;
+                let models = crate::setup::catalog_models(&body.provider_key, &catalog);
+                provider.catalog = Some(catalog);
+                let revision = service.replace(&body.revision, &profile)?;
+                Ok(
+                    serde_json::to_value(crate::contracts::SetupConnectResponse {
+                        api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
+                        provider_key: body.provider_key,
+                        models,
+                        revision,
+                    })
+                    .map_err(|error| OcgError::config(error.to_string()))?,
+                )
+            }
+
+            Route::SetupModelsSave => {
+                let body: crate::contracts::SetupModelsRequest = serde_json::from_value(
+                    request.json_body().map_err(|_| OcgError::config("invalid setup models body"))?,
+                )
+                .map_err(|error| OcgError::config(format!("invalid setup models: {error}")))?;
+
+                // Get current profile
+                let current = service.current()?;
+                let (mut profile, _revision) = current.as_ref()
+                    .ok_or_else(|| OcgError::config("profile must be bootstrapped first"))?
+                    .clone();
+
+                // Ensure provider exists
+                if !profile.providers.contains_key(&body.provider_key) {
+                    return Err(OcgError::config(format!("provider '{}' not found", body.provider_key)));
+                }
+
+                if body.models.is_empty() {
+                    return Err(OcgError::config("select at least one model"));
+                }
+
+                let provider_key = body.provider_key.clone();
+                if !profile.providers.contains_key(&provider_key) {
+                    return Err(OcgError::config(format!(
+                        "provider '{provider_key}' is not configured"
+                    )));
+                }
+                let catalog = profile
+                    .providers
+                    .get(&provider_key)
+                    .and_then(|provider| provider.catalog.as_ref())
+                    .ok_or_else(|| OcgError::config("refresh provider models before selecting"))?
+                    .clone();
+                let mut selected = std::collections::BTreeSet::new();
+                for selection in &body.models {
+                    if !selected.insert(&selection.key)
+                        || !catalog.models.iter().any(|model| {
+                            model.id == selection.id
+                                && crate::setup::model_key(&provider_key, &model.id)
+                                    == selection.key
+                        })
+                    {
+                        return Err(OcgError::config(
+                            "selected model does not belong to the current provider catalog",
+                        ));
+                    }
+                }
+                if !body.models.iter().any(|s| s.key == body.default_model) {
+                    return Err(OcgError::config(
+                        "the default model must be one of the selected models",
+                    ));
+                }
+
+                // Replace this provider's models wholesale; keep other providers.
+                profile.models.retain(|_, m| m.provider != provider_key);
+                for selection in &body.models {
+                    let discovered = catalog
+                        .models
+                        .iter()
+                        .find(|model| model.id == selection.id)
+                        .ok_or_else(|| {
+                            OcgError::config("selected model is no longer in the catalog")
+                        })?;
+                    profile.models.insert(
+                        selection.key.clone(),
+                        crate::profile::Model {
+                            provider: provider_key.clone(),
+                            id: selection.id.clone(),
+                            variant: discovered.metadata.variant.clone(),
+                            variants: discovered.metadata.variants.clone().unwrap_or_default(),
+                            label: Some(discovered.label.clone()),
+                            metadata: Some(discovered.metadata.clone()),
+                        },
+                    );
+                }
+
+                profile.default_model = Some(body.default_model.clone());
+                profile.validate()?;
+
+                // Backend readiness is the only authority on whether setup may
+                // continue. Anything less than one runnable choice is reported
+                // as a failure instead of a silent success.
+                let runnable = profile.executable_choices(&crate::vault::Vault::user_global()?);
+                if !runnable.contains(&body.default_model) {
+                    return Err(OcgError::config(
+                        "selected default model is not executable: check provider configuration",
+                    ));
+                }
+
+                let new_revision = service.replace(&body.revision, &profile)?;
+
+                Ok(serde_json::to_value(crate::contracts::SetupModelsResponse {
+                    api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
+                    selected_models: selected.into_iter().cloned().collect(),
+                    default_model: body.default_model.clone(),
+                    runnable_choices: runnable,
+                    revision: new_revision.clone(),
+                }).map_err(|error| OcgError::config(error.to_string()))?)
+            }
+
+            Route::SetupBrowse => {
+                let body: crate::contracts::SetupBrowseRequest = serde_json::from_value(
+                    request.json_body().map_err(|_| OcgError::config("invalid setup browse body"))?,
+                )
+                .map_err(|error| OcgError::config(format!("invalid setup browse: {error}")))?;
+
+                let path = body.path.as_ref()
+                    .map(Path::new)
+                    .unwrap_or_else(|| Path::new(""));
+
+                let listing = crate::setup::browse_directory(path)?;
+
+                Ok(serde_json::to_value(crate::contracts::SetupBrowseResponse {
+                    current: listing.current,
+                    parent: listing.parent,
+                    entries: listing.entries.into_iter().map(|e| {
+                        crate::contracts::SetupDirectoryEntry {
+                            name: e.name,
+                            path: e.path,
+                            is_dir: e.is_dir,
+                        }
+                    }).collect(),
+                }).map_err(|error| OcgError::config(error.to_string()))?)
+            }
+
+            Route::SetupProjectInit => {
+                let body: crate::contracts::SetupProjectRequest = serde_json::from_value(
+                    request.json_body().map_err(|_| OcgError::config("invalid setup project body"))?,
+                )
+                .map_err(|error| OcgError::config(format!("invalid setup project: {error}")))?;
+
+                let root = Path::new(&body.root);
+
+                // Initialize the .ocg marker if it doesn't exist
+                let canonical_root = crate::setup::initialize_project_marker(root)?;
+
+                // Open canonical control service for this project
+                let canonical = crate::orchestration::canonical_control::CanonicalControlService::open(&canonical_root)
+                    .map_err(|error| OcgError::config(format!("cannot open canonical service: {}", error)))?;
+
+                let now = now_unix();
+                let response = canonical.register_project(&body.command_id, &canonical_root, now)?;
+
+                // Extract project name from root path
+                let name = canonical_root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Project".to_string());
+
+                Ok(serde_json::to_value(crate::contracts::SetupProjectResponse {
+                    api_version: crate::orchestration::canonical_control::CANONICAL_CONTROL_API_VERSION.to_string(),
+                    project_id: response.project.project_id,
+                    name,
+                    root: canonical_root.display().to_string(),
+                }).map_err(|error| OcgError::config(error.to_string()))?)
+            }
+
+            _ => unreachable!("not a Setup route"),
+        }
+    };
+
+    let origin = allowed_cors_origin(request);
+    match operation() {
+        Ok(value) => write_json_with_origin(stream, 200, &value, origin.as_deref()),
+        Err(error) => write_json_with_origin(
+            stream,
+            400,
+            &ApiError::new(400, "invalid_setup", error.to_string()).to_json(),
             origin.as_deref(),
         ),
     }
@@ -1475,6 +1807,12 @@ enum Route {
     ProfilePut,
     ProfileCredential,
     ProfilePreflight,
+    // Setup / first-run
+    SetupProviderConnect,
+    SetupProviderRefresh,
+    SetupModelsSave,
+    SetupBrowse,
+    SetupProjectInit,
     // Canonical Job/Attempt control surface (project import, configuration,
     // pre-attempt Job configuration, snapshots and the event tail).
     CanonicalProjects,
@@ -1515,6 +1853,14 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "profile"])
                 | ("OPTIONS", ["api", "v1", "profile", "bootstrap"])
                 | ("OPTIONS", ["api", "v1", "profile", "credentials"])
+                | ("POST", ["api", "v1", "setup", "connect"])
+                | ("POST", ["api", "v1", "setup", "models"])
+                | ("POST", ["api", "v1", "setup", "browse"])
+                | ("POST", ["api", "v1", "setup", "project"])
+                | ("OPTIONS", ["api", "v1", "setup", "connect"])
+                | ("OPTIONS", ["api", "v1", "setup", "models"])
+                | ("OPTIONS", ["api", "v1", "setup", "browse"])
+                | ("OPTIONS", ["api", "v1", "setup", "project"])
                 | ("GET", ["api", "v1", "canonical", "projects"])
                 | ("POST", ["api", "v1", "canonical", "projects", "import"])
                 | ("GET", ["api", "v1", "canonical", "projects", _])
@@ -1566,6 +1912,13 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         ("PUT", ["api", "v1", "profile"]) => Ok(Route::ProfilePut),
         ("POST", ["api", "v1", "profile", "credentials"]) => Ok(Route::ProfileCredential),
         ("OPTIONS", ["api", "v1", "profile", ..]) => Ok(Route::ProfilePreflight),
+        // Setup routes
+        ("POST", ["api", "v1", "setup", "connect"]) => Ok(Route::SetupProviderConnect),
+        ("POST", ["api", "v1", "setup", "refresh"]) => Ok(Route::SetupProviderRefresh),
+        ("POST", ["api", "v1", "setup", "models"]) => Ok(Route::SetupModelsSave),
+        ("POST", ["api", "v1", "setup", "browse"]) => Ok(Route::SetupBrowse),
+        ("POST", ["api", "v1", "setup", "project"]) => Ok(Route::SetupProjectInit),
+        ("OPTIONS", ["api", "v1", "setup", ..]) => Ok(Route::ProfilePreflight),
         ("GET", ["api", "v1", "canonical", "projects"]) => Ok(Route::CanonicalProjects),
         ("POST", ["api", "v1", "canonical", "projects", "import"]) => {
             Ok(Route::CanonicalProjectImport)
@@ -1666,6 +2019,10 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         ["api", "v1", "profile"] => Some("GET, PUT"),
         ["api", "v1", "profile", "bootstrap"] => Some("POST"),
         ["api", "v1", "profile", "credentials"] => Some("POST"),
+        ["api", "v1", "setup", "connect"] => Some("POST"),
+        ["api", "v1", "setup", "models"] => Some("POST"),
+        ["api", "v1", "setup", "browse"] => Some("POST"),
+        ["api", "v1", "setup", "project"] => Some("POST"),
         ["api", "v1", "canonical", "configuration"] => Some("GET, PUT"),
         ["api", "v1", "canonical", "configuration", "projects", _] => Some("PUT"),
         ["api", "v1", "canonical", "jobs", _, "configuration"] => Some("GET, PUT"),

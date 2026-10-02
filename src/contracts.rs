@@ -49,9 +49,7 @@ pub use crate::orchestration::canonical_control::{
 /// PWA reads it out of an opaque JSON value and must not be able to drift from
 /// the definition that actually confers authority.
 pub use crate::orchestration::domain::ExecutionWitness;
-pub use crate::profile::{
-    Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION,
-};
+pub use crate::profile::{Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION};
 pub use crate::provider_protocol::ProviderProtocol;
 
 /// The Profile control API version. Shared with the generated TypeScript, so a
@@ -179,6 +177,125 @@ pub struct JobLaunchResponse {
     pub duplicate: bool,
 }
 
+// -- setup / first-run ---------------------------------------------------------
+
+/// Request to connect a new provider and discover models.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupConnectRequest {
+    /// Human-readable provider name.
+    pub name: String,
+    /// Provider endpoint URL (base URL or full chat/completions URL).
+    pub endpoint: String,
+    /// API key for the provider.
+    pub api_key: String,
+}
+
+/// Response after connecting a provider and discovering models.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupConnectResponse {
+    #[ts(type = "ProfileApiVersion")]
+    pub api_version: String,
+    /// Provider key assigned by the backend.
+    pub provider_key: String,
+    /// Normalized models from the provider.
+    pub models: Vec<SetupModel>,
+    /// Profile revision after the provider was persisted, for the model save.
+    pub revision: String,
+}
+
+/// A model discovered from a provider.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupModel {
+    /// OCG model key (provider_key/model_id normalized).
+    pub key: String,
+    /// Upstream provider model id.
+    pub id: String,
+    /// Display label.
+    pub label: String,
+    /// Known metadata (may be empty).
+    pub metadata: crate::profile::ModelMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupRefreshRequest {
+    pub provider_key: String,
+    pub revision: String,
+}
+
+/// Request to save selected models.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupModelsRequest {
+    /// Provider key.
+    pub provider_key: String,
+    /// Models to enable, each carrying the OCG key and the upstream provider model id.
+    pub models: Vec<SetupModelSelection>,
+    /// Default model key.
+    pub default_model: String,
+    /// Profile revision for optimistic locking.
+    pub revision: String,
+}
+
+/// A model selected by the user during setup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupModelSelection {
+    /// OCG model key.
+    pub key: String,
+    /// Upstream provider model id.
+    pub id: String,
+}
+
+/// Response after saving models.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupModelsResponse {
+    #[ts(type = "ProfileApiVersion")]
+    pub api_version: String,
+    pub selected_models: Vec<String>,
+    pub default_model: String,
+    pub runnable_choices: Vec<String>,
+    pub revision: String,
+}
+
+/// Request to browse filesystem directories.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupBrowseRequest {
+    /// Path to browse (empty = home directory).
+    pub path: Option<String>,
+}
+
+/// A directory entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupDirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
+/// Response for directory listing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupBrowseResponse {
+    pub current: String,
+    pub parent: Option<String>,
+    pub entries: Vec<SetupDirectoryEntry>,
+}
+
+/// Request to initialize and import a project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupProjectRequest {
+    pub command_id: String,
+    /// Root path of the project.
+    pub root: String,
+}
+
+/// Response after project initialization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct SetupProjectResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub project_id: String,
+    pub name: String,
+    pub root: String,
+}
+
 // -- generation ---------------------------------------------------------------
 
 /// One generation config for the whole file.
@@ -216,6 +333,18 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     ProfileBootstrapRequest::export_all(cfg)?;
     ProfileReplaceRequest::export_all(cfg)?;
     ProfileCredentialRequest::export_all(cfg)?;
+    SetupConnectRequest::export_all(cfg)?;
+    SetupRefreshRequest::export_all(cfg)?;
+    SetupConnectResponse::export_all(cfg)?;
+    SetupModel::export_all(cfg)?;
+    SetupModelSelection::export_all(cfg)?;
+    SetupModelsRequest::export_all(cfg)?;
+    SetupModelsResponse::export_all(cfg)?;
+    SetupBrowseRequest::export_all(cfg)?;
+    SetupDirectoryEntry::export_all(cfg)?;
+    SetupBrowseResponse::export_all(cfg)?;
+    SetupProjectRequest::export_all(cfg)?;
+    SetupProjectResponse::export_all(cfg)?;
     ActivityCursor::export_all(cfg)?;
     ChangeSetFingerprintInputV1::export_all(cfg)?;
     CommandFingerprintInputV1::export_all(cfg)?;
@@ -403,7 +532,7 @@ fn clean(body: &str) -> String {
         if trimmed.starts_with("export type { ") && trimmed.ends_with(" };") {
             continue;
         }
-        out.push_str(line);
+        out.push_str(line.trim_end());
         out.push('\n');
     }
     while out.ends_with("\n\n") {

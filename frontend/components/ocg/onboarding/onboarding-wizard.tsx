@@ -23,7 +23,6 @@ import {
   ONBOARDING_STAGE_SUMMARY,
 } from "../bootstrap/presentation";
 import { StagePanel } from "./stage-panels";
-import { ProfilePanel } from "../profile/profile-panel";
 import { createProfileClient } from "../profile/profile-client";
 import {
   createHttpCanonicalControlClient,
@@ -117,7 +116,7 @@ function executableDefaultModel(
   if (!key || !runnable.includes(key)) return null;
   const record = profile?.models[key];
   const provider = record?.provider;
-  if (!record || record.placeholder || !provider) return null;
+  if (!record || !provider) return null;
   return { provider, model: key };
 }
 
@@ -134,7 +133,7 @@ function isExecutablePair(
   }
   if (!runnable.includes(model)) return false;
   const record = profile?.models[model];
-  return !!record && !record.placeholder && record.provider === provider;
+  return !!record && record.provider === provider;
 }
 
 export function OnboardingWizard() {
@@ -278,7 +277,7 @@ export function OnboardingWizard() {
         </header>
 
         <div className="mt-5 flex flex-col gap-3">
-          {controlUrl && <ProfilePanel />}
+          <Button size="sm" onClick={() => router.push("/onboarding?scenario=local-first-run")}>Connect Provider & Choose Models</Button>
           {onboarding.failure && (
             <FailureBanner failure={onboarding.failure} onAction={handleFailureAction} />
           )}

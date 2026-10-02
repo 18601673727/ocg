@@ -14,6 +14,7 @@ export type ProjectId = string;
 export type ProjectSummary = {
   id: ProjectId;
   name: string;
+  root?: string;
 };
 
 /** Project is the same product concept as ProjectSummary in this slice. */

@@ -50,6 +50,7 @@ impl Vault {
         if value.is_empty() {
             return Err(OcgError::config("credential value cannot be empty"));
         }
+        let _lock = self.lock()?;
         let mut credentials = self.read()?;
         credentials.0.insert(name.to_string(), value.to_string());
         self.write(&credentials)
@@ -57,12 +58,62 @@ impl Vault {
 
     pub fn remove(&self, name: &str) -> Result<bool> {
         validate_name(name)?;
+        let _lock = self.lock()?;
         let mut credentials = self.read()?;
         let removed = credentials.0.remove(name).is_some();
         if removed {
             self.write(&credentials)?;
         }
         Ok(removed)
+    }
+
+    fn lock(&self) -> Result<std::fs::File> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| OcgError::io("cannot create Vault directory", error))?;
+        }
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(self.path.with_extension("lock"))
+            .map_err(|error| OcgError::io("cannot open Vault lock", error))?;
+        fs2::FileExt::lock_exclusive(&lock)
+            .map_err(|error| OcgError::io("cannot lock Vault", error))?;
+        Ok(lock)
+    }
+
+    pub fn insert_with<T>(
+        &self,
+        name: &str,
+        value: &str,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        validate_name(name)?;
+        if value.is_empty() {
+            return Err(OcgError::config("credential value cannot be empty"));
+        }
+        let _lock = self.lock()?;
+        let mut credentials = self.read()?;
+        if credentials.0.contains_key(name) {
+            return Err(OcgError::config(
+                "credential name is already in use; reconnect provider",
+            ));
+        }
+        credentials.0.insert(name.to_string(), value.to_string());
+        self.write(&credentials)?;
+        match commit() {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                credentials.0.remove(name);
+                self.write(&credentials).map_err(|rollback| {
+                    OcgError::config(format!(
+                        "Provider save failed: {error}; credential rollback failed: {rollback}"
+                    ))
+                })?;
+                Err(error)
+            }
+        }
     }
 
     /// Get a single credential value by name.
@@ -155,7 +206,7 @@ impl Vault {
         restrict_permissions(&temp)?;
         std::fs::rename(&temp, &self.path)
             .map_err(|error| OcgError::io("cannot install OCG credential vault", error))?;
-        restrict_permissions(&self.path)
+        Ok(())
     }
 }
 

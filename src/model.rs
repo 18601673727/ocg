@@ -46,10 +46,10 @@ pub fn model_entry<'a>(data: &'a Value, key: &str) -> Result<&'a Map<String, Val
 
 /// `(provider, "provider/model_id")` for a model key.
 ///
-/// This resolves the registry entry only. Placeholder and runnability checks
+/// This resolves the registry entry only. Runnability checks
 /// belong to the *selection* paths (`Profile::select`, `lead_contract`,
 /// provider configuration), so diagnostics, worker routing and validation
-/// can still read every configured resource, including placeholders.
+/// can still read every configured resource, including incomplete configurations.
 pub fn model_full_id(data: &Value, key: &str) -> Result<(String, String)> {
     let entry = model_entry(data, key)?;
     let provider = entry

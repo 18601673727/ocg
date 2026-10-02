@@ -21,7 +21,7 @@ export function createJobLaunchObservability(command: JobLaunchCommand, jobId: s
     workerId: "lead",
     role: "lead",
     label: "Lead",
-    provider: "Command Code",
+    provider: "Provider",
     model: "DeepSeek V4.1 Flash",
     variant: "mid",
     status: "active",
