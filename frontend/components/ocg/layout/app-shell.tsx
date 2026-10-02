@@ -543,7 +543,6 @@ export function RuntimeWorkspace({
           onToggleInspector={() => setInspectorMode((value) => value === "collapsed" ? "docked" : "collapsed")}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileInspector={() => setMobileInspectorOpen(true)}
-          onNavigate={navigate}
           runtimeStatus={snapshot.status}
           runtimeAuthority={runtimeAuthority}
           syncStatus={sync?.status ?? null}

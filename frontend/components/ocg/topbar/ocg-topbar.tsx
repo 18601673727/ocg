@@ -1,20 +1,10 @@
 "use client";
 
-import { Menu } from "@base-ui/react/menu";
 import {
-  Bell,
   ChevronsLeft,
   ChevronsRight,
-  Home,
-  MoreHorizontal,
   PanelLeft,
   PanelRight,
-  ScrollText,
-  SlidersHorizontal,
-  Settings,
-  Table2,
-  Workflow,
-  MessageSquare,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -43,13 +33,6 @@ type OcgTopbarProps = {
   onToggleInspector: () => void;
   onOpenMobileSidebar: () => void;
   onOpenMobileInspector: () => void;
-  /**
-   * Opens a workspace, or closes it when it is already the active view. Omitting
-   * it hides the whole shortcut group, which is how a surface renders the topbar
-   * without workspace navigation.
-   */
-  onNavigate?: (view: WorkspaceView) => void;
-  /** Current workspace, used to highlight the matching shortcut. */
   activeView?: WorkspaceView;
   runtimeStatus: RuntimeStatus;
   /** Which runtime answers Chat, so the pill never names a fixture. */
@@ -57,18 +40,6 @@ type OcgTopbarProps = {
   /** Canonical reconciler sync status. Only degraded states are surfaced. */
   syncStatus?: RuntimeSyncStatus | null;
 };
-
-const WORKSPACE_SHORTCUTS: { view: WorkspaceView; icon: typeof Home; label: string }[] = [
-  { view: "chat", icon: MessageSquare, label: "Chat" },
-  { view: "home", icon: Home, label: "Home" },
-  { view: "attention", icon: Bell, label: "Attention" },
-  { view: "control-center", icon: SlidersHorizontal, label: "Control Center" },
-  { view: "ledger", icon: Table2, label: "Resource Ledger" },
-  { view: "job-execution", icon: Workflow, label: "Job Execution" },
-  { view: "logs", icon: ScrollText, label: "Logs" },
-  { view: "settings", icon: Settings, label: "Settings" },
-  { view: "canonical", icon: SlidersHorizontal, label: "OCG Control" },
-];
 
 const WORK_TYPE_DOT: Record<ChatSession["workType"], string> = {
   research: "bg-sky-500",
@@ -87,7 +58,6 @@ export function OcgTopbar({
   onToggleInspector,
   onOpenMobileSidebar,
   onOpenMobileInspector,
-  onNavigate,
   activeView = "chat",
   runtimeStatus,
   runtimeAuthority,
@@ -158,34 +128,6 @@ export function OcgTopbar({
           <StatusDot tone={sync.tone} pulse={sync.pulse} />
           <span className="font-medium">{syncStatusLabel(syncStatus)}</span>
         </div>
-      )}
-
-      {onNavigate && (
-        <Menu.Root>
-          <Menu.Trigger render={<Button variant="ghost" size="icon-xs" aria-label="Workspace views" title="Workspace views" />}>
-            <MoreHorizontal className="size-4" />
-          </Menu.Trigger>
-          <Menu.Portal>
-            <Menu.Positioner align="end" sideOffset={6} className="z-50">
-              <Menu.Popup className="min-w-52 rounded-lg border border-border bg-background p-1 shadow-lg">
-                {WORKSPACE_SHORTCUTS.map((shortcut) => {
-                  const Icon = shortcut.icon;
-                  return (
-                    <Menu.Item
-                      key={shortcut.view}
-                      onClick={() => { if (activeView !== shortcut.view) onNavigate(shortcut.view); }}
-                      aria-current={activeView === shortcut.view ? "page" : undefined}
-                      className={cn("flex cursor-pointer items-center gap-2 rounded-md px-3 py-2 text-[13px] outline-none data-[highlighted]:bg-muted", activeView === shortcut.view && "bg-muted font-medium")}
-                    >
-                      <Icon className="size-3.5" aria-hidden="true" />
-                      {shortcut.label}
-                    </Menu.Item>
-                  );
-                })}
-              </Menu.Popup>
-            </Menu.Positioner>
-          </Menu.Portal>
-        </Menu.Root>
       )}
 
       {inspectorControls && (
