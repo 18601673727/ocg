@@ -1165,20 +1165,28 @@ impl CanonicalControlService {
             credential_ref,
         };
 
+        // The protocol is declared by the provider the Profile names, not
+        // inferred from its key, label or host, and it is frozen with the rest
+        // of the dispatch.
+        let protocol = provider_entry.wire_protocol();
+
         let chat = self.chat_registrations.lock().ok().and_then(|registrations| {
             registrations.get(&request.command_id).map(|registration| {
                 (registration.sender.clone(), registration.cancelled.clone())
             })
         });
         let _call = match crate::provider_loop::admit_provider_call_with_events(
-            &mut domain,
-            &authority,
-            &executor.id,
-            provider_request,
-            &budget_config,
-            quota_facts,
-            runtime_handle.provider_dispatcher(),
-            provider_config,
+            crate::provider_loop::ProviderCallAdmission {
+                domain: &mut domain,
+                authority: &authority,
+                executor_id: &executor.id,
+                request: provider_request,
+                config: &budget_config,
+                quota: quota_facts,
+                dispatcher: runtime_handle.provider_dispatcher(),
+                provider_config,
+                protocol,
+            },
             chat.as_ref().map(|(sender, _)| sender.clone()),
             chat.as_ref()
                 .map(|(_, cancelled)| cancelled.clone())

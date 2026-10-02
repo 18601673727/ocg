@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useOcgControlUrl } from "./control-url";
 import { createProfileClient, runnableChoices, type Profile, type ProfileView } from "./profile-client";
+import type { ProviderProtocol } from "../contracts";
 
 /** Shared backend-backed editor for onboarding and Configuration. A draft is
  * never authoritative: every successful mutation installs the backend reply. */
@@ -62,7 +63,7 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
   function addProvider() {
     const key = providerKey.trim();
     if (!key || !draft || draft.providers[key]) return;
-    change(profile => { profile.providers[key] = { placeholder: false, label: key }; return profile; });
+    change(profile => { profile.providers[key] = { placeholder: false, label: key, protocol: "openai_compatible" }; return profile; });
     setModelProvider(key);
     setProviderKey("");
   }
@@ -107,7 +108,7 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
           {runnableChoices(draft).length === 0 && <p role="status">Placeholder-only Profile: configuration is valid, inference is unavailable.</p>}
           {view.runnable_choices.length === 0 && <p role="status">No executable provider/model: each provider needs an HTTPS endpoint, a credential reference, and a matching Vault credential.</p>}
           <div className="space-y-1"><h3 className="font-medium">Providers</h3>
-            {Object.entries(draft.providers).map(([key, provider]) => <div key={key} className="flex flex-wrap items-center gap-2"><span className="min-w-24">{key}{provider.placeholder ? " (placeholder)" : ""}</span><Input aria-label={`${key} label`} value={provider.label} onChange={event => change(profile => { profile.providers[key].label = event.target.value; return profile; })} /><Input aria-label={`${key} endpoint`} placeholder="https:// provider endpoint" value={provider.endpoint ?? ""} onChange={event => change(profile => { profile.providers[key].endpoint = event.target.value || null; return profile; })} /><Input aria-label={`${key} credential reference`} placeholder="vault credential name" value={provider.credential_ref ?? ""} onChange={event => change(profile => { profile.providers[key].credential_ref = event.target.value || null; return profile; })} /><Button size="xs" variant="outline" aria-label={`Remove provider ${key}`} onClick={() => change(profile => { delete profile.providers[key]; for (const [name, model] of Object.entries(profile.models)) if (model.provider === key) delete profile.models[name]; if (profile.defaultModel && !profile.models[profile.defaultModel]) profile.defaultModel = null; return profile; })}><Trash2 className="size-3" /></Button></div>)}
+            {Object.entries(draft.providers).map(([key, provider]) => <div key={key} className="flex flex-wrap items-center gap-2"><span className="min-w-24">{key}{provider.placeholder ? " (placeholder)" : ""}</span><Input aria-label={`${key} label`} value={provider.label} onChange={event => change(profile => { profile.providers[key].label = event.target.value; return profile; })} /><select aria-label={`${key} protocol`} className="rounded border border-border bg-background px-2" value={provider.protocol ?? "openai_compatible"} onChange={event => change(profile => { profile.providers[key].protocol = event.target.value as ProviderProtocol; return profile; })}><option value="openai_compatible">OpenAI-compatible</option><option value="openai">OpenAI native</option><option value="anthropic">Anthropic native</option></select><Input aria-label={`${key} endpoint`} placeholder="https:// provider endpoint" value={provider.endpoint ?? ""} onChange={event => change(profile => { profile.providers[key].endpoint = event.target.value || null; return profile; })} /><Input aria-label={`${key} credential reference`} placeholder="vault credential name" value={provider.credential_ref ?? ""} onChange={event => change(profile => { profile.providers[key].credential_ref = event.target.value || null; return profile; })} /><Button size="xs" variant="outline" aria-label={`Remove provider ${key}`} onClick={() => change(profile => { delete profile.providers[key]; for (const [name, model] of Object.entries(profile.models)) if (model.provider === key) delete profile.models[name]; if (profile.defaultModel && !profile.models[profile.defaultModel]) profile.defaultModel = null; return profile; })}><Trash2 className="size-3" /></Button></div>)}
             <div className="flex gap-2"><Input aria-label="New provider key" placeholder="provider key" value={providerKey} onChange={event => setProviderKey(event.target.value)} /><Button size="sm" variant="outline" onClick={addProvider}><Plus className="size-3" /> Provider</Button></div>
           </div>
           <div className="space-y-1"><h3 className="font-medium">Vault credential</h3>

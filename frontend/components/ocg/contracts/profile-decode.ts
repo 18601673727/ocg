@@ -8,7 +8,7 @@
  * purpose; see `decode.ts` for the rule.
  */
 
-import type { Model, Origin, Profile, ProfileView, Provider } from "./generated";
+import type { Model, Origin, Profile, ProfileView, Provider, ProviderProtocol } from "./generated";
 import { PROFILE_API_VERSION } from "./generated";
 import {
   array,
@@ -27,6 +27,15 @@ import {
   type Decoder,
 } from "./decode";
 
+// An unrecognized protocol is rejected rather than defaulted: a PWA that cannot
+// name the wire contract must not present the provider as if it knew one.
+const providerProtocol: Decoder<ProviderProtocol> = (input, path) => {
+  if (input === "anthropic") return yes("anthropic");
+  if (input === "openai") return yes("openai");
+  if (input === "openai_compatible") return yes("openai_compatible");
+  return bad(path || "protocol", "a known ProviderProtocol");
+};
+
 const provider: Decoder<Provider> = (input, path) => {
   const rec = record(input, path, "a Provider");
   if (!rec.ok) return rec;
@@ -41,11 +50,17 @@ const provider: Decoder<Provider> = (input, path) => {
   if (!endpoint.ok) return endpoint;
   const credentialRef = opt(rec.value, "credential_ref", string, path);
   if (!credentialRef.ok) return credentialRef;
+  // `protocol` is `skip_serializing_if`, so absence is normal and means the
+  // OpenAI-compatible contract. It must be read so an edit round-trip does not
+  // silently downgrade an Anthropic provider to that contract.
+  const protocol = opt(rec.value, "protocol", providerProtocol, path);
+  if (!protocol.ok) return protocol;
   return yes({
     placeholder: placeholder.value,
     label: label.value,
     endpoint: endpoint.value,
     credential_ref: credentialRef.value,
+    protocol: protocol.value,
   });
 };
 
