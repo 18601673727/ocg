@@ -42,8 +42,7 @@
  * returned.
  */
 
-import type { ProjectId } from "../project/domain";
-import type { ChatMessagesResponse, JobLaunchRequest } from "../contracts";
+import type { ChatMessagesResponse, ChatSendRequest, JobLaunchRequest } from "../contracts";
 import type {
   JobLaunchCommand,
   JobLaunchResult,
@@ -78,6 +77,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly control: CanonicalControlClient;
   private readonly profile: ReturnType<typeof createProfileClient>;
   private chatCounter = 0;
+  private readonly pendingSends = new Map<string, Promise<void>>();
+  private readonly historyEpochs = new Map<string, number>();
   private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string }>();
   private readonly sessionProjects = new Map<string, string>();
   private readonly projectHydrations = new Map<string, Promise<void>>();
@@ -237,10 +238,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.emit({ type: "conversation.history-loaded", sessionId: id, messages }, { projectId });
     const jobId = [...history.messages].reverse().find(message => message.role === "assistant" && message.job_id)?.job_id;
     if (jobId) void this.refreshExecution(id, projectId, jobId);
-    if (this.chatStreams.has(id)) return;
+    if (this.chatStreams.has(id) || this.pendingSends.has(id)) return;
     const replay = history.messages.find((message) => message.replay_job_id !== null);
-    const assistant = replay && messages.find((message) => message.id === replay.message_id);
-    if (replay?.replay_job_id && assistant) {
+    const assistant = replay && this.store.getSnapshot().messagesBySession[id]?.find(message =>
+      message.id === replay.message_id || (message.commandId === replay.command_id && message.role === replay.role));
+    if (replay?.replay_job_id && assistant && (assistant.status === "pending" || assistant.status === "streaming")) {
       this.emit({ type: "conversation.message-started", sessionId: id, message: { ...assistant, status: "streaming" } }, { projectId });
       this.openChatStream(id, replay.replay_job_id, assistant.id);
     }
@@ -249,14 +251,30 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private async refreshSessionHistory(sessionId: string): Promise<void> {
     const session = this.store.getSnapshot().sessions.find((item) => item.id === sessionId);
     if (!session?.projectId || !session.sessionId) return;
+    const epoch = this.historyEpochs.get(sessionId) ?? 0;
     try {
-      this.installHistory(await this.readSessionHistory(session.projectId, session.sessionId));
+      const history = await this.readSessionHistory(session.projectId, session.sessionId);
+      if (epoch === (this.historyEpochs.get(sessionId) ?? 0)) this.installHistory(history);
     } catch (cause) {
       this.emit({ type: "error", message: `Chat history refresh failed: ${cause instanceof Error ? cause.message : String(cause)}` });
     }
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
+    if (this.enqueueIfBusy(sessionId, input)) return;
+    const pending = this.pendingSends.get(sessionId);
+    if (pending) await pending;
+    const sending = this.sendChatTurn(sessionId, input);
+    this.pendingSends.set(sessionId, sending);
+    try {
+      await sending;
+    } finally {
+      if (this.pendingSends.get(sessionId) === sending) this.pendingSends.delete(sessionId);
+    }
+  }
+
+  private async sendChatTurn(sessionId: string, input: SendMessageInput): Promise<void> {
+    this.historyEpochs.set(sessionId, (this.historyEpochs.get(sessionId) ?? 0) + 1);
     const content = input.content.trim();
     if (!content) return;
 
@@ -321,7 +339,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       return;
     }
 
-    const request: JobLaunchRequest = {
+    const request: ChatSendRequest = {
+      selection: input.selection ?? null,
       command_id: commandId,
       draft_id: commandId,
       project_id: projectId,
@@ -375,21 +394,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   override async cancel(sessionId: string): Promise<void> {
+    this.pauseQueue(sessionId);
+    this.historyEpochs.set(sessionId, (this.historyEpochs.get(sessionId) ?? 0) + 1);
+    // Admission can still be in flight when an automatically dequeued turn is stopped.
+    await this.pendingSends.get(sessionId);
     const session = this.store.getSnapshot().sessions.find((item) => item.id === sessionId);
     const response = await this.control.cancelChatMessage(session?.sessionId ?? sessionId, session?.projectId);
-    if (isCanonicalRejection(response)) {
-      const streaming = this.streamingMessage(sessionId);
-      if (streaming) {
-        this.closeChatStream(sessionId, false);
-        this.emit({
-          type: "conversation.message-completed",
-          sessionId,
-          message: { ...streaming, content: streaming.content || response.message, status: "failed" },
-        });
-      }
+    if (isCanonicalRejection(response)) throw new Error(response.message);
+    if (!response.cancelled) {
+      void this.refreshSessionHistory(sessionId);
       return;
     }
-    if (!response.cancelled) return;
     const streaming = this.streamingMessage(sessionId);
     // Backend authority was revoked first; reflect it locally and stop the
     // SSE tail. A late provider `Failed("chat cancelled")` is ignored once
@@ -400,6 +415,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     } else {
       this.emit({ type: "cancelled", sessionId });
     }
+    void this.refreshSessionHistory(sessionId);
   }
 
   /**
@@ -512,6 +528,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       if (typeof record["error"] === "string") {
         const message = (record["error"] as string).slice(0, 1024);
         if (message === "chat cancelled") {
+          this.pauseQueue(sessionId);
           this.emit({ type: "cancelled", sessionId, messageId: assistantId });
         } else {
           const after = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);

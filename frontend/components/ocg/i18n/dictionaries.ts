@@ -8,6 +8,27 @@ import type { Locale } from "./locale";
  * plural forms (`one` / `other`) since Chinese does not pluralize.
  */
 export const en = {
+  "chat.executionSettings": "Execution settings",
+  "chat.provider": "Provider",
+  "chat.model": "Model",
+  "chat.effort": "Reasoning effort",
+  "chat.noModels": "No runnable models",
+  "chat.providerDefault": "Provider default",
+  "chat.effortUnsupported": "Not supported",
+  "chat.settingsLocked": "Agent is working. Settings are locked until this turn ends.",
+  "chat.selectorUnavailable": "Connect a backend to select a model.",
+  "chat.modelsLoading": "Loading models…",
+  "chat.settingsNextTurn": "Applied to the next message.",
+  "chat.queue": "Queue",
+  "chat.steer": "Steer now",
+  "chat.cancel": "Cancel execution",
+  "chat.queueHint": "Enter queues · Steer replaces the current execution",
+  "chat.queueCount": "{count} queued",
+  "chat.queuePaused": "Queue paused",
+  "chat.resumeQueue": "Resume queue",
+  "chat.removeQueued": "Remove queued message",
+  "chat.steerHint": "Replace the running turn using its current model settings",
+
   "chat.projectMissing": "This conversation is not associated with a project. Select a project and start a new conversation.",
   "chat.streamClosed": "The connection to the conversation stream closed. Refresh to load its latest recorded state.",
 
@@ -728,6 +749,27 @@ export type I18nKey = keyof typeof en;
 export type Dictionary = Record<I18nKey, string>;
 
 export const zh: Dictionary = {
+  "chat.executionSettings": "执行设置",
+  "chat.provider": "提供商",
+  "chat.model": "模型",
+  "chat.effort": "推理强度",
+  "chat.noModels": "无可运行模型",
+  "chat.providerDefault": "提供商默认",
+  "chat.effortUnsupported": "不支持",
+  "chat.settingsLocked": "Agent 正在工作，执行设置将在本轮结束后解锁。",
+  "chat.selectorUnavailable": "连接后端后可选择模型。",
+  "chat.modelsLoading": "正在加载模型…",
+  "chat.settingsNextTurn": "所选配置将用于下一条消息。",
+  "chat.queue": "排队",
+  "chat.steer": "立即调整",
+  "chat.cancel": "停止执行",
+  "chat.queueHint": "Enter 加入队列 · 立即调整会替换当前执行",
+  "chat.queueCount": "{count} 条排队中",
+  "chat.queuePaused": "队列已暂停",
+  "chat.resumeQueue": "继续队列",
+  "chat.removeQueued": "移除排队消息",
+  "chat.steerHint": "沿用当前模型设置，替换正在执行的轮次",
+
   "chat.projectMissing": "此对话未关联项目。请选择项目并新建对话。",
   "chat.streamClosed": "对话流连接已关闭。请刷新以加载最新记录。",
 

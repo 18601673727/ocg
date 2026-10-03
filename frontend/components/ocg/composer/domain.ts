@@ -23,6 +23,8 @@ export type ComposerJobCreateIntent = {
 };
 
 export type ComposerChatIntent = {
+  selection?: import("../contracts").ChatModelSelection;
+  mode?: "queue" | "steer";
   kind: "chat";
   text: string;
   raw: string;

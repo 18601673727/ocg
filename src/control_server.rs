@@ -1138,9 +1138,9 @@ fn handle_canonical(
             }
             Route::ChatSend => {
                 let body = body()?;
-                let request: crate::contracts::JobLaunchRequest = serde_json::from_value(body)
+                let request: crate::contracts::ChatSendRequest = serde_json::from_value(body)
                     .map_err(|error| OcgError::config(error.to_string()))?;
-                answer!(service.launch_chat(request, now)?)
+                answer!(service.launch_chat_selected(request.launch, request.selection, now)?)
             }
             Route::ChatConversations => {
                 answer!(service.chat_conversations(&query("project_id")?)?)

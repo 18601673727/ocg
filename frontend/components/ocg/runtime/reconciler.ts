@@ -490,6 +490,12 @@ function setMessages(snapshot: RuntimeSnapshot, sessionId: string, messages: Cha
 export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: AnyRuntimeEnvelope): ApplyResult {
   const sessionId = envelope.sessionId;
   switch (envelope.type) {
+    case "conversation.queue-updated": {
+      if (!sessionExists(snapshot, sessionId)) {
+        return { snapshot, diagnostics: [diag("unknown-session", "Queue for unknown session.", { sessionId })] };
+      }
+      return { snapshot: { ...snapshot, chatQueues: { ...snapshot.chatQueues, [sessionId]: envelope.payload } }, diagnostics: [] };
+    }
     case "conversation.history-loaded": {
       if (!sessionExists(snapshot, sessionId)) {
         return { snapshot, diagnostics: [diag("unknown-session", "History for unknown session.", { sessionId })] };

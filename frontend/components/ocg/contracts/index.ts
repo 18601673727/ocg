@@ -11,6 +11,8 @@
  */
 
 export type {
+  ChatSendRequest,
+  ChatModelSelection,
   ChatConversationView,
   ChatConversationsResponse,
   ChatMessageView,

@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
+  Square,
+  ListPlus,
+  X,
   Bot,
   Check,
   ChevronDown,
@@ -27,6 +30,9 @@ import { BORDER_TONE, StatusDot, TEXT_TONE, TOOL_STATUS } from "@/components/ocg
 import { ActivityPulse } from "../activity-pulse";
 import { useI18n, runtimeStateLabel, runtimeStatusDetail, chatFailureReason } from "../i18n";
 import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
+import { ModelSelector } from "./model-selector";
+import type { ChatModelSelection } from "../contracts";
+import type { QueuedChatMessage } from "../types";
 import { retryContent } from "./retry";
 import {
   applyComposerSuggestion,
@@ -283,10 +289,20 @@ function Composer({
   onDraftChange,
   onIntent,
   runtimeStatus,
+  busy,
+  queueing,
+  selection,
+  onSelectionChange,
+  onCancel,
 }: {
+  busy: boolean;
+  queueing: boolean;
+  selection?: ChatModelSelection;
+  onSelectionChange: (selection: ChatModelSelection) => void;
+  onCancel?: () => Promise<void>;
   draft: string;
   onDraftChange: (v: string) => void;
-  onIntent: (intent: ComposerIntent) => void;
+  onIntent: (intent: ComposerIntent) => void | Promise<void>;
   runtimeStatus: RuntimeStatus;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -295,6 +311,9 @@ function Composer({
   const [dismissedFor, setDismissedFor] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<{ raw: string; message: string } | null>(null);
   const chatReady = runtimeStatus.state === "connected";
+  const actionLock = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     const el = ref.current;
@@ -330,7 +349,8 @@ function Composer({
     ref.current?.focus();
   };
 
-  const submit = () => {
+  const submit = async (mode: "queue" | "steer" = "queue") => {
+    if (actionLock.current) return;
     const intent = parseComposerIntent(draft);
     if (intent.kind === "unknown-command") {
       setDismissedFor(draft);
@@ -338,9 +358,33 @@ function Composer({
       return;
     }
     if (intent.kind === "chat" && intent.text.length === 0) return;
+    if (intent.kind === "chat" && !chatReady) return;
+    actionLock.current = true;
+    setSubmitting(true);
     setCommandError(null);
-    onDraftChange("");
-    onIntent(intent);
+    try {
+      await onIntent(intent.kind === "chat" ? { ...intent, selection, mode } : intent);
+      onDraftChange("");
+    } catch (cause) {
+      setCommandError({ raw: draft, message: cause instanceof Error ? cause.message : String(cause) });
+    } finally {
+      actionLock.current = false;
+      setSubmitting(false);
+    }
+  };
+
+  const cancel = async () => {
+    if (!onCancel || actionLock.current) return;
+    actionLock.current = true;
+    setCancelling(true);
+    try {
+      await onCancel();
+    } catch (cause) {
+      setCommandError({ raw: draft, message: cause instanceof Error ? cause.message : String(cause) });
+    } finally {
+      actionLock.current = false;
+      setCancelling(false);
+    }
   };
 
   return (
@@ -348,11 +392,12 @@ function Composer({
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          submit();
+          void submit();
         }}
         className="mx-auto max-w-3xl"
       >
         <div className="rounded-lg border border-border bg-background shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition-colors focus-within:border-ring">
+          <ModelSelector selection={selection} onChange={onSelectionChange} busy={busy || submitting || cancelling} />
           <div className="relative">
             {suggestionsOpen && (
               <ul
@@ -398,6 +443,7 @@ function Composer({
             <textarea
               ref={ref}
               value={draft}
+              readOnly={submitting || cancelling}
               onChange={(e) => {
                 setDismissedFor(null);
                 onDraftChange(e.target.value);
@@ -423,7 +469,7 @@ function Composer({
                     applySuggestion(suggestions[activeIndex]);
                     return;
                   }
-                  submit();
+                  void submit();
                 }
               }}
               rows={1}
@@ -442,7 +488,7 @@ function Composer({
               {error}
             </p>
           )}
-          <div className="flex items-center gap-1 px-2 pb-2">
+          <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
             <Button
               type="button"
               variant="ghost"
@@ -462,18 +508,20 @@ function Composer({
               <Mic className="size-4" />
             </Button>
             <span className="ml-1 hidden text-[11px] text-muted-foreground sm:inline">
-              {t("chat.hint")}
+              {busy ? t("chat.queueHint") : t("chat.hint")}
             </span>
-            <Button
-              type="submit"
-              size="icon-sm"
-              disabled={!canSend}
-              aria-label={t("chat.send")}
-              title={chatReady ? t("chat.send") : `${t("chat.unavailable")}: ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
-              className="ml-auto rounded-md"
-            >
-              <ArrowUp className="size-4" />
-            </Button>
+            <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
+              {busy && onCancel && <Button type="button" variant="outline" size="xs" disabled={submitting || cancelling} onClick={() => void cancel()} title={t("chat.cancel")}>
+                {cancelling ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}{t("chat.cancel")}
+              </Button>}
+              {busy && <Button type="button" variant="outline" size="xs" disabled={!canSend || !chatReady || submitting || cancelling} onClick={() => void submit("steer")} title={t("chat.steerHint")}>
+                {t("chat.steer")}
+              </Button>}
+              <Button type="submit" size={queueing ? "xs" : "icon-sm"} disabled={!canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat")} aria-label={t(queueing ? "chat.queue" : "chat.send")} title={t(busy ? "chat.queueHint" : "chat.send")}>
+                {submitting ? <Loader2 className="size-4 animate-spin" /> : busy ? <ListPlus className="size-4" /> : <ArrowUp className="size-4" />}
+                {queueing && t("chat.queue")}
+              </Button>
+            </div>
           </div>
         </div>
         <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
@@ -492,7 +540,11 @@ type ChatViewProps = {
   session: ChatSession;
   messages: ChatMessage[];
   runtimeStatus: RuntimeStatus;
-  onComposerIntent: (intent: ComposerIntent) => void;
+  onComposerIntent: (intent: ComposerIntent) => void | Promise<void>;
+  onCancel?: () => Promise<void>;
+  queueState?: { queue: QueuedChatMessage[]; paused: boolean };
+  onRemoveQueued?: (id: string) => void;
+  onResumeQueue?: () => void;
   onRetryMessage: (messageId: string) => Promise<void>;
   /** Structured command surfaces are composed by the shell, not selected here. */
   composerSurface?: React.ReactNode;
@@ -509,10 +561,16 @@ export function ChatView({
   runtimeStatus,
   onComposerIntent,
   onRetryMessage,
+  onCancel,
+  queueState,
+  onRemoveQueued,
+  onResumeQueue,
   composerSurface,
   composerSurfaceKey,
 }: ChatViewProps) {
   const [draft, setDraft] = useState("");
+  const [selection, setSelection] = useState<ChatModelSelection>();
+  const busy = messages.some(message => message.role === "assistant" && (message.status === "streaming" || message.status === "pending"));
   const { t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
   const retryLock = useRef(false);
@@ -606,7 +664,26 @@ export function ChatView({
           </div>
         )}
       </div>
+      {!!queueState?.queue.length && (
+        <div className="mx-auto w-full max-w-3xl shrink-0 border-t border-border px-3 py-2 sm:px-5" aria-label={t("chat.queue")}>
+          <div className="mb-1 flex items-center gap-2 text-[11px] text-muted-foreground" role="status">
+            <ListPlus className="size-3.5" />{t("chat.queueCount", { count: queueState.queue.length })}
+            {queueState.paused && <><span>· {t("chat.queuePaused")}</span><Button type="button" size="xs" variant="ghost" disabled={runtimeStatus.state !== "connected"} onClick={onResumeQueue}>{t("chat.resumeQueue")}</Button></>}
+          </div>
+          <ol className="max-h-28 overflow-y-auto">
+            {queueState.queue.map((item, index) => <li key={item.id} className="flex items-center gap-2 py-1 text-xs">
+              <span className="text-muted-foreground">{index + 1}.</span><span className="min-w-0 flex-1 truncate">{item.input.content}</span>
+              <Button type="button" size="icon-xs" variant="ghost" aria-label={t("chat.removeQueued")} onClick={() => onRemoveQueued?.(item.id)}><X className="size-3" /></Button>
+            </li>)}
+          </ol>
+        </div>
+      )}
       <Composer
+        busy={busy}
+        queueing={busy || Boolean(queueState?.queue.length)}
+        selection={selection}
+        onSelectionChange={setSelection}
+        onCancel={onCancel}
         draft={draft}
         onDraftChange={setDraft}
         onIntent={onComposerIntent}

@@ -97,6 +97,7 @@ export type RuntimeSnapshot = {
   status: RuntimeStatus;
   sessions: ChatSession[];
   messagesBySession: Record<string, ChatMessage[]>;
+  chatQueues?: Record<string, { queue: import("../types").QueuedChatMessage[]; paused: boolean }>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
   executionBySession: Record<string, JobExecution | null>;
   accountingBySession: Record<string, JobAccounting | null>;
@@ -129,6 +130,8 @@ export interface OcgRuntimeClient {
   getSnapshot(): RuntimeSnapshot;
   getSyncState?(): RuntimeSyncState;
   cancel?(sessionId: string): Promise<void>;
+  removeQueuedMessage?(sessionId: string, id: string): void;
+  resumeQueue?(sessionId: string): void;
   /** Bind a session to its owning Project so a later send launches into that Project. */
   bindSessionProject?(sessionId: string, projectId: string): void;
   hydrateProject?(projectId: string): Promise<void>;

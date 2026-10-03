@@ -36,6 +36,7 @@ import {
   type CanonicalJobLaunchAck,
   type CanonicalJobSnapshot,
   type GlobalConfiguration,
+  type ChatSendRequest,
   type JobLaunchRequest,
   type JsonValue,
   type ProjectConfigurationView,
@@ -141,7 +142,7 @@ export interface CanonicalControlClient {
    * the same `JobLaunchResponse` the Job lane returns; the live provider
    * deltas arrive on `chatStreamUrl`, never from a fixture.
    */
-  sendChatMessage(request: JobLaunchRequest): Promise<CanonicalResult<CanonicalJobLaunchAck>>;
+  sendChatMessage(request: ChatSendRequest): Promise<CanonicalResult<CanonicalJobLaunchAck>>;
   /** Revoke one active chat turn. Returns whether a turn was stopped. */
   cancelChatMessage(sessionId: string, projectId?: string): Promise<CanonicalResult<{ sessionId: string; cancelled: boolean }>>;
   /** SSE tail for one chat turn. Consumed with `EventSource`, not `fetch`. */

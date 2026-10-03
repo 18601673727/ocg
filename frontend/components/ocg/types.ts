@@ -111,12 +111,17 @@ export type RuntimeStatus = {
 };
 
 export type SendMessageInput = {
+  selection?: import("./contracts").ChatModelSelection;
+  mode?: "queue" | "steer";
   content: string;
   /** Explicit owning Project from real UI state (the active project at send time). */
   projectId?: string;
 };
 
+export type QueuedChatMessage = { id: string; input: SendMessageInput };
+
 export type OcgRuntimeEvent =
+  | { type: "conversation.queue-updated"; sessionId: string; queue: QueuedChatMessage[]; paused: boolean }
   | { type: "conversation.history-loaded"; sessionId: string; messages: ChatMessage[] }
   | { type: "runtime.status-changed"; status: RuntimeStatus }
   | { type: "conversation.session-created"; session: ChatSession }

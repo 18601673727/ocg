@@ -299,6 +299,7 @@ enum CandidateRepository {
 
 #[derive(Debug)]
 struct ChatRegistration {
+    selection: Option<crate::contracts::ChatModelSelection>,
     sender: flume::Sender<ExecutionEvent>,
     cancelled: CallCancellation,
 }
@@ -1152,6 +1153,17 @@ impl CanonicalControlService {
             .map_err(|e| invalid(format!("cannot serialize request: {e}")))?;
         let mut hasher = Sha256::new();
         hasher.update(request_canonical.as_bytes());
+        let selection = self
+            .chat_registrations
+            .lock()
+            .map_err(|_| invalid("chat registrations poisoned"))?
+            .get(&request.command_id)
+            .and_then(|entry| entry.selection.clone());
+        if let Some(selection) = &selection {
+            hasher.update(
+                serde_json::to_vec(selection).map_err(|error| invalid(error.to_string()))?,
+            );
+        }
         let request_hash = format!("{:x}", hasher.finalize());
 
         // Check for existing command
@@ -1265,14 +1277,17 @@ impl CanonicalControlService {
             .contains_key(&request.command_id);
         let chat_selection = if is_chat {
             Some(profile.select(
-                project_config.defaults.get("model").and_then(Value::as_str),
+                selection.as_ref().map(|selection| selection.model.as_str())
+                    .or_else(|| project_config.defaults.get("model").and_then(Value::as_str)),
             )?)
         } else {
             None
         };
 
         // Resolve provider and model from project configuration defaults
-        let provider_key = match project_config.defaults.get("provider").and_then(Value::as_str)
+        let provider_key = match selection.as_ref()
+            .and_then(|_| chat_selection.map(|(_, model)| model.provider.as_str()))
+            .or_else(|| project_config.defaults.get("provider").and_then(Value::as_str))
             .or_else(|| chat_selection.map(|(_, model)| model.provider.as_str()))
         {
             Some(p) => p,
@@ -1300,7 +1315,8 @@ impl CanonicalControlService {
             }
         };
 
-        let model = match project_config.defaults.get("model").and_then(Value::as_str)
+        let model = match selection.as_ref().map(|selection| selection.model.as_str())
+            .or_else(|| project_config.defaults.get("model").and_then(Value::as_str))
             .or_else(|| chat_selection.map(|(key, _)| key))
         {
             Some(m) => m,
@@ -1377,6 +1393,30 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
+
+        let effort = selection
+            .as_ref()
+            .and_then(|selection| selection.effort.as_deref());
+        if let Some(effort) = effort {
+            let entry = profile
+                .models
+                .get(model)
+                .ok_or_else(|| invalid("selected model missing"))?;
+            let metadata = entry.metadata.as_ref();
+            let supported = metadata.and_then(|metadata| metadata.efforts.as_ref())
+                .is_some_and(|efforts| efforts.iter().any(|candidate| candidate == effort))
+                || entry.variants.iter().any(|candidate| candidate == effort)
+                || metadata.and_then(|metadata| metadata.variants.as_ref())
+                    .is_some_and(|variants| variants.iter().any(|candidate| candidate == effort));
+            if !supported
+                || !provider_entry.wire_protocol().is_openai_chat_completions()
+                || !matches!(effort, "none" | "minimal" | "low" | "medium" | "high" | "xhigh")
+            {
+                return Err(invalid(
+                    "selected reasoning effort is unsupported for this model/protocol",
+                ));
+            }
+        }
 
         // Validate endpoint
         let endpoint = match &provider_entry.endpoint {
@@ -1520,11 +1560,15 @@ impl CanonicalControlService {
         };
         // This snapshot becomes the immutable Call/DispatchIntent input. The
         // worker compacts these messages without reading the Conversation again.
-        let provider_request = serde_json::json!({
+        let mut provider_request = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": true,
         });
+
+        if let Some(effort) = effort {
+            provider_request["reasoning_effort"] = json!(effort);
+        }
 
         // Resolve quota facts for economic admission
         let quota_facts = crate::orchestration::budget::QuotaFacts::unknown();
@@ -1629,6 +1673,15 @@ impl CanonicalControlService {
         request: crate::contracts::JobLaunchRequest,
         _now: i64,
     ) -> Result<crate::contracts::JobLaunchResponse> {
+        self.launch_chat_selected(request, None, _now)
+    }
+
+    pub fn launch_chat_selected(
+        &self,
+        request: crate::contracts::JobLaunchRequest,
+        selection: Option<crate::contracts::ChatModelSelection>,
+        _now: i64,
+    ) -> Result<crate::contracts::JobLaunchResponse> {
         let _launch = self
             .launch_lock
             .lock()
@@ -1639,6 +1692,7 @@ impl CanonicalControlService {
         let cancelled = CallCancellation::new();
         if let Ok(mut registrations) = self.chat_registrations.lock() {
             registrations.insert(request.command_id.clone(), ChatRegistration {
+                selection,
                 sender: sender.clone(),
                 cancelled: cancelled.clone(),
             });

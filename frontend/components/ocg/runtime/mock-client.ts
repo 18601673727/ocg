@@ -55,6 +55,7 @@ export class RuntimeClientBase implements OcgRuntimeClient {
   private readonly listeners = new Set<(event: OcgRuntimeEvent) => void>();
   private readonly timers = new Map<string, Timer[]>();
   private nextId = 0;
+  private readonly drainingQueues = new Set<string>();
   /** The single runtime store. A backend-backed subclass projects real Job
    * execution through it rather than keeping a second runtime store. */
   protected readonly store: RuntimeStore;
@@ -207,6 +208,7 @@ export class RuntimeClientBase implements OcgRuntimeClient {
   }
 
   async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
+    if (this.enqueueIfBusy(sessionId, input)) return;
     const content = input.content.trim();
     if (!content) return;
 
@@ -223,6 +225,16 @@ export class RuntimeClientBase implements OcgRuntimeClient {
     if (!session) {
       this.emit({ type: "error", message: `Unknown mock session: ${sessionId}` });
       return;
+    }
+
+    if (input.mode === "steer") {
+      (this.timers.get(sessionId) ?? []).forEach(timer => clearTimeout(timer));
+      this.timers.delete(sessionId);
+      for (const message of snapshot.messagesBySession[sessionId] ?? []) {
+        if (message.role === "assistant" && message.status === "streaming") {
+          this.emit({ type: "cancelled", sessionId, messageId: message.id });
+        }
+      }
     }
 
     const userMessage: ChatMessage = {
@@ -280,6 +292,7 @@ export class RuntimeClientBase implements OcgRuntimeClient {
   }
 
   async cancel(sessionId: string): Promise<void> {
+    this.pauseQueue(sessionId);
     const timers = this.timers.get(sessionId) ?? [];
     timers.forEach((timer) => clearTimeout(timer));
     this.timers.delete(sessionId);
@@ -313,6 +326,65 @@ export class RuntimeClientBase implements OcgRuntimeClient {
    * Stamp a deterministic envelope, apply it through the canonical store, then
    * notify raw listeners. State is always updated before listeners run.
    */
+  protected enqueueIfBusy(sessionId: string, input: SendMessageInput): boolean {
+    if (!input.content.trim() || input.mode === "steer") return false;
+    const snapshot = this.store.getSnapshot();
+    if (!snapshot.sessions.some(session => session.id === sessionId)) return false;
+    const active = (snapshot.messagesBySession[sessionId] ?? []).some(message =>
+      message.role === "assistant" && (message.status === "streaming" || message.status === "pending"));
+    const existing = snapshot.chatQueues?.[sessionId];
+    if (!active && !existing?.queue.length) return false;
+    this.emit({ type: "conversation.queue-updated", sessionId,
+      queue: [...(existing?.queue ?? []), { id: crypto.randomUUID(), input: structuredClone(input) }],
+      paused: existing?.paused ?? false });
+    if (!active && !existing?.paused) this.drainQueue(sessionId);
+    return true;
+  }
+
+  protected pauseQueue(sessionId: string): void {
+    const queue = this.store.getSnapshot().chatQueues?.[sessionId]?.queue ?? [];
+    this.emit({ type: "conversation.queue-updated", sessionId, queue, paused: true });
+  }
+
+  removeQueuedMessage(sessionId: string, id: string): void {
+    const state = this.store.getSnapshot().chatQueues?.[sessionId];
+    if (!state) return;
+    this.emit({ type: "conversation.queue-updated", sessionId, queue: state.queue.filter(item => item.id !== id), paused: state.paused });
+  }
+
+  resumeQueue(sessionId: string): void {
+    const state = this.store.getSnapshot().chatQueues?.[sessionId];
+    if (!state) return;
+    this.emit({ type: "conversation.queue-updated", sessionId, queue: state.queue, paused: false });
+    this.drainQueue(sessionId);
+  }
+
+  private drainQueue(sessionId: string): void {
+    if (this.drainingQueues.has(sessionId)) return;
+    this.drainingQueues.add(sessionId);
+    queueMicrotask(async () => {
+      try {
+        const snapshot = this.store.getSnapshot();
+        const state = snapshot.chatQueues?.[sessionId];
+        if (!state?.queue.length || state.paused) return;
+        if (snapshot.status.state !== "connected") {
+          this.pauseQueue(sessionId);
+          return;
+        }
+        if ((snapshot.messagesBySession[sessionId] ?? []).some(message => message.role === "assistant" &&
+            (message.status === "streaming" || message.status === "pending"))) return;
+        const [next, ...queue] = state.queue;
+        this.emit({ type: "conversation.queue-updated", sessionId, queue, paused: false });
+        await this.sendMessage(sessionId, { ...next.input, mode: "steer" });
+      } catch (cause) {
+        this.pauseQueue(sessionId);
+        this.emit({ type: "error", message: cause instanceof Error ? cause.message : String(cause) });
+      } finally {
+        this.drainingQueues.delete(sessionId);
+      }
+    });
+  }
+
   protected emit(
     event: OcgRuntimeEvent,
     scope: { projectId?: ProjectId | null; commandId?: string } = {},
@@ -320,6 +392,10 @@ export class RuntimeClientBase implements OcgRuntimeClient {
     const envelope = this.stampEnvelope(event, scope);
     this.store.applyEnvelope(envelope);
     for (const listener of this.listeners) listener(event);
+    if (event.type === "conversation.message-completed" && event.message.role === "assistant") {
+      if (event.message.status === "completed") this.drainQueue(event.sessionId);
+      else this.pauseQueue(event.sessionId);
+    }
   }
 
   private stampEnvelope(

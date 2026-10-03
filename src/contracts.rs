@@ -162,6 +162,20 @@ pub struct JobLaunchRequest {
     pub resource_commitment: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct ChatSendRequest {
+    #[serde(flatten)]
+    pub launch: JobLaunchRequest,
+    #[serde(default)]
+    pub selection: Option<ChatModelSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ChatModelSelection {
+    pub model: String,
+    pub effort: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ChatConversationView {
     pub conversation_id: String,
@@ -377,6 +391,7 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     CanonicalJobSnapshot::export_all(cfg)?;
     CanonicalJobEvent::export_all(cfg)?;
     JobLaunchRequest::export_all(cfg)?;
+    ChatSendRequest::export_all(cfg)?;
     ChatConversationsResponse::export_all(cfg)?;
     ChatMessagesResponse::export_all(cfg)?;
     JobLaunchResponse::export_all(cfg)?;

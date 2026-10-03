@@ -164,6 +164,12 @@ export type ChatMessageView = { message_id: string, command_id: string, role: Ch
 export type ChatMessagesResponse = { api_version: CanonicalApiVersion, project_id: string, conversation: ChatConversationView, messages: Array<ChatMessageView>, };
 
 
+export type ChatModelSelection = { model: string, effort: string | null, };
+
+
+export type ChatSendRequest = { selection: ChatModelSelection | null, command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
+
+
 export type ChildCancellationPolicy = "cascade" | "soft_cascade" | "independent";
 
 

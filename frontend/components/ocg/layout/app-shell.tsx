@@ -151,7 +151,7 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, sendMessage, retryMessage, setActiveProfile, launchJob, sync } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, sendMessage, retryMessage, cancel, client, setActiveProfile, launchJob, sync } = useOcgRuntime();
   const {
     activeProjectId,
     activeProject,
@@ -480,12 +480,14 @@ export function RuntimeWorkspace({
       });
   }, [activeDraftScope, activeSession, launchJob, jobDrafts, navigate, view]);
 
-  const handleComposerIntent = useCallback((intent: ComposerIntent) => {
+  const handleComposerIntent = useCallback(async (intent: ComposerIntent) => {
+    if (intent.kind === "chat") {
+      if (!activeProjectId || !activeSessionKey) throw new Error("Select a conversation and project first.");
+      await sendMessage(activeSessionKey, { content: intent.text, projectId: activeProjectId, selection: intent.selection, mode: intent.mode });
+      return;
+    }
     dispatchComposerIntent(intent, {
-      chat: ({ text }) => {
-        if (!activeProjectId) return;
-        if (activeSessionKey) void sendMessage(activeSessionKey, { content: text, projectId: activeProjectId });
-      },
+      chat: () => {},
       "job.create": ({ seed }) => handleCreateJobDraft(seed),
     });
   }, [activeProjectId, activeSessionKey, handleCreateJobDraft, sendMessage]);
@@ -705,6 +707,10 @@ export function RuntimeWorkspace({
                 messages={messages}
                 runtimeStatus={snapshot.status}
                 onComposerIntent={handleComposerIntent}
+                onCancel={() => cancel(activeSession.id)}
+                queueState={runtimeSnapshot.chatQueues?.[activeSession.id]}
+                onRemoveQueued={id => client.removeQueuedMessage?.(activeSession.id, id)}
+                onResumeQueue={() => client.resumeQueue?.(activeSession.id)}
                 onRetryMessage={(messageId) => retryMessage(activeSession.id, messageId)}
                 composerSurface={activeDraft ? (
                   <JobDraftSurface

@@ -77,6 +77,7 @@ export function selectProjectSnapshot(
     ...snapshot,
     sessions: snapshot.sessions.filter((session) => allowed.has(session.id)),
     messagesBySession: keepBySession(snapshot.messagesBySession),
+    ...(snapshot.chatQueues ? { chatQueues: keepBySession(snapshot.chatQueues) } : {}),
     observabilityBySession: keepBySession(snapshot.observabilityBySession),
     executionBySession: keepBySession(snapshot.executionBySession),
     accountingBySession: keepBySession(snapshot.accountingBySession),

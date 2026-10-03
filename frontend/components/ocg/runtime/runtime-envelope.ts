@@ -61,6 +61,7 @@ export type RuntimeEnvelopePayloads = {
     /** Optional monotonic delta sequence within the turn. */
     deltaSequence?: number;
   };
+  "conversation.queue-updated": { queue: import("../types").QueuedChatMessage[]; paused: boolean };
   "conversation.message-completed": { message: ChatMessage };
   "activity.updated": { messageId: string; activity: ToolActivity };
   "observability.updated": { observability: RuntimeObservability };
@@ -77,6 +78,7 @@ export type RuntimeEnvelopePayloads = {
 export type RuntimeEventType = keyof RuntimeEnvelopePayloads;
 
 export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
+  "conversation.queue-updated",
   "conversation.history-loaded",
   "job.execution-updated",
   "job.launch-updated",
@@ -234,6 +236,8 @@ export function envelopeFromRuntimeEvent(
   };
 
   switch (event.type) {
+    case "conversation.queue-updated":
+      return { ...base, type: event.type, payload: { queue: event.queue, paused: event.paused } };
     case "conversation.history-loaded":
       return { ...base, type: event.type, payload: { messages: event.messages } };
     case "runtime.status-changed":
@@ -356,6 +360,8 @@ export class RuntimeEnvelopeFactory {
 export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
   const sessionId = envelope.sessionId ?? "";
   switch (envelope.type) {
+    case "conversation.queue-updated":
+      return { type: envelope.type, sessionId, queue: envelope.payload.queue, paused: envelope.payload.paused };
     case "conversation.history-loaded":
       return { type: envelope.type, sessionId, messages: envelope.payload.messages };
     case "job.execution-updated":
@@ -414,6 +420,12 @@ function diagnostic(
 function validatePayload(type: RuntimeEventType, payload: unknown): string | null {
   if (!isRecord(payload)) return `Event "${type}" payload must be an object.`;
   switch (type) {
+    case "conversation.queue-updated": {
+      if (typeof payload.paused !== "boolean" || !Array.isArray(payload.queue) || payload.queue.some(item =>
+        !isRecord(item) || !isNonEmptyString(item.id) || !isRecord(item.input) || typeof item.input.content !== "string"
+      )) return "queue must contain valid queued chat messages.";
+      return null;
+    }
     case "job.execution-updated": {
       const execution = payload.execution;
       if (!isRecord(execution) || !isNonEmptyString(execution.jobId)) return "execution.jobId is required.";
