@@ -1335,6 +1335,11 @@ async fn execute_provider_loop(
         if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
             || round_response.summary.tool_calls.is_empty()
         {
+            if round_response.summary.text.trim().is_empty() {
+                return Err(OcgError::config(
+                    "provider returned no user-visible assistant content",
+                ));
+            }
             return Ok(ProviderFinalResponse {
                 content: round_response.summary.text,
                 reasoning: round_response.summary.reasoning,

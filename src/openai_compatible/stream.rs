@@ -127,9 +127,13 @@ impl ChatStreamSummary {
             ChatStreamEvent::ReasoningDelta { delta } => self.reasoning.push_str(delta),
             ChatStreamEvent::ToolCallStart { index, id, name } => {
                 let slot = self.slot(*index);
+                // Compatible providers may repeat call metadata with argument
+                // fragments. Only a different call replaces accumulated JSON.
+                if !slot.id.is_empty() && slot.id != *id {
+                    slot.arguments.clear();
+                }
                 slot.id.clone_from(id);
                 slot.name.clone_from(name);
-                slot.arguments.clear();
             }
             ChatStreamEvent::ToolCallArgumentsDelta { index, id, delta } => {
                 let slot = self.slot(*index);
