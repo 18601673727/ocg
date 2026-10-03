@@ -17,6 +17,7 @@ import { CanonicalControlSurface } from "../canonical/canonical-control-surface"
 import { useOcgControlUrl } from "../profile/control-url";
 import type { ControlCenterView } from "../control-center/domain";
 import { useOcgRuntime } from "../runtime/runtime-context";
+import { retryContent } from "../chat/retry";
 import type { InspectorMode } from "../observability/inspector-state";
 import { HomeSurface } from "../home/home-surface";
 import { AttentionSurface } from "../attention/attention-surface";
@@ -150,7 +151,7 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, sendMessage, setActiveProfile, launchJob, sync } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, sendMessage, retryMessage, setActiveProfile, launchJob, sync } = useOcgRuntime();
   const {
     activeProjectId,
     activeProject,
@@ -518,6 +519,8 @@ export function RuntimeWorkspace({
 
   const messages = activeSession ? snapshot.messagesBySession[activeSession.id] ?? [] : [];
   const execution = activeSession ? snapshot.executionBySession[activeSession.id] ?? null : null;
+  const lastAssistant = messages.findLast(message => message.role === "assistant");
+  const retryableMessage = lastAssistant && retryContent(messages, lastAssistant.id) ? lastAssistant.id : null;
   const accounting = activeSession ? snapshot.accountingBySession[activeSession.id] ?? null : null;
   const observability = activeSession ? snapshot.observabilityBySession[activeSession.id] : undefined;
   const inspectorOpen = inspectorMode !== "collapsed";
@@ -627,6 +630,7 @@ export function RuntimeWorkspace({
                 key={`${activeProjectId}:${activeSession?.id}`}
                 execution={execution}
                 onOpenInspector={() => navigate("chat")}
+                onReexecute={activeSession && retryableMessage && snapshot.status.state === "connected" ? () => retryMessage(activeSession.id, retryableMessage) : undefined}
               />
             ) : (
               <NoExecutionNotice />
@@ -701,6 +705,7 @@ export function RuntimeWorkspace({
                 messages={messages}
                 runtimeStatus={snapshot.status}
                 onComposerIntent={handleComposerIntent}
+                onRetryMessage={(messageId) => retryMessage(activeSession.id, messageId)}
                 composerSurface={activeDraft ? (
                   <JobDraftSurface
                     project={activeProject}

@@ -24,6 +24,7 @@ type RuntimeContextValue = {
   diagnostics: readonly RuntimeDiagnostic[];
   createSession: (input: CreateSessionInput) => Promise<ChatSession>;
   sendMessage: (sessionId: string, input: SendMessageInput) => Promise<void>;
+  retryMessage: (sessionId: string, messageId: string) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
   requestAccessHandoff: () => Promise<void>;
   setOnboardingStage: (stage: OnboardingStageId) => Promise<void>;
@@ -73,6 +74,9 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   const cancel = useCallback(async (sessionId: string) => {
     await client.cancel?.(sessionId);
   }, [client]);
+  const retryMessage = useCallback(async (sessionId: string, messageId: string) => {
+    await client.retryMessage(sessionId, messageId);
+  }, [client]);
   const requestAccessHandoff = useCallback(async () => {
     await client.requestAccessHandoff?.();
   }, [client]);
@@ -112,6 +116,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       diagnostics,
       createSession,
       sendMessage,
+      retryMessage,
       cancel,
       requestAccessHandoff,
       setOnboardingStage,
@@ -120,7 +125,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       setActiveProfile,
       launchJob,
     }),
-    [authority, cancel, client, completeOnboarding, createSession, diagnostics, launchJob, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
+    [authority, cancel, client, completeOnboarding, createSession, diagnostics, launchJob, requestAccessHandoff, retryBootstrap, retryMessage, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
   );
   if (!hydrated) return null;
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;

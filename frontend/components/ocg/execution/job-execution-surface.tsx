@@ -1,20 +1,33 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageSurface, Pill, SectionTitle } from "../primitives";
 import { filterCalls, type JobExecution } from "./domain";
 import { runtimeStateLabel, useI18n } from "../i18n";
 
-export function JobExecutionSurface({ execution, onOpenInspector, embedded = false }: {
+export function JobExecutionSurface({ execution, onOpenInspector, onReexecute, embedded = false }: {
   execution: JobExecution;
   onOpenInspector?: () => void;
+  onReexecute?: () => Promise<void>;
   embedded?: boolean;
 }) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [attemptId, setAttemptId] = useState("");
+  const retryLock = useRef(false);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  async function reexecute() {
+    if (!onReexecute || retryLock.current) return;
+    retryLock.current = true;
+    setRetrying(true);
+    setRetryError(null);
+    try { await onReexecute(); }
+    catch (cause) { setRetryError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { retryLock.current = false; setRetrying(false); }
+  }
   const calls = filterCalls(execution.calls, { query }).filter((call) => !attemptId || call.attemptId === attemptId);
 
   return (
@@ -27,7 +40,9 @@ export function JobExecutionSurface({ execution, onOpenInspector, embedded = fal
         </div>
         <Pill tone={execution.state === "completed" ? "emerald" : execution.state === "failed" ? "red" : "slate"}>{runtimeStateLabel(t, execution.state)}</Pill>
         {onOpenInspector && <Button variant="outline" size="xs" onClick={onOpenInspector}>{t("execution.openInspector")}</Button>}
+        {onReexecute && (execution.state === "failed" || execution.state === "cancelled") && <Button variant="outline" size="xs" disabled={retrying} onClick={() => void reexecute()}>{t("execution.reexecute")}</Button>}
       </header>
+      {retryError && <p role="alert" className="text-destructive">{retryError}</p>}
       <section className="rounded border border-border p-3">
         <SectionTitle>{t("execution.attempts")}</SectionTitle>
         <p className="mb-2 text-muted-foreground">{t("execution.authoritativeAttempt", { id: execution.authoritativeAttemptId ?? t("common.none") })}</p>

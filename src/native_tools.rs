@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub const TOOL_OUTPUT_CAP: usize = 64 * 1024;
+const FILE_READ_CONTENT_CAP: usize = TOOL_OUTPUT_CAP / 8;
 pub const TOOL_STDERR_CAP: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,8 +285,8 @@ impl NativeToolRegistry {
         vec![
             NativeToolDefinition {
                 name: "filesystem.read",
-                description: "Read a bounded UTF-8 file inside the current Project root.",
-                parameters: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1}}}),
+                description: "Read a bounded UTF-8 file inside the current Project root. offset and limit count bytes, not lines. Each read returns at most 8192 bytes. Omit limit for the default bounded read; use metadata.nextOffset to continue a truncated read.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0,"description":"Zero-based byte offset, not a line number. Default: 0."},"limit":{"type":"integer","minimum":1,"description":"Maximum bytes to read, not lines. Omit to use the default bounded read."}}}),
                 permission: PermissionClass::ReadOnly,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemRead,
@@ -306,7 +307,7 @@ impl NativeToolRegistry {
             },
             NativeToolDefinition {
                 name: "filesystem.search",
-                description: "Search Project files with rg using argv-only execution.",
+                description: "Search file contents with an rg regular expression under a Project-relative directory. path must be a directory, not a file. Use process.exec with rg argv to search one file.",
                 parameters: json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{"query":{"type":"string"},"path":{"type":"string"}}}),
                 permission: PermissionClass::ReadOnly,
                 capability: "filesystem",
@@ -331,8 +332,8 @@ impl NativeToolRegistry {
             },
             NativeToolDefinition {
                 name: "process.exec",
-                description: "Execute one program with argv directly inside the current Project root.",
-                parameters: json!({"type":"object","additionalProperties":false,"required":["program"],"properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"}}}),
+                description: "Execute one direct executable with argv inside the current Project root. cwd must be relative (use . for the root). Shell interpreters, -c scripts, pipes, redirects and command chains are not supported. Supply each argument separately; use sed -n START,ENDp to read lines.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["program"],"properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string","description":"Project-relative directory; use . for the root. Absolute paths are rejected."}}}),
                 permission: PermissionClass::ProcessExec,
                 capability: "process",
                 executor: NativeToolExecutorBinding::ProcessExec,
@@ -644,8 +645,9 @@ impl NativeToolExecutor {
             .get("limit")
             .and_then(Value::as_u64)
             .map(|value| value as usize)
-            .unwrap_or(TOOL_OUTPUT_CAP);
-        let cap = limit.min(TOOL_OUTPUT_CAP);
+            .unwrap_or(FILE_READ_CONTENT_CAP);
+        // Leave room for JSON escaping and pagination metadata in the result cap.
+        let cap = limit.min(FILE_READ_CONTENT_CAP);
         let mut file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(error) => {
@@ -684,7 +686,11 @@ impl NativeToolExecutor {
             success: true,
             output: json!({"path": relative_display(&self.root, &path), "content": content}),
             truncated,
-            metadata: json!({"remaining": truncated}),
+            metadata: json!({
+                "remaining": truncated,
+                "offset": start,
+                "nextOffset": start.saturating_add(bytes.len().min(cap) as u64),
+            }),
             error: None,
         }
     }

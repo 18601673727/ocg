@@ -20,11 +20,36 @@ require.extensions[".ts"] = (module, filename) => {
 const { CanonicalOcgRuntimeClient } = require(path.join(frontend, "components/ocg/runtime/canonical-launch-client.ts"));
 const { RuntimeEnvelopeFactory, validateRuntimeEnvelope } = require(path.join(frontend, "components/ocg/runtime/runtime-envelope.ts"));
 const { selectProjectSnapshot } = require(path.join(frontend, "components/ocg/project/selectors.ts"));
+const { retryContent } = require(path.join(frontend, "components/ocg/chat/retry.ts"));
 
 async function main() {
-  const [controlUrl, projectId] = process.argv.slice(2);
+  const [controlUrl, projectId, retrySessionId, retryMessageId] = process.argv.slice(2);
   const client = CanonicalOcgRuntimeClient.connect("local-ready", controlUrl, fetch);
   await client.hydrateProject(projectId);
+  if (retrySessionId) {
+    const session = client.getSnapshot().sessions.find(item => item.sessionId === retrySessionId);
+    assert.ok(session);
+    const messages = client.getSnapshot().messagesBySession[session.id];
+    const failed = messages.find(item => item.id === retryMessageId);
+    assert.equal(failed.status, "failed");
+    assert.ok(retryContent(messages.map(item => item.id === failed.id ? { ...item, status: "cancelled" } : item), failed.id));
+    await assert.rejects(client.retryMessage(session.id, messages.find(item => item.role === "user").id));
+    const streams = [];
+    global.EventSource = class {
+      static CONNECTING = 0;
+      static CLOSED = 2;
+      constructor(url) { streams.push(new URL(url)); }
+      close() {}
+    };
+    await client.retryMessage(session.id, failed.id);
+    await assert.rejects(client.retryMessage(session.id, failed.id));
+    assert.equal(streams.length, 1);
+    const after = client.getSnapshot().messagesBySession[session.id];
+    assert.equal(after.find(item => item.id === failed.id).status, "failed");
+    assert.notEqual(after.at(-1).commandId, failed.commandId);
+    process.stdout.write(JSON.stringify({ job_id: streams[0].searchParams.get("job_id") }));
+    return;
+  }
   const session = await client.createSession({ projectId, title: "", workType: "coding" });
   assert.equal(session.title, "");
   assert.equal(client.getSyncState().status, "live");

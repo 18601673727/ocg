@@ -27,6 +27,7 @@ import { BORDER_TONE, StatusDot, TEXT_TONE, TOOL_STATUS } from "@/components/ocg
 import { ActivityPulse } from "../activity-pulse";
 import { useI18n, runtimeStateLabel, runtimeStatusDetail, chatFailureReason } from "../i18n";
 import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
+import { retryContent } from "./retry";
 import {
   applyComposerSuggestion,
   matchComposerSuggestions,
@@ -220,7 +221,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
 
 /* ---------- message row ---------- */
 
-function MessageRow({ message }: { message: ChatMessage }) {
+function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage; onRetry?: () => void; retryDisabled?: boolean }) {
   const { t } = useI18n();
   if (message.role === "tool") {
     return (
@@ -263,6 +264,7 @@ function MessageRow({ message }: { message: ChatMessage }) {
            {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
              {chatFailureReason(t, message)}
            </p>}
+           {onRetry && <Button className="mt-2" size="xs" variant="outline" disabled={retryDisabled} onClick={onRetry}>{t("common.retry")}</Button>}
            {message.status !== "completed" && message.status !== "pending" && (
              <span className="mt-1 block text-[11px] text-muted-foreground">
                {runtimeStateLabel(t, message.status)}
@@ -491,6 +493,7 @@ type ChatViewProps = {
   messages: ChatMessage[];
   runtimeStatus: RuntimeStatus;
   onComposerIntent: (intent: ComposerIntent) => void;
+  onRetryMessage: (messageId: string) => Promise<void>;
   /** Structured command surfaces are composed by the shell, not selected here. */
   composerSurface?: React.ReactNode;
   composerSurfaceKey?: string | null;
@@ -505,12 +508,31 @@ export function ChatView({
   messages,
   runtimeStatus,
   onComposerIntent,
+  onRetryMessage,
   composerSurface,
   composerSurfaceKey,
 }: ChatViewProps) {
   const [draft, setDraft] = useState("");
   const { t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
+  const retryLock = useRef(false);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+
+  async function retry(messageId: string) {
+    if (retryLock.current || !retryContent(messages, messageId)) return;
+    retryLock.current = true;
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      await onRetryMessage(messageId);
+    } catch (cause) {
+      setRetryError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      retryLock.current = false;
+      setRetrying(false);
+    }
+  }
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -552,8 +574,12 @@ export function ChatView({
               </div>
             )}
             {messages.map((m) => (
-              <MessageRow key={m.id} message={m} />
+              <MessageRow key={m.id} message={m}
+                onRetry={retryContent(messages, m.id) ? () => void retry(m.id) : undefined}
+                retryDisabled={retrying || runtimeStatus.state !== "connected"}
+              />
             ))}
+            {retryError && <p role="alert" className="text-sm text-destructive">{retryError}</p>}
             {messages.length > 0 && (
               <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-muted/20 px-2.5 py-2 text-[12px] text-muted-foreground">
                 {runtimeStatus.state === "connected" ? (

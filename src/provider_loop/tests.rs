@@ -87,6 +87,7 @@ impl ProviderStub {
                                     0
                                 );
                             } else {
+                                if label == "slow-head" { thread::sleep(Duration::from_secs(31)); }
                                 let tool_messages = body["messages"].as_array().expect("messages")
                                     .iter().filter(|message| message["role"] == "tool")
                                     .collect::<Vec<_>>();
@@ -705,6 +706,40 @@ fn streaming_success_and_http_failure_settle_the_attempt() {
         }
         fixture.no_residue();
     }
+}
+
+#[test]
+fn reasoning_provider_can_wait_more_than_thirty_seconds_for_a_response_head() {
+    let upstream = ProviderStub::start();
+    let mut fixture = Fixture::new();
+    let (call, envelope, _events) = fixture.admitted(&upstream.endpoint, "slow-head", true);
+    fixture.execute(envelope).expect("reasoning provider response");
+    upstream.request("slow-head");
+    upstream.closure("slow-head");
+    fixture.terminal(&call, "completed");
+    fixture.no_residue();
+}
+
+#[test]
+fn native_file_read_reports_byte_pagination_for_continuation() {
+    let root = tempfile::tempdir().expect("project");
+    std::fs::write(root.path().join("sample"), "first line\nsecond line\n").expect("file");
+    let executor = crate::native_tools::NativeToolExecutor::new(root.path()).expect("native tools");
+    let read = |arguments| executor.execute("filesystem.read", &arguments,
+        crate::native_tools::PermissionClass::ReadOnly, PermissionPolicy::allow_all(), &AtomicBool::new(false));
+    let first = read(json!({"path":"sample","offset":0,"limit":5}));
+    assert!(first.success && first.truncated);
+    assert_eq!(first.output["content"], "first");
+    assert_eq!(first.metadata["nextOffset"], 5);
+    let next = read(json!({"path":"sample","offset":first.metadata["nextOffset"]}));
+    assert!(next.success && !next.truncated);
+    assert_eq!(next.output["content"], " line\nsecond line\n");
+    std::fs::write(root.path().join("quoted"), "\"".repeat(20_000)).expect("large file");
+    let large = read(json!({"path":"quoted"}));
+    assert!(large.success && large.truncated);
+    assert_eq!(large.output["content"].as_str().expect("structured content").len(), 8192);
+    assert_eq!(large.metadata["nextOffset"], 8192);
+    assert!(large.to_value().to_string().len() <= crate::native_tools::TOOL_OUTPUT_CAP);
 }
 
 #[test]

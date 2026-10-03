@@ -492,6 +492,7 @@ export const en = {
   // -- execution / job -----------------------------------------------------------
   "execution.title": "Job execution",
   "execution.openInspector": "Open inspector",
+  "execution.reexecute": "Run again",
   "execution.noExecution": "No Job execution is available.",
   "execution.inspector": "Job Inspector",
   "execution.overview": "Overview",
@@ -1193,6 +1194,7 @@ export const zh: Dictionary = {
 
   "execution.title": "任务执行",
   "execution.openInspector": "打开检查器",
+  "execution.reexecute": "重新执行",
   "execution.noExecution": "暂无可用的任务执行。",
   "execution.inspector": "任务检查器",
   "execution.overview": "总览",

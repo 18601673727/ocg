@@ -1335,7 +1335,7 @@ fn handle_chat_stream(
     // `started_at` was fixed when the ActiveChat was created, so every
     // attach and reconnect shares the same deadline and a reconnect can
     // never extend the execution lifetime.
-    let overall = Duration::from_secs(300);
+    let overall = crate::orchestration::canonical_control::CHAT_EXECUTION_TIMEOUT;
     let deadline = started_at + overall;
     let mut last_heartbeat = std::time::Instant::now();
     let heartbeat = Duration::from_secs(10);

@@ -534,6 +534,28 @@ impl SmokeHarness {
         format!("smoke-{}", self.sequence)
     }
 
+    pub fn retry_failed_turn(&mut self, chat: &Chat, message_id: &str) -> Result<Chat> {
+        self.alive()?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut command = Command::new("node");
+        command.env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .current_dir(root)
+            .arg(root.join("tests/smoke/canonical-session.cjs"))
+            .arg(format!("http://{}", self.address.ok_or("no OCG address")?))
+            .args([&chat.project_id, &chat.session_id, message_id]);
+        let mut process = Process::spawn(&mut command, &self.path(""), "canonical-retry", self.timeouts)?;
+        let status = process.wait_until(self.operation_deadline(self.timeouts.http))?
+            .ok_or("canonical retry timed out")?;
+        if !status.success() {
+            return Err(format!("canonical retry: {status}\n{}", log(&process.stderr)).into());
+        }
+        Ok(Chat {
+            project_id: chat.project_id.clone(), session_id: chat.session_id.clone(),
+            job_id: string(&serde_json::from_str(&log(&process.stdout))?, "job_id")?,
+        })
+    }
+
     pub fn send_chat(
         &mut self,
         project_id: &str,

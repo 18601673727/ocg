@@ -39,6 +39,9 @@ pub const MAX_PROVIDER_ERROR_BODY: usize = 4096;
 /// rate-limit condition the caller can actually act on.
 const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Reasoning providers can queue a round longer than ordinary HTTP requests.
+const PROVIDER_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Time allowed to read a whole body once the head has arrived.
 ///
 /// This is a total read budget rather than an idle timeout, so it has to scale
@@ -945,7 +948,7 @@ async fn native_post_json_stream(
         )));
     }
     let client = ntex::client::ClientBuilder::new()
-        .response_timeout(RESPONSE_HEAD_TIMEOUT)
+        .response_timeout(PROVIDER_RESPONSE_HEAD_TIMEOUT)
         .response_payload_limit(MAX_BODY_BYTES as usize)
         .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
         .build(ntex::SharedCfg::default())
@@ -1014,7 +1017,7 @@ async fn native_post_json_stream(
 /// Build an ntex client whose secure connections tunnel through the given
 /// `http://` proxy endpoint. The caller keeps the original target URL; only
 /// this connector dials the proxy and performs `CONNECT`.
-async fn proxy_client_for(endpoint: &str) -> Result<ntex::client::Client> {
+async fn proxy_client_for(endpoint: &str, head_timeout: Duration) -> Result<ntex::client::Client> {
     let dial = parse_proxy_dial(endpoint)?;
     let tls_config = proxy_tls_config()?;
     let connector = ProxySecureConnector {
@@ -1025,7 +1028,7 @@ async fn proxy_client_for(endpoint: &str) -> Result<ntex::client::Client> {
     };
     let connector = ntex::client::Connector::default().secure_connector(connector);
     ntex::client::ClientBuilder::new()
-        .response_timeout(RESPONSE_HEAD_TIMEOUT)
+        .response_timeout(head_timeout)
         .response_payload_limit(MAX_BODY_BYTES as usize)
         .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
         .connector::<()>(connector)
@@ -1037,7 +1040,7 @@ async fn proxy_client_for(endpoint: &str) -> Result<ntex::client::Client> {
 }
 
 async fn native_get_via_proxy(url: &str, token: Option<&GithubToken>, endpoint: &str) -> Result<HttpResponse> {
-    let client = proxy_client_for(endpoint).await?;
+    let client = proxy_client_for(endpoint, RESPONSE_HEAD_TIMEOUT).await?;
     let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     let headers = github_headers_for(url, token.is_some());
     if headers.authorization { if let Some(token) = token { request = request.header("Authorization", format!("Bearer {}", token.expose())); } }
@@ -1080,7 +1083,7 @@ async fn native_get_with_headers_via_proxy(
     headers: &[(String, String)],
     endpoint: &str,
 ) -> Result<HttpResponse> {
-    let client = proxy_client_for(endpoint).await?;
+    let client = proxy_client_for(endpoint, RESPONSE_HEAD_TIMEOUT).await?;
     let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
@@ -1106,7 +1109,7 @@ async fn native_post_json_via_proxy(
             "request to {url} exceeded the {MAX_BODY_BYTES} byte limit"
         )));
     }
-    let client = proxy_client_for(endpoint).await?;
+    let client = proxy_client_for(endpoint, RESPONSE_HEAD_TIMEOUT).await?;
     let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
@@ -1144,7 +1147,7 @@ async fn native_post_json_stream_via_proxy(
             "request to {url} exceeded the {MAX_BODY_BYTES} byte limit"
         )));
     }
-    let client = proxy_client_for(endpoint).await?;
+    let client = proxy_client_for(endpoint, PROVIDER_RESPONSE_HEAD_TIMEOUT).await?;
     let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());

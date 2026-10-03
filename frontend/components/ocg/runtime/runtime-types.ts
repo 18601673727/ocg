@@ -124,6 +124,7 @@ export interface OcgRuntimeClient {
   getBootstrap(): Promise<BootstrapState>;
   createSession(input: CreateSessionInput): Promise<ChatSession>;
   sendMessage(sessionId: string, input: SendMessageInput): Promise<void>;
+  retryMessage(sessionId: string, messageId: string): Promise<void>;
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;
   getSnapshot(): RuntimeSnapshot;
   getSyncState?(): RuntimeSyncState;

@@ -12,6 +12,30 @@ use provider::Reply;
 use serde_json::json;
 
 #[test]
+fn failed_chat_retry_creates_a_new_job_and_preserves_history() -> Result<()> {
+    let mut smoke = SmokeHarness::start(Reply::Text(vec![]))?;
+    smoke.configure_provider()?;
+    let project = smoke.add_project("retry-project")?;
+    let project_id = string(&project, "project_id")?;
+    let session_id = smoke.create_untitled_session(&project_id)?;
+    let original = smoke.send_chat(&project_id, &session_id, "Review this project")?;
+    assert!(smoke.consume_chat(&original).is_err());
+    smoke.assert_terminal_execution(&original, "failed")?;
+    let messages = smoke.json("GET", &format!(
+        "/api/v1/canonical/chat/messages?project_id={project_id}&session_id={session_id}"
+    ), None)?;
+    let failed = array(&messages, "messages")?.iter().find(|item| item["role"] == "assistant").ok_or("assistant missing")?;
+    let message_id = string(failed, "message_id")?;
+    smoke.provider_reply(Reply::Text(vec!["Review completed".into()]))?;
+    let retry = smoke.retry_failed_turn(&original, &message_id)?;
+    assert_ne!(original.job_id, retry.job_id);
+    assert_eq!(smoke.consume_chat(&retry)?, "Review completed");
+    smoke.assert_terminal_execution(&retry, "completed")?;
+    smoke.assert_terminal_execution(&original, "failed")?;
+    smoke.finish()
+}
+
+#[test]
 fn onboarding_same_session_two_chat_turns() -> Result<()> {
     let mut smoke = SmokeHarness::start(Reply::Text(vec![
         "SMOKE_".into(),

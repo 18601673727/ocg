@@ -6,6 +6,7 @@ import type {
   SendMessageInput,
 } from "../types";
 import { createScenarioFixture } from "./scenarios";
+import { retryContent } from "../chat/retry";
 import {
   advanceOnboarding,
   resolveAccessHandoff,
@@ -195,6 +196,14 @@ export class RuntimeClientBase implements OcgRuntimeClient {
     };
     this.emit({ type: "conversation.session-created", session: clone(session) });
     return clone(session);
+  }
+
+  async retryMessage(sessionId: string, messageId: string): Promise<void> {
+    const snapshot = this.store.getSnapshot();
+    const content = retryContent(snapshot.messagesBySession[sessionId] ?? [], messageId);
+    const session = snapshot.sessions.find(item => item.id === sessionId);
+    if (!content || !session) throw new Error("This turn cannot be retried while another turn is active.");
+    await this.sendMessage(sessionId, { content, projectId: session.projectId });
   }
 
   async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {

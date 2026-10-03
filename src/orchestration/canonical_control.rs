@@ -24,6 +24,7 @@ const CONFIG_FILE: &str = "configuration.json";
 /// provider terminal event is recorded. This is transport retention only, not
 /// durable chat history.
 const CHAT_REPLAY_LIFETIME: Duration = Duration::from_secs(300);
+pub(crate) const CHAT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(900);
 
 fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
@@ -330,7 +331,7 @@ struct ActiveChat {
     cancelled: CallCancellation,
     sender: flume::Sender<ExecutionEvent>,
     buffer: std::sync::Arc<ChatEventBuffer>,
-    /// When the turn started. The 300s execution deadline is anchored here,
+    /// When the turn started. The execution deadline is anchored here,
     /// so every SSE attach/reconnect of the same turn shares one deadline.
     started_at: Instant,
 }
