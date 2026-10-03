@@ -2,7 +2,6 @@
 
 import { CircleDot, ExternalLink, Maximize2, Minimize2, X } from "lucide-react";
 import { useState } from "react";
-import { humanizeStatus } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -23,7 +22,7 @@ import {
   type InspectorMode,
   type InspectorTab,
 } from "../observability/inspector-state";
-import { useI18n, type I18nKey } from "../i18n";
+import { runtimeStateLabel, useI18n, type I18nKey } from "../i18n";
 
 type JobInspectorProps = {
   execution: JobExecution;
@@ -62,7 +61,7 @@ function JobContext({ execution, compact = false }: { execution: JobExecution; c
           dot
           pulse={JOB_STATE[execution.state].pulse}
         >
-          {humanizeStatus(execution.state)}
+          {runtimeStateLabel(t, execution.state)}
         </Pill>
         <span className="text-[11px] text-muted-foreground">
           {t("execution.callsSettledShort", { settled, total })}

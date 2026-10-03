@@ -46,6 +46,7 @@ export type RuntimeSyncStatus =
   | "error";
 
 export type RuntimeSyncState = {
+  authority?: "canonical" | "mock";
   status: RuntimeSyncStatus;
   scope: RuntimeSnapshotScope | null;
   cursor: RuntimeCursor | null;
@@ -212,7 +213,7 @@ function ownerProjectForJob(jobId: string): ProjectId | null {
 function hasScopeViolation(sync: RuntimeSyncState, envelope: AnyRuntimeEnvelope): boolean {
   if (envelope.projectId === null) return false;
   if (!envelope.sessionId) return false;
-  const owner = sync.sessionProjects[envelope.sessionId] ?? ownerProjectForSession(envelope.sessionId);
+  const owner = sync.sessionProjects[envelope.sessionId] ?? (sync.authority === "canonical" ? null : ownerProjectForSession(envelope.sessionId));
   return owner !== null && owner !== envelope.projectId;
 }
 
@@ -223,7 +224,7 @@ function hasPayloadScopeViolation(sync: RuntimeSyncState, envelope: AnyRuntimeEn
     return envelope.payload.item.projectId !== undefined && envelope.payload.item.projectId !== envelope.projectId;
   }
   if (envelope.type === "ledger.entry-added" || envelope.type === "ledger.entry-updated") {
-    const owner = ownerProjectForJob(envelope.payload.entry.jobId);
+    const owner = sync.authority === "canonical" ? null : ownerProjectForJob(envelope.payload.entry.jobId);
     return owner !== null && owner !== envelope.projectId;
   }
   return false;
@@ -298,6 +299,7 @@ function installValidatedSnapshot(state: RuntimeState, envelope: RuntimeSnapshot
   }
 
   const nextSync: RuntimeSyncState = {
+    authority: envelope.snapshot.authority,
     status: "live",
     scope: envelope.scope,
     cursor: envelope.cursor,
@@ -320,7 +322,7 @@ function installValidatedSnapshot(state: RuntimeState, envelope: RuntimeSnapshot
       envelope.snapshot.sessions.flatMap((session) => {
         const owner = envelope.scope.kind === "project"
           ? envelope.scope.projectId
-          : ownerProjectForSession(session.id);
+          : session.projectId ?? (envelope.snapshot.authority === "canonical" ? null : ownerProjectForSession(session.id));
         return owner ? [[session.id, owner] as const] : [];
       }),
     ),

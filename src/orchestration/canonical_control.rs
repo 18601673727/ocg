@@ -762,8 +762,22 @@ impl CanonicalControlService {
                 Ok(ChatMessageView {
                     message_id: message.id.as_str().to_string(),
                     command_id: origin.command_id.clone(),
-                    role,
+                    job_id: Some(origin.job_id.clone()),
+                    role: role.clone(),
                     state: message.state,
+                    // Dispatch failures are already redacted at the provider boundary.
+                    // Diagnostics belong to the view, never to Conversation blocks.
+                    failure_reason: if role == ChatMessageRole::Assistant
+                        && message.state == MessageLifecycle::Failed
+                        && origin.attempt_state != "cancelled"
+                    {
+                        origin
+                            .failure_reason
+                            .as_ref()
+                            .map(|reason| reason.chars().take(1024).collect::<String>())
+                    } else {
+                        None
+                    },
                     content: message
                         .blocks
                         .into_iter()

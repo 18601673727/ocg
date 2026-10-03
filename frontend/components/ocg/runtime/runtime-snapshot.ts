@@ -8,7 +8,6 @@
 
 import type { BootstrapState } from "../bootstrap/types";
 import { isRecord, isNonEmptyString, isNonNegativeInteger } from "@/lib/narrow";
-import { createBootstrapFixture } from "../bootstrap/fixtures";
 import { executionFixtureForSession, accountingFixtureForSession } from "../execution/fixtures";
 import { assembleJobExecution } from "../execution/domain";
 import { CANONICAL_API_VERSION } from "../contracts";
@@ -109,7 +108,11 @@ export function sameSnapshotScope(a: RuntimeSnapshotScope, b: RuntimeSnapshotSco
 
 /** An explicitly empty baseline. It never pretends to hold fixture data. */
 export function emptyRuntimeSnapshot(scenario: ScenarioId): RuntimeSnapshot {
-  const bootstrap: BootstrapState = createBootstrapFixture(scenario);
+  const bootstrap: BootstrapState = {
+    access: { state: "local", remote: false, handoffState: "unavailable" },
+    onboarding: null, resources: [], connections: [], models: [],
+    capabilities: [], profiles: [], providers: [], ready: false,
+  };
   return {
     scenario,
     status: { state: "connecting", detail: "Runtime snapshot is not loaded." },

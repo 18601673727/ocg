@@ -1,5 +1,6 @@
 "use client";
 
+import { useI18n, type I18nKey } from "../i18n";
 import { useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, ArrowRight, Check, Loader2, FolderOpen, ChevronRight, AlertCircle } from "lucide-react";
@@ -14,10 +15,10 @@ import type { SetupModel, SetupBrowseResponse } from "../contracts";
 
 type SetupStep = "provider" | "models" | "projects";
 
-const STEP_LABELS: Record<SetupStep, string> = {
-  provider: "Connect Provider",
-  models: "Choose Models",
-  projects: "Add Projects",
+const STEP_LABELS: Record<SetupStep, I18nKey> = {
+  provider: "setup.provider",
+  models: "setup.models",
+  projects: "setup.projects",
 };
 
 const STEPS: SetupStep[] = ["provider", "models", "projects"];
@@ -33,6 +34,7 @@ interface ConnectResult {
 }
 
 export function SetupWizard() {
+  const { t } = useI18n();
   const router = useRouter();
   const controlUrl = useOcgControlUrl();
   const { completeOnboarding } = useOcgRuntime();
@@ -65,12 +67,12 @@ export function SetupWizard() {
 
   const handleConnectProvider = useCallback(async () => {
     if (!controlUrl) {
-      setError("No loopback control endpoint available.");
+      setError(t("setup.noEndpoint"));
       return;
     }
     const apiKey = apiKeyInput.current?.value.trim() ?? "";
     if (!provider.name.trim() || !provider.endpoint.trim() || !apiKey) {
-      setError("All fields are required.");
+      setError(t("setup.required"));
       return;
     }
 
@@ -111,12 +113,12 @@ export function SetupWizard() {
 
       setStep("models");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Failed to connect provider.");
+      setError(cause instanceof Error ? cause.message : t("setup.connectFailed"));
     } finally {
       if (apiKeyInput.current) apiKeyInput.current.value = "";
       setLoading(false);
     }
-  }, [controlUrl, provider]);
+  }, [controlUrl, provider, t]);
 
   const handleRefreshModels = useCallback(async () => {
     if (!controlUrl || !connectResult) return;
@@ -131,20 +133,20 @@ export function SetupWizard() {
       setSelectedModels(retained);
       setDefaultModel(retained.has(defaultModel) ? defaultModel : retained.values().next().value ?? "");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Failed to refresh provider models.");
+      setError(cause instanceof Error ? cause.message : t("setup.refreshFailed"));
     } finally {
       setLoading(false);
     }
-  }, [controlUrl, connectResult, profileRevision, selectedModels, defaultModel]);
+  }, [controlUrl, connectResult, profileRevision, selectedModels, defaultModel, t]);
 
   const handleSaveModels = useCallback(async () => {
     if (!controlUrl || !connectResult) return;
     if (selectedModels.size === 0) {
-      setError("Select at least one model.");
+      setError(t("setup.selectModel"));
       return;
     }
     if (!defaultModel || !selectedModels.has(defaultModel)) {
-      setError("Choose a default model.");
+      setError(t("setup.chooseDefault"));
       return;
     }
 
@@ -154,7 +156,7 @@ export function SetupWizard() {
       const setupClient = createSetupClient(controlUrl, fetch);
       const modelsToSave = Array.from(selectedModels).map((key) => {
         const model = connectResult.models.find((m) => m.key === key);
-        if (!model) throw new Error("Refresh the provider model catalog before selecting.");
+        if (!model) throw new Error(t("setup.refreshCatalog"));
         return { key: model.key, id: model.id };
       });
       const result = await setupClient.saveModels(
@@ -165,7 +167,7 @@ export function SetupWizard() {
       );
 
       if (result.runnable_choices.length === 0) {
-        setError("No runnable models after save. Check provider configuration.");
+        setError(t("setup.noRunnable"));
         return;
       }
 
@@ -183,11 +185,11 @@ export function SetupWizard() {
 
       setStep("projects");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Failed to save models.");
+      setError(cause instanceof Error ? cause.message : t("setup.saveFailed"));
     } finally {
       setLoading(false);
     }
-  }, [controlUrl, connectResult, selectedModels, defaultModel, profileRevision]);
+  }, [controlUrl, connectResult, selectedModels, defaultModel, profileRevision, t]);
 
   const handleBrowse = useCallback(async (path: string) => {
     if (!controlUrl) return;
@@ -197,11 +199,11 @@ export function SetupWizard() {
       const result = await setupClient.browseDirectory(path);
       setBrowseResult(result);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Failed to browse directory.");
+      setError(cause instanceof Error ? cause.message : t("setup.browseFailed"));
     } finally {
       setLoading(false);
     }
-  }, [controlUrl]);
+  }, [controlUrl, t]);
 
   const handleSelectFolder = useCallback((path: string) => {
     setSelectedFolders((current) =>
@@ -220,7 +222,7 @@ export function SetupWizard() {
   const handleImportProjects = useCallback(async () => {
     if (!controlUrl) return;
     if (selectedFolders.length === 0) {
-      setError("Select at least one folder.");
+      setError(t("setup.selectFolder"));
       return;
     }
 
@@ -252,11 +254,11 @@ export function SetupWizard() {
       const projectParam = imported.length > 0 ? `&project=${encodeURIComponent(imported[0].id)}` : "";
       router.push(`/?scenario=local-ready${projectParam}`);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Failed to import projects.");
+      setError(cause instanceof Error ? cause.message : t("setup.importFailed"));
     } finally {
       setLoading(false);
     }
-  }, [controlUrl, selectedFolders, completeOnboarding, router, setActiveProject]);
+  }, [controlUrl, selectedFolders, completeOnboarding, router, setActiveProject, t]);
 
   return (
     <div className="flex min-h-dvh justify-center bg-background px-4 py-8 text-foreground sm:py-12">
@@ -264,13 +266,13 @@ export function SetupWizard() {
         <header>
           <div className="flex items-center gap-2">
             <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase">
-              OCG setup
+              {t("setup.title")}
             </span>
           </div>
-          <h1 className="mt-3 text-[18px] font-semibold tracking-tight">{STEP_LABELS[step]}</h1>
+          <h1 className="mt-3 text-[18px] font-semibold tracking-tight">{t(STEP_LABELS[step])}</h1>
 
           {/* Step indicator */}
-          <ol className="mt-4 grid grid-cols-3 gap-1" aria-label="Setup steps">
+          <ol className="mt-4 grid grid-cols-3 gap-1" aria-label={t("setup.steps")}>
             {STEPS.map((s, i) => {
               const isCurrent = s === step;
               const isDone = i < currentIndex;
@@ -292,7 +294,7 @@ export function SetupWizard() {
                     >
                       {isDone ? <Check className="size-2.5" /> : i + 1}
                     </span>
-                    <span className="truncate text-[10px] text-muted-foreground">{STEP_LABELS[s]}</span>
+                    <span className="truncate text-[10px] text-muted-foreground">{t(STEP_LABELS[s])}</span>
                   </div>
                 </li>
               );
@@ -364,27 +366,27 @@ export function SetupWizard() {
           </Button>
 
           <span className="text-[11px] text-muted-foreground">
-            Step {currentIndex + 1} of {STEPS.length}
+            {t("setup.progress", { step: currentIndex + 1, total: STEPS.length })}
           </span>
 
           {step === "provider" && (
             <Button size="sm" onClick={() => void handleConnectProvider()} disabled={loading}>
               {loading ? <Loader2 className="size-3.5 animate-spin" /> : null}
-              Connect & Discover Models
+              {t("setup.connect")}
               <ArrowRight className="size-3.5" aria-hidden="true" />
             </Button>
           )}
           {step === "models" && (
             <Button size="sm" onClick={() => void handleSaveModels()} disabled={loading}>
               {loading ? <Loader2 className="size-3.5 animate-spin" /> : null}
-              Save & Continue
+              {t("setup.save")}
               <ArrowRight className="size-3.5" aria-hidden="true" />
             </Button>
           )}
           {step === "projects" && (
             <Button size="sm" onClick={() => void handleImportProjects()} disabled={loading || selectedFolders.length === 0}>
               {loading ? <Loader2 className="size-3.5 animate-spin" /> : null}
-              Import & Start
+              {t("setup.start")}
               <ArrowRight className="size-3.5" aria-hidden="true" />
             </Button>
           )}
@@ -407,17 +409,18 @@ function ConnectProviderPanel({
   onChange: (state: ProviderState) => void;
   loading: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-1.5">
         <label htmlFor="setup-provider-name" className="text-[12px] font-medium">
-          Provider Name
+          {t("setup.providerName")}
         </label>
         <input
           id="setup-provider-name"
           type="text"
           className="rounded-md border border-border bg-background px-3 py-2 text-[13px]"
-          placeholder="Provider"
+          placeholder={t("setup.providerName")}
           value={provider.name}
           onChange={(event) => onChange({ ...provider, name: event.target.value })}
           disabled={loading}
@@ -425,7 +428,7 @@ function ConnectProviderPanel({
       </div>
       <div className="flex flex-col gap-1.5">
         <label htmlFor="setup-provider-endpoint" className="text-[12px] font-medium">
-          Provider Endpoint
+          {t("setup.providerEndpoint")}
         </label>
         <input
           id="setup-provider-endpoint"
@@ -439,7 +442,7 @@ function ConnectProviderPanel({
       </div>
       <div className="flex flex-col gap-1.5">
         <label htmlFor="setup-provider-apikey" className="text-[12px] font-medium">
-          API Key
+          {t("setup.apiKey")}
         </label>
         <input
           id="setup-provider-apikey"
@@ -472,16 +475,17 @@ function ChooseModelsPanel({
   onToggleModel: (key: string) => void;
   onSetDefault: (key: string) => void;
 }) {
+  const { t } = useI18n();
   if (models.length === 0) {
-    return <p className="text-[12px] text-muted-foreground">No models discovered from this provider.</p>;
+    return <p className="text-[12px] text-muted-foreground">{t("setup.noModels")}</p>;
   }
 
   return (
     <div className="flex flex-col gap-3">
       <p className="text-[12px] text-muted-foreground">
-        Select the models you want to use. The default model is used for new chats.
+        {t("setup.modelsHint")}
       </p>
-      <Button size="sm" variant="outline" onClick={onRefresh} disabled={loading}>Refresh models</Button>
+      <Button size="sm" variant="outline" onClick={onRefresh} disabled={loading}>{t("setup.refreshModels")}</Button>
       <ul className="divide-y divide-border rounded-md border border-border">
         {models.map((model) => {
           const selected = selectedModels.has(model.key);
@@ -494,7 +498,7 @@ function ChooseModelsPanel({
                 checked={selected}
                 disabled={loading}
                 onChange={() => onToggleModel(model.key)}
-                aria-label={`Select ${model.label}`}
+                aria-label={t("setup.selectNamedModel", { model: model.label })}
               />
               <div className="min-w-0 flex-1">
                 <p className="truncate text-[12px] font-medium">{model.label}</p>
@@ -506,7 +510,7 @@ function ChooseModelsPanel({
                   disabled={loading}
                   onClick={() => onSetDefault(model.key)}
                 >
-                  {isDefault ? "Default" : "Set default"}
+                  {t(isDefault ? "setup.default" : "setup.setDefault")}
                 </Button>
               )}
             </li>
@@ -538,10 +542,11 @@ function AddProjectsPanel({
   onAddManualPath: () => void;
   loading: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex flex-col gap-4">
       <p className="text-[12px] text-muted-foreground">
-        Select local folders to import as Projects. Each folder becomes an OCG Project.
+        {t("setup.projectsHint")}
       </p>
 
       {/* Manual path entry */}
@@ -561,14 +566,14 @@ function AddProjectsPanel({
           disabled={loading}
         />
         <Button size="sm" variant="outline" onClick={onAddManualPath} disabled={loading || !manualPath.trim()}>
-          Add
+          {t("common.add")}
         </Button>
       </div>
 
       {/* Selected folders */}
       {selectedFolders.length > 0 && (
         <div className="flex flex-col gap-1">
-          <p className="text-[11px] font-medium text-muted-foreground">Selected ({selectedFolders.length})</p>
+          <p className="text-[11px] font-medium text-muted-foreground">{t("setup.selected", { count: selectedFolders.length })}</p>
           <ul className="divide-y divide-border rounded-md border border-border">
             {selectedFolders.map((folder) => (
               <li key={folder} className="flex items-center gap-2 px-3 py-2">
@@ -580,7 +585,7 @@ function AddProjectsPanel({
                   onClick={() => onSelectFolder(folder)}
                   disabled={loading}
                 >
-                  Remove
+                  {t("common.remove")}
                 </Button>
               </li>
             ))}
@@ -592,7 +597,7 @@ function AddProjectsPanel({
       {browseResult && (
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2">
-            <p className="text-[11px] font-medium text-muted-foreground">Browse</p>
+            <p className="text-[11px] font-medium text-muted-foreground">{t("setup.browse")}</p>
             {browseResult.parent && (
               <Button
                 size="xs"
@@ -600,7 +605,7 @@ function AddProjectsPanel({
                 onClick={() => browseResult.parent && onBrowse(browseResult.parent)}
                 disabled={loading}
               >
-                <ArrowLeft className="size-3" /> Up
+                <ArrowLeft className="size-3" /> {t("setup.up")}
               </Button>
             )}
           </div>
@@ -628,14 +633,14 @@ function AddProjectsPanel({
                     }}
                     disabled={loading}
                   >
-                    {isSelected ? <Check className="size-3" /> : "Select"}
+                    {isSelected ? <Check className="size-3" /> : t("common.select")}
                   </Button>
                   <button
                     type="button"
                     className="shrink-0 text-muted-foreground hover:text-foreground"
                     onClick={() => onBrowse(entry.path)}
                     disabled={loading}
-                    aria-label={`Open ${entry.name}`}
+                    aria-label={t("setup.openFolder", { name: entry.name })}
                   >
                     <ChevronRight className="size-3.5" />
                   </button>
@@ -644,7 +649,7 @@ function AddProjectsPanel({
             })}
             {browseResult.entries.length === 0 && (
               <li className="px-3 py-2 text-[11px] text-muted-foreground">
-                No subdirectories found.
+                {t("setup.noDirectories")}
               </li>
             )}
           </ul>
@@ -655,7 +660,7 @@ function AddProjectsPanel({
       {importedProjects.length > 0 && (
         <div className="rounded-md border border-emerald-500/40 bg-emerald-500/5 p-3">
           <p className="text-[12px] font-medium text-emerald-700 dark:text-emerald-400">
-            {importedProjects.length} project{importedProjects.length > 1 ? "s" : ""} imported
+            {t("setup.imported", { count: importedProjects.length })}
           </p>
         </div>
       )}

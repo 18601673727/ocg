@@ -23,8 +23,8 @@ import type {
 } from "./runtime-types";
 import { type ProjectId } from "../project/domain";
 import { FIXTURE_PROJECT_IDS, projectSessionIds } from "../project/fixtures";
-import { RuntimeEnvelopeFactory, eventSessionId, type AnyRuntimeEnvelope } from "./runtime-envelope";
-import { createSnapshotEnvelopeFromFixture } from "./runtime-snapshot";
+import { RuntimeEnvelopeFactory, eventSessionId, RUNTIME_PROTOCOL_VERSION, type AnyRuntimeEnvelope } from "./runtime-envelope";
+import { createSnapshotEnvelopeFromFixture, emptyRuntimeSnapshot } from "./runtime-snapshot";
 import { RuntimeStore } from "./runtime-store";
 import { createUninitializedRuntimeState, type RuntimeState, type RuntimeSyncState } from "./reconciler";
 
@@ -39,14 +39,16 @@ function clockLabel(): string {
   return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
 }
 
-export class MockOcgRuntimeClient implements OcgRuntimeClient {
+/** Shared runtime store/event machinery. Authority-specific clients choose
+ * their seed explicitly; this base never makes fixture data authoritative. */
+export class RuntimeClientBase implements OcgRuntimeClient {
   /**
    * The fixture runtime never owns Chat for a session that has a loopback
    * control endpoint: that path is the canonical backend's. This client is
    * reached only when the invocation has no control endpoint to be canonical
    * for, and it answers with the seeded fixtures rather than an execution.
    */
-  readonly authority: RuntimeAuthority = "mock";
+  readonly authority: RuntimeAuthority;
 
   private readonly scenario: ScenarioId;
   private readonly listeners = new Set<(event: OcgRuntimeEvent) => void>();
@@ -58,19 +60,20 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
   private readonly envelopes: RuntimeEnvelopeFactory;
   private liveScenarioStarted = false;
 
-  constructor(scenario: ScenarioId, canonicalChat = false) {
+  constructor(scenario: ScenarioId, canonicalChat = false, authority: RuntimeAuthority = "mock") {
+    this.authority = authority;
     this.scenario = scenario;
-    const fixture = createScenarioFixture(scenario);
-    const seed = createSnapshotEnvelopeFromFixture(fixture, { streamId: `stream:${scenario}`, generation: 1 });
-    if (canonicalChat) {
-      this.liveScenarioStarted = true;
-      seed.snapshot = {
-        ...seed.snapshot,
-        status: { state: "connecting", detail: "Loading OCG runtime status" },
-        sessions: [], messagesBySession: {}, observabilityBySession: {},
-        executionBySession: {}, accountingBySession: {},
-      };
-    }
+    const seed = canonicalChat
+      ? {
+        protocolVersion: RUNTIME_PROTOCOL_VERSION,
+        streamId: "canonical",
+        generation: 1,
+        cursor: { streamId: "canonical", sequence: 0 },
+        scope: { kind: "all-projects" as const },
+        snapshot: { ...emptyRuntimeSnapshot(scenario), authority: "canonical" as const },
+      }
+      : createSnapshotEnvelopeFromFixture(createScenarioFixture(scenario), { streamId: `stream:${scenario}`, generation: 1 });
+    this.liveScenarioStarted = canonicalChat;
     this.store = new RuntimeStore(createUninitializedRuntimeState(scenario));
     this.store.installSnapshot(seed);
     this.envelopes = new RuntimeEnvelopeFactory(seed.streamId, seed.generation, {
@@ -342,5 +345,12 @@ export class MockOcgRuntimeClient implements OcgRuntimeClient {
       const timers = this.timers.get("__observability__") ?? [];
       this.timers.set("__observability__", [...timers, timer]);
     });
+  }
+}
+
+/** Fixture/demo runtime. It is the only client that seeds scenario data. */
+export class MockOcgRuntimeClient extends RuntimeClientBase {
+  constructor(scenario: ScenarioId) {
+    super(scenario, false, "mock");
   }
 }

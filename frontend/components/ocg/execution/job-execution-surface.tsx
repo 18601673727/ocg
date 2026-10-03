@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Pill, SectionTitle } from "../primitives";
 import { filterCalls, type JobExecution } from "./domain";
-import { useI18n } from "../i18n";
+import { runtimeStateLabel, useI18n } from "../i18n";
 
 export function JobExecutionSurface({ execution, onOpenInspector }: {
   execution: JobExecution;
@@ -24,7 +24,7 @@ export function JobExecutionSurface({ execution, onOpenInspector }: {
           <h1 className="mt-1 break-all text-lg font-semibold">{execution.jobId}</h1>
           <p className="mt-1 text-muted-foreground">{t("execution.projectMeta", { project: execution.projectId, generation: execution.generation, cursor: execution.cursor })}</p>
         </div>
-        <Pill tone={execution.state === "completed" ? "emerald" : execution.state === "failed" ? "red" : "slate"}>{execution.state}</Pill>
+        <Pill tone={execution.state === "completed" ? "emerald" : execution.state === "failed" ? "red" : "slate"}>{runtimeStateLabel(t, execution.state)}</Pill>
         {onOpenInspector && <Button variant="outline" size="xs" onClick={onOpenInspector}>{t("execution.openInspector")}</Button>}
       </header>
       <section className="mb-4 rounded border border-border p-3">
@@ -35,7 +35,7 @@ export function JobExecutionSurface({ execution, onOpenInspector }: {
           <Button size="xs" variant={attemptId === "" ? "secondary" : "outline"} onClick={() => setAttemptId("")}>{t("execution.allAttempts")}</Button>
           {execution.attempts.map((attempt) => (
             <Button key={attempt.id} size="xs" variant={attemptId === attempt.attemptId ? "secondary" : "outline"} onClick={() => setAttemptId(attempt.attemptId)}>
-              {attempt.attemptId} · {attempt.state}{attempt.authoritative ? ` · ${t("execution.authoritative")}` : ""}
+              {attempt.attemptId} · {runtimeStateLabel(t, attempt.state)}{attempt.authoritative ? ` · ${t("execution.authoritative")}` : ""}
             </Button>
           ))}
         </div>
@@ -43,7 +43,7 @@ export function JobExecutionSurface({ execution, onOpenInspector }: {
       <section className="mb-4 rounded border border-border p-3">
         <SectionTitle>{t("execution.executors")}</SectionTitle>
         {execution.executors.length === 0 && <p className="text-muted-foreground">{t("execution.noExecutors")}</p>}
-        <ul className="space-y-1">{execution.executors.map((executor) => <li key={executor.id}>{executor.executorId} · {executor.status} · {t("execution.callsCount", { count: executor.callIds.length })}</li>)}</ul>
+        <ul className="space-y-1">{execution.executors.map((executor) => <li key={executor.id}>{executor.executorId} · {runtimeStateLabel(t, executor.status)} · {t("execution.callsCount", { count: executor.callIds.length })}</li>)}</ul>
       </section>
       <section className="rounded border border-border p-3">
         <SectionTitle detail={t("execution.callsCount", { count: calls.length })}>{t("execution.calls")}</SectionTitle>
@@ -51,7 +51,7 @@ export function JobExecutionSurface({ execution, onOpenInspector }: {
         {calls.length === 0 && <p className="text-muted-foreground">{t("execution.noCallsMatch")}</p>}
         <ul className="space-y-2">{calls.map((call) => (
           <li key={call.id} className="rounded border border-border p-3">
-            <div className="flex flex-wrap justify-between gap-2"><span className="break-all font-medium">{call.callId}</span><span>{call.rawState}</span></div>
+            <div className="flex flex-wrap justify-between gap-2"><span className="break-all font-medium">{call.callId}</span><span>{runtimeStateLabel(t, call.rawState)}</span></div>
             <p className="mt-1 text-muted-foreground">{t("execution.callMeta", { attempt: call.attemptId, executor: call.executorId ?? t("common.notReported"), effect: call.effectKind })}</p>
             {call.reason && <p className="mt-2">{call.reason}</p>}
             <details className="mt-2"><summary className="cursor-pointer">{t("execution.requestAndResponse")}</summary><pre className="mt-2 whitespace-pre-wrap break-all">{call.request}</pre><pre className="mt-2 whitespace-pre-wrap break-all">{call.response ?? t("execution.noResponse")}</pre></details>

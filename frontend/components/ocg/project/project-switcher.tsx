@@ -7,12 +7,13 @@
  */
 
 import { useState } from "react";
-import { Check, ChevronsUpDown, FolderKanban } from "lucide-react";
+import { Check, ChevronsUpDown, FolderKanban, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
+  DialogClose,
   DialogDescription,
   DialogHeader,
   DialogTitle,
@@ -103,7 +104,8 @@ export function ProjectSwitcher({
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       {collapsed ? collapsedTrigger : expandedTrigger}
-      <DialogContent>
+      <DialogContent showCloseButton={false}>
+        <DialogClose render={<Button variant="ghost" className="absolute top-5 right-5 bg-secondary" size="icon-sm" aria-label={t("common.close")} />}><X aria-hidden="true" /></DialogClose>
         <DialogHeader>
           <DialogTitle>{t("project.switch")}</DialogTitle>
           <DialogDescription>

@@ -42,6 +42,7 @@ import {
   nullable,
   number,
   oneOf,
+  opt,
   record,
   req,
   string,
@@ -107,6 +108,10 @@ const chatMessageView: Decoder<ChatMessageView> = (input, path) => {
   if (!state.ok) return state;
   const content = req(rec.value, "content", string, path);
   if (!content.ok) return content;
+  const failure_reason = opt(rec.value, "failure_reason", nullable(string), path);
+  if (!failure_reason.ok) return failure_reason;
+  const job_id = opt(rec.value, "job_id", nullable(identity), path);
+  if (!job_id.ok) return job_id;
   const created_at = req(rec.value, "created_at", string, path);
   if (!created_at.ok) return created_at;
   const updated_at = req(rec.value, "updated_at", string, path);
@@ -121,6 +126,8 @@ const chatMessageView: Decoder<ChatMessageView> = (input, path) => {
     role: role.value,
     state: state.value,
     content: content.value,
+    failure_reason: failure_reason.value ?? null,
+    job_id: job_id.value ?? null,
     created_at: created_at.value,
     updated_at: updated_at.value,
     attempt_state: attempt_state.value,

@@ -43,6 +43,7 @@ export type DraftIssueCode =
   | "profile-invalid"
   | "routing-invalid"
   | "root-required"
+  | "root-format"
   | "job-required"
   | "job-dispatched";
 
@@ -75,7 +76,7 @@ export function validateImportRoot(root: string): DraftIssue[] {
   if (!trimmed.startsWith("/") && !trimmed.startsWith(".")) {
     return [
       {
-        code: "root-required",
+        code: "root-format",
         field: "root",
         message: "Use an absolute path or an explicit ./relative path.",
       },
@@ -148,23 +149,25 @@ export function preRunConfigurationState(state: CanonicalState): {
   jobId: string | null;
   editable: boolean;
   reason: string | null;
+  reasonCode: "job-required" | "not-loaded" | "job-dispatched" | null;
 } {
   const jobId = state.jobId;
   if (jobId === null) {
-    return { jobId: null, editable: false, reason: "No Job is selected." };
+    return { jobId: null, editable: false, reasonCode: "job-required", reason: "No Job is selected." };
   }
   if (state.projection === null) {
-    return { jobId, editable: false, reason: "Runtime state has not been loaded." };
+    return { jobId, editable: false, reasonCode: "not-loaded", reason: "Runtime state has not been loaded." };
   }
   if (state.projection.attempts.length > 0) {
     return {
       jobId,
       editable: false,
+      reasonCode: "job-dispatched",
       reason:
         "An Attempt is already dispatched. Its frozen executor/model/role contract cannot be edited; changes apply to future dispatches or a replacement Job.",
     };
   }
-  return { jobId, editable: true, reason: null };
+  return { jobId, editable: true, reasonCode: null, reason: null };
 }
 
 export function globalConfigurationCommandId(revision: number): string {

@@ -52,7 +52,7 @@ import type {
 } from "./runtime-types";
 import type { ChatMessage, ChatSession, OcgRuntimeEvent, RuntimeStatus, SendMessageInput } from "../types";
 import type { CreateSessionInput } from "./runtime-types";
-import { MockOcgRuntimeClient } from "./mock-client";
+import { RuntimeClientBase } from "./mock-client";
 import { createProfileClient } from "../profile/profile-client";
 import {
   createHttpCanonicalControlClient,
@@ -60,6 +60,7 @@ import {
   type CanonicalControlClient,
   type CanonicalJobLaunchAck,
 } from "./canonical-client";
+import { selectCanonical } from "./canonical-store";
 import type { JobExecution } from "../execution/domain";
 
 /** Bounds the snapshot/event refetch loop when the backend keeps demanding a resync. */
@@ -71,7 +72,7 @@ type ChatAvailability = {
   status: RuntimeStatus;
 };
 
-export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
+export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   readonly authority: RuntimeAuthority = "canonical";
 
   private readonly control: CanonicalControlClient;
@@ -88,7 +89,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     control: CanonicalControlClient,
     profile: ReturnType<typeof createProfileClient>,
   ) {
-    super(scenario, true);
+    super(scenario, true, "canonical");
     this.control = control;
     this.profile = profile;
   }
@@ -174,7 +175,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       id,
       sessionId,
       projectId: input.projectId,
-      title: input.title?.trim() || "Untitled thread",
+      title: input.title?.trim() || "",
       workType: input.workType,
       updatedAt: "now",
     };
@@ -221,19 +222,21 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     const id = chatSessionKey(projectId, history.conversation.session_id);
     const session: ChatSession = {
       id, projectId, sessionId: history.conversation.session_id,
-      title: history.conversation.title || "Untitled thread",
+      title: history.conversation.title || history.messages.find(message => message.role === "user" && message.content.trim())?.content.trim().slice(0, 80) || "",
       workType: "coding", updatedAt: chatTimestamp(history.conversation.updated_at),
     };
     this.bindSessionProject(id, projectId);
     this.emit({ type: "conversation.session-created", session }, { projectId });
     const messages: ChatMessage[] = history.messages.filter((message) => message.state !== "deleted").map((message) => ({
       id: message.message_id, commandId: message.command_id, role: message.role,
-      content: message.content, createdAt: chatTimestamp(message.created_at),
+      content: message.content, failureReason: message.failure_reason ?? undefined, createdAt: chatTimestamp(message.created_at),
       status: message.state === "complete" ? "completed" :
         message.state === "failed" && message.attempt_state === "cancelled" ? "cancelled" :
         message.state === "failed" ? "failed" : "pending",
     }));
     this.emit({ type: "conversation.history-loaded", sessionId: id, messages }, { projectId });
+    const jobId = [...history.messages].reverse().find(message => message.role === "assistant" && message.job_id)?.job_id;
+    if (jobId) void this.refreshExecution(id, projectId, jobId);
     if (this.chatStreams.has(id)) return;
     const replay = history.messages.find((message) => message.replay_job_id !== null);
     const assistant = replay && messages.find((message) => message.id === replay.message_id);
@@ -294,7 +297,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       this.emit({
         type: "conversation.message-completed",
         sessionId,
-        message: { ...assistant, content: "Chat failed: this session has no Project binding.", status: "failed" },
+        message: { ...assistant, content: "", failureCode: "project-missing", status: "failed" },
       });
       return;
     }
@@ -309,7 +312,9 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
         sessionId,
         message: {
           ...assistant,
-          content: `Chat unavailable: ${availability.status.detail ?? "the runtime cannot execute chat."}`,
+          content: "",
+          failureReason: availability.status.detailCode ? undefined : availability.status.detail,
+          failureCode: availability.status.detailCode === "configuration-required" ? "configuration-required" : undefined,
           status: "failed",
         },
       });
@@ -338,7 +343,8 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
         sessionId,
         message: {
           ...current,
-          content: `Chat failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+          content: "",
+          failureReason: (cause instanceof Error ? cause.message : String(cause)).slice(0, 1024),
           status: "failed",
         },
       });
@@ -348,7 +354,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       this.emit({
         type: "conversation.message-completed",
         sessionId,
-        message: { ...assistant, content: `Chat failed: ${response.message}`, status: "failed" },
+        message: { ...assistant, content: "", failureReason: response.message.slice(0, 1024), status: "failed" },
       });
       return;
     }
@@ -356,7 +362,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
       this.emit({
         type: "conversation.message-completed",
         sessionId,
-        message: { ...assistant, content: `Chat failed: ${response.message}`, status: "failed" },
+        message: { ...assistant, content: "", failureReason: response.message.slice(0, 1024), status: "failed" },
       });
       return;
     }
@@ -365,6 +371,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     // Keep its EventSource alive until then so failed sends leave it streaming.
     this.closeChatStream(sessionId, true);
     this.openChatStream(sessionId, response.job_id, assistantId);
+    void this.refreshExecution(sessionId, projectId, response.job_id);
   }
 
   override async cancel(sessionId: string): Promise<void> {
@@ -419,12 +426,13 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
     try {
       const view = await this.profile.read();
       if (view.runnable_choices.length > 0) {
-        return { available: true, status: { state: "connected", detail: "OCG provider runtime" } };
+        return { available: true, status: { state: "connected", detailCode: "provider-ready", detail: "OCG provider runtime" } };
       }
       return {
         available: false,
         status: {
           state: "disconnected",
+          detailCode: "configuration-required",
           detail: "no runnable provider or model: configuration required",
         },
       };
@@ -502,13 +510,12 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
         return;
       }
       if (typeof record["error"] === "string") {
-        const message = record["error"] as string;
+        const message = (record["error"] as string).slice(0, 1024);
         if (message === "chat cancelled") {
           this.emit({ type: "cancelled", sessionId, messageId: assistantId });
         } else {
           const after = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
-          const content = after?.content || message;
-          this.emit({ type: "conversation.message-completed", sessionId, message: { ...(after ?? { id: assistantId, role: "assistant" as const, createdAt: chatClockLabel() }), content, status: "failed" } });
+          this.emit({ type: "conversation.message-completed", sessionId, message: { ...(after ?? { id: assistantId, role: "assistant" as const, createdAt: chatClockLabel() }), content: "", failureReason: message, status: "failed" } });
         }
         this.closeChatStream(sessionId, false);
         void this.refreshSessionHistory(sessionId);
@@ -529,7 +536,7 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
         this.emit({
           type: "conversation.message-completed",
           sessionId,
-          message: { ...after, content: after.content || "Chat stream failed.", status: "failed" },
+          message: { ...after, content: "", failureCode: "stream-closed", status: "failed" },
         });
       }
       this.closeChatStream(sessionId, false);
@@ -569,29 +576,31 @@ export class CanonicalOcgRuntimeClient extends MockOcgRuntimeClient {
    * the loop refetches until the tail is empty. Each round advances the cursor
    * together with the projection it belongs to.
    */
-  private async projectCanonicalExecution(
-    projectId: string,
-    jobId: string,
-  ): Promise<JobExecution | null> {
-    const scoped: ProjectId = projectId;
+  private async refreshExecution(sessionId: string, projectId: string, jobId: string): Promise<void> {
+    try {
+      const execution = await this.projectCanonicalExecution(projectId, jobId);
+      if (execution) this.emit({ type: "job.execution-updated", sessionId, execution, accounting: null }, { projectId });
+    } catch (cause) {
+      this.emit({ type: "error", message: cause instanceof Error ? cause.message : String(cause) });
+    }
+  }
+
+  private async projectCanonicalExecution(projectId: string, jobId: string): Promise<JobExecution | null> {
     for (let attempt = 0; attempt < MAX_REFRESH_ROUNDS; attempt += 1) {
       const snapshot = await this.control.readJobSnapshot(projectId, jobId);
       if (isCanonicalRejection(snapshot)) return null;
-
       const generation = this.store.getCanonical().generation + 1;
-      const next = this.store.applyCanonicalSnapshot({ payload: snapshot, projectId: scoped, generation });
-      // A rejected or stale snapshot leaves the projection and its cursor
-      // untouched, so there is no coherent new tail to read.
+      const next = this.store.applyCanonicalSnapshot({ payload: snapshot, projectId, generation });
       if (next.projection === null || next.cursor !== snapshot.cursor) return null;
-
+      const execution = selectCanonical(next).execution;
       const events = await this.control.readJobEvents(projectId, jobId, next.cursor);
-      if (isCanonicalRejection(events)) return this.store.selectCanonical().execution;
-
-      const applied = this.store.applyCanonicalEvents(events, { projectId: scoped, generation });
-      if (!applied.resyncRequired) return this.store.selectCanonical().execution;
+      // Retain this read's projection: another Project may refresh while the
+      // event tail is in flight. Never return that Project's current store view.
+      if (isCanonicalRejection(events) || events.length === 0 || attempt === MAX_REFRESH_ROUNDS - 1) return execution;
     }
-    return this.store.selectCanonical().execution;
+    return null;
   }
+
 }
 
 function toLaunchRequest(command: JobLaunchCommand): JobLaunchRequest {

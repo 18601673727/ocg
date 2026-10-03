@@ -142,6 +142,9 @@ export function OcgSidebar({
   onNavigate,
 }: OcgSidebarProps) {
   const { t } = useI18n();
+  const workspaceNav = runtimeAuthority === "canonical"
+    ? WORKSPACE_NAV.filter(item => ["home", "attention", "chat", "job-execution"].includes(item.target))
+    : WORKSPACE_NAV;
   const hasNav = Boolean(onNavigate);
   const connection = RUNTIME_CONNECTION[runtimeStatus.state];
   const connectionLabel = t(
@@ -213,7 +216,7 @@ export function OcgSidebar({
           {hasNav && (
             <>
               <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
-              {WORKSPACE_NAV.map((item) => {
+              {workspaceNav.map((item) => {
                 const Icon = item.icon;
                 if (!onNavigate) return null;
                 const label = navLabel(item);
@@ -321,14 +324,14 @@ export function OcgSidebar({
         {hasNav && (
           <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
             <ul className="flex flex-col gap-px">
-              {WORKSPACE_NAV.slice(0, 3).map(renderWorkspaceItem)}
+              {(runtimeAuthority === "canonical" ? workspaceNav : workspaceNav.slice(0, 3)).map(renderWorkspaceItem)}
             </ul>
-            <details open={WORKSPACE_NAV.slice(3).some((item) => item.target === activeView) || undefined} className="mt-1">
+            {runtimeAuthority === "mock" && <details open={workspaceNav.slice(3).some((item) => item.target === activeView) || undefined} className="mt-1">
               <summary className="cursor-pointer rounded-md px-2 py-1.5 text-[12px] text-muted-foreground hover:bg-muted/60">{t("nav.tools")}</summary>
               <ul className="flex flex-col gap-px pl-2">
-                {WORKSPACE_NAV.slice(3).map(renderWorkspaceItem)}
+                {workspaceNav.slice(3).map(renderWorkspaceItem)}
               </ul>
-            </details>
+            </details>}
           </nav>
         )}
 
@@ -397,7 +400,7 @@ export function OcgSidebar({
         <div className="border-t border-border px-3 py-2.5">
           <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
              <StatusDot tone={connection.tone} pulse={connection.pulse} />
-             <span className="truncate">Runtime {connectionLabel} · {authorityLabel}</span>
+             <span className="truncate">{t("chat.runtime")} {connectionLabel} · {authorityLabel}</span>
           </div>
           <div className="mt-2 flex items-center gap-2">
             <Avatar size="sm">

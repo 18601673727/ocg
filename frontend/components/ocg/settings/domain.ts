@@ -49,16 +49,26 @@ export const SETTINGS_SECTION_COPY: Record<SettingsSectionId, { title: string; d
   advanced: { title: "Advanced", description: "Read-only projections useful when debugging the frontend boundary." },
 };
 
-export const RECONFIGURE_PATH = "/onboarding?scenario=onboarding-invalid-configuration";
+export const RECONFIGURE_PATH = "/onboarding";
 
 function accessLabel(state: BootstrapState["access"]["state"]): string {
   return state === "local" ? "Local" : state === "authenticated" ? "Remote · authorized" : `Remote · ${state}`;
 }
 
 export function createSettingsState(
-  snapshot: { status: RuntimeStatus; bootstrap: BootstrapState },
+  snapshot: { status: RuntimeStatus; bootstrap: BootstrapState; authority?: "canonical" | "mock" },
   appearance: AppearancePreferences = DEFAULT_APPEARANCE,
 ): NormalizedSettingsState {
+  if (snapshot.authority === "canonical") {
+    return { sections: {
+      general: [], runtime: [], resources: [], access: [], diagnostics: [], advanced: [],
+      appearance: [
+        { id: "appearance.theme", label: "Theme", value: appearance.theme, description: "", ownership: "frontend-only", readOnly: false },
+        { id: "appearance.density", label: "Density", value: appearance.density, description: "", ownership: "frontend-only", readOnly: false },
+        { id: "appearance.accent", label: "Accent", value: appearance.accent, description: "", ownership: "frontend-only", readOnly: false },
+      ],
+    } };
+  }
   const { bootstrap, status } = snapshot;
   const activeProfile = bootstrap.profiles.find((profile) => profile.id === bootstrap.activeProfileId)
     ?? bootstrap.profiles.find((profile) => profile.recommended);

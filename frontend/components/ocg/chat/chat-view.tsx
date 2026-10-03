@@ -25,7 +25,7 @@ import {
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { BORDER_TONE, StatusDot, TEXT_TONE, TOOL_STATUS } from "@/components/ocg/primitives";
 import { ActivityPulse } from "../activity-pulse";
-import { useI18n } from "../i18n";
+import { useI18n, runtimeStateLabel, runtimeStatusDetail, chatFailureReason } from "../i18n";
 import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
 import {
   applyComposerSuggestion,
@@ -201,7 +201,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
             ) : (
               <StatusDot tone={tone} />
             )}
-            {tool.status === "success" ? "success" : tool.status} · {tool.durationMs}ms
+            {runtimeStateLabel(t, tool.status)} · {tool.durationMs}ms
           </span>
           <ChevronDown
             className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", !open && "-rotate-90")}
@@ -260,9 +260,12 @@ function MessageRow({ message }: { message: ChatMessage }) {
            )}
          >
            <Markdown content={message.content} />
+           {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
+             {chatFailureReason(t, message)}
+           </p>}
            {message.status !== "completed" && message.status !== "pending" && (
              <span className="mt-1 block text-[11px] text-muted-foreground">
-               {message.status === "streaming" ? t("chat.streaming") : message.status}
+               {runtimeStateLabel(t, message.status)}
              </span>
            )}
          </div>
@@ -464,7 +467,7 @@ function Composer({
               size="icon-sm"
               disabled={!canSend}
               aria-label={t("chat.send")}
-              title={chatReady ? t("chat.send") : `${t("chat.unavailable")}: ${runtimeStatus.detail ?? t("chat.unavailableFallback")}`}
+              title={chatReady ? t("chat.send") : `${t("chat.unavailable")}: ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
               className="ml-auto rounded-md"
             >
               <ArrowUp className="size-4" />
@@ -474,7 +477,7 @@ function Composer({
         <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
           {chatReady
             ? t("chat.repliesStream")
-            : `${t("chat.unavailable")} · ${runtimeStatus.detail ?? t("chat.unavailableFallback")}`}
+            : `${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
         </p>
       </form>
     </div>
@@ -494,10 +497,8 @@ type ChatViewProps = {
 };
 
 const SUGGESTIONS = [
-  "Summarize the open decisions in this thread",
-  "Draft the layout grid for Sidebar | Chat | Job",
-  "List what Phase 2 needs from this mock state",
-];
+  "chat.suggestion.summary", "chat.suggestion.plan", "chat.suggestion.review",
+] as const;
 
 export function ChatView({
   session,
@@ -533,10 +534,10 @@ export function ChatView({
                 <button
                   key={s}
                   type="button"
-                  onClick={() => setDraft(s)}
+                  onClick={() => setDraft(t(s))}
                   className="rounded-md border border-border bg-muted/30 px-3 py-2 text-left text-[13px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                 >
-                  {s}
+                  {t(s)}
                 </button>
               ))}
             </div>

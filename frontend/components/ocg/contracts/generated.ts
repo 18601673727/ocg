@@ -158,7 +158,7 @@ export type ChatConversationsResponse = { api_version: CanonicalApiVersion, proj
 export type ChatMessageRole = "user" | "assistant";
 
 
-export type ChatMessageView = { message_id: string, command_id: string, role: ChatMessageRole, state: MessageLifecycle, content: string, created_at: string, updated_at: string, attempt_state: string, replay_job_id: string | null, };
+export type ChatMessageView = { message_id: string, command_id: string, role: ChatMessageRole, state: MessageLifecycle, content: string, failure_reason: string | null, job_id: string | null, created_at: string, updated_at: string, attempt_state: string, replay_job_id: string | null, };
 
 
 export type ChatMessagesResponse = { api_version: CanonicalApiVersion, project_id: string, conversation: ChatConversationView, messages: Array<ChatMessageView>, };

@@ -68,6 +68,7 @@ type AttentionSurfaceProps = {
   queue?: AttentionQueue;
   /** Opens the workspace an item points at; the shell decides the address. */
   onNavigate: (view: WorkspaceView) => void;
+  onSelectSession?: (sessionId: string) => void;
 };
 
 const TAB_LABEL_KEY = {
@@ -124,7 +125,27 @@ const DESTINATION_VIEWS: Record<AttentionDestination, WorkspaceView> = {
 /** Local fixture decisions use a fixed clock so UI state stays deterministic. */
 const DECISION_CLOCK = "2026-09-25T10:00:00Z";
 
+function CanonicalAttentionSurface({ snapshot, onNavigate, onSelectSession }: AttentionSurfaceProps) {
+  const { t } = useI18n();
+  const failed = Object.entries(snapshot.executionBySession).filter(([, execution]) => execution?.state === "failed");
+  return <div className="flex-1 overflow-auto p-4 sm:p-6">
+    <h1 className="text-xl font-semibold">{t("attention.title")}</h1>
+    <p className="mt-1 text-sm text-muted-foreground">{t("attention.localReview")}</p>
+    {failed.length === 0 ? <p className="mt-6 text-sm text-muted-foreground">{t("attention.noFailedConversations")}</p> :
+      <ul className="mt-4 space-y-3">{failed.map(([sessionId, execution]) => <li key={sessionId} className="rounded-lg border border-border p-3">
+        <p className="text-sm font-medium">{t("home.failedJob", { id: execution!.jobId })}</p>
+        <p className="mt-1 text-xs text-muted-foreground">{snapshot.sessions.find(session => session.id === sessionId)?.title}</p>
+        <p className="mt-2 whitespace-pre-wrap break-words text-xs">{[...(snapshot.messagesBySession[sessionId] ?? [])].reverse().find(message => message.status === "failed")?.failureReason ?? t("chat.failureMissing")}</p>
+        <Button className="mt-3" size="xs" variant="outline" onClick={() => { onSelectSession?.(sessionId); onNavigate("chat"); }}>{t("nav.chat")}</Button>
+      </li>)}</ul>}
+  </div>;
+}
+
 export function AttentionSurface(props: AttentionSurfaceProps) {
+  return props.snapshot.authority === "canonical" ? <CanonicalAttentionSurface {...props} /> : <MockAttentionSurface {...props} />;
+}
+
+function MockAttentionSurface(props: AttentionSurfaceProps) {
   const { snapshot, initialTab = "overview", queue: queueProp, onNavigate } = props;
   const { t } = useI18n();
   const tabLabel = (tab: AttentionTab) => t(TAB_LABEL_KEY[tab]);
@@ -420,6 +441,7 @@ function AttentionInspector({
 }: {
   item: AttentionItem;
   onNavigate: (view: WorkspaceView) => void;
+  onSelectSession?: (sessionId: string) => void;
   onClose: () => void;
   onDecide: (id: string, decision: "approved" | "rejected") => void;
   onAcknowledge: (id: string) => void;

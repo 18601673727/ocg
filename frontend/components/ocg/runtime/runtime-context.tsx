@@ -35,6 +35,10 @@ type RuntimeContextValue = {
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
+const subscribeHydration = () => () => {};
+const browserHydrated = () => true;
+const serverHydrated = () => false;
+
 const EMPTY_DIAGNOSTICS: readonly RuntimeDiagnostic[] = [];
 
 export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioId; children: ReactNode }) {
@@ -44,6 +48,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   // explicit dev/mock path, never a silent product fallback. The scenario
   // seeds the shell projection either way; it never decides this.
   const controlUrl = useOcgControlUrl();
+  const hydrated = useSyncExternalStore(subscribeHydration, browserHydrated, serverHydrated);
   const client = useMemo<OcgRuntimeClient>(() => {
     if (controlUrl) return CanonicalOcgRuntimeClient.connect(scenario, controlUrl, fetch);
     return new MockOcgRuntimeClient(scenario);
@@ -117,6 +122,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
     }),
     [authority, cancel, client, completeOnboarding, createSession, diagnostics, launchJob, requestAccessHandoff, retryBootstrap, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
   );
+  if (!hydrated) return null;
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
 

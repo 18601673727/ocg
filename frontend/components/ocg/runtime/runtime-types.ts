@@ -92,6 +92,7 @@ export type ScenarioId =
 
 /** Single execution read model: canonical Job/Attempt/Call + accounting ceiling. */
 export type RuntimeSnapshot = {
+  authority?: RuntimeAuthority;
   scenario: ScenarioId;
   status: RuntimeStatus;
   sessions: ChatSession[];
@@ -130,7 +131,7 @@ export interface OcgRuntimeClient {
   /** Bind a session to its owning Project so a later send launches into that Project. */
   bindSessionProject?(sessionId: string, projectId: string): void;
   hydrateProject?(projectId: string): Promise<void>;
-  /** Frontend-only Job launch boundary. Validates against the mock snapshot and projects canonical execution into the per-session maps. */
+  /** Canonical Job launch boundary, projecting backend execution into session maps. */
   launchJob?(command: JobLaunchCommand): Promise<JobLaunchResult>;
   requestAccessHandoff?(): Promise<void>;
   setOnboardingStage?(stage: OnboardingStageId): Promise<void>;

@@ -23,7 +23,6 @@ import { useI18n, type I18nKey } from "../i18n";
 import {
   DEFAULT_CONFIGURATION_DRAFT,
   MIN_HARD_BUDGET,
-  describeAcknowledgement,
   draftFromConfiguration,
   globalConfigurationCommandId,
   preRunConfigurationState,
@@ -83,14 +82,12 @@ const ISSUE_I18N_KEY: Record<DraftIssueCode, I18nKey> = {
   "profile-invalid": "canonical.issue.profile-invalid",
   "routing-invalid": "canonical.issue.routing-invalid",
   "root-required": "canonical.issue.root-required",
+  "root-format": "canonical.issue.root-format",
   "job-required": "canonical.issue.job-required",
   "job-dispatched": "canonical.issue.job-dispatched",
 };
 
 function issueText(t: ReturnType<typeof useI18n>["t"], issue: DraftIssue): string {
-  if (issue.code === "root-required" && issue.message.includes("absolute")) {
-    return t("canonical.issue.root-format");
-  }
   if (issue.code === "budget-below-minimum") {
     return t(ISSUE_I18N_KEY[issue.code], { min: MIN_HARD_BUDGET });
   }
@@ -189,7 +186,7 @@ export function CanonicalControlSurface({
   const importProject = () =>
     run(async () => {
       const result = await client.importProject(projectImportCommandId(root.trim()), root.trim());
-      setAck(describeAcknowledgement(result));
+      setAck(isCanonicalRejection(result) ? t("canonical.rejected", { id: result.commandId, message: result.message }) : t("canonical.accepted", { id: result.commandId }));
       if (isCanonicalRejection(result)) return;
       setState(
         store.applyCanonicalCommandAck({
@@ -217,7 +214,7 @@ export function CanonicalControlSurface({
       }
       const commandId = globalConfigurationCommandId(configurationRevision(configuration) + 1);
       const result = await client.writeGlobalConfiguration(commandId, toGlobalConfiguration(draft));
-      setAck(describeAcknowledgement(result));
+      setAck(isCanonicalRejection(result) ? t("canonical.rejected", { id: result.commandId, message: result.message }) : t("canonical.accepted", { id: result.commandId }));
       if (isCanonicalRejection(result)) return;
       setConfiguration(result.configuration);
       setState(
@@ -243,7 +240,7 @@ export function CanonicalControlSurface({
         project.project_id,
         { profile: draft.profile, routing: draft.routing, hard_budget: draft.hardBudget },
       );
-      setAck(describeAcknowledgement(result));
+      setAck(isCanonicalRejection(result) ? t("canonical.rejected", { id: result.commandId, message: result.message }) : t("canonical.accepted", { id: result.commandId }));
       if (!isCanonicalRejection(result)) {
         setConfiguration(result.configuration);
       }
@@ -257,7 +254,7 @@ export function CanonicalControlSurface({
         preRun.jobId,
         { profile: draft.profile, routing: draft.routing, hard_budget: draft.hardBudget },
       );
-      setAck(describeAcknowledgement(result));
+      setAck(isCanonicalRejection(result) ? t("canonical.rejected", { id: result.commandId, message: result.message }) : t("canonical.accepted", { id: result.commandId }));
       if (!isCanonicalRejection(result)) {
         setState(
           store.applyCanonicalCommandAck({
@@ -291,10 +288,10 @@ export function CanonicalControlSurface({
         {ack ? <p className="text-[10px] text-muted-foreground">{ack}</p> : null}
 
         <div className="grid gap-3 xl:grid-cols-2">
-          <Panel className="bg-background p-3" title="Project Manager" detail="backend identity">
+          <Panel className="bg-background p-3" title={t("canonical.projectManager")} detail={t("canonical.backendIdentity")}>
             <div className="flex flex-wrap items-end gap-2">
               <label className="flex-1 text-[10px] text-muted-foreground">
-                Repository root
+                {t("canonical.repositoryRoot")}
                 <Input
                   className="mt-1 h-7 text-[11px]"
                   value={root}
@@ -303,7 +300,7 @@ export function CanonicalControlSurface({
                 />
               </label>
               <Button size="xs" disabled={busy || importIssues.length > 0} onClick={importProject}>
-                <Upload className="size-3.5" /> Import
+                <Upload className="size-3.5" /> {t("common.import")}
               </Button>
             </div>
             <IssueList issues={importIssues} />
@@ -326,10 +323,10 @@ export function CanonicalControlSurface({
                     <span className="truncate text-muted-foreground">{project.root}</span>
                     {project.marker ? (
                       <span className="ml-auto inline-flex items-center gap-1 text-muted-foreground">
-                        <ShieldCheck className="size-3" /> boundary
+                        <ShieldCheck className="size-3" /> {t("canonical.boundary")}
                       </span>
                     ) : (
-                      <span className="ml-auto text-muted-foreground">explicit</span>
+                      <span className="ml-auto text-muted-foreground">{t("canonical.explicit")}</span>
                     )}
                   </button>
                 </li>
@@ -337,10 +334,10 @@ export function CanonicalControlSurface({
             </ul>
           </Panel>
 
-          <Panel className="bg-background p-3" title="Global Configurator" detail="persisted OCG configuration">
+          <Panel className="bg-background p-3" title={t("canonical.globalConfigurator")} detail={t("canonical.persistedConfig")}>
             <div className="grid gap-2 sm:grid-cols-2">
               <label className="text-[10px] text-muted-foreground">
-                Provider
+                {t("canonical.provider")}
                 <Input
                   className="mt-1 h-7 text-[11px]"
                   value={draft.provider}
@@ -348,7 +345,7 @@ export function CanonicalControlSurface({
                 />
               </label>
               <label className="text-[10px] text-muted-foreground">
-                Model
+                {t("canonical.model")}
                 <Input
                   className="mt-1 h-7 text-[11px]"
                   value={draft.model}
@@ -356,7 +353,7 @@ export function CanonicalControlSurface({
                 />
               </label>
               <label className="text-[10px] text-muted-foreground">
-                Profile
+                {t("canonical.profile")}
                 <select
                   className="mt-1 h-7 w-full rounded-md border border-border bg-background px-2 text-[11px]"
                   value={draft.profile}
@@ -364,13 +361,13 @@ export function CanonicalControlSurface({
                     setDraft({ ...draft, profile: event.target.value as ConfigurationDraft["profile"] })
                   }
                 >
-                  <option value="fast">fast</option>
-                  <option value="careful">careful</option>
-                  <option value="balanced">balanced</option>
+                  <option value="fast">{t("canonical.option.fast")}</option>
+                  <option value="careful">{t("canonical.option.careful")}</option>
+                  <option value="balanced">{t("canonical.option.balanced")}</option>
                 </select>
               </label>
               <label className="text-[10px] text-muted-foreground">
-                Routing
+                {t("canonical.routing")}
                 <select
                   className="mt-1 h-7 w-full rounded-md border border-border bg-background px-2 text-[11px]"
                   value={draft.routing}
@@ -378,13 +375,13 @@ export function CanonicalControlSurface({
                     setDraft({ ...draft, routing: event.target.value as ConfigurationDraft["routing"] })
                   }
                 >
-                  <option value="direct">direct</option>
-                  <option value="balanced">balanced</option>
-                  <option value="review">review</option>
+                  <option value="direct">{t("canonical.option.direct")}</option>
+                  <option value="balanced">{t("canonical.option.balanced")}</option>
+                  <option value="review">{t("canonical.option.review")}</option>
                 </select>
               </label>
               <label className="text-[10px] text-muted-foreground">
-                Hard budget (USD)
+                {t("canonical.hardBudget")}
                 <Input
                   className="mt-1 h-7 text-[11px]"
                   type="number"
@@ -406,7 +403,7 @@ export function CanonicalControlSurface({
 
           <Panel
             className="bg-background p-3"
-            title="Job pre-run configuration"
+            title={t("canonical.preRun")}
             detail={preRun.jobId ? `job ${preRun.jobId}` : t("canonical.noJob")}
           >
             <div className="flex flex-wrap items-end gap-2">
@@ -426,7 +423,7 @@ export function CanonicalControlSurface({
             {preRun.reason ? (
               <p className="mt-2 flex items-start gap-1 text-[10px] text-muted-foreground">
                 <Lock className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
-                {preRun.reason}
+                {preRun.reasonCode ? t(preRun.reasonCode === "not-loaded" ? "canonical.notLoaded" : preRun.reasonCode === "job-required" ? "canonical.issue.job-required" : "canonical.frozen") : null}
               </p>
             ) : null}
             <div className="mt-2 flex flex-wrap gap-2">
@@ -439,26 +436,25 @@ export function CanonicalControlSurface({
               </Button>
             </div>
             <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[10px]">
-              <dt className="text-muted-foreground">Attempts</dt>
+              <dt className="text-muted-foreground">{t("execution.attempts")}</dt>
               <dd>{state.projection?.attempts.length ?? 0}</dd>
-              <dt className="text-muted-foreground">Calls</dt>
+              <dt className="text-muted-foreground">{t("execution.calls")}</dt>
               <dd>{state.projection?.calls.length ?? 0}</dd>
-              <dt className="text-muted-foreground">Attempt history</dt>
+              <dt className="text-muted-foreground">{t("canonical.attemptHistory")}</dt>
               <dd>{selected.attemptHistory.length}</dd>
-              <dt className="text-muted-foreground">Event cursor</dt>
+              <dt className="text-muted-foreground">{t("canonical.eventCursor")}</dt>
               <dd>{state.cursor}</dd>
             </dl>
           </Panel>
 
-          <Panel className="bg-background p-3" title={t("canonical.runningJob")} detail="Runtime state">
+          <Panel className="bg-background p-3" title={t("canonical.runningJob")} detail={t("canonical.runtimeState")}>
             {selected.execution ? (
               <div className="h-[420px] overflow-hidden rounded border border-border">
                 <JobExecutionSurface execution={selected.execution} />
               </div>
             ) : (
               <p className="text-[11px] text-muted-foreground">
-                Load a Job to inspect its execution graph, Attempt history, Call states, and frozen
-                contracts.
+                {t("canonical.loadHint")}
               </p>
             )}
           </Panel>

@@ -150,7 +150,7 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, sendMessage, setActiveProfile, cancel, launchJob, sync } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, sendMessage, setActiveProfile, launchJob, sync } = useOcgRuntime();
   const {
     activeProjectId,
     activeProject,
@@ -162,6 +162,7 @@ export function RuntimeWorkspace({
     historyError,
     retryHistory,
   } = useProject();
+  const { t } = useI18n();
   const router = useRouter();
   const searchParams = useSearchParams();
   const [activeSessionId, setActiveSessionId] = useState(() => searchParams.get("session") ?? "");
@@ -212,11 +213,11 @@ export function RuntimeWorkspace({
   useEffect(() => {
     if (runtimeAuthority === "canonical" && historyStatus === "ready" && activeSessionKey) rememberSession(activeSessionKey);
   }, [activeSessionKey, historyStatus, rememberSession, runtimeAuthority]);
-  const isLedger = view === "ledger";
-  const isControlCenter = view === "control-center";
+  const isLedger = view === "ledger" && runtimeAuthority === "mock";
+  const isControlCenter = view === "control-center" && runtimeAuthority === "mock";
   const isJobExecution = view === "job-execution";
-  const isLogs = view === "logs";
-  const isSettings = view === "settings";
+  const isLogs = view === "logs" && runtimeAuthority === "mock";
+  const isSettings = view === "settings" || (runtimeAuthority === "canonical" && ["control-center", "ledger", "logs"].includes(view));
   const isCanonical = view === "canonical";
   const isHome = view === "home";
   const isAttention = view === "attention";
@@ -226,7 +227,7 @@ export function RuntimeWorkspace({
   // explicit projectId tag.
   const attentionQueue = useMemo(
     () => {
-      const fixtureQueue = selectProjectAttentionQueue(createAttentionQueue(snapshot.scenario), activeProjectId);
+      const fixtureQueue = runtimeAuthority === "mock" ? selectProjectAttentionQueue(createAttentionQueue(snapshot.scenario), activeProjectId) : { approvals: [], history: [] };
       const runtimeItems = snapshot.attentionItems ?? [];
       const runtimeIds = new Set(runtimeItems.map((item) => item.id));
       return {
@@ -240,7 +241,7 @@ export function RuntimeWorkspace({
         ],
       };
     },
-    [snapshot.attentionItems, snapshot.scenario, activeProjectId],
+    [snapshot.attentionItems, snapshot.scenario, activeProjectId, runtimeAuthority],
   );
 
   // Quiet unresolved-attention badge for product navigation. Derived from
@@ -492,13 +493,12 @@ export function RuntimeWorkspace({
     void setActiveProfile(profileId);
   }, [setActiveProfile]);
 
-  // Switching projects closes mobile overlays, cancels any in-flight stream,
+  // Switching projects changes only the visible context and closes overlays,
   // persists the new selection, and keeps the URL in sync so a refresh keeps
   // the operator in the same project.
   const handleProjectChange = useCallback((id: ProjectId) => {
     setMobileNavOpen(false);
     setMobileInspectorOpen(false);
-    if (activeSessionKey) void cancel(activeSessionKey);
     // Reset the active session to one the target project owns so a stale
     // selection cannot survive the switch.
     const nextSessionId = resolveSelectedSessionId(
@@ -514,7 +514,7 @@ export function RuntimeWorkspace({
       else url.searchParams.delete("session");
       window.history.replaceState(null, "", `${url.pathname}${url.search}`);
     }
-  }, [activeSessionKey, cancel, runtimeSnapshot.sessions, setActiveProject]);
+  }, [runtimeSnapshot.sessions, setActiveProject]);
 
   const messages = activeSession ? snapshot.messagesBySession[activeSession.id] ?? [] : [];
   const execution = activeSession ? snapshot.executionBySession[activeSession.id] ?? null : null;
@@ -593,7 +593,7 @@ export function RuntimeWorkspace({
       <div className="flex min-w-0 flex-1 flex-col">
         <OcgTopbar
           session={activeSession}
-          projectName={activeProject.name}
+          projectName={activeProjectId ? activeProject.name : t("project.noProject")}
           sidebarCollapsed={sidebarCollapsed}
           inspectorOpen={inspectorOpen}
           inspectorControls={Boolean(activeSession) && view === "chat"}
@@ -667,6 +667,7 @@ export function RuntimeWorkspace({
               key={activeProjectId}
               snapshot={snapshot}
               queue={attentionQueue}
+              onSelectSession={selectSession}
               onNavigate={navigate}
             />
           </main>
@@ -676,10 +677,10 @@ export function RuntimeWorkspace({
           </main>
         ) : historyStatus !== "ready" ? (
           <main aria-label="Chat history" className="flex min-h-0 flex-1 items-center justify-center p-6">
-            {historyStatus === "loading" ? <p>Loading chat history…</p> : (
+            {historyStatus === "loading" ? <p>{t("chat.historyLoading")}</p> : (
               <div role="alert" className="space-y-3 text-center">
-                <p>Chat history could not be loaded: {historyError}</p>
-                <button type="button" onClick={retryHistory} className="rounded-md border px-3 py-2">Retry</button>
+                <p>{t("chat.historyFailed", { error: historyError ?? "" })}</p>
+                <button type="button" onClick={retryHistory} className="rounded-md border px-3 py-2">{t("common.retry")}</button>
               </div>
             )}
           </main>

@@ -1,5 +1,6 @@
 "use client";
 
+import { usePathname } from "next/navigation";
 import { OcgRuntimeProvider, useOcgRuntime } from "../runtime/runtime-context";
 import type { ScenarioId } from "../runtime/runtime-types";
 import { RuntimeWorkspace } from "../layout/app-shell";
@@ -37,8 +38,11 @@ export function OcgEntryGate({
 }
 
 function BootstrapSurface({ view, controlCenterView }: { view: WorkspaceView; controlCenterView: ControlCenterView }) {
-  const { snapshot } = useOcgRuntime();
-  const entry = selectBootstrapEntry(snapshot.bootstrap);
+  const path = usePathname();
+  const { snapshot, authority } = useOcgRuntime();
+  const entry = authority === "canonical"
+    ? path === "/onboarding" ? "onboarding" : "app"
+    : selectBootstrapEntry(snapshot.bootstrap);
 
   if (entry === "login") return <LoginView />;
   if (entry === "onboarding") return <SetupWizard />;

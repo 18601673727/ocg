@@ -193,6 +193,10 @@ pub struct ChatMessageView {
     pub role: ChatMessageRole,
     pub state: MessageLifecycle,
     pub content: String,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub job_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub attempt_state: String,

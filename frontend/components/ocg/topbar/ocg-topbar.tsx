@@ -17,7 +17,7 @@ import {
   SYNC_STATUS,
   TEXT_TONE,
 } from "@/components/ocg/primitives";
-import { useI18n } from "../i18n";
+import { runtimeStatusDetail, useI18n } from "../i18n";
 import type { RuntimeAuthority } from "../runtime/runtime-types";
 import type { WorkspaceView } from "../layout/view-domain";
 
@@ -131,7 +131,7 @@ export function OcgTopbar({
 
       <div
         className="hidden shrink-0 items-center gap-1.5 rounded-full border border-border bg-muted/40 px-2.5 py-1 text-[11px] text-muted-foreground md:flex"
-        title={runtimeStatus.detail ?? authorityLabel}
+        title={runtimeStatusDetail(t, runtimeStatus) ?? authorityLabel}
       >
         <StatusDot tone={connection.tone} pulse={connection.pulse} />
         <span className="font-medium">{authorityLabel}</span>

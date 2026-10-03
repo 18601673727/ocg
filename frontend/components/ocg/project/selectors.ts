@@ -57,11 +57,13 @@ export function selectProjectSnapshot(
   extraSessionIds: readonly string[] = [],
 ): RuntimeSnapshot {
   const id = resolveProjectId(projectId);
-  const allowed = new Set(selectProjectSessionIds(id, extraSessionIds));
+  const allowed = new Set(snapshot.authority === "canonical"
+    ? snapshot.sessions.filter(session => session.projectId === id).map(session => session.id)
+    : selectProjectSessionIds(id, extraSessionIds));
   const keepBySession = <T>(record: Record<string, T>): Record<string, T> =>
     Object.fromEntries(Object.entries(record).filter(([key]) => allowed.has(key)));
 
-  const jobIds = new Set(projectLedgerJobIds(id));
+  const jobIds = new Set(snapshot.authority === "canonical" ? [] : projectLedgerJobIds(id));
   const ledgerEntries = snapshot.resourceLedger?.entries.filter((entry) =>
     jobIds.has(entry.jobId) || (entry.sessionId !== null && allowed.has(entry.sessionId)),
   ) ?? [];

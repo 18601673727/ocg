@@ -90,12 +90,13 @@ export const HOME_STATUS_LABELS: Record<ActiveJobProjection["status"], string> =
 export function HomeSurface(props: HomeSurfaceProps) {
   const { t } = useI18n();
   const { snapshot } = props;
-  const attention = useMemo(() => selectHomeAttention(snapshot), [snapshot]);
+  const canonical = snapshot.authority === "canonical";
+  const attention = useMemo(() => selectHomeAttention(snapshot, t), [snapshot, t]);
   const jobs = useMemo(() => selectHomeActiveJobs(snapshot), [snapshot]);
-  const recentWork = useMemo(() => selectRecentWork(snapshot.sessions), [snapshot.sessions]);
+  const recentWork = useMemo(() => selectRecentWork(snapshot.sessions, t), [snapshot.sessions, t]);
   const resourceHealth = useMemo(() => selectResourceHealthSummary(snapshot.bootstrap), [snapshot.bootstrap]);
   const usage = useMemo(() => selectHomeUsageSummary(snapshot.resourceLedger), [snapshot.resourceLedger]);
-  const activity = useMemo(() => selectRecentProductActivity(snapshot), [snapshot]);
+  const activity = useMemo(() => selectRecentProductActivity(snapshot, t), [snapshot, t]);
 
   return (
     <div className="flex min-h-0 flex-1 overflow-y-auto">
@@ -107,7 +108,7 @@ export function HomeSurface(props: HomeSurfaceProps) {
             <p className="mt-1 text-sm text-muted-foreground">
               {attention.length > 0
                 ? t(attention.length === 1 ? "home.attention.one" : "home.attention.other", { count: attention.length })
-                : t("home.healthy")}
+                : t(canonical ? "home.realWelcome" : "home.healthy")}
               {resourceHealth.hasDegradedOrAuthRequired ? t("home.resourcesNeedReview") : ""}
             </p>
           </div>
@@ -121,7 +122,7 @@ export function HomeSurface(props: HomeSurfaceProps) {
         <AttentionSection items={attention} onNavigate={props.onNavigate} />
 
         {/* Main grid */}
-        <div className="grid gap-5 lg:grid-cols-[1fr_320px] xl:grid-cols-[1fr_380px]">
+        <div className={cn("grid gap-5", !canonical && "lg:grid-cols-[1fr_320px] xl:grid-cols-[1fr_380px]")}>
           {/* Left column */}
           <div className="flex flex-col gap-5">
             <ActiveJobsSection jobs={jobs} onNavigate={props.onNavigate} />
@@ -130,10 +131,10 @@ export function HomeSurface(props: HomeSurfaceProps) {
           </div>
 
           {/* Right column */}
-          <div className="flex flex-col gap-5">
+          {!canonical && <div className="flex flex-col gap-5">
             <ResourceHealthSection health={resourceHealth} onNavigate={props.onNavigate} />
             <UsageSummarySection usage={usage} onNavigate={props.onNavigate} />
-          </div>
+          </div>}
         </div>
       </div>
     </div>
@@ -280,11 +281,11 @@ function JobCard({ job, onClick }: { job: ActiveJobProjection; onClick: () => vo
           </span>
         </div>
         <div className="flex items-center gap-3 text-[12px] text-muted-foreground">
-          <span>{job.completed} / {job.total} calls</span>
-          {job.activeWorkers > 0 && <span>{job.activeWorkers} active</span>}
-          {job.blockedWorkers > 0 && <span className="text-amber-600 dark:text-amber-400">{job.blockedWorkers} blocked</span>}
+          <span>{t("home.callProgress", { settled: job.completed, total: job.total })}</span>
+          {job.activeWorkers > 0 && <span>{t("home.activeWorkers", { count: job.activeWorkers })}</span>}
+          {job.blockedWorkers > 0 && <span className="text-amber-600 dark:text-amber-400">{t("home.blockedWorkers", { count: job.blockedWorkers })}</span>}
           {waveInfo && <span>{waveInfo}</span>}
-          <span className="ml-auto flex items-center gap-1"><Clock3 className="size-3" />{job.elapsed}</span>
+          <span className="ml-auto flex items-center gap-1"><Clock3 className="size-3" />{t("home.ongoing")}</span>
         </div>
         {budgetText && (
           <div className="flex items-center gap-2 text-[12px]">

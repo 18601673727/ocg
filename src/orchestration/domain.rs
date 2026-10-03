@@ -556,6 +556,7 @@ pub struct ChatMessageOrigin {
     pub command_id: String,
     pub job_id: String,
     pub attempt_state: String,
+    pub failure_reason: Option<String>,
 }
 
 pub struct ChatHistory {
@@ -679,7 +680,13 @@ impl DomainRepository {
         let messages = read_conversation_messages(&transaction, conversation.id.as_str())?;
         let mut statement = transaction
             .prepare(
-                "SELECT m.id,t.command_id,t.job_id,a.state FROM domain_messages m
+                "SELECT m.id,t.command_id,t.job_id,a.state,
+                 (SELECT i.failure FROM domain_dispatch_intents i
+                  WHERE i.attempt_id=t.attempt_id AND i.failure IS NOT NULL
+                    AND i.state IN ('failed','fenced')
+                  ORDER BY CASE i.state WHEN 'failed' THEN 0 ELSE 1 END,
+                    i.updated_at DESC,i.created_at DESC,i.id DESC LIMIT 1)
+                 FROM domain_messages m
              JOIN domain_chat_turns t ON t.attempt_id=m.attempt_id
              JOIN domain_conversations c ON c.id=t.conversation_id
              JOIN domain_attempts a ON a.id=t.attempt_id
@@ -694,6 +701,7 @@ impl DomainRepository {
                         command_id: row.get(1)?,
                         job_id: row.get(2)?,
                         attempt_state: row.get(3)?,
+                        failure_reason: row.get(4)?,
                     },
                 ))
             })

@@ -5,6 +5,8 @@
  * snapshot. No new state is introduced here and no values are invented.
  */
 
+import type { I18nKey, TranslateFn } from "../i18n";
+import { runtimeStateLabel } from "../i18n";
 import type { AttentionItem, AttentionSeverity, ActiveJobProjection, ContinueWorkingEntry, ResourceHealthSummary as HomeResourceHealthSummary, UsageSummary, RecentActivityItem } from "./domain";
 import type { BootstrapState } from "../bootstrap/types";
 import type { JobExecution } from "../execution/domain";
@@ -20,7 +22,7 @@ export function selectHomeAttention(snapshot: {
   bootstrap: BootstrapState;
   executionBySession: Record<string, JobExecution | null>;
   accountingBySession: Record<string, JobAccounting | null>;
-}): AttentionItem[] {
+}, t?: TranslateFn): AttentionItem[] {
   const items: AttentionItem[] = [];
   const { bootstrap, executionBySession } = snapshot;
 
@@ -81,8 +83,8 @@ export function selectHomeAttention(snapshot: {
         id: `attention-execution-failed-${sessionId}`,
         severity: "warning",
         kind: "runtimeFailure",
-        title: `Job ${execution.jobId} failed`,
-        summary: `Job execution failed in session ${sessionId}.`,
+        title: t ? t("home.failedJob", { id: execution.jobId }) : `Job ${execution.jobId} failed`,
+        summary: t ? t("home.failedSummary") : `Job execution failed in session ${sessionId}.`,
         jobId: execution.jobId,
         sessionId,
         createdAt: "now",
@@ -147,7 +149,7 @@ export function selectHomeActiveJobs(snapshot: {
 // Recent work
 // ---------------------------------------------------------------------------
 
-export function selectRecentWork(sessions: { id: string; title: string; updatedAt: string; workType?: string }[]): ContinueWorkingEntry[] {
+export function selectRecentWork(sessions: { id: string; title: string; updatedAt: string; workType?: string }[], t?: TranslateFn): ContinueWorkingEntry[] {
   return sessions
     .slice()
     .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0))
@@ -238,7 +240,7 @@ export function selectHomeUsageSummary(
 export function selectRecentProductActivity(snapshot: {
   sessions: { id: string; title: string; workType: string; updatedAt?: string }[];
   executionBySession: Record<string, JobExecution | null>;
-}): RecentActivityItem[] {
+}, t?: TranslateFn): RecentActivityItem[] {
   const items: RecentActivityItem[] = [];
   for (const session of snapshot.sessions.slice(0, 5)) {
     items.push({
@@ -263,3 +265,8 @@ export function selectRecentProductActivity(snapshot: {
   }
   return items.slice(0, 6);
 }
+
+const WORK_TYPE_KEYS: Record<string, I18nKey> = {
+  coding: "sidebar.workType.coding", research: "sidebar.workType.research",
+  design: "sidebar.workType.design", devops: "sidebar.workType.devops",
+} as const;

@@ -80,6 +80,8 @@ export type ChatMessage = {
   optimistic?: boolean;
   role: MessageRole;
   content: string;
+  failureReason?: string;
+  failureCode?: "project-missing" | "configuration-required" | "stream-closed";
   createdAt: string;
   status: MessageStatus;
   call?: CallActivity;
@@ -104,6 +106,7 @@ export const RUNTIME_CONNECTION_STATES: readonly RuntimeConnectionState[] = [
 
 export type RuntimeStatus = {
   state: RuntimeConnectionState;
+  detailCode?: "provider-ready" | "configuration-required";
   detail?: string;
 };
 
