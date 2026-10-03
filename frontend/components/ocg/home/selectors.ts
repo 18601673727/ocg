@@ -157,7 +157,11 @@ export function selectRecentWork(sessions: { id: string; title: string; updatedA
        id: `continue-${session.id}`,
        sessionId: session.id,
        title: session.title,
-       subtitle: `Session · ${session.workType ?? "coding"}`,
+       subtitle: t ? t("home.sessionType", {
+         type: WORK_TYPE_KEYS[session.workType ?? "coding"]
+           ? t(WORK_TYPE_KEYS[session.workType ?? "coding"])
+           : session.workType ?? "coding",
+       }) : `Session · ${session.workType ?? "coding"}`,
        timeAgo: session.updatedAt,
        kind: "chat" as const,
        updatedAt: session.updatedAt,
@@ -246,7 +250,9 @@ export function selectRecentProductActivity(snapshot: {
     items.push({
       id: `activity-${session.id}`,
       summary: session.title,
-      subtitle: `Session · ${session.workType}`,
+      subtitle: t ? t("home.sessionType", {
+        type: WORK_TYPE_KEYS[session.workType] ? t(WORK_TYPE_KEYS[session.workType]) : session.workType,
+      }) : `Session · ${session.workType}`,
       timestamp: session.updatedAt,
       kind: "job" as const,
       tone: "slate" as const,
@@ -257,7 +263,9 @@ export function selectRecentProductActivity(snapshot: {
     if (!execution) continue;
     items.push({
       id: `execution-${sessionId}`,
-      summary: `Job ${execution.jobId} · ${execution.state} · ${execution.calls.length} calls`,
+      summary: t ? t("home.executionActivity", {
+        id: execution.jobId, state: runtimeStateLabel(t, execution.state), count: execution.calls.length,
+      }) : `Job ${execution.jobId} · ${execution.state} · ${execution.calls.length} calls`,
       kind: "job" as const,
       tone: execution.state === "failed" ? "red" as const : "emerald" as const,
       timeAgo: new Date(execution.updatedAt * 1000).toISOString(),

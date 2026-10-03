@@ -730,7 +730,7 @@ export const zh: Dictionary = {
   "chat.projectMissing": "此对话未关联项目。请选择项目并新建对话。",
   "chat.streamClosed": "对话流连接已关闭。请刷新以加载最新记录。",
 
-  "attention.noFailedConversations": "å½åå¯¹è¯ææ å¤±è´¥ä»»å¡ã",
+  "attention.noFailedConversations": "当前对话暂无失败任务。",
   "chat.failed": "失败",
   "chat.cancelled": "已取消",
   "chat.failureMissing": "执行失败，未记录诊断信息。请查看任务详情或重试。",

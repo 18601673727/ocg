@@ -33,6 +33,9 @@ impl Vault {
     }
 
     pub fn user_global() -> Result<Self> {
+        if let Some(path) = std::env::var_os("OCG_VAULT_PATH") {
+            return Ok(Self::new(path));
+        }
         let dirs = directories::BaseDirs::new().ok_or_else(|| {
             OcgError::config("cannot resolve the user data directory for OCG credentials")
         })?;
@@ -211,6 +214,40 @@ impl Vault {
 }
 
 fn encryption_key(create: bool) -> Result<Vec<u8>> {
+    // An explicit key file lets isolated/headless processes avoid the shared
+    // OS keychain. A missing or invalid override must never fall back to it.
+    if let Some(path) = std::env::var_os("OCG_VAULT_KEY_FILE") {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| OcgError::io("cannot inspect explicit Vault key file", error))?;
+            if metadata.file_type().is_symlink() {
+                return Err(OcgError::config(
+                    "explicit Vault key file must not be a symbolic link",
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(OcgError::config(
+                    "explicit Vault key file must be a regular file",
+                ));
+            }
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(OcgError::config(
+                    "explicit Vault key file must not grant group or other permissions",
+                ));
+            }
+        }
+        let key = std::fs::read(path)
+            .map_err(|error| OcgError::io("cannot read explicit Vault key file", error))?;
+        if key.len() != KEY_LEN {
+            return Err(OcgError::config(
+                "explicit Vault key file must contain 32 bytes",
+            ));
+        }
+        return Ok(key);
+    }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)
         .map_err(|_| OcgError::config("cannot access the operating-system credential store"))?;
     match entry.get_password() {

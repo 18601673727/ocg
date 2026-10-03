@@ -336,11 +336,39 @@ fn reconcile_command(root: &Path, _args: &[OsString], pretty: bool) -> Result<i3
     print_json(&repository.reconcile_dispatches()?, pretty).map(|_| 0)
 }
 
-fn serve_command(root: &Path, profile: &Path, args: &[OsString], pretty: bool, disable_proxy: bool) -> Result<i32, Failure> {
-    let address = args.first().map(|value| value.to_string_lossy().into_owned()).unwrap_or_else(|| "127.0.0.1:0".into());
-    let server = crate::control_server::ControlServer::bind_with_profile(&address, root, profile, crate::control_server::ServerConfig::default(), disable_proxy)?;
-    if pretty { print_json(&json!({"listening": server.base_url()}), true)?; } else { println!("listening on {}", server.base_url()); }
+fn serve_command(
+    root: &Path,
+    profile: &Path,
+    args: &[OsString],
+    pretty: bool,
+    disable_proxy: bool,
+) -> Result<i32, Failure> {
+    let address = args
+        .first()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "127.0.0.1:0".into());
+    let server = crate::control_server::ControlServer::bind_with_profile(
+        &address,
+        root,
+        profile,
+        crate::control_server::ServerConfig::default(),
+        disable_proxy,
+    )?;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal_stop = std::sync::Arc::clone(&stop);
+    ctrlc::set_handler(move || {
+        signal_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    })
+    .map_err(|error| {
+        OcgError::config(format!(
+            "cannot install control server shutdown handler: {error}"
+        ))
+    })?;
+    if pretty {
+        print_json(&json!({"listening": server.base_url()}), true)?;
+    } else {
+        println!("listening on {}", server.base_url());
+    }
     server.serve(stop)?;
     Ok(0)
 }

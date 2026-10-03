@@ -241,6 +241,33 @@ impl ProjectRuntimeRegistry {
         Ok(handle)
     }
 
+    /// Stop and forget the cached runtime for one Project.
+    ///
+    /// The removed runtime is fully stopped here: `shutdown` cancels it, closes
+    /// both dispatchers and joins both workers before returning, so once this
+    /// call has returned no worker of the old root can still be running and no
+    /// live-but-forgotten runtime can be left behind. A worker that reported a
+    /// failure while stopping is still joined, so the error is a report about a
+    /// runtime that is already dead — it never describes a runtime that
+    /// outlived this call.
+    ///
+    /// Callers get `Err` when that shutdown failed and must not treat the
+    /// Project as movable to another root on a runtime they believe is gone.
+    pub fn invalidate(&self, project_id: &str) -> Result<()> {
+        let runtime = {
+            let mut state = self.state.lock()
+                .map_err(|_| OcgError::config("Project runtime registry poisoned"))?;
+            state.runtimes.remove(project_id)
+        };
+        match runtime {
+            // `ExecutionRuntime::shutdown` joins every worker before it
+            // returns, so the removed runtime is dead whether it reports
+            // success or failure.
+            Some(runtime) => runtime.shutdown(),
+            None => Ok(()),
+        }
+    }
+
     pub fn shutdown(&self) -> Result<()> {
         let runtimes = {
             let mut state = self.state.lock()

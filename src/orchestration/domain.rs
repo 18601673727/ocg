@@ -566,7 +566,18 @@ pub struct ChatHistory {
 }
 
 impl DomainRepository {
-    pub fn open(root: &Path) -> Result<Self> {
+    /// Open the durable store at a boundary without deciding what Project owns
+    /// it.
+    ///
+    /// Opening a store and creating a Project identity are two separate facts.
+    /// A whole Project — its `.ocg` store included — can move to a new
+    /// directory, and the store it carries already holds the durable Project
+    /// that must survive the move. Creating a Project row here would mint a
+    /// second identity for the same durable store and make that new row look
+    /// like the authoritative one. Callers that only need to read or reconcile
+    /// what a store already holds use this entry point; callers that require a
+    /// Project to exist use [`DomainRepository::open`].
+    pub fn open_existing(root: &Path) -> Result<Self> {
         crate::install::ensure_gitignore(root)?;
         let path = crate::orchestration::state::state_dir(root).join("substrate.sqlite3");
         let parent = path
@@ -620,7 +631,12 @@ impl DomainRepository {
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
             [],
         ).map_err(sql)?;
-        let repository = Self { connection, path };
+        Ok(Self { connection, path })
+    }
+
+    /// Open the durable store and require a Project identity at this boundary.
+    pub fn open(root: &Path) -> Result<Self> {
+        let repository = Self::open_existing(root)?;
         repository.ensure_project(root)?;
         Ok(repository)
     }
@@ -1962,6 +1978,71 @@ impl DomainRepository {
                 },
             )
             .map_err(sql)
+    }
+
+    /// Resolve the durable Project for a canonical root, adopting the existing
+    /// durable identity when the whole Project store (its `.ocg` directory)
+    /// moved with the directory. Never mints a second identity for the same
+    /// durable store: when no row matches the new root but the store holds
+    /// exactly one Project row, that row's recorded root is repaired in place.
+    /// With zero rows a new Project is created; with several and no root match
+    /// the durable identity is ambiguous and must not be guessed.
+    /// Read the durable Project recorded at a canonical root, if any. This
+    /// never creates or changes identity.
+    pub fn project_at_root(&self, root: &Path) -> Result<Option<Project>> {
+        let root = crate::project::canonicalize(root)
+            .to_string_lossy()
+            .to_string();
+        self.connection
+            .query_row(
+                "SELECT id,root,created_at FROM domain_projects WHERE root=?1",
+                [&root],
+                |row| {
+                    Ok(Project {
+                        id: row.get(0)?,
+                        root: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    /// Resolve the durable Project for a canonical root, adopting the existing
+    /// durable identity when the whole Project store (its `.ocg` directory)
+    /// moved with the directory. Never mints a second identity for the same
+    /// durable store: when no row matches the new root but the store holds
+    /// exactly one Project row, that row's recorded root is repaired in place.
+    /// With zero rows a new Project is created; with several and no root match
+    /// the durable identity is ambiguous and must not be guessed.
+    pub fn reconcile_project(&self, root: &Path) -> Result<Project> {
+        let root = crate::project::canonicalize(root)
+            .to_string_lossy()
+            .to_string();
+        if let Some(project) = self.project_at_root(Path::new(&root))? {
+            return Ok(project);
+        }
+        let projects = all_projects(&self.connection)?;
+        match projects.len() {
+            0 => self.ensure_project(Path::new(&root)),
+            1 => {
+                self.connection
+                    .execute(
+                        "UPDATE domain_projects SET root=?1 WHERE id=?2",
+                        params![&root, &projects[0].id],
+                    )
+                    .map_err(sql)?;
+                Ok(Project {
+                    id: projects[0].id.clone(),
+                    root,
+                    created_at: projects[0].created_at,
+                })
+            }
+            _ => Err(invalid(
+                "ambiguous durable Project identity at this boundary",
+            )),
+        }
     }
 
     pub fn create_job(&self, project_id: &str, payload: &str) -> Result<Job> {
