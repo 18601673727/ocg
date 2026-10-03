@@ -450,7 +450,7 @@ export function CanonicalControlSurface({
           <Panel className="bg-background p-3" title={t("canonical.runningJob")} detail={t("canonical.runtimeState")}>
             {selected.execution ? (
               <div className="h-[420px] overflow-hidden rounded border border-border">
-                <JobExecutionSurface execution={selected.execution} />
+                <JobExecutionSurface execution={selected.execution} embedded />
               </div>
             ) : (
               <p className="text-[11px] text-muted-foreground">

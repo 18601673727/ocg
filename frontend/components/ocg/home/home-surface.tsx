@@ -35,6 +35,7 @@ import { formatCostMicros, formatPercent, formatTokens } from "@/lib/format";
 import {
   DOT_TONE,
   EmptyPanel,
+  PageSurface,
   SectionHeading,
   SURFACE_TONE,
   TEXT_TONE,
@@ -99,45 +100,43 @@ export function HomeSurface(props: HomeSurfaceProps) {
   const activity = useMemo(() => selectRecentProductActivity(snapshot, t), [snapshot, t]);
 
   return (
-    <div className="flex min-h-0 flex-1 overflow-y-auto">
-      <div className="flex w-full flex-col gap-5 p-4 sm:p-6 lg:p-8">
-        {/* Hero entry */}
-        <section className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <h1 className="text-[22px] font-semibold tracking-tight">{t("home.welcome")}</h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              {attention.length > 0
-                ? t(attention.length === 1 ? "home.attention.one" : "home.attention.other", { count: attention.length })
-                : t(canonical ? "home.realWelcome" : "home.healthy")}
-              {resourceHealth.hasDegradedOrAuthRequired ? t("home.resourcesNeedReview") : ""}
-            </p>
-          </div>
-          <Button variant="default" size="sm" onClick={() => props.onNavigate("chat")} className="shrink-0">
-            <Sparkles className="mr-1.5 size-3.5" />
-            {t("home.start")}
-          </Button>
-        </section>
-
-        {/* Attention summary — View all navigates to the Attention Center. */}
-        <AttentionSection items={attention} onNavigate={props.onNavigate} />
-
-        {/* Main grid */}
-        <div className={cn("grid gap-5", !canonical && "lg:grid-cols-[1fr_320px] xl:grid-cols-[1fr_380px]")}>
-          {/* Left column */}
-          <div className="flex flex-col gap-5">
-            <ActiveJobsSection jobs={jobs} onNavigate={props.onNavigate} />
-            <ContinueWorkingSection entries={recentWork} onSelectSession={props.onSelectSession ?? (() => props.onNavigate("chat"))} />
-            <RecentActivitySection items={activity} />
-          </div>
-
-          {/* Right column */}
-          {!canonical && <div className="flex flex-col gap-5">
-            <ResourceHealthSection health={resourceHealth} onNavigate={props.onNavigate} />
-            <UsageSummarySection usage={usage} onNavigate={props.onNavigate} />
-          </div>}
+    <PageSurface className="flex flex-col gap-5">
+      {/* Hero entry */}
+      <section className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-[22px] font-semibold tracking-tight">{t("home.welcome")}</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {attention.length > 0
+              ? t(attention.length === 1 ? "home.attention.one" : "home.attention.other", { count: attention.length })
+              : t(canonical ? "home.realWelcome" : "home.healthy")}
+            {resourceHealth.hasDegradedOrAuthRequired ? t("home.resourcesNeedReview") : ""}
+          </p>
         </div>
+        <Button variant="default" size="sm" onClick={() => props.onNavigate("chat")} className="shrink-0">
+          <Sparkles className="mr-1.5 size-3.5" />
+          {t("home.start")}
+        </Button>
+      </section>
+
+      {/* Attention summary — View all navigates to the Attention Center. */}
+      <AttentionSection items={attention} onNavigate={props.onNavigate} />
+
+      {/* Main grid */}
+      <div className={cn("grid gap-5", !canonical && "lg:grid-cols-[1fr_320px] xl:grid-cols-[1fr_380px]")}>
+        {/* Left column */}
+        <div className="flex flex-col gap-5">
+          <ActiveJobsSection jobs={jobs} onNavigate={props.onNavigate} />
+          <ContinueWorkingSection entries={recentWork} onSelectSession={props.onSelectSession ?? (() => props.onNavigate("chat"))} />
+          <RecentActivitySection items={activity} />
+        </div>
+
+        {/* Right column */}
+        {!canonical && <div className="flex flex-col gap-5">
+          <ResourceHealthSection health={resourceHealth} onNavigate={props.onNavigate} />
+          <UsageSummarySection usage={usage} onNavigate={props.onNavigate} />
+        </div>}
       </div>
-    </div>
+    </PageSurface>
   );
 }
 

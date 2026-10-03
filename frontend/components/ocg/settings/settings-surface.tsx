@@ -4,7 +4,7 @@ import { useMemo } from "react";
 import { ArrowRight, RotateCcw, Settings2, ShieldCheck } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { Pill } from "@/components/ocg/primitives";
+import { PageSurface, Pill } from "@/components/ocg/primitives";
 import { cn } from "@/lib/utils";
 import { useTheme } from "../appearance/theme-provider";
 import { ProfilePanel } from "../profile/profile-panel";
@@ -153,30 +153,28 @@ export function SettingsSurface({ snapshot }: { snapshot: RuntimeSnapshot }) {
   const appearanceSection = sections.find((section) => section.id === "appearance");
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto bg-background">
-      <div className="mx-auto w-full max-w-5xl px-3 py-4 sm:px-5 sm:py-6">
-        <header className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{t("settings.workspace")}</span><span className="text-[10px] text-muted-foreground">{t("settings.settings")}</span></div><h1 className="mt-1.5 flex items-center gap-2 text-[18px] font-semibold tracking-tight"><Settings2 className="size-4 text-muted-foreground" />{t("settings.title")}</h1><p className="mt-1 max-w-2xl text-[11px] leading-5 text-muted-foreground">{t(canonical ? "settings.realSubtitle" : "settings.subtitle")}</p></div><div className="rounded-md border border-border bg-muted/20 px-2.5 py-2 text-right text-[10px] text-muted-foreground"><p className="font-medium text-foreground">{t("settings.themeActive", { theme: t(theme.resolvedTheme === "dark" ? "settings.theme.dark" : "settings.theme.light") })}</p><p className="mt-0.5">{theme.hydrated ? t("settings.preferencesActive") : t("settings.preferencesLoading")}</p></div></header>
-        {!canonical && <div className="mt-4 rounded-md border border-violet-500/25 bg-violet-500/5 px-3 py-2.5 text-[10px] leading-4 text-muted-foreground"><strong className="font-semibold text-foreground">{t("settings.boundaryTitle")}</strong> {t("settings.boundaryBody")}</div>}
-        {canonical ? <section className="mt-4 rounded-lg border border-border p-4">
-          <h2 className="text-sm font-semibold">{t("settings.providerModels")}</h2>
-          <p className="mt-1 text-xs text-muted-foreground">{t("settings.providerModelsDesc")}</p>
-          <Button className="mt-3" size="sm" variant="outline" onClick={() => router.push(RECONFIGURE_PATH)}>{t("settings.configure")}<ArrowRight className="size-3" /></Button>
-        </section> : <div className="mt-4"><ProfilePanel /></div>}
-        <div className="mt-4 grid gap-3 lg:grid-cols-2">
-          {sections.map((section) => <SettingsSection key={section.id} section={section} onReconfigure={() => router.push(RECONFIGURE_PATH)} onReset={section.id === "appearance" ? theme.resetAppearance : undefined} />)}
-        </div>
-        {canonical && <details className="mt-4 rounded-lg border border-border p-4">
-          <summary className="cursor-pointer text-sm font-medium">{t("settings.section.advanced")}</summary>
-          <div className="mt-3 space-y-3">
-            <Button size="sm" variant="outline" onClick={() => {
-              const url = new URL(window.location.href); url.pathname = "/"; url.searchParams.set("view", "canonical");
-              window.history.pushState(null, "", url.pathname + url.search);
-            }}>{t("nav.canonical")}<ArrowRight className="size-3" /></Button>
-            <ProfilePanel />
-          </div>
-        </details>}
-        {appearanceSection && <p className="mt-3 text-[10px] text-muted-foreground">{t("settings.appearanceNote")}</p>}
+    <PageSurface className="mx-auto w-full max-w-5xl">
+      <header className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{t("settings.workspace")}</span><span className="text-[10px] text-muted-foreground">{t("settings.settings")}</span></div><h1 className="mt-1.5 flex items-center gap-2 text-[18px] font-semibold tracking-tight"><Settings2 className="size-4 text-muted-foreground" />{t("settings.title")}</h1><p className="mt-1 max-w-2xl text-[11px] leading-5 text-muted-foreground">{t(canonical ? "settings.realSubtitle" : "settings.subtitle")}</p></div><div className="rounded-md border border-border bg-muted/20 px-2.5 py-2 text-right text-[10px] text-muted-foreground"><p className="font-medium text-foreground">{t("settings.themeActive", { theme: t(theme.resolvedTheme === "dark" ? "settings.theme.dark" : "settings.theme.light") })}</p><p className="mt-0.5">{theme.hydrated ? t("settings.preferencesActive") : t("settings.preferencesLoading")}</p></div></header>
+      {!canonical && <div className="mt-4 rounded-md border border-violet-500/25 bg-violet-500/5 px-3 py-2.5 text-[10px] leading-4 text-muted-foreground"><strong className="font-semibold text-foreground">{t("settings.boundaryTitle")}</strong> {t("settings.boundaryBody")}</div>}
+      {canonical ? <section className="mt-4 rounded-lg border border-border p-4">
+        <h2 className="text-sm font-semibold">{t("settings.providerModels")}</h2>
+        <p className="mt-1 text-xs text-muted-foreground">{t("settings.providerModelsDesc")}</p>
+        <Button className="mt-3" size="sm" variant="outline" onClick={() => router.push(RECONFIGURE_PATH)}>{t("settings.configure")}<ArrowRight className="size-3" /></Button>
+      </section> : <div className="mt-4"><ProfilePanel /></div>}
+      <div className="mt-4 grid gap-3 lg:grid-cols-2">
+        {sections.map((section) => <SettingsSection key={section.id} section={section} onReconfigure={() => router.push(RECONFIGURE_PATH)} onReset={section.id === "appearance" ? theme.resetAppearance : undefined} />)}
       </div>
-    </div>
+      {canonical && <details className="mt-4 rounded-lg border border-border p-4">
+        <summary className="cursor-pointer text-sm font-medium">{t("settings.section.advanced")}</summary>
+        <div className="mt-3 space-y-3">
+          <Button size="sm" variant="outline" onClick={() => {
+            const url = new URL(window.location.href); url.pathname = "/"; url.searchParams.set("view", "canonical");
+            window.history.pushState(null, "", url.pathname + url.search);
+          }}>{t("nav.canonical")}<ArrowRight className="size-3" /></Button>
+          <ProfilePanel />
+        </div>
+      </details>}
+      {appearanceSection && <p className="mt-3 text-[10px] text-muted-foreground">{t("settings.appearanceNote")}</p>}
+    </PageSurface>
   );
 }

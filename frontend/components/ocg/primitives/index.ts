@@ -12,6 +12,7 @@ export { FilterOption, FilterSelect } from "./filter-select";
 export { KeyValue, KeyValueList } from "./key-value";
 export { Metric } from "./metric";
 export { Panel } from "./panel";
+export { PageSurface } from "./page-surface";
 export { ProgressBar } from "./progress-bar";
 export { SegmentedTabs, type TabItem } from "./segmented-tabs";
 export { SectionHeading, SectionTitle } from "./section-title";

@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   EmptyPanel,
+  PageSurface,
   Pill,
   SegmentedTabs,
   StatusDot,
@@ -128,7 +129,7 @@ const DECISION_CLOCK = "2026-09-25T10:00:00Z";
 function CanonicalAttentionSurface({ snapshot, onNavigate, onSelectSession }: AttentionSurfaceProps) {
   const { t } = useI18n();
   const failed = Object.entries(snapshot.executionBySession).filter(([, execution]) => execution?.state === "failed");
-  return <div className="flex-1 overflow-auto p-4 sm:p-6">
+  return <PageSurface>
     <h1 className="text-xl font-semibold">{t("attention.title")}</h1>
     <p className="mt-1 text-sm text-muted-foreground">{t("attention.localReview")}</p>
     {failed.length === 0 ? <p className="mt-6 text-sm text-muted-foreground">{t("attention.noFailedConversations")}</p> :
@@ -138,7 +139,7 @@ function CanonicalAttentionSurface({ snapshot, onNavigate, onSelectSession }: At
         <p className="mt-2 whitespace-pre-wrap break-words text-xs">{[...(snapshot.messagesBySession[sessionId] ?? [])].reverse().find(message => message.status === "failed")?.failureReason ?? t("chat.failureMissing")}</p>
         <Button className="mt-3" size="xs" variant="outline" onClick={() => { onSelectSession?.(sessionId); onNavigate("chat"); }}>{t("nav.chat")}</Button>
       </li>)}</ul>}
-  </div>;
+  </PageSurface>;
 }
 
 export function AttentionSurface(props: AttentionSurfaceProps) {
