@@ -31,6 +31,7 @@ fn onboarding_same_session_two_chat_turns() -> Result<()> {
     assert!(array(&projects, "projects")?
         .iter()
         .any(|project| project["project_id"] == project_id));
+    let session_id = smoke.create_untitled_session(&project_id)?;
 
     for turn in ["ONE", "TWO"] {
         let expected = format!("SMOKE_TURN_{turn}_OK");
@@ -41,7 +42,7 @@ fn onboarding_same_session_two_chat_turns() -> Result<()> {
         ]))?;
         let chat = smoke.send_chat(
             &project_id,
-            "smoke-session",
+            &session_id,
             &format!("Reply with exactly: {expected}"),
         )?;
         assert_eq!(smoke.consume_chat(&chat)?, expected);
@@ -50,7 +51,7 @@ fn onboarding_same_session_two_chat_turns() -> Result<()> {
     let messages = smoke.json(
         "GET",
         &format!(
-            "/api/v1/canonical/chat/messages?project_id={project_id}&session_id=smoke-session"
+            "/api/v1/canonical/chat/messages?project_id={project_id}&session_id={session_id}"
         ),
         None,
     )?;

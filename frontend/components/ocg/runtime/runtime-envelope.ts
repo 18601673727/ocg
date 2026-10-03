@@ -436,7 +436,7 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
     case "conversation.session-updated": {
       const session = payload.session;
       if (!isRecord(session) || !isNonEmptyString(session.id)) return "session.id is required.";
-      if (!isNonEmptyString(session.title)) return "session.title is required.";
+      if (typeof session.title !== "string") return "session.title must be a string.";
       if (!isNonEmptyString(session.workType)) return "session.workType is required.";
       return null;
     }

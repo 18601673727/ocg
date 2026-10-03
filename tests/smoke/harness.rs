@@ -495,6 +495,40 @@ impl SmokeHarness {
         Ok(project)
     }
 
+    pub fn create_untitled_session(&mut self, project_id: &str) -> Result<String> {
+        self.phase = "canonical untitled session creation".into();
+        self.alive()?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut command = Command::new("node");
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .current_dir(root)
+            .arg(root.join("tests/smoke/canonical-session.cjs"))
+            .arg(format!("http://{}", self.address.ok_or("no OCG address")?))
+            .arg(project_id);
+        let mut process = Process::spawn(
+            &mut command,
+            &self.path(""),
+            "canonical-session",
+            self.timeouts,
+        )?;
+        let status = process
+            .wait_until(self.operation_deadline(self.timeouts.http))?
+            .ok_or("canonical session creation timed out")?;
+        if !status.success() {
+            return Err(format!(
+                "canonical session creation: {status}\nstdout:\n{}\nstderr:\n{}",
+                log(&process.stdout),
+                log(&process.stderr)
+            )
+            .into());
+        }
+        let session_id = string(&serde_json::from_str(&log(&process.stdout))?, "session_id")?;
+        self.ids.push(session_id.clone());
+        Ok(session_id)
+    }
+
     pub fn id(&mut self) -> String {
         self.sequence += 1;
         format!("smoke-{}", self.sequence)
