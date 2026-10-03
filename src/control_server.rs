@@ -128,18 +128,16 @@ impl ServerConfig {
 pub struct ControlServer {
     listener: TcpListener,
     addr: SocketAddr,
-    /// Backend-backed canonical control surface. It is opened best-effort:
-    /// a project without a marker still serves the legacy routes, and the
-    /// canonical routes report an explicit boundary error instead of guessing.
+    /// Backend-backed canonical control surface with process-scoped metadata.
     canonical: Option<crate::orchestration::canonical_control::CanonicalControlService>,
     profile: crate::profile::ProfileService,
     config: ServerConfig,
     active: Arc<AtomicUsize>,
     /// Long-lived chat SSE streams admitted from their own bounded pool.
     active_streams: Arc<AtomicUsize>,
-    /// Long-lived execution runtime owning provider and native tool workers.
+    /// Process-owned registry of lazily activated Project execution workers.
     /// Only present when canonical control service is available.
-    execution_runtime: Option<crate::orchestration::execution_runtime::ExecutionRuntime>,
+    execution_runtimes: Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
 }
 
 impl ControlServer {
@@ -190,58 +188,32 @@ impl ControlServer {
             )));
         }
 
-        // Try to open canonical control service
-        let mut canonical = crate::orchestration::canonical_control::CanonicalControlService::open(root).ok();
-
-        // The invocation boundary is the canonical Project boundary. Register
-        // it before the server can answer a frontend listProjects() request;
-        // register_project is keyed by the backend Project identity, so this is
-        // idempotent across restarts and never derives identity from a label.
-        if let Some(service) = canonical.as_ref() {
-            service.register_project("startup-register", root, now_unix())?;
+        let service = crate::orchestration::canonical_control::CanonicalControlService::open_process(
+            root,
+            profile_path,
+        )?;
+        let boundary = crate::project::resolve(root);
+        if boundary.has_marker() {
+            service.register_project("startup-register", boundary.root(), now_unix())?;
         }
 
-        // Wire the profile service if canonical service exists
-        if let Some(ref mut service) = canonical {
-            *service = service.clone().with_profile_service(
-                crate::profile::ProfileService::with_workspace(profile_path, root)
-            );
-        }
-
-        // If canonical service exists, start execution runtime and wire the handle
-        let execution_runtime = if canonical.is_some() {
-            // Resolve the effective proxy exactly once, here. The provider
-            // transport never re-reads the ambient environment afterwards, so
-            // this stored plan is the only route policy any Call can use.
-            let selection = crate::proxy::resolve(
-                disable_proxy,
-                &crate::proxy::SystemProxyEnv,
-                &crate::process::SystemStaticProxy,
-            );
-            let transport =
-                Arc::new(crate::http::NativeHttp::with_policy(selection.plan(), None)?);
-            match crate::orchestration::execution_runtime::ExecutionRuntime::start(
-                root,
-                16, // provider_capacity
-                16, // native_tool_capacity
+        // Share process transport policy; activate bounded workers lazily per Project.
+        let selection = crate::proxy::resolve(
+            disable_proxy,
+            &crate::proxy::SystemProxyEnv,
+            &crate::process::SystemStaticProxy,
+        );
+        let transport = Arc::new(crate::http::NativeHttp::with_policy(selection.plan(), None)?);
+        let registry = Arc::new(
+            crate::orchestration::execution_runtime::ProjectRuntimeRegistry::new(
                 transport,
                 crate::native_tools::PermissionPolicy::default(),
-            ) {
-                Ok(runtime) => {
-                    let handle = crate::orchestration::execution_runtime::ExecutionRuntimeHandle::new(&runtime);
-                    if let Some(ref mut service) = canonical {
-                        *service = service.clone().with_runtime_handle(handle);
-                    }
-                    Some(runtime)
-                }
-                Err(error) => {
-                    eprintln!("ocg: failed to start execution runtime: {error}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+                16,
+                16,
+            ),
+        );
+        let canonical = Some(service.with_runtime_registry(registry.clone()));
+        let execution_runtimes = Some(registry);
 
         Ok(Self {
             listener,
@@ -251,7 +223,7 @@ impl ControlServer {
             config,
             active: Arc::new(AtomicUsize::new(0)),
             active_streams: Arc::new(AtomicUsize::new(0)),
-            execution_runtime,
+            execution_runtimes,
         })
     }
 
@@ -348,8 +320,10 @@ impl Drop for ClientGuard {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        if let Some(runtime) = self.execution_runtime.take() {
-            let _ = runtime.shutdown();
+        if let Some(registry) = self.execution_runtimes.take() {
+            if let Err(error) = registry.shutdown() {
+                eprintln!("ocg: Project runtime shutdown failed: {error}");
+            }
         }
     }
 }
@@ -521,7 +495,7 @@ fn handle_client(
         if request.method == "OPTIONS" {
             let _ = write_preflight(&mut stream, &request);
         } else {
-            let _ = handle_setup(&mut stream, profile, &route, &request);
+            let _ = handle_setup(&mut stream, profile, canonical, &route, &request);
         }
         return;
     }
@@ -722,6 +696,7 @@ fn handle_profile(
 fn handle_setup(
     stream: &mut TcpStream,
     service: &crate::profile::ProfileService,
+    canonical: Option<&crate::orchestration::canonical_control::CanonicalControlService>,
     route: &Route,
     request: &Request,
 ) -> std::io::Result<()> {
@@ -998,9 +973,7 @@ fn handle_setup(
                 // Initialize the .ocg marker if it doesn't exist
                 let canonical_root = crate::setup::initialize_project_marker(root)?;
 
-                // Open canonical control service for this project
-                let canonical = crate::orchestration::canonical_control::CanonicalControlService::open(&canonical_root)
-                    .map_err(|error| OcgError::config(format!("cannot open canonical service: {}", error)))?;
+                let canonical = canonical.ok_or_else(|| OcgError::config("Project registry is not available"))?;
 
                 let now = now_unix();
                 let response = canonical.register_project(&body.command_id, &canonical_root, now)?;
@@ -1399,7 +1372,7 @@ fn handle_chat_stream(
             // Attempt/Call/provider execution is actually revoked. It runs
             // even when the frontend socket write above failed, and it precedes
             // any ActiveChat removal so the cancel state is still findable.
-            let _ = service.cancel_chat(&session_id);
+            let _ = service.cancel_chat_turn(&session_id, &job_id);
             break;
         }
         let (base_index, pending): (

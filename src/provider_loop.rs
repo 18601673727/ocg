@@ -1074,6 +1074,15 @@ pub fn run_provider_dispatcher(
         ready
     };
 
+    run_recovered_provider_dispatcher(project_root, dispatcher, config, recovered)
+}
+
+pub(crate) fn run_recovered_provider_dispatcher(
+    project_root: &Path,
+    dispatcher: &BoundedDispatcher,
+    config: ProviderHandlerConfig,
+    recovered: Vec<crate::orchestration::domain::DispatchIntent>,
+) -> Result<()> {
     let handler = CanonicalProviderCallHandler::new(config);
     let dispatcher_clone = dispatcher.clone();
     let project_root_clone = project_root.to_path_buf();

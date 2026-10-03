@@ -4,14 +4,16 @@ use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
 use crate::native_tools::PermissionPolicy;
 use crate::orchestration::execution_dispatch::BoundedDispatcher;
-use crate::provider_loop::{run_provider_dispatcher, ProviderHandlerConfig};
-use std::path::Path;
+use crate::provider_loop::{run_recovered_provider_dispatcher, ProviderHandlerConfig};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// Long-lived execution runtime that owns provider and native tool dispatchers.
 pub struct ExecutionRuntime {
+    project_root: PathBuf,
     provider_dispatcher: BoundedDispatcher,
     native_tool_dispatcher: BoundedDispatcher,
     cancelled: Arc<AtomicBool>,
@@ -28,9 +30,16 @@ impl ExecutionRuntime {
         transport: Arc<dyn HttpTransport>,
         permission_policy: PermissionPolicy,
     ) -> Result<Self> {
+        let canonical_root = project_root
+            .canonicalize()
+            .map_err(|error| OcgError::io("resolve execution Project root", error))?;
+        let project_root = canonical_root.as_path();
         let provider_dispatcher = BoundedDispatcher::new(provider_capacity)?;
         let native_tool_dispatcher = BoundedDispatcher::new(native_tool_capacity)?;
         let cancelled = Arc::new(AtomicBool::new(false));
+        // Finish the recovery scan before exposing a handle for new admissions.
+        let recovered = crate::orchestration::domain::DomainRepository::open(project_root)?
+            .recover_provider_dispatches()?;
 
         let provider_config = ProviderHandlerConfig {
             transport,
@@ -58,14 +67,28 @@ impl ExecutionRuntime {
         // Start provider dispatcher in separate thread (with recovery)
         let provider_dispatcher_clone = provider_dispatcher.clone();
         let project_root_clone = project_root.to_path_buf();
-        let provider_thread = std::thread::Builder::new()
+        let provider_thread = match std::thread::Builder::new()
             .name("provider-worker".to_string())
             .spawn(move || {
-                run_provider_dispatcher(&project_root_clone, &provider_dispatcher_clone, provider_config)
+                run_recovered_provider_dispatcher(
+                    &project_root_clone,
+                    &provider_dispatcher_clone,
+                    provider_config,
+                    recovered,
+                )
             })
-            .map_err(|error| OcgError::config(format!("spawn provider thread: {error}")))?;
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                cancelled.store(true, Ordering::SeqCst);
+                native_tool_dispatcher.shutdown();
+                let _ = native_tool_thread.join();
+                return Err(OcgError::config(format!("spawn provider thread: {error}")));
+            }
+        };
 
         Ok(Self {
+            project_root: project_root.to_path_buf(),
             provider_dispatcher,
             native_tool_dispatcher,
             cancelled,
@@ -86,39 +109,36 @@ impl ExecutionRuntime {
 
     /// Shutdown the runtime gracefully.
     pub fn shutdown(mut self) -> Result<()> {
+        self.stop();
+        let mut failure = None;
+        for thread in [self.provider_thread.take(), self.native_tool_thread.take()]
+            .into_iter()
+            .flatten()
+        {
+            let result = thread
+                .join()
+                .unwrap_or_else(|_| Err(OcgError::config("execution worker panicked")));
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn stop(&self) {
         // Set cancelled flag first so queued work gets fast-failed
         self.cancelled.store(true, Ordering::SeqCst);
 
         // Close both dispatchers to signal workers to exit
         self.provider_dispatcher.shutdown();
         self.native_tool_dispatcher.shutdown();
-
-        // Join provider thread first (it may still be submitting native tool work)
-        if let Some(thread) = self.provider_thread.take() {
-            match thread.join() {
-                Ok(result) => result?,
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
-        }
-
-        // Join native tool thread after provider has exited
-        if let Some(thread) = self.native_tool_thread.take() {
-            match thread.join() {
-                Ok(result) => result?,
-                Err(panic) => std::panic::resume_unwind(panic),
-            }
-        }
-
-        Ok(())
     }
 }
 
 impl Drop for ExecutionRuntime {
     fn drop(&mut self) {
         // Ensure threads don't outlive the runtime
-        self.cancelled.store(true, Ordering::SeqCst);
-        self.provider_dispatcher.shutdown();
-        self.native_tool_dispatcher.shutdown();
+        self.stop();
 
         if let Some(thread) = self.provider_thread.take() {
             let _ = thread.join();
@@ -132,6 +152,7 @@ impl Drop for ExecutionRuntime {
 /// A lightweight handle to submit work to an owned ExecutionRuntime.
 #[derive(Clone, Debug)]
 pub struct ExecutionRuntimeHandle {
+    project_root: PathBuf,
     provider_dispatcher: BoundedDispatcher,
     cancelled: Arc<AtomicBool>,
 }
@@ -139,6 +160,7 @@ pub struct ExecutionRuntimeHandle {
 impl ExecutionRuntimeHandle {
     pub fn new(runtime: &ExecutionRuntime) -> Self {
         Self {
+            project_root: runtime.project_root.clone(),
             provider_dispatcher: runtime.provider_dispatcher.clone(),
             cancelled: runtime.cancelled.clone(),
         }
@@ -148,7 +170,99 @@ impl ExecutionRuntimeHandle {
         &self.provider_dispatcher
     }
 
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+pub struct ProjectRuntimeRegistry {
+    transport: Arc<dyn HttpTransport>,
+    permission_policy: PermissionPolicy,
+    provider_capacity: usize,
+    native_tool_capacity: usize,
+    state: Mutex<ProjectRuntimeState>,
+}
+
+#[derive(Default)]
+struct ProjectRuntimeState {
+    runtimes: HashMap<String, ExecutionRuntime>,
+    shutdown: bool,
+}
+
+impl std::fmt::Debug for ProjectRuntimeRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectRuntimeRegistry")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProjectRuntimeRegistry {
+    pub fn new(
+        transport: Arc<dyn HttpTransport>,
+        permission_policy: PermissionPolicy,
+        provider_capacity: usize,
+        native_tool_capacity: usize,
+    ) -> Self {
+        Self {
+            transport,
+            permission_policy,
+            provider_capacity,
+            native_tool_capacity,
+            state: Mutex::new(ProjectRuntimeState::default()),
+        }
+    }
+
+    pub fn get_or_start(&self, project_id: &str, root: &Path) -> Result<ExecutionRuntimeHandle> {
+        let mut state = self.state.lock()
+            .map_err(|_| OcgError::config("Project runtime registry poisoned"))?;
+        if state.shutdown {
+            return Err(OcgError::config("Project runtime registry is shutting down"));
+        }
+        if let Some(runtime) = state.runtimes.get(project_id) {
+            if runtime.project_root != root {
+                return Err(OcgError::config("Project runtime root changed"));
+            }
+            return Ok(ExecutionRuntimeHandle::new(runtime));
+        }
+        let runtime = ExecutionRuntime::start(
+            root,
+            self.provider_capacity,
+            self.native_tool_capacity,
+            self.transport.clone(),
+            self.permission_policy,
+        )?;
+        let handle = ExecutionRuntimeHandle::new(&runtime);
+        state.runtimes.insert(project_id.to_string(), runtime);
+        Ok(handle)
+    }
+
+    pub fn shutdown(&self) -> Result<()> {
+        let runtimes = {
+            let mut state = self.state.lock()
+                .map_err(|_| OcgError::config("Project runtime registry poisoned"))?;
+            state.shutdown = true;
+            std::mem::take(&mut state.runtimes)
+        };
+        for runtime in runtimes.values() {
+            runtime.stop();
+        }
+        let mut failure = None;
+        for runtime in runtimes.into_values() {
+            if let Err(error) = runtime.shutdown() {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for ProjectRuntimeRegistry {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }

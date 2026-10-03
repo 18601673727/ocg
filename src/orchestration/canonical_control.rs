@@ -234,12 +234,15 @@ pub struct ChatCancelResponse {
 
 #[derive(Debug, Clone)]
 pub struct CanonicalControlService {
-    root: PathBuf,
+    initial_root: PathBuf,
+    control_state: PathBuf,
     runtime_handle: Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>,
+    runtime_registry: Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
     profile_service: crate::profile::ProfileService,
     chat_registrations: Arc<Mutex<std::collections::HashMap<String, ChatRegistration>>>,
     active_chats: Arc<Mutex<std::collections::HashMap<(String, String), ActiveChat>>>,
     launch_lock: Arc<Mutex<()>>,
+    registry_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -301,14 +304,52 @@ impl CanonicalControlService {
             home.as_deref(),
         );
 
-        Ok(Self {
-            root: boundary.root().to_path_buf(),
+        Ok(Self::new(
+            boundary.root(),
+            &profile_path,
+            crate::orchestration::state::state_dir(boundary.root()),
+        ))
+    }
+
+    pub fn open_process(root: &Path, profile_path: &Path) -> Result<Self> {
+        let boundary = project::resolve(root);
+        let service = Self::new(
+            boundary.root(),
+            profile_path,
+            project::canonicalize(profile_path)
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("state")
+                .join("control"),
+        );
+        // Adopt the existing control metadata once; Project substrates stay put.
+        let legacy = Self::new(
+            boundary.root(),
+            profile_path,
+            crate::orchestration::state::state_dir(boundary.root()),
+        );
+        if !service.project_file().exists() && legacy.project_file().exists() {
+            service.write_projects(&legacy.read_projects()?)?;
+        }
+        if !service.config_file().exists() && legacy.config_file().exists() {
+            let (global, defaults, revision) = legacy.read_configuration()?;
+            service.write_configuration(&global, &defaults, revision)?;
+        }
+        Ok(service)
+    }
+
+    fn new(root: &Path, profile_path: &Path, control_state: PathBuf) -> Self {
+        Self {
+            initial_root: root.to_path_buf(),
+            control_state,
             runtime_handle: None,
-            profile_service: crate::profile::ProfileService::with_workspace(&profile_path, root),
+            runtime_registry: None,
+            profile_service: crate::profile::ProfileService::with_workspace(profile_path, root),
             chat_registrations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             active_chats: Arc::new(Mutex::new(std::collections::HashMap::new())),
             launch_lock: Arc::new(Mutex::new(())),
-        })
+            registry_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn with_runtime_handle(
@@ -327,16 +368,24 @@ impl CanonicalControlService {
         self
     }
 
+    pub fn with_runtime_registry(
+        mut self,
+        registry: Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>,
+    ) -> Self {
+        self.runtime_registry = Some(registry);
+        self
+    }
+
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.initial_root
     }
 
     fn project_file(&self) -> PathBuf {
-        crate::orchestration::state::state_dir(&self.root).join(PROJECTS_FILE)
+        self.control_state.join(PROJECTS_FILE)
     }
 
     fn config_file(&self) -> PathBuf {
-        crate::orchestration::state::state_dir(&self.root).join(CONFIG_FILE)
+        self.control_state.join(CONFIG_FILE)
     }
 
     fn read_projects(&self) -> Result<Vec<ProjectRecord>> {
@@ -444,11 +493,19 @@ impl CanonicalControlService {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
+        let _registry = self.registry_lock.lock()
+            .map_err(|_| invalid("Project registry poisoned"))?;
         let boundary: ProjectBoundary = project::resolve(requested_root);
         boundary.require(requested_root)?;
         let root = project::canonicalize(boundary.root());
         if !root.is_dir() {
             return Err(invalid("project root is not a directory"));
+        }
+        let marker = root.join(project::MARKER);
+        let canonical_marker = marker.canonicalize()
+            .map_err(|error| OcgError::io("resolve Project marker", error))?;
+        if !canonical_marker.starts_with(&root) || project::resolve(&canonical_marker).root() != root {
+            return Err(invalid("Project marker must stay inside its boundary"));
         }
         let boundary_root = project::canonicalize(boundary.root());
         let project_id = DomainRepository::open(&root)?.ensure_project(&root)?.id;
@@ -583,7 +640,7 @@ impl CanonicalControlService {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
-        let mut repository = DomainRepository::open(&self.root)?;
+        let mut repository = self.repository_for_job(job_id)?;
         let revision = repository.set_job_configuration(job_id, &config)?;
         Ok(CanonicalJobConfigResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -596,10 +653,10 @@ impl CanonicalControlService {
     }
 
     pub fn job_configuration(&self, job_id: &str) -> Result<Option<(Value, u64)>> {
-        DomainRepository::open(&self.root)?.job_configuration(job_id)
+        self.repository_for_job(job_id)?.job_configuration(job_id)
     }
 
-    fn chat_repository(&self, project_id: &str) -> Result<DomainRepository> {
+    fn project_repository(&self, project_id: &str) -> Result<(ProjectRecord, DomainRepository)> {
         let project = self
             .read_projects()?
             .into_iter()
@@ -609,20 +666,50 @@ impl CanonicalControlService {
         if !root.is_dir() {
             return Err(invalid("registered Project root is unavailable"));
         }
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|error| OcgError::io("resolve registered Project root", error))?;
+        let boundary = project::resolve(&canonical_root);
+        if canonical_root != root || !boundary.has_marker() || boundary.root() != root {
+            return Err(invalid("registered Project boundary is no longer valid"));
+        }
+        let marker = root.join(project::MARKER);
+        let canonical_marker = marker
+            .canonicalize()
+            .map_err(|error| OcgError::io("resolve registered Project marker", error))?;
+        if !canonical_marker.starts_with(root) || project::resolve(&canonical_marker).root() != root {
+            return Err(invalid("registered Project marker must stay inside its boundary"));
+        }
         let repository = DomainRepository::open(root)?;
         if repository.ensure_project(root)?.id != project_id {
             return Err(invalid(
-                "Project identity does not own this conversation boundary",
+                "Project identity does not own this durable boundary",
             ));
         }
-        Ok(repository)
+        Ok((project, repository))
+    }
+
+    fn repository_for_job(&self, job_id: &str) -> Result<DomainRepository> {
+        let mut owner = None;
+        for project in self.read_projects()? {
+            let (_, repository) = self.project_repository(&project.project_id)?;
+            if repository.job(job_id)?
+                .is_some_and(|job| job.project_id == project.project_id)
+            {
+                if owner.is_some() {
+                    return Err(invalid("ambiguous canonical Job identity"));
+                }
+                owner = Some(repository);
+            }
+        }
+        owner.ok_or_else(|| invalid("unknown canonical Job"))
     }
 
     pub fn chat_conversations(
         &self,
         project_id: &str,
     ) -> Result<crate::contracts::ChatConversationsResponse> {
-        let repository = self.chat_repository(project_id)?;
+        let (_, repository) = self.project_repository(project_id)?;
         let conversations = repository
             .conversations(project_id)?
             .into_iter()
@@ -643,7 +730,7 @@ impl CanonicalControlService {
     ) -> Result<crate::contracts::ChatMessagesResponse> {
         use crate::contracts::{ChatMessageRole, ChatMessageView, ChatMessagesResponse};
         use crate::core_contract::{Actor, MessageBlockKind, MessageLifecycle};
-        let repository = self.chat_repository(project_id)?;
+        let (_, repository) = self.project_repository(project_id)?;
         let history = repository
             .conversation_history_with_origins(project_id, session_id)?
             .ok_or_else(|| invalid("unknown conversation in this Project"))?;
@@ -710,15 +797,7 @@ impl CanonicalControlService {
         project_id: &str,
         job_id: &str,
     ) -> Result<CanonicalJobSnapshot> {
-        let project = self
-            .read_projects()?
-            .into_iter()
-            .find(|project| project.project_id == project_id)
-            .ok_or_else(|| invalid("unknown Project identity"))?;
-        if project.root != self.root.to_string_lossy() {
-            return Err(invalid("Project identity does not own this boundary"));
-        }
-        let repository = DomainRepository::open(&self.root)?;
+        let (_, repository) = self.project_repository(project_id)?;
         let snapshot = repository.execution_snapshot()?;
         let projection = ExecutionProjection::from(snapshot);
         let job = projection
@@ -726,6 +805,9 @@ impl CanonicalControlService {
             .get(job_id)
             .cloned()
             .ok_or_else(|| invalid("unknown canonical Job"))?;
+        if job.project_id != project_id {
+            return Err(invalid("Job does not belong to the requested Project"));
+        }
         let attempts: Vec<Attempt> = projection
             .attempts
             .values()
@@ -784,15 +866,12 @@ impl CanonicalControlService {
         job_id: &str,
         after: u64,
     ) -> Result<CanonicalEventTail> {
-        let project = self
-            .read_projects()?
-            .into_iter()
-            .find(|project| project.project_id == project_id)
-            .ok_or_else(|| invalid("unknown Project identity"))?;
-        if project.root != self.root.to_string_lossy() {
-            return Err(invalid("Project identity does not own this boundary"));
+        let (project, repository) = self.project_repository(project_id)?;
+        if !repository.job(job_id)?
+            .is_some_and(|job| job.project_id == project_id)
+        {
+            return Err(invalid("Job does not belong to the requested Project"));
         }
-        let repository = DomainRepository::open(&self.root)?;
         match repository.journal_delta_for_job(job_id, after, MAX_EVENT_READ)? {
             EventDelta::Available { events, .. } => Ok(CanonicalEventTail::Events(
                 events
@@ -835,14 +914,8 @@ impl CanonicalControlService {
         project_id: &str,
         job_id: Option<&str>,
     ) -> Result<CanonicalDashboardResponse> {
-        let project = self
-            .read_projects()?
-            .into_iter()
-            .find(|project| project.project_id == project_id)
-            .ok_or_else(|| invalid("unknown Project identity"))?;
-        let repository = DomainRepository::open(&self.root)?;
-        let canonical_project = repository.ensure_project(&self.root)?;
-        let jobs = repository.jobs(&canonical_project.id)?.into_iter().map(|job| json!({"job_id":job.id,"created_at":job.created_at,"state":job.state,"updated_at":job.updated_at})).collect();
+        let (project, repository) = self.project_repository(project_id)?;
+        let jobs = repository.jobs(project_id)?.into_iter().map(|job| json!({"job_id":job.id,"created_at":job.created_at,"state":job.state,"updated_at":job.updated_at})).collect();
         let selected_job = job_id
             .map(|id| self.canonical_snapshot(&project.project_id, id))
             .transpose()?;
@@ -899,6 +972,23 @@ impl CanonicalControlService {
             });
         }
 
+        let (project, mut domain) = match self.project_repository(&request.project_id) {
+            Ok(project) => project,
+            Err(error) => {
+                return Ok(crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "rejected".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: request.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: None,
+                    message: error.to_string(),
+                    duplicate: false,
+                });
+            }
+        };
+
         // Compute request hash for idempotency conflict detection
         let request_canonical = serde_json::to_string(&request)
             .map_err(|e| invalid(format!("cannot serialize request: {e}")))?;
@@ -907,7 +997,6 @@ impl CanonicalControlService {
         let request_hash = format!("{:x}", hasher.finalize());
 
         // Check for existing command
-        let mut domain = crate::orchestration::domain::DomainRepository::open(&self.root)?;
         if let Some((stored_hash, job_id, outcome, message)) = domain.lookup_launch_command(
             &request.command_id,
             &request.project_id,
@@ -938,47 +1027,20 @@ impl CanonicalControlService {
             });
         }
 
-        // Early validation: Verify project is registered with this control service
-        // This check does not record outcomes to avoid claiming command_id on invalid input
-        let project = match self
-            .read_projects()?
-            .into_iter()
-            .find(|p| p.project_id == request.project_id)
-        {
-            Some(p) => p,
-            None => {
-                return Ok(crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: request.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("unknown project: {}", request.project_id),
-                    duplicate: false,
-                });
-            }
+        let runtime = if let Some(registry) = &self.runtime_registry {
+            registry.get_or_start(&project.project_id, Path::new(&project.root))
+        } else {
+            self.runtime_handle
+                .as_ref()
+                .filter(|handle| {
+                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
+                })
+                .cloned()
+                .ok_or_else(|| invalid("execution runtime is not available for this Project"))
         };
-
-        if Path::new(&project.root) != self.root {
-            return Ok(crate::contracts::JobLaunchResponse {
-                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                outcome: "rejected".to_string(),
-                command_id: request.command_id.clone(),
-                draft_id: request.draft_id.clone(),
-                project_id: request.project_id.clone(),
-                session_id: request.session_id.clone(),
-                job_id: None,
-                message: "Project identity does not own this control boundary; connect to that Project's control server".to_string(),
-                duplicate: false,
-            });
-        }
-
-        // Early validation: Verify execution runtime is available
-        let runtime_handle = match &self.runtime_handle {
-            Some(h) => h,
-            None => {
+        let runtime_handle = match runtime {
+            Ok(handle) => handle,
+            Err(error) => {
                 let response = crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                     outcome: "failed".to_string(),
@@ -987,7 +1049,7 @@ impl CanonicalControlService {
                     project_id: project.project_id.clone(),
                     session_id: request.session_id.clone(),
                     job_id: None,
-                    message: "execution runtime is not available; Job was not created".to_string(),
+                    message: format!("{error}; Job was not created"),
                     duplicate: false,
                 };
                 domain.record_launch_command(
@@ -1501,7 +1563,7 @@ impl CanonicalControlService {
         // Resolve the Attempt that launch_job created for this Job. There is
         // exactly one Attempt right after launch.
         let attempt_id = {
-            let domain = DomainRepository::open(&self.root)?;
+            let (_, domain) = self.project_repository(&request.project_id)?;
             let attempts = domain.attempts_for_job(&job_id)?;
             attempts.last().map(|attempt| attempt.id.clone()).unwrap_or_default()
         };
@@ -1516,7 +1578,7 @@ impl CanonicalControlService {
         // create — `cancel_chat` could not, because it had no Attempt identity
         // then — and let the queued envelope be fenced by the worker.
         if cancelled.is_cancelled() {
-            let mut domain = DomainRepository::open(&self.root)?;
+            let (_, mut domain) = self.project_repository(&request.project_id)?;
             if domain.request_cancel(&attempt_id).is_ok() {
                 let _ = domain.confirm_cancel(&attempt_id, true);
             }
@@ -1571,7 +1633,7 @@ impl CanonicalControlService {
         if !published {
             // The turn was cancelled between launch and publication. Settle the
             // Attempt it created rather than leaving it live and unreachable.
-            let mut domain = DomainRepository::open(&self.root)?;
+            let (_, mut domain) = self.project_repository(&request.project_id)?;
             if domain.request_cancel(&attempt_id).is_ok() {
                 let _ = domain.confirm_cancel(&attempt_id, true);
             }
@@ -1667,6 +1729,22 @@ impl CanonicalControlService {
         self.cancel_chat_in_project(None, session_id)
     }
 
+    pub(crate) fn cancel_chat_turn(&self, session_id: &str, job_id: &str) -> Result<bool> {
+        let active = {
+            let mut chats = self.active_chats.lock()
+                .map_err(|_| invalid("active chats poisoned"))?;
+            let key = chats
+                .iter()
+                .find(|(_, entry)| entry.session_id == session_id && entry.job_id == job_id)
+                .map(|(key, _)| key.clone());
+            key.and_then(|key| chats.remove(&key))
+        };
+        match active {
+            Some(active) => self.end_active_chat(active),
+            None => Ok(false),
+        }
+    }
+
     pub fn cancel_chat_in_project(
         &self,
         project_id: Option<&str>,
@@ -1706,14 +1784,17 @@ impl CanonicalControlService {
     /// only has its token signalled — its queued envelope is then fenced by the
     /// worker's own cancellation gate before any side effect.
     fn end_active_chat(&self, active: ActiveChat) -> Result<bool> {
-        let mut domain = DomainRepository::open(&self.root)?;
         // If authority is already gone (completed/failed), or the turn has not
         // resolved its Attempt yet, there is nothing to revoke; still stop the
         // transport so a queued or running read cannot continue.
+        let mut domain = self.project_repository(&active.project_id)
+            .map(|(_, repository)| repository);
         let revocable = !active.attempt_id.is_empty()
-            && domain.request_cancel(&active.attempt_id).is_ok();
+            && domain.as_mut()
+                .is_ok_and(|domain| domain.request_cancel(&active.attempt_id).is_ok());
         active.cancelled.cancel();
         let _ = active.sender.send(ExecutionEvent::Failed("chat cancelled".to_string()));
+        let mut domain = domain?;
         if revocable {
             let _ = domain.confirm_cancel(&active.attempt_id, true);
             return Ok(true);
