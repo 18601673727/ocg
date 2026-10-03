@@ -405,6 +405,14 @@ impl BoundedDispatcher {
         Ok(self.receiver.len())
     }
 
+    pub(crate) fn is_closed(&self) -> Result<bool> {
+        Ok(self
+            .sender
+            .lock()
+            .map_err(|_| invalid("dispatcher lock poisoned"))?
+            .is_none())
+    }
+
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.receiver.is_empty())
     }

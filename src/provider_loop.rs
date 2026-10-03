@@ -9,7 +9,7 @@ use crate::call_recovery as recovery;
 use crate::error::{OcgError, Result};
 use crate::http::{BoxFuture, HttpTransport};
 use crate::native_tools::{
-    openai_projection::OpenAiToolProjection, NativeToolRegistry, PermissionPolicy,
+    openai_projection::OpenAiToolProjection, NativeToolRegistry, PermissionPolicy, ToolResult,
 };
 use crate::openai_compatible::{
     ChatFinishReason, ChatStreamEvent, ChatStreamSummary, CompletedToolCall, NormalizedUsage,
@@ -796,29 +796,32 @@ impl CanonicalProviderCallHandler {
                 return Err(error);
             }
         };
-        let mut domain = DomainRepository::open(&config.project_root)?;
-        let serialized = serde_json::to_string(&json!({
-            "content": response.content,
-            "reasoning": response.reasoning,
-            "rounds": response.rounds
-        }))
-        .map_err(|error| OcgError::config(format!("serialize provider response: {error}")))?;
-        domain.finish_call(
-            &envelope.call_id,
-            &envelope.attempt_id,
-            envelope.generation,
-            &serialized,
-        )?;
-        // This provider round was this Attempt's last outstanding Call: the loop
-        // above returned a final answer, and every native tool Call it admitted
-        // was completed before it did. `finish_attempt` is the existing
-        // settlement authority for that fact, and it decides on its own terms
-        // whether the Attempt may close — it refuses unless every Call of this
-        // Attempt reached `completed`, fences anything still outstanding, moves
-        // the Attempt's Executors to the same terminal state, revokes the
-        // Attempt's authority, and carries the Job to the same terminal state in
-        // one transaction. Nothing here re-derives that rule.
-        domain.finish_attempt(&authority.attempt_id, true)?;
+        let settlement = (|| -> Result<()> {
+            let mut domain = DomainRepository::open(&config.project_root)?;
+            let serialized = serde_json::to_string(&json!({
+                "content": response.content,
+                "reasoning": response.reasoning,
+                "rounds": response.rounds
+            }))
+            .map_err(|error| OcgError::config(format!("serialize provider response: {error}")))?;
+            domain.finish_call(
+                &envelope.call_id,
+                &envelope.attempt_id,
+                envelope.generation,
+                &serialized,
+            )?;
+            domain.finish_attempt(&authority.attempt_id, true)?;
+            Ok(())
+        })();
+        if let Err(error) = settlement {
+            fail_authoritative_provider_call(
+                &config.project_root,
+                &envelope,
+                &error.to_string(),
+                true,
+            );
+            return Err(error);
+        }
         let _ = envelope
             .events
             .send(crate::orchestration::execution_dispatch::ExecutionEvent::Finished);
@@ -1186,14 +1189,45 @@ pub fn run_native_tool_worker(
     dispatcher: &BoundedDispatcher,
     handler: &crate::native_tools::NativeToolCallHandler,
 ) -> Result<()> {
-    loop {
-        let Some(envelope) = dispatcher.recv()? else {
-            return Ok(());
-        };
-        if let Err(error) = execute_native_tool_envelope_sync(handler, envelope) {
-            tracing::error!(error = %error, "canonical native tool Call execution failed; continuing with next bounded item");
+    let result = (|| -> Result<()> {
+        loop {
+            let Some(envelope) = dispatcher.recv()? else {
+                return Ok(());
+            };
+            let call = DomainRepository::open(handler.project_root())?.call(&envelope.call_id)?;
+            if call.attempt_id == envelope.attempt_id
+                && call.generation == envelope.generation
+                && matches!(
+                    call.state.as_str(),
+                    "running" | "completed" | "failed" | "unknown"
+                )
+            {
+                tracing::debug!(call_id = %call.id, "native tool envelope already delivered");
+                continue;
+            }
+            let call_id = envelope.call_id.clone();
+            if let Err(error) = execute_native_tool_envelope_sync(handler, envelope) {
+                let domain = DomainRepository::open(handler.project_root())?;
+                let call = domain.call(&call_id)?;
+                if matches!(call.state.as_str(), "created" | "running")
+                    || domain.dispatch_intent(&call_id)?.is_some_and(|intent| {
+                        matches!(intent.state.as_str(), "pending" | "queued" | "running")
+                    })
+                {
+                    return Err(OcgError::config(format!(
+                        "native tool Call could not be terminalized: {error}"
+                    )));
+                }
+                tracing::error!(error = %error, "canonical native tool Call execution failed; continuing with next bounded item");
+            }
         }
+    })();
+    if result.is_err() {
+        // A failed settlement cannot be acknowledged as finished execution.
+        // Closing this lane wakes its parent waiter instead of stranding it.
+        dispatcher.shutdown();
     }
+    result
 }
 
 /// Execute one native tool envelope synchronously.
@@ -1201,11 +1235,9 @@ fn execute_native_tool_envelope_sync(
     handler: &crate::native_tools::NativeToolCallHandler,
     envelope: ExecutionEnvelope,
 ) -> Result<()> {
-    let input: serde_json::Value = serde_json::from_str(&envelope.payload)
-        .map_err(|error| OcgError::config(format!("invalid Call input JSON: {error}")))?;
-    crate::orchestration::call_schema::validate_input(&input)?;
-    let output = handler.execute_validated_sync(envelope)?;
-    crate::orchestration::call_schema::validate_output(&output)?;
+    // The handler validates before settlement and terminalizes every error
+    // it owns. Post-settlement validation would contradict durable success.
+    handler.execute_validated_sync(envelope)?;
     Ok(())
 }
 
@@ -1361,8 +1393,13 @@ async fn execute_provider_loop(
                     // Wait for child Call completion by polling (blocking is
                     // acceptable here because provider and native tool use
                     // separate dispatchers).
-                    let result =
-                        wait_for_call_completion(project_root, &tool_call.id, envelope, shutdown)?;
+                    let result = wait_for_call_completion(
+                        project_root,
+                        &tool_call.id,
+                        envelope,
+                        shutdown,
+                        native_tool_dispatcher,
+                    )?;
 
                     ensure_provider_active(project_root, envelope, shutdown)?;
                     push_tool_message(request, call, result)?;
@@ -1729,15 +1766,14 @@ fn ensure_provider_active(
 /// Poll for Call completion. This blocks the provider handler but does not
 /// block the native tool consumer since they use separate dispatchers.
 ///
-/// A failed Call is returned as its recorded result rather than raised as an
-/// error. A tool that failed — a stale revision, an ambiguous target, a denied
-/// permission — is a fact the model needs to correct, and raising it aborted the
-/// entire provider Call, discarding the round and every fact in it.
+/// Only a validated, settled tool failure is a corrective observation.
+/// Framework failures and indeterminate effects end the provider execution.
 fn wait_for_call_completion(
     project_root: &Path,
     call_id: &str,
     envelope: &ExecutionEnvelope,
     shutdown: &AtomicBool,
+    dispatcher: &BoundedDispatcher,
 ) -> Result<String> {
     for _ in 0..600 {
         ensure_provider_active(project_root, envelope, shutdown)?;
@@ -1745,26 +1781,48 @@ fn wait_for_call_completion(
         let call = domain.call(call_id)?;
         match call.state.as_str() {
             "completed" => {
-                return call.response.ok_or_else(|| {
+                let response = call.response.ok_or_else(|| {
                     OcgError::config("completed native tool Call has no response")
-                })
+                })?;
+                ToolResult::validate_response(&response, true)?;
+                return Ok(response);
             }
             "failed" => {
-                return Ok(call.response.unwrap_or_else(|| {
-                    json!({"success": false, "error": {"kind": "unknown", "message": "native tool Call failed"}}).to_string()
-                }))
+                let response = call
+                    .response
+                    .ok_or_else(|| OcgError::config("failed native tool Call has no result"))?;
+                ToolResult::validate_response(&response, false)?;
+                let intent = domain.dispatch_intent(call_id)?.ok_or_else(|| {
+                    OcgError::config("failed native tool Call has no dispatch intent")
+                })?;
+                if intent.state != "failed" || intent.effect_state != EffectIntentState::Settled {
+                    return Err(OcgError::config(
+                        "native tool Call failed with an unsettled effect",
+                    ));
+                }
+                return Ok(response);
             }
-            "fenced" => {
-                return Ok(json!({
-                    "success": false,
-                    "error": {
-                        "kind": "fenced",
-                        "message": "native tool Call was fenced; its effect is unknown and it will not be retried automatically"
-                    }
-                })
-                .to_string())
+            "unknown" | "fenced" => {
+                return Err(OcgError::config(
+                    "native tool Call was fenced; its effect is unknown",
+                ));
             }
-            _ => envelope.cancelled.wait_timeout(std::time::Duration::from_millis(100)),
+            "created" | "running" => {
+                if dispatcher.is_closed()? {
+                    return Err(OcgError::config("native tool worker is unavailable"));
+                }
+                if domain.dispatch_intent(call_id)?.is_none_or(|intent| {
+                    !matches!(intent.state.as_str(), "pending" | "queued" | "running")
+                }) {
+                    return Err(OcgError::config(
+                        "native tool Call has no live dispatch intent",
+                    ));
+                }
+                envelope
+                    .cancelled
+                    .wait_timeout(std::time::Duration::from_millis(100));
+            }
+            _ => return Err(OcgError::config("invalid native tool Call state")),
         }
     }
     Err(OcgError::config("native tool Call timeout"))

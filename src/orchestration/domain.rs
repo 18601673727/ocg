@@ -3342,7 +3342,7 @@ impl DomainRepository {
         generation: u64,
         failure: &str,
     ) -> Result<Call> {
-        self.fail_call_checked(call_id, attempt_id, generation, failure, false)?
+        self.fail_call_checked(call_id, attempt_id, generation, failure, false, None)?
             .ok_or_else(|| invalid("Call failure rejected: Attempt authority is stale"))
     }
 
@@ -3354,8 +3354,32 @@ impl DomainRepository {
         failure: &str,
     ) -> Result<bool> {
         Ok(self
-            .fail_call_checked(call_id, attempt_id, generation, failure, true)?
+            .fail_call_checked(call_id, attempt_id, generation, failure, true, None)?
             .is_some())
+    }
+
+    pub(crate) fn fail_native_tool_call(
+        &mut self,
+        call_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        response: &str,
+    ) -> Result<Call> {
+        let result = crate::native_tools::ToolResult::validate_response(response, false)?;
+        let failure = result
+            .error
+            .as_ref()
+            .map(|error| error.kind.as_str())
+            .ok_or_else(|| invalid("native tool failure has no error"))?;
+        self.fail_call_checked(
+            call_id,
+            attempt_id,
+            generation,
+            failure,
+            false,
+            Some(response),
+        )?
+        .ok_or_else(|| invalid("native tool failure rejected: Attempt authority is stale"))
     }
 
     fn fail_call_checked(
@@ -3365,6 +3389,7 @@ impl DomainRepository {
         generation: u64,
         failure: &str,
         unclaimed: bool,
+        tool_response: Option<&str>,
     ) -> Result<Option<Call>> {
         validate_id(call_id)?;
         validate_id(attempt_id)?;
@@ -3377,6 +3402,32 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
+        if let Some(response) = tool_response {
+            let call = read_call(&transaction, call_id)?
+                .ok_or_else(|| invalid("unknown native tool Call"))?;
+            let request: serde_json::Value = serde_json::from_str(&call.request)
+                .map_err(|_| invalid("invalid native tool Call request"))?;
+            if request.get("kind").and_then(serde_json::Value::as_str) != Some("native_tool") {
+                return Err(invalid(
+                    "structured tool failure requires a native tool Call",
+                ));
+            }
+            let duplicate = call.attempt_id == attempt_id
+                && call.generation == generation
+                && call.state == "failed"
+                && call.response.as_deref() == Some(response);
+            if duplicate {
+                transaction.commit().map_err(sql)?;
+                return Ok(Some(call));
+            }
+            if call.state != "running"
+                || read_dispatch_intent_by_call(&transaction, call_id)?.is_none_or(|intent| {
+                    intent.state != "running" || intent.effect_state != EffectIntentState::Started
+                })
+            {
+                return Err(invalid("native tool failure requires the current claim"));
+            }
+        }
         let current: bool = transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM domain_calls c JOIN domain_attempts a ON a.id=c.attempt_id JOIN domain_jobs j ON j.id=a.job_id WHERE c.id=?1 AND c.attempt_id=?2 AND c.generation=?3 AND c.state IN ('created','running') AND (?4=0 OR c.state='created') AND a.generation=?3 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.state IN ('queued','running'))",
@@ -3393,15 +3444,15 @@ impl DomainRepository {
         let changed = transaction
             .execute(
                 "UPDATE domain_calls SET state='failed',response=?2,finished_at=?3 WHERE id=?1 AND state IN ('created','running')",
-                params![call_id, failure, now()],
+                params![call_id, tool_response.unwrap_or(failure), now()],
             )
             .map_err(sql)?;
         if changed != 1 {
             return Err(invalid("Call is already terminal"));
         }
         let intent_moved = transaction.execute(
-            "UPDATE domain_dispatch_intents SET state='failed',effect_state=CASE WHEN effect_state='started' THEN 'unknown' ELSE 'not_started' END,failure=?2,updated_at=?3 WHERE call_id=?1 AND state IN ('pending','queued','running')",
-            params![call_id, failure, now()],
+            "UPDATE domain_dispatch_intents SET state='failed',effect_state=CASE WHEN ?4 THEN 'settled' WHEN effect_state='started' THEN 'unknown' ELSE 'not_started' END,failure=?2,updated_at=?3 WHERE call_id=?1 AND state IN ('pending','queued','running')",
+            params![call_id, failure, now(), tool_response.is_some()],
         ).map_err(sql)?;
         let call =
             read_call(&transaction, call_id)?.ok_or_else(|| invalid("failed Call disappeared"))?;
@@ -5282,6 +5333,12 @@ fn finish_call_in(
     crate::orchestration::call_schema::validate_output(&serde_json::json!({
         "result": value
     }))?;
+    let call = read_call(transaction, call_id)?.ok_or_else(|| invalid("unknown Call"))?;
+    if serde_json::from_str::<serde_json::Value>(&call.request).is_ok_and(|request| {
+        request.get("kind").and_then(serde_json::Value::as_str) == Some("native_tool")
+    }) {
+        crate::native_tools::ToolResult::validate_response(response, true)?;
+    }
     let generation_i64 =
         i64::try_from(generation).map_err(|_| invalid("Call generation exceeds SQLite range"))?;
     let duplicate: bool = transaction.query_row(
@@ -5575,12 +5632,41 @@ fn finish_attempt_in(
         }
     } else {
         if state == "completed" {
-            let unfinished: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM domain_calls WHERE attempt_id=?1 AND state!='completed')",
-                    [attempt_id], |row| row.get(0)
-                ).map_err(sql)?;
-            if unfinished {
-                return Err(invalid("Attempt still has unsettled or unsuccessful Calls"));
+            let calls = attempt_calls(transaction, attempt_id)?;
+            let provider_completed = calls.iter().any(|call| {
+                call.state == "completed"
+                    && serde_json::from_str::<serde_json::Value>(&call.request).is_ok_and(
+                        |request| {
+                            request
+                                .get("executor_transport")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("provider")
+                        },
+                    )
+            });
+            for call in calls {
+                if call.state == "completed" {
+                    continue;
+                }
+                // A known native tool failure is an observation the provider
+                // can correct. Framework failures and unknown effects cannot
+                // qualify a successful Attempt.
+                let request: serde_json::Value = serde_json::from_str(&call.request)
+                    .map_err(|_| invalid("invalid durable Call request"))?;
+                let observed_failure = provider_completed
+                    && call.state == "failed"
+                    && request.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("native_tool")
+                    && call.response.as_deref().is_some_and(|response| {
+                        crate::native_tools::ToolResult::validate_response(response, false).is_ok()
+                    })
+                    && read_dispatch_intent_by_call(transaction, &call.id)?.is_some_and(|intent| {
+                        intent.state == "failed"
+                            && intent.effect_state == EffectIntentState::Settled
+                    });
+                if !observed_failure {
+                    return Err(invalid("Attempt still has unsettled or unsuccessful Calls"));
+                }
             }
         }
         // Capture the rows this terminal transition settles before it moves

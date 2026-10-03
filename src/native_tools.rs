@@ -12,6 +12,7 @@ use crate::error::{OcgError, Result};
 use crate::orchestration::call_schema;
 use crate::orchestration::domain::{AttemptAuthority, DomainRepository, EffectIntentKind};
 use crate::process::{CaptureRunner, ProcessExit, SystemCaptureRunner};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -101,7 +102,8 @@ impl PermissionClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolErrorKind {
     InvalidInput,
     PermissionDenied,
@@ -126,7 +128,7 @@ impl ToolErrorKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolError {
     pub kind: ToolErrorKind,
     pub message: String,
@@ -151,7 +153,7 @@ impl ToolError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub success: bool,
     pub output: Value,
@@ -193,6 +195,27 @@ impl ToolResult {
 
     pub fn tool_message_content(&self) -> String {
         self.to_value().to_string()
+    }
+
+    pub(crate) fn validate_response(response: &str, success: bool) -> Result<Self> {
+        if response.len() > TOOL_OUTPUT_CAP {
+            return Err(OcgError::config("native tool result exceeds output cap"));
+        }
+        let result: Self = serde_json::from_str(response)
+            .map_err(|error| OcgError::config(format!("invalid native tool result: {error}")))?;
+        if result.success != success
+            || result.success != result.error.is_none()
+            || !result.metadata.is_object()
+            || result.error.as_ref().is_some_and(|error| {
+                error.kind == ToolErrorKind::Cancelled
+                    || error.message.is_empty()
+                    || !error.metadata.is_object()
+            })
+        {
+            return Err(OcgError::config("invalid native tool result outcome"));
+        }
+        call_schema::validate_output(&json!({"result": result.to_value()}))?;
+        Ok(result)
     }
 
     /// Bound the complete canonical result, including structured metadata and
@@ -1111,6 +1134,10 @@ pub struct NativeToolCallHandler {
 }
 
 impl NativeToolCallHandler {
+    pub(crate) fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
     pub fn new(
         project_root: PathBuf,
         permission_policy: PermissionPolicy,
@@ -1127,9 +1154,23 @@ impl NativeToolCallHandler {
         &self,
         envelope: crate::orchestration::execution_dispatch::ExecutionEnvelope,
     ) -> Result<serde_json::Value> {
-        let cancelled = || {
-            self.runtime_shutdown.load(Ordering::SeqCst) || envelope.cancelled.is_cancelled()
-        };
+        let mut claimed = false;
+        match self.execute_envelope(&envelope, &mut claimed) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                self.terminalize_error(&envelope, &error.to_string(), claimed)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn execute_envelope(
+        &self,
+        envelope: &crate::orchestration::execution_dispatch::ExecutionEnvelope,
+        claimed: &mut bool,
+    ) -> Result<Value> {
+        let cancelled =
+            || self.runtime_shutdown.load(Ordering::SeqCst) || envelope.cancelled.is_cancelled();
         if cancelled() {
             return Err(OcgError::config("cancelled before native tool execution"));
         }
@@ -1140,15 +1181,35 @@ impl NativeToolCallHandler {
         let _authority = domain
             .authority(&envelope.attempt_id)?
             .filter(|authority| {
-                authority.job_id == envelope.job_id
-                    && authority.generation == envelope.generation
+                authority.job_id == envelope.job_id && authority.generation == envelope.generation
             })
             .ok_or_else(|| OcgError::config("native tool Call has stale Attempt authority"))?;
 
-        domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)?;
+        let call = domain.call(&envelope.call_id)?;
+        let intent = domain
+            .dispatch_intent(&envelope.call_id)?
+            .ok_or_else(|| OcgError::config("native tool Call has no dispatch intent"))?;
+        if call.attempt_id != envelope.attempt_id
+            || call.generation != envelope.generation
+            || call.executor_id != envelope.executor_id
+            || call.request != envelope.payload
+            || intent.job_id != envelope.job_id
+            || intent.attempt_id != envelope.attempt_id
+            || intent.generation != envelope.generation
+            || intent.executor_id != envelope.executor_id
+            || intent.request != envelope.payload
+            || !matches!(intent.state.as_str(), "pending" | "queued")
+            || intent.effect_state != crate::orchestration::domain::EffectIntentState::NotStarted
+        {
+            return Err(OcgError::config("native tool envelope is not executable"));
+        }
 
         let input: Value = serde_json::from_str(&envelope.payload)
             .map_err(|error| OcgError::config(format!("invalid native tool payload: {error}")))?;
+        call_schema::validate_input(&input)?;
+        if input.get("kind").and_then(Value::as_str) != Some("native_tool") {
+            return Err(OcgError::config("invalid native tool payload kind"));
+        }
 
         let name = input
             .get("name")
@@ -1165,9 +1226,13 @@ impl NativeToolCallHandler {
 
         let permission = definition.permission;
 
-        drop(domain);
-
         let executor = NativeToolExecutor::new(&self.project_root)?;
+        if cancelled() {
+            return Err(OcgError::config("cancelled before native tool claim"));
+        }
+        domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)?;
+        *claimed = true;
+        drop(domain);
         let result = executor.execute_cancellable(
             name,
             &arguments,
@@ -1176,8 +1241,19 @@ impl NativeToolCallHandler {
             &cancelled,
         );
 
-        let mut domain = DomainRepository::open(&self.project_root)?;
+        if cancelled()
+            || result
+                .error
+                .as_ref()
+                .is_some_and(|error| error.kind == ToolErrorKind::Cancelled)
+        {
+            return Err(OcgError::config("native tool execution cancelled"));
+        }
         let serialized = result.to_value().to_string();
+        ToolResult::validate_response(&serialized, result.success)?;
+        let output = json!({"result": result.to_value()});
+        call_schema::validate_output(&output)?;
+        let mut domain = DomainRepository::open(&self.project_root)?;
 
         if result.success {
             domain.finish_call(
@@ -1186,20 +1262,74 @@ impl NativeToolCallHandler {
                 envelope.generation,
                 &serialized,
             )?;
-            Ok(result.to_value())
         } else {
-            let failure = result
-                .error
-                .as_ref()
-                .map(|error| format!("{}: {}", error.kind.as_str(), error.message))
-                .unwrap_or_else(|| "native tool failed".to_string());
-            domain.fail_call(
+            domain.fail_native_tool_call(
                 &envelope.call_id,
                 &envelope.attempt_id,
                 envelope.generation,
-                &failure,
+                &serialized,
             )?;
-            Err(OcgError::config(failure))
         }
+        Ok(output)
+    }
+
+    fn terminalize_error(
+        &self,
+        envelope: &crate::orchestration::execution_dispatch::ExecutionEnvelope,
+        failure: &str,
+        claimed: bool,
+    ) -> Result<()> {
+        let mut domain = DomainRepository::open(&self.project_root)?;
+        let call = domain.call(&envelope.call_id)?;
+        if call.attempt_id != envelope.attempt_id
+            || call.generation != envelope.generation
+            || domain
+                .attempt(&call.attempt_id)?
+                .is_none_or(|attempt| attempt.job_id != envelope.job_id)
+        {
+            return Ok(());
+        }
+        if !matches!(call.state.as_str(), "created" | "running") {
+            return Ok(());
+        }
+        // A redelivery does not own the running actor's settlement.
+        if !claimed && call.state == "running" {
+            return Ok(());
+        }
+        let mut failure = failure.to_string();
+        let mut end = failure.len().min(4096);
+        while !failure.is_char_boundary(end) {
+            end -= 1;
+        }
+        failure.truncate(end);
+        let unstarted = call.state == "created"
+            && domain.dispatch_intent(&call.id)?.is_some_and(|intent| {
+                matches!(intent.state.as_str(), "pending" | "queued")
+                    && intent.effect_state
+                        == crate::orchestration::domain::EffectIntentState::NotStarted
+            });
+        if unstarted {
+            match domain.fail_unclaimed_call(
+                &call.id,
+                &envelope.attempt_id,
+                envelope.generation,
+                &failure,
+            ) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(%error, call_id = %call.id, "native tool failure settlement rejected; fencing unfinished Call");
+                }
+            }
+        }
+        let current = domain.call(&call.id)?;
+        if matches!(current.state.as_str(), "created" | "running")
+            && (claimed || current.state == "created")
+        {
+            // A claimed execution without a validated outcome cannot prove
+            // its effect. Fencing also handles authority revoked mid-flight.
+            domain.fence_dispatch_intent(&call.id, &failure)?;
+        }
+        Ok(())
     }
 }
