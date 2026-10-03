@@ -29,6 +29,45 @@ fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
 }
 
+static TEMPORARY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A temp path that can never collide with another writer in this process:
+/// the serialization locks already order committed writers, and the unique
+/// suffix removes the fixed-name temp race entirely.
+fn unique_temporary_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state".to_string());
+    let sequence = TEMPORARY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_file_name(format!("{name}.tmp-{}-{sequence}", std::process::id()))
+}
+
+/// Write a temp file on the same filesystem, flush it, then atomically rename
+/// it over the target. The authoritative file is only replaced by a complete
+/// temp; a failure removes the temp and leaves the previous revision intact.
+fn atomic_write(path: &Path, bytes: &[u8], context: &'static str) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| OcgError::io("create control state", e))?;
+    }
+    let temporary = unique_temporary_path(path);
+    let result = (|| -> Result<()> {
+        let mut file =
+            std::fs::File::create(&temporary).map_err(|e| OcgError::io(context, e))?;
+        file.write_all(bytes)
+            .map_err(|e| OcgError::io(context, e))?;
+        file.sync_all().map_err(|e| OcgError::io(context, e))?;
+        drop(file);
+        std::fs::rename(&temporary, path).map_err(|e| OcgError::io(context, e))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn chat_conversation_view(
     session_id: String,
     conversation: crate::core_contract::Conversation,
@@ -243,6 +282,18 @@ pub struct CanonicalControlService {
     active_chats: Arc<Mutex<std::collections::HashMap<(String, String), ActiveChat>>>,
     launch_lock: Arc<Mutex<()>>,
     registry_lock: Arc<Mutex<()>>,
+    configuration_lock: Arc<Mutex<()>>,
+}
+
+/// One registered Project considered as a candidate owner of a Job lookup.
+///
+/// Only the boundary itself can be missing. Once the boundary exists, every
+/// other failure — an unreadable store, a failed read, an identity this
+/// boundary no longer owns — stays an error so corruption is never reported as
+/// an absent Job.
+enum CandidateRepository {
+    Ready(DomainRepository),
+    Unavailable(&'static str),
 }
 
 #[derive(Debug)]
@@ -349,6 +400,7 @@ impl CanonicalControlService {
             active_chats: Arc::new(Mutex::new(std::collections::HashMap::new())),
             launch_lock: Arc::new(Mutex::new(())),
             registry_lock: Arc::new(Mutex::new(())),
+            configuration_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -404,9 +456,7 @@ impl CanonicalControlService {
             std::fs::create_dir_all(parent).map_err(|e| OcgError::io("create control state", e))?;
         }
         let bytes = serde_json::to_vec_pretty(projects).map_err(|e| invalid(e.to_string()))?;
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, bytes).map_err(|e| OcgError::io("write project registry", e))?;
-        std::fs::rename(&temporary, &path).map_err(|e| OcgError::io("commit project registry", e))
+        atomic_write(&path, &bytes, "commit project registry")
     }
 
     fn read_configuration(
@@ -475,11 +525,9 @@ impl CanonicalControlService {
         }
         let value =
             json!({"global":global,"project_defaults":project_defaults,"revision":revision});
-        let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, serde_json::to_vec_pretty(&value).unwrap())
-            .map_err(|e| OcgError::io("write canonical configuration", e))?;
-        std::fs::rename(&temporary, &path)
-            .map_err(|e| OcgError::io("commit canonical configuration", e))
+        let bytes = serde_json::to_vec_pretty(&value)
+            .map_err(|e| invalid(e.to_string()))?;
+        atomic_write(&path, &bytes, "commit canonical configuration")
     }
 
     /// Register/import an existing repository only after nearest-boundary
@@ -508,12 +556,35 @@ impl CanonicalControlService {
             return Err(invalid("Project marker must stay inside its boundary"));
         }
         let boundary_root = project::canonicalize(boundary.root());
-        let project_id = DomainRepository::open(&root)?.ensure_project(&root)?.id;
+        // The durable Project identity is proven by the new root's own
+        // `.ocg` store, never by a project_id a client may claim. The store is
+        // opened without creating identity so a moved Project is read first:
+        // `open` would mint a second row for the same durable store and that
+        // new row would then look authoritative.
+        let project_id = DomainRepository::open_existing(&root)?
+            .reconcile_project(&root)?
+            .id;
         let mut projects = self.read_projects()?;
         let record = projects
             .iter_mut()
             .find(|project| project.project_id == project_id);
         let project = if let Some(existing) = record {
+            // Same durable identity at a new location: this is a repair of
+            // registry location authority, not a new Project. Identity and
+            // created_at stay; the observed location metadata is replaced.
+            let root_moved = existing.root != root.to_string_lossy();
+            if root_moved {
+                // A live runtime still pinned to the old root is stopped and
+                // joined before the registry may name the new one, so one
+                // project_id can never hold two authoritative roots. A failed
+                // shutdown aborts registration with the registry untouched.
+                if let Some(registry) = &self.runtime_registry {
+                    registry.invalidate(&project_id)?;
+                }
+            }
+            existing.root = root.to_string_lossy().to_string();
+            existing.boundary = boundary_root.to_string_lossy().to_string();
+            existing.marker = boundary.has_marker();
             existing.updated_at = now;
             existing.clone()
         } else {
@@ -568,6 +639,13 @@ impl CanonicalControlService {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
+        // One serialization boundary covers the whole read-modify-write: the
+        // latest authoritative revision is read, mutated and committed while
+        // no other configuration writer can interleave.
+        let _configuration = self
+            .configuration_lock
+            .lock()
+            .map_err(|_| invalid("configuration authority poisoned"))?;
         let (_old, project_defaults, revision) = self.read_configuration()?;
         let revision = revision.saturating_add(1);
         // Global configuration and project defaults are separate scopes: this
@@ -608,17 +686,28 @@ impl CanonicalControlService {
             .into_iter()
             .find(|project| project.project_id == project_id)
             .ok_or_else(|| invalid("unknown Project identity"))?;
-        let (global, mut project_defaults, revision) = self.read_configuration()?;
-        let revision = revision.saturating_add(1);
-        // Scoped per Project: editing one project's defaults never touches
-        // another project's persisted defaults or the global scope.
-        let entry = ProjectConfiguration { defaults };
-        project_defaults.insert(project_id.to_string(), entry.clone());
-        self.write_configuration(&global, &project_defaults, revision)?;
+        let (global, revision) = {
+            let _configuration = self
+                .configuration_lock
+                .lock()
+                .map_err(|_| invalid("configuration authority poisoned"))?;
+            let (global, mut project_defaults, revision) = self.read_configuration()?;
+            let revision = revision.saturating_add(1);
+            // Scoped per Project: editing one project's defaults never touches
+            // another project's persisted defaults or the global scope.
+            project_defaults.insert(
+                project_id.to_string(),
+                ProjectConfiguration {
+                    defaults: defaults.clone(),
+                },
+            );
+            self.write_configuration(&global, &project_defaults, revision)?;
+            (global, revision)
+        };
         let view = ProjectConfigurationView {
             project: project.clone(),
             global,
-            project_defaults: entry,
+            project_defaults: ProjectConfiguration { defaults },
         };
         Ok(CanonicalConfigurationResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -662,47 +751,101 @@ impl CanonicalControlService {
             .into_iter()
             .find(|project| project.project_id == project_id)
             .ok_or_else(|| invalid("unknown Project identity"))?;
+        match self.candidate_repository(&project)? {
+            CandidateRepository::Unavailable(reason) => Err(invalid(reason)),
+            CandidateRepository::Ready(repository) => Ok((project, repository)),
+        }
+    }
+
+    /// Open one registered Project as a candidate owner of a Job lookup.
+    ///
+    /// Only a registry entry whose boundary itself is gone is reported as
+    /// unavailable: a deleted root, an unreachable path, or a marker that no
+    /// longer proves this boundary. Everything after that boundary exists is a
+    /// real failure — a corrupt store, a failed read or an identity this
+    /// boundary no longer owns — and must never be downgraded into "not the
+    /// owner", because that would report corruption as an unknown Job.
+    fn candidate_repository(&self, project: &ProjectRecord) -> Result<CandidateRepository> {
         let root = Path::new(&project.root);
         if !root.is_dir() {
-            return Err(invalid("registered Project root is unavailable"));
+            return Ok(CandidateRepository::Unavailable(
+                "registered Project root is unavailable",
+            ));
         }
-        let canonical_root = root
-            .canonicalize()
-            .map_err(|error| OcgError::io("resolve registered Project root", error))?;
+        let canonical_root = match root.canonicalize() {
+            Ok(canonical_root) => canonical_root,
+            Err(_) => {
+                return Ok(CandidateRepository::Unavailable(
+                    "registered Project root is unavailable",
+                ))
+            }
+        };
         let boundary = project::resolve(&canonical_root);
         if canonical_root != root || !boundary.has_marker() || boundary.root() != root {
-            return Err(invalid("registered Project boundary is no longer valid"));
+            return Ok(CandidateRepository::Unavailable(
+                "registered Project boundary is no longer valid",
+            ));
         }
         let marker = root.join(project::MARKER);
-        let canonical_marker = marker
-            .canonicalize()
-            .map_err(|error| OcgError::io("resolve registered Project marker", error))?;
+        let canonical_marker = match marker.canonicalize() {
+            Ok(canonical_marker) => canonical_marker,
+            Err(_) => {
+                return Ok(CandidateRepository::Unavailable(
+                    "registered Project boundary is no longer valid",
+                ))
+            }
+        };
         if !canonical_marker.starts_with(root) || project::resolve(&canonical_marker).root() != root {
-            return Err(invalid("registered Project marker must stay inside its boundary"));
+            return Ok(CandidateRepository::Unavailable(
+                "registered Project marker must stay inside its boundary",
+            ));
         }
-        let repository = DomainRepository::open(root)?;
-        if repository.ensure_project(root)?.id != project_id {
+        // Read the identity this store already holds. Opening it never mints a
+        // new Project, so a Job lookup can never create one.
+        let repository = DomainRepository::open_existing(root)?;
+        if repository.project_at_root(root)?.map(|project| project.id)
+            != Some(project.project_id.clone())
+        {
             return Err(invalid(
                 "Project identity does not own this durable boundary",
             ));
         }
-        Ok((project, repository))
+        Ok(CandidateRepository::Ready(repository))
     }
 
     fn repository_for_job(&self, job_id: &str) -> Result<DomainRepository> {
         let mut owner = None;
+        let mut skipped = 0usize;
         for project in self.read_projects()? {
-            let (_, repository) = self.project_repository(&project.project_id)?;
-            if repository.job(job_id)?
-                .is_some_and(|job| job.project_id == project.project_id)
-            {
+            // Search every registered Project as a candidate owner, but only
+            // skip a candidate whose boundary is gone. A candidate whose store
+            // cannot be opened, read, or proven to own its own identity fails
+            // the lookup here instead of being silently passed over.
+            let repository = match self.candidate_repository(&project)? {
+                CandidateRepository::Ready(repository) => repository,
+                CandidateRepository::Unavailable(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let job = repository.job(job_id)?;
+            if job.is_some_and(|job| job.project_id == project.project_id) {
                 if owner.is_some() {
                     return Err(invalid("ambiguous canonical Job identity"));
                 }
                 owner = Some(repository);
             }
         }
-        owner.ok_or_else(|| invalid("unknown canonical Job"))
+        owner.ok_or_else(|| {
+            if skipped > 0 {
+                invalid(format!(
+                    "unknown canonical Job ({skipped} unavailable Project candidate{} skipped)",
+                    if skipped == 1 { "" } else { "s" }
+                ))
+            } else {
+                invalid("unknown canonical Job")
+            }
+        })
     }
 
     pub fn chat_conversations(
@@ -1319,7 +1462,12 @@ impl CanonicalControlService {
         // constraints, and the declared budget commitment. Frozen provider
         // transport identity (endpoint, upstream model id, credential
         // reference) belongs to the Call's DispatchIntent, not to the Job.
-        let canonical_project = domain.ensure_project(Path::new(&project.root))?;
+        // The boundary already proved this Project identity; read it back
+        // rather than creating one, so a launch can never mint identity for a
+        // boundary whose durable row is missing.
+        let canonical_project = domain
+            .project_at_root(Path::new(&project.root))?
+            .ok_or_else(|| invalid("registered Project identity is not durable at this root"))?;
         let job_payload = serde_json::to_string(&serde_json::json!({
             "provider": provider_key,
             "model": model,
