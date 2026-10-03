@@ -23,6 +23,7 @@ import {
   type InspectorMode,
   type InspectorTab,
 } from "../observability/inspector-state";
+import { useI18n, type I18nKey } from "../i18n";
 
 type JobInspectorProps = {
   execution: JobExecution;
@@ -34,16 +35,15 @@ type JobInspectorProps = {
   onOpenJobExecution?: () => void;
 };
 
-const TAB_LABELS: Record<InspectorTab, string> = {
-  overview: "Overview",
-  runtime: "Runtime",
-  usage: "Usage",
+const TAB_LABEL_KEYS: Record<InspectorTab, I18nKey> = {
+  overview: "execution.overview",
+  runtime: "execution.runtime",
+  usage: "execution.usage",
 };
-
-const TABS: TabItem<InspectorTab>[] = INSPECTOR_TABS.map((id) => ({ id, label: TAB_LABELS[id] }));
 
 /** Canonical Job summary: state, Project, and settled Calls over the authoritative Attempt. */
 function JobContext({ execution, compact = false }: { execution: JobExecution; compact?: boolean }) {
+  const { t } = useI18n();
   const progress = execution.progress;
   const settled = progress?.settled ?? 0;
   const total = progress?.total ?? 0;
@@ -65,7 +65,7 @@ function JobContext({ execution, compact = false }: { execution: JobExecution; c
           {humanizeStatus(execution.state)}
         </Pill>
         <span className="text-[11px] text-muted-foreground">
-          {settled} / {total} calls
+          {t("execution.callsSettledShort", { settled, total })}
         </span>
         <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">{pct}%</span>
       </div>
@@ -73,9 +73,9 @@ function JobContext({ execution, compact = false }: { execution: JobExecution; c
         className="mt-2"
         value={settled}
         max={total}
-        ariaLabel="Job progress"
+        ariaLabel={t("execution.jobProgress")}
       />
-      {!compact && <p className="mt-1 text-[11px] text-muted-foreground">{pct}% of the authoritative Attempt&apos;s Calls settled · {execution.projectId}</p>}
+      {!compact && <p className="mt-1 text-[11px] text-muted-foreground">{t("execution.authoritativeSettled", { percent: pct, project: execution.projectId })}</p>}
     </div>
   );
 }
@@ -89,15 +89,20 @@ export function JobInspector({
   onClose,
   onOpenJobExecution,
 }: JobInspectorProps) {
+  const { t } = useI18n();
   const [tab, setTab] = useState<InspectorTab>("overview");
   const nextMode = toggleInspectorMode(mode);
+  const tabs: TabItem<InspectorTab>[] = INSPECTOR_TABS.map((id) => ({ id, label: t(TAB_LABEL_KEYS[id]) }));
+  const dockLabel = t("execution.dockInspector");
+  const expandLabel = t("execution.expandInspector");
+  const modeLabel = mode === "expanded" ? dockLabel : expandLabel;
   return (
     <div className="flex h-full w-full min-w-0 flex-col">
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5">
         <CircleDot className="size-4 text-muted-foreground" aria-hidden="true" />
-        <h2 className="flex-1 text-[13px] font-semibold tracking-tight">Job Inspector</h2>
+        <h2 className="flex-1 text-[13px] font-semibold tracking-tight">{t("execution.inspector")}</h2>
         {onOpenJobExecution && (
-          <Button variant="ghost" size="icon-xs" onClick={onOpenJobExecution} aria-label="Open Job Execution" title="Open Job Execution">
+          <Button variant="ghost" size="icon-xs" onClick={onOpenJobExecution} aria-label={t("execution.openJobExecution")} title={t("execution.openJobExecution")}>
             <ExternalLink className="size-3.5" />
           </Button>
         )}
@@ -107,13 +112,13 @@ export function JobInspector({
             size="icon-xs"
             className="hidden lg:inline-flex"
             onClick={() => onModeChange(nextMode)}
-            aria-label={mode === "expanded" ? "Dock job inspector" : "Expand job inspector"}
-            title={mode === "expanded" ? "Dock job inspector" : "Expand job inspector"}
+            aria-label={modeLabel}
+            title={modeLabel}
           >
             {mode === "expanded" ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
           </Button>
         )}
-        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label="Collapse job inspector" title="Collapse job inspector">
+        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("execution.collapseInspector")} title={t("execution.collapseInspector")}>
           <X className="size-4" />
         </Button>
       </header>
@@ -122,22 +127,22 @@ export function JobInspector({
         {!observability ? (
           <div className="flex flex-col gap-3">
             <JobContext execution={execution} />
-            <EmptyState>Runtime observability is not available for this Job yet.</EmptyState>
+            <EmptyState>{t("execution.noObservability")}</EmptyState>
           </div>
         ) : (
           <>
             <JobContext execution={execution} compact={tab !== "overview"} />
             <nav className="sticky top-0 z-10 -mx-3 mt-3 border-y border-border bg-background/95 px-3 py-1.5 backdrop-blur">
               <SegmentedTabs
-                tabs={TABS}
+                tabs={tabs}
                 value={tab}
                 onSelect={setTab}
-                ariaLabel="Job inspector surfaces"
+                ariaLabel={t("execution.inspectorSurfaces")}
                 panelIdBase="job-inspector"
                 className="grid-cols-3"
               />
             </nav>
-            <div id={`job-inspector-${tab}`} role="tabpanel" aria-label={TAB_LABELS[tab]} className="mt-3">
+            <div id={`job-inspector-${tab}`} role="tabpanel" aria-label={t(TAB_LABEL_KEYS[tab])} className="mt-3">
               <ObservabilityPanel execution={execution} accounting={accounting} observability={observability} tab={tab} />
             </div>
           </>

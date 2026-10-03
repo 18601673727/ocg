@@ -36,6 +36,7 @@ import {
   selectProviderAssignments,
   selectProviders,
 } from "./domain";
+import { useI18n } from "../i18n";
 function ProviderListCard({
   provider,
   modelCount,
@@ -178,6 +179,7 @@ export function ProvidersView({
     [providers, query, stateFilter],
   );
   const selected = filtered.find((provider) => provider.id === selectedProviderId) ?? filtered[0] ?? null;
+  const { t } = useI18n();
   const stateCounts = useMemo(() => {
     const counts: Record<BootstrapProviderState, number> = { connected: 0, "auth-required": 0, degraded: 0, unavailable: 0, unknown: 0 };
     for (const provider of providers) counts[provider.state] += 1;
@@ -198,8 +200,8 @@ export function ProvidersView({
             type="search"
             value={query}
             onChange={(event) => onQueryChange(event.target.value)}
-            placeholder="Filter providers…"
-            aria-label="Filter providers"
+            placeholder={t("control.filterProviders")}
+            aria-label={t("control.filterProviders")}
             className="h-5 w-36 min-w-0 bg-transparent text-[11px] outline-none placeholder:text-muted-foreground"
           />
         </label>
@@ -218,10 +220,10 @@ export function ProvidersView({
       </div>
 
       <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(220px,300px)_minmax(0,1fr)]">
-        <section aria-label="Providers" className="min-w-0">
-          <SectionTitle detail={`${filtered.length} / ${providers.length}`}>Providers</SectionTitle>
+        <section aria-label={t("control.providers")} className="min-w-0">
+          <SectionTitle detail={`${filtered.length} / ${providers.length}`}>{t("control.providers")}</SectionTitle>
           {filtered.length === 0 ? (
-            <EmptyState>No provider matches the filter.</EmptyState>
+            <EmptyState>{t("control.noProviderMatch")}</EmptyState>
           ) : (
             <ul className="flex flex-col gap-1.5">
               {filtered.map((provider) => (
@@ -240,7 +242,7 @@ export function ProvidersView({
           {selected ? (
             <ProviderDetail bootstrap={bootstrap} provider={selected} />
           ) : (
-            <EmptyState className="py-4">Select a provider to inspect its state and models.</EmptyState>
+            <EmptyState className="py-4">{t("control.selectProvider")}</EmptyState>
           )}
         </section>
       </div>

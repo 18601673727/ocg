@@ -1,14 +1,17 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
-import { Geist_Mono, Noto_Sans, Playfair_Display } from "next/font/google";
+import { Geist_Mono, Noto_Sans, Noto_Sans_SC, Playfair_Display } from "next/font/google";
 import "./globals.css";
 import { cn } from "@/lib/utils";
 import { ThemeProvider } from "@/components/ocg/appearance/theme-provider";
 import { THEME_BOOTSTRAP_SCRIPT } from "@/components/ocg/appearance/theme-bootstrap";
+import { I18nProvider, LOCALE_BOOTSTRAP_SCRIPT } from "@/components/ocg/i18n";
 
 const playfairDisplayHeading = Playfair_Display({subsets:['latin'],variable:'--font-heading'});
 
 const notoSans = Noto_Sans({subsets:['latin'],variable:'--font-sans'});
+
+const notoSansSc = Noto_Sans_SC({subsets:['latin'],variable:'--font-sans-sc', weight: ['400','500','700']});
 
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
@@ -23,15 +26,17 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html
-      lang="en"
+      lang="en-US"
       suppressHydrationWarning
-      className={cn("h-full", "antialiased", geistMono.variable, "font-sans", notoSans.variable, playfairDisplayHeading.variable)}
+      className={cn("h-full", "antialiased", geistMono.variable, "font-sans", notoSans.variable, notoSansSc.variable, playfairDisplayHeading.variable)}
     >
       <head>
         {/* Applies the stored theme before first paint; see theme-bootstrap. */}
         <script dangerouslySetInnerHTML={{ __html: THEME_BOOTSTRAP_SCRIPT }} />
+        {/* Applies the stored locale before first paint; see locale-bootstrap. */}
+        <script dangerouslySetInnerHTML={{ __html: LOCALE_BOOTSTRAP_SCRIPT }} />
       </head>
-      <body className="flex min-h-full flex-col"><ThemeProvider>{children}</ThemeProvider></body>
+      <body className="flex min-h-full flex-col"><ThemeProvider><I18nProvider>{children}</I18nProvider></ThemeProvider></body>
     </html>
   );
 }

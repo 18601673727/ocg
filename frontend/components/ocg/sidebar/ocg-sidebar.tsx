@@ -27,17 +27,15 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus, WorkType } from "../types";
-import { WORK_TYPE_LABEL } from "../types";
 import type { RuntimeAuthority } from "../runtime/runtime-types";
 import { ProjectSwitcher } from "../project/project-switcher";
 import type { ProjectId, ProjectSummary } from "../project/domain";
 import { DEFAULT_PROJECT_ID } from "../project/domain";
 import {
-  RUNTIME_AUTHORITY_LABEL,
   RUNTIME_CONNECTION,
-  RUNTIME_CONNECTION_LABEL,
   StatusDot,
 } from "@/components/ocg/primitives";
+import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
 
 const GROUP_ORDER: WorkType[] = ["research", "coding", "design", "devops"];
@@ -49,16 +47,23 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
   devops: Server,
 };
 
-const WORKSPACE_NAV: { target: WorkspaceView; label: string; icon: typeof Search }[] = [
-  { target: "home", label: "Home", icon: Home },
-  { target: "attention", label: "Attention", icon: Bell },
-  { target: "chat", label: "Chat", icon: MessageSquare },
-  { target: "control-center", label: "Control Center", icon: SlidersHorizontal },
-  { target: "ledger", label: "Resource Ledger", icon: Table2 },
-  { target: "job-execution", label: "Job Execution", icon: Workflow },
-  { target: "logs", label: "Logs / Diagnostics", icon: ScrollText },
-  { target: "canonical", label: "OCG Control", icon: SlidersHorizontal },
+const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
+  { target: "home", labelKey: "nav.home", icon: Home },
+  { target: "attention", labelKey: "nav.attention", icon: Bell },
+  { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
+  { target: "control-center", labelKey: "nav.controlCenter", icon: SlidersHorizontal },
+  { target: "ledger", labelKey: "nav.ledger", icon: Table2 },
+  { target: "job-execution", labelKey: "nav.jobExecution", icon: Workflow },
+  { target: "logs", labelKey: "nav.logs", icon: ScrollText },
+  { target: "canonical", labelKey: "nav.canonical", icon: SlidersHorizontal },
 ];
+
+const WORK_TYPE_LABEL_KEY = {
+  research: "sidebar.workType.research",
+  coding: "sidebar.workType.coding",
+  design: "sidebar.workType.design",
+  devops: "sidebar.workType.devops",
+} as const;
 
 type OcgSidebarProps = {
   sessions: ChatSession[];
@@ -136,13 +141,29 @@ export function OcgSidebar({
   attentionCount = 0,
   onNavigate,
 }: OcgSidebarProps) {
+  const { t } = useI18n();
   const hasNav = Boolean(onNavigate);
   const connection = RUNTIME_CONNECTION[runtimeStatus.state];
+  const connectionLabel = t(
+    runtimeStatus.state === "connected"
+      ? "topbar.connection.ready"
+      : runtimeStatus.state === "connecting"
+        ? "topbar.connection.connecting"
+        : runtimeStatus.state === "failed"
+          ? "topbar.connection.failed"
+          : "topbar.connection.disconnected",
+  );
+  const authorityLabel = t(
+    runtimeAuthority === "canonical" ? "topbar.authority.canonical" : "topbar.authority.mock",
+  );
+  const workTypeLabel = (group: WorkType) => t(WORK_TYPE_LABEL_KEY[group]);
+  const navLabel = (item: (typeof WORKSPACE_NAV)[number]) => t(item.labelKey);
 
   const renderWorkspaceItem = (item: (typeof WORKSPACE_NAV)[number]) => {
     const Icon = item.icon;
     if (!onNavigate) return null;
     const active = activeView === item.target;
+    const label = navLabel(item);
     return (
       <li key={item.target}>
         <button
@@ -157,10 +178,10 @@ export function OcgSidebar({
           )}
         >
           <Icon className="size-3.5 shrink-0" aria-hidden="true" />
-          <span className="min-w-0 flex-1 truncate">{item.label}</span>
+          <span className="min-w-0 flex-1 truncate">{label}</span>
           {item.target === "attention" && attentionCount > 0 && (
             <span
-              aria-label={`${attentionCount} items need action`}
+              aria-label={t("sidebar.attentionBadge", { count: attentionCount })}
               className="shrink-0 rounded-full bg-muted px-1.5 text-[10px] font-semibold tabular-nums text-muted-foreground"
             >
               {attentionCount > 99 ? "99+" : attentionCount}
@@ -175,7 +196,7 @@ export function OcgSidebar({
     return (
       <TooltipProvider delay={100}>
         <div className="flex h-full w-full flex-col items-center gap-1 px-2 py-3">
-          <RailButton label="Expand sidebar" onClick={onToggle}>
+          <RailButton label={t("sidebar.expand")} onClick={onToggle}>
             <ChevronsLeft className="size-4 rotate-180" />
           </RailButton>
           {onProjectChange && (
@@ -186,7 +207,7 @@ export function OcgSidebar({
               onChange={onProjectChange}
             />
           )}
-          <RailButton label="New chat" onClick={onNewChat}>
+          <RailButton label={t("sidebar.newChat")} onClick={onNewChat}>
             <Plus className="size-4" />
           </RailButton>
           {hasNav && (
@@ -195,10 +216,11 @@ export function OcgSidebar({
               {WORKSPACE_NAV.map((item) => {
                 const Icon = item.icon;
                 if (!onNavigate) return null;
+                const label = navLabel(item);
                 return (
                   <RailButton
                     key={item.target}
-                    label={item.target === "attention" && attentionCount > 0 ? `${item.label} (${attentionCount} need action)` : item.label}
+                    label={item.target === "attention" && attentionCount > 0 ? t("sidebar.attentionBadgeShort", { label, count: attentionCount }) : label}
                     active={activeView === item.target}
                     onClick={() => onNavigate(item.target)}
                   >
@@ -230,7 +252,7 @@ export function OcgSidebar({
               return (
                 <RailButton
                   key={group}
-                  label={WORK_TYPE_LABEL[group]}
+                  label={workTypeLabel(group)}
                   active={groupActive}
                   onClick={() => firstInGroup && onSelect(firstInGroup.id)}
                 >
@@ -240,7 +262,7 @@ export function OcgSidebar({
             })}
           </div>
           <div className="flex flex-col items-center gap-1">
-            <RailButton label="Settings" onClick={onNavigate ? () => onNavigate("settings") : undefined}>
+            <RailButton label={t("sidebar.settings")} onClick={onNavigate ? () => onNavigate("settings") : undefined}>
               <Settings className="size-4" />
             </RailButton>
             <Avatar size="sm">
@@ -261,10 +283,10 @@ export function OcgSidebar({
           </div>
           <div className="min-w-0 flex-1">
             <p className="truncate text-[13px] font-semibold tracking-tight">
-              OCG Server
+              {t("sidebar.ocgServer")}
             </p>
             <p className="truncate text-[11px] text-muted-foreground">
-              local state
+              {t("sidebar.localState")}
             </p>
           </div>
           <Tooltip>
@@ -274,15 +296,15 @@ export function OcgSidebar({
                   variant="ghost"
                   size="icon-xs"
                   onClick={onToggle}
-                  aria-label="Collapse sidebar"
+                  aria-label={t("sidebar.collapse")}
                   aria-expanded="true"
-                  title="Collapse sidebar"
+                  title={t("sidebar.collapse")}
                 >
                   <ChevronsLeft className="size-4" />
                 </Button>
               }
             />
-            <TooltipContent side="right">Collapse sidebar</TooltipContent>
+            <TooltipContent side="right">{t("sidebar.collapse")}</TooltipContent>
           </Tooltip>
         </div>
 
@@ -297,12 +319,12 @@ export function OcgSidebar({
         )}
 
         {hasNav && (
-          <nav aria-label="Workspace navigation" className="px-2 pb-2">
+          <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
             <ul className="flex flex-col gap-px">
               {WORKSPACE_NAV.slice(0, 3).map(renderWorkspaceItem)}
             </ul>
             <details open={WORKSPACE_NAV.slice(3).some((item) => item.target === activeView) || undefined} className="mt-1">
-              <summary className="cursor-pointer rounded-md px-2 py-1.5 text-[12px] text-muted-foreground hover:bg-muted/60">Tools</summary>
+              <summary className="cursor-pointer rounded-md px-2 py-1.5 text-[12px] text-muted-foreground hover:bg-muted/60">{t("nav.tools")}</summary>
               <ul className="flex flex-col gap-px pl-2">
                 {WORKSPACE_NAV.slice(3).map(renderWorkspaceItem)}
               </ul>
@@ -318,12 +340,12 @@ export function OcgSidebar({
             onClick={onNewChat}
           >
             <Plus className="size-3.5" data-icon="inline-start" />
-            New chat
+            {t("sidebar.newChat")}
           </Button>
         </div>
 
         <nav
-          aria-label="Chat sessions grouped by work type"
+          aria-label={t("nav.chatSessions")}
           className="min-h-0 flex-1 overflow-y-auto px-2 pb-2"
         >
           {GROUP_ORDER.map((group) => {
@@ -331,10 +353,10 @@ export function OcgSidebar({
             const items = sessions.filter((s) => s.workType === group);
             if (items.length === 0) return null;
             return (
-              <section key={group} aria-label={WORK_TYPE_LABEL[group]} className="mt-1">
+              <section key={group} aria-label={workTypeLabel(group)} className="mt-1">
                 <h2 className="flex items-center gap-1.5 px-2 pt-3 pb-1 text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
                   <Icon className="size-3.5" aria-hidden="true" />
-                  {WORK_TYPE_LABEL[group]}
+                  {workTypeLabel(group)}
                 </h2>
                 <ul className="flex flex-col gap-px">
                   {items.map((session) => {
@@ -375,16 +397,16 @@ export function OcgSidebar({
         <div className="border-t border-border px-3 py-2.5">
           <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
              <StatusDot tone={connection.tone} pulse={connection.pulse} />
-             <span className="truncate">Runtime {RUNTIME_CONNECTION_LABEL[runtimeStatus.state]} · {RUNTIME_AUTHORITY_LABEL[runtimeAuthority]}</span>
+             <span className="truncate">Runtime {connectionLabel} · {authorityLabel}</span>
           </div>
           <div className="mt-2 flex items-center gap-2">
             <Avatar size="sm">
               <AvatarFallback className="text-[11px]">OC</AvatarFallback>
             </Avatar>
             <div className="min-w-0 flex-1">
-              <p className="truncate text-[12px] font-medium">Operator</p>
+              <p className="truncate text-[12px] font-medium">{t("sidebar.operator")}</p>
               <p className="truncate text-[11px] text-muted-foreground">
-                local profile
+                {t("sidebar.localProfile")}
               </p>
             </div>
             <Tooltip>
@@ -393,15 +415,15 @@ export function OcgSidebar({
                   <Button
                     variant="ghost"
                     size="icon-xs"
-                     aria-label="Open settings"
-                     title="Open settings"
+                     aria-label={t("sidebar.openSettings")}
+                     title={t("sidebar.openSettings")}
                      onClick={onNavigate ? () => onNavigate("settings") : undefined}
                   >
                     <Settings className="size-4" />
                   </Button>
                 }
               />
-              <TooltipContent side="top">Open settings</TooltipContent>
+              <TooltipContent side="top">{t("sidebar.openSettings")}</TooltipContent>
             </Tooltip>
           </div>
         </div>

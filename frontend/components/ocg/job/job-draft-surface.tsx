@@ -18,7 +18,6 @@ import type { ProjectSummary } from "../project/domain";
 import type { JobLaunchResult } from "../runtime/runtime-types";
 import {
   FIXTURE_RECOMMENDED_BUDGET_MICROS,
-  FIXTURE_RECOMMENDED_BUDGET_NOTE,
   HARD_BUDGET_MIN_MICROS,
   microsToUsd,
   jobDraftHasErrors,
@@ -27,6 +26,7 @@ import {
   type JobDraft,
   type JobDraftTextField,
 } from "./draft-domain";
+import { useI18n, type TranslateFn } from "../i18n";
 
 type JobDraftSurfaceProps = {
   project: ProjectSummary;
@@ -47,6 +47,20 @@ const OUTCOME_TONE: Record<JobLaunchResult["outcome"], string> = {
   failed: "border-red-500/40 bg-red-500/5 text-red-800 dark:text-red-200",
 };
 
+const KNOWN_VALIDATION_FAILED = "Draft validation failed before launch.";
+const KNOWN_LAUNCH_FAILED = "The runtime adapter failed while launching this Job.";
+
+/**
+ * Reducer and adapter messages stay English at the domain boundary so the
+ * runtime logic never depends on locale. Localize the two known messages at
+ * render time; unknown backend messages stay raw so nothing is hidden.
+ */
+function localizeKnownFailureMessage(message: string, t: TranslateFn): string {
+  if (message === KNOWN_VALIDATION_FAILED) return t("job.validationFailed");
+  if (message === KNOWN_LAUNCH_FAILED) return t("job.launchFailed");
+  return message;
+}
+
 export function JobDraftSurface({
   project,
   draft,
@@ -58,6 +72,7 @@ export function JobDraftSurface({
   onLaunch,
   onClose,
 }: JobDraftSurfaceProps) {
+  const { t } = useI18n();
   const summaryRef = useRef<HTMLDivElement>(null);
   const [budgetText, setBudgetText] = useState(() =>
     draft.hardBudgetMicros === null ? "" : String(microsToUsd(draft.hardBudgetMicros)),
@@ -66,6 +81,7 @@ export function JobDraftSurface({
   const isLaunching = draft.lifecycle === "launching";
   const hasErrors = jobDraftHasErrors(draft.issues);
   const commitmentPercent = Math.round(draft.resourceCommitment * 100);
+  const errorCount = draft.issues.filter((issue) => issue.severity === "error").length;
 
   const setFixtureBudget = () => {
     setBudgetText(String(microsToUsd(FIXTURE_RECOMMENDED_BUDGET_MICROS)));
@@ -101,7 +117,7 @@ export function JobDraftSurface({
 
   return (
     <section
-      aria-label="Job draft"
+      aria-label={t("job.draft")}
       className="flex flex-col gap-3 rounded-lg border border-border bg-background px-3 py-3 shadow-[0_1px_2px_rgba(0,0,0,0.04)] sm:px-4"
     >
       <header className="flex items-start gap-2">
@@ -109,9 +125,9 @@ export function JobDraftSurface({
           <Target className="size-3.5 text-muted-foreground" />
         </span>
         <div className="min-w-0 flex-1">
-          <h2 className="text-[13px] font-semibold tracking-tight">Job draft</h2>
+          <h2 className="text-[13px] font-semibold tracking-tight">{t("job.draft")}</h2>
           <p className="mt-0.5 text-[11px] text-muted-foreground">
-            Active Project <span className="font-medium text-foreground">{project.name}</span> · from the shell, not selected here
+            {t("job.activeProject")} <span className="font-medium text-foreground">{project.name}</span> · {t("job.activeProjectNote")}
           </p>
         </div>
         <Button
@@ -119,8 +135,8 @@ export function JobDraftSurface({
           variant="ghost"
           size="icon-xs"
           onClick={onClose}
-          aria-label="Close Job draft"
-          title="Close Job draft"
+          aria-label={t("job.closeDraft")}
+          title={t("job.closeDraft")}
         >
           <X className="size-4" />
         </Button>
@@ -139,22 +155,22 @@ export function JobDraftSurface({
         )}
       >
         {hasErrors
-          ? `${draft.issues.filter((issue) => issue.severity === "error").length} field${draft.issues.filter((issue) => issue.severity === "error").length === 1 ? "" : "s"} need attention before launch.`
+          ? t("job.draftAttention", { count: errorCount })
           : draft.lifecycle === "ready"
-            ? "Draft is ready to launch."
-            : "Fill the objective, success criteria, and hard budget, then launch."}
+            ? t("job.draftReady")
+            : t("job.fillHint")}
       </div>
 
       <div className="flex flex-col gap-1">
         <label htmlFor="job-draft-objective" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-          Objective
+          {t("job.objective")}
         </label>
         <Textarea
           id="job-draft-objective"
           value={draft.objective}
           onChange={(event) => onFieldChange("objective", event.target.value)}
           onBlur={onValidate}
-          placeholder="What should this Job accomplish?"
+          placeholder={t("job.objectivePlaceholder")}
           aria-invalid={draft.issues.some((issue) => issue.field === "objective" && issue.severity === "error")}
           disabled={isLaunching}
           className="min-h-11 text-[13px]"
@@ -164,14 +180,14 @@ export function JobDraftSurface({
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="flex flex-col gap-1">
           <label htmlFor="job-draft-criteria" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Success criteria
+            {t("job.successCriteria")}
           </label>
           <Textarea
             id="job-draft-criteria"
             value={draft.successCriteria}
             onChange={(event) => onFieldChange("successCriteria", event.target.value)}
             onBlur={onValidate}
-            placeholder={"One check per line\ne.g. Launch creates an execution"}
+            placeholder={t("job.successCriteriaPlaceholder")}
             aria-invalid={draft.issues.some((issue) => issue.field === "successCriteria" && issue.severity === "error")}
             disabled={isLaunching}
             className="min-h-16 text-[13px]"
@@ -179,14 +195,14 @@ export function JobDraftSurface({
         </div>
         <div className="flex flex-col gap-1">
           <label htmlFor="job-draft-constraints" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Constraints / notes
+            {t("job.constraints")}
           </label>
           <Textarea
             id="job-draft-constraints"
             value={draft.constraints}
             onChange={(event) => onFieldChange("constraints", event.target.value)}
             onBlur={onValidate}
-            placeholder="Files, systems, or limits to respect (optional)"
+            placeholder={t("job.constraintsPlaceholder")}
             disabled={isLaunching}
             className="min-h-16 text-[13px]"
           />
@@ -196,7 +212,7 @@ export function JobDraftSurface({
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="flex flex-col gap-1">
           <label htmlFor="job-draft-budget" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Hard budget (USD)
+            {t("job.budget")}
           </label>
           <div className="flex items-center gap-2">
             <span aria-hidden="true" className="text-[13px] text-muted-foreground">$</span>
@@ -212,12 +228,11 @@ export function JobDraftSurface({
               className="h-8 text-[13px]"
             />
             <Button type="button" variant="outline" size="xs" onClick={setFixtureBudget} disabled={isLaunching}>
-              Use fixture
+              {t("job.useFixture")}
             </Button>
           </div>
           <p className="text-[10px] leading-4 text-muted-foreground">
-            Hard cutoff: the runtime must not start work that would exceed this cap. Stored as integer micros
-            ({draft.hardBudgetMicros === null ? "not set" : draft.hardBudgetMicros.toLocaleString()}).
+            {t("job.budgetHelp", { value: draft.hardBudgetMicros === null ? t("job.budgetNotSet") : draft.hardBudgetMicros.toLocaleString() })}
           </p>
           <p
             className={cn(
@@ -226,14 +241,14 @@ export function JobDraftSurface({
             )}
           >
             {draft.hardBudgetSource === "fixture-recommended"
-              ? FIXTURE_RECOMMENDED_BUDGET_NOTE
-              : "You set this hard budget. The fixture recommendation is no longer applied."}
+              ? t("job.fixtureNote")
+              : t("job.budgetCustomNote")}
           </p>
         </div>
 
         <div className="flex flex-col gap-1">
           <label htmlFor="job-draft-commitment" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Resource commitment
+            {t("job.resourceCommitment")}
           </label>
           <input
             id="job-draft-commitment"
@@ -245,53 +260,59 @@ export function JobDraftSurface({
             onChange={(event) => onCommitmentChange(Number(event.target.value))}
             onBlur={onValidate}
             disabled={isLaunching}
-            aria-valuetext={`${commitmentPercent}% of available capacity`}
+            aria-valuetext={t("job.commitmentValue", { percent: commitmentPercent })}
             className="h-8 w-full accent-foreground"
           />
-          <p className="text-[11px] tabular-nums text-foreground/80">{commitmentPercent}% of available capacity</p>
+          <p className="text-[11px] tabular-nums text-foreground/80">{t("job.commitmentValue", { percent: commitmentPercent })}</p>
           <p className="text-[10px] leading-4 text-muted-foreground">
-            Relative share only. The scheduler/runtime may translate it into model quality, parallelism, retries, and verification depth later; no resource is reserved here.
+            {t("job.commitmentHelp")}
           </p>
         </div>
       </div>
 
       {hasErrors && (
-        <ul className="flex flex-col gap-1" aria-label="Draft validation issues">
+        <ul className="flex flex-col gap-1" aria-label={t("job.validationIssues")}>
           {draft.issues.filter((issue) => issue.severity === "error").map((issue) => (
             <li key={`${issue.code}-${issue.field}`} className="flex items-start gap-1.5 text-[11px] leading-4 text-red-700 dark:text-red-300">
               <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
-              <span>{issue.message}</span>
+              <span>{localizeKnownFailureMessage(issue.message, t)}</span>
             </li>
           ))}
         </ul>
       )}
 
+      {draft.lifecycle === "launch-failed" && draft.launchMessage && (!launchResult || launchResult.message !== draft.launchMessage) && (
+        <p role="alert" className="rounded-md border border-red-500/40 bg-red-500/5 px-2.5 py-1.5 text-[11px] leading-4 text-red-800 dark:text-red-200">
+          {localizeKnownFailureMessage(draft.launchMessage, t)}
+        </p>
+      )}
+
       {launchResult && (
         <p className={cn("rounded-md border px-2.5 py-1.5 text-[11px] leading-4", OUTCOME_TONE[launchResult.outcome])}>
           <span className="font-semibold capitalize">{launchResult.outcome}</span>
-          {launchResult.duplicate ? " (recorded result reused)" : ""} · {launchResult.message}
+          {launchResult.duplicate ? ` ${t("job.recordedReused")}` : ""} · {localizeKnownFailureMessage(launchResult.message, t)}
         </p>
       )}
 
       <footer className="flex flex-wrap items-center gap-2 border-t border-border pt-2.5">
         <p className="min-w-0 flex-1 text-[10px] text-muted-foreground">
           {draft.hardBudgetMicros !== null && Number.isSafeInteger(draft.hardBudgetMicros) && draft.hardBudgetMicros >= HARD_BUDGET_MIN_MICROS
-            ? "Budget is a positive integer amount of USD micros."
-            : "Enter a positive amount that fits the integer USD micro-unit range."}
+            ? t("job.budgetValid")
+            : t("job.budgetInvalid")}
         </p>
         <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={isLaunching}>
-          Close draft
+          {t("job.close")}
         </Button>
         <Button type="button" size="sm" onClick={attemptLaunch} disabled={isLaunching} className="gap-1.5">
           {isLaunching ? (
             <>
               <Check className="size-3.5 animate-pulse" aria-hidden="true" />
-              Launching…
+              {t("job.launching")}
             </>
           ) : (
             <>
               <Rocket className="size-3.5" aria-hidden="true" />
-              Launch Job
+              {t("job.launch")}
             </>
           )}
         </Button>

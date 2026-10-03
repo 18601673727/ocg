@@ -38,6 +38,7 @@ import {
   type ProfileHealth,
   type ResolvedRoute,
 } from "./domain";
+import { useI18n } from "../i18n";
 function ProfileListCard({
   profile,
   health,
@@ -126,6 +127,7 @@ function ProfileDetail({
   const workerRoles = selectWorkerRoles(routes);
   const warnings = selectProfileWarnings(bootstrap, profile);
   const source = selectProfileSource(profile);
+  const { t } = useI18n();
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
@@ -150,7 +152,7 @@ function ProfileDetail({
             title={active ? "This profile is already active" : "Set this profile active in the mock runtime"}
           >
             {active ? <CheckCircle2 className="size-3" data-icon="inline-start" aria-hidden="true" /> : <Star className="size-3" data-icon="inline-start" aria-hidden="true" />}
-            {active ? "Active" : "Set active"}
+            {active ? t("control.active") : t("control.setActive")}
           </Button>
           <span className="text-[10px] text-muted-foreground">Frontend-only mock switch. No configuration is written.</span>
         </div>
@@ -226,11 +228,12 @@ export function ProfilesView({
 }) {
   const active = selectActiveProfile(bootstrap);
   const selected = selectProfileById(bootstrap, selectedProfileId) ?? active;
+  const { t } = useI18n();
 
   return (
     <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(220px,300px)_minmax(0,1fr)]">
-      <section aria-label="Profiles" className="min-w-0">
-        <SectionTitle detail={`${bootstrap.profiles.length} profile(s)`}>Profiles</SectionTitle>
+      <section aria-label={t("control.profiles")} className="min-w-0">
+        <SectionTitle detail={`${bootstrap.profiles.length} profile(s)`}>{t("control.profiles")}</SectionTitle>
         <ul className="flex flex-col gap-1.5">
           {bootstrap.profiles.map((profile) => (
             <ProfileListCard
@@ -253,7 +256,7 @@ export function ProfilesView({
             onActivate={() => onActivateProfile(selected.id)}
           />
         ) : (
-          <EmptyState className="py-4">No profile is available in this workspace.</EmptyState>
+          <EmptyState className="py-4">{t("control.noProfileAvailable")}</EmptyState>
         )}
       </section>
     </div>

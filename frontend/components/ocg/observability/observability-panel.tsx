@@ -58,6 +58,7 @@ import {
   type WorkerRuntimeStats,
 } from "../runtime/observability";
 import { restoreWorkerSelection, type InspectorTab } from "./inspector-state";
+import { useI18n } from "../i18n";
 
 const CHART_ESTIMATED = "var(--chart-4)";
 const CHART_REPORTED = "var(--chart-2)";
@@ -82,25 +83,27 @@ function formatCostUsage(value?: UsageValue): string {
 }
 
 function TokenMetrics({ tokenUsage }: { tokenUsage: RuntimeObservability["job"]["tokenUsage"] }) {
+  const { t } = useI18n();
   return (
     <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-2 2xl:grid-cols-3">
-      <Metric label="Total tokens" value={formatTokenUsage(tokenUsage.total)} icon={Gauge} />
-      <Metric label="Input" value={formatTokenUsage(tokenUsage.input)} icon={Activity} />
-      <Metric label="Output" value={formatTokenUsage(tokenUsage.output)} icon={Activity} />
-      <Metric label="Reasoning" value={formatTokenUsage(tokenUsage.reasoning)} icon={GitBranch} />
-      <Metric label="Cache read" value={formatTokenUsage(tokenUsage.cacheRead)} icon={Zap} />
-      <Metric label="Cache write" value={formatTokenUsage(tokenUsage.cacheWrite)} icon={Zap} />
+      <Metric label={t("observability.totalTokens")} value={formatTokenUsage(tokenUsage.total)} icon={Gauge} />
+      <Metric label={t("observability.input")} value={formatTokenUsage(tokenUsage.input)} icon={Activity} />
+      <Metric label={t("observability.output")} value={formatTokenUsage(tokenUsage.output)} icon={Activity} />
+      <Metric label={t("observability.reasoning")} value={formatTokenUsage(tokenUsage.reasoning)} icon={GitBranch} />
+      <Metric label={t("observability.cacheRead")} value={formatTokenUsage(tokenUsage.cacheRead)} icon={Zap} />
+      <Metric label={t("observability.cacheWrite")} value={formatTokenUsage(tokenUsage.cacheWrite)} icon={Zap} />
     </div>
   );
 }
 
 function BudgetSection({ accounting, observability }: { accounting: JobAccounting | null; observability: RuntimeObservability }) {
+  const { t } = useI18n();
   const budget = deriveBudgetUsage(accounting?.ceiling ?? null, observability.job.estimatedFinalSpend);
   return (
     <section className="rounded-md border border-border bg-muted/20 p-2.5" aria-label="Job budget">
       <div className="flex items-center gap-1.5">
         <Wallet className="size-3.5 text-muted-foreground" aria-hidden="true" />
-        <h3 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Budget</h3>
+        <h3 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("observability.budget")}</h3>
         <span className="ml-auto text-[10px] text-muted-foreground">hard limit</span>
       </div>
       {budget.limit === null ? (
@@ -140,13 +143,14 @@ function CurrentRuntimeSummary({ observability }: { observability: RuntimeObserv
 
 /** Canonical Call/Attempt counts, the only execution figures the projection states. */
 function CallSummary({ execution }: { execution: JobExecution }) {
+  const { t } = useI18n();
   const summary = execution.summary;
   return (
     <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
-      <Metric label="Calls" value={`${summary.total}`} />
-      <Metric label="Running" value={`${summary.running}`} />
-      <Metric label="Settled" value={`${summary.completed}`} />
-      <Metric label="Failed" value={`${summary.failed}`} />
+      <Metric label={t("observability.calls")} value={`${summary.total}`} />
+      <Metric label={t("observability.running")} value={`${summary.running}`} />
+      <Metric label={t("observability.settled")} value={`${summary.completed}`} />
+      <Metric label={t("observability.failed")} value={`${summary.failed}`} />
     </div>
   );
 }
@@ -296,6 +300,7 @@ function AggregateDetail({ selection, providers, models }: { selection: Aggregat
 }
 
 function OverviewSurface({ execution, accounting, observability }: { execution: JobExecution; accounting: JobAccounting | null; observability: RuntimeObservability }) {
+  const { t } = useI18n();
   const latestActivity = observability.activities.at(-1);
   const currentCall = execution.currentCall ?? execution.latestCall;
   return (
@@ -304,7 +309,7 @@ function OverviewSurface({ execution, accounting, observability }: { execution: 
       <p className="text-[12px] leading-5 text-muted-foreground"><span className="font-medium text-foreground">{execution.jobId}</span> · {execution.projectId} · {humanizeStatus(execution.state)}</p>
       <CurrentRuntimeSummary observability={observability} />
       <BudgetSection accounting={accounting} observability={observability} />
-      <section><SectionTitle detail={execution.progress ? `${execution.progress.settled}/${execution.progress.total}` : `${execution.summary.total}`}>Calls</SectionTitle><CallSummary execution={execution} /></section>
+      <section><SectionTitle detail={execution.progress ? `${execution.progress.settled}/${execution.progress.total}` : `${execution.summary.total}`}>{t("observability.calls")}</SectionTitle><CallSummary execution={execution} /></section>
       <section><SectionTitle>Current call</SectionTitle><p className="rounded-md border border-border bg-muted/30 px-2.5 py-2 text-[12px] font-medium">{currentCall ? `Call ${currentCall.callId} · ${currentCall.effectKind} · ${humanizeStatus(currentCall.status)}` : "No Call has been admitted for this Job yet."}</p></section>
       {latestActivity && <section><SectionTitle detail="latest">Runtime activity</SectionTitle><ul className="rounded-md border border-border px-2"><ActivityRow item={latestActivity} /></ul></section>}
     </div>

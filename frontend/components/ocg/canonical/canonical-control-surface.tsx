@@ -19,8 +19,10 @@ import { RuntimeStore } from "../runtime/runtime-store";
 import { createUninitializedRuntimeState } from "../runtime/reconciler";
 import { type CanonicalState, selectCanonical } from "../runtime/canonical-store";
 import { JobExecutionSurface } from "../execution/job-execution-surface";
+import { useI18n, type I18nKey } from "../i18n";
 import {
   DEFAULT_CONFIGURATION_DRAFT,
+  MIN_HARD_BUDGET,
   describeAcknowledgement,
   draftFromConfiguration,
   globalConfigurationCommandId,
@@ -33,6 +35,7 @@ import {
   validateImportRoot,
   type ConfigurationDraft,
   type DraftIssue,
+  type DraftIssueCode,
 } from "./canonical-control-domain";
 
 /**
@@ -53,16 +56,45 @@ export type CanonicalControlSurfaceProps = {
 };
 
 function IssueList({ issues }: { issues: readonly DraftIssue[] }) {
+  const { t } = useI18n();
   if (issues.length === 0) return null;
   return (
     <ul className="mt-2 space-y-1">
       {issues.map((issue) => (
         <li key={`${issue.field}:${issue.code}`} className="text-[10px] text-amber-700 dark:text-amber-300">
-          {issue.message}
+          {issueText(t, issue)}
         </li>
       ))}
     </ul>
   );
+}
+
+/**
+ * Static validation copy lives in the i18n table keyed by issue code; the
+ * domain message is only a fallback. Contract/backend error strings stay raw
+ * at their call sites. `root-required` covers two domain messages, so the
+ * absolute-path variant selects its own key by content.
+ */
+const ISSUE_I18N_KEY: Record<DraftIssueCode, I18nKey> = {
+  "provider-required": "canonical.issue.provider-required",
+  "model-required": "canonical.issue.model-required",
+  "budget-invalid": "canonical.issue.budget-invalid",
+  "budget-below-minimum": "canonical.issue.budget-below-minimum",
+  "profile-invalid": "canonical.issue.profile-invalid",
+  "routing-invalid": "canonical.issue.routing-invalid",
+  "root-required": "canonical.issue.root-required",
+  "job-required": "canonical.issue.job-required",
+  "job-dispatched": "canonical.issue.job-dispatched",
+};
+
+function issueText(t: ReturnType<typeof useI18n>["t"], issue: DraftIssue): string {
+  if (issue.code === "root-required" && issue.message.includes("absolute")) {
+    return t("canonical.issue.root-format");
+  }
+  if (issue.code === "budget-below-minimum") {
+    return t(ISSUE_I18N_KEY[issue.code], { min: MIN_HARD_BUDGET });
+  }
+  return t(ISSUE_I18N_KEY[issue.code]);
 }
 
 export function CanonicalControlSurface({
@@ -89,6 +121,7 @@ export function CanonicalControlSurface({
   const [ack, setAck] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { t } = useI18n();
 
   const activeProjectId = state.projectId;
   const selected = useMemo(() => selectCanonical(state), [state]);
@@ -179,7 +212,7 @@ export function CanonicalControlSurface({
     run(async () => {
       const project = projects.find((item) => item.project_id === activeProjectId) ?? projects[0];
       if (!project) {
-        setError("Register a Project before changing global configuration.");
+        setError(t("canonical.error.needProjectGlobal"));
         return;
       }
       const commandId = globalConfigurationCommandId(configurationRevision(configuration) + 1);
@@ -202,7 +235,7 @@ export function CanonicalControlSurface({
     run(async () => {
       const project = projects.find((item) => item.project_id === activeProjectId) ?? projects[0];
       if (!project) {
-        setError("Register a Project before changing project defaults.");
+        setError(t("canonical.error.needProjectDefaults"));
         return;
       }
       const result = await client.writeProjectDefaults(
@@ -241,7 +274,7 @@ export function CanonicalControlSurface({
     run(async () => {
       const project = projects.find((item) => item.project_id === activeProjectId) ?? projects[0];
       if (!project) {
-        setError("Select a Project first.");
+        setError(t("canonical.error.selectProjectFirst"));
         return;
       }
       await refresh(project, jobId.trim());
@@ -363,10 +396,10 @@ export function CanonicalControlSurface({
             <IssueList issues={draftIssues} />
             <div className="mt-2 flex flex-wrap gap-2">
               <Button size="xs" disabled={busy || draftIssues.length > 0} onClick={saveGlobal}>
-                <Save className="size-3.5" /> Save global
+                <Save className="size-3.5" /> {t("canonical.saveGlobal")}
               </Button>
               <Button size="xs" variant="outline" disabled={busy || draftIssues.length > 0} onClick={saveProjectDefaults}>
-                Save project defaults
+                {t("canonical.saveProjectDefaults")}
               </Button>
             </div>
           </Panel>
@@ -374,11 +407,11 @@ export function CanonicalControlSurface({
           <Panel
             className="bg-background p-3"
             title="Job pre-run configuration"
-            detail={preRun.jobId ? `job ${preRun.jobId}` : "no Job selected"}
+            detail={preRun.jobId ? `job ${preRun.jobId}` : t("canonical.noJob")}
           >
             <div className="flex flex-wrap items-end gap-2">
               <label className="flex-1 text-[10px] text-muted-foreground">
-                Job id
+                {t("canonical.jobId")}
                 <Input
                   className="mt-1 h-7 text-[11px]"
                   value={jobId}
@@ -387,7 +420,7 @@ export function CanonicalControlSurface({
                 />
               </label>
               <Button size="xs" variant="outline" disabled={busy || jobId.trim().length === 0} onClick={loadJob}>
-                <GitCommitHorizontal className="size-3.5" /> Load
+                <GitCommitHorizontal className="size-3.5" /> {t("common.load")}
               </Button>
             </div>
             {preRun.reason ? (
@@ -402,7 +435,7 @@ export function CanonicalControlSurface({
                 disabled={busy || draftIssues.length > 0 || !preRun.editable}
                 onClick={saveJobConfig}
               >
-                <Save className="size-3.5" /> Save pre-run configuration
+                <Save className="size-3.5" /> {t("canonical.savePreRun")}
               </Button>
             </div>
             <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[10px]">
@@ -417,7 +450,7 @@ export function CanonicalControlSurface({
             </dl>
           </Panel>
 
-          <Panel className="bg-background p-3" title="Running Job" detail="Runtime state">
+          <Panel className="bg-background p-3" title={t("canonical.runningJob")} detail="Runtime state">
             {selected.execution ? (
               <div className="h-[420px] overflow-hidden rounded border border-border">
                 <JobExecutionSurface execution={selected.execution} />

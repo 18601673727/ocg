@@ -25,6 +25,7 @@ import {
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { BORDER_TONE, StatusDot, TEXT_TONE, TOOL_STATUS } from "@/components/ocg/primitives";
 import { ActivityPulse } from "../activity-pulse";
+import { useI18n } from "../i18n";
 import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
 import {
   applyComposerSuggestion,
@@ -71,21 +72,22 @@ function renderInline(text: string, keyPrefix: string): React.ReactNode[] {
 
 function CodeBlock({ language, code }: { language: string; code: string }) {
   const { isCopied, copyToClipboard } = useCopyToClipboard();
+  const { t } = useI18n();
   return (
     <div className="overflow-hidden rounded-md border border-border bg-muted/40">
       <div className="flex items-center gap-2 border-b border-border px-2.5 py-1.5">
         <span className="font-mono text-[11px] text-muted-foreground">
-          {language || "code"}
+          {language || t("chat.code")}
         </span>
         <button
           type="button"
           onClick={() => copyToClipboard(code)}
           className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          aria-label={isCopied ? "Copied" : "Copy code to clipboard"}
-          title="Copy code"
+          aria-label={isCopied ? t("common.copied") : t("chat.copyCodeToClipboard")}
+          title={t("chat.copyCode")}
         >
           {isCopied ? <Check className="size-3" /> : <Copy className="size-3" />}
-          {isCopied ? "Copied" : "Copy"}
+          {isCopied ? t("common.copied") : t("common.copy")}
         </button>
       </div>
       <pre className="overflow-x-auto p-2.5 font-mono text-[12px] leading-5 text-foreground">
@@ -166,6 +168,7 @@ function Markdown({ content }: { content: string }) {
 function ToolBlock({ message }: { message: ChatMessage }) {
   const tool = message.tool;
   const [open, setOpen] = useState(true);
+  const { t } = useI18n();
   if (!tool) return null;
   const tone = Object.entries(TOOL_STATUS).find(([status]) => status === tool.status)?.[1].tone ?? "slate";
   return (
@@ -173,7 +176,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
       <div className="overflow-hidden rounded-md border border-border bg-muted/30">
         <CollapsibleTrigger
           className="flex w-full items-center gap-2 px-2.5 py-2 text-left"
-          aria-label={`${tool.name} ${tool.status}. Toggle details.`}
+          aria-label={t("chat.toolToggleDetails", { name: tool.name, status: tool.status })}
         >
           <span className="flex size-6 shrink-0 items-center justify-center rounded border border-border bg-background">
             <Wrench className="size-3.5 text-muted-foreground" aria-hidden="true" />
@@ -218,6 +221,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
 /* ---------- message row ---------- */
 
 function MessageRow({ message }: { message: ChatMessage }) {
+  const { t } = useI18n();
   if (message.role === "tool") {
     return (
       <div className="flex gap-2.5">
@@ -244,7 +248,7 @@ function MessageRow({ message }: { message: ChatMessage }) {
       </span>
       <div className="min-w-0 flex-1">
         <p className="mb-1 flex items-baseline gap-2">
-          <span className="text-[12px] font-semibold">{isUser ? "You" : "Assistant"}</span>
+          <span className="text-[12px] font-semibold">{isUser ? t("chat.you") : t("chat.assistant")}</span>
           <span className="text-[11px] text-muted-foreground">{message.createdAt}</span>
         </p>
          <div
@@ -258,7 +262,7 @@ function MessageRow({ message }: { message: ChatMessage }) {
            <Markdown content={message.content} />
            {message.status !== "completed" && message.status !== "pending" && (
              <span className="mt-1 block text-[11px] text-muted-foreground">
-               {message.status === "streaming" ? "streaming…" : message.status}
+               {message.status === "streaming" ? t("chat.streaming") : message.status}
              </span>
            )}
          </div>
@@ -281,6 +285,7 @@ function Composer({
   runtimeStatus: RuntimeStatus;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
+  const { t } = useI18n();
   const [highlight, setHighlight] = useState<{ raw: string; index: number } | null>(null);
   const [dismissedFor, setDismissedFor] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<{ raw: string; message: string } | null>(null);
@@ -348,7 +353,7 @@ function Composer({
               <ul
                 id="composer-suggestions"
                 role="listbox"
-                aria-label="Composer suggestions"
+                aria-label={t("chat.composerSuggestions")}
                 className="absolute inset-x-1 bottom-full z-20 mb-1 overflow-hidden rounded-md border border-border bg-popover text-popover-foreground shadow-md"
               >
                 {suggestions.map((suggestion, index) => {
@@ -417,8 +422,8 @@ function Composer({
                 }
               }}
               rows={1}
-              placeholder="Message OCG… (type / for Job commands)"
-              aria-label="Message OCG"
+              placeholder={t("chat.messagePlaceholder")}
+              aria-label={t("chat.messageLabel")}
               role="combobox"
               aria-autocomplete="list"
               aria-expanded={suggestionsOpen}
@@ -437,8 +442,8 @@ function Composer({
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label="Attach file (placeholder)"
-              title="Attach file (placeholder)"
+              aria-label={t("chat.attachFile")}
+              title={t("chat.attachFile")}
             >
               <Paperclip className="size-4" />
             </Button>
@@ -446,20 +451,20 @@ function Composer({
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label="Voice input (placeholder)"
-              title="Voice input (placeholder)"
+              aria-label={t("chat.voiceInput")}
+              title={t("chat.voiceInput")}
             >
               <Mic className="size-4" />
             </Button>
             <span className="ml-1 hidden text-[11px] text-muted-foreground sm:inline">
-              / for Job · Enter to send · Shift+Enter for newline
+              {t("chat.hint")}
             </span>
             <Button
               type="submit"
               size="icon-sm"
               disabled={!canSend}
-              aria-label="Send message"
-              title={chatReady ? "Send message" : `Chat unavailable: ${runtimeStatus.detail ?? "the runtime cannot execute chat"}`}
+              aria-label={t("chat.send")}
+              title={chatReady ? t("chat.send") : `${t("chat.unavailable")}: ${runtimeStatus.detail ?? t("chat.unavailableFallback")}`}
               className="ml-auto rounded-md"
             >
               <ArrowUp className="size-4" />
@@ -468,8 +473,8 @@ function Composer({
         </div>
         <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
           {chatReady
-            ? "Replies stream from the connected runtime."
-            : `Chat unavailable · ${runtimeStatus.detail ?? "the runtime cannot execute chat"}`}
+            ? t("chat.repliesStream")
+            : `${t("chat.unavailable")} · ${runtimeStatus.detail ?? t("chat.unavailableFallback")}`}
         </p>
       </form>
     </div>
@@ -503,6 +508,7 @@ export function ChatView({
   composerSurfaceKey,
 }: ChatViewProps) {
   const [draft, setDraft] = useState("");
+  const { t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -512,16 +518,15 @@ export function ChatView({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto" role="log" aria-label={`Conversation: ${session.title}`}>
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto" role="log" aria-label={t("chat.conversation", { title: session.title })}>
         {messages.length === 0 && !composerSurface ? (
           <div className="relative mx-auto flex h-full max-w-3xl flex-col items-center justify-center px-5 py-10 text-center">
-            <ActivityPulse className="size-20 opacity-80" label="OCG idle illustration" />
+            <ActivityPulse className="size-20 opacity-80" label={t("chat.idleIllustration")} />
             <h2 className="mt-5 text-[15px] font-semibold tracking-tight">
-              Start a new thread
+              {t("chat.newThread")}
             </h2>
             <p className="mt-1 max-w-md text-[13px] leading-6 text-muted-foreground">
-              This is the ChatView for <span className="font-medium text-foreground">{session.title}</span>.
-              Pick a suggestion or write below.
+              {t("chat.emptyPrefix")} <span className="font-medium text-foreground">{session.title}</span>{t("chat.emptySuffix")}
             </p>
             <div className="mt-4 flex w-full max-w-md flex-col gap-1.5">
               {SUGGESTIONS.map((s) => (
@@ -541,7 +546,7 @@ export function ChatView({
             {messages.length > 0 && (
               <div className="flex items-center gap-2 text-[11px] text-muted-foreground" aria-hidden="true">
                 <span className="h-px flex-1 bg-border" />
-                <span>Today</span>
+                <span>{t("chat.today")}</span>
                 <span className="h-px flex-1 bg-border" />
               </div>
             )}
@@ -558,13 +563,13 @@ export function ChatView({
                 <span>
                   {runtimeStatus.state === "connected" ? (
                     <>
-                      Runtime <span className="font-medium">ready</span>
+                      {t("chat.runtime")} <span className="font-medium">{t("chat.ready")}</span>
                       {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
                     </>
                   ) : (
                     <>
-                      Chat <span className="font-medium">unavailable</span>
-                      {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : " · configuration required"}
+                      {t("chat.chat")} <span className="font-medium">{t("chat.unavailableState")}</span>
+                      {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ` · ${t("chat.configRequired")}`}
                     </>
                   )}
                 </span>

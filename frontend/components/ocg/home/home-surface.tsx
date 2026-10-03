@@ -42,6 +42,7 @@ import {
 } from "@/components/ocg/primitives";
 import type { RuntimeSnapshot } from "../runtime/runtime-types";
 import type { WorkspaceView } from "../layout/view-domain";
+import { useI18n } from "../i18n";
 
 type HomeSurfaceProps = {
   snapshot: RuntimeSnapshot;
@@ -68,7 +69,8 @@ const SEVERITY_TONE: Record<AttentionItem["severity"], Tone> = {
   info: "sky",
 };
 
-const KIND_LABELS: Record<AttentionItem["kind"], string> = {
+/** English fallback retained for non-React callers; UI uses i18n keys. */
+export const HOME_KIND_LABELS: Record<AttentionItem["kind"], string> = {
   approvalRequired: "Approval",
   budgetGate: "Budget gate",
   blockedTask: "Blocked task",
@@ -80,12 +82,13 @@ const KIND_LABELS: Record<AttentionItem["kind"], string> = {
   degradedResource: "Degraded resource",
 };
 
-const STATUS_LABELS: Record<ActiveJobProjection["status"], string> = {
+export const HOME_STATUS_LABELS: Record<ActiveJobProjection["status"], string> = {
   running: "Running",
   pending: "Pending",
 };
 
 export function HomeSurface(props: HomeSurfaceProps) {
+  const { t } = useI18n();
   const { snapshot } = props;
   const attention = useMemo(() => selectHomeAttention(snapshot), [snapshot]);
   const jobs = useMemo(() => selectHomeActiveJobs(snapshot), [snapshot]);
@@ -100,17 +103,17 @@ export function HomeSurface(props: HomeSurfaceProps) {
         {/* Hero entry */}
         <section className="flex items-start justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="text-[22px] font-semibold tracking-tight">Welcome back</h1>
+            <h1 className="text-[22px] font-semibold tracking-tight">{t("home.welcome")}</h1>
             <p className="mt-1 text-sm text-muted-foreground">
               {attention.length > 0
-                ? `${attention.length} item${attention.length > 1 ? "s" : ""} need${attention.length > 1 ? "" : "s"} your attention`
-                : "Everything looks operational"}
-              {resourceHealth.hasDegradedOrAuthRequired ? " — some resources need review" : ""}
+                ? t(attention.length === 1 ? "home.attention.one" : "home.attention.other", { count: attention.length })
+                : t("home.healthy")}
+              {resourceHealth.hasDegradedOrAuthRequired ? t("home.resourcesNeedReview") : ""}
             </p>
           </div>
           <Button variant="default" size="sm" onClick={() => props.onNavigate("chat")} className="shrink-0">
             <Sparkles className="mr-1.5 size-3.5" />
-            Start with OCG
+            {t("home.start")}
           </Button>
         </section>
 
@@ -148,13 +151,34 @@ function AttentionSection({
   items: AttentionItem[];
   onNavigate: (view: WorkspaceView) => void;
 }) {
+  const { t } = useI18n();
+  const kindLabel = (kind: AttentionItem["kind"]) =>
+    t(
+      kind === "approvalRequired"
+        ? "home.kind.approval"
+        : kind === "budgetGate"
+          ? "home.kind.budget"
+          : kind === "blockedTask"
+            ? "home.kind.blocked"
+            : kind === "providerUnavailable"
+              ? "home.kind.provider"
+              : kind === "runtimeFailure"
+                ? "home.kind.runtime"
+                : kind === "verificationFailure"
+                  ? "home.kind.verification"
+                  : kind === "configurationIssue"
+                    ? "home.kind.configuration"
+                    : kind === "authenticationRequired"
+                      ? "home.kind.authentication"
+                      : "home.kind.degraded",
+    );
   if (items.length === 0) {
     return (
-      <section aria-label="Attention">
+      <section aria-label={t("attention.title")}>
         <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/20 px-4 py-3">
           <ShieldCheck className="size-4 text-emerald-500" aria-hidden="true" />
-          <span className="text-sm font-medium">No action required</span>
-          <span className="ml-auto text-xs text-muted-foreground">Workspace is healthy</span>
+          <span className="text-sm font-medium">{t("home.noAction")}</span>
+          <span className="ml-auto text-xs text-muted-foreground">{t("home.workspaceHealthy")}</span>
         </div>
       </section>
     );
@@ -163,8 +187,8 @@ function AttentionSection({
   return (
     <section aria-label="Attention items">
       <SectionHeading
-        title="Attention"
-        action={<Button variant="ghost" size="xs" onClick={() => onNavigate("attention")}>View all <ArrowRight className="ml-1 size-3" /></Button>}
+        title={t("home.attentionTitle")}
+        action={<Button variant="ghost" size="xs" onClick={() => onNavigate("attention")}>{t("home.viewAll")} <ArrowRight className="ml-1 size-3" /></Button>}
       />
       <div className="flex flex-col gap-2">
         {items.map((item) => {
@@ -185,7 +209,7 @@ function AttentionSection({
                 <div className="flex items-center gap-2">
                   <span className="text-[13px] font-semibold">{item.title}</span>
                   <span className={cn("rounded-full px-1.5 py-0.5 text-[10px] font-medium", SURFACE_TONE[tone], TEXT_TONE[tone])}>
-                    {KIND_LABELS[item.kind]}
+                    {kindLabel(item.kind)}
                   </span>
                 </div>
                 <p className="mt-0.5 text-[12px] text-muted-foreground">{item.summary}</p>
@@ -209,12 +233,13 @@ function ActiveJobsSection({
   jobs: ActiveJobProjection[];
   onNavigate: (view: WorkspaceView) => void;
 }) {
+  const { t } = useI18n();
   const openJobExecution = () => onNavigate("job-execution");
   if (jobs.length === 0) {
     return (
       <section aria-label="Active jobs">
-        <SectionHeading title="Active Jobs" />
-        <EmptyPanel icon={Rocket} title="No active jobs" hint="Start a Job to see it here" className="mt-2" />
+        <SectionHeading title={t("home.activeJobs")} />
+        <EmptyPanel icon={Rocket} title={t("home.noActiveJobs")} hint={t("home.startJobHint")} className="mt-2" />
       </section>
     );
   }
@@ -222,8 +247,8 @@ function ActiveJobsSection({
   return (
     <section aria-label="Active jobs">
       <SectionHeading
-        title="Active Jobs"
-        action={<Button variant="ghost" size="xs" onClick={openJobExecution}>Job Execution <ArrowRight className="ml-1 size-3" /></Button>}
+        title={t("home.activeJobs")}
+        action={<Button variant="ghost" size="xs" onClick={openJobExecution}>{t("home.jobExecution")} <ArrowRight className="ml-1 size-3" /></Button>}
       />
       <div className="flex flex-col gap-2">
         {jobs.map((job) => (
@@ -235,7 +260,8 @@ function ActiveJobsSection({
 }
 
 function JobCard({ job, onClick }: { job: ActiveJobProjection; onClick: () => void }) {
-  const statusLabel = STATUS_LABELS[job.status] ?? job.status;
+  const { t } = useI18n();
+  const statusLabel = t(job.status === "running" ? "home.status.running" : "home.status.pending");
   const waveInfo = job.currentWave && job.totalWaves ? `Wave ${job.currentWave}/${job.totalWaves}` : null;
   const budgetText = job.budgetSpent !== undefined && job.budgetLimit ? `$${job.budgetSpent.toFixed(2)} / $${job.budgetLimit.toFixed(2)}` : null;
 
@@ -277,11 +303,12 @@ function JobCard({ job, onClick }: { job: ActiveJobProjection; onClick: () => vo
 // ---------------------------------------------------------------------------
 
 function ContinueWorkingSection({ entries, onSelectSession }: { entries: ContinueWorkingEntry[]; onSelectSession: (sessionId: string) => void }) {
+  const { t } = useI18n();
   if (entries.length === 0) return null;
 
   return (
     <section aria-label="Continue working">
-      <SectionHeading title="Continue Working" />
+      <SectionHeading title={t("home.continueWorking")} />
       <div className="flex flex-col gap-1">
         {entries.map((entry) => (
           <button
@@ -322,11 +349,12 @@ function ResourceHealthSection({
   health: ResourceHealthSummary;
   onNavigate: (view: WorkspaceView) => void;
 }) {
+  const { t } = useI18n();
   return (
     <section aria-label="Resource health">
       <SectionHeading
-        title="Resources"
-        action={<Button variant="ghost" size="xs" onClick={() => onNavigate("control-center")}>Details <ArrowRight className="ml-1 size-3" /></Button>}
+        title={t("home.resources")}
+        action={<Button variant="ghost" size="xs" onClick={() => onNavigate("control-center")}>{t("common.details")} <ArrowRight className="ml-1 size-3" /></Button>}
       />
       <div className="mt-2 space-y-2.5 rounded-lg border border-border bg-card p-3">
         <div className="flex items-center justify-between">
@@ -353,11 +381,11 @@ function ResourceHealthSection({
         )}
         <div className="mt-1 h-px bg-border" aria-hidden="true" />
         <div className="flex items-center justify-between">
-          <span className="text-[12px] text-muted-foreground">Active profile</span>
+          <span className="text-[12px] text-muted-foreground">{t("home.activeProfile")}</span>
           <span className="text-[12px] font-medium">{health.activeProfileLabel}</span>
         </div>
         <div className="flex items-center justify-between">
-          <span className="text-[12px] text-muted-foreground">Models</span>
+          <span className="text-[12px] text-muted-foreground">{t("home.models")}</span>
           <span className="text-[12px] font-medium">{health.availableModels} / {health.modelCount} available</span>
         </div>
       </div>
@@ -376,36 +404,37 @@ function UsageSummarySection({
   usage: UsageSummary;
   onNavigate: (view: WorkspaceView) => void;
 }) {
+  const { t } = useI18n();
   return (
     <section aria-label="Usage snapshot">
       <SectionHeading
-        title="Usage"
-        action={<Button variant="ghost" size="xs" onClick={() => onNavigate("ledger")}>Ledger <ArrowRight className="ml-1 size-3" /></Button>}
+        title={t("home.usage")}
+        action={<Button variant="ghost" size="xs" onClick={() => onNavigate("ledger")}>{t("ledger.title")} <ArrowRight className="ml-1 size-3" /></Button>}
       />
       <div className="mt-2 space-y-2.5 rounded-lg border border-border bg-card p-3">
         {usage.available ? (
           <>
             <div className="flex items-center justify-between">
-              <span className="text-[12px] text-muted-foreground">Cost</span>
+              <span className="text-[12px] text-muted-foreground">{t("home.cost")}</span>
               <span className="text-[12px] font-medium">{formatCostMicros(usage.costMicros)}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-[12px] text-muted-foreground">Tokens</span>
+              <span className="text-[12px] text-muted-foreground">{t("home.tokens")}</span>
               <span className="text-[12px] font-medium tabular-nums">{formatTokens(usage.totalTokens)}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-[12px] text-muted-foreground">Cache read</span>
+              <span className="text-[12px] text-muted-foreground">{t("home.cacheRead")}</span>
               <span className="text-[12px] font-medium tabular-nums">{formatTokens(usage.cacheRead)}</span>
             </div>
             {usage.cacheShare !== null && (
               <div className="flex items-center justify-between">
-                <span className="text-[12px] text-muted-foreground">Cache share</span>
+                <span className="text-[12px] text-muted-foreground">{t("home.cacheShare")}</span>
                 <span className="text-[12px] font-medium tabular-nums">{formatPercent(usage.cacheShare)}</span>
               </div>
             )}
             {usage.cacheLeverage !== null && (
               <div className="flex items-center justify-between">
-                <span className="text-[12px] text-muted-foreground">Cache leverage</span>
+                <span className="text-[12px] text-muted-foreground">{t("home.cacheLeverage")}</span>
                 <span className="text-[12px] font-medium tabular-nums">{formatPercent(usage.cacheLeverage)}</span>
               </div>
             )}
@@ -417,7 +446,7 @@ function UsageSummarySection({
           </>
         ) : (
           <div className="flex items-center justify-center py-2 text-[12px] text-muted-foreground">
-            <Database className="mr-1.5 size-3" /> No resource ledger data available
+            <Database className="mr-1.5 size-3" /> {t("home.noLedger")}
           </div>
         )}
       </div>
@@ -430,18 +459,19 @@ function UsageSummarySection({
 // ---------------------------------------------------------------------------
 
 function RecentActivitySection({ items }: { items: RecentActivityItem[] }) {
+  const { t } = useI18n();
   if (items.length === 0) {
     return (
       <section aria-label="Recent activity">
-        <SectionHeading title="Recent Activity" />
-        <EmptyPanel icon={Clock3} title="No recent activity to report" />
+        <SectionHeading title={t("home.recentActivity")} />
+        <EmptyPanel icon={Clock3} title={t("home.noActivity")} />
       </section>
     );
   }
 
   return (
     <section aria-label="Recent activity">
-      <SectionHeading title="Recent Activity" />
+      <SectionHeading title={t("home.recentActivity")} />
       <div className="flex flex-col gap-1">
         {items.map((item) => (
           <div key={item.id} className="flex items-start gap-3 rounded-md px-3 py-2">

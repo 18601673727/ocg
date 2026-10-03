@@ -39,6 +39,7 @@ import {
   selectModelProvider,
   selectProviders,
 } from "./domain";
+import { useI18n } from "../i18n";
 function ModelListRow({
   bootstrap,
   model,
@@ -234,6 +235,7 @@ export function ModelsView({
     [assignedModelIds, assignmentFilter, bootstrap.models, capabilityFilter, providerFilter, query, statusFilter],
   );
   const selected = filtered.find((model) => model.id === selectedModelId) ?? filtered[0] ?? null;
+  const { t } = useI18n();
 
   return (
     <div className="flex min-w-0 flex-col gap-2">
@@ -244,8 +246,8 @@ export function ModelsView({
             type="search"
             value={query}
             onChange={(event) => onQueryChange(event.target.value)}
-            placeholder="Search models, providers, variants…"
-            aria-label="Search models"
+            placeholder={t("control.searchModels")}
+            aria-label={t("control.searchModels")}
             className="h-5 w-full min-w-0 bg-transparent text-[11px] outline-none placeholder:text-muted-foreground"
           />
         </label>
@@ -299,10 +301,10 @@ export function ModelsView({
       </div>
 
       <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(240px,360px)_minmax(0,1fr)]">
-        <section aria-label="Models" className="min-w-0">
+        <section aria-label={t("control.models")} className="min-w-0">
           <SectionTitle detail="same name on different providers stays distinct">Dense model list</SectionTitle>
           {filtered.length === 0 ? (
-            <EmptyState>No model matches the current search and provider filter.</EmptyState>
+            <EmptyState>{t("control.noModelMatch")}</EmptyState>
           ) : (
             <ul className="flex flex-col gap-1">
               {filtered.map((model) => (
@@ -321,7 +323,7 @@ export function ModelsView({
           {selected ? (
             <ModelDetail bootstrap={bootstrap} model={selected} />
           ) : (
-            <EmptyState className="py-4">Select a model to inspect its full identity and capability support.</EmptyState>
+            <EmptyState className="py-4">{t("control.selectModel")}</EmptyState>
           )}
         </section>
       </div>

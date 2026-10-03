@@ -4,12 +4,18 @@ import { useId } from "react";
 import { RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { FilterOption, LedgerFilter, LedgerFilterOptions, TimeWindow } from "./types";
-import { ALL_FILTER_VALUE, TIME_WINDOWS, TIME_WINDOW_LABEL } from "./types";
+import { ALL_FILTER_VALUE, TIME_WINDOWS } from "./types";
+import { useI18n, type I18nKey } from "../i18n";
 
-const TIME_WINDOW_OPTIONS: FilterOption[] = TIME_WINDOWS.map((window) => ({
-  value: window,
-  label: TIME_WINDOW_LABEL[window],
-}));
+const TIME_WINDOW_KEY: Record<TimeWindow, I18nKey> = {
+  all: "ledger.filter.allTime",
+  today: "ledger.window.today",
+  last15m: "ledger.window.last15m",
+  last1h: "ledger.window.last1h",
+  last6h: "ledger.window.last6h",
+  last24h: "ledger.window.last24h",
+  last7d: "ledger.window.last7d",
+};
 
 function FilterSelect({
   label,
@@ -67,42 +73,47 @@ export function LedgerFilters({
   onChange,
   onReset,
 }: LedgerFiltersProps) {
+  const { t } = useI18n();
+  const timeWindowOptions: FilterOption[] = TIME_WINDOWS.map((window) => ({
+    value: window,
+    label: t(TIME_WINDOW_KEY[window]),
+  }));
   return (
-    <section aria-label="Ledger filters" className="border-b border-border px-3 py-2">
+    <section aria-label={t("ledger.filters")} className="border-b border-border px-3 py-2">
       <div className="flex flex-wrap items-end gap-x-2 gap-y-1.5">
         <FilterSelect
-          label="Window"
+          label={t("ledger.filter.window")}
           value={filter.window}
-          options={TIME_WINDOW_OPTIONS}
-          allLabel="All time"
+          options={timeWindowOptions}
+          allLabel={t("ledger.filter.allTime")}
           onChange={(window) => onChange({ ...filter, window: window as TimeWindow })}
         />
         <FilterSelect
-          label="Job"
+          label={t("ledger.filter.job")}
           value={filter.jobId}
           options={options.jobs}
-          allLabel="All jobs"
+          allLabel={t("ledger.filter.allJobs")}
           onChange={(jobId) => onChange({ ...filter, jobId })}
         />
         <FilterSelect
-          label="Worker"
+          label={t("ledger.filter.worker")}
           value={filter.workerId}
           options={options.workers}
-          allLabel="All workers"
+          allLabel={t("ledger.filter.allWorkers")}
           onChange={(workerId) => onChange({ ...filter, workerId })}
         />
         <FilterSelect
-          label="Provider"
+          label={t("ledger.filter.provider")}
           value={filter.provider}
           options={options.providers}
-          allLabel="All providers"
+          allLabel={t("ledger.filter.allProviders")}
           onChange={(provider) => onChange({ ...filter, provider })}
         />
         <FilterSelect
-          label="Model"
+          label={t("ledger.filter.model")}
           value={filter.modelKey}
           options={options.models}
-          allLabel="All models"
+          allLabel={t("ledger.filter.allModels")}
           onChange={(modelKey) => onChange({ ...filter, modelKey })}
         />
         <Button
@@ -111,13 +122,13 @@ export function LedgerFilters({
           size="xs"
           disabled={!active}
           onClick={onReset}
-          title="Reset all ledger filters"
+          title={t("ledger.reset")}
         >
           <RotateCcw className="size-3" data-icon="inline-start" aria-hidden />
-          Reset
+          {t("common.reset")}
         </Button>
         <span className="ml-auto shrink-0 self-end pb-1 text-[10px] tabular-nums text-muted-foreground">
-          {resultCount} / {totalCount} calls
+          {t("ledger.filter.count", { result: resultCount, total: totalCount })}
         </span>
       </div>
     </section>
