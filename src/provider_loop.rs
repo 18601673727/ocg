@@ -20,7 +20,8 @@ use crate::orchestration::domain::{
     EffectIntentState,
 };
 use crate::orchestration::execution_dispatch::{
-    admit_call, BoundedDispatcher, CallCancellation, ExecutionEnvelope, ExecutionEvent,
+    admit_call_with_cancellation, BoundedDispatcher, CallCancellation, ExecutionEnvelope,
+    ExecutionEvent,
 };
 use crate::provider_protocol::ProviderProtocol;
 use serde_json::{json, Value};
@@ -1277,9 +1278,7 @@ async fn execute_provider_loop(
     .await?;
 
     for round in 0..MAX_PROVIDER_ROUNDS {
-        if shutdown.load(Ordering::SeqCst) || envelope.cancelled.is_cancelled() {
-            return Err(OcgError::config("provider loop cancelled"));
-        }
+        ensure_provider_active(project_root, envelope, shutdown)?;
         if let Some(tools) = request.get("tools").and_then(Value::as_array) {
             if tools.is_empty() {
                 request.as_object_mut().and_then(|obj| obj.remove("tools"));
@@ -1287,6 +1286,7 @@ async fn execute_provider_loop(
         }
 
         let round_response = provider.complete(request).await?;
+        ensure_provider_active(project_root, envelope, shutdown)?;
 
         if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
             return Err(OcgError::config("provider exceeded token limit"));
@@ -1306,6 +1306,7 @@ async fn execute_provider_loop(
             .ok_or_else(|| OcgError::config("provider request messages are missing"))?
             .push(round_response.assistant);
         for call in &round_response.summary.tool_calls {
+            ensure_provider_active(project_root, envelope, shutdown)?;
             // A tool call is admitted, executed and completed as a canonical
             // Call. That authority is unchanged here; what changes is what
             // happens when the Runtime can already tell the Call is invalid.
@@ -1336,13 +1337,14 @@ async fn execute_provider_loop(
                     let mut domain = DomainRepository::open(project_root)?;
                     let side_effect = permission != crate::native_tools::PermissionClass::ReadOnly;
 
-                    let tool_call = admit_call(
+                    let tool_call = admit_call_with_cancellation(
                         &mut domain,
                         authority,
                         executor_id,
                         side_effect,
                         &payload.to_string(),
                         native_tool_dispatcher,
+                        envelope.cancelled.clone(),
                     )?;
 
                     drop(domain);
@@ -1350,8 +1352,10 @@ async fn execute_provider_loop(
                     // Wait for child Call completion by polling (blocking is
                     // acceptable here because provider and native tool use
                     // separate dispatchers).
-                    let result = wait_for_call_completion(project_root, &tool_call.id)?;
+                    let result =
+                        wait_for_call_completion(project_root, &tool_call.id, envelope, shutdown)?;
 
+                    ensure_provider_active(project_root, envelope, shutdown)?;
                     push_tool_message(request, call, result)?;
                 }
                 ResolvedCall::Rejected(content) => {
@@ -1692,6 +1696,27 @@ fn push_tool_message(request: &mut Value, call: &CompletedToolCall, content: Str
     Ok(())
 }
 
+fn ensure_provider_active(
+    project_root: &Path,
+    envelope: &ExecutionEnvelope,
+    shutdown: &AtomicBool,
+) -> Result<()> {
+    if shutdown.load(Ordering::SeqCst) || envelope.cancelled.is_cancelled() {
+        return Err(OcgError::config("provider loop cancelled"));
+    }
+    let domain = DomainRepository::open(project_root)?;
+    if domain
+        .authority(&envelope.attempt_id)?
+        .is_none_or(|authority| {
+            authority.job_id != envelope.job_id || authority.generation != envelope.generation
+        })
+        || domain.call(&envelope.call_id)?.state != "running"
+    {
+        return Err(OcgError::config("provider Call no longer authoritative"));
+    }
+    Ok(())
+}
+
 /// Poll for Call completion. This blocks the provider handler but does not
 /// block the native tool consumer since they use separate dispatchers.
 ///
@@ -1699,9 +1724,14 @@ fn push_tool_message(request: &mut Value, call: &CompletedToolCall, content: Str
 /// error. A tool that failed — a stale revision, an ambiguous target, a denied
 /// permission — is a fact the model needs to correct, and raising it aborted the
 /// entire provider Call, discarding the round and every fact in it.
-fn wait_for_call_completion(project_root: &Path, call_id: &str) -> Result<String> {
+fn wait_for_call_completion(
+    project_root: &Path,
+    call_id: &str,
+    envelope: &ExecutionEnvelope,
+    shutdown: &AtomicBool,
+) -> Result<String> {
     for _ in 0..600 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        ensure_provider_active(project_root, envelope, shutdown)?;
         let domain = DomainRepository::open(project_root)?;
         let call = domain.call(call_id)?;
         match call.state.as_str() {
@@ -1725,7 +1755,7 @@ fn wait_for_call_completion(project_root: &Path, call_id: &str) -> Result<String
                 })
                 .to_string())
             }
-            _ => continue,
+            _ => envelope.cancelled.wait_timeout(std::time::Duration::from_millis(100)),
         }
     }
     Err(OcgError::config("native tool Call timeout"))

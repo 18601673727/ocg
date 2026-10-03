@@ -383,7 +383,20 @@ pub trait CaptureRunner: Send + Sync {
         max_bytes: usize,
         cancelled: &AtomicBool,
     ) -> Result<CapturedOutput> {
-        if cancelled.load(Ordering::SeqCst) {
+        self.run_with_cancellation(program, args, cwd, max_bytes, &|| {
+            cancelled.load(Ordering::SeqCst)
+        })
+    }
+
+    fn run_with_cancellation(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        max_bytes: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<CapturedOutput> {
+        if cancelled() {
             return Ok(CapturedOutput {
                 exit: ProcessExit::Unknown,
                 success: false,
@@ -395,7 +408,7 @@ pub trait CaptureRunner: Send + Sync {
             });
         }
         let output = self.run(program, args, cwd, max_bytes)?;
-        if cancelled.load(Ordering::SeqCst) {
+        if cancelled() {
             return Ok(CapturedOutput {
                 exit: ProcessExit::Unknown,
                 success: false,
@@ -479,14 +492,25 @@ impl CaptureRunner for SystemCaptureRunner {
         })
     }
 
-    fn run_cancellable(
+    fn run_with_cancellation(
         &self,
         program: &str,
         args: &[String],
         cwd: &Path,
         max_bytes: usize,
-        cancelled: &AtomicBool,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<CapturedOutput> {
+        if cancelled() {
+            return Ok(CapturedOutput {
+                exit: ProcessExit::Unknown,
+                success: false,
+                stdout: Vec::new(),
+                stderr: b"cancelled".to_vec(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration_ms: 0,
+            });
+        }
         let max_bytes = max_bytes.max(1);
         let start = Instant::now();
         let mut child = Command::new(program)
@@ -506,10 +530,18 @@ impl CaptureRunner for SystemCaptureRunner {
             .take()
             .map(|stderr| thread::spawn(move || read_drain_bounded(stderr, max_bytes)));
         let mut cancelled_child = false;
+        let mut kill_error_reported = false;
         loop {
-            if cancelled.load(Ordering::SeqCst) && !cancelled_child {
-                cancelled_child = true;
-                let _ = child.kill();
+            if cancelled() && !cancelled_child {
+                match child.kill() {
+                    Ok(()) => cancelled_child = true,
+                    Err(error) => {
+                        if !kill_error_reported {
+                            tracing::warn!(%error, program, "cannot kill cancelled child process; retrying until it exits");
+                            kill_error_reported = true;
+                        }
+                    }
+                }
             }
             if child.try_wait().map_err(|error| OcgError::io(format!("cannot poll {program}"), error))?.is_some() {
                 break;

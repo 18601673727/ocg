@@ -535,6 +535,19 @@ impl NativeToolExecutor {
         policy: PermissionPolicy,
         cancelled: &AtomicBool,
     ) -> ToolResult {
+        self.execute_cancellable(name, arguments, permission, policy, &|| {
+            cancelled.load(Ordering::SeqCst)
+        })
+    }
+
+    fn execute_cancellable(
+        &self,
+        name: &str,
+        arguments: &Value,
+        permission: PermissionClass,
+        policy: PermissionPolicy,
+        cancelled: &dyn Fn() -> bool,
+    ) -> ToolResult {
         let Some(definition) = NativeToolRegistry::get(name) else {
             return ToolResult::failure(ToolError::new(
                 ToolErrorKind::InvalidInput,
@@ -556,7 +569,7 @@ impl NativeToolExecutor {
                 ),
             ));
         }
-        if cancelled.load(Ordering::SeqCst) {
+        if cancelled() {
             return ToolResult::failure(ToolError::new(
                 ToolErrorKind::Cancelled,
                 "Attempt was cancelled before tool execution",
@@ -570,11 +583,17 @@ impl NativeToolExecutor {
         }
         let result = match definition.executor {
             NativeToolExecutorBinding::FilesystemRead => self.read(arguments),
-            NativeToolExecutorBinding::FilesystemList => self.list(arguments),
+            NativeToolExecutorBinding::FilesystemList => self.list(arguments, cancelled),
             NativeToolExecutorBinding::FilesystemSearch => self.search(arguments, cancelled),
             NativeToolExecutorBinding::FilesystemEdit => self.edit(arguments, cancelled),
             NativeToolExecutorBinding::ProcessExec => self.exec(arguments, cancelled),
         };
+        if cancelled() {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::Cancelled,
+                "Attempt was cancelled during tool execution",
+            ));
+        }
         result.bounded()
     }
 
@@ -647,7 +666,7 @@ impl NativeToolExecutor {
         }
     }
 
-    fn list(&self, arguments: &Value) -> ToolResult {
+    fn list(&self, arguments: &Value, cancelled: &dyn Fn() -> bool) -> ToolResult {
         let raw = match arguments.get("path").and_then(Value::as_str) {
             Some(raw) => raw,
             None => {
@@ -679,6 +698,12 @@ impl NativeToolExecutor {
         };
         let mut truncated = false;
         for entry in iterator {
+            if cancelled() {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::Cancelled,
+                    "Attempt was cancelled during filesystem.list",
+                ));
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -734,7 +759,7 @@ impl NativeToolExecutor {
         }
     }
 
-    fn search(&self, arguments: &Value, cancelled: &AtomicBool) -> ToolResult {
+    fn search(&self, arguments: &Value, cancelled: &dyn Fn() -> bool) -> ToolResult {
         let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
         if query.is_empty() {
             return ToolResult::failure(ToolError::new(
@@ -765,7 +790,7 @@ impl NativeToolExecutor {
         let output =
             match self
                 .runner
-                .run_cancellable("rg", &args, &cwd, TOOL_OUTPUT_CAP, cancelled)
+                .run_with_cancellation("rg", &args, &cwd, TOOL_OUTPUT_CAP, cancelled)
             {
                 Ok(output) => output,
                 Err(error) => {
@@ -784,7 +809,7 @@ impl NativeToolExecutor {
             }
         }
         let truncated = output.truncated() || stdout_truncated || stderr_truncated;
-        if cancelled.load(Ordering::SeqCst) {
+        if cancelled() {
             return ToolResult::failure(ToolError::new(
                 ToolErrorKind::Cancelled,
                 "Attempt was cancelled during search",
@@ -808,7 +833,7 @@ impl NativeToolExecutor {
         }
     }
 
-    fn edit(&self, arguments: &Value, cancelled: &AtomicBool) -> ToolResult {
+    fn edit(&self, arguments: &Value, cancelled: &dyn Fn() -> bool) -> ToolResult {
         let file = match arguments.get("file").and_then(Value::as_str) {
             Some(file) => file,
             None => {
@@ -830,7 +855,7 @@ impl NativeToolExecutor {
                 ))
             }
         };
-        if cancelled.load(Ordering::SeqCst) {
+        if cancelled() {
             return ToolResult::failure(ToolError::new(
                 ToolErrorKind::Cancelled,
                 "Attempt was cancelled before filesystem.edit persistence",
@@ -847,7 +872,7 @@ impl NativeToolExecutor {
         }
     }
 
-    fn exec(&self, arguments: &Value, cancelled: &AtomicBool) -> ToolResult {
+    fn exec(&self, arguments: &Value, cancelled: &dyn Fn() -> bool) -> ToolResult {
         let program = match arguments.get("program").and_then(Value::as_str) {
             Some(program) if !program.is_empty() => program,
             _ => {
@@ -889,7 +914,7 @@ impl NativeToolExecutor {
         let output =
             match self
                 .runner
-                .run_cancellable(program, &args, &cwd, TOOL_OUTPUT_CAP, cancelled)
+                .run_with_cancellation(program, &args, &cwd, TOOL_OUTPUT_CAP, cancelled)
             {
                 Ok(output) => output,
                 Err(error) => {
@@ -899,7 +924,7 @@ impl NativeToolExecutor {
                     ))
                 }
             };
-        if cancelled.load(Ordering::SeqCst) {
+        if cancelled() {
             return ToolResult::failure(ToolError::new(
                 ToolErrorKind::Cancelled,
                 "Attempt was cancelled during process execution",
@@ -1082,19 +1107,19 @@ pub fn tool_permission_for(name: &str) -> Option<PermissionClass> {
 pub struct NativeToolCallHandler {
     project_root: PathBuf,
     permission_policy: PermissionPolicy,
-    cancelled: Arc<AtomicBool>,
+    runtime_shutdown: Arc<AtomicBool>,
 }
 
 impl NativeToolCallHandler {
     pub fn new(
         project_root: PathBuf,
         permission_policy: PermissionPolicy,
-        cancelled: Arc<AtomicBool>,
+        runtime_shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
             project_root,
             permission_policy,
-            cancelled,
+            runtime_shutdown,
         }
     }
 
@@ -1102,7 +1127,10 @@ impl NativeToolCallHandler {
         &self,
         envelope: crate::orchestration::execution_dispatch::ExecutionEnvelope,
     ) -> Result<serde_json::Value> {
-        if self.cancelled.load(Ordering::SeqCst) {
+        let cancelled = || {
+            self.runtime_shutdown.load(Ordering::SeqCst) || envelope.cancelled.is_cancelled()
+        };
+        if cancelled() {
             return Err(OcgError::config("cancelled before native tool execution"));
         }
 
@@ -1140,12 +1168,12 @@ impl NativeToolCallHandler {
         drop(domain);
 
         let executor = NativeToolExecutor::new(&self.project_root)?;
-        let result = executor.execute(
+        let result = executor.execute_cancellable(
             name,
             &arguments,
             permission,
             self.permission_policy,
-            &self.cancelled,
+            &cancelled,
         );
 
         let mut domain = DomainRepository::open(&self.project_root)?;

@@ -27,8 +27,8 @@ pub struct ExecutionEnvelope {
 
 /// Cancellation for one dispatched Call.
 ///
-/// The flag is the authority every existing poller reads, so nothing about who
-/// may still act changes. The channel is what lets a future that is *parked* be
+/// The flag is a control signal; durable Attempt/Call fencing remains the
+/// authority to act. The channel is what lets a future that is *parked* be
 /// woken: a provider socket read waiting for bytes that may never arrive cannot
 /// observe a flag, so without a wakeup, cancelling a turn would have to wait for
 /// the upstream to send another chunk. Cancelling sets the flag and posts on the
@@ -71,8 +71,7 @@ impl CallCancellation {
         self.inner.flag.load(Ordering::SeqCst)
     }
 
-    /// Cancel the Call and wake anything waiting on it. Idempotent: the flag is
-    /// the authority and the bounded post is best effort.
+    /// Cancel the Call and wake anything waiting on it. Idempotent across clones.
     pub fn cancel(&self) {
         self.inner.flag.store(true, Ordering::SeqCst);
         // Closing the channel wakes every waiter without consuming a wakeup.
@@ -95,6 +94,15 @@ impl CallCancellation {
         }
         match self.inner.wake.recv_async().await {
             Ok(()) | Err(flume::RecvError::Disconnected) => {}
+        }
+    }
+
+    pub fn wait_timeout(&self, timeout: std::time::Duration) {
+        if !self.is_cancelled() {
+            match self.inner.wake.recv_timeout(timeout) {
+                Ok(())
+                | Err(flume::RecvTimeoutError::Disconnected | flume::RecvTimeoutError::Timeout) => {}
+            }
         }
     }
 }
@@ -156,6 +164,50 @@ pub fn admit_call_with_events(
     crate::orchestration::domain::Call,
     flume::Receiver<ExecutionEvent>,
 )> {
+    admit_call_with_cancellation_and_events(
+        domain,
+        authority,
+        executor_id,
+        side_effect,
+        request,
+        dispatcher,
+        CallCancellation::new(),
+    )
+}
+
+pub(crate) fn admit_call_with_cancellation(
+    domain: &mut crate::orchestration::domain::DomainRepository,
+    authority: &crate::orchestration::domain::AttemptAuthority,
+    executor_id: &str,
+    side_effect: bool,
+    request: &str,
+    dispatcher: &BoundedDispatcher,
+    cancelled: CallCancellation,
+) -> Result<crate::orchestration::domain::Call> {
+    let (call, _events) = admit_call_with_cancellation_and_events(
+        domain,
+        authority,
+        executor_id,
+        side_effect,
+        request,
+        dispatcher,
+        cancelled,
+    )?;
+    Ok(call)
+}
+
+fn admit_call_with_cancellation_and_events(
+    domain: &mut crate::orchestration::domain::DomainRepository,
+    authority: &crate::orchestration::domain::AttemptAuthority,
+    executor_id: &str,
+    side_effect: bool,
+    request: &str,
+    dispatcher: &BoundedDispatcher,
+    cancelled: CallCancellation,
+) -> Result<(
+    crate::orchestration::domain::Call,
+    flume::Receiver<ExecutionEvent>,
+)> {
     let input: serde_json::Value = serde_json::from_str(request)
         .map_err(|error| invalid(&format!("invalid Call input JSON: {error}")))?;
     crate::orchestration::call_schema::validate_input(&input)?;
@@ -182,7 +234,7 @@ pub fn admit_call_with_events(
         dispatch_id: None,
         events,
         provider_config: None,
-        cancelled: CallCancellation::new(),
+        cancelled,
     }) {
         let _ = domain.finish_dispatch_intent(
             &call.id,
