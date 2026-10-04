@@ -45,7 +45,7 @@ function OwnershipBadge({ setting }: { setting: NormalizedSetting }) {
   const backend = isBackendOwned(setting);
   const browserOnly = setting.ownership === "frontend-only";
   return (
-    <Pill tone={backend ? "sky" : browserOnly ? "violet" : "slate"} className="text-[9px] normal-case">
+    <Pill tone={backend ? "sky" : browserOnly ? "violet" : "slate"} className="text-[11px] normal-case">
       {backend ? <ShieldCheck className="size-2.5" /> : null}
       {backend ? t("common.runtimeOwned") : browserOnly ? t("common.browserOnly") : t("common.effective")}
     </Pill>
@@ -64,9 +64,9 @@ function ChoiceGroup<T extends string>({
   onChange: (value: T) => void;
 }) {
   return (
-    <div className="mt-2 flex flex-wrap gap-1" role="group" aria-label={label}>
+    <div className="flex flex-wrap gap-2" role="group" aria-label={label}>
       {options.map((option) => (
-        <button key={option.value} type="button" aria-pressed={value === option.value} onClick={() => onChange(option.value)} className={cn("rounded-md border px-2 py-1 text-[10px] capitalize transition-colors", value === option.value ? "border-foreground/30 bg-muted font-medium text-foreground" : "border-border text-muted-foreground hover:bg-muted/50 hover:text-foreground")}>
+        <button key={option.value} type="button" aria-pressed={value === option.value} onClick={() => onChange(option.value)} className={cn("min-h-11 rounded-md border px-3 py-2 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/30", value === option.value ? "border-primary/50 bg-primary/10 font-medium text-foreground" : "border-border text-muted-foreground hover:bg-muted/50 hover:text-foreground")}>
           {option.label}
         </button>
       ))}
@@ -87,7 +87,7 @@ function LanguageSetting() {
   const { t } = useI18n();
   return (
     <div className="flex min-w-0 flex-col gap-2 border-b border-border/70 py-3 last:border-b-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-      <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="text-[12px] font-medium">{t("settings.language.label")}</h3><Pill tone="violet" className="text-[9px] normal-case">{t("common.browserOnly")}</Pill></div><p className="mt-0.5 max-w-2xl text-[10px] leading-4 text-muted-foreground">{t("settings.language.desc")}</p></div>
+      <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-medium">{t("settings.language.label")}</h3><Pill tone="violet" className="text-[11px] normal-case">{t("common.browserOnly")}</Pill></div><p className="mt-1 max-w-2xl text-[13px] leading-5 text-muted-foreground">{t("settings.language.desc")}</p></div>
       <div className="min-w-0 shrink-0 sm:max-w-[48%] sm:text-right">
         <div className="sm:flex sm:flex-col sm:items-end"><LanguageSwitcher /></div>
       </div>
@@ -123,9 +123,9 @@ function SettingRow({ setting, onReconfigure }: { setting: NormalizedSetting; on
   const isAppearance = localized.id.startsWith("appearance.");
   return (
     <div className="flex min-w-0 flex-col gap-2 border-b border-border/70 py-3 last:border-b-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-      <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="text-[12px] font-medium">{localized.label}</h3><OwnershipBadge setting={localized} />{localized.readOnly && <span className="text-[9px] uppercase tracking-wider text-muted-foreground">{t("common.readOnly")}</span>}</div><p className="mt-0.5 max-w-2xl text-[10px] leading-4 text-muted-foreground">{localized.description}</p></div>
+      <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-medium">{localized.label}</h3><OwnershipBadge setting={localized} />{localized.readOnly && <span className="text-[11px] text-muted-foreground">{t("common.readOnly")}</span>}</div><p className="mt-1 max-w-2xl text-[13px] leading-5 text-muted-foreground">{localized.description}</p></div>
       <div className="min-w-0 shrink-0 sm:max-w-[48%] sm:text-right">
-        {isAppearance ? <div className="sm:flex sm:flex-col sm:items-end"><AppearanceSetting setting={localized} /></div> : localized.action === "reconfigure" ? <Button size="xs" variant="outline" onClick={onReconfigure}>{localized.value}<ArrowRight className="size-3" /></Button> : <span className="break-words text-[11px] font-medium text-foreground">{String(localized.value)}</span>}
+        {isAppearance ? <div className="sm:flex sm:flex-col sm:items-end"><AppearanceSetting setting={localized} /></div> : localized.action === "reconfigure" ? <Button size="sm" variant="outline" className="h-auto min-h-11 max-w-full whitespace-normal rounded-md py-2 tracking-normal normal-case" onClick={onReconfigure}>{localized.value}<ArrowRight className="size-3" /></Button> : <span className="[overflow-wrap:anywhere] text-[13px] font-medium text-foreground">{String(localized.value)}</span>}
       </div>
     </div>
   );
@@ -137,7 +137,7 @@ function SettingsSection({ section, onReconfigure, onReset }: { section: Setting
   const description = t(SECTION_DESC_KEY[section.id]);
   return (
     <section aria-labelledby={`settings-${section.id}`} className="rounded-lg border border-border bg-background px-3 py-2.5 sm:px-4">
-      <div className="flex items-start justify-between gap-3 border-b border-border pb-2.5"><div className="min-w-0"><h2 id={`settings-${section.id}`} className="text-[12px] font-semibold tracking-tight">{title}</h2><p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">{description}</p></div>{onReset && <Button variant="ghost" size="xs" onClick={onReset} title={t("settings.resetAppearance")}><RotateCcw className="size-3" />{t("common.reset")}</Button>}</div>
+      <div className="flex items-start justify-between gap-3 border-b border-border pb-3"><div className="min-w-0"><h2 id={`settings-${section.id}`} tabIndex={-1} className="scroll-mt-4 text-base font-semibold tracking-tight">{title}</h2><p className="mt-1 text-[13px] leading-5 text-muted-foreground">{description}</p></div>{onReset && <Button variant="ghost" size="sm" className="h-11 rounded-md tracking-normal normal-case" onClick={onReset} title={t("settings.resetAppearance")}><RotateCcw className="size-3" />{t("common.reset")}</Button>}</div>
       <div>{section.items.map((setting) => <SettingRow key={setting.id} setting={setting} onReconfigure={onReconfigure} />)}{section.id === "appearance" && <LanguageSetting />}</div>
     </section>
   );
@@ -153,28 +153,49 @@ export function SettingsSurface({ snapshot }: { snapshot: RuntimeSnapshot }) {
   const appearanceSection = sections.find((section) => section.id === "appearance");
 
   return (
-    <PageSurface className="mx-auto w-full max-w-5xl">
-      <header className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{t("settings.workspace")}</span><span className="text-[10px] text-muted-foreground">{t("settings.settings")}</span></div><h1 className="mt-1.5 flex items-center gap-2 text-[18px] font-semibold tracking-tight"><Settings2 className="size-4 text-muted-foreground" />{t("settings.title")}</h1><p className="mt-1 max-w-2xl text-[11px] leading-5 text-muted-foreground">{t(canonical ? "settings.realSubtitle" : "settings.subtitle")}</p></div><div className="rounded-md border border-border bg-muted/20 px-2.5 py-2 text-right text-[10px] text-muted-foreground"><p className="font-medium text-foreground">{t("settings.themeActive", { theme: t(theme.resolvedTheme === "dark" ? "settings.theme.dark" : "settings.theme.light") })}</p><p className="mt-0.5">{theme.hydrated ? t("settings.preferencesActive") : t("settings.preferencesLoading")}</p></div></header>
-      {!canonical && <div className="mt-4 rounded-md border border-violet-500/25 bg-violet-500/5 px-3 py-2.5 text-[10px] leading-4 text-muted-foreground"><strong className="font-semibold text-foreground">{t("settings.boundaryTitle")}</strong> {t("settings.boundaryBody")}</div>}
-      {canonical ? <section className="mt-4 rounded-lg border border-border p-4">
-        <h2 className="text-sm font-semibold">{t("settings.providerModels")}</h2>
-        <p className="mt-1 text-xs text-muted-foreground">{t("settings.providerModelsDesc")}</p>
-        <Button className="mt-3" size="sm" variant="outline" onClick={() => router.push(RECONFIGURE_PATH)}>{t("settings.configure")}<ArrowRight className="size-3" /></Button>
-      </section> : <div className="mt-4"><ProfilePanel /></div>}
-      <div className="mt-4 grid gap-3 lg:grid-cols-2">
-        {sections.map((section) => <SettingsSection key={section.id} section={section} onReconfigure={() => router.push(RECONFIGURE_PATH)} onReset={section.id === "appearance" ? theme.resetAppearance : undefined} />)}
-      </div>
-      {canonical && <details className="mt-4 rounded-lg border border-border p-4">
-        <summary className="cursor-pointer text-sm font-medium">{t("settings.section.advanced")}</summary>
-        <div className="mt-3 space-y-3">
-          <Button size="sm" variant="outline" onClick={() => {
-            const url = new URL(window.location.href); url.pathname = "/"; url.searchParams.set("view", "canonical");
-            window.history.pushState(null, "", url.pathname + url.search);
-          }}>{t("nav.canonical")}<ArrowRight className="size-3" /></Button>
-          <ProfilePanel />
+    <PageSurface className="mx-auto w-full max-w-5xl pb-[max(2rem,env(safe-area-inset-bottom))]">
+      <header className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight"><Settings2 className="size-5 text-muted-foreground" />{t("settings.title")}</h1>
+          <p className="mt-2 max-w-xl text-sm leading-6 text-muted-foreground">{t(canonical ? "settings.realSubtitle" : "settings.subtitle")}</p>
         </div>
-      </details>}
-      {appearanceSection && <p className="mt-3 text-[10px] text-muted-foreground">{t("settings.appearanceNote")}</p>}
+        <div role="status" className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">{t("settings.themeActive", { theme: t(theme.resolvedTheme === "dark" ? "settings.theme.dark" : "settings.theme.light") })}</p>
+          <p className="mt-1">{theme.hydrated ? t("settings.autoSaved") : t("settings.preferencesLoading")}</p>
+        </div>
+      </header>
+      <div className="mt-6 grid min-w-0 gap-4 lg:grid-cols-[160px_minmax(0,1fr)] lg:gap-6">
+        <nav aria-label={t("settings.navigation")} className="flex min-w-0 gap-1 overflow-x-auto rounded-lg border border-border p-1 lg:sticky lg:top-4 lg:flex-col lg:self-start">
+          <a href="#settings-providers" className="flex min-h-11 shrink-0 items-center rounded-md px-3 text-sm text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30">{t("settings.providerModels")}</a>
+          {sections.map(section => <a key={section.id} href={`#settings-${section.id}`} className="flex min-h-11 shrink-0 items-center rounded-md px-3 text-sm text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30">{t(SECTION_TITLE_KEY[section.id])}</a>)}
+          {canonical && <a href="#settings-advanced" className="flex min-h-11 shrink-0 items-center rounded-md px-3 text-sm text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30">{t("settings.section.advanced")}</a>}
+        </nav>
+        <div className="min-w-0 space-y-4">
+          {!canonical && <div className="rounded-lg border border-violet-500/25 bg-violet-500/5 px-4 py-3 text-[13px] leading-5 text-muted-foreground"><strong className="font-semibold text-foreground">{t("settings.boundaryTitle")}</strong> {t("settings.boundaryBody")}</div>}
+          <section aria-labelledby="settings-providers">
+            <h2 id="settings-providers" tabIndex={-1} className="mb-3 scroll-mt-4 text-base font-semibold">{t("settings.providerModels")}</h2>
+            {canonical ? <div className="rounded-lg border border-border p-4">
+              <p className="text-sm leading-6 text-muted-foreground">{t("settings.providerModelsDesc")}</p>
+              <Button className="mt-3 h-auto min-h-11 max-w-full whitespace-normal rounded-md py-2 tracking-normal normal-case" size="sm" onClick={() => router.push(RECONFIGURE_PATH)}>{t("settings.configure")}<ArrowRight className="size-4" /></Button>
+            </div> : <ProfilePanel />}
+          </section>
+          {sections.map(section => <SettingsSection key={section.id} section={section} onReconfigure={() => router.push(RECONFIGURE_PATH)} onReset={section.id === "appearance" ? theme.resetAppearance : undefined} />)}
+          {appearanceSection && <p className="text-xs leading-5 text-muted-foreground">{t("settings.appearanceNote")}</p>}
+          {canonical && <details className="rounded-lg border border-border p-4">
+            <summary id="settings-advanced" tabIndex={0} className="min-h-11 cursor-pointer scroll-mt-4 py-2 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring/30">{t("settings.section.advanced")}</summary>
+            <div className="mt-3 space-y-4">
+              <Button size="sm" variant="outline" className="h-11 rounded-md tracking-normal normal-case" onClick={() => {
+                const url = new URL(window.location.href);
+                url.pathname = "/";
+                url.hash = "";
+                url.searchParams.set("view", "canonical");
+                router.push(url.pathname + url.search);
+              }}>{t("nav.canonical")}<ArrowRight className="size-3" /></Button>
+              <ProfilePanel />
+            </div>
+          </details>}
+        </div>
+      </div>
     </PageSurface>
   );
 }

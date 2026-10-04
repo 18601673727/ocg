@@ -286,23 +286,6 @@ export function RuntimeWorkspace({
     [activeProjectId, activeSessionKey],
   );
 
-  const handleNewChat = useCallback(async () => {
-    if (!activeWorkType) return;
-    const session = await createSession({ workType: activeWorkType, projectId: activeProjectId });
-    // Register before selecting so the new chat stays in the current project.
-    registerProjectSession(session.id);
-    setActiveSessionId(session.id);
-    rememberSession(session.id);
-    setMobileNavOpen(false);
-  }, [activeProjectId, activeWorkType, createSession, registerProjectSession, rememberSession]);
-
-  const handleNewProjectChat = useCallback(async () => {
-    const session = await createSession({ workType: "coding", projectId: activeProjectId });
-    registerProjectSession(session.id, activeProjectId);
-    setActiveSessionId(session.id);
-    rememberSession(session.id);
-  }, [activeProjectId, createSession, registerProjectSession, rememberSession]);
-
   /**
    * The one navigation path for every workspace control in the shell. Where a
    * view lives, and whether selecting it again closes it, is decided by the
@@ -315,9 +298,29 @@ export function RuntimeWorkspace({
     if (href !== null) {
       // Update the view without replacing the page and its runtime providers,
       // including when the workspace was entered through a standalone route.
-      window.history.pushState(null, "", withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`));
+      const url = new URL(withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`), window.location.origin);
+      if (new URLSearchParams(window.location.search).get("demo") === "1") url.searchParams.set("demo", "1");
+      window.history.pushState(null, "", url.pathname + url.search);
     }
   }, [snapshot.scenario, view, withProject]);
+
+  const handleNewChat = useCallback(async () => {
+    if (!activeWorkType) return;
+    const session = await createSession({ workType: activeWorkType, projectId: activeProjectId });
+    // Register before selecting so the new chat stays in the current project.
+    registerProjectSession(session.id);
+    setActiveSessionId(session.id);
+    navigate("chat");
+    rememberSession(session.id);
+  }, [activeProjectId, activeWorkType, createSession, registerProjectSession, rememberSession, navigate]);
+
+  const handleNewProjectChat = useCallback(async () => {
+    const session = await createSession({ workType: "coding", projectId: activeProjectId });
+    registerProjectSession(session.id, activeProjectId);
+    setActiveSessionId(session.id);
+    navigate("chat");
+    rememberSession(session.id);
+  }, [activeProjectId, createSession, registerProjectSession, rememberSession, navigate]);
 
   const selectSession = useCallback((id: string) => {
     setActiveSessionId(id);
@@ -580,7 +583,7 @@ export function RuntimeWorkspace({
   );
 
   return (
-    <div className="flex h-dvh overflow-hidden bg-background text-foreground">
+    <div className="flex h-dvh overflow-hidden bg-background pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)] text-foreground">
       <aside
         aria-label="OCG navigation"
         className={cn(
@@ -605,7 +608,7 @@ export function RuntimeWorkspace({
         <aside
           aria-label="OCG navigation"
           className={cn(
-            "absolute inset-y-0 left-0 w-[272px] border-r border-border bg-sidebar transition-transform duration-200 ease-out",
+            "absolute inset-y-0 left-0 w-[272px] border-r border-border bg-sidebar pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] transition-transform duration-200 ease-out",
             mobileNavOpen ? "translate-x-0" : "-translate-x-full",
           )}
         >
@@ -813,7 +816,7 @@ export function RuntimeWorkspace({
           <aside
             aria-label={t("usage.inspector")}
             className={cn(
-               "absolute inset-y-0 right-0 w-full max-w-none border-l border-border bg-background transition-transform duration-200 ease-out sm:w-[640px] sm:max-w-[85vw]",
+               "absolute inset-y-0 right-0 w-full max-w-none border-l border-border bg-background pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] transition-transform duration-200 ease-out sm:w-[640px] sm:max-w-[85vw]",
                mobileInspectorOpen ? "translate-x-0" : "translate-x-full",
              )}
             >

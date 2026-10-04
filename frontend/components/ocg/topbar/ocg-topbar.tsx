@@ -96,7 +96,7 @@ export function OcgTopbar({
       <Button
         variant="ghost"
         size="icon-xs"
-        className="lg:hidden"
+        className="size-11 rounded-md lg:hidden"
         onClick={onOpenMobileSidebar}
         aria-label={t("topbar.openNavigation")}
         title={t("topbar.openNavigation")}
@@ -159,7 +159,7 @@ export function OcgTopbar({
           <Button
             variant="ghost"
             size="icon-xs"
-            className="lg:hidden"
+            className="size-11 rounded-md lg:hidden"
             onClick={onOpenMobileInspector}
             aria-label={t("topbar.openInspector")}
             title={t("topbar.openInspector")}

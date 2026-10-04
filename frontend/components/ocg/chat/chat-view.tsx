@@ -12,7 +12,6 @@ import {
   Command,
   Copy,
   Loader2,
-  Mic,
   Paperclip,
   Sparkles,
   User,
@@ -319,7 +318,7 @@ function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage;
         </div>
          <div
            className={cn(
-             "text-[13.5px] text-foreground/90",
+             "text-sm text-foreground/90",
              isUser && "rounded-md border border-border bg-muted/30 px-3 py-2",
              message.status === "failed" && "text-red-600 dark:text-red-400",
              message.status === "cancelled" && "text-muted-foreground italic",
@@ -459,7 +458,7 @@ function Composer({
   };
 
   return (
-    <div className="shrink-0 border-t border-border bg-background px-3 pt-2 pb-2 sm:px-5 sm:pb-3">
+    <div className="shrink-0 border-t border-border bg-background px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-5">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -549,7 +548,7 @@ function Composer({
                 onDraftChange(e.target.value);
               }}
               onKeyDown={(e) => {
-                if (e.nativeEvent.isComposing) return;
+                if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
                 if (e.key === "Escape" && suggestionsOpen) {
                   e.preventDefault();
                   closeSuggestions();
@@ -564,11 +563,13 @@ function Composer({
                   return;
                 }
                 if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
                   if (suggestionsOpen && activeIndex >= 0) {
+                    e.preventDefault();
                     applySuggestion(suggestions[activeIndex]);
                     return;
                   }
+                  if (window.matchMedia("(pointer: coarse)").matches && !e.ctrlKey && !e.metaKey) return;
+                  e.preventDefault();
                   void submit();
                 }
               }}
@@ -580,7 +581,9 @@ function Composer({
               aria-expanded={suggestionsOpen}
               aria-controls={suggestionsOpen ? "composer-suggestions" : undefined}
               aria-activedescendant={activeIndex >= 0 ? `composer-suggestion-${suggestions[activeIndex].id}` : undefined}
-              className="max-h-40 min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-[13.5px] outline-none placeholder:text-muted-foreground"
+              aria-describedby="composer-hint composer-status"
+              aria-invalid={Boolean(error)}
+              className="max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
             />
           </div>
           {error && (
@@ -593,6 +596,7 @@ function Composer({
               type="button"
               variant="ghost"
               size="icon-xs"
+              className="size-11 rounded-md sm:size-9"
               aria-label={t("chat.attachFile")}
               title={t("chat.attachFile")}
               disabled={submitting || cancelling}
@@ -600,35 +604,27 @@ function Composer({
             >
               <Paperclip className="size-4" />
             </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={t("chat.voiceInput")}
-              title={t("chat.voiceInput")}
-            >
-              <Mic className="size-4" />
-            </Button>
-            <span className="ml-1 hidden text-[11px] text-muted-foreground sm:inline">
-              {busy ? t("chat.queueHint") : t("chat.hint")}
+            <span id="composer-hint" className="sr-only sm:ml-1 sm:not-sr-only sm:text-[11px] sm:text-muted-foreground">
+              <span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span>
+              <span className="pointer-coarse:hidden">{busy ? t("chat.queueHint") : t("chat.hint")}</span>
             </span>
             <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
-              {busy && onCancel && <Button type="button" variant="outline" size="xs" disabled={submitting || cancelling} onClick={() => void cancel()} title={t("chat.cancel")}>
+              {busy && onCancel && <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={submitting || cancelling} onClick={() => void cancel()} title={t("chat.cancel")}>
                 {cancelling ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}{t("chat.cancel")}
               </Button>}
-              {busy && <Button type="button" variant="outline" size="xs" disabled={!canSend || !chatReady || submitting || cancelling} onClick={() => void submit("steer")} title={t("chat.steerHint")}>
+              {busy && <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={!canSend || !chatReady || submitting || cancelling} onClick={() => void submit("steer")} title={t("chat.steerHint")}>
                 {t("chat.steer")}
               </Button>}
-              <Button type="submit" size={queueing ? "xs" : "icon-sm"} disabled={!canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat")} aria-label={t(queueing ? "chat.queue" : "chat.send")} title={t(busy ? "chat.queueHint" : "chat.send")}>
+              <Button type="submit" size={queueing ? "xs" : "icon-sm"} className={cn("h-11 rounded-md tracking-normal normal-case sm:h-9", !queueing && "w-11 sm:w-9")} disabled={!canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat")} aria-label={t(queueing ? "chat.queue" : "chat.send")} title={t(busy ? "chat.queueHint" : "chat.send")}>
                 {submitting ? <Loader2 className="size-4 animate-spin" /> : busy ? <ListPlus className="size-4" /> : <ArrowUp className="size-4" />}
                 {queueing && t("chat.queue")}
               </Button>
             </div>
           </div>
         </div>
-        <p className="mt-1.5 text-center text-[11px] text-muted-foreground">
+        <p id="composer-status" role="status" className="mt-1.5 text-center text-xs text-muted-foreground">
           {chatReady
-            ? t("chat.repliesStream")
+            ? <><span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span><span className="pointer-coarse:hidden">{t("chat.repliesStream")}</span></>
             : `${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
         </p>
       </form>
@@ -675,6 +671,9 @@ export function ChatView({
   const busy = messages.some(message => message.role === "assistant" && (message.status === "streaming" || message.status === "pending"));
   const { t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const following = useRef(true);
+  const [showLatest, setShowLatest] = useState(false);
   const retryLock = useRef(false);
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
@@ -694,78 +693,101 @@ export function ChatView({
     }
   }
 
-  const lastImageCount = messages.at(-1)?.images?.length;
-  useEffect(() => {
+  const empty = messages.length === 0 && !composerSurface;
+  const scrollToLatest = () => {
+    following.current = true;
+    setShowLatest(false);
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length, session.id, composerSurfaceKey, lastImageCount]);
+  };
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    const content = contentRef.current;
+    if (!el || !content) return;
+    const followContent = () => {
+      if (following.current) el.scrollTop = el.scrollHeight;
+      else setShowLatest(el.scrollHeight - el.clientHeight - el.scrollTop > 80);
+    };
+    const observer = new ResizeObserver(followContent);
+    observer.observe(content);
+    observer.observe(el);
+    followContent();
+    return () => observer.disconnect();
+  }, [session.id, empty, composerSurfaceKey]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto" role="log" aria-label={t("chat.conversation", { title: session.title })}>
-        {messages.length === 0 && !composerSurface ? (
-          <div className="relative mx-auto flex h-full max-w-3xl flex-col items-center justify-center px-5 py-10 text-center">
-            <ActivityPulse className="size-20 opacity-80" label={t("chat.idleIllustration")} />
-            <h2 className="mt-5 text-[15px] font-semibold tracking-tight">
-              {t("chat.newThread")}
-            </h2>
-            <p className="mt-1 max-w-md text-[13px] leading-6 text-muted-foreground">
-              {t("chat.emptyPrefix")} <span className="font-medium text-foreground">{session.title}</span>{t("chat.emptySuffix")}
-            </p>
-            <div className="mt-4 flex w-full max-w-md flex-col gap-1.5">
-              {SUGGESTIONS.map((s) => (
-                <button
-                  key={s}
-                  type="button"
-                  onClick={() => setDraft(t(s))}
-                  className="rounded-md border border-border bg-muted/30 px-3 py-2 text-left text-[13px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                >
-                  {t(s)}
-                </button>
-              ))}
+      <div className="relative flex min-h-0 flex-1 flex-col">
+        <div ref={scrollRef} onScroll={() => {
+          const el = scrollRef.current;
+          if (!el) return;
+          const atBottom = el.scrollHeight - el.clientHeight - el.scrollTop <= 80;
+          following.current = atBottom;
+          setShowLatest(!atBottom);
+        }} className="min-h-0 flex-1 overflow-y-auto overscroll-contain" role="log" aria-label={t("chat.conversation", { title: session.title })}>
+          {empty ? (
+            <div ref={contentRef} className="relative mx-auto flex min-h-full max-w-3xl flex-col items-center justify-center px-5 py-8 text-center">
+              <ActivityPulse className="size-20 opacity-80" label={t("chat.idleIllustration")} />
+              <h2 className="mt-5 text-[15px] font-semibold tracking-tight">
+                {t("chat.newThread")}
+              </h2>
+              <p className="mt-1 max-w-md text-[13px] leading-6 text-muted-foreground">
+                {t("chat.emptyPrefix")} <span className="font-medium text-foreground">{session.title}</span>{t("chat.emptySuffix")}
+              </p>
+              <div className="mt-4 flex w-full max-w-md flex-col gap-1.5">
+                {SUGGESTIONS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => setDraft(t(s))}
+                    className="min-h-11 rounded-md border border-border bg-muted/30 px-3 py-2 text-left text-sm text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30"
+                  >
+                    {t(s)}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
-        ) : (
-          <div className="mx-auto flex max-w-3xl flex-col gap-5 px-3 py-5 sm:px-5">
-            {messages.length > 0 && (
-              <div className="flex items-center gap-2 text-[11px] text-muted-foreground" aria-hidden="true">
-                <span className="h-px flex-1 bg-border" />
-                <span>{t("chat.today")}</span>
-                <span className="h-px flex-1 bg-border" />
-              </div>
-            )}
-            {messages.map((m) => (
-              <MessageRow key={m.id} message={m}
-                onRetry={retryInput(messages, m.id) ? () => void retry(m.id) : undefined}
-                retryDisabled={retrying || runtimeStatus.state !== "connected"}
-              />
-            ))}
-            {retryError && <p role="alert" className="text-sm text-destructive">{retryError}</p>}
-            {messages.length > 0 && (
-              <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-muted/20 px-2.5 py-2 text-[12px] text-muted-foreground">
-                {runtimeStatus.state === "connected" ? (
-                  <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-                ) : (
-                  <span className="size-1.5 rounded-full bg-muted-foreground" aria-hidden="true" />
-                )}
-                <span>
-                  {runtimeStatus.state === "connected" ? (
-                    <>
-                      {t("chat.runtime")} <span className="font-medium">{t("chat.ready")}</span>
-                      {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
-                    </>
+          ) : (
+            <div ref={contentRef} className="mx-auto flex max-w-3xl flex-col gap-5 px-3 py-5 sm:px-5">
+              {messages.map((m) => (
+                <MessageRow key={m.id} message={m}
+                  onRetry={retryInput(messages, m.id) ? () => void retry(m.id) : undefined}
+                  retryDisabled={retrying || runtimeStatus.state !== "connected"}
+                />
+              ))}
+              {retryError && <p role="alert" className="text-sm text-destructive">{retryError}</p>}
+              {messages.length > 0 && (
+                <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-muted/20 px-2.5 py-2 text-[12px] text-muted-foreground">
+                  {runtimeStatus.state === "connected" && busy ? (
+                    <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                  ) : runtimeStatus.state === "connected" ? (
+                    <Check className="size-3.5" aria-hidden="true" />
                   ) : (
-                    <>
-                      {t("chat.chat")} <span className="font-medium">{t("chat.unavailableState")}</span>
-                      {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ` · ${t("chat.configRequired")}`}
-                    </>
+                    <span className="size-1.5 rounded-full bg-muted-foreground" aria-hidden="true" />
                   )}
-                </span>
-              </div>
-            )}
-            {composerSurface}
-          </div>
-        )}
+                  <span>
+                    {runtimeStatus.state === "connected" ? (
+                      <>
+                        <span className="font-medium">{t(busy ? "chat.working" : "chat.ready")}</span>
+                        {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
+                      </>
+                    ) : (
+                      <>
+                        {t("chat.chat")} <span className="font-medium">{t("chat.unavailableState")}</span>
+                        {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ` · ${t("chat.configRequired")}`}
+                      </>
+                    )}
+                  </span>
+                </div>
+              )}
+              {composerSurface}
+            </div>
+          )}
+        </div>
+        {showLatest && <Button type="button" size="sm" variant="secondary" onClick={scrollToLatest} className="absolute bottom-3 left-1/2 h-11 -translate-x-1/2 rounded-full border border-border tracking-normal normal-case shadow-md">
+          <ChevronDown className="size-4" />{t("chat.jumpToLatest")}
+        </Button>}
       </div>
       {!!queueState?.queue.length && (
         <div className="mx-auto w-full max-w-3xl shrink-0 border-t border-border px-3 py-2 sm:px-5" aria-label={t("chat.queue")}>
@@ -773,11 +795,11 @@ export function ChatView({
             <ListPlus className="size-3.5" />{t("chat.queueCount", { count: queueState.queue.length })}
             {queueState.paused && <><span>· {t("chat.queuePaused")}</span><Button type="button" size="xs" variant="ghost" disabled={runtimeStatus.state !== "connected"} onClick={onResumeQueue}>{t("chat.resumeQueue")}</Button></>}
           </div>
-          <ol className="max-h-28 overflow-y-auto">
+          <ol className="max-h-[min(7rem,15dvh)] overflow-y-auto">
             {queueState.queue.map((item, index) => <li key={item.id} className="flex items-center gap-2 py-1 text-xs">
               <span className="text-muted-foreground">{index + 1}.</span><span className="min-w-0 flex-1 truncate">{item.input.content || t("chat.imageCount", { count: item.input.images?.length ?? 0 })}</span>
               <ImageGallery images={item.input.images} compact />
-              <Button type="button" size="icon-xs" variant="ghost" aria-label={t("chat.removeQueued")} onClick={() => onRemoveQueued?.(item.id)}><X className="size-3" /></Button>
+              <Button type="button" size="icon-xs" variant="ghost" className="size-11 rounded-md sm:size-7" aria-label={t("chat.removeQueued")} onClick={() => onRemoveQueued?.(item.id)}><X className="size-3" /></Button>
             </li>)}
           </ol>
         </div>
@@ -792,7 +814,10 @@ export function ChatView({
         onCancel={onCancel}
         draft={draft}
         onDraftChange={setDraft}
-        onIntent={onComposerIntent}
+        onIntent={async intent => {
+          await onComposerIntent(intent);
+          scrollToLatest();
+        }}
         runtimeStatus={runtimeStatus}
       />
     </div>

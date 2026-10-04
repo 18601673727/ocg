@@ -83,7 +83,7 @@ export function ModelSelector({ selection, onChange, busy }: {
   const status = busy ? t("chat.settingsLocked") : !baseUrl ? t("chat.selectorUnavailable")
     : loading ? t("chat.modelsLoading") : error ? t("chat.modelsFailed")
       : !model ? t("chat.noModels") : t("chat.settingsNextTurn");
-  const selectClass = "h-9 w-full min-w-0 rounded-md border border-border bg-background px-2 text-[12px] text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60";
+  const selectClass = "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
 
   return (
     <div className="border-b border-border px-3 py-2">
@@ -95,7 +95,7 @@ export function ModelSelector({ selection, onChange, busy }: {
           aria-controls={id + "-panel"}
           aria-describedby={id + "-status"}
           onClick={() => setExpanded(value => !value)}
-          className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring/30"
+          className="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-md py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring/30"
         >
           <SlidersHorizontal className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="min-w-0 flex-1">
@@ -113,16 +113,16 @@ export function ModelSelector({ selection, onChange, busy }: {
           title={t(error ? "common.retry" : "chat.refreshModels")}
           disabled={busy || loading}
           onClick={() => setRefresh(value => value + 1)}
-          className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40"
+          className="flex size-11 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40 sm:size-9"
         >
           <RefreshCw className={cn("size-3.5", loading && "animate-spin")} aria-hidden="true" />
         </button>}
       </div>
-      <p id={id + "-status"} role="status" className={cn("mt-1 flex items-center gap-1.5 text-[10px]", busy ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground")}>
+      <p id={id + "-status"} role="status" className={cn("mt-1 flex items-center gap-1.5 text-xs", busy ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground", !model && "sr-only")}>
         {busy && <span className="size-1.5 animate-pulse rounded-full bg-amber-500" aria-hidden="true" />}
         {status}
       </p>
-      {expanded && <div id={id + "-panel"} className="mt-2 space-y-2 border-t border-border pt-2">
+      {expanded && <div id={id + "-panel"} className="mt-2 max-h-[min(25dvh,12rem)] space-y-2 overflow-y-auto overscroll-contain border-t border-border pt-2 [@media(max-height:600px)]:max-h-[18dvh]">
         <fieldset disabled={disabled} aria-describedby={id + "-status"} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-12">
           <legend className="sr-only">{t("chat.executionSettings")}</legend>
           <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground sm:col-span-3">

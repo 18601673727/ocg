@@ -39,7 +39,7 @@ export function LanguageSwitcher({
     <div
       role="group"
       aria-label="Language"
-      className={cn("mt-2 flex flex-wrap gap-1", className)}
+      className={cn("flex flex-wrap gap-2", className)}
     >
       {LOCALES.map((option) => (
         <button
@@ -48,7 +48,7 @@ export function LanguageSwitcher({
           aria-pressed={locale === option}
           onClick={() => setLocale(option)}
           className={cn(
-            "rounded-md border px-2 py-1 text-[10px] transition-colors",
+            "min-h-11 rounded-md border px-3 py-2 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/30",
             locale === option
               ? "border-foreground/30 bg-muted font-medium text-foreground"
               : "border-border text-muted-foreground hover:bg-muted/50 hover:text-foreground",
