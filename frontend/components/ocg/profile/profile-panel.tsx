@@ -133,6 +133,11 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
   if (!baseUrl) return <p role="status" className="text-sm text-muted-foreground">{t("profile.noEndpoint")}</p>;
   const duplicateProvider = Boolean(draft && providerKey.trim() && draft.providers[providerKey.trim()]);
   const duplicateModel = Boolean(draft && modelKey.trim() && draft.models[modelKey.trim()]);
+  // Every configured model stays visible so an incomplete setup is readable,
+  // but only the backend-confirmed executable ones can become the default.
+  const defaultModelOptions = draft && view
+    ? Object.keys(draft.models).map(key => ({ key, executable: view.runnable_choices.includes(key) }))
+    : [];
   return (
     <section className="space-y-4 rounded-lg border border-border bg-background p-4" aria-label={t("profile.title")} aria-busy={busy}>
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -211,7 +216,10 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
               </div>
               {duplicateModel && <p id="profile-model-error" role="status" className="text-sm text-destructive">{t("profile.duplicateModel")}</p>}
             </section>
-            <Field label={t("profile.defaultModel")}><select aria-label={t("profile.defaultModel")} className={selectClass} value={draft.defaultModel ?? ""} onChange={event => change(profile => { profile.defaultModel = event.target.value || null; return profile; })}><option value="">{t("profile.selectAtExecution")}</option>{Object.keys(draft.models).map(key => <option key={key} value={key}>{key}</option>)}</select></Field>
+            {/* Execution readiness is the backend's authority: every configured
+             * model is listed, but only a `view.runnable_choices` model may be
+             * chosen as the active default. */}
+            <Field label={t("profile.defaultModel")}><select aria-label={t("profile.defaultModel")} className={selectClass} value={draft.defaultModel ?? ""} onChange={event => change(profile => { profile.defaultModel = event.target.value || null; return profile; })}><option value="">{t("profile.selectAtExecution")}</option>{defaultModelOptions.map(({ key, executable }) => <option key={key} value={key} disabled={!executable}>{key}{executable ? "" : ` · ${t("profile.notExecutable")}`}</option>)}</select></Field>
           </fieldset>
           <div className="sticky bottom-0 flex flex-wrap items-center gap-3 border-t border-border bg-background py-3">
             <p role="status" className="min-w-0 flex-1 text-[13px] text-muted-foreground">{hasUnsaved ? t("profile.unsaved") : t("profile.saved")}</p>
