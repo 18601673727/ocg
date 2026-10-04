@@ -17,6 +17,7 @@ pub mod classify;
 pub mod config;
 pub mod engine;
 pub mod freshness;
+pub mod fulltext;
 pub mod gitdiff;
 pub mod index;
 pub mod ranking;

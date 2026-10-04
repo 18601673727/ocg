@@ -5,7 +5,9 @@
 //! executor bindings. OpenAI-compatible function definitions are projections
 //! of those definitions; they are not the canonical tool model.
 
+mod evidence;
 pub mod openai_projection;
+mod validation;
 
 use crate::edit;
 use crate::error::{OcgError, Result};
@@ -36,6 +38,9 @@ pub enum NativeToolExecutorBinding {
     FilesystemRead,
     FilesystemList,
     FilesystemSearch,
+    ContextSearch,
+    ContextRead,
+    ContextValidation,
     FilesystemEdit,
     ProcessExec,
 }
@@ -315,6 +320,39 @@ impl NativeToolRegistry {
                 aliases: &["search", "grep", "ripgrep", "find_in_files"],
                 target_field: Some("path"),
                 argument_aliases: &[("directory", "path"), ("dir", "path"), ("pattern", "query")],
+            },
+            NativeToolDefinition {
+                name: "context.search",
+                description: "Search reusable Project-local indexed text. Refreshes changed files on demand. query is plain text: all case-insensitive word tokens must occur in the same bounded chunk. path restricts results to a Project-relative directory. Returns line ranges, snippets, content revisions, freshness and refresh counters. Use filesystem.search for live regex search.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{"query":{"type":"string","description":"Plain text word tokens, maximum 512 bytes."},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::ContextSearch,
+                aliases: &[],
+                target_field: Some("path"),
+                argument_aliases: &[],
+            },
+            NativeToolDefinition {
+                name: "context.read",
+                description: "Read 1..16 revision-validated evidence ranges from context.search in one Call. Each item requires a Project-relative path, the search sha256 revision, and 1-based inclusive line_start/line_end (at most 400 lines). Reads and hashes each unique file once, returns ordered per-item ok/stale/missing outcomes. Stale evidence requires a new context.search. Content is bounded to 8192 bytes per item and the total result cap; inspect truncated. Use filesystem.read for reads without a revision.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["items"],"properties":{"items":{"type":"array","description":"Between 1 and 16 evidence ranges.","items":{"type":"object","additionalProperties":false,"required":["path","line_start","line_end","revision"],"properties":{"path":{"type":"string"},"line_start":{"type":"integer","minimum":1,"maximum":4294967295u64},"line_end":{"type":"integer","minimum":1,"maximum":4294967295u64},"revision":{"type":"string","description":"Exact sha256: followed by 64 lowercase hexadecimal characters from context.search."}}}}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::ContextRead,
+                aliases: &[],
+                target_field: None,
+                argument_aliases: &[],
+            },
+            NativeToolDefinition {
+                name: "context.validation",
+                description: "Discover durable validation facts for this Project source revision. Optional program + exact args + Project-relative cwd filters cargo check/build or git diff --check; omit these to list recent evidence. Each fact includes passed/failed, applicability, source/environment fingerprints and producing Job/Attempt/Call. Stale facts do not validate current sources. Only bounded metadata probes run; validation is never executed or skipped. Inspect applicability (applicable/stale/unverifiable), bounded reasons, reusable and component fingerprints. External path dependencies, opaque build inputs and unavailable input closure are never reusable. Legacy facts are unverifiable.",
+                parameters: json!({"type":"object","additionalProperties":false,"properties":{"program":{"type":"string","enum":["cargo","git"]},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::ContextValidation,
+                aliases: &[],
+                target_field: None,
+                argument_aliases: &[],
             },
             NativeToolDefinition {
                 name: "filesystem.edit",
@@ -609,6 +647,11 @@ impl NativeToolExecutor {
             NativeToolExecutorBinding::FilesystemRead => self.read(arguments),
             NativeToolExecutorBinding::FilesystemList => self.list(arguments, cancelled),
             NativeToolExecutorBinding::FilesystemSearch => self.search(arguments, cancelled),
+            NativeToolExecutorBinding::ContextSearch => self.context_search(arguments, cancelled),
+            NativeToolExecutorBinding::ContextRead => evidence::read(&self.root, arguments, cancelled),
+            NativeToolExecutorBinding::ContextValidation => {
+                validation::query(&self.root, arguments, cancelled)
+            }
             NativeToolExecutorBinding::FilesystemEdit => self.edit(arguments, cancelled),
             NativeToolExecutorBinding::ProcessExec => self.exec(arguments, cancelled),
         };
@@ -862,6 +905,45 @@ impl NativeToolExecutor {
         }
     }
 
+    fn context_search(&self, arguments: &Value, cancelled: &dyn Fn() -> bool) -> ToolResult {
+        let raw = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        let directory = match self.root.resolve_existing(raw) {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::InvalidInput,
+                    "search path must be a directory",
+                ))
+            }
+            Err(error) => return ToolResult::failure(error),
+        };
+        let prefix = directory
+            .strip_prefix(self.root.path())
+            .unwrap_or(Path::new(""));
+        let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+        if query.len() > 512 || !query.chars().any(char::is_alphanumeric) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "context query requires word tokens and at most 512 bytes",
+            ));
+        }
+        let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+        match crate::context::fulltext::search(
+            self.root.path(),
+            prefix,
+            query,
+            limit,
+            self.runner.as_ref(),
+            cancelled,
+        ) {
+            Ok(output) => ToolResult::success(output),
+            Err(error) => ToolResult::failure(ToolError::new(
+                ToolErrorKind::ExecutionFailure,
+                error.to_string(),
+            )),
+        }
+    }
+
     fn edit(&self, arguments: &Value, cancelled: &dyn Fn() -> bool) -> ToolResult {
         let file = match arguments.get("file").and_then(Value::as_str) {
             Some(file) => file,
@@ -1046,6 +1128,7 @@ pub fn execute_canonical_tool_call(
         &payload,
     )?;
     domain.mark_dispatch_queued(&call.id)?;
+    let mut observation = None;
     let result = if definition.is_none() {
         ToolResult::failure(ToolError::new(
             ToolErrorKind::InvalidInput,
@@ -1080,13 +1163,21 @@ pub fn execute_canonical_tool_call(
         } else {
             domain.start_call(&call.id, &authority.attempt_id, authority.generation)?;
             match NativeToolExecutor::new(project_root) {
-                Ok(executor) => executor.execute(
-                    &request.name,
-                    &request.arguments,
-                    permission,
-                    policy,
-                    cancelled,
-                ),
+                Ok(executor) => {
+                    observation = validation::Observation::begin(
+                        &executor.root,
+                        &request.name,
+                        &request.arguments,
+                        &|| cancelled.load(Ordering::SeqCst),
+                    );
+                    executor.execute(
+                        &request.name,
+                        &request.arguments,
+                        permission,
+                        policy,
+                        cancelled,
+                    )
+                }
                 Err(error) => ToolResult::failure(ToolError::new(
                     ToolErrorKind::ExecutionFailure,
                     error.to_string(),
@@ -1123,6 +1214,13 @@ pub fn execute_canonical_tool_call(
             .is_err()
         {
             domain.fence_dispatch_intent(&call.id, &failure)?;
+        }
+    }
+    if let Some(observation) = observation {
+        if let Ok(root) = ProjectRoot::new(project_root) {
+            observation.finish(&root, domain, &call.id, &result, &|| {
+                cancelled.load(Ordering::SeqCst)
+            });
         }
     }
     Ok(result.bounded())
@@ -1239,6 +1337,8 @@ impl NativeToolCallHandler {
         domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)?;
         *claimed = true;
         drop(domain);
+        let observation =
+            validation::Observation::begin(&executor.root, name, &arguments, &cancelled);
         let result = executor.execute_cancellable(
             name,
             &arguments,
@@ -1275,6 +1375,15 @@ impl NativeToolCallHandler {
                 envelope.generation,
                 &serialized,
             )?;
+        }
+        if let Some(observation) = observation {
+            observation.finish(
+                &executor.root,
+                &domain,
+                &envelope.call_id,
+                &result,
+                &cancelled,
+            );
         }
         Ok(output)
     }
