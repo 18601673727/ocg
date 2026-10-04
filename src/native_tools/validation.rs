@@ -44,6 +44,7 @@ const CARGO_ENVIRONMENT: &[&str] = &[
     "CARGO_BUILD_INCREMENTAL",
     "CARGO_INCREMENTAL",
     "CARGO_BUILD_JOBS",
+    "CARGO_BUILD_WARNINGS",
     "CARGO_BUILD_DEP_INFO_BASEDIR",
     "CC",
     "CXX",
@@ -56,7 +57,30 @@ const CARGO_ENVIRONMENT: &[&str] = &[
     "DEVELOPER_DIR",
     "SOURCE_DATE_EPOCH",
 ];
-const GIT_ENVIRONMENT: &[&str] = &["PATH", "HOME", "XDG_CONFIG_HOME", "LANG", "LC_ALL"];
+const GIT_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "LANG",
+    "LC_ALL",
+    "GIT_INDEX_FILE",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_EXEC_PATH",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+const INPUT_MODEL_VERSION: u32 = 3;
 
 fn now() -> i64 {
     SystemTime::now()
@@ -258,6 +282,7 @@ struct ValidationInputs {
     environment: String,
     config: Option<String>,
     git_state: Option<String>,
+    dependency_boundary: Option<String>,
     unsupported_inputs: Vec<String>,
     unknown: bool,
     #[serde(skip)]
@@ -265,9 +290,28 @@ struct ValidationInputs {
     #[serde(skip)]
     git_state_ms: u128,
     #[serde(skip)]
+    dependency_boundary_ms: u128,
+    #[serde(skip)]
     git_index_stamp: Option<String>,
 }
 impl ValidationInputs {
+    fn unavailable() -> Self {
+        Self {
+            version: INPUT_MODEL_VERSION,
+            toolchain: None,
+            environment: String::new(),
+            config: None,
+            git_state: None,
+            dependency_boundary: None,
+            unsupported_inputs: Vec::new(),
+            unknown: true,
+            toolchain_ms: 0,
+            git_state_ms: 0,
+            dependency_boundary_ms: 0,
+            git_index_stamp: None,
+        }
+    }
+
     fn fingerprint(&self) -> String {
         digest(json!(self).to_string().as_bytes())
     }
@@ -275,7 +319,7 @@ impl ValidationInputs {
 
 fn validation_fingerprint(command: &Value, revision: &str, inputs: &ValidationInputs) -> String {
     digest(
-        json!([2, revision, command, inputs.fingerprint()])
+        json!([INPUT_MODEL_VERSION, revision, command, inputs.fingerprint()])
             .to_string()
             .as_bytes(),
     )
@@ -335,18 +379,29 @@ fn toolchain(
     cwd: &Path,
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
-) -> VResult<String> {
+) -> VResult<(String, Option<String>)> {
     let program = command["program"].as_str().ok_or("program missing")?;
     let executable = executable_identity(program, cancelled)?;
     let version = probe_bytes(program, &["--version"], cwd, 4096, deadline, cancelled)?;
     if program == "git" {
-        return Ok(digest(
-            json!([executable, digest(&version)]).to_string().as_bytes(),
+        return Ok((
+            digest(json!([executable, digest(&version)]).to_string().as_bytes()),
+            None,
         ));
     }
-    let rustc = executable_identity("rustc", cancelled)?;
+    let compiler = std::env::var_os("RUSTC")
+        .or_else(|| std::env::var_os("CARGO_BUILD_RUSTC"))
+        .unwrap_or_else(|| "rustc".into());
+    let compiler = PathBuf::from(compiler);
+    let compiler = if compiler.is_relative() && compiler.components().count() > 1 {
+        cwd.join(compiler)
+    } else {
+        compiler
+    };
+    let compiler = compiler.to_str().ok_or("non UTF-8 compiler path")?;
+    let rustc = executable_identity(compiler, cancelled)?;
     let rustc_version = probe_bytes(
-        "rustc",
+        compiler,
         &["--version", "--verbose"],
         cwd,
         4096,
@@ -364,42 +419,33 @@ fn toolchain(
     {
         return Err("invalid rustc host".into());
     }
-    let active_toolchain = if SystemProcessHost.find_in_path("rustup").is_some() {
-        Some(digest(&probe_bytes(
-            "rustup",
-            &["show", "active-toolchain"],
-            cwd,
-            4096,
-            deadline,
-            cancelled,
-        )?))
-    } else {
-        None
-    };
     let target = command["args"].as_array().and_then(|args| {
         args.windows(2)
             .find(|pair| pair[0] == "--target")
             .map(|pair| pair[1].clone())
     });
-    Ok(digest(
-        json!([
-            executable,
-            digest(&version),
-            rustc,
-            digest(&rustc_version),
-            host,
-            active_toolchain,
-            target
-        ])
-        .to_string()
-        .as_bytes(),
+    Ok((
+        digest(
+            json!([
+                executable,
+                digest(&version),
+                rustc,
+                digest(&rustc_version),
+                host,
+                target
+            ])
+            .to_string()
+            .as_bytes(),
+        ),
+        Some(host.to_string()),
     ))
 }
 
-fn environment(command: &Value) -> (String, Vec<String>) {
+fn environment(command: &Value, host: Option<&str>) -> (String, Vec<String>) {
     let cargo = command["program"] == "cargo";
     let mut facts = BTreeMap::new();
     let mut unsupported = Vec::new();
+    // Never enumerate environment entries: even unused values may contain credentials.
     for name in if cargo {
         CARGO_ENVIRONMENT
     } else {
@@ -410,48 +456,175 @@ fn environment(command: &Value) -> (String, Vec<String>) {
             std::env::var_os(name).map(|value| digest(value.to_string_lossy().as_bytes())),
         );
     }
-    for (name, value) in std::env::vars_os() {
-        let name = name.to_string_lossy();
-        // Only target compiler/linker knobs are admitted dynamically, never registry credentials.
-        let target = cargo
-            && name.starts_with("CARGO_TARGET_")
-            && ["_LINKER", "_RUSTFLAGS"]
-                .iter()
-                .any(|suffix| name.ends_with(suffix));
-        if target {
-            facts.insert(
-                name.to_string(),
-                Some(digest(value.to_string_lossy().as_bytes())),
-            );
-        } else if cargo
-            && (name.starts_with("CARGO_") || name.starts_with("RUST"))
-            && !CARGO_ENVIRONMENT.contains(&name.as_ref())
-            && ![
-                "RUST_LOG",
-                "RUSTDOCFLAGS",
-                "CARGO_ENCODED_RUSTDOCFLAGS",
-                "CARGO_ZIGBUILD_CACHE_DIR",
-            ]
-            .contains(&name.as_ref())
-        {
-            unsupported.push("unmodeled_cargo_environment".to_string());
-        } else if !cargo
-            && name.starts_with("GIT_")
-            && ![
-                "GIT_PAGER",
-                "GIT_EDITOR",
-                "GIT_TRACE",
-                "GIT_TRACE_PACKET",
-                "GIT_TRACE_PERFORMANCE",
-            ]
-            .contains(&name.as_ref())
-        {
-            unsupported.push("git_environment_override".to_string());
+    if cargo {
+        let mut targets = Vec::new();
+        if let Some(host) = host {
+            targets.push(host.to_string());
+        }
+        if let Some(target) = std::env::var_os("CARGO_BUILD_TARGET") {
+            targets.push(target.to_string_lossy().into_owned());
+        }
+        if let Some(args) = command["args"].as_array() {
+            for pair in args.windows(2) {
+                if pair[0] == "--target" {
+                    if let Some(target) = pair[1].as_str() {
+                        targets.push(target.to_string());
+                    }
+                }
+            }
+        }
+        targets.sort();
+        targets.dedup();
+        for target in targets {
+            if target.len() > 128
+                || !target
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                unsupported.push("opaque_build_inputs".to_string());
+                continue;
+            }
+            let target = target.to_ascii_uppercase().replace('-', "_");
+            for suffix in ["LINKER", "RUSTFLAGS"] {
+                let name = format!("CARGO_TARGET_{target}_{suffix}");
+                // A target supplied by argv/environment must never turn into a credential variable name.
+                if name.split('_').any(|part| {
+                    matches!(
+                        part,
+                        "TOKEN" | "KEY" | "SECRET" | "PASSWORD" | "CREDENTIAL" | "APIKEY"
+                    )
+                }) {
+                    unsupported.push("opaque_build_inputs".to_string());
+                    continue;
+                }
+                facts.insert(
+                    name.clone(),
+                    std::env::var_os(name).map(|value| digest(value.to_string_lossy().as_bytes())),
+                );
+            }
+        }
+    } else if [
+        "GIT_EXTERNAL_DIFF",
+        "GIT_EXEC_PATH",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+    ]
+    .iter()
+    .any(|name| facts.get(*name).is_some_and(Option::is_some))
+    {
+        unsupported.push("opaque_git_inputs".to_string());
+    }
+    (digest(json!(facts).to_string().as_bytes()), unsupported)
+}
+
+fn cargo_boundary(
+    root: &ProjectRoot,
+    command: &Value,
+    cwd: &Path,
+    source: &Snapshot,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> VResult<(String, Vec<String>)> {
+    // --no-deps avoids resolving/downloading or traversing external dependency contents.
+    let mut args = vec![
+        "metadata",
+        "--format-version",
+        "1",
+        "--no-deps",
+        "--locked",
+        "--offline",
+    ];
+    if let Some(argv) = command["args"].as_array() {
+        let mut position = 1;
+        while position < argv.len() {
+            match argv[position].as_str() {
+                Some("--all-features" | "--no-default-features") => {
+                    args.push(argv[position].as_str().ok_or("invalid feature flag")?)
+                }
+                Some("--features") => {
+                    args.push("--features");
+                    position += 1;
+                    args.push(
+                        argv.get(position)
+                            .and_then(Value::as_str)
+                            .ok_or("missing features")?,
+                    );
+                }
+                _ => {}
+            }
+            position += 1;
         }
     }
-    unsupported.sort();
-    unsupported.dedup();
-    (digest(json!(facts).to_string().as_bytes()), unsupported)
+    let bytes = probe_bytes("cargo", &args, cwd, 1024 * 1024, deadline, cancelled)?;
+    let metadata: Value = serde_json::from_slice(&bytes)?;
+    if metadata["version"] != 1 {
+        return Err("unsupported Cargo metadata version".into());
+    }
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or("Cargo packages unavailable")?;
+    if packages.is_empty() || packages.len() > 512 {
+        return Err("Cargo metadata package limit".into());
+    }
+    let mut risks = Vec::new();
+    let mut facts = Vec::new();
+    for package in packages {
+        active(cancelled)?;
+        let manifest = Path::new(
+            package["manifest_path"]
+                .as_str()
+                .ok_or("manifest path unavailable")?,
+        );
+        if !source.stamps.contains_key(manifest) {
+            risks.push("external_path_dependency".to_string());
+        }
+        let targets = package["targets"].as_array().ok_or("targets unavailable")?;
+        let opaque = targets.iter().any(|target| {
+            target["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "custom-build"))
+        });
+        if opaque {
+            risks.push("opaque_build_inputs".to_string());
+        }
+        facts.push(json!([
+            digest(manifest.to_string_lossy().as_bytes()),
+            opaque
+        ]));
+        let dependencies = package["dependencies"]
+            .as_array()
+            .ok_or("dependencies unavailable")?;
+        if dependencies.len() > 2048 {
+            return Err("Cargo dependency count limit".into());
+        }
+        for dependency in dependencies {
+            if let Some(path) = dependency["path"].as_str() {
+                let path = Path::new(path);
+                let inside = path
+                    .strip_prefix(root.path())
+                    .ok()
+                    .and_then(|relative| relative.to_str())
+                    .and_then(|relative| root.resolve_existing(relative).ok());
+                if let Some(inside) = inside {
+                    if !source.stamps.contains_key(&inside.join("Cargo.toml")) {
+                        risks.push("dependency_inputs_untracked".to_string());
+                    }
+                } else {
+                    risks.push("external_path_dependency".to_string());
+                }
+                facts.push(json!(["path", digest(path.to_string_lossy().as_bytes())]));
+            } else {
+                // Registry/Git sources and their transitive build steps are outside the Project snapshot.
+                risks.push("dependency_inputs_untracked".to_string());
+                facts.push(json!(["external_dependency"]));
+            }
+        }
+    }
+    facts.sort_by_key(Value::to_string);
+    risks.sort();
+    risks.dedup();
+    Ok((digest(json!(facts).to_string().as_bytes()), risks))
 }
 
 fn cargo_config(
@@ -459,13 +632,13 @@ fn cargo_config(
     cwd: &Path,
     source: &Snapshot,
 ) -> VResult<(String, Vec<String>)> {
-    let mut unsupported = vec!["cargo_compiler_dependency_input_closure_unproven".to_string()];
+    let mut unsupported = vec!["compiler_input_closure_unproven".to_string()];
     if source
         .stamps
         .keys()
         .any(|path| path.file_name().is_some_and(|name| name == "build.rs"))
     {
-        unsupported.push("build_script_inputs_unproven".to_string());
+        unsupported.push("opaque_build_inputs".to_string());
     }
     let mut external = Vec::new();
     // Inside-project manifests, lockfiles and Cargo configuration are already content-hashed by source.
@@ -478,7 +651,7 @@ fn cargo_config(
             match fs::symlink_metadata(&path) {
                 Ok(_) => {
                     external.push(digest(path.to_string_lossy().as_bytes()));
-                    unsupported.push("external_cargo_config_or_workspace".to_string());
+                    unsupported.push("external_cargo_config".to_string());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -493,7 +666,7 @@ fn cargo_config(
         match fs::symlink_metadata(home.join(name)) {
             Ok(_) => {
                 external.push(name.to_string());
-                unsupported.push("user_global_cargo_config_unproven".to_string());
+                unsupported.push("external_cargo_config".to_string());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -531,14 +704,21 @@ fn git_state(
         deadline,
         cancelled,
     )?;
-    let git_directory = PathBuf::from(
-        std::str::from_utf8(&repository)?
-            .lines()
-            .next()
-            .ok_or("Git directory missing")?,
-    );
-    let index_stamp =
-        crate::context::fulltext::metadata_stamp(&fs::metadata(git_directory.join("index"))?);
+    let index_path = probe_bytes(
+        "git",
+        &["rev-parse", "--git-path", "index"],
+        cwd,
+        4096,
+        deadline,
+        cancelled,
+    )?;
+    let index_path = PathBuf::from(std::str::from_utf8(&index_path)?.trim());
+    let index_path = if index_path.is_absolute() {
+        index_path
+    } else {
+        cwd.join(index_path)
+    };
+    let index_stamp = crate::context::fulltext::metadata_stamp(&fs::metadata(&index_path)?);
     let head = probe_bytes(
         "git",
         &["rev-parse", "--verify", "HEAD"],
@@ -547,11 +727,13 @@ fn git_state(
         deadline,
         cancelled,
     )?;
-    let config = probe(
+    // Discover unknown configuration names without copying potentially credential-bearing values.
+    let names = probe(
         "git",
         &[
             "config",
             "--null",
+            "--name-only",
             "--get-regexp",
             "^(core\\.|diff\\.|filter\\.|extensions\\.)",
         ],
@@ -560,49 +742,81 @@ fn git_state(
         deadline,
         cancelled,
     )?;
+    if !names.success && names.exit != crate::process::ProcessExit::Code(1) {
+        return Err("Git config names unavailable".into());
+    }
+    let safe = [
+        "core.whitespace",
+        "core.autocrlf",
+        "core.safecrlf",
+        "core.eol",
+        "core.filemode",
+        "core.symlinks",
+        "core.ignorecase",
+        "core.precomposeunicode",
+        "diff.algorithm",
+        "diff.renames",
+        "diff.relative",
+        "diff.ignoresubmodules",
+        "diff.mnemonicprefix",
+        "diff.noprefix",
+        "diff.context",
+        "core.repositoryformatversion",
+        "extensions.worktreeconfig",
+        "extensions.objectformat",
+        "extensions.refstorage",
+    ];
+    let ignored = [
+        "core.bare",
+        "core.logallrefupdates",
+        "core.pager",
+        "core.editor",
+        "core.quotepath",
+        "core.attributesfile",
+        "core.excludesfile",
+    ];
+    let mut unsupported = Vec::new();
+    for name in names
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let name = std::str::from_utf8(name)?;
+        if !safe.contains(&name) && !ignored.contains(&name) {
+            unsupported.push("opaque_git_inputs".to_string());
+        }
+    }
+    let pattern = format!(
+        "^({})$",
+        safe.iter()
+            .map(|name| name.replace('.', "\\."))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    let config = probe(
+        "git",
+        &["config", "--null", "--get-regexp", &pattern],
+        cwd,
+        64 * 1024,
+        deadline,
+        cancelled,
+    )?;
     if !config.success && config.exit != crate::process::ProcessExit::Code(1) {
         return Err("Git config probe failed".into());
     }
-    let mut unsupported = Vec::new();
     let mut relevant = BTreeMap::new();
     for entry in config
         .stdout
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
-        let text = std::str::from_utf8(entry)?;
-        let (name, value) = text.split_once('\n').ok_or("invalid Git config record")?;
-        match name {
-            "core.whitespace"
-            | "core.autocrlf"
-            | "core.safecrlf"
-            | "core.eol"
-            | "core.filemode"
-            | "core.symlinks"
-            | "core.ignorecase"
-            | "core.precomposeunicode"
-            | "diff.algorithm"
-            | "diff.renames"
-            | "diff.relative"
-            | "diff.ignoresubmodules"
-            | "diff.mnemonicprefix"
-            | "diff.noprefix"
-            | "diff.context"
-            | "core.repositoryformatversion"
-            | "extensions.worktreeconfig"
-            | "extensions.objectformat"
-            | "extensions.refstorage" => {
-                relevant.insert(name, digest(value.as_bytes()));
-            }
-            "core.bare"
-            | "core.logallrefupdates"
-            | "core.pager"
-            | "core.editor"
-            | "core.quotepath"
-            | "core.attributesfile"
-            | "core.excludesfile" => {}
-            _ => unsupported.push("unmodeled_git_config_or_external_filter".to_string()),
+        let (name, value) = std::str::from_utf8(entry)?
+            .split_once('\n')
+            .ok_or("invalid Git config record")?;
+        if !safe.contains(&name) {
+            return Err("unexpected Git config input".into());
         }
+        relevant.insert(name, digest(value.as_bytes()));
     }
     let index = probe_bytes(
         "git",
@@ -648,7 +862,7 @@ fn git_state(
             if matches!(entry[1], b"filter" | b"diff" | b"working-tree-encoding")
                 && !matches!(entry[2], b"unset" | b"unspecified")
             {
-                unsupported.push("external_git_attribute_driver_or_encoding".to_string());
+                unsupported.push("opaque_git_inputs".to_string());
             }
         }
         attributes.push(digest(&output));
@@ -731,8 +945,7 @@ fn git_state(
         deadline,
         cancelled,
     )?;
-    let index_stamp_after =
-        crate::context::fulltext::metadata_stamp(&fs::metadata(git_directory.join("index"))?);
+    let index_stamp_after = crate::context::fulltext::metadata_stamp(&fs::metadata(&index_path)?);
     if head != head_after || index != index_after || index_stamp != index_stamp_after {
         return Err("Git state changed during fingerprint".into());
     }
@@ -756,17 +969,19 @@ fn inputs(
     deadline: Instant,
 ) -> ValidationInputs {
     let cwd = root.path().join(command["cwd"].as_str().unwrap_or("."));
-    let (environment, unsupported_inputs) = environment(command);
+    let (environment_fingerprint, unsupported_inputs) = environment(command, None);
     let mut result = ValidationInputs {
-        version: 2,
+        version: INPUT_MODEL_VERSION,
         toolchain: None,
-        environment,
+        environment: environment_fingerprint,
         config: None,
         git_state: None,
+        dependency_boundary: None,
         unsupported_inputs,
         unknown: false,
         toolchain_ms: 0,
         git_state_ms: 0,
+        dependency_boundary_ms: 0,
         git_index_stamp: None,
     };
     if Instant::now() >= deadline {
@@ -775,11 +990,25 @@ fn inputs(
     }
     let started = Instant::now();
     match toolchain(command, &cwd, deadline, cancelled) {
-        Ok(value) => result.toolchain = Some(value),
+        Ok((value, host)) => {
+            result.toolchain = Some(value);
+            let (environment, risks) = environment(command, host.as_deref());
+            result.environment = environment;
+            result.unsupported_inputs.extend(risks);
+        }
         Err(_) => result.unknown = true,
     }
     result.toolchain_ms = started.elapsed().as_millis();
     if command["program"] == "cargo" {
+        let started = Instant::now();
+        match cargo_boundary(root, command, &cwd, source, deadline, cancelled) {
+            Ok((boundary, risks)) => {
+                result.dependency_boundary = Some(boundary);
+                result.unsupported_inputs.extend(risks);
+            }
+            Err(_) => result.unknown = true,
+        }
+        result.dependency_boundary_ms = started.elapsed().as_millis();
         match cargo_config(root, &cwd, source) {
             Ok((config, risks)) => {
                 result.config = Some(config);
@@ -805,7 +1034,7 @@ fn inputs(
     if command["program"] == "cargo" && command["args"][0] == "build" {
         result
             .unsupported_inputs
-            .push("external_linker_system_dependencies_unproven".to_string());
+            .push("opaque_build_inputs".to_string());
     }
     result.unsupported_inputs.sort();
     result.unsupported_inputs.dedup();
@@ -816,55 +1045,102 @@ fn applicability(
     evidence: &Value,
     current: &Snapshot,
     observed: &ValidationInputs,
-) -> &'static str {
-    let stored: ValidationInputs =
-        match serde_json::from_value::<ValidationInputs>(evidence["validation_inputs"].clone()) {
-            Ok(inputs) if evidence["input_model_version"] == 2 && inputs.version == 2 => inputs,
-            _ => return "unknown",
-        };
-    let Some(revision) = evidence["project_revision"].as_str() else {
-        return "unknown";
+    current_command: Option<&Value>,
+) -> (&'static str, Vec<String>) {
+    let unavailable = || {
+        (
+            "unverifiable",
+            vec!["applicability_unavailable".to_string()],
+        )
     };
+    let Some(revision) = evidence["project_revision"].as_str() else {
+        return unavailable();
+    };
+    if revision != current.revision {
+        return ("stale", vec!["source_changed".to_string()]);
+    }
+    let stored =
+        match serde_json::from_value::<ValidationInputs>(evidence["validation_inputs"].clone()) {
+            Ok(inputs)
+                if evidence["input_model_version"] == INPUT_MODEL_VERSION
+                    && inputs.version == INPUT_MODEL_VERSION =>
+            {
+                inputs
+            }
+            _ => return unavailable(),
+        };
     if evidence["validation_input_fingerprint"]
         != validation_fingerprint(&evidence["command"], revision, &stored)
     {
-        return "unknown";
+        return unavailable();
     }
-    if evidence["project_revision"] != current.revision {
-        return "stale_source";
+    let mut changed = Vec::new();
+    if current_command.is_some_and(|command| evidence["command"] != *command) {
+        changed.push("command_changed".to_string());
     }
     if stored.toolchain != observed.toolchain
         && stored.toolchain.is_some()
         && observed.toolchain.is_some()
     {
-        return "stale_toolchain";
+        changed.push("toolchain_changed".to_string());
     }
-    if stored.environment != observed.environment {
-        return "stale_environment";
+    if !observed.environment.is_empty() && stored.environment != observed.environment {
+        changed.push("environment_changed".to_string());
     }
-    if stored.unknown || observed.unknown || evidence["stable_during_execution"] != true {
-        return "unknown";
+    if evidence["command"]["program"] == "git"
+        && ((stored.git_state != observed.git_state
+            && stored.git_state.is_some()
+            && observed.git_state.is_some())
+            || (stored.config != observed.config
+                && stored.config.is_some()
+                && observed.config.is_some()))
+    {
+        changed.push("git_state_changed".to_string());
+    } else if evidence["command"]["program"] == "cargo"
+        && stored.config != observed.config
+        && stored.config.is_some()
+        && observed.config.is_some()
+    {
+        changed.push("configuration_changed".to_string());
     }
-    if !stored.unsupported_inputs.is_empty() || !observed.unsupported_inputs.is_empty() {
-        return "unsupported_inputs";
+    if stored.dependency_boundary != observed.dependency_boundary
+        && stored.dependency_boundary.is_some()
+        && observed.dependency_boundary.is_some()
+    {
+        changed.push("dependency_boundary_changed".to_string());
     }
-    if stored.toolchain.is_none()
+    if !changed.is_empty() {
+        return ("stale", changed);
+    }
+    let mut reasons = stored
+        .unsupported_inputs
+        .iter()
+        .chain(&observed.unsupported_inputs)
+        .cloned()
+        .collect::<Vec<_>>();
+    if stored.unknown
+        || observed.unknown
+        || evidence["stable_during_execution"] != true
+        || current_command.is_none()
+        || stored.toolchain.is_none()
         || observed.toolchain.is_none()
         || stored.config.is_none()
         || observed.config.is_none()
         || (evidence["command"]["program"] == "git"
             && (stored.git_state.is_none() || observed.git_state.is_none()))
+        || (evidence["command"]["program"] == "cargo"
+            && (stored.dependency_boundary.is_none() || observed.dependency_boundary.is_none()))
     {
-        return "unknown";
+        reasons.push("applicability_unavailable".to_string());
     }
-    if stored.git_state != observed.git_state || stored.config != observed.config {
-        return if evidence["command"]["program"] == "git" {
-            "stale_git_state"
-        } else {
-            "unsupported_inputs"
-        };
+    reasons.sort();
+    reasons.dedup();
+    reasons.truncate(16);
+    if reasons.is_empty() {
+        ("applicable", reasons)
+    } else {
+        ("unverifiable", reasons)
     }
-    "applicable"
 }
 
 pub(super) struct Observation {
@@ -953,7 +1229,7 @@ impl Observation {
             ]))?);
             let mut evidence = json!({"identity":identity,"project_id":job.project_id,"project_revision":self.snapshot.revision,
                 "command":self.command,"environment_fingerprint":self.inputs.environment,"stable_during_execution":stable,
-                "input_model_version":2,"validation_inputs":self.inputs,"validation_input_fingerprint":validation_fingerprint(&self.command,&self.snapshot.revision,&self.inputs),
+                "input_model_version":INPUT_MODEL_VERSION,"validation_inputs":self.inputs,"validation_input_fingerprint":validation_fingerprint(&self.command,&self.snapshot.revision,&self.inputs),
                 "status":if result.success {"passed"} else {"failed"},"exit":exit,
                 "started_at_ms":self.started,"finished_at_ms":finished,"duration_ms":result.metadata.get("durationMs"),
                 "provenance":{"job_id":job.id,"attempt_id":attempt.id,"call_id":call.id,"generation":call.generation},
@@ -1071,7 +1347,9 @@ pub(super) fn query(
         let project = DomainRepository::open_existing(root.path())?
             .project_at_root(root.path())?
             .ok_or("Project missing")?;
+        let source_started = Instant::now();
         let current = snapshot(root, cancelled)?;
+        let source_revision_ms = source_started.elapsed().as_millis();
         let mut observations = BTreeMap::new();
         let (rows, rebuilt) = with_store(root, cancelled, |connection, rebuilt| {
             let mut statement = connection.prepare("SELECT body FROM evidence WHERE finished>=?1 ORDER BY finished DESC,call_id LIMIT 128")?;
@@ -1107,9 +1385,14 @@ pub(super) fn query(
             {
                 continue;
             }
-            let command = evidence["command"].clone();
+            let normalized = command(root, &evidence["command"]).ok();
+            let command = normalized.as_ref().unwrap_or(&evidence["command"]).clone();
             let key = command.to_string();
             let observed = observations.entry(key).or_insert_with(|| {
+                // A derived record is never authority to probe an unvalidated command or cwd.
+                if normalized.is_none() {
+                    return ValidationInputs::unavailable();
+                }
                 inputs(
                     root,
                     &command,
@@ -1118,13 +1401,15 @@ pub(super) fn query(
                     started + Duration::from_secs(3),
                 )
             });
-            let reason = applicability(&evidence, &current, observed);
-            let applies = reason == "applicable";
+            let (state, reasons) =
+                applicability(&evidence, &current, observed, normalized.as_ref());
+            let applies = state == "applicable";
             evidence["applicable"] = json!(applies);
             evidence["reusable"] = json!(applies);
-            evidence["stale"] = json!(!applies);
-            evidence["applicability"] = json!(reason);
-            evidence["reason"] = json!(reason);
+            evidence["stale"] = json!(state == "stale");
+            evidence["applicability"] = json!(state);
+            evidence["reason"] = json!(reasons.first());
+            evidence["reasons"] = json!(reasons);
             evidence["current_validation_input_fingerprint"] = json!(validation_fingerprint(
                 &command,
                 &current.revision,
@@ -1150,7 +1435,7 @@ pub(super) fn query(
             output: json!({"project_id":project.id,"project_revision":current.revision,"evidence":entries,
             "scope":{"excluded_directories":EXCLUDED,"environment":"explicit per-command allowlist; unproven Cargo compiler/dependency closure is never reusable","reuse":"discovery_only; never automatically skip execution"},"rebuilt":rebuilt}),
             truncated,
-            metadata: json!({"elapsed_ms":started.elapsed().as_millis(),"toolchain_fingerprint_ms":observations.values().map(|inputs| inputs.toolchain_ms).sum::<u128>(),"git_state_fingerprint_ms":observations.values().map(|inputs| inputs.git_state_ms).sum::<u128>()}),
+            metadata: json!({"elapsed_ms":started.elapsed().as_millis(),"source_revision_ms":source_revision_ms,"dependency_boundary_ms":observations.values().map(|inputs| inputs.dependency_boundary_ms).sum::<u128>(),"toolchain_fingerprint_ms":observations.values().map(|inputs| inputs.toolchain_ms).sum::<u128>(),"git_state_fingerprint_ms":observations.values().map(|inputs| inputs.git_state_ms).sum::<u128>()}),
             error: None,
         })
     };
