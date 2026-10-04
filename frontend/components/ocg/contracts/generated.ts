@@ -422,7 +422,12 @@ export type ProjectRecord = { project_id: string, root: string, boundary: string
 export type ProjectScope = string;
 
 
-export type ProjectUsageResponse = { api_version: CanonicalApiVersion, project_id: string, window: UsageWindow, window_started_at: number | null, generated_at: number, conversations: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, conversation_rows: Array<UsageConversationRow>, truncated: boolean, };
+export type ProjectUsageResponse = { api_version: CanonicalApiVersion, project_id: string, window: UsageWindow,
+/**
+ * Epoch seconds at which `window` begins. For `Today` this is the most
+ * recent UTC midnight, never the viewer's local midnight.
+ */
+window_started_at: number | null, generated_at: number, conversations: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, conversation_rows: Array<UsageConversationRow>, truncated: boolean, };
 
 
 export type ProjectionEffect = "reducible" | "snapshot_barrier";
@@ -668,6 +673,14 @@ export type UsageTokenTotals = { input: UsageQuantity, output: UsageQuantity, re
 export type UsageTotals = { turns: number, jobs: number, attempts: number, provider_calls: number, native_calls: number, provider_requests: UsageQuantity, provider_rounds: UsageQuantity, tokens: UsageTokenTotals, cost: UsageCost, context_costs: ContextCostTotals, first_activity_at: number | null, last_activity_at: number | null, };
 
 
+/**
+ * The reporting window a usage projection is aggregated over.
+ *
+ * `Today` is a **UTC day**, not the viewer's local day: it begins at the most
+ * recent UTC midnight. The backend carries no authoritative user timezone, so
+ * the window boundary is UTC and the wire value is named and rendered as UTC
+ * rather than presented as a local "Today".
+ */
 export type UsageWindow = "all" | "today" | "7d" | "30d";
 
 /**

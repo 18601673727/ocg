@@ -16,26 +16,70 @@ pub enum ToolProjectionProfile {
 }
 
 impl ToolProjectionProfile {
-    fn includes(self, canonical_name: &str) -> bool {
+    /// The canonical tool names this profile can select.
+    ///
+    /// This list is part of the projection contract itself, not of the current
+    /// registry, so validating a frozen projection against it stays stable across
+    /// binary upgrades that change which Native Tools exist.
+    fn canonical_names(self) -> &'static [&'static str] {
         match self {
-            Self::Full => true,
-            Self::Context => matches!(
-                canonical_name,
-                "context.search" | "context.read" | "context.snapshot" | "context.validation"
-            ),
-            Self::Coding => matches!(
-                canonical_name,
-                "context.search"
-                    | "context.read"
-                    | "filesystem.list"
-                    | "filesystem.read"
-                    | "filesystem.edit"
-                    | "filesystem.search"
-                    | "process.exec"
-            ),
-            Self::NoTools => false,
+            Self::Full => &["*"],
+            Self::Context => &[
+                "context.search",
+                "context.read",
+                "context.snapshot",
+                "context.validation",
+            ],
+            Self::Coding => &[
+                "context.search",
+                "context.read",
+                "filesystem.list",
+                "filesystem.read",
+                "filesystem.edit",
+                "filesystem.search",
+                "process.exec",
+            ],
+            Self::NoTools => &[],
         }
     }
+
+    fn includes(self, canonical_name: &str) -> bool {
+        let names = self.canonical_names();
+        names.contains(&"*") || names.contains(&canonical_name)
+    }
+
+    /// Whether every wire-format name in `wire_names` is selectable by this
+    /// profile, judged against the profile contract rather than the registry.
+    ///
+    /// This deliberately does not consult [`NativeToolRegistry`]: the profile's
+    /// own name list is the stable part of the contract, so a frozen projection
+    /// stays valid when an upgrade changes which Native Tools exist.
+    fn includes_name(self, wire_names: &[String]) -> bool {
+        if self == Self::Full {
+            // `Full` projects the whole registry, so the only decidable
+            // property is that each name is a well-formed tool name.
+            return wire_names.iter().all(|name| is_wellformed_tool_name(name));
+        }
+        // A wire name is its canonical name with `.` replaced by `_`, so the
+        // profile's canonical names project to exactly the names it may freeze.
+        let allowed = self
+            .canonical_names()
+            .iter()
+            .map(|name| name.replace('.', "_"))
+            .collect::<Vec<_>>();
+        wire_names
+            .iter()
+            .all(|name| allowed.iter().any(|allowed| allowed == name))
+    }
+}
+
+/// A wire tool name must be a non-empty, bounded, `[a-z0-9_]` identifier.
+fn is_wellformed_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +166,19 @@ fn schema_bytes(tools: &[Value]) -> Result<usize> {
         .map_err(|error| OcgError::config(format!("serialize tool projection: {error}")))
 }
 
+/// Validates an already-admitted Call's frozen tool projection.
+///
+/// Recovery trusts the frozen admission facts and validates them *internally*:
+/// the frozen schemas are the only authority for what this Call may carry. The
+/// current binary's [`NativeToolRegistry`] is deliberately not consulted here.
+/// An upgrade that adds or drops a Native Tool changes the registry for NEW
+/// admissions, but it must not retroactively invalidate a Call that was already
+/// admitted against a different registry, because that would make a valid frozen
+/// Call unreplayable after an ordinary binary upgrade.
+///
+/// Malformed or tampered frozen data still fails closed: the schemas must be
+/// well-formed tool schemas, and every recorded count, name, and byte total must
+/// agree with the frozen schemas themselves.
 pub(crate) fn frozen(input: &Value) -> Result<Option<ToolProjectionFacts>> {
     let Some(value) = input.get("tool_projection") else {
         return Ok(None);
@@ -131,19 +188,29 @@ pub(crate) fn frozen(input: &Value) -> Result<Option<ToolProjectionFacts>> {
     let tools = input["arguments"]["tools"]
         .as_array()
         .ok_or_else(|| OcgError::config("frozen tool projection has no schemas"))?;
-    let expected_names = NativeToolRegistry::definitions()
-        .into_iter()
-        .filter(|definition| facts.profile.includes(definition.name))
-        .map(|definition| definition.name.replace('.', "_"))
-        .collect::<Vec<_>>();
-    if tools.len() != facts.projected_tool_count
-        || facts.visible_tool_names != expected_names
-        || names(tools)? != facts.visible_tool_names
-        || schema_bytes(tools)? != facts.projected_schema_bytes
-        || facts.projected_schema_bytes > facts.full_schema_baseline_bytes
-        || facts.schema_bytes_saved
-            != facts.full_schema_baseline_bytes - facts.projected_schema_bytes
-    {
+    let frozen_names = names(tools)?;
+    // Self-consistency of the frozen record: the recorded facts must describe
+    // exactly the schemas this Call froze.
+    let unique = {
+        let mut unique = frozen_names.clone();
+        unique.sort();
+        unique.dedup();
+        unique.len() == frozen_names.len()
+    };
+    let consistent = unique
+        && frozen_names.len() == facts.projected_tool_count
+        && facts.projected_tool_count == tools.len()
+        && facts.visible_tool_names == frozen_names
+        && schema_bytes(tools)? == facts.projected_schema_bytes
+        && facts.projected_schema_bytes <= facts.full_schema_baseline_bytes
+        && facts.schema_bytes_saved
+            == facts
+                .full_schema_baseline_bytes
+                .saturating_sub(facts.projected_schema_bytes);
+    // Every frozen name must be one this profile is allowed to project, judged
+    // against the profile contract rather than the current registry.
+    let profile_consistent = facts.profile.includes_name(&frozen_names);
+    if !consistent || !profile_consistent {
         return Err(OcgError::config(
             "frozen tool projection facts differ from schemas",
         ));

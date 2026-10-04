@@ -553,6 +553,9 @@ impl DomainRepository {
         let generated_at = now();
         let since = match window {
             UsageWindow::All => None,
+            // A UTC day, not the viewer's local day: the backend carries no
+            // authoritative user timezone, so the boundary is the most recent
+            // UTC midnight and the wire contract documents it as such.
             UsageWindow::Today => Some(generated_at - generated_at.rem_euclid(86400)),
             UsageWindow::SevenDays => Some(generated_at.saturating_sub(7 * 86400)),
             UsageWindow::ThirtyDays => Some(generated_at.saturating_sub(30 * 86400)),

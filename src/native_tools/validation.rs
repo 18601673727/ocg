@@ -1421,8 +1421,7 @@ pub(super) fn query_current(
             } else {
                 &unavailable
             };
-            let (state, reasons) =
-                applicability(&evidence, &current, observed, normalized.as_ref());
+            let (state, reasons) = applicability(&evidence, current, observed, normalized.as_ref());
             let applies = state == "applicable";
             evidence["applicable"] = json!(applies);
             evidence["reusable"] = json!(applies);

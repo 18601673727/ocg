@@ -304,11 +304,18 @@ pub struct UsageBreakdown {
     pub totals: UsageTotals,
 }
 
+/// The reporting window a usage projection is aggregated over.
+///
+/// `Today` is a **UTC day**, not the viewer's local day: it begins at the most
+/// recent UTC midnight. The backend carries no authoritative user timezone, so
+/// the window boundary is UTC and the wire value is named and rendered as UTC
+/// rather than presented as a local "Today".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageWindow {
     #[default]
     All,
+    /// Totals since the most recent UTC midnight.
     Today,
     #[serde(rename = "7d")]
     SevenDays,
@@ -333,6 +340,8 @@ pub struct ProjectUsageResponse {
     pub api_version: String,
     pub project_id: String,
     pub window: UsageWindow,
+    /// Epoch seconds at which `window` begins. For `Today` this is the most
+    /// recent UTC midnight, never the viewer's local midnight.
     pub window_started_at: Option<i64>,
     pub generated_at: i64,
     pub conversations: u64,
