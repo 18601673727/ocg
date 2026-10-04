@@ -7,6 +7,7 @@
 
 mod evidence;
 pub mod openai_projection;
+mod validation;
 
 use crate::edit;
 use crate::error::{OcgError, Result};
@@ -39,6 +40,7 @@ pub enum NativeToolExecutorBinding {
     FilesystemSearch,
     ContextSearch,
     ContextRead,
+    ContextValidation,
     FilesystemEdit,
     ProcessExec,
 }
@@ -342,6 +344,17 @@ impl NativeToolRegistry {
                 argument_aliases: &[],
             },
             NativeToolDefinition {
+                name: "context.validation",
+                description: "Discover durable validation facts for this Project source revision. Optional program + exact args + Project-relative cwd filters cargo check/build or git diff --check; omit these to list recent evidence. Each fact includes passed/failed, applicability, source/environment fingerprints and producing Job/Attempt/Call. Stale facts do not validate current sources. No command is executed and no execution is skipped. Scope excludes build outputs and external dependencies; facts are not an automatic skip policy.",
+                parameters: json!({"type":"object","additionalProperties":false,"properties":{"program":{"type":"string","enum":["cargo","git"]},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::ContextValidation,
+                aliases: &[],
+                target_field: None,
+                argument_aliases: &[],
+            },
+            NativeToolDefinition {
                 name: "filesystem.edit",
                 description: "Apply a transactional Robust Edit inside the current Project root.",
                 parameters: json!({"type":"object","additionalProperties":false,"required":["operation","file"],"properties":{"operation":{"type":"string","enum":["replace","insertBefore","insertAfter","append"]},"file":{"type":"string"},"expectedRevision":{"type":"string"},"oldString":{"type":"string"},"old_string":{"type":"string"},"anchor":{"type":"string"},"newString":{"type":"string"},"content":{"type":"string"}}}),
@@ -636,6 +649,9 @@ impl NativeToolExecutor {
             NativeToolExecutorBinding::FilesystemSearch => self.search(arguments, cancelled),
             NativeToolExecutorBinding::ContextSearch => self.context_search(arguments, cancelled),
             NativeToolExecutorBinding::ContextRead => evidence::read(&self.root, arguments, cancelled),
+            NativeToolExecutorBinding::ContextValidation => {
+                validation::query(&self.root, arguments, cancelled)
+            }
             NativeToolExecutorBinding::FilesystemEdit => self.edit(arguments, cancelled),
             NativeToolExecutorBinding::ProcessExec => self.exec(arguments, cancelled),
         };
@@ -1112,6 +1128,7 @@ pub fn execute_canonical_tool_call(
         &payload,
     )?;
     domain.mark_dispatch_queued(&call.id)?;
+    let mut observation = None;
     let result = if definition.is_none() {
         ToolResult::failure(ToolError::new(
             ToolErrorKind::InvalidInput,
@@ -1146,13 +1163,21 @@ pub fn execute_canonical_tool_call(
         } else {
             domain.start_call(&call.id, &authority.attempt_id, authority.generation)?;
             match NativeToolExecutor::new(project_root) {
-                Ok(executor) => executor.execute(
-                    &request.name,
-                    &request.arguments,
-                    permission,
-                    policy,
-                    cancelled,
-                ),
+                Ok(executor) => {
+                    observation = validation::Observation::begin(
+                        &executor.root,
+                        &request.name,
+                        &request.arguments,
+                        &|| cancelled.load(Ordering::SeqCst),
+                    );
+                    executor.execute(
+                        &request.name,
+                        &request.arguments,
+                        permission,
+                        policy,
+                        cancelled,
+                    )
+                }
                 Err(error) => ToolResult::failure(ToolError::new(
                     ToolErrorKind::ExecutionFailure,
                     error.to_string(),
@@ -1189,6 +1214,13 @@ pub fn execute_canonical_tool_call(
             .is_err()
         {
             domain.fence_dispatch_intent(&call.id, &failure)?;
+        }
+    }
+    if let Some(observation) = observation {
+        if let Ok(root) = ProjectRoot::new(project_root) {
+            observation.finish(&root, domain, &call.id, &result, &|| {
+                cancelled.load(Ordering::SeqCst)
+            });
         }
     }
     Ok(result.bounded())
@@ -1305,6 +1337,8 @@ impl NativeToolCallHandler {
         domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)?;
         *claimed = true;
         drop(domain);
+        let observation =
+            validation::Observation::begin(&executor.root, name, &arguments, &cancelled);
         let result = executor.execute_cancellable(
             name,
             &arguments,
@@ -1341,6 +1375,15 @@ impl NativeToolCallHandler {
                 envelope.generation,
                 &serialized,
             )?;
+        }
+        if let Some(observation) = observation {
+            observation.finish(
+                &executor.root,
+                &domain,
+                &envelope.call_id,
+                &result,
+                &cancelled,
+            );
         }
         Ok(output)
     }
