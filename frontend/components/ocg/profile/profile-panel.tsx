@@ -114,9 +114,11 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
     const key = modelKey.trim();
     const id = modelId.trim();
     if (!key || !id || !modelProvider || !draft || draft.models[key] || !draft.providers[modelProvider]) return;
+    // A new model is draft-only, so it cannot become the default here: the
+    // backend has not confirmed it executable and this panel never establishes
+    // a default the backend has not reported in `runnable_choices`.
     change(profile => {
       profile.models[key] = { provider: modelProvider, id };
-      profile.defaultModel ??= key;
       return profile;
     });
     setModelKey(""); setModelId("");
