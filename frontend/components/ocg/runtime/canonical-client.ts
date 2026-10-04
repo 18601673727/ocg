@@ -19,6 +19,9 @@ import type { ProjectId } from "../project/domain";
 import type { CanonicalBackendEvent } from "./canonical-store";
 import {
   ContractError,
+  decodeChatImage,
+  type ChatImage,
+  type ChatImageUploadRequest,
   decodeChatConversationsResponse,
   decodeChatMessagesResponse,
   type ChatConversationsResponse,
@@ -93,6 +96,7 @@ function isCanonicalRejection<T>(value: CanonicalResult<T>): value is CanonicalR
 export { isCanonicalRejection };
 
 export interface CanonicalControlClient {
+  uploadChatImage?(request: ChatImageUploadRequest, signal?: AbortSignal): Promise<CanonicalResult<ChatImage>>;
   readChatConversations(projectId: string): Promise<CanonicalResult<ChatConversationsResponse>>;
   readChatMessages(projectId: string, sessionId: string): Promise<CanonicalResult<ChatMessagesResponse>>;
   listProjects(): Promise<ProjectRecord[]>;
@@ -151,7 +155,7 @@ export interface CanonicalControlClient {
 
 export type FetchLike = (
   input: string,
-  init?: { method?: string; body?: string; headers?: Record<string, string> },
+  init?: { method?: string; body?: string; headers?: Record<string, string>; signal?: AbortSignal },
 ) => Promise<{ status: number; ok: boolean; text(): Promise<string> }>;
 
 export type HttpCanonicalControlClientOptions = {
@@ -197,9 +201,11 @@ export function createHttpCanonicalControlClient(
     method: string,
     path: string,
     body: unknown,
+    signal?: AbortSignal,
   ): Promise<{ status: number; value: unknown; text: string }> {
     const response = await fetch(`${base}${path}`, {
       method,
+      signal,
       ...(body === undefined
         ? {}
         : { body: JSON.stringify(body), headers: { "content-type": "application/json" } }),
@@ -238,6 +244,11 @@ export function createHttpCanonicalControlClient(
   }
 
   return {
+    async uploadChatImage(request, signal) {
+      const { status, value, text } = await send("POST", "/api/v1/canonical/chat/images", request, signal);
+      if (status !== 200) return rejection("image-upload", status, text);
+      return decodeChatImage(value);
+    },
     async readChatConversations(projectId) {
       const { status, value, text } = await send("GET",
         `/api/v1/canonical/chat/conversations?project_id=${encodeURIComponent(projectId)}`, undefined);

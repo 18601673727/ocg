@@ -739,6 +739,17 @@ impl DomainRepository {
         attempt: &Attempt,
         content: &str,
     ) -> Result<Vec<serde_json::Value>> {
+        self.prepare_chat_turn_with_images(request, request_hash, attempt, content, &[])
+    }
+
+    pub fn prepare_chat_turn_with_images(
+        &self,
+        request: &crate::contracts::JobLaunchRequest,
+        request_hash: &str,
+        attempt: &Attempt,
+        content: &str,
+        images: &[crate::contracts::ChatImage],
+    ) -> Result<Vec<serde_json::Value>> {
         validate_id(&request.session_id)?;
         let transaction = self.begin()?;
         let owns_project: bool = transaction
@@ -796,7 +807,9 @@ impl DomainRepository {
                 user_id: "local".to_string(),
             },
             produced_by_attempt_ref: None,
-            blocks: vec![chat_text_block(content)],
+            blocks: std::iter::once(chat_text_block(content))
+                .chain(images.iter().map(chat_image_block))
+                .collect(),
             state: MessageLifecycle::Pending,
             revision: 0,
             created_at: timestamp.clone(),
@@ -827,6 +840,13 @@ impl DomainRepository {
         }
         // Only complete canonical messages enter history. The current staged
         // user is included explicitly, before the immutable Call is admitted.
+        let root: String = transaction
+            .query_row(
+                "SELECT root FROM domain_projects WHERE id=?1",
+                [&request.project_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
         let mut history = Vec::new();
         for message in read_conversation_messages(&transaction, conversation.id.as_str())? {
             if message.state != MessageLifecycle::Complete && message.id != user.id {
@@ -844,6 +864,31 @@ impl DomainRepository {
                 .filter_map(|block| block.content.as_deref())
                 .collect::<Vec<_>>()
                 .join("\n\n");
+            let mut parts = vec![serde_json::json!({"type": "text", "text": content})];
+            for block in message
+                .blocks
+                .iter()
+                .filter(|block| block.kind == MessageBlockKind::Image)
+            {
+                let image: crate::contracts::ChatImage = serde_json::from_value(
+                    block
+                        .raw
+                        .clone()
+                        .ok_or_else(|| invalid("image block has no image"))?,
+                )
+                .map_err(|error| invalid(&error.to_string()))?;
+                let url = crate::chat_images::upstream_url(
+                    std::path::Path::new(&root),
+                    &request.project_id,
+                    &image,
+                )?;
+                parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+            }
+            let content = if parts.len() == 1 {
+                serde_json::Value::String(content)
+            } else {
+                serde_json::Value::Array(parts)
+            };
             history.push(serde_json::json!({"role": role, "content": content}));
         }
         bump_conversation(&transaction, conversation.id.as_str())?;
@@ -5508,6 +5553,15 @@ fn chat_text_block(content: &str) -> MessageBlock {
     }
 }
 
+fn chat_image_block(image: &crate::contracts::ChatImage) -> MessageBlock {
+    MessageBlock {
+        kind: MessageBlockKind::Image,
+        content: None,
+        raw: Some(serde_json::json!(image)),
+        ..chat_text_block("")
+    }
+}
+
 fn read_conversation_messages(
     connection: &Connection,
     conversation_id: &str,
@@ -5632,6 +5686,25 @@ fn settle_chat_turn(
             MessageLifecycle::Complete,
             Some(content),
         )?;
+        if let Some(images) = response.get("images").and_then(serde_json::Value::as_array) {
+            let (root, project_id, record): (String, String, String) = transaction.query_row(
+                "SELECT p.root,t.project_id,m.record FROM domain_chat_turns t JOIN domain_projects p ON p.id=t.project_id JOIN domain_messages m ON m.attempt_id=t.attempt_id AND m.role='assistant' WHERE t.attempt_id=?1",
+                [attempt_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).map_err(sql)?;
+            let mut message: Message = decode_chat_record(&record)?;
+            for url in images.iter().take(crate::chat_images::MAX_IMAGES) {
+                let url = url.as_str().ok_or_else(|| invalid("invalid final image"))?;
+                let image =
+                    crate::chat_images::received(std::path::Path::new(&root), &project_id, url)?;
+                message.blocks.push(chat_image_block(&image));
+            }
+            transaction
+                .execute(
+                    "UPDATE domain_messages SET record=?2 WHERE id=?1",
+                    params![message.id.as_str(), encode_chat_record(&message)?],
+                )
+                .map_err(sql)?;
+        }
     } else {
         update_chat_message(
             transaction,

@@ -299,6 +299,7 @@ enum CandidateRepository {
 
 #[derive(Debug)]
 struct ChatRegistration {
+    images: Vec<crate::contracts::ChatImage>,
     selection: Option<crate::contracts::ChatModelSelection>,
     sender: flume::Sender<ExecutionEvent>,
     cancelled: CallCancellation,
@@ -923,6 +924,14 @@ impl CanonicalControlService {
                     } else {
                         None
                     },
+                    images: message
+                        .blocks
+                        .iter()
+                        .filter(|block| block.kind == MessageBlockKind::Image)
+                        .filter_map(|block| block.raw.clone())
+                        .map(serde_json::from_value)
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|error| invalid(error.to_string()))?,
                     content: message
                         .blocks
                         .into_iter()
@@ -1164,6 +1173,16 @@ impl CanonicalControlService {
                 serde_json::to_vec(selection).map_err(|error| invalid(error.to_string()))?,
             );
         }
+        let images = self
+            .chat_registrations
+            .lock()
+            .map_err(|_| invalid("chat registrations poisoned"))?
+            .get(&request.command_id)
+            .map(|entry| entry.images.clone())
+            .unwrap_or_default();
+        if !images.is_empty() {
+            hasher.update(serde_json::to_vec(&images).map_err(|error| invalid(error.to_string()))?);
+        }
         let request_hash = format!("{:x}", hasher.finalize());
 
         // Check for existing command
@@ -1394,6 +1413,19 @@ impl CanonicalControlService {
             }
         };
 
+        if !images.is_empty()
+            && profile
+                .models
+                .get(model)
+                .and_then(|entry| entry.metadata.as_ref())
+                .is_some_and(|metadata| {
+                    metadata.images == Some(false)
+                        || (metadata.images.is_none() && metadata.multimodal == Some(false))
+                })
+        {
+            return Err(invalid("selected model does not support image input"));
+        }
+
         let effort = selection
             .as_ref()
             .and_then(|selection| selection.effort.as_deref());
@@ -1548,7 +1580,13 @@ impl CanonicalControlService {
 
         let user_content = initial_user_message(&request);
         let messages = if is_chat {
-            match domain.prepare_chat_turn(&request, &request_hash, &attempt, &user_content) {
+            match domain.prepare_chat_turn_with_images(
+                &request,
+                &request_hash,
+                &attempt,
+                &user_content,
+                &images,
+            ) {
                 Ok(messages) => messages,
                 Err(error) => {
                     domain.finish_attempt(&attempt.id, false)?;
@@ -1682,6 +1720,58 @@ impl CanonicalControlService {
         selection: Option<crate::contracts::ChatModelSelection>,
         _now: i64,
     ) -> Result<crate::contracts::JobLaunchResponse> {
+        self.launch_chat_with_images(request, selection, &[], _now)
+    }
+
+    pub fn upload_chat_image(
+        &self,
+        request: &crate::contracts::ChatImageUploadRequest,
+    ) -> Result<crate::contracts::ChatImage> {
+        let (project, _) = self.project_repository(&request.project_id)?;
+        crate::chat_images::upload(Path::new(&project.root), request)
+    }
+
+    pub fn read_chat_image(&self, project_id: &str, image_id: &str) -> Result<(String, Vec<u8>)> {
+        let (project, _) = self.project_repository(project_id)?;
+        crate::chat_images::read(Path::new(&project.root), image_id)
+    }
+
+    pub fn receive_chat_image_for_turn(
+        &self,
+        session_id: &str,
+        job_id: &str,
+        url: &str,
+    ) -> Result<crate::contracts::ChatImage> {
+        let project_id = self
+            .active_chats
+            .lock()
+            .map_err(|_| invalid("active chats poisoned"))?
+            .values()
+            .find(|chat| chat.session_id == session_id && chat.job_id == job_id)
+            .map(|chat| chat.project_id.clone())
+            .ok_or_else(|| invalid("unknown chat turn"))?;
+        self.receive_chat_image(&project_id, url)
+    }
+
+    pub fn receive_chat_image(
+        &self,
+        project_id: &str,
+        url: &str,
+    ) -> Result<crate::contracts::ChatImage> {
+        let (project, _) = self.project_repository(project_id)?;
+        crate::chat_images::received(Path::new(&project.root), project_id, url)
+    }
+
+    pub fn launch_chat_with_images(
+        &self,
+        request: crate::contracts::JobLaunchRequest,
+        selection: Option<crate::contracts::ChatModelSelection>,
+        image_ids: &[String],
+        _now: i64,
+    ) -> Result<crate::contracts::JobLaunchResponse> {
+        let (project, _) = self.project_repository(&request.project_id)?;
+        let images =
+            crate::chat_images::selected(Path::new(&project.root), &request.project_id, image_ids)?;
         let _launch = self
             .launch_lock
             .lock()
@@ -1691,11 +1781,15 @@ impl CanonicalControlService {
         let (sender, receiver) = flume::unbounded();
         let cancelled = CallCancellation::new();
         if let Ok(mut registrations) = self.chat_registrations.lock() {
-            registrations.insert(request.command_id.clone(), ChatRegistration {
-                selection,
-                sender: sender.clone(),
-                cancelled: cancelled.clone(),
-            });
+            registrations.insert(
+                request.command_id.clone(),
+                ChatRegistration {
+                    images,
+                    selection,
+                    sender: sender.clone(),
+                    cancelled: cancelled.clone(),
+                },
+            );
         }
         let buffer = std::sync::Arc::new(ChatEventBuffer::default());
         // One active turn per session. Detach the previous turn so this one can

@@ -24,6 +24,7 @@ pub mod anthropic;
 pub mod call_recovery;
 pub mod capabilities;
 pub mod cli;
+pub(crate) mod chat_images;
 pub mod clock;
 pub mod compaction;
 pub mod compiler_feedback;

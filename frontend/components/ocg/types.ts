@@ -75,6 +75,7 @@ export type CallActivity = {
 };
 
 export type ChatMessage = {
+  images?: import("./contracts").ChatImage[];
   id: string;
   commandId?: string;
   optimistic?: boolean;
@@ -111,6 +112,7 @@ export type RuntimeStatus = {
 };
 
 export type SendMessageInput = {
+  images?: import("./contracts").ChatImage[];
   selection?: import("./contracts").ChatModelSelection;
   mode?: "queue" | "steer";
   content: string;
@@ -121,6 +123,7 @@ export type SendMessageInput = {
 export type QueuedChatMessage = { id: string; input: SendMessageInput };
 
 export type OcgRuntimeEvent =
+  | { type: "conversation.message-image"; sessionId: string; messageId: string; image: import("./contracts").ChatImage }
   | { type: "conversation.queue-updated"; sessionId: string; queue: QueuedChatMessage[]; paused: boolean }
   | { type: "conversation.history-loaded"; sessionId: string; messages: ChatMessage[] }
   | { type: "runtime.status-changed"; status: RuntimeStatus }

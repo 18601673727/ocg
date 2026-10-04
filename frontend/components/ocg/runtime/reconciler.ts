@@ -562,6 +562,16 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
       return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
     }
 
+    case "conversation.message-image": {
+      if (!sessionExists(snapshot, sessionId)) return { snapshot, diagnostics: [diag("unknown-session", "Image for unknown session.", { sessionId })] };
+      const messages = snapshot.messagesBySession[sessionId] ?? [];
+      const current = messages.find(message => message.id === envelope.payload.messageId);
+      if (!current || current.role !== "assistant" || (current.status !== "streaming" && current.status !== "pending")) return { snapshot, diagnostics: [] };
+      const image = envelope.payload.image;
+      if (current.images?.some(existing => existing.id === image.id)) return { snapshot, diagnostics: [] };
+      return { snapshot: setMessages(snapshot, sessionId, messages.map(message => message.id === current.id ? { ...message, images: [...(message.images ?? []), image] } : message)), diagnostics: [] };
+    }
+
     case "conversation.message-delta": {
       if (!sessionExists(snapshot, sessionId)) {
         return { snapshot, diagnostics: [diag("unknown-session", `Message delta for unknown session "${sessionId ?? ""}".`, { sessionId })] };

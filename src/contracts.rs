@@ -168,6 +168,23 @@ pub struct ChatSendRequest {
     pub launch: JobLaunchRequest,
     #[serde(default)]
     pub selection: Option<ChatModelSelection>,
+    #[serde(default)]
+    pub image_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ChatImage {
+    pub id: String,
+    pub name: String,
+    pub media_type: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ChatImageUploadRequest {
+    pub project_id: String,
+    pub name: String,
+    pub data_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -209,6 +226,8 @@ pub struct ChatMessageView {
     pub content: String,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub images: Vec<ChatImage>,
     #[serde(default)]
     pub job_id: Option<String>,
     pub created_at: String,
@@ -392,6 +411,7 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     CanonicalJobEvent::export_all(cfg)?;
     JobLaunchRequest::export_all(cfg)?;
     ChatSendRequest::export_all(cfg)?;
+    ChatImageUploadRequest::export_all(cfg)?;
     ChatConversationsResponse::export_all(cfg)?;
     ChatMessagesResponse::export_all(cfg)?;
     JobLaunchResponse::export_all(cfg)?;

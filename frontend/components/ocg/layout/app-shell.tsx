@@ -483,7 +483,7 @@ export function RuntimeWorkspace({
   const handleComposerIntent = useCallback(async (intent: ComposerIntent) => {
     if (intent.kind === "chat") {
       if (!activeProjectId || !activeSessionKey) throw new Error("Select a conversation and project first.");
-      await sendMessage(activeSessionKey, { content: intent.text, projectId: activeProjectId, selection: intent.selection, mode: intent.mode });
+      await sendMessage(activeSessionKey, { content: intent.text, images: intent.images, projectId: activeProjectId, selection: intent.selection, mode: intent.mode });
       return;
     }
     dispatchComposerIntent(intent, {

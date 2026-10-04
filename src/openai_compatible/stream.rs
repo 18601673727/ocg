@@ -60,6 +60,9 @@ impl NormalizedUsage {
 /// multiple calls reconstruct without re-deriving order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatStreamEvent {
+    Image {
+        url: String,
+    },
     TextDelta {
         delta: String,
     },
@@ -111,6 +114,7 @@ pub struct CompletedToolCall {
 /// events are the source of truth for reconstruction.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChatStreamSummary {
+    pub images: Vec<String>,
     pub text: String,
     pub reasoning: String,
     pub tool_calls: Vec<CompletedToolCall>,
@@ -123,6 +127,11 @@ impl ChatStreamSummary {
     /// Fold one normalized event into the summary.
     pub fn apply(&mut self, event: &ChatStreamEvent) {
         match event {
+            ChatStreamEvent::Image { url } => {
+                if !self.images.contains(url) {
+                    self.images.push(url.clone());
+                }
+            }
             ChatStreamEvent::TextDelta { delta } => self.text.push_str(delta),
             ChatStreamEvent::ReasoningDelta { delta } => self.reasoning.push_str(delta),
             ChatStreamEvent::ToolCallStart { index, id, name } => {

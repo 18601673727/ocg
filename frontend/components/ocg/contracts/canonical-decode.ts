@@ -11,6 +11,7 @@ import type {
   ChatConversationView,
   ChatConversationsResponse,
   ChatMessageView,
+  ChatImage,
   ChatMessagesResponse,
   CanonicalApiVersion,
   CanonicalConfigurationEnvelope,
@@ -95,6 +96,24 @@ export function decodeChatConversationsResponse(input: unknown): ChatConversatio
   return decode((input) => chatConversationsResponse(input, ""), input);
 }
 
+const chatImage: Decoder<ChatImage> = (input, path) => {
+  const rec = record(input, path, "ChatImage");
+  if (!rec.ok) return rec;
+  const id = req(rec.value, "id", identity, path);
+  if (!id.ok) return id;
+  const name = req(rec.value, "name", string, path);
+  if (!name.ok) return name;
+  const media_type = req(rec.value, "media_type", string, path);
+  if (!media_type.ok) return media_type;
+  const url = req(rec.value, "url", string, path);
+  if (!url.ok) return url;
+  return yes({ id: id.value, name: name.value, media_type: media_type.value, url: url.value });
+};
+
+export function decodeChatImage(input: unknown): ChatImage {
+  return decode((input) => chatImage(input, ""), input);
+}
+
 const chatMessageView: Decoder<ChatMessageView> = (input, path) => {
   const rec = record(input, path, "ChatMessageView");
   if (!rec.ok) return rec;
@@ -106,6 +125,8 @@ const chatMessageView: Decoder<ChatMessageView> = (input, path) => {
   if (!role.ok) return role;
   const state = req(rec.value, "state", oneOf(["pending", "streaming", "complete", "failed", "deleted"] as const), path);
   if (!state.ok) return state;
+  const images = opt(rec.value, "images", array(chatImage), path);
+  if (!images.ok) return images;
   const content = req(rec.value, "content", string, path);
   if (!content.ok) return content;
   const failure_reason = opt(rec.value, "failure_reason", nullable(string), path);
@@ -126,6 +147,7 @@ const chatMessageView: Decoder<ChatMessageView> = (input, path) => {
     role: role.value,
     state: state.value,
     content: content.value,
+    images: images.value ?? [],
     failure_reason: failure_reason.value ?? null,
     job_id: job_id.value ?? null,
     created_at: created_at.value,

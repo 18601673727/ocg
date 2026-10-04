@@ -155,10 +155,16 @@ export type ChatConversationView = { conversation_id: string, session_id: string
 export type ChatConversationsResponse = { api_version: CanonicalApiVersion, project_id: string, conversations: Array<ChatConversationView>, };
 
 
+export type ChatImage = { id: string, name: string, media_type: string, url: string, };
+
+
+export type ChatImageUploadRequest = { project_id: string, name: string, data_url: string, };
+
+
 export type ChatMessageRole = "user" | "assistant";
 
 
-export type ChatMessageView = { message_id: string, command_id: string, role: ChatMessageRole, state: MessageLifecycle, content: string, failure_reason: string | null, job_id: string | null, created_at: string, updated_at: string, attempt_state: string, replay_job_id: string | null, };
+export type ChatMessageView = { message_id: string, command_id: string, role: ChatMessageRole, state: MessageLifecycle, content: string, failure_reason: string | null, images: Array<ChatImage>, job_id: string | null, created_at: string, updated_at: string, attempt_state: string, replay_job_id: string | null, };
 
 
 export type ChatMessagesResponse = { api_version: CanonicalApiVersion, project_id: string, conversation: ChatConversationView, messages: Array<ChatMessageView>, };
@@ -167,7 +173,7 @@ export type ChatMessagesResponse = { api_version: CanonicalApiVersion, project_i
 export type ChatModelSelection = { model: string, effort: string | null, };
 
 
-export type ChatSendRequest = { selection: ChatModelSelection | null, command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
+export type ChatSendRequest = { selection: ChatModelSelection | null, image_ids: Array<string>, command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
 
 
 export type ChildCancellationPolicy = "cascade" | "soft_cascade" | "independent";
@@ -317,7 +323,7 @@ export type Message = { id: EntityId, project_scope: ProjectScope, conversation_
 export type MessageBlock = { kind: MessageBlockKind, content: string | null, entity_ref: EntityRef | null, artifact_ref: EntityRef | null, changeset_ref: EntityRef | null, projection_kind: string | null, raw: JsonValue | null, };
 
 
-export type MessageBlockKind = "markdown" | "entity_ref" | "artifact_ref" | "diff_ref" | "status_projection" | "unknown";
+export type MessageBlockKind = "markdown" | "image" | "entity_ref" | "artifact_ref" | "diff_ref" | "status_projection" | "unknown";
 
 
 export type MessageLifecycle = "pending" | "streaming" | "complete" | "failed" | "deleted";

@@ -42,6 +42,7 @@ pub struct ProviderRound {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderFinalResponse {
+    pub images: Vec<String>,
     pub content: String,
     pub reasoning: String,
     pub rounds: usize,
@@ -310,6 +311,93 @@ fn parse_usage(value: &Value) -> NormalizedUsage {
     usage
 }
 
+fn apply_visible_content(
+    summary: &mut ChatStreamSummary,
+    message: &Value,
+) -> Result<Vec<ChatStreamEvent>> {
+    let mut events = Vec::new();
+    if let Some(text) = message
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        events.push(ChatStreamEvent::TextDelta {
+            delta: text.to_string(),
+        });
+    }
+    let parts = message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            message
+                .get("images")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        );
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text" | "output_text") => {
+                if let Some(text) = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    events.push(ChatStreamEvent::TextDelta {
+                        delta: text.to_string(),
+                    });
+                }
+            }
+            _ => {
+                if part
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        !matches!(kind, "image_url" | "image" | "input_image" | "output_image")
+                    })
+                {
+                    continue;
+                }
+                let encoded_url = part.get("b64_json").and_then(Value::as_str).map(|data| {
+                    let media_type = part
+                        .get("media_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("image/png");
+                    format!("data:{media_type};base64,{data}")
+                });
+                let url = part
+                    .get("image_url")
+                    .and_then(|value| {
+                        value
+                            .as_str()
+                            .or_else(|| value.get("url").and_then(Value::as_str))
+                    })
+                    .or_else(|| part.get("url").and_then(Value::as_str))
+                    .or(encoded_url.as_deref());
+                if let Some(url) = url {
+                    if !crate::chat_images::valid_provider_url(url) {
+                        return Err(OcgError::config(
+                            "provider returned an unsupported image URL",
+                        ));
+                    }
+                    if !summary.images.iter().any(|existing| existing == url) && !events.iter().any(|event| matches!(event, ChatStreamEvent::Image { url: existing } if existing == url)) {
+                        if summary.images.len() + events.iter().filter(|event| matches!(event, ChatStreamEvent::Image { .. })).count() >= crate::chat_images::MAX_IMAGES {
+                            return Err(OcgError::config("provider returned more than 8 images"));
+                        }
+                        events.push(ChatStreamEvent::Image { url: url.to_string() });
+                    }
+                }
+            }
+        }
+    }
+    for event in &events {
+        summary.apply(event);
+    }
+    Ok(events)
+}
+
 /// Fold one streamed chat-completion chunk into the summary. Tool-call
 /// argument deltas accumulate by the OpenAI `index` even when a fragment
 /// carries no `id` or `name`, matching [`ChatStreamSummary::apply`].
@@ -321,15 +409,7 @@ fn apply_chunk_json(
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         if let Some(first) = choices.first() {
             if let Some(delta) = first.get("delta") {
-                if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                    if !content.is_empty() {
-                        let event = ChatStreamEvent::TextDelta {
-                            delta: content.to_string(),
-                        };
-                        summary.apply(&event);
-                        emitted.push(event);
-                    }
-                }
+                emitted.extend(apply_visible_content(summary, delta)?);
                 if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
                     if !reasoning.is_empty() {
                         let event = ChatStreamEvent::ReasoningDelta {
@@ -390,9 +470,7 @@ fn apply_completion_json(summary: &mut ChatStreamSummary, value: &Value) -> Resu
     if let Some(choices) = value.get("choices").and_then(Value::as_array) {
         if let Some(first) = choices.first() {
             if let Some(message) = first.get("message") {
-                if let Some(content) = message.get("content").and_then(Value::as_str) {
-                    summary.text.push_str(content);
-                }
+                apply_visible_content(summary, message)?;
                 if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
                     summary.reasoning.push_str(reasoning);
                 }
@@ -447,6 +525,16 @@ fn build_assistant_message(summary: &ChatStreamSummary) -> Value {
     } else {
         json!({"role": "assistant", "content": summary.text, "tool_calls": tool_calls})
     };
+    if !summary.images.is_empty() {
+        let mut parts = vec![json!({"type": "text", "text": summary.text})];
+        parts.extend(
+            summary
+                .images
+                .iter()
+                .map(|url| json!({"type": "image_url", "image_url": {"url": url}})),
+        );
+        message["content"] = json!(parts);
+    }
     if !summary.reasoning.is_empty() {
         message["reasoning_content"] = json!(summary.reasoning);
     }
@@ -801,6 +889,7 @@ impl CanonicalProviderCallHandler {
             let serialized = serde_json::to_string(&json!({
                 "content": response.content,
                 "reasoning": response.reasoning,
+                "images": response.images,
                 "rounds": response.rounds
             }))
             .map_err(|error| OcgError::config(format!("serialize provider response: {error}")))?;
@@ -829,6 +918,7 @@ impl CanonicalProviderCallHandler {
             "result": {
                 "content": response.content,
                 "reasoning": response.reasoning,
+                "images": response.images,
                 "rounds": response.rounds
             }
         }))
@@ -1335,12 +1425,15 @@ async fn execute_provider_loop(
         if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
             || round_response.summary.tool_calls.is_empty()
         {
-            if round_response.summary.text.trim().is_empty() {
+            if round_response.summary.text.trim().is_empty()
+                && round_response.summary.images.is_empty()
+            {
                 return Err(OcgError::config(
                     "provider returned no user-visible assistant content",
                 ));
             }
             return Ok(ProviderFinalResponse {
+                images: round_response.summary.images,
                 content: round_response.summary.text,
                 reasoning: round_response.summary.reasoning,
                 rounds: round + 1,

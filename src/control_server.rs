@@ -1022,10 +1022,10 @@ fn handle_canonical(
     let allowed_origin = allowed_cors_origin(request);
     let respond = |stream: &mut TcpStream, result: Result<Value>| match result {
         Ok(value) => write_json_with_origin(stream, 200, &value, allowed_origin.as_deref()),
-        Err(error) => write_api_error(
-            stream,
-            &ApiError::new(400, "invalid_request", error.to_string()),
-        ),
+        Err(error) => {
+            let error = ApiError::new(400, "invalid_request", error.to_string());
+            write_json_with_origin(stream, error.status, &error.body, allowed_origin.as_deref())
+        }
     };
     let query = |key: &str| -> Result<String> {
         request
@@ -1140,7 +1140,18 @@ fn handle_canonical(
                 let body = body()?;
                 let request: crate::contracts::ChatSendRequest = serde_json::from_value(body)
                     .map_err(|error| OcgError::config(error.to_string()))?;
-                answer!(service.launch_chat_selected(request.launch, request.selection, now)?)
+                answer!(service.launch_chat_with_images(
+                    request.launch,
+                    request.selection,
+                    &request.image_ids,
+                    now
+                )?)
+            }
+            Route::ChatImageUpload => {
+                let request: crate::contracts::ChatImageUploadRequest =
+                    serde_json::from_value(body()?)
+                        .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.upload_chat_image(&request)?)
             }
             Route::ChatConversations => {
                 answer!(service.chat_conversations(&query("project_id")?)?)
@@ -1195,12 +1206,48 @@ fn handle_canonical(
             | Route::CanonicalEvents
             | Route::CanonicalDashboard
             | Route::ChatSend
+            | Route::ChatImageUpload
+            | Route::ChatImageGet { .. }
             | Route::ChatConversations
             | Route::ChatMessages
             | Route::ChatStream
             | Route::ChatCancel
     ) {
         return None;
+    }
+    if matches!(route, Route::ChatImageUpload | Route::ChatImageGet { .. })
+        && request.headers.contains_key("origin")
+        && allowed_origin.is_none()
+    {
+        return Some(write_api_error(
+            stream,
+            &ApiError::new(
+                403,
+                "origin_refused",
+                "Chat images accept only loopback browser origins",
+            ),
+        ));
+    }
+    if let Route::ChatImageGet { project, image } = route {
+        return Some(match service.read_chat_image(project, image) {
+            Ok((media_type, bytes)) => {
+                let mut headers = vec![
+                    (
+                        "Cache-Control",
+                        "private, max-age=31536000, immutable".to_string(),
+                    ),
+                    ("X-Content-Type-Options", "nosniff".to_string()),
+                ];
+                if let Some(origin) = allowed_origin.as_ref() {
+                    headers.push(("Access-Control-Allow-Origin", origin.clone()));
+                }
+                write_response(stream, 200, &media_type, &bytes, &headers)
+            }
+            Err(error) => write_api_error(
+                stream,
+                &ApiError::new(404, "image_unavailable", error.to_string()),
+            ),
+        });
     }
     // The chat tail streams live provider events as SSE. The durable Call
     // remains the execution authority; this channel is transport observability
@@ -1430,6 +1477,13 @@ fn handle_chat_stream(
                 Live::Provider(provider_event) => {
                     use crate::openai_compatible::stream::ChatStreamEvent as Stream;
                     let payload = match provider_event {
+                        Stream::Image { url } => Some(
+                            match service.receive_chat_image_for_turn(&session_id, &job_id, &url) {
+                                Ok(image) => json!({"image": image}),
+                                Err(error) => json!({"error": error.to_string()}),
+                            }
+                            .to_string(),
+                        ),
                         Stream::TextDelta { delta } => Some(json!({"delta": delta}).to_string()),
                         Stream::ReasoningDelta { delta } => {
                             Some(json!({"reasoning": delta}).to_string())
@@ -1688,11 +1742,17 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, ApiError
         })?,
         None => 0,
     };
-    if content_length > MAX_BODY_BYTES {
+    let (path, query) = parse_target(&target)?;
+    let max_body_bytes = if method == "POST" && path == "/api/v1/canonical/chat/images" {
+        crate::chat_images::MAX_UPLOAD_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    };
+    if content_length > max_body_bytes {
         return Err(ApiError::new(
             413,
             "payload_too_large",
-            format!("the request body exceeds the {MAX_BODY_BYTES} byte limit"),
+            format!("the request body exceeds the {max_body_bytes} byte limit"),
         ));
     }
 
@@ -1726,7 +1786,6 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, ApiError
         body.extend_from_slice(&chunk[..read]);
     }
 
-    let (path, query) = parse_target(&target)?;
     Ok(Request {
         method,
         path,
@@ -1813,6 +1872,8 @@ enum Route {
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
+    ChatImageUpload,
+    ChatImageGet { project: String, image: String },
     ChatSend,
     ChatConversations,
     ChatMessages,
@@ -1870,6 +1931,8 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("GET", ["api", "v1", "canonical", "jobs", "events"])
                 | ("POST", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("GET", ["api", "v1", "canonical", "dashboard"])
+                | ("POST", ["api", "v1", "canonical", "chat", "images"])
+                | ("GET", ["api", "v1", "canonical", "chat", "images", _, _])
                 | ("POST", ["api", "v1", "canonical", "chat", "send"])
                 | ("GET", ["api", "v1", "canonical", "chat", "stream"])
                 | ("GET", ["api", "v1", "canonical", "chat", "conversations"])
@@ -1887,6 +1950,8 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
+                | ("OPTIONS", ["api", "v1", "canonical", "chat", "images"])
+                | ("OPTIONS", ["api", "v1", "canonical", "chat", "images", _, _])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "send"])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "stream"])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "conversations"])
@@ -1943,6 +2008,13 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         ("GET", ["api", "v1", "canonical", "jobs"]) => Ok(Route::CanonicalSnapshot),
         ("GET", ["api", "v1", "canonical", "jobs", "events"]) => Ok(Route::CanonicalEvents),
         ("GET", ["api", "v1", "canonical", "dashboard"]) => Ok(Route::CanonicalDashboard),
+        ("POST", ["api", "v1", "canonical", "chat", "images"]) => Ok(Route::ChatImageUpload),
+        ("GET", ["api", "v1", "canonical", "chat", "images", project, image]) => {
+            Ok(Route::ChatImageGet {
+                project: (*project).to_string(),
+                image: (*image).to_string(),
+            })
+        }
         ("POST", ["api", "v1", "canonical", "chat", "send"]) => Ok(Route::ChatSend),
         ("GET", ["api", "v1", "canonical", "chat", "stream"]) => Ok(Route::ChatStream),
         ("GET", ["api", "v1", "canonical", "chat", "conversations"]) => {
@@ -2030,6 +2102,8 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         | ["api", "v1", "canonical", "chat", "messages"]
         | ["api", "v1", "canonical", "projects"] => Some("GET"),
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
+        ["api", "v1", "canonical", "chat", "images", _, _] => Some("GET"),
+        ["api", "v1", "canonical", "chat", "images"] => Some("POST"),
         ["api", "v1", "canonical", "jobs", "launch"]
         | ["api", "v1", "canonical", "chat", "send"]
         | ["api", "v1", "canonical", "chat", "cancel"] => Some("POST"),

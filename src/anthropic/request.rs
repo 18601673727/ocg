@@ -166,6 +166,7 @@ fn encode_message(message: &Value, system: &mut Vec<Value>) -> Result<Option<Val
             for text in text_parts(content) {
                 blocks.push(json!({"type": "text", "text": text}));
             }
+            blocks.extend(image_parts(content)?);
             // Extended thinking is not replayed. Anthropic validates a thinking
             // block against its signature, which the canonical assistant message
             // does not carry, so forwarding the reasoning text alone would be
@@ -211,12 +212,40 @@ fn encode_message(message: &Value, system: &mut Vec<Value>) -> Result<Option<Val
             for text in text_parts(content) {
                 blocks.push(json!({"type": "text", "text": text}));
             }
+            blocks.extend(image_parts(content)?);
             if blocks.is_empty() {
                 return Ok(None);
             }
             Ok(Some(json!({"role": "user", "content": blocks})))
         }
     }
+}
+
+fn image_parts(content: Option<&Value>) -> Result<Vec<Value>> {
+    let mut images = Vec::new();
+    for part in content.and_then(Value::as_array).into_iter().flatten() {
+        if part.get("type").and_then(Value::as_str) != Some("image_url") {
+            continue;
+        }
+        let url = part
+            .get("image_url")
+            .and_then(|image| image.get("url"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| OcgError::config("image has no URL"))?;
+        if !crate::chat_images::valid_provider_url(url) {
+            return Err(OcgError::config("unsupported image URL"));
+        }
+        let source = if let Some(data) = url.strip_prefix("data:") {
+            let (media_type, data) = data
+                .split_once(";base64,")
+                .ok_or_else(|| OcgError::config("invalid image data URL"))?;
+            json!({"type": "base64", "media_type": media_type, "data": data})
+        } else {
+            json!({"type": "url", "url": url})
+        };
+        images.push(json!({"type": "image", "source": source}));
+    }
+    Ok(images)
 }
 
 /// The text fragments of a canonical message content field, which is either a

@@ -124,6 +124,7 @@ export interface OcgRuntimeClient {
   getAccounting?(sessionId: string): Promise<JobAccounting | null>;
   getBootstrap(): Promise<BootstrapState>;
   createSession(input: CreateSessionInput): Promise<ChatSession>;
+  uploadChatImage?(request: import("../contracts").ChatImageUploadRequest, signal?: AbortSignal): Promise<import("../contracts").ChatImage>;
   sendMessage(sessionId: string, input: SendMessageInput): Promise<void>;
   retryMessage(sessionId: string, messageId: string): Promise<void>;
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;

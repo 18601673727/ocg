@@ -46,6 +46,7 @@ export type RuntimeResumeCursor = string;
 
 /** Per-event normalized payloads for every currently meaningful event. */
 export type RuntimeEnvelopePayloads = {
+  "conversation.message-image": { messageId: string; image: import("../contracts").ChatImage };
   "conversation.history-loaded": { messages: ChatMessage[] };
   "job.execution-updated": { execution: import("../execution/domain").JobExecution; accounting: import("../execution/accounting").JobAccounting | null };
   "job.launch-updated": { result: import("./runtime-types").JobLaunchResult };
@@ -78,6 +79,7 @@ export type RuntimeEnvelopePayloads = {
 export type RuntimeEventType = keyof RuntimeEnvelopePayloads;
 
 export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
+  "conversation.message-image",
   "conversation.queue-updated",
   "conversation.history-loaded",
   "job.execution-updated",
@@ -248,6 +250,8 @@ export function envelopeFromRuntimeEvent(
       return { ...base, type: event.type, payload: { session: event.session } };
     case "conversation.message-started":
       return { ...base, type: event.type, payload: { message: event.message } };
+    case "conversation.message-image":
+      return { ...base, type: event.type, payload: { messageId: event.messageId, image: event.image } };
     case "conversation.message-delta":
       return { ...base, type: event.type, payload: { messageId: event.messageId, delta: event.delta } };
     case "conversation.message-completed":
@@ -376,6 +380,8 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
       return { type: envelope.type, session: envelope.payload.session };
     case "conversation.message-started":
       return { type: envelope.type, sessionId, message: envelope.payload.message };
+    case "conversation.message-image":
+      return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, image: envelope.payload.image };
     case "conversation.message-delta":
       return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, delta: envelope.payload.delta };
     case "conversation.message-completed":
@@ -467,6 +473,12 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
         !isNonEmptyString(message.role) || !isNonEmptyString(message.status) ||
         typeof message.content !== "string"
       )) return "messages must contain valid chat messages.";
+      return null;
+    }
+    case "conversation.message-image": {
+      if (!isNonEmptyString(payload.messageId)) return "messageId is required.";
+      const image = payload.image;
+      if (!isRecord(image) || !isNonEmptyString(image.id) || typeof image.name !== "string" || !isNonEmptyString(image.media_type) || !isNonEmptyString(image.url)) return "image must contain a valid image.";
       return null;
     }
     case "conversation.message-delta": {

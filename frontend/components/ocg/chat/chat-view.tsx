@@ -33,7 +33,8 @@ import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
 import { ModelSelector } from "./model-selector";
 import type { ChatModelSelection } from "../contracts";
 import type { QueuedChatMessage } from "../types";
-import { retryContent } from "./retry";
+import { retryInput } from "./retry";
+import { AttachmentStaging, ImageGallery, useImageAttachments } from "./image-attachments";
 import {
   applyComposerSuggestion,
   matchComposerSuggestions,
@@ -127,7 +128,13 @@ function Markdown({ content }: { content: string }) {
     };
     for (const line of lines) {
       const trimmed = line.trim();
-      if (trimmed.startsWith("- ")) {
+      const embeddedImages = [...line.matchAll(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)\)/g)];
+      if (embeddedImages.length) {
+        flushList();
+        const text = line.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)\)/g, "").trim();
+        if (text) blocks.push(<p key={`${key}-p${li}`} className="leading-6">{renderInline(text, `${key}-p${li}`)}</p>);
+        blocks.push(<ImageGallery key={`${key}-images${li}`} images={embeddedImages.map((match, index) => ({ id: `${key}-${li}-${index}`, name: match[1] || "Image", media_type: "image/*", url: match[2] }))} />);
+      } else if (trimmed.startsWith("- ")) {
         listBuffer.push(trimmed.slice(2));
       } else {
         flushList();
@@ -267,6 +274,7 @@ function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage;
            )}
          >
            <Markdown content={message.content} />
+           <ImageGallery images={message.images} />
            {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
              {chatFailureReason(t, message)}
            </p>}
@@ -285,6 +293,7 @@ function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage;
 /* ---------- composer ---------- */
 
 function Composer({
+  projectId,
   draft,
   onDraftChange,
   onIntent,
@@ -295,6 +304,7 @@ function Composer({
   onSelectionChange,
   onCancel,
 }: {
+  projectId?: string;
   busy: boolean;
   queueing: boolean;
   selection?: ChatModelSelection;
@@ -306,6 +316,10 @@ function Composer({
   runtimeStatus: RuntimeStatus;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const images = useImageAttachments(projectId);
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
   const { t } = useI18n();
   const [highlight, setHighlight] = useState<{ raw: string; index: number } | null>(null);
   const [dismissedFor, setDismissedFor] = useState<string | null>(null);
@@ -328,7 +342,7 @@ function Composer({
     ? highlight.index
     : -1;
   const error = commandError && commandError.raw === draft ? commandError.message : null;
-  const canSend = draft.trim().length > 0;
+  const canSend = (draft.trim().length > 0 || images.attachments.length > 0) && images.ready;
 
   const closeSuggestions = () => {
     setHighlight(null);
@@ -350,21 +364,26 @@ function Composer({
   };
 
   const submit = async (mode: "queue" | "steer" = "queue") => {
-    if (actionLock.current) return;
+    if (actionLock.current || !images.ready) return;
     const intent = parseComposerIntent(draft);
     if (intent.kind === "unknown-command") {
       setDismissedFor(draft);
       setCommandError({ raw: draft, message: intent.reason });
       return;
     }
-    if (intent.kind === "chat" && intent.text.length === 0) return;
+    if (intent.kind !== "chat" && images.attachments.length) {
+      setCommandError({ raw: draft, message: t("chat.imagesRequireChat") });
+      return;
+    }
+    if (intent.kind === "chat" && intent.text.length === 0 && !images.images.length) return;
     if (intent.kind === "chat" && !chatReady) return;
     actionLock.current = true;
     setSubmitting(true);
     setCommandError(null);
     try {
-      await onIntent(intent.kind === "chat" ? { ...intent, selection, mode } : intent);
+      await onIntent(intent.kind === "chat" ? { ...intent, selection, mode, images: images.images } : intent);
       onDraftChange("");
+      images.clear();
     } catch (cause) {
       setCommandError({ raw: draft, message: cause instanceof Error ? cause.message : String(cause) });
     } finally {
@@ -394,10 +413,39 @@ function Composer({
           e.preventDefault();
           void submit();
         }}
-        className="mx-auto max-w-3xl"
+        onDragEnter={(event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          dragDepth.current += 1;
+          setDragging(true);
+        }}
+        onDragOver={(event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = submitting || cancelling ? "none" : "copy";
+        }}
+        onDragLeave={(event) => {
+          event.preventDefault();
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (dragDepth.current === 0) setDragging(false);
+        }}
+        onDrop={(event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          dragDepth.current = 0;
+          setDragging(false);
+          if (!submitting && !cancelling) images.add(Array.from(event.dataTransfer.files));
+        }}
+        className="relative mx-auto max-w-3xl"
       >
+        {dragging && <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-lg border-2 border-dashed border-primary bg-background/95 text-sm font-medium" role="status">{t("chat.dropImages")}</div>}
+        <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden disabled={submitting || cancelling} aria-label={t("chat.attachFile")} onChange={(event) => {
+          images.add(Array.from(event.target.files ?? []));
+          event.target.value = "";
+        }} />
         <div className="rounded-lg border border-border bg-background shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition-colors focus-within:border-ring">
           <ModelSelector selection={selection} onChange={onSelectionChange} busy={busy || submitting || cancelling} />
+          <AttachmentStaging state={images} disabled={submitting || cancelling} />
           <div className="relative">
             {suggestionsOpen && (
               <ul
@@ -495,6 +543,8 @@ function Composer({
               size="icon-xs"
               aria-label={t("chat.attachFile")}
               title={t("chat.attachFile")}
+              disabled={submitting || cancelling}
+              onClick={() => fileInput.current?.click()}
             >
               <Paperclip className="size-4" />
             </Button>
@@ -578,7 +628,7 @@ export function ChatView({
   const [retryError, setRetryError] = useState<string | null>(null);
 
   async function retry(messageId: string) {
-    if (retryLock.current || !retryContent(messages, messageId)) return;
+    if (retryLock.current || !retryInput(messages, messageId)) return;
     retryLock.current = true;
     setRetrying(true);
     setRetryError(null);
@@ -592,10 +642,11 @@ export function ChatView({
     }
   }
 
+  const lastImageCount = messages.at(-1)?.images?.length;
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages.length, session.id, composerSurfaceKey]);
+  }, [messages.length, session.id, composerSurfaceKey, lastImageCount]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -633,7 +684,7 @@ export function ChatView({
             )}
             {messages.map((m) => (
               <MessageRow key={m.id} message={m}
-                onRetry={retryContent(messages, m.id) ? () => void retry(m.id) : undefined}
+                onRetry={retryInput(messages, m.id) ? () => void retry(m.id) : undefined}
                 retryDisabled={retrying || runtimeStatus.state !== "connected"}
               />
             ))}
@@ -672,13 +723,16 @@ export function ChatView({
           </div>
           <ol className="max-h-28 overflow-y-auto">
             {queueState.queue.map((item, index) => <li key={item.id} className="flex items-center gap-2 py-1 text-xs">
-              <span className="text-muted-foreground">{index + 1}.</span><span className="min-w-0 flex-1 truncate">{item.input.content}</span>
+              <span className="text-muted-foreground">{index + 1}.</span><span className="min-w-0 flex-1 truncate">{item.input.content || t("chat.imageCount", { count: item.input.images?.length ?? 0 })}</span>
+              <ImageGallery images={item.input.images} compact />
               <Button type="button" size="icon-xs" variant="ghost" aria-label={t("chat.removeQueued")} onClick={() => onRemoveQueued?.(item.id)}><X className="size-3" /></Button>
             </li>)}
           </ol>
         </div>
       )}
       <Composer
+        key={`${session.id}:${session.projectId ?? ""}`}
+        projectId={session.projectId}
         busy={busy}
         queueing={busy || Boolean(queueState?.queue.length)}
         selection={selection}

@@ -1038,6 +1038,7 @@ pub struct Approval {
 #[serde(rename_all = "snake_case")]
 pub enum MessageBlockKind {
     Markdown,
+    Image,
     EntityRef,
     ArtifactRef,
     DiffRef,

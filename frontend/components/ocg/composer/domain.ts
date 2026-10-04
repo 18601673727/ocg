@@ -23,6 +23,7 @@ export type ComposerJobCreateIntent = {
 };
 
 export type ComposerChatIntent = {
+  images?: import("../contracts").ChatImage[];
   selection?: import("../contracts").ChatModelSelection;
   mode?: "queue" | "steer";
   kind: "chat";

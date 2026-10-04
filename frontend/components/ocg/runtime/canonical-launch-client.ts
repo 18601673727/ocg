@@ -42,7 +42,7 @@
  * returned.
  */
 
-import type { ChatMessagesResponse, ChatSendRequest, JobLaunchRequest } from "../contracts";
+import { decodeChatImage, type ChatImage, type ChatImageUploadRequest, type ChatMessagesResponse, type ChatSendRequest, type JobLaunchRequest } from "../contracts";
 import type {
   JobLaunchCommand,
   JobLaunchResult,
@@ -223,14 +223,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const id = chatSessionKey(projectId, history.conversation.session_id);
     const session: ChatSession = {
       id, projectId, sessionId: history.conversation.session_id,
-      title: history.conversation.title || history.messages.find(message => message.role === "user" && message.content.trim())?.content.trim().slice(0, 80) || "",
+      title: history.conversation.title || history.messages.find(message => message.role === "user" && message.content.trim())?.content.trim().slice(0, 80) || history.messages.find(message => message.role === "user" && message.images.length)?.images[0]?.name || "",
       workType: "coding", updatedAt: chatTimestamp(history.conversation.updated_at),
     };
     this.bindSessionProject(id, projectId);
     this.emit({ type: "conversation.session-created", session }, { projectId });
     const messages: ChatMessage[] = history.messages.filter((message) => message.state !== "deleted").map((message) => ({
       id: message.message_id, commandId: message.command_id, role: message.role,
-      content: message.content, failureReason: message.failure_reason ?? undefined, createdAt: chatTimestamp(message.created_at),
+      images: message.images, content: message.content, failureReason: message.failure_reason ?? undefined, createdAt: chatTimestamp(message.created_at),
       status: message.state === "complete" ? "completed" :
         message.state === "failed" && message.attempt_state === "cancelled" ? "cancelled" :
         message.state === "failed" ? "failed" : "pending",
@@ -276,7 +276,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private async sendChatTurn(sessionId: string, input: SendMessageInput): Promise<void> {
     this.historyEpochs.set(sessionId, (this.historyEpochs.get(sessionId) ?? 0) + 1);
     const content = input.content.trim();
-    if (!content) return;
+    if (!content && !input.images?.length) return;
 
     const snapshot = this.store.getSnapshot();
     const session = snapshot.sessions.find((item) => item.id === sessionId);
@@ -287,6 +287,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
     const commandId = `cmd-chat-${crypto.randomUUID()}`;
     const userMessage: ChatMessage = {
+      images: input.images,
       commandId,
       optimistic: true,
       id: `chat-user-${Date.now().toString(36)}-${this.chatCounter++}`,
@@ -296,7 +297,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       status: "completed",
     };
     this.emit({ type: "conversation.message-started", sessionId, message: { ...userMessage } });
-    this.emit({ type: "conversation.session-updated", session: { ...session, updatedAt: "now" } });
+    this.emit({ type: "conversation.session-updated", session: { ...session, title: session.title || content.slice(0, 80) || input.images?.[0]?.name || "", updatedAt: "now" } });
 
     const assistantId = `chat-assistant-${Date.now().toString(36)}-${this.chatCounter++}`;
     const assistant: ChatMessage = {
@@ -340,6 +341,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     }
 
     const request: ChatSendRequest = {
+      image_ids: input.images?.map(image => image.id) ?? [],
       selection: input.selection ?? null,
       command_id: commandId,
       draft_id: commandId,
@@ -391,6 +393,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.closeChatStream(sessionId, true);
     this.openChatStream(sessionId, response.job_id, assistantId);
     void this.refreshExecution(sessionId, projectId, response.job_id);
+  }
+
+  async uploadChatImage(request: ChatImageUploadRequest, signal?: AbortSignal): Promise<ChatImage> {
+    if (!this.control.uploadChatImage) throw new Error("Image upload is unavailable.");
+    const result = await this.control.uploadChatImage(request, signal);
+    if (isCanonicalRejection(result)) throw new Error(result.message);
+    return result;
   }
 
   override async cancel(sessionId: string): Promise<void> {
@@ -509,6 +518,18 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       }
       if (typeof value !== "object" || value === null) return;
       const record = value as Record<string, unknown>;
+      if (record["image"] !== undefined) {
+        try {
+          const image = decodeChatImage(record["image"]);
+          this.emit({ type: "conversation.message-image", sessionId, messageId: assistantId, image });
+        } catch (cause) {
+          const after = this.store.getSnapshot().messagesBySession[sessionId]?.find(item => item.id === assistantId);
+          if (after?.status === "streaming") this.emit({ type: "conversation.message-completed", sessionId, message: { ...after, status: "failed", failureReason: cause instanceof Error ? cause.message : String(cause) } });
+          this.closeChatStream(sessionId, false);
+          void this.refreshSessionHistory(sessionId);
+        }
+        return;
+      }
       if (typeof record["delta"] === "string") {
         const current = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
         if (!current || current.status !== "streaming") return;

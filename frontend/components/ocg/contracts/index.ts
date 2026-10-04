@@ -12,6 +12,8 @@
 
 export type {
   ChatSendRequest,
+  ChatImage,
+  ChatImageUploadRequest,
   ChatModelSelection,
   ChatConversationView,
   ChatConversationsResponse,
@@ -82,6 +84,7 @@ export {
   decodeConfigurationAck,
   decodeChatConversationsResponse,
   decodeChatMessagesResponse,
+  decodeChatImage,
   decodeConfigurationEnvelope,
   decodeConfigurationView,
   decodeDashboardResponse,

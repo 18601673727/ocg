@@ -6,7 +6,7 @@ import type {
   SendMessageInput,
 } from "../types";
 import { createScenarioFixture } from "./scenarios";
-import { retryContent } from "../chat/retry";
+import { retryInput } from "../chat/retry";
 import {
   advanceOnboarding,
   resolveAccessHandoff,
@@ -201,16 +201,16 @@ export class RuntimeClientBase implements OcgRuntimeClient {
 
   async retryMessage(sessionId: string, messageId: string): Promise<void> {
     const snapshot = this.store.getSnapshot();
-    const content = retryContent(snapshot.messagesBySession[sessionId] ?? [], messageId);
+    const input = retryInput(snapshot.messagesBySession[sessionId] ?? [], messageId);
     const session = snapshot.sessions.find(item => item.id === sessionId);
-    if (!content || !session) throw new Error("This turn cannot be retried while another turn is active.");
-    await this.sendMessage(sessionId, { content, projectId: session.projectId });
+    if (!input || !session) throw new Error("This turn cannot be retried while another turn is active.");
+    await this.sendMessage(sessionId, { ...input, projectId: session.projectId });
   }
 
   async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
     if (this.enqueueIfBusy(sessionId, input)) return;
     const content = input.content.trim();
-    if (!content) return;
+    if (!content && !input.images?.length) return;
 
     const snapshot = this.store.getSnapshot();
     if (snapshot.status.state !== "connected") {
@@ -238,6 +238,7 @@ export class RuntimeClientBase implements OcgRuntimeClient {
     }
 
     const userMessage: ChatMessage = {
+      images: input.images,
       id: `mock-user-${Date.now()}-${this.nextId++}`,
       role: "user",
       content,
@@ -327,7 +328,7 @@ export class RuntimeClientBase implements OcgRuntimeClient {
    * notify raw listeners. State is always updated before listeners run.
    */
   protected enqueueIfBusy(sessionId: string, input: SendMessageInput): boolean {
-    if (!input.content.trim() || input.mode === "steer") return false;
+    if ((!input.content.trim() && !input.images?.length) || input.mode === "steer") return false;
     const snapshot = this.store.getSnapshot();
     if (!snapshot.sessions.some(session => session.id === sessionId)) return false;
     const active = (snapshot.messagesBySession[sessionId] ?? []).some(message =>
