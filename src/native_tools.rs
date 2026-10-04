@@ -36,6 +36,7 @@ pub enum NativeToolExecutorBinding {
     FilesystemRead,
     FilesystemList,
     FilesystemSearch,
+    ContextSearch,
     FilesystemEdit,
     ProcessExec,
 }
@@ -315,6 +316,17 @@ impl NativeToolRegistry {
                 aliases: &["search", "grep", "ripgrep", "find_in_files"],
                 target_field: Some("path"),
                 argument_aliases: &[("directory", "path"), ("dir", "path"), ("pattern", "query")],
+            },
+            NativeToolDefinition {
+                name: "context.search",
+                description: "Search reusable Project-local indexed text. Refreshes changed files on demand. query is plain text: all case-insensitive word tokens must occur in the same bounded chunk. path restricts results to a Project-relative directory. Returns line ranges, snippets, content revisions, freshness and refresh counters. Use filesystem.search for live regex search.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["query"],"properties":{"query":{"type":"string","description":"Plain text word tokens, maximum 512 bytes."},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::ContextSearch,
+                aliases: &[],
+                target_field: Some("path"),
+                argument_aliases: &[],
             },
             NativeToolDefinition {
                 name: "filesystem.edit",
@@ -609,6 +621,7 @@ impl NativeToolExecutor {
             NativeToolExecutorBinding::FilesystemRead => self.read(arguments),
             NativeToolExecutorBinding::FilesystemList => self.list(arguments, cancelled),
             NativeToolExecutorBinding::FilesystemSearch => self.search(arguments, cancelled),
+            NativeToolExecutorBinding::ContextSearch => self.context_search(arguments, cancelled),
             NativeToolExecutorBinding::FilesystemEdit => self.edit(arguments, cancelled),
             NativeToolExecutorBinding::ProcessExec => self.exec(arguments, cancelled),
         };
@@ -859,6 +872,45 @@ impl NativeToolExecutor {
                     "rg returned a non-zero exit status",
                 ))
             },
+        }
+    }
+
+    fn context_search(&self, arguments: &Value, cancelled: &dyn Fn() -> bool) -> ToolResult {
+        let raw = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+        let directory = match self.root.resolve_existing(raw) {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::InvalidInput,
+                    "search path must be a directory",
+                ))
+            }
+            Err(error) => return ToolResult::failure(error),
+        };
+        let prefix = directory
+            .strip_prefix(self.root.path())
+            .unwrap_or(Path::new(""));
+        let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+        if query.len() > 512 || !query.chars().any(char::is_alphanumeric) {
+            return ToolResult::failure(ToolError::new(
+                ToolErrorKind::InvalidInput,
+                "context query requires word tokens and at most 512 bytes",
+            ));
+        }
+        let limit = arguments.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+        match crate::context::fulltext::search(
+            self.root.path(),
+            prefix,
+            query,
+            limit,
+            self.runner.as_ref(),
+            cancelled,
+        ) {
+            Ok(output) => ToolResult::success(output),
+            Err(error) => ToolResult::failure(ToolError::new(
+                ToolErrorKind::ExecutionFailure,
+                error.to_string(),
+            )),
         }
     }
 
