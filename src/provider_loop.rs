@@ -425,8 +425,13 @@ fn apply_chunk_json(
                         let id = call.get("id").and_then(Value::as_str).unwrap_or("");
                         if let Some(function) = call.get("function") {
                             if let (Some(id), Some(name)) = (
-                                call.get("id").and_then(Value::as_str),
-                                function.get("name").and_then(Value::as_str),
+                                call.get("id")
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty()),
+                                function
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .filter(|name| !name.is_empty()),
                             ) {
                                 let event = ChatStreamEvent::ToolCallStart {
                                     index,
