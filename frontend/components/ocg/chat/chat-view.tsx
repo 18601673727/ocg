@@ -34,6 +34,7 @@ import { ModelSelector } from "./model-selector";
 import type { ChatModelSelection } from "../contracts";
 import type { QueuedChatMessage } from "../types";
 import { retryInput } from "./retry";
+import { parseMarkdownTable, type MarkdownTable } from "./markdown-table";
 import { AttachmentStaging, ImageGallery, useImageAttachments } from "./image-attachments";
 import {
   applyComposerSuggestion,
@@ -105,6 +106,36 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
   );
 }
 
+function TableBlock({ table }: { table: MarkdownTable }) {
+  const { t } = useI18n();
+  return (
+    <div role="region" aria-label={t("chat.markdownTable")} tabIndex={0} className="max-w-full overflow-x-auto rounded-md border border-border focus-visible:outline-ring">
+      <table className="w-full min-w-max border-collapse text-[12px] leading-5">
+        <thead className="bg-muted/50">
+          <tr>
+            {table.headers.map((header, index) => (
+              <th key={index} scope="col" style={{ textAlign: table.alignments[index] }} className="border-r border-border px-3 py-2 font-semibold last:border-r-0">
+                {renderInline(header, `table-header-${index}`)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        {table.rows.length > 0 && <tbody>
+          {table.rows.map((row, rowIndex) => (
+            <tr key={rowIndex} className="border-t border-border">
+              {row.map((cell, columnIndex) => (
+                <td key={columnIndex} style={{ textAlign: table.alignments[columnIndex] }} className="border-r border-border px-3 py-2 align-top last:border-r-0">
+                  {renderInline(cell, `table-${rowIndex}-${columnIndex}`)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>}
+      </table>
+    </div>
+  );
+}
+
 function Markdown({ content }: { content: string }) {
   const blocks: React.ReactNode[] = [];
   const fence = /```(\w*)\n([\s\S]*?)```/g;
@@ -126,7 +157,16 @@ function Markdown({ content }: { content: string }) {
       );
       listBuffer = [];
     };
-    for (const line of lines) {
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const table = parseMarkdownTable(lines, lineIndex);
+      if (table) {
+        flushList();
+        blocks.push(<TableBlock key={`${key}-table${li}`} table={table} />);
+        lineIndex = table.nextLine - 1;
+        li += 1;
+        continue;
+      }
+      const line = lines[lineIndex];
       const trimmed = line.trim();
       const embeddedImages = [...line.matchAll(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)\)/g)];
       if (embeddedImages.length) {
@@ -236,6 +276,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
 
 function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage; onRetry?: () => void; retryDisabled?: boolean }) {
   const { t } = useI18n();
+  const { isCopied, copyToClipboard } = useCopyToClipboard();
   if (message.role === "tool") {
     return (
       <div className="flex gap-2.5">
@@ -261,10 +302,21 @@ function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage;
         {isUser ? <User className="size-3.5" /> : <Bot className="size-3.5" />}
       </span>
       <div className="min-w-0 flex-1">
-        <p className="mb-1 flex items-baseline gap-2">
+        <div className="mb-1 flex items-center gap-2">
           <span className="text-[12px] font-semibold">{isUser ? t("chat.you") : t("chat.assistant")}</span>
           <span className="text-[11px] text-muted-foreground">{message.createdAt}</span>
-        </p>
+          <button
+            type="button"
+            onClick={() => copyToClipboard(message.content)}
+            disabled={message.content.length === 0}
+            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+            aria-label={isUser ? t("chat.copyRawUserMessage") : t("chat.copyRawAssistantMessage")}
+            title={t("chat.copyRawMessage")}
+          >
+            {isCopied ? <Check className="size-3" aria-hidden="true" /> : <Copy className="size-3" aria-hidden="true" />}
+            <span role="status">{isCopied ? t("common.copied") : t("common.copy")}</span>
+          </button>
+        </div>
          <div
            className={cn(
              "text-[13.5px] text-foreground/90",

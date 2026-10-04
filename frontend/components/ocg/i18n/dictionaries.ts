@@ -8,6 +8,10 @@ import type { Locale } from "./locale";
  * plural forms (`one` / `other`) since Chinese does not pluralize.
  */
 export const en = {
+  "chat.markdownTable": "Markdown table",
+  "chat.copyRawMessage": "Copy raw message",
+  "chat.copyRawUserMessage": "Copy raw user message",
+  "chat.copyRawAssistantMessage": "Copy raw assistant message",
   "chat.imageStaging": "Images ready to send",
   "chat.imageUploading": "Uploading…",
   "chat.imageReady": "Uploaded",
@@ -769,6 +773,10 @@ export type I18nKey = keyof typeof en;
 export type Dictionary = Record<I18nKey, string>;
 
 export const zh: Dictionary = {
+  "chat.markdownTable": "Markdown 表格",
+  "chat.copyRawMessage": "复制原始消息",
+  "chat.copyRawUserMessage": "复制用户原始消息",
+  "chat.copyRawAssistantMessage": "复制助手原始消息",
   "chat.imageStaging": "图片等待区",
   "chat.imageUploading": "上传中…",
   "chat.imageReady": "已上传",
