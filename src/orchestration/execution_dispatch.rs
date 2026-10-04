@@ -8,6 +8,7 @@ fn invalid(message: &str) -> OcgError {
     OcgError::config(message)
 }
 
+#[derive(Clone)]
 pub struct ExecutionEnvelope {
     pub call_id: String,
     pub job_id: String,
@@ -101,7 +102,8 @@ impl CallCancellation {
         if !self.is_cancelled() {
             match self.inner.wake.recv_timeout(timeout) {
                 Ok(())
-                | Err(flume::RecvTimeoutError::Disconnected | flume::RecvTimeoutError::Timeout) => {}
+                | Err(flume::RecvTimeoutError::Disconnected | flume::RecvTimeoutError::Timeout) => {
+                }
             }
         }
     }
@@ -376,7 +378,7 @@ impl BoundedDispatcher {
             .map_err(|_| invalid("dispatcher is closed"))
     }
 
-    /// Blocking consumer operation intended to run inside a dedicated execution thread.
+    /// Blocking consumer operation intended for a synchronous execution lane.
     pub fn recv(&self) -> Result<Option<ExecutionEnvelope>> {
         match self.receiver.recv() {
             Ok(value) => Ok(Some(value)),
@@ -384,6 +386,24 @@ impl BoundedDispatcher {
         }
     }
 
+    /// Async consumer operation for a dispatcher owned by an async execution
+    /// runtime. The channel remains bounded; only the receive operation changes
+    /// how the worker waits for the next envelope.
+    pub async fn recv_async(&self) -> Result<Option<ExecutionEnvelope>> {
+        match self.receiver.recv_async().await {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Option<ExecutionEnvelope>> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(value) => Ok(Some(value)),
+            Err(flume::RecvTimeoutError::Timeout | flume::RecvTimeoutError::Disconnected) => {
+                Ok(None)
+            }
+        }
+    }
     pub fn close(&mut self) -> Result<()> {
         let mut sender = self
             .sender

@@ -17,6 +17,7 @@ pub struct ExecutionRuntime {
     provider_dispatcher: BoundedDispatcher,
     native_tool_dispatcher: BoundedDispatcher,
     cancelled: Arc<AtomicBool>,
+    provider_in_flight_limit: Arc<std::sync::atomic::AtomicUsize>,
     provider_thread: Option<JoinHandle<Result<()>>>,
     native_tool_thread: Option<JoinHandle<Result<()>>>,
 }
@@ -27,9 +28,15 @@ impl ExecutionRuntime {
         project_root: &Path,
         provider_capacity: usize,
         native_tool_capacity: usize,
+        provider_in_flight_limit: usize,
         transport: Arc<dyn HttpTransport>,
         permission_policy: PermissionPolicy,
     ) -> Result<Self> {
+        if !(1..=64).contains(&provider_in_flight_limit) {
+            return Err(OcgError::config(
+                "provider in-flight limit must be between 1 and 64",
+            ));
+        }
         let canonical_root = project_root
             .canonicalize()
             .map_err(|error| OcgError::io("resolve execution Project root", error))?;
@@ -41,12 +48,16 @@ impl ExecutionRuntime {
         let recovered = crate::orchestration::domain::DomainRepository::open(project_root)?
             .recover_provider_dispatches()?;
 
+        let provider_in_flight_limit = Arc::new(std::sync::atomic::AtomicUsize::new(
+            provider_in_flight_limit,
+        ));
         let provider_config = ProviderHandlerConfig {
             transport,
             project_root: project_root.to_path_buf(),
             permission_policy,
             cancelled: cancelled.clone(),
             native_tool_dispatcher: native_tool_dispatcher.clone(),
+            in_flight_limit: provider_in_flight_limit.clone(),
         };
 
         let native_tool_handler = crate::native_tools::NativeToolCallHandler::new(
@@ -60,7 +71,10 @@ impl ExecutionRuntime {
         let native_tool_thread = std::thread::Builder::new()
             .name("native-tool-worker".to_string())
             .spawn(move || {
-                crate::provider_loop::run_native_tool_worker(&native_tool_dispatcher_clone, &native_tool_handler)
+                crate::provider_loop::run_native_tool_worker(
+                    &native_tool_dispatcher_clone,
+                    &native_tool_handler,
+                )
             })
             .map_err(|error| OcgError::config(format!("spawn native tool thread: {error}")))?;
 
@@ -76,8 +90,7 @@ impl ExecutionRuntime {
                     provider_config,
                     recovered,
                 )
-            })
-        {
+            }) {
             Ok(thread) => thread,
             Err(error) => {
                 cancelled.store(true, Ordering::SeqCst);
@@ -92,6 +105,7 @@ impl ExecutionRuntime {
             provider_dispatcher,
             native_tool_dispatcher,
             cancelled,
+            provider_in_flight_limit,
             provider_thread: Some(provider_thread),
             native_tool_thread: Some(native_tool_thread),
         })
@@ -100,6 +114,16 @@ impl ExecutionRuntime {
     /// Get a handle to submit work to the provider dispatcher.
     pub fn provider_dispatcher(&self) -> &BoundedDispatcher {
         &self.provider_dispatcher
+    }
+
+    pub fn set_provider_in_flight_limit(&self, limit: usize) -> Result<()> {
+        if !(1..=64).contains(&limit) {
+            return Err(OcgError::config(
+                "provider in-flight limit must be between 1 and 64",
+            ));
+        }
+        self.provider_in_flight_limit.store(limit, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Check if the runtime has been cancelled.
@@ -217,22 +241,33 @@ impl ProjectRuntimeRegistry {
         }
     }
 
-    pub fn get_or_start(&self, project_id: &str, root: &Path) -> Result<ExecutionRuntimeHandle> {
-        let mut state = self.state.lock()
+    pub fn get_or_start(
+        &self,
+        project_id: &str,
+        root: &Path,
+        provider_in_flight_limit: usize,
+    ) -> Result<ExecutionRuntimeHandle> {
+        let mut state = self
+            .state
+            .lock()
             .map_err(|_| OcgError::config("Project runtime registry poisoned"))?;
         if state.shutdown {
-            return Err(OcgError::config("Project runtime registry is shutting down"));
+            return Err(OcgError::config(
+                "Project runtime registry is shutting down",
+            ));
         }
         if let Some(runtime) = state.runtimes.get(project_id) {
             if runtime.project_root != root {
                 return Err(OcgError::config("Project runtime root changed"));
             }
+            runtime.set_provider_in_flight_limit(provider_in_flight_limit)?;
             return Ok(ExecutionRuntimeHandle::new(runtime));
         }
         let runtime = ExecutionRuntime::start(
             root,
             self.provider_capacity,
             self.native_tool_capacity,
+            provider_in_flight_limit,
             self.transport.clone(),
             self.permission_policy,
         )?;
@@ -255,7 +290,9 @@ impl ProjectRuntimeRegistry {
     /// Project as movable to another root on a runtime they believe is gone.
     pub fn invalidate(&self, project_id: &str) -> Result<()> {
         let runtime = {
-            let mut state = self.state.lock()
+            let mut state = self
+                .state
+                .lock()
                 .map_err(|_| OcgError::config("Project runtime registry poisoned"))?;
             state.runtimes.remove(project_id)
         };
@@ -270,7 +307,9 @@ impl ProjectRuntimeRegistry {
 
     pub fn shutdown(&self) -> Result<()> {
         let runtimes = {
-            let mut state = self.state.lock()
+            let mut state = self
+                .state
+                .lock()
                 .map_err(|_| OcgError::config("Project runtime registry poisoned"))?;
             state.shutdown = true;
             std::mem::take(&mut state.runtimes)

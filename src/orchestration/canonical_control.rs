@@ -7,6 +7,7 @@
 
 use crate::error::{OcgError, Result};
 use crate::orchestration::domain::{Attempt, Call, DispatchIntent, DomainRepository, Executor};
+use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
 use crate::project::{self, ProjectBoundary};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,6 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use ts_rs::TS;
 
 pub const CANONICAL_CONTROL_API_VERSION: &str = "ocg.canonical.v1";
@@ -54,8 +54,7 @@ fn atomic_write(path: &Path, bytes: &[u8], context: &'static str) -> Result<()> 
     }
     let temporary = unique_temporary_path(path);
     let result = (|| -> Result<()> {
-        let mut file =
-            std::fs::File::create(&temporary).map_err(|e| OcgError::io(context, e))?;
+        let mut file = std::fs::File::create(&temporary).map_err(|e| OcgError::io(context, e))?;
         file.write_all(bytes)
             .map_err(|e| OcgError::io(context, e))?;
         file.sync_all().map_err(|e| OcgError::io(context, e))?;
@@ -84,7 +83,10 @@ fn chat_conversation_view(
 
 fn endpoint_has_userinfo(endpoint: &str) -> bool {
     endpoint.split_once("://").is_some_and(|(_, rest)| {
-        rest.split(['/', '?', '#']).next().unwrap_or("").contains('@')
+        rest.split(['/', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .contains('@')
     })
 }
 
@@ -166,6 +168,17 @@ pub struct GlobalConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 pub struct ProjectConfiguration {
     pub defaults: Value,
+}
+
+fn provider_concurrency(defaults: &Value) -> Result<usize> {
+    match defaults.get("provider_concurrency") {
+        None => Ok(1),
+        Some(value) => value
+            .as_u64()
+            .filter(|limit| (1..=64).contains(limit))
+            .map(|limit| limit as usize)
+            .ok_or_else(|| invalid("Project provider_concurrency must be between 1 and 64")),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -284,6 +297,7 @@ pub struct CanonicalControlService {
     launch_lock: Arc<Mutex<()>>,
     registry_lock: Arc<Mutex<()>>,
     configuration_lock: Arc<Mutex<()>>,
+    chat_forwarder: Arc<ChatForwarder>,
 }
 
 /// One registered Project considered as a candidate owner of a Job lookup.
@@ -303,6 +317,85 @@ struct ChatRegistration {
     selection: Option<crate::contracts::ChatModelSelection>,
     sender: flume::Sender<ExecutionEvent>,
     cancelled: CallCancellation,
+}
+
+#[derive(Debug)]
+struct ChatForwarder {
+    registrations: flume::Sender<ChatForwardRegistration>,
+}
+
+struct ChatForwardRegistration {
+    receiver: flume::Receiver<ExecutionEvent>,
+    buffer: Arc<ChatEventBuffer>,
+}
+
+impl std::fmt::Debug for ChatForwardRegistration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ChatForwardRegistration").finish()
+    }
+}
+
+impl ChatForwarder {
+    fn new() -> Arc<Self> {
+        let (registrations, receiver) = flume::unbounded();
+        std::thread::spawn(move || Self::run(receiver));
+        Arc::new(Self { registrations })
+    }
+
+    fn register(
+        &self,
+        receiver: flume::Receiver<ExecutionEvent>,
+        buffer: Arc<ChatEventBuffer>,
+    ) -> Result<()> {
+        self.registrations
+            .send(ChatForwardRegistration { receiver, buffer })
+            .map_err(|_| invalid("shared chat forwarder is unavailable"))
+    }
+
+    fn run(registrations: flume::Receiver<ChatForwardRegistration>) {
+        let mut active = Vec::new();
+        loop {
+            while let Ok(registration) = registrations.try_recv() {
+                active.push(registration);
+            }
+            if active.is_empty() {
+                match registrations.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(registration) => active.push(registration),
+                    Err(flume::RecvTimeoutError::Disconnected) => return,
+                    Err(flume::RecvTimeoutError::Timeout) => continue,
+                }
+            }
+            let mut index = 0;
+            while index < active.len() {
+                let registration = &active[index];
+                let mut terminal = false;
+                while let Ok(event) = registration.receiver.try_recv() {
+                    terminal =
+                        matches!(&event, ExecutionEvent::Finished | ExecutionEvent::Failed(_));
+                    if let Ok(mut state) = registration.buffer.state.lock() {
+                        state.events.push(event);
+                        if terminal {
+                            state.terminal = true;
+                            state.terminal_at = Some(Instant::now());
+                        }
+                    }
+                    registration.buffer.cvar.notify_all();
+                    if terminal {
+                        break;
+                    }
+                }
+                if terminal || registration.receiver.is_disconnected() {
+                    active.swap_remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            if registrations.is_disconnected() && active.is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 /// Retained provider tail for one chat turn. Events are appended in order
@@ -404,6 +497,7 @@ impl CanonicalControlService {
             launch_lock: Arc::new(Mutex::new(())),
             registry_lock: Arc::new(Mutex::new(())),
             configuration_lock: Arc::new(Mutex::new(())),
+            chat_forwarder: ChatForwarder::new(),
         }
     }
 
@@ -415,10 +509,7 @@ impl CanonicalControlService {
         self
     }
 
-    pub fn with_profile_service(
-        mut self,
-        profile_service: crate::profile::ProfileService,
-    ) -> Self {
+    pub fn with_profile_service(mut self, profile_service: crate::profile::ProfileService) -> Self {
         self.profile_service = profile_service;
         self
     }
@@ -528,8 +619,7 @@ impl CanonicalControlService {
         }
         let value =
             json!({"global":global,"project_defaults":project_defaults,"revision":revision});
-        let bytes = serde_json::to_vec_pretty(&value)
-            .map_err(|e| invalid(e.to_string()))?;
+        let bytes = serde_json::to_vec_pretty(&value).map_err(|e| invalid(e.to_string()))?;
         atomic_write(&path, &bytes, "commit canonical configuration")
     }
 
@@ -544,7 +634,9 @@ impl CanonicalControlService {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
-        let _registry = self.registry_lock.lock()
+        let _registry = self
+            .registry_lock
+            .lock()
             .map_err(|_| invalid("Project registry poisoned"))?;
         let boundary: ProjectBoundary = project::resolve(requested_root);
         boundary.require(requested_root)?;
@@ -553,9 +645,12 @@ impl CanonicalControlService {
             return Err(invalid("project root is not a directory"));
         }
         let marker = root.join(project::MARKER);
-        let canonical_marker = marker.canonicalize()
+        let canonical_marker = marker
+            .canonicalize()
             .map_err(|error| OcgError::io("resolve Project marker", error))?;
-        if !canonical_marker.starts_with(&root) || project::resolve(&canonical_marker).root() != root {
+        if !canonical_marker.starts_with(&root)
+            || project::resolve(&canonical_marker).root() != root
+        {
             return Err(invalid("Project marker must stay inside its boundary"));
         }
         let boundary_root = project::canonicalize(boundary.root());
@@ -684,6 +779,7 @@ impl CanonicalControlService {
         if !safe_id(command_id) || !defaults.is_object() {
             return Err(invalid("invalid project configuration command"));
         }
+        provider_concurrency(&defaults)?;
         let project = self
             .read_projects()?
             .into_iter()
@@ -798,7 +894,8 @@ impl CanonicalControlService {
                 ))
             }
         };
-        if !canonical_marker.starts_with(root) || project::resolve(&canonical_marker).root() != root {
+        if !canonical_marker.starts_with(root) || project::resolve(&canonical_marker).root() != root
+        {
             return Ok(CandidateRepository::Unavailable(
                 "registered Project marker must stay inside its boundary",
             ));
@@ -1008,7 +1105,11 @@ impl CanonicalControlService {
         let executors: Vec<Executor> = projection
             .executors
             .values()
-            .filter(|executor| attempts.iter().any(|attempt| attempt.id == executor.attempt_id))
+            .filter(|executor| {
+                attempts
+                    .iter()
+                    .any(|attempt| attempt.id == executor.attempt_id)
+            })
             .cloned()
             .collect();
         let dispatch_intents: Vec<DispatchIntent> = projection
@@ -1049,7 +1150,8 @@ impl CanonicalControlService {
         after: u64,
     ) -> Result<CanonicalEventTail> {
         let (project, repository) = self.project_repository(project_id)?;
-        if !repository.job(job_id)?
+        if !repository
+            .job(job_id)?
             .is_some_and(|job| job.project_id == project_id)
         {
             return Err(invalid("Job does not belong to the requested Project"));
@@ -1125,7 +1227,7 @@ impl CanonicalControlService {
         &self,
         request: crate::contracts::JobLaunchRequest,
     ) -> Result<crate::contracts::JobLaunchResponse> {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         if !safe_id(&request.command_id) {
             return Ok(crate::contracts::JobLaunchResponse {
@@ -1183,9 +1285,8 @@ impl CanonicalControlService {
             .get(&request.command_id)
             .and_then(|entry| entry.selection.clone());
         if let Some(selection) = &selection {
-            hasher.update(
-                serde_json::to_vec(selection).map_err(|error| invalid(error.to_string()))?,
-            );
+            hasher
+                .update(serde_json::to_vec(selection).map_err(|error| invalid(error.to_string()))?);
         }
         let images = self
             .chat_registrations
@@ -1200,10 +1301,9 @@ impl CanonicalControlService {
         let request_hash = format!("{:x}", hasher.finalize());
 
         // Check for existing command
-        if let Some((stored_hash, job_id, outcome, message)) = domain.lookup_launch_command(
-            &request.command_id,
-            &request.project_id,
-        )? {
+        if let Some((stored_hash, job_id, outcome, message)) =
+            domain.lookup_launch_command(&request.command_id, &request.project_id)?
+        {
             if stored_hash != request_hash {
                 return Ok(crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -1230,8 +1330,20 @@ impl CanonicalControlService {
             });
         }
 
+        // Resolve configuration
+        let (global_config, project_configs, _revision) = self.read_configuration()?;
+        let project_config = project_configs
+            .get(&project.project_id)
+            .cloned()
+            .unwrap_or_default();
+        let provider_concurrency = provider_concurrency(&project_config.defaults)?;
+
         let runtime = if let Some(registry) = &self.runtime_registry {
-            registry.get_or_start(&project.project_id, Path::new(&project.root))
+            registry.get_or_start(
+                &project.project_id,
+                Path::new(&project.root),
+                provider_concurrency,
+            )
         } else {
             self.runtime_handle
                 .as_ref()
@@ -1266,13 +1378,6 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
-
-        // Resolve configuration
-        let (global_config, project_configs, _revision) = self.read_configuration()?;
-        let project_config = project_configs
-            .get(&project.project_id)
-            .cloned()
-            .unwrap_or_default();
 
         // Resolve profile from the user-global profile service
         let (profile, _) = match self.profile_service.current()? {
@@ -1309,18 +1414,28 @@ impl CanonicalControlService {
             .map_err(|_| invalid("chat registrations poisoned"))?
             .contains_key(&request.command_id);
         let chat_selection = if is_chat {
-            Some(profile.select(
-                selection.as_ref().map(|selection| selection.model.as_str())
-                    .or_else(|| project_config.defaults.get("model").and_then(Value::as_str)),
-            )?)
+            Some(
+                profile.select(
+                    selection
+                        .as_ref()
+                        .map(|selection| selection.model.as_str())
+                        .or_else(|| project_config.defaults.get("model").and_then(Value::as_str)),
+                )?,
+            )
         } else {
             None
         };
 
         // Resolve provider and model from project configuration defaults
-        let provider_key = match selection.as_ref()
+        let provider_key = match selection
+            .as_ref()
             .and_then(|_| chat_selection.map(|(_, model)| model.provider.as_str()))
-            .or_else(|| project_config.defaults.get("provider").and_then(Value::as_str))
+            .or_else(|| {
+                project_config
+                    .defaults
+                    .get("provider")
+                    .and_then(Value::as_str)
+            })
             .or_else(|| chat_selection.map(|(_, model)| model.provider.as_str()))
         {
             Some(p) => p,
@@ -1348,7 +1463,9 @@ impl CanonicalControlService {
             }
         };
 
-        let model = match selection.as_ref().map(|selection| selection.model.as_str())
+        let model = match selection
+            .as_ref()
+            .map(|selection| selection.model.as_str())
             .or_else(|| project_config.defaults.get("model").and_then(Value::as_str))
             .or_else(|| chat_selection.map(|(key, _)| key))
         {
@@ -1420,8 +1537,12 @@ impl CanonicalControlService {
                     duplicate: false,
                 };
                 domain.record_launch_command(
-                    &request.command_id, &request.project_id, &request_hash,
-                    "rejected", None, &response.message,
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "rejected",
+                    None,
+                    &response.message,
                 )?;
                 return Ok(response);
             }
@@ -1449,14 +1570,19 @@ impl CanonicalControlService {
                 .get(model)
                 .ok_or_else(|| invalid("selected model missing"))?;
             let metadata = entry.metadata.as_ref();
-            let supported = metadata.and_then(|metadata| metadata.efforts.as_ref())
+            let supported = metadata
+                .and_then(|metadata| metadata.efforts.as_ref())
                 .is_some_and(|efforts| efforts.iter().any(|candidate| candidate == effort))
                 || entry.variants.iter().any(|candidate| candidate == effort)
-                || metadata.and_then(|metadata| metadata.variants.as_ref())
+                || metadata
+                    .and_then(|metadata| metadata.variants.as_ref())
                     .is_some_and(|variants| variants.iter().any(|candidate| candidate == effort));
             if !supported
                 || !provider_entry.wire_protocol().is_openai_chat_completions()
-                || !matches!(effort, "none" | "minimal" | "low" | "medium" | "high" | "xhigh")
+                || !matches!(
+                    effort,
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+                )
             {
                 return Err(invalid(
                     "selected reasoning effort is unsupported for this model/protocol",
@@ -1626,7 +1752,9 @@ impl CanonicalControlService {
         let quota_facts = crate::orchestration::budget::QuotaFacts::unknown();
 
         // Admit the provider call
-        let authority = domain.authority(&attempt.id)?.ok_or_else(|| invalid("attempt authority disappeared"))?;
+        let authority = domain
+            .authority(&attempt.id)?
+            .ok_or_else(|| invalid("attempt authority disappeared"))?;
 
         // Freeze provider execution configuration for this Call
         let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
@@ -1642,11 +1770,15 @@ impl CanonicalControlService {
         // of the dispatch.
         let protocol = provider_entry.wire_protocol();
 
-        let chat = self.chat_registrations.lock().ok().and_then(|registrations| {
-            registrations.get(&request.command_id).map(|registration| {
-                (registration.sender.clone(), registration.cancelled.clone())
-            })
-        });
+        let chat = self
+            .chat_registrations
+            .lock()
+            .ok()
+            .and_then(|registrations| {
+                registrations.get(&request.command_id).map(|registration| {
+                    (registration.sender.clone(), registration.cancelled.clone())
+                })
+            });
         let _call = match crate::provider_loop::admit_provider_call_with_events(
             crate::provider_loop::ProviderCallAdmission {
                 domain: &mut domain,
@@ -1890,7 +2022,10 @@ impl CanonicalControlService {
         let attempt_id = {
             let (_, domain) = self.project_repository(&request.project_id)?;
             let attempts = domain.attempts_for_job(&job_id)?;
-            attempts.last().map(|attempt| attempt.id.clone()).unwrap_or_default()
+            attempts
+                .last()
+                .map(|attempt| attempt.id.clone())
+                .unwrap_or_default()
         };
         if attempt_id.is_empty() {
             if registered {
@@ -1909,37 +2044,10 @@ impl CanonicalControlService {
             }
             return Ok(response);
         }
-        // Retain every provider event from this point on. The forwarder
-        // appends in order the moment the provider produces an event, so a
-        // later EventSource attach replays the prefix instead of losing it.
-        {
-            let forward_buffer = buffer.clone();
-            std::thread::Builder::new()
-                .name("chat-forward".to_string())
-                .spawn(move || {
-                    for event in receiver.iter() {
-                        let terminal = matches!(
-                            &event,
-                            ExecutionEvent::Finished | ExecutionEvent::Failed(_)
-                        );
-                        if let Ok(state) = forward_buffer.state.lock() {
-                            // The mutex is only poisoned on panic; retain
-                            // what arrived rather than dropping the tail.
-                            let mut guard = state;
-                            guard.events.push(event);
-                            if terminal {
-                                guard.terminal = true;
-                                guard.terminal_at = Some(Instant::now());
-                            }
-                        }
-                        forward_buffer.cvar.notify_all();
-                        if terminal {
-                            break;
-                        }
-                    }
-                })
-                .ok();
-        }
+        // Retain every provider event from this point on through the shared
+        // forwarder. Registration happens after launch so failed launches do
+        // not leave a live receiver in the shared event loop.
+        self.chat_forwarder.register(receiver, buffer.clone())?;
         // Publish the real identity onto the registration made before the
         // launch, so cancellation can now settle the Attempt as well as the
         // transport.
@@ -2056,7 +2164,9 @@ impl CanonicalControlService {
 
     pub(crate) fn cancel_chat_turn(&self, session_id: &str, job_id: &str) -> Result<bool> {
         let active = {
-            let mut chats = self.active_chats.lock()
+            let mut chats = self
+                .active_chats
+                .lock()
                 .map_err(|_| invalid("active chats poisoned"))?;
             let key = chats
                 .iter()
@@ -2112,13 +2222,17 @@ impl CanonicalControlService {
         // If authority is already gone (completed/failed), or the turn has not
         // resolved its Attempt yet, there is nothing to revoke; still stop the
         // transport so a queued or running read cannot continue.
-        let mut domain = self.project_repository(&active.project_id)
+        let mut domain = self
+            .project_repository(&active.project_id)
             .map(|(_, repository)| repository);
         let revocable = !active.attempt_id.is_empty()
-            && domain.as_mut()
+            && domain
+                .as_mut()
                 .is_ok_and(|domain| domain.request_cancel(&active.attempt_id).is_ok());
         active.cancelled.cancel();
-        let _ = active.sender.send(ExecutionEvent::Failed("chat cancelled".to_string()));
+        let _ = active
+            .sender
+            .send(ExecutionEvent::Failed("chat cancelled".to_string()));
         let mut domain = domain?;
         if revocable {
             let _ = domain.confirm_cancel(&active.attempt_id, true);

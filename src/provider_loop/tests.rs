@@ -43,7 +43,9 @@ impl ProviderStub {
                         let closed = closed.clone();
                         let handler = thread::spawn(move || {
                             let mut stream = stream;
-                            stream.set_nonblocking(false).expect("blocking fixture socket");
+                            stream
+                                .set_nonblocking(false)
+                                .expect("blocking fixture socket");
                             stream.set_read_timeout(Some(WAIT)).expect("read timeout");
                             stream.set_write_timeout(Some(WAIT)).expect("write timeout");
                             let mut reader =
@@ -87,9 +89,14 @@ impl ProviderStub {
                                     0
                                 );
                             } else {
-                                if label == "slow-head" { thread::sleep(Duration::from_secs(31)); }
-                                let tool_messages = body["messages"].as_array().expect("messages")
-                                    .iter().filter(|message| message["role"] == "tool")
+                                if label == "slow-head" {
+                                    thread::sleep(Duration::from_secs(31));
+                                }
+                                let tool_messages = body["messages"]
+                                    .as_array()
+                                    .expect("messages")
+                                    .iter()
+                                    .filter(|message| message["role"] == "tool")
                                     .collect::<Vec<_>>();
                                 let chunk = |delta: Value, reason: Value| {
                                     let value = json!({"choices":[{"index":0,"delta":delta,"finish_reason":reason}]});
@@ -97,46 +104,69 @@ impl ProviderStub {
                                 };
                                 let chunks = if label == "retry-empty" && tool_messages.len() < 6 {
                                     if let Some(message) = tool_messages.last() {
-                                        let observation = message["content"].as_str().expect("repair");
+                                        let observation =
+                                            message["content"].as_str().expect("repair");
                                         assert!(observation.contains("InvalidArguments"));
                                         assert!(observation.contains("path"));
                                         assert!(observation.contains("expected string"));
                                     }
-                                    vec![chunk(json!({"tool_calls": [{"index": 0,
-                                        "id": format!("retry-{}", tool_messages.len()),
-                                        "function": {"name": "filesystem_list", "arguments": "{\"path\":42}"}
-                                    }]}), json!("tool_calls"))]
-                                } else if matches!(label.as_str(), "tool-loop" | "fragmented-tool-loop") && tool_messages.is_empty() {
+                                    vec![chunk(
+                                        json!({"tool_calls": [{"index": 0,
+                                            "id": format!("retry-{}", tool_messages.len()),
+                                            "function": {"name": "filesystem_list", "arguments": "{\"path\":42}"}
+                                        }]}),
+                                        json!("tool_calls"),
+                                    )]
+                                } else if matches!(
+                                    label.as_str(),
+                                    "tool-loop" | "fragmented-tool-loop"
+                                ) && tool_messages.is_empty()
+                                {
                                     let repeated = label == "fragmented-tool-loop";
                                     vec![
-                                        chunk(json!({"tool_calls": [{"index": 0, "id": "native-list",
-                                            "function": {"name": "filesystem_list", "arguments": "{\"path\":"}
-                                        }]}), Value::Null),
-                                        chunk(if repeated {
+                                        chunk(
                                             json!({"tool_calls": [{"index": 0, "id": "native-list",
-                                                "function": {"name": "filesystem_list", "arguments": "\".\"}"}
-                                            }]})
-                                        } else {
-                                            json!({"tool_calls": [{"index": 0, "function": {"arguments": "\".\"}"}}]})
-                                        }, json!("tool_calls")),
+                                                "function": {"name": "filesystem_list", "arguments": "{\"path\":"}
+                                            }]}),
+                                            Value::Null,
+                                        ),
+                                        chunk(
+                                            if repeated {
+                                                json!({"tool_calls": [{"index": 0, "id": "native-list",
+                                                    "function": {"name": "filesystem_list", "arguments": "\".\"}"}
+                                                }]})
+                                            } else {
+                                                json!({"tool_calls": [{"index": 0, "function": {"arguments": "\".\"}"}}]})
+                                            },
+                                            json!("tool_calls"),
+                                        ),
                                     ]
                                 } else {
-                                    if matches!(label.as_str(), "tool-loop" | "fragmented-tool-loop") {
-                                        let content = tool_messages.last().expect("tool result")["content"].as_str().expect("content");
-                                        let result: Value = serde_json::from_str(content).expect("canonical tool result");
+                                    if matches!(
+                                        label.as_str(),
+                                        "tool-loop" | "fragmented-tool-loop"
+                                    ) {
+                                        let content = tool_messages.last().expect("tool result")
+                                            ["content"]
+                                            .as_str()
+                                            .expect("content");
+                                        let result: Value = serde_json::from_str(content)
+                                            .expect("canonical tool result");
                                         assert_eq!(result["success"], true);
                                     }
                                     [("Real ", Value::Null), ("reply", json!("stop"))]
-                                    .into_iter()
-                                    .map(|(content, reason)| {
-                                        let delta = match label.as_str() {
-                                            "empty-final" | "retry-empty" => json!({"reasoning_content": "Hidden reasoning"}),
-                                            "blank-final" => json!({"content": " \n\t"}),
-                                            _ => json!({"content": content}),
-                                        };
-                                        chunk(delta, reason)
-                                    })
-                                    .collect::<Vec<_>>()
+                                        .into_iter()
+                                        .map(|(content, reason)| {
+                                            let delta = match label.as_str() {
+                                                "empty-final" | "retry-empty" => {
+                                                    json!({"reasoning_content": "Hidden reasoning"})
+                                                }
+                                                "blank-final" => json!({"content": " \n\t"}),
+                                                _ => json!({"content": content}),
+                                            };
+                                            chunk(delta, reason)
+                                        })
+                                        .collect::<Vec<_>>()
                                 };
                                 let body = format!("{}data: [DONE]\n\n", chunks.concat());
                                 write!(
@@ -225,6 +255,7 @@ impl Fixture {
             permission_policy: PermissionPolicy::allow_all(),
             cancelled: Arc::new(AtomicBool::new(false)),
             native_tool_dispatcher: tools.clone(),
+            in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
         });
         Self {
             root,
@@ -713,7 +744,9 @@ fn reasoning_provider_can_wait_more_than_thirty_seconds_for_a_response_head() {
     let upstream = ProviderStub::start();
     let mut fixture = Fixture::new();
     let (call, envelope, _events) = fixture.admitted(&upstream.endpoint, "slow-head", true);
-    fixture.execute(envelope).expect("reasoning provider response");
+    fixture
+        .execute(envelope)
+        .expect("reasoning provider response");
     upstream.request("slow-head");
     upstream.closure("slow-head");
     fixture.terminal(&call, "completed");
@@ -725,8 +758,15 @@ fn native_file_read_reports_byte_pagination_for_continuation() {
     let root = tempfile::tempdir().expect("project");
     std::fs::write(root.path().join("sample"), "first line\nsecond line\n").expect("file");
     let executor = crate::native_tools::NativeToolExecutor::new(root.path()).expect("native tools");
-    let read = |arguments| executor.execute("filesystem.read", &arguments,
-        crate::native_tools::PermissionClass::ReadOnly, PermissionPolicy::allow_all(), &AtomicBool::new(false));
+    let read = |arguments| {
+        executor.execute(
+            "filesystem.read",
+            &arguments,
+            crate::native_tools::PermissionClass::ReadOnly,
+            PermissionPolicy::allow_all(),
+            &AtomicBool::new(false),
+        )
+    };
     let first = read(json!({"path":"sample","offset":0,"limit":5}));
     assert!(first.success && first.truncated);
     assert_eq!(first.output["content"], "first");
@@ -737,7 +777,13 @@ fn native_file_read_reports_byte_pagination_for_continuation() {
     std::fs::write(root.path().join("quoted"), "\"".repeat(20_000)).expect("large file");
     let large = read(json!({"path":"quoted"}));
     assert!(large.success && large.truncated);
-    assert_eq!(large.output["content"].as_str().expect("structured content").len(), 8192);
+    assert_eq!(
+        large.output["content"]
+            .as_str()
+            .expect("structured content")
+            .len(),
+        8192
+    );
     assert_eq!(large.metadata["nextOffset"], 8192);
     assert!(large.to_value().to_string().len() <= crate::native_tools::TOOL_OUTPUT_CAP);
 }
@@ -760,15 +806,30 @@ fn empty_user_visible_final_fails_and_settles_the_attempt() {
     for label in ["retry-empty", "empty-final", "blank-final"] {
         let mut fixture = Fixture::new();
         let (call, envelope, _events) = fixture.admitted(&upstream.endpoint, label, true);
-        let error = fixture.execute(envelope).expect_err("empty final must fail");
-        assert!(error.to_string().contains("no user-visible assistant content"));
+        let error = fixture
+            .execute(envelope)
+            .expect_err("empty final must fail");
+        assert!(error
+            .to_string()
+            .contains("no user-visible assistant content"));
         for _ in 0..if label == "retry-empty" { 7 } else { 1 } {
             upstream.request(label);
             upstream.closure(label);
         }
-        assert_eq!(fixture.domain.calls_for_attempt(&call.attempt_id).expect("calls").len(), 1);
+        assert_eq!(
+            fixture
+                .domain
+                .calls_for_attempt(&call.attempt_id)
+                .expect("calls")
+                .len(),
+            1
+        );
         assert_eq!(fixture.domain.call(&call.id).expect("Call").state, "failed");
-        let intent = fixture.domain.dispatch_intent(&call.id).expect("Intent").expect("exists");
+        let intent = fixture
+            .domain
+            .dispatch_intent(&call.id)
+            .expect("Intent")
+            .expect("exists");
         assert_eq!(intent.state, "failed");
         // The upstream request was dispatched, so retain conservative failure accounting.
         assert_eq!(intent.effect_state, EffectIntentState::Unknown);
@@ -785,24 +846,32 @@ fn native_tool_loop_preserves_fragmented_arguments_and_completes() {
         let (call, envelope, _events) = fixture.admitted(&upstream.endpoint, label, true);
         let tools = fixture.tools.clone();
         let handler = crate::native_tools::NativeToolCallHandler::new(
-            fixture.root.path().to_path_buf(), PermissionPolicy::allow_all(),
+            fixture.root.path().to_path_buf(),
+            PermissionPolicy::allow_all(),
             Arc::new(AtomicBool::new(false)),
         );
         let worker = thread::spawn(move || run_native_tool_worker(&tools, &handler));
         let result = fixture.execute(envelope);
         fixture.tools.shutdown();
-        worker.join().expect("native worker").expect("native execution");
+        worker
+            .join()
+            .expect("native worker")
+            .expect("native execution");
         result.expect("normal tool loop");
         for _ in 0..2 {
             upstream.request(label);
             upstream.closure(label);
         }
         fixture.terminal(&call, "completed");
-        let calls = fixture.domain.calls_for_attempt(&call.attempt_id).expect("calls");
+        let calls = fixture
+            .domain
+            .calls_for_attempt(&call.attempt_id)
+            .expect("calls");
         assert_eq!(calls.len(), 2);
         assert!(calls.iter().all(|call| call.state == "completed"));
         let provider = fixture.domain.call(&call.id).expect("provider");
-        let response: Value = serde_json::from_str(provider.response.as_deref().expect("response")).expect("JSON");
+        let response: Value =
+            serde_json::from_str(provider.response.as_deref().expect("response")).expect("JSON");
         assert_eq!(response["content"], "Real reply");
         assert_eq!(response["rounds"], 2);
         fixture.no_residue();
@@ -813,11 +882,15 @@ fn native_tool_loop_preserves_fragmented_arguments_and_completes() {
 fn repeated_tool_metadata_does_not_discard_argument_deltas() {
     let mut summary = ChatStreamSummary::default();
     for arguments in ["{\"path\":", "\".\"}"] {
-        apply_chunk_json(&mut summary, &json!({"choices": [{"delta": {
-            "tool_calls": [{"index": 0, "id": "native-list", "function": {
-                "name": "filesystem_list", "arguments": arguments
-            }}]
-        }}]})).expect("stream chunk");
+        apply_chunk_json(
+            &mut summary,
+            &json!({"choices": [{"delta": {
+                "tool_calls": [{"index": 0, "id": "native-list", "function": {
+                    "name": "filesystem_list", "arguments": arguments
+                }}]
+            }}]}),
+        )
+        .expect("stream chunk");
     }
     assert_eq!(summary.tool_calls.len(), 1);
     assert_eq!(summary.tool_calls[0].arguments, "{\"path\":\".\"}");
@@ -906,6 +979,7 @@ fn chat_queue_supersede_cancel_and_empty_final_keep_one_consumer_progressing() {
         root.path(),
         8,
         8,
+        1,
         Arc::new(NativeHttp::new().expect("HTTP")),
         PermissionPolicy::allow_all(),
     )
@@ -992,7 +1066,9 @@ fn chat_queue_supersede_cancel_and_empty_final_keep_one_consumer_progressing() {
         upstream.request("retry-empty");
         upstream.closure("retry-empty");
     }
-    assert!(!service.cancel_chat("session").expect("failed turn is terminal"));
+    assert!(!service
+        .cancel_chat("session")
+        .expect("failed turn is terminal"));
     let next = send("after-empty", "session");
     wait_terminal(&domain, &next, JobState::Completed);
     upstream.request("after-empty");

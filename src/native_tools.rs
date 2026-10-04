@@ -396,10 +396,7 @@ impl NativeToolRegistry {
     /// the registry.
     pub fn get_by_alias(name: &str) -> Option<(NativeToolDefinition, NameMatch)> {
         let definitions = Self::definitions();
-        let exact = definitions
-            .iter()
-            .find(|tool| tool.name == name)
-            .cloned();
+        let exact = definitions.iter().find(|tool| tool.name == name).cloned();
         if let Some(definition) = exact {
             return Some((definition, NameMatch::Exact));
         }
@@ -648,7 +645,9 @@ impl NativeToolExecutor {
             NativeToolExecutorBinding::FilesystemList => self.list(arguments, cancelled),
             NativeToolExecutorBinding::FilesystemSearch => self.search(arguments, cancelled),
             NativeToolExecutorBinding::ContextSearch => self.context_search(arguments, cancelled),
-            NativeToolExecutorBinding::ContextRead => evidence::read(&self.root, arguments, cancelled),
+            NativeToolExecutorBinding::ContextRead => {
+                evidence::read(&self.root, arguments, cancelled)
+            }
             NativeToolExecutorBinding::ContextValidation => {
                 validation::query(&self.root, arguments, cancelled)
             }
@@ -1022,19 +1021,21 @@ impl NativeToolExecutor {
                 "cwd must be a directory",
             ));
         }
-        let output =
-            match self
-                .runner
-                .run_with_cancellation(program, &args, &cwd, TOOL_OUTPUT_CAP, cancelled)
-            {
-                Ok(output) => output,
-                Err(error) => {
-                    return ToolResult::failure(ToolError::new(
-                        ToolErrorKind::Unavailable,
-                        error.to_string(),
-                    ))
-                }
-            };
+        let output = match self.runner.run_with_cancellation(
+            program,
+            &args,
+            &cwd,
+            TOOL_OUTPUT_CAP,
+            cancelled,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                return ToolResult::failure(ToolError::new(
+                    ToolErrorKind::Unavailable,
+                    error.to_string(),
+                ))
+            }
+        };
         if cancelled() {
             return ToolResult::failure(ToolError::new(
                 ToolErrorKind::Cancelled,
@@ -1231,6 +1232,7 @@ pub fn tool_permission_for(name: &str) -> Option<PermissionClass> {
 }
 
 /// Handler for Native Tool Calls running through bounded execution.
+#[derive(Clone)]
 pub struct NativeToolCallHandler {
     project_root: PathBuf,
     permission_policy: PermissionPolicy,

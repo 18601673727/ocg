@@ -625,7 +625,12 @@ impl DomainRepository {
             "payload_digest",
             "TEXT NOT NULL DEFAULT ''",
         )?;
-        ensure_column(&connection, "domain_dispatch_intents", "upstream_model_id", "TEXT")?;
+        ensure_column(
+            &connection,
+            "domain_dispatch_intents",
+            "upstream_model_id",
+            "TEXT",
+        )?;
         ensure_column(&connection, "domain_job_bindings", "attempt_id", "TEXT")?;
         connection.execute(
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
@@ -1560,7 +1565,6 @@ impl DomainRepository {
         transaction.commit().map_err(sql)?;
         Ok(())
     }
-
 
     /// Freeze the pricing basis for one dispatch, durably, before the provider
     /// is asked to do anything.
@@ -2809,6 +2813,16 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
+        let blocked: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM domain_job_dependencies d JOIN domain_jobs prerequisite ON prerequisite.id=d.prerequisite_job_id WHERE d.job_id=?1 AND prerequisite.state!='completed')",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if blocked {
+            return Err(invalid("Job dependencies are not satisfied"));
+        }
         let (attempt, _root) = create_attempt_in(&transaction, job_id)?;
         transaction.commit().map_err(sql)?;
         Ok(attempt)
@@ -2824,6 +2838,16 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
+        let blocked: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM domain_job_dependencies d JOIN domain_jobs prerequisite ON prerequisite.id=d.prerequisite_job_id WHERE d.job_id=?1 AND prerequisite.state!='completed')",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if blocked {
+            return Err(invalid("Job dependencies are not satisfied"));
+        }
         transaction.execute("UPDATE domain_jobs SET state='eligible',updated_at=?2 WHERE id=?1 AND state='pending' AND authoritative_attempt_id IS NULL", params![job_id,now()]).map_err(sql)?;
         let (attempt, root) = create_attempt_in(&transaction, job_id)?;
         let executor = Executor {
@@ -3401,7 +3425,12 @@ impl DomainRepository {
         }
         let intent = read_dispatch_intent_by_call(&transaction, call_id)?
             .ok_or_else(|| invalid("configured dispatch intent disappeared"))?;
-        emit_dispatch_intent(&transaction, EventKind::DispatchIntentUpdated, &intent, None)?;
+        emit_dispatch_intent(
+            &transaction,
+            EventKind::DispatchIntentUpdated,
+            &intent,
+            None,
+        )?;
         transaction.commit().map_err(sql)?;
         Ok(())
     }

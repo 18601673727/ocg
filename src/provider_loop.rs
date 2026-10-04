@@ -25,6 +25,7 @@ use crate::orchestration::execution_dispatch::{
 };
 use crate::provider_protocol::ProviderProtocol;
 use serde_json::{json, Value};
+use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -590,6 +591,10 @@ pub struct ProviderHandlerConfig {
     pub permission_policy: PermissionPolicy,
     pub cancelled: Arc<AtomicBool>,
     pub native_tool_dispatcher: BoundedDispatcher,
+    /// Maximum number of independent provider Calls this Project scheduler may
+    /// have in flight at once. Durable Attempt/Call fencing remains the source
+    /// of execution authority; this is only a resource policy.
+    pub in_flight_limit: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub struct CanonicalProviderCallHandler {
@@ -859,7 +864,7 @@ impl CanonicalProviderCallHandler {
                 authority: &authority,
                 executor_id: &executor.id,
                 permission_policy: config.permission_policy,
-                shutdown: &config.cancelled,
+                shutdown: config.cancelled.clone(),
                 native_tool_dispatcher: &config.native_tool_dispatcher,
                 task: &task,
             },
@@ -1182,30 +1187,18 @@ pub(crate) fn run_recovered_provider_dispatcher(
     recovered: Vec<crate::orchestration::domain::DispatchIntent>,
 ) -> Result<()> {
     let handler = CanonicalProviderCallHandler::new(config);
-    let dispatcher_clone = dispatcher.clone();
     let project_root_clone = project_root.to_path_buf();
 
-    // Use a channel to coordinate consumer startup with recovery producer
+    // Recovery uses the existing blocking send path, so it stays a separate
+    // producer while the provider worker is the only consumer.
     let (ready_tx, ready_rx) = flume::bounded::<()>(1);
-
-    // Start bounded consumer in separate thread
-    let consumer_thread = std::thread::Builder::new()
-        .name("provider-consumer".to_string())
-        .spawn(move || {
-            // Signal that consumer is ready to receive
-            let _ = ready_tx.send(());
-            run_provider_worker(&dispatcher_clone, &handler)
-        })
-        .map_err(|error| OcgError::config(format!("spawn consumer thread: {error}")))?;
-
-    // Wait for consumer to signal readiness before starting recovery producer
-    let _ = ready_rx.recv();
-
-    // Start recovery producer in separate thread with explicit ownership
     let recovery_dispatcher = dispatcher.clone();
     let recovery_thread = std::thread::Builder::new()
         .name("provider-recovery".to_string())
         .spawn(move || -> Result<()> {
+            ready_rx
+                .recv()
+                .map_err(|_| OcgError::config("provider worker stopped before recovery"))?;
             let mut domain = DomainRepository::open(&project_root_clone)?;
             for intent in &recovered {
                 requeue_recovered_provider_call(&mut domain, intent, &recovery_dispatcher)?;
@@ -1214,69 +1207,148 @@ pub(crate) fn run_recovered_provider_dispatcher(
         })
         .map_err(|error| OcgError::config(format!("spawn recovery thread: {error}")))?;
 
-    // Join recovery thread and propagate errors
-    let recovery_result = recovery_thread.join();
-    let recovery_error = match recovery_result {
+    // The current thread owns the one persistent provider worker and its
+    // long-lived ntex System. Recovery can only enqueue after readiness.
+    let worker_result = run_provider_worker_ready(dispatcher, &handler, &ready_tx);
+    let recovery_error = match recovery_thread.join() {
         Ok(result) => result.err(),
         Err(panic) => {
-            // Recovery thread panicked; propagate it
             std::panic::resume_unwind(panic);
         }
     };
 
-    // Join consumer thread and propagate errors
-    let consumer_result = consumer_thread.join();
-    let consumer_error = match consumer_result {
-        Ok(result) => result.err(),
-        Err(panic) => {
-            // Consumer thread panicked; propagate it
-            std::panic::resume_unwind(panic);
-        }
-    };
-
-    // Return first error encountered, if any
     if let Some(error) = recovery_error {
         return Err(error);
     }
-    if let Some(error) = consumer_error {
-        return Err(error);
-    }
-
-    Ok(())
+    worker_result
 }
 
-/// Run the provider worker loop using ntex runtime for async execution.
+/// Run the provider worker loop using one long-lived ntex runtime.
 pub fn run_provider_worker(
     dispatcher: &BoundedDispatcher,
     handler: &CanonicalProviderCallHandler,
 ) -> Result<()> {
+    let dispatcher = dispatcher.clone();
+    let handler = handler.clone();
+    let runtime = ntex::rt::System::new("ocg-provider", ntex::rt::DefaultRuntime);
+    runtime.block_on(run_provider_worker_async(dispatcher, handler))
+}
+
+fn run_provider_worker_ready(
+    dispatcher: &BoundedDispatcher,
+    handler: &CanonicalProviderCallHandler,
+    ready: &flume::Sender<()>,
+) -> Result<()> {
+    let dispatcher = dispatcher.clone();
+    let handler = handler.clone();
+    let ready = ready.clone();
+    let runtime = ntex::rt::System::new("ocg-provider", ntex::rt::DefaultRuntime);
+    runtime.block_on(async move {
+        // Recovery is allowed to enqueue only after this worker owns a live
+        // receiver. The receiver itself is async, so bounded backpressure is
+        // preserved while recovery fills the queue.
+        ready
+            .send(())
+            .map_err(|_| OcgError::config("provider worker readiness receiver closed"))?;
+        run_provider_worker_async(dispatcher, handler).await
+    })
+}
+
+async fn run_provider_worker_async(
+    dispatcher: BoundedDispatcher,
+    handler: CanonicalProviderCallHandler,
+) -> Result<()> {
+    let mut tasks: Vec<ProviderTask> = Vec::new();
+    let mut closed = false;
     loop {
-        let Some(envelope) = dispatcher.recv()? else {
+        if handler.config.cancelled.load(Ordering::SeqCst) {
+            closed = true;
+            for task in &tasks {
+                task.cancelled.cancel();
+            }
+        }
+        if closed && tasks.is_empty() {
             return Ok(());
-        };
-        if let Err(error) = execute_provider_envelope_sync(handler, envelope) {
-            tracing::error!(error = %error, "canonical provider Call execution failed; continuing with next bounded item");
+        }
+        let limit = handler.config.in_flight_limit.load(Ordering::SeqCst).max(1);
+        if closed || tasks.len() >= limit {
+            log_provider_task_result(next_provider_completion(&mut tasks).await);
+            continue;
+        }
+        match ntex::util::select(
+            next_provider_completion(&mut tasks),
+            dispatcher.recv_async(),
+        )
+        .await
+        {
+            ntex::util::Either::Left(result) => log_provider_task_result(result),
+            ntex::util::Either::Right(envelope) => match envelope? {
+                Some(envelope) => tasks.push(spawn_provider_task(&handler, envelope)),
+                None => closed = true,
+            },
         }
     }
 }
 
-/// Execute one provider envelope on the runtime that owns this worker thread.
-///
-/// This is the only runtime boundary on the provider path. The `System` is
-/// entered once per Call and everything inside it — the provider round, its
-/// HTTP/streaming I/O, and any summarizing round — is awaited on that runtime.
-/// Nothing inside may stand up another runtime or block on one.
+async fn next_provider_completion(tasks: &mut Vec<ProviderTask>) -> Result<()> {
+    std::future::poll_fn(|context| {
+        for index in 0..tasks.len() {
+            if let std::task::Poll::Ready(result) =
+                std::pin::Pin::new(&mut tasks[index].handle).poll(context)
+            {
+                let _task = tasks.swap_remove(index);
+                return std::task::Poll::Ready(result.map_err(|error| {
+                    OcgError::config(format!("provider task join failed: {error}"))
+                })?);
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+fn spawn_provider_task(
+    handler: &CanonicalProviderCallHandler,
+    envelope: ExecutionEnvelope,
+) -> ProviderTask {
+    let handler = handler.clone();
+    let cancelled = envelope.cancelled.clone();
+    ProviderTask {
+        handle: ntex::rt::spawn(async move { execute_provider_envelope(&handler, envelope).await }),
+        cancelled,
+    }
+}
+
+struct ProviderTask {
+    handle: ntex::rt::JoinHandle<Result<()>>,
+    cancelled: CallCancellation,
+}
+
+fn log_provider_task_result(result: Result<()>) {
+    if let Err(error) = result {
+        tracing::error!(error = %error, "canonical provider Call execution failed; continuing with next bounded item");
+    }
+}
+
+/// Execute one provider envelope on the long-lived runtime owned by the
+/// provider worker thread.
+async fn execute_provider_envelope(
+    handler: &CanonicalProviderCallHandler,
+    envelope: ExecutionEnvelope,
+) -> Result<()> {
+    let output = handler.execute_validated(envelope).await?;
+    crate::orchestration::call_schema::validate_output(&output)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn execute_provider_envelope_sync(
     handler: &CanonicalProviderCallHandler,
     envelope: ExecutionEnvelope,
 ) -> Result<()> {
     let handler = handler.clone();
-    let runtime = ntex::rt::System::new("ocg-provider", ntex::rt::DefaultRuntime);
-    runtime.block_on(async move {
-        let output = handler.execute_validated(envelope).await?;
-        crate::orchestration::call_schema::validate_output(&output)?;
-        Ok(())
-    })
+    let runtime = ntex::rt::System::new("ocg-provider-test", ntex::rt::DefaultRuntime);
+    runtime.block_on(async move { execute_provider_envelope(&handler, envelope).await })
 }
 
 /// Run the native tool worker loop synchronously without an async runtime.
@@ -1284,45 +1356,120 @@ pub fn run_native_tool_worker(
     dispatcher: &BoundedDispatcher,
     handler: &crate::native_tools::NativeToolCallHandler,
 ) -> Result<()> {
-    let result = (|| -> Result<()> {
-        loop {
-            let Some(envelope) = dispatcher.recv()? else {
-                return Ok(());
-            };
-            let call = DomainRepository::open(handler.project_root())?.call(&envelope.call_id)?;
-            if call.attempt_id == envelope.attempt_id
-                && call.generation == envelope.generation
-                && matches!(
-                    call.state.as_str(),
-                    "running" | "completed" | "failed" | "unknown"
-                )
-            {
-                tracing::debug!(call_id = %call.id, "native tool envelope already delivered");
-                continue;
-            }
-            let call_id = envelope.call_id.clone();
-            if let Err(error) = execute_native_tool_envelope_sync(handler, envelope) {
-                let domain = DomainRepository::open(handler.project_root())?;
-                let call = domain.call(&call_id)?;
-                if matches!(call.state.as_str(), "created" | "running")
-                    || domain.dispatch_intent(&call_id)?.is_some_and(|intent| {
-                        matches!(intent.state.as_str(), "pending" | "queued" | "running")
-                    })
-                {
-                    return Err(OcgError::config(format!(
-                        "native tool Call could not be terminalized: {error}"
-                    )));
-                }
-                tracing::error!(error = %error, "canonical native tool Call execution failed; continuing with next bounded item");
-            }
-        }
-    })();
+    let result = run_native_tool_scheduler(dispatcher, handler, 4);
     if result.is_err() {
         // A failed settlement cannot be acknowledged as finished execution.
         // Closing this lane wakes its parent waiter instead of stranding it.
         dispatcher.shutdown();
     }
     result
+}
+
+fn run_native_tool_scheduler(
+    dispatcher: &BoundedDispatcher,
+    handler: &crate::native_tools::NativeToolCallHandler,
+    read_only_lanes: usize,
+) -> Result<()> {
+    let mut read_only_tasks = Vec::new();
+    loop {
+        if read_only_tasks.len() >= read_only_lanes.max(1) {
+            finish_native_tool_task(&mut read_only_tasks)?;
+        }
+
+        let envelope = if read_only_tasks.is_empty() {
+            dispatcher.recv()?
+        } else {
+            match dispatcher.recv_timeout(std::time::Duration::from_millis(10))? {
+                Some(envelope) => Some(envelope),
+                None => {
+                    if let Some(index) = read_only_tasks
+                        .iter()
+                        .position(std::thread::JoinHandle::is_finished)
+                    {
+                        let task = read_only_tasks.remove(index);
+                        task.join()
+                            .map_err(|_| OcgError::config("native tool task panicked"))??;
+                    } else if dispatcher.is_closed()? && dispatcher.is_empty()? {
+                        while !read_only_tasks.is_empty() {
+                            finish_native_tool_task(&mut read_only_tasks)?;
+                        }
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+        };
+        let Some(envelope) = envelope else {
+            while !read_only_tasks.is_empty() {
+                finish_native_tool_task(&mut read_only_tasks)?;
+            }
+            return Ok(());
+        };
+
+        if is_read_only_native_tool(&envelope)? {
+            let handler = handler.clone();
+            read_only_tasks.push(std::thread::spawn(move || {
+                process_native_tool_item(&handler, envelope)
+            }));
+        } else {
+            while !read_only_tasks.is_empty() {
+                finish_native_tool_task(&mut read_only_tasks)?;
+            }
+            process_native_tool_item(handler, envelope)?;
+        }
+    }
+}
+
+fn is_read_only_native_tool(envelope: &ExecutionEnvelope) -> Result<bool> {
+    let input: Value = serde_json::from_str(&envelope.payload)
+        .map_err(|error| OcgError::config(format!("invalid native tool payload: {error}")))?;
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| OcgError::config("native tool payload missing 'name'"))?;
+    Ok(crate::native_tools::tool_permission_for(name)
+        == Some(crate::native_tools::PermissionClass::ReadOnly))
+}
+
+fn finish_native_tool_task(tasks: &mut Vec<std::thread::JoinHandle<Result<()>>>) -> Result<()> {
+    let task = tasks
+        .pop()
+        .ok_or_else(|| OcgError::config("native tool task accounting underflow"))?;
+    task.join()
+        .map_err(|_| OcgError::config("native tool task panicked"))?
+}
+
+fn process_native_tool_item(
+    handler: &crate::native_tools::NativeToolCallHandler,
+    envelope: ExecutionEnvelope,
+) -> Result<()> {
+    let call_id = envelope.call_id.clone();
+    let call = DomainRepository::open(handler.project_root())?.call(&call_id)?;
+    if call.attempt_id == envelope.attempt_id
+        && call.generation == envelope.generation
+        && matches!(
+            call.state.as_str(),
+            "running" | "completed" | "failed" | "unknown"
+        )
+    {
+        tracing::debug!(call_id = %call.id, "native tool envelope already delivered");
+        return Ok(());
+    }
+    if let Err(error) = execute_native_tool_envelope_sync(handler, envelope) {
+        let domain = DomainRepository::open(handler.project_root())?;
+        let call = domain.call(&call_id)?;
+        if matches!(call.state.as_str(), "created" | "running")
+            || domain.dispatch_intent(&call_id)?.is_some_and(|intent| {
+                matches!(intent.state.as_str(), "pending" | "queued" | "running")
+            })
+        {
+            return Err(OcgError::config(format!(
+                "native tool Call could not be terminalized: {error}"
+            )));
+        }
+        tracing::error!(error = %error, "canonical native tool Call execution failed; continuing with next bounded item");
+    }
+    Ok(())
 }
 
 /// Execute one native tool envelope synchronously.
@@ -1345,9 +1492,14 @@ struct ProviderAdmission<'a> {
     authority: &'a AttemptAuthority,
     executor_id: &'a str,
     permission_policy: PermissionPolicy,
-    shutdown: &'a AtomicBool,
+    shutdown: Arc<AtomicBool>,
     native_tool_dispatcher: &'a BoundedDispatcher,
     task: &'a str,
+}
+
+struct PendingNativeToolCall {
+    provider_call: CompletedToolCall,
+    durable_call_id: String,
 }
 
 async fn execute_provider_loop(
@@ -1376,6 +1528,7 @@ async fn execute_provider_loop(
         .as_ref()
         .map(|config| config.upstream_model_id.clone())
         .unwrap_or_default();
+    let mut pending_read_only = Vec::new();
 
     // Inject native tools into request
     let object = request
@@ -1414,7 +1567,7 @@ async fn execute_provider_loop(
     .await?;
 
     for round in 0..MAX_PROVIDER_ROUNDS {
-        ensure_provider_active(project_root, envelope, shutdown)?;
+        ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
         if let Some(tools) = request.get("tools").and_then(Value::as_array) {
             if tools.is_empty() {
                 request.as_object_mut().and_then(|obj| obj.remove("tools"));
@@ -1422,7 +1575,7 @@ async fn execute_provider_loop(
         }
 
         let round_response = provider.complete(request).await?;
-        ensure_provider_active(project_root, envelope, shutdown)?;
+        ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
 
         if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
             return Err(OcgError::config("provider exceeded token limit"));
@@ -1437,6 +1590,15 @@ async fn execute_provider_loop(
                     "provider returned no user-visible assistant content",
                 ));
             }
+            wait_for_native_tool_calls(
+                project_root,
+                envelope,
+                shutdown.clone(),
+                native_tool_dispatcher,
+                request,
+                &mut pending_read_only,
+            )
+            .await?;
             return Ok(ProviderFinalResponse {
                 images: round_response.summary.images,
                 content: round_response.summary.text,
@@ -1450,7 +1612,7 @@ async fn execute_provider_loop(
             .ok_or_else(|| OcgError::config("provider request messages are missing"))?
             .push(round_response.assistant);
         for call in &round_response.summary.tool_calls {
-            ensure_provider_active(project_root, envelope, shutdown)?;
+            ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
             // A tool call is admitted, executed and completed as a canonical
             // Call. That authority is unchanged here; what changes is what
             // happens when the Runtime can already tell the Call is invalid.
@@ -1481,6 +1643,18 @@ async fn execute_provider_loop(
                     let mut domain = DomainRepository::open(project_root)?;
                     let side_effect = permission != crate::native_tools::PermissionClass::ReadOnly;
 
+                    if side_effect {
+                        wait_for_native_tool_calls(
+                            project_root,
+                            envelope,
+                            shutdown.clone(),
+                            native_tool_dispatcher,
+                            request,
+                            &mut pending_read_only,
+                        )
+                        .await?;
+                    }
+
                     let tool_call = admit_call_with_cancellation(
                         &mut domain,
                         authority,
@@ -1493,19 +1667,23 @@ async fn execute_provider_loop(
 
                     drop(domain);
 
-                    // Wait for child Call completion by polling (blocking is
-                    // acceptable here because provider and native tool use
-                    // separate dispatchers).
-                    let result = wait_for_call_completion(
-                        project_root,
-                        &tool_call.id,
-                        envelope,
-                        shutdown,
-                        native_tool_dispatcher,
-                    )?;
-
-                    ensure_provider_active(project_root, envelope, shutdown)?;
-                    push_tool_message(request, call, result)?;
+                    if side_effect {
+                        let result = wait_for_call_completion_async(
+                            project_root.to_path_buf(),
+                            tool_call.id.clone(),
+                            envelope.clone(),
+                            shutdown.clone(),
+                            native_tool_dispatcher.clone(),
+                        )
+                        .await?;
+                        ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
+                        push_tool_message(request, call, result)?;
+                    } else {
+                        pending_read_only.push(PendingNativeToolCall {
+                            provider_call: call.clone(),
+                            durable_call_id: tool_call.id,
+                        });
+                    }
                 }
                 ResolvedCall::Rejected(content) => {
                     // The Call failed before dispatch. It is reported as a
@@ -1517,6 +1695,15 @@ async fn execute_provider_loop(
                 }
             }
         }
+        wait_for_native_tool_calls(
+            project_root,
+            envelope,
+            shutdown.clone(),
+            native_tool_dispatcher,
+            request,
+            &mut pending_read_only,
+        )
+        .await?;
     }
     Err(OcgError::config(format!(
         "provider exceeded the {MAX_PROVIDER_ROUNDS}-round native tool loop limit"
@@ -1929,6 +2116,49 @@ fn wait_for_call_completion(
         }
     }
     Err(OcgError::config("native tool Call timeout"))
+}
+
+async fn wait_for_native_tool_calls(
+    project_root: &Path,
+    envelope: &ExecutionEnvelope,
+    shutdown: Arc<AtomicBool>,
+    dispatcher: &BoundedDispatcher,
+    request: &mut Value,
+    pending: &mut Vec<PendingNativeToolCall>,
+) -> Result<()> {
+    for pending_call in pending.drain(..) {
+        let result = wait_for_call_completion_async(
+            project_root.to_path_buf(),
+            pending_call.durable_call_id,
+            envelope.clone(),
+            shutdown.clone(),
+            dispatcher.clone(),
+        )
+        .await?;
+        ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
+        push_tool_message(request, &pending_call.provider_call, result)?;
+    }
+    Ok(())
+}
+
+async fn wait_for_call_completion_async(
+    project_root: std::path::PathBuf,
+    call_id: String,
+    envelope: ExecutionEnvelope,
+    shutdown: Arc<AtomicBool>,
+    dispatcher: BoundedDispatcher,
+) -> Result<String> {
+    ntex::rt::spawn_blocking(move || {
+        wait_for_call_completion(
+            &project_root,
+            &call_id,
+            &envelope,
+            shutdown.as_ref(),
+            &dispatcher,
+        )
+    })
+    .await
+    .map_err(|_| OcgError::config("native tool completion wait failed"))?
 }
 
 impl ProviderClient for NativeOpenAiCompatibleProvider<'_> {
