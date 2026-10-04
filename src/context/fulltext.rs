@@ -248,39 +248,7 @@ fn refresh_and_query(
     started: Instant,
     rebuilt: bool,
 ) -> IndexResult<Value> {
-    let mut args = vec!["--files".into(), "--hidden".into(), "--null".into()];
-    for excluded in repomap::EXCLUDED_DIRS
-        .iter()
-        .copied()
-        .chain([repomap::OCG_DIR, ".codegraph"])
-    {
-        args.extend(["--glob".into(), format!("!**/{excluded}/**")]);
-    }
-    args.push(".".into());
-    let discovered = runner.run_with_cancellation("rg", &args, root, 4 * 1024 * 1024, cancelled)?;
-    active(cancelled)?;
-    if discovered.truncated()
-        || (!discovered.success && !matches!(discovered.exit, ProcessExit::Code(1)))
-    {
-        return Err(IndexError::Boundary(
-            "bounded repository discovery failed; use filesystem.search".into(),
-        ));
-    }
-    let paths = discovered
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|bytes| !bytes.is_empty())
-        .map(|bytes| {
-            std::str::from_utf8(bytes)
-                .map(|path| path.strip_prefix("./").unwrap_or(path).to_owned())
-        })
-        .collect::<std::result::Result<BTreeSet<_>, _>>()
-        .map_err(|_| IndexError::Boundary("repository paths must be UTF-8".into()))?;
-    if paths.len() > MAX_FILES {
-        return Err(IndexError::Boundary(
-            "context manifest exceeds 20000 files".into(),
-        ));
-    }
+    let paths = discover(root, runner, cancelled)?;
     let transaction = connection.transaction()?;
     let prior: BTreeMap<String, Entry> = {
         let mut statement = transaction
@@ -504,6 +472,131 @@ pub(crate) fn metadata_stamp(metadata: &Metadata) -> String {
     }
 }
 
+pub(crate) fn status(
+    root: &Path,
+    revisions: Option<&BTreeMap<String, String>>,
+    runner: &dyn CaptureRunner,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Value> {
+    let read = || -> IndexResult<Value> {
+        active(cancelled)?;
+        let directory = root.join(".ocg/index");
+        for path in [root.join(".ocg"), directory.clone()] {
+            if !state_exists(root, &path)? {
+                return Ok(json!({"available":false,"reason":"index_missing"}));
+            }
+        }
+        let database = directory.join("context-fulltext.sqlite3");
+        if !state_exists(root, &database)? {
+            return Ok(json!({"available":false,"reason":"index_missing"}));
+        }
+        let lock_path = directory.join("context-fulltext.lock");
+        if !state_exists(root, &lock_path)? {
+            return Ok(json!({"available":false,"reason":"index_unavailable"}));
+        }
+        let lock = File::open(lock_path)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            active(cancelled)?;
+            match FileExt::try_lock_shared(&lock) {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for suffix in ["-journal", "-wal", "-shm"] {
+            state_exists(
+                root,
+                &directory.join(format!("context-fulltext.sqlite3{suffix}")),
+            )?;
+        }
+        // Snapshot inspects the existing derived manifest. It never creates,
+        // repairs or refreshes an index, and never reads chunk content.
+        let connection =
+            Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_millis(100))?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != 1 {
+            return Err(IndexError::Version);
+        }
+        let identity: String =
+            connection.query_row("SELECT root FROM identity", [], |row| row.get(0))?;
+        if identity != root.to_string_lossy() {
+            return Ok(json!({"available":false,"reason":"index_identity_changed"}));
+        }
+        connection.prepare("SELECT rowid FROM chunks LIMIT 0")?;
+        connection.prepare("SELECT id FROM chunk_content LIMIT 0")?;
+        let count: i64 =
+            connection.query_row("SELECT count(*) FROM manifest", [], |row| row.get(0))?;
+        if !(0..=MAX_FILES as i64).contains(&count) {
+            return Err(IndexError::Boundary("manifest exceeds bounds".into()));
+        }
+        let paths = discover(root, runner, cancelled)?;
+        let mut statement = connection.prepare(
+            "SELECT path,size,stamp,revision,state,indexed_at FROM manifest ORDER BY path",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut material = String::new();
+        let mut indexed = 0;
+        let mut skipped = 0;
+        let mut last_indexed = 0i64;
+        let mut stored_paths = BTreeSet::new();
+        let mut stale = false;
+        let mut freshness_known = revisions.is_some();
+        while let Some(row) = rows.next()? {
+            active(cancelled)?;
+            let path: String = row.get(0)?;
+            let size = u64::try_from(row.get::<_, i64>(1)?)
+                .map_err(|_| IndexError::Boundary("invalid manifest size".into()))?;
+            let stamp: String = row.get(2)?;
+            let revision: String = row.get(3)?;
+            let state: String = row.get(4)?;
+            if path.len() > 4096
+                || revision.len() > 71
+                || !matches!(
+                    state.as_str(),
+                    "indexed" | "binary" | "excluded" | "large" | "capacity"
+                )
+            {
+                return Err(IndexError::Boundary("invalid manifest entry".into()));
+            }
+            // Only paths freshly discovered under the root can authorize a stat.
+            if paths.contains(&path) {
+                let metadata = fs::symlink_metadata(root.join(&path))?;
+                stale |= !metadata.is_file() || metadata.len() != size;
+                if revision.is_empty() {
+                    stale |= metadata_stamp(&metadata) != stamp;
+                } else if let Some(current) = revisions.and_then(|revisions| revisions.get(&path)) {
+                    stale |= *current != revision;
+                } else {
+                    freshness_known = false;
+                }
+            }
+            indexed += usize::from(state == "indexed");
+            skipped += usize::from(state != "indexed");
+            last_indexed = last_indexed.max(row.get(5)?);
+            material.push_str(
+                &serde_json::to_string(&(&path, &revision, &state))
+                    .map_err(|error| IndexError::Boundary(error.to_string()))?,
+            );
+            stored_paths.insert(path);
+        }
+        stale |= stored_paths != paths;
+        Ok(
+            json!({"available":true,"index_revision":format!("sha256:{}",crate::hash::sha256_hex(material.as_bytes())),
+            "stale":if stale {Some(true)} else if freshness_known {Some(false)} else {None},
+            "freshness_known":freshness_known,"indexed_files":indexed,"skipped_files":skipped,
+            "coverage_limited":skipped>0,"last_indexed_at":last_indexed}),
+        )
+    };
+    read().map_err(|error| OcgError::config(format!("Project context index status: {error}")))
+}
+
 fn chunks(content: &str) -> Vec<(usize, usize, i64, i64)> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -557,4 +650,45 @@ fn insert_chunks(
         ])?;
     }
     Ok(())
+}
+
+fn discover(
+    root: &Path,
+    runner: &dyn CaptureRunner,
+    cancelled: &dyn Fn() -> bool,
+) -> IndexResult<BTreeSet<String>> {
+    let mut args = vec!["--files".into(), "--hidden".into(), "--null".into()];
+    for excluded in repomap::EXCLUDED_DIRS
+        .iter()
+        .copied()
+        .chain([repomap::OCG_DIR, ".codegraph"])
+    {
+        args.extend(["--glob".into(), format!("!**/{excluded}/**")]);
+    }
+    args.push(".".into());
+    let discovered = runner.run_with_cancellation("rg", &args, root, 4 * 1024 * 1024, cancelled)?;
+    active(cancelled)?;
+    if discovered.truncated()
+        || (!discovered.success && !matches!(discovered.exit, ProcessExit::Code(1)))
+    {
+        return Err(IndexError::Boundary(
+            "bounded repository discovery failed; use filesystem.search".into(),
+        ));
+    }
+    let paths = discovered
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| {
+            std::str::from_utf8(bytes)
+                .map(|path| path.strip_prefix("./").unwrap_or(path).to_owned())
+        })
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .map_err(|_| IndexError::Boundary("repository paths must be UTF-8".into()))?;
+    if paths.len() > MAX_FILES {
+        return Err(IndexError::Boundary(
+            "context manifest exceeds 20000 files".into(),
+        ));
+    }
+    Ok(paths)
 }

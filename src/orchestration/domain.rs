@@ -135,6 +135,21 @@ pub struct Attempt {
     pub finished_at: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RecentProjectExecution {
+    pub job_id: JobId,
+    pub objective: Option<String>,
+    pub objective_truncated: bool,
+    pub job_state: JobState,
+    pub generation: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub attempt_id: Option<AttemptId>,
+    pub attempt_state: Option<AttemptState>,
+    pub attempt_authoritative: bool,
+    pub attempt_finished_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display, EnumString)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -1102,6 +1117,98 @@ impl DomainRepository {
         };
         transaction.commit().map_err(sql)?;
         Ok(snapshot)
+    }
+
+    pub fn recent_project_execution(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<RecentProjectExecution>, bool)> {
+        if !(1..=10).contains(&limit) {
+            return Err(invalid("recent execution limit must be 1..10"));
+        }
+        // Terminalization clears the authority pointer. Its last generation is
+        // still the producing Attempt, never an arbitrary older/orphaned row.
+        // Project only objective text, not the potentially large Job payload.
+        let mut statement = self.connection.prepare(
+            "SELECT j.id,CASE WHEN json_valid(j.payload) THEN CASE WHEN json_type(j.payload,'$.objective')='text' THEN substr(json_extract(j.payload,'$.objective'),1,513) END END,j.state,j.generation,j.created_at,j.updated_at,a.id,a.state,coalesce(a.authoritative,0),a.finished_at,j.authoritative_attempt_id FROM domain_jobs j LEFT JOIN domain_attempts a ON a.job_id=j.id AND a.generation=j.generation AND ((j.authoritative_attempt_id=a.id AND (a.authoritative=1 OR (j.state='cancelling' AND a.state='cancelling'))) OR (j.authoritative_attempt_id IS NULL AND j.state IN ('completed','failed','cancelled','unknown','orphaned') AND a.state=j.state AND a.authoritative=0)) WHERE j.project_id=?1 ORDER BY j.updated_at DESC,j.id DESC LIMIT ?2"
+        ).map_err(sql)?;
+        let rows = statement
+            .query_map(params![project_id, (limit + 1) as i64], |row| {
+                let mut objective: Option<String> = row.get(1)?;
+                let objective_truncated = objective.as_ref().is_some_and(|text| text.len() > 512);
+                if let Some(text) = &mut objective {
+                    let mut boundary = text.len().min(512);
+                    while !text.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    text.truncate(boundary);
+                }
+                let job_state: String = row.get(2)?;
+                let attempt_state: Option<String> = row.get(7)?;
+                let pointer: Option<String> = row.get(10)?;
+                let attempt_id: Option<String> = row.get(6)?;
+                let generation = u64::try_from(row.get::<_, i64>(3)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                if pointer.is_some() && attempt_id.is_none() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                let state: JobState = job_state
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                if generation > 0
+                    && matches!(
+                        state,
+                        JobState::Completed
+                            | JobState::Failed
+                            | JobState::Cancelled
+                            | JobState::Unknown
+                            | JobState::Orphaned
+                    )
+                    && attempt_id.is_none()
+                {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                let attempt_state: Option<AttemptState> = attempt_state
+                    .map(|state| state.parse().map_err(|_| rusqlite::Error::InvalidQuery))
+                    .transpose()?;
+                let attempt_authoritative: bool = row.get(8)?;
+                if matches!(state, JobState::Running | JobState::Cancelling) && pointer.is_none() {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                if pointer.is_some()
+                    && !((state == JobState::Running
+                        && attempt_authoritative
+                        && matches!(
+                            attempt_state,
+                            Some(AttemptState::Queued | AttemptState::Running)
+                        ))
+                        || (state == JobState::Cancelling
+                            && !attempt_authoritative
+                            && attempt_state == Some(AttemptState::Cancelling)))
+                {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                Ok(RecentProjectExecution {
+                    job_id: row.get(0)?,
+                    objective,
+                    objective_truncated,
+                    job_state: state,
+                    generation,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    attempt_id,
+                    attempt_state,
+                    attempt_authoritative,
+                    attempt_finished_at: row.get(9)?,
+                })
+            })
+            .map_err(sql)?;
+        let mut entries = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)?;
+        let truncated =
+            entries.len() > limit || entries.iter().any(|entry| entry.objective_truncated);
+        entries.truncate(limit);
+        Ok((entries, truncated))
     }
 
     pub fn project_budget(&self, project_id: &str) -> Result<budget::ProjectBudgetReceipt> {

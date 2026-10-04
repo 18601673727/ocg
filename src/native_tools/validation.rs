@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-type VResult<T> = Result<T, Box<dyn std::error::Error>>;
+pub(super) type VResult<T> = Result<T, Box<dyn std::error::Error>>;
 const EXCLUDED: &[&str] = &[
     ".git",
     ".ocg",
@@ -99,9 +99,22 @@ fn active(cancelled: &dyn Fn() -> bool) -> VResult<()> {
 }
 
 #[derive(Clone)]
-struct Snapshot {
-    revision: String,
+pub(super) struct Snapshot {
+    pub(super) revision: String,
+    pub(super) revisions: BTreeMap<String, String>,
     stamps: BTreeMap<PathBuf, String>,
+}
+
+impl Snapshot {
+    pub(super) fn verify(&self, cancelled: &dyn Fn() -> bool) -> VResult<()> {
+        for (path, stamp) in &self.stamps {
+            active(cancelled)?;
+            if crate::context::fulltext::metadata_stamp(&fs::symlink_metadata(path)?) != *stamp {
+                return Err("workspace changed during evidence lookup; retry".into());
+            }
+        }
+        Ok(())
+    }
 }
 fn file_hash(path: &Path, cancelled: &dyn Fn() -> bool, remaining: &mut u64) -> VResult<String> {
     let before = fs::symlink_metadata(path)?;
@@ -146,7 +159,7 @@ fn file_hash(path: &Path, cancelled: &dyn Fn() -> bool, remaining: &mut u64) -> 
             .collect::<String>()
     ))
 }
-fn snapshot(root: &ProjectRoot, cancelled: &dyn Fn() -> bool) -> VResult<Snapshot> {
+pub(super) fn snapshot(root: &ProjectRoot, cancelled: &dyn Fn() -> bool) -> VResult<Snapshot> {
     let mut pending = vec![root.path().to_path_buf()];
     let mut entries = BTreeMap::new();
     let mut stamps = BTreeMap::new();
@@ -195,6 +208,7 @@ fn snapshot(root: &ProjectRoot, cancelled: &dyn Fn() -> bool) -> VResult<Snapsho
     }
     Ok(Snapshot {
         revision: digest(&serde_json::to_vec(&entries)?),
+        revisions: entries,
         stamps,
     })
 }
@@ -1318,9 +1332,11 @@ fn with_store<T>(
     action(&mut connection, rebuilt)
 }
 
-pub(super) fn query(
+pub(super) fn query_current(
     root: &ProjectRoot,
     arguments: &Value,
+    project_id: &str,
+    current: &Snapshot,
     cancelled: &dyn Fn() -> bool,
 ) -> ToolResult {
     let started = Instant::now();
@@ -1344,12 +1360,6 @@ pub(super) fn query(
         None
     };
     let query = || -> VResult<ToolResult> {
-        let project = DomainRepository::open_existing(root.path())?
-            .project_at_root(root.path())?
-            .ok_or("Project missing")?;
-        let source_started = Instant::now();
-        let current = snapshot(root, cancelled)?;
-        let source_revision_ms = source_started.elapsed().as_millis();
         let mut observations = BTreeMap::new();
         let (rows, rebuilt) = with_store(root, cancelled, |connection, rebuilt| {
             let mut statement = connection.prepare("SELECT body FROM evidence WHERE finished>=?1 ORDER BY finished DESC,call_id LIMIT 128")?;
@@ -1378,29 +1388,39 @@ pub(super) fn query(
                 tracing::warn!("ignoring damaged derived validation evidence record");
                 continue;
             }
-            if evidence["project_id"] != project.id
+            if evidence["project_id"] != project_id
                 || filter
                     .as_ref()
                     .is_some_and(|filter| evidence["command"] != *filter)
             {
                 continue;
             }
+            if entries.len() == limit {
+                truncated = true;
+                break;
+            }
             let normalized = command(root, &evidence["command"]).ok();
             let command = normalized.as_ref().unwrap_or(&evidence["command"]).clone();
             let key = command.to_string();
-            let observed = observations.entry(key).or_insert_with(|| {
-                // A derived record is never authority to probe an unvalidated command or cwd.
-                if normalized.is_none() {
-                    return ValidationInputs::unavailable();
-                }
-                inputs(
-                    root,
-                    &command,
-                    &current,
-                    cancelled,
-                    started + Duration::from_secs(3),
-                )
-            });
+            let unavailable = ValidationInputs::unavailable();
+            // A source mismatch already proves staleness. Legacy or malformed
+            // records cannot become reusable through additional probes either.
+            let observed = if evidence["project_revision"] == current.revision
+                && evidence["input_model_version"] == INPUT_MODEL_VERSION
+                && normalized.is_some()
+            {
+                observations.entry(key).or_insert_with(|| {
+                    inputs(
+                        root,
+                        &command,
+                        current,
+                        cancelled,
+                        started + Duration::from_secs(3),
+                    )
+                })
+            } else {
+                &unavailable
+            };
             let (state, reasons) =
                 applicability(&evidence, &current, observed, normalized.as_ref());
             let applies = state == "applicable";
@@ -1410,11 +1430,15 @@ pub(super) fn query(
             evidence["applicability"] = json!(state);
             evidence["reason"] = json!(reasons.first());
             evidence["reasons"] = json!(reasons);
-            evidence["current_validation_input_fingerprint"] = json!(validation_fingerprint(
-                &command,
-                &current.revision,
-                observed
-            ));
+            evidence["current_validation_input_fingerprint"] = if observed.unknown {
+                Value::Null
+            } else {
+                json!(validation_fingerprint(
+                    &command,
+                    &current.revision,
+                    observed
+                ))
+            };
             evidence["unsupported_inputs"] = json!(observed.unsupported_inputs);
             budget += evidence.to_string().len();
             if entries.len() == limit || budget > super::TOOL_OUTPUT_CAP / 2 {
@@ -1424,20 +1448,46 @@ pub(super) fn query(
             entries.push(evidence);
         }
         // Directory and file stamps protect the query from returning a known raced snapshot.
-        for (path, stamp) in current.stamps {
-            active(cancelled)?;
-            if crate::context::fulltext::metadata_stamp(&fs::symlink_metadata(path)?) != stamp {
-                return Err("workspace changed during evidence lookup; retry".into());
-            }
-        }
+        current.verify(cancelled)?;
         Ok(ToolResult {
             success: true,
-            output: json!({"project_id":project.id,"project_revision":current.revision,"evidence":entries,
+            output: json!({"project_id":project_id,"project_revision":current.revision,"evidence":entries,
             "scope":{"excluded_directories":EXCLUDED,"environment":"explicit per-command allowlist; unproven Cargo compiler/dependency closure is never reusable","reuse":"discovery_only; never automatically skip execution"},"rebuilt":rebuilt}),
             truncated,
-            metadata: json!({"elapsed_ms":started.elapsed().as_millis(),"source_revision_ms":source_revision_ms,"dependency_boundary_ms":observations.values().map(|inputs| inputs.dependency_boundary_ms).sum::<u128>(),"toolchain_fingerprint_ms":observations.values().map(|inputs| inputs.toolchain_ms).sum::<u128>(),"git_state_fingerprint_ms":observations.values().map(|inputs| inputs.git_state_ms).sum::<u128>()}),
+            metadata: json!({"elapsed_ms":started.elapsed().as_millis(),"dependency_boundary_ms":observations.values().map(|inputs| inputs.dependency_boundary_ms).sum::<u128>(),"toolchain_fingerprint_ms":observations.values().map(|inputs| inputs.toolchain_ms).sum::<u128>(),"git_state_fingerprint_ms":observations.values().map(|inputs| inputs.git_state_ms).sum::<u128>()}),
             error: None,
         })
+    };
+    match query() {
+        Ok(result) => result,
+        Err(error) => ToolResult::failure(ToolError::new(
+            if cancelled() {
+                ToolErrorKind::Cancelled
+            } else {
+                ToolErrorKind::Unavailable
+            },
+            error.to_string(),
+        )),
+    }
+}
+
+pub(super) fn query(
+    root: &ProjectRoot,
+    arguments: &Value,
+    cancelled: &dyn Fn() -> bool,
+) -> ToolResult {
+    let started = Instant::now();
+    let query = || -> VResult<ToolResult> {
+        let project = DomainRepository::open_existing(root.path())?
+            .project_at_root(root.path())?
+            .ok_or("Project missing")?;
+        let source_started = Instant::now();
+        let current = snapshot(root, cancelled)?;
+        let source_revision_ms = source_started.elapsed().as_millis();
+        let mut result = query_current(root, arguments, &project.id, &current, cancelled);
+        result.metadata["source_revision_ms"] = json!(source_revision_ms);
+        result.metadata["elapsed_ms"] = json!(started.elapsed().as_millis());
+        Ok(result)
     };
     match query() {
         Ok(result) => result,

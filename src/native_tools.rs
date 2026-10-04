@@ -7,6 +7,7 @@
 
 mod evidence;
 pub mod openai_projection;
+mod snapshot;
 mod validation;
 
 use crate::edit;
@@ -41,6 +42,7 @@ pub enum NativeToolExecutorBinding {
     ContextSearch,
     ContextRead,
     ContextValidation,
+    ContextSnapshot,
     FilesystemEdit,
     ProcessExec,
 }
@@ -355,6 +357,17 @@ impl NativeToolRegistry {
                 argument_aliases: &[],
             },
             NativeToolDefinition {
+                name: "context.snapshot",
+                description: "Get a bounded deterministic Project handoff in one Call: current content revision, Git HEAD/branch and staged/unstaged/untracked paths, recent canonical Jobs and their current-generation Attempts, validation facts with current applicability, and existing context index freshness. Defaults to 5 Jobs and 10 validations; maxima 10 and 20. No file content, patch, transcript or generated summary. Does not execute validation or rebuild the index. Unavailable derived subsystems are reported separately; inspect truncated and freshness.",
+                parameters: json!({"type":"object","additionalProperties":false,"properties":{"recent_jobs":{"type":"integer","minimum":1,"maximum":10},"recent_validations":{"type":"integer","minimum":1,"maximum":20}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::ContextSnapshot,
+                aliases: &[],
+                target_field: None,
+                argument_aliases: &[],
+            },
+            NativeToolDefinition {
                 name: "filesystem.edit",
                 description: "Apply a transactional Robust Edit inside the current Project root.",
                 parameters: json!({"type":"object","additionalProperties":false,"required":["operation","file"],"properties":{"operation":{"type":"string","enum":["replace","insertBefore","insertAfter","append"]},"file":{"type":"string"},"expectedRevision":{"type":"string"},"oldString":{"type":"string"},"old_string":{"type":"string"},"anchor":{"type":"string"},"newString":{"type":"string"},"content":{"type":"string"}}}),
@@ -650,6 +663,9 @@ impl NativeToolExecutor {
             }
             NativeToolExecutorBinding::ContextValidation => {
                 validation::query(&self.root, arguments, cancelled)
+            }
+            NativeToolExecutorBinding::ContextSnapshot => {
+                snapshot::query(&self.root, arguments, cancelled)
             }
             NativeToolExecutorBinding::FilesystemEdit => self.edit(arguments, cancelled),
             NativeToolExecutorBinding::ProcessExec => self.exec(arguments, cancelled),
