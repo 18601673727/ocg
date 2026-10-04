@@ -5,7 +5,7 @@
  * a given model serves.
  */
 
-import { useMemo } from "react";
+import { useMemo, ViewTransition } from "react";
 import {
   Ban,
   CheckCircle2,
@@ -51,6 +51,7 @@ function ModelListRow({
   selected: boolean;
   onSelect: () => void;
 }) {
+  const { t } = useI18n();
   const provider = selectModelProvider(bootstrap, model);
   const capabilities = selectModelCapabilities(model);
   const assignments = selectModelAssignments(bootstrap, model.id);
@@ -73,7 +74,7 @@ function ModelListRow({
           <span className="block truncate text-[10px] text-muted-foreground">{provider?.label ?? model.provider}</span>
         </span>
         <span className="hidden shrink-0 text-[10px] text-muted-foreground sm:inline">
-           {model.variants?.length ? `${model.variants.length} variant(s)` : "no variants"}
+          {model.variants === undefined ? t("control.variantsNotReported") : `${model.variants.length} variant(s)`}
         </span>
         <span className="hidden shrink-0 text-[10px] tabular-nums text-muted-foreground md:inline">
           {assignments.length ? `${assignments.length} role(s)` : "unassigned"}
@@ -86,6 +87,7 @@ function ModelListRow({
 }
 
 function ModelDetail({ bootstrap, model }: { bootstrap: BootstrapState; model: BootstrapModel }) {
+  const { t } = useI18n();
   const provider = selectModelProvider(bootstrap, model);
   const capabilities = selectModelCapabilities(model);
   const assignments = selectModelAssignments(bootstrap, model.id);
@@ -136,15 +138,17 @@ function ModelDetail({ bootstrap, model }: { bootstrap: BootstrapState; model: B
       </div>
 
       <section aria-label="Model variants">
-        <SectionTitle detail={model.variants?.length ? `${model.variants.length} variant(s)` : "none"}>Variants</SectionTitle>
+        <SectionTitle detail={model.variants === undefined ? t("control.variantsNotReported") : `${model.variants.length} variant(s)`}>Variants</SectionTitle>
         {model.variants && model.variants.length > 0 ? (
           <div className="flex flex-wrap gap-1">
             {model.variants.map((variant) => (
               <Pill key={variant} tone="slate">{variant}</Pill>
             ))}
           </div>
+        ) : model.variants === undefined ? (
+          <EmptyState compact>{t("control.variantNotReportedBody")}</EmptyState>
         ) : (
-          <EmptyState compact>This model reported no variants.</EmptyState>
+          <EmptyState compact>{t("control.noVariantsBody")}</EmptyState>
         )}
       </section>
 
@@ -304,7 +308,7 @@ export function ModelsView({
         <section aria-label={t("control.models")} className="min-w-0">
           <SectionTitle detail="same name on different providers stays distinct">Dense model list</SectionTitle>
           {filtered.length === 0 ? (
-            <EmptyState>{t("control.noModelMatch")}</EmptyState>
+            <EmptyState>{!bootstrap.ready && bootstrap.models.length === 0 ? t("control.modelsNotReported") : t("control.noModelMatch")}</EmptyState>
           ) : (
             <ul className="flex flex-col gap-1">
               {filtered.map((model) => (
@@ -320,18 +324,20 @@ export function ModelsView({
           )}
         </section>
         <section aria-label="Model detail" className="min-w-0">
-          {selected ? (
-            <ModelDetail bootstrap={bootstrap} model={selected} />
-          ) : (
-            <EmptyState className="py-4">{t("control.selectModel")}</EmptyState>
-          )}
+          <ViewTransition key={selected?.id ?? "empty"} enter="vt-detail" exit="vt-detail" default="none">
+            {selected ? (
+              <ModelDetail bootstrap={bootstrap} model={selected} />
+            ) : (
+              <EmptyState className="py-4">{t("control.selectModel")}</EmptyState>
+            )}
+          </ViewTransition>
         </section>
       </div>
 
       <p className="flex items-start gap-1.5 text-[10px] text-muted-foreground">
         <ShieldAlert className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
         <span className="min-w-0 break-words">
-          The model catalogue is fully dynamic. OCG renders whatever the normalized state reports; it has no baked-in provider or model list.
+          {t("control.modelProbeGap")}
         </span>
       </p>
     </div>
