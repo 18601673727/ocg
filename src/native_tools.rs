@@ -5,6 +5,7 @@
 //! executor bindings. OpenAI-compatible function definitions are projections
 //! of those definitions; they are not the canonical tool model.
 
+mod evidence;
 pub mod openai_projection;
 
 use crate::edit;
@@ -37,6 +38,7 @@ pub enum NativeToolExecutorBinding {
     FilesystemList,
     FilesystemSearch,
     ContextSearch,
+    ContextRead,
     FilesystemEdit,
     ProcessExec,
 }
@@ -326,6 +328,17 @@ impl NativeToolRegistry {
                 executor: NativeToolExecutorBinding::ContextSearch,
                 aliases: &[],
                 target_field: Some("path"),
+                argument_aliases: &[],
+            },
+            NativeToolDefinition {
+                name: "context.read",
+                description: "Read 1..16 revision-validated evidence ranges from context.search in one Call. Each item requires a Project-relative path, the search sha256 revision, and 1-based inclusive line_start/line_end (at most 400 lines). Reads and hashes each unique file once, returns ordered per-item ok/stale/missing outcomes. Stale evidence requires a new context.search. Content is bounded to 8192 bytes per item and the total result cap; inspect truncated. Use filesystem.read for reads without a revision.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["items"],"properties":{"items":{"type":"array","description":"Between 1 and 16 evidence ranges.","items":{"type":"object","additionalProperties":false,"required":["path","line_start","line_end","revision"],"properties":{"path":{"type":"string"},"line_start":{"type":"integer","minimum":1,"maximum":4294967295u64},"line_end":{"type":"integer","minimum":1,"maximum":4294967295u64},"revision":{"type":"string","description":"Exact sha256: followed by 64 lowercase hexadecimal characters from context.search."}}}}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::ContextRead,
+                aliases: &[],
+                target_field: None,
                 argument_aliases: &[],
             },
             NativeToolDefinition {
@@ -622,6 +635,7 @@ impl NativeToolExecutor {
             NativeToolExecutorBinding::FilesystemList => self.list(arguments, cancelled),
             NativeToolExecutorBinding::FilesystemSearch => self.search(arguments, cancelled),
             NativeToolExecutorBinding::ContextSearch => self.context_search(arguments, cancelled),
+            NativeToolExecutorBinding::ContextRead => evidence::read(&self.root, arguments, cancelled),
             NativeToolExecutorBinding::FilesystemEdit => self.edit(arguments, cancelled),
             NativeToolExecutorBinding::ProcessExec => self.exec(arguments, cancelled),
         };

@@ -12,7 +12,7 @@ use std::path::{Component, Path};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const MAX_FILES: usize = 20_000;
-const MAX_FILE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TEXT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CHUNKS: usize = 100_000;
 const CHUNK_BYTES: usize = 4096;
@@ -477,7 +477,7 @@ fn refresh_and_query(
     )
 }
 
-fn metadata_stamp(metadata: &Metadata) -> String {
+pub(crate) fn metadata_stamp(metadata: &Metadata) -> String {
     // ctime catches replacements and same-size writes even when mtime is restored.
     // Platforms without a change clock hash the bounded content on every refresh.
     #[cfg(unix)]
