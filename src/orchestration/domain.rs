@@ -3679,6 +3679,63 @@ impl DomainRepository {
         self.call(call_id)
     }
 
+    pub(crate) fn record_provider_context_costs(
+        &mut self,
+        call_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        costs: &crate::provider_loop::context_cost::ContextCosts,
+    ) -> Result<()> {
+        let metadata = serde_json::to_value(costs)
+            .map_err(|error| invalid(&format!("invalid provider accounting: {error}")))?;
+        if serde_json::to_vec(&metadata)
+            .map_err(|error| invalid(&error.to_string()))?
+            .len()
+            > 256 * 1024
+        {
+            return Err(invalid("provider accounting exceeds metadata bound"));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let call = read_call(&transaction, call_id)?.ok_or_else(|| invalid("unknown Call"))?;
+        let request: serde_json::Value = serde_json::from_str(&call.request)
+            .map_err(|_| invalid("invalid provider Call request"))?;
+        if call.attempt_id != attempt_id
+            || call.generation != generation
+            || request["executor_transport"] != "provider"
+        {
+            return Err(invalid("provider accounting identity mismatch"));
+        }
+        // Observability can be appended to this producing Call after fencing or
+        // cancellation. It never changes authority, lifecycle or settlement.
+        let mut response = call
+            .response
+            .as_deref()
+            .and_then(|response| serde_json::from_str::<serde_json::Value>(response).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| match &call.response {
+                Some(failure) => serde_json::json!({"failure": failure}),
+                None => serde_json::json!({}),
+            });
+        response["context_costs"] = metadata;
+        let response =
+            serde_json::to_string(&response).map_err(|error| invalid(&error.to_string()))?;
+        if call.response.as_deref() != Some(&response) {
+            transaction
+                .execute(
+                    "UPDATE domain_calls SET response=?2 WHERE id=?1",
+                    params![call_id, response],
+                )
+                .map_err(sql)?;
+            let updated =
+                read_call(&transaction, call_id)?.ok_or_else(|| invalid("unknown Call"))?;
+            emit_call(&transaction, EventKind::CallUpdated, &updated, None)?;
+        }
+        transaction.commit().map_err(sql)
+    }
+
     /// Persist a terminal Call failure only while the Attempt authority and
     /// generation still match. This keeps provider failures from mutating a
     /// replacement Attempt's state.
@@ -3788,10 +3845,33 @@ impl DomainRepository {
             }
             return Err(invalid("Call failure rejected: Attempt authority is stale"));
         }
+        let mut provider_response = None;
+        if tool_response.is_none() {
+            let call = read_call(&transaction, call_id)?.ok_or_else(|| invalid("unknown Call"))?;
+            if serde_json::from_str::<serde_json::Value>(&call.request)
+                .is_ok_and(|request| request["executor_transport"] == "provider")
+            {
+                if let Some(costs) = call
+                    .response
+                    .as_deref()
+                    .and_then(|response| serde_json::from_str::<serde_json::Value>(response).ok())
+                    .and_then(|response| response.get("context_costs").cloned())
+                {
+                    provider_response = Some(
+                        serde_json::to_string(&serde_json::json!({
+                            "failure": failure,
+                            "context_costs": costs,
+                        }))
+                        .map_err(|error| invalid(&error.to_string()))?,
+                    );
+                }
+            }
+        }
+        let failure_response = tool_response.or(provider_response.as_deref()).unwrap_or(failure);
         let changed = transaction
             .execute(
                 "UPDATE domain_calls SET state='failed',response=?2,finished_at=?3 WHERE id=?1 AND state IN ('created','running')",
-                params![call_id, tool_response.unwrap_or(failure), now()],
+                params![call_id, failure_response, now()],
             )
             .map_err(sql)?;
         if changed != 1 {

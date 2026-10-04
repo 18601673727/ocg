@@ -30,6 +30,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub(crate) mod context_cost;
 #[cfg(test)]
 mod tests;
 
@@ -62,6 +63,10 @@ pub trait ProviderClient: Send + Sync {
     /// so the transport performs its I/O on that ambient execution context
     /// rather than blocking the worker thread on a runtime of its own.
     fn complete(&self, request: &Value) -> BoxFuture<'_, Result<ProviderRound>>;
+
+    fn complete_context_summary(&self, request: &Value) -> BoxFuture<'_, Result<ProviderRound>> {
+        self.complete(request)
+    }
 }
 
 /// The decoding state of one streamed round, whatever protocol produced it.
@@ -304,12 +309,46 @@ fn parse_usage(value: &Value) -> NormalizedUsage {
     usage.input_tokens = value
         .get("prompt_tokens")
         .and_then(Value::as_u64)
-        .map(|v| v as u32);
+        .map(|v| v.min(u32::MAX as u64) as u32);
     usage.output_tokens = value
         .get("completion_tokens")
         .and_then(Value::as_u64)
-        .map(|v| v as u32);
+        .map(|v| v.min(u32::MAX as u64) as u32);
+    usage.cache_read_tokens = value["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .map(|v| v.min(u32::MAX as u64) as u32);
+    usage.reasoning_tokens = value["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .map(|v| v.min(u32::MAX as u64) as u32);
     usage
+}
+
+fn update_usage(summary: &mut ChatStreamSummary, value: &Value) {
+    let Some(incoming) = value.as_object() else {
+        return;
+    };
+    let mut merged = summary.usage.raw.clone().unwrap_or_else(|| json!({}));
+    if let Some(object) = merged.as_object_mut() {
+        for (key, value) in incoming {
+            if value.is_null() {
+                continue;
+            }
+            if let (Some(existing), Some(incoming)) = (
+                object.get_mut(key).and_then(Value::as_object_mut),
+                value.as_object(),
+            ) {
+                existing.extend(
+                    incoming
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+            } else {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    // Stream counters are snapshots for this request, never additive deltas.
+    summary.usage = parse_usage(&merged);
 }
 
 fn apply_visible_content(
@@ -466,7 +505,7 @@ fn apply_chunk_json(
         }
     }
     if let Some(usage) = value.get("usage") {
-        summary.usage = parse_usage(usage);
+        update_usage(summary, usage);
     }
     Ok(emitted)
 }
@@ -512,7 +551,7 @@ fn apply_completion_json(summary: &mut ChatStreamSummary, value: &Value) -> Resu
         }
     }
     if let Some(usage) = value.get("usage") {
-        summary.usage = parse_usage(usage);
+        update_usage(summary, usage);
     }
     Ok(())
 }
@@ -833,14 +872,27 @@ impl CanonicalProviderCallHandler {
             return Err(error);
         }
         drop(domain);
-        let provider = provider_client(
-            ProviderBinding::of(protocol),
-            config.transport.as_ref(),
-            provider_config,
-            bearer,
-            envelope.cancelled.clone(),
-            Some(envelope.events.clone()),
-        );
+        let costs = context_cost::CostLog::default();
+        let transport = context_cost::AccountingTransport {
+            inner: config.transport.as_ref(),
+            costs: costs.clone(),
+        };
+        let provider = context_cost::AccountingProvider {
+            inner: provider_client(
+                ProviderBinding::of(protocol),
+                &transport,
+                provider_config,
+                bearer,
+                envelope.cancelled.clone(),
+                Some(envelope.events.clone()),
+            ),
+            costs: costs.clone(),
+            protocol,
+            provider: &provider_config.provider_key,
+            model: &provider_config.upstream_model_id,
+            root: &config.project_root,
+            envelope: &envelope,
+        };
         let task = input
             .get("context_task")
             .and_then(Value::as_str)
@@ -855,7 +907,7 @@ impl CanonicalProviderCallHandler {
                 )
             });
         let response = match execute_provider_loop(
-            provider.as_ref(),
+            &provider,
             &config.project_root,
             &envelope,
             &mut request,
@@ -879,6 +931,7 @@ impl CanonicalProviderCallHandler {
                 // with `failed`. The error is still returned so the worker logs
                 // the reason and moves on to the next bounded envelope.
                 if envelope.cancelled.is_cancelled() {
+                    costs.persist(&config.project_root, &envelope);
                     return Err(error);
                 }
                 // A failed provider round is a terminal Call failure, never a
@@ -891,6 +944,7 @@ impl CanonicalProviderCallHandler {
                     &error.to_string(),
                     true,
                 );
+                costs.persist(&config.project_root, &envelope);
                 return Err(error);
             }
         };
@@ -900,7 +954,8 @@ impl CanonicalProviderCallHandler {
                 "content": response.content,
                 "reasoning": response.reasoning,
                 "images": response.images,
-                "rounds": response.rounds
+                "rounds": response.rounds,
+                "context_costs": costs.snapshot()
             }))
             .map_err(|error| OcgError::config(format!("serialize provider response: {error}")))?;
             domain.finish_call(
@@ -919,6 +974,7 @@ impl CanonicalProviderCallHandler {
                 &error.to_string(),
                 true,
             );
+            costs.persist(&config.project_root, &envelope);
             return Err(error);
         }
         let _ = envelope
@@ -929,7 +985,8 @@ impl CanonicalProviderCallHandler {
                 "content": response.content,
                 "reasoning": response.reasoning,
                 "images": response.images,
-                "rounds": response.rounds
+                "rounds": response.rounds,
+                "context_costs": costs.snapshot()
             }
         }))
     }
@@ -2004,7 +2061,13 @@ async fn apply_active_context<'p>(
             "max_tokens": max_tokens,
             "stream": false,
         });
-        Box::pin(async move { Ok(provider.complete(&summary_request).await?.summary.text) })
+        Box::pin(async move {
+            Ok(provider
+                .complete_context_summary(&summary_request)
+                .await?
+                .summary
+                .text)
+        })
     };
     let assembled = match crate::provider_context::assemble(
         project_root,

@@ -313,6 +313,8 @@ pub fn http_failure(url: &str, response: &HttpResponse) -> OcgError {
 /// stops the read early; returning `Err` aborts the request.
 pub type ChunkSink = Box<dyn FnMut(&[u8]) -> Result<bool> + Send>;
 
+pub type RequestBodyObserver = Box<dyn FnOnce(usize, u64) + Send>;
+
 /// A boxed future, so an async operation can stay part of a `dyn`-dispatched
 /// trait without pulling in an async-trait dependency.
 ///
@@ -418,6 +420,18 @@ pub trait HttpTransport: Send + Sync {
                 "HTTP transport does not support in-runtime streaming",
             ))
         })
+    }
+
+    fn post_json_stream_observed_in_runtime(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        on_chunk: ChunkSink,
+        _observer: RequestBodyObserver,
+    ) -> BoxFuture<'static, Result<HttpResponse>> {
+        // Transports without serialization observation leave wire size unknown.
+        self.post_json_stream_in_runtime(url, headers, body, on_chunk)
     }
 }
 
@@ -709,11 +723,19 @@ impl NativeHttp {
         url: &str,
         headers: &[(&str, &str)],
         body: &Value,
+        observer: Option<RequestBodyObserver>,
     ) -> Result<PreparedStream> {
         validate_provider_url(url)?;
         let proxy = self.proxy_endpoint_for(url)?;
+        let started = std::time::Instant::now();
         let body = serde_json::to_vec(body)
             .map_err(|error| OcgError::config(format!("cannot encode JSON request: {error}")))?;
+        if let Some(observer) = observer {
+            observer(
+                body.len(),
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            );
+        }
         let headers = headers
             .iter()
             .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
@@ -815,10 +837,27 @@ impl HttpTransport for NativeHttp {
         body: &Value,
         on_chunk: ChunkSink,
     ) -> BoxFuture<'static, Result<HttpResponse>> {
+        self.post_json_stream_observed_in_runtime(
+            url,
+            headers,
+            body,
+            on_chunk,
+            Box::new(|_, _| {}),
+        )
+    }
+
+    fn post_json_stream_observed_in_runtime(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+        on_chunk: ChunkSink,
+        observer: RequestBodyObserver,
+    ) -> BoxFuture<'static, Result<HttpResponse>> {
         // Everything that can fail is decided here, before the future exists.
         // The request is then fully owned, so the future borrows nothing and
         // can run on whichever runtime its caller is already on.
-        let prepared = match self.prepare_stream(url, headers, body) {
+        let prepared = match self.prepare_stream(url, headers, body, Some(observer)) {
             Ok(prepared) => prepared,
             Err(error) => return Box::pin(async move { Err(error) }),
         };
