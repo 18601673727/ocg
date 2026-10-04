@@ -1,6 +1,7 @@
 use super::{ProviderClient, ProviderRound};
 use crate::error::{OcgError, Result};
 use crate::http::{BoxFuture, ChunkSink, HttpResponse, HttpTransport};
+use crate::native_tools::projection::ToolProjectionFacts;
 use crate::openai_compatible::NormalizedUsage;
 use crate::orchestration::domain::DomainRepository;
 use crate::orchestration::execution_dispatch::ExecutionEnvelope;
@@ -39,6 +40,7 @@ struct RequestCost {
     provider: String,
     model: String,
     protocol: ProviderProtocol,
+    tool_projection: Option<ToolProjectionFacts>,
     canonical: CanonicalCost,
     wire: WireCost,
     reported_usage: ReportedUsage,
@@ -333,6 +335,7 @@ pub(super) struct AccountingProvider<'a> {
     pub model: &'a str,
     pub root: &'a Path,
     pub envelope: &'a ExecutionEnvelope,
+    pub projection: &'a ToolProjectionFacts,
 }
 
 impl AccountingProvider<'_> {
@@ -364,6 +367,7 @@ impl AccountingProvider<'_> {
                         provider: self.provider.chars().take(128).collect(),
                         model: self.model.chars().take(256).collect(),
                         protocol: self.protocol,
+                        tool_projection: (purpose == "execution").then(|| self.projection.clone()),
                         canonical,
                         wire: WireCost::default(),
                         reported_usage: ReportedUsage {

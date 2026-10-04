@@ -7,6 +7,7 @@
 
 mod evidence;
 pub mod openai_projection;
+pub mod projection;
 mod snapshot;
 mod validation;
 

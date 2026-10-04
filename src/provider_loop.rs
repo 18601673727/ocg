@@ -8,9 +8,8 @@
 use crate::call_recovery as recovery;
 use crate::error::{OcgError, Result};
 use crate::http::{BoxFuture, HttpTransport};
-use crate::native_tools::{
-    openai_projection::OpenAiToolProjection, NativeToolRegistry, PermissionPolicy, ToolResult,
-};
+use crate::native_tools::projection::{self, ToolProjectionProfile};
+use crate::native_tools::{openai_projection::OpenAiToolProjection, PermissionPolicy, ToolResult};
 use crate::openai_compatible::{
     ChatFinishReason, ChatStreamEvent, ChatStreamSummary, CompletedToolCall, NormalizedUsage,
 };
@@ -752,6 +751,50 @@ impl CanonicalProviderCallHandler {
                 }
             },
         };
+        let tool_projection = match (|| -> Result<_> {
+            let facts = match projection::frozen(&input)? {
+                Some(facts) => facts,
+                None => {
+                    // Calls admitted before profiles existed retain their full surface.
+                    let (tools, facts) =
+                        projection::project(protocol, ToolProjectionProfile::Full)?;
+                    request
+                        .as_object_mut()
+                        .ok_or_else(|| OcgError::config("provider request must be an object"))?
+                        .insert("tools".to_string(), Value::Array(tools));
+                    facts
+                }
+            };
+            // Revalidate against the first durable admission as well: independent
+            // repository connections can race to admit Calls for one Attempt.
+            let first = domain
+                .first_provider_call_input(&envelope.attempt_id)?
+                .ok_or_else(|| OcgError::config("Attempt has no frozen provider input"))?;
+            match projection::frozen(&first)? {
+                Some(first_facts)
+                    if first_facts.profile == facts.profile
+                        && first["provider_protocol"].as_str() == Some(protocol.as_str())
+                        && first["arguments"]["tools"] == request["tools"] => {}
+                None if facts.profile == ToolProjectionProfile::Full => {}
+                _ => {
+                    return Err(OcgError::config(
+                        "tool projection differs from Attempt admission",
+                    ))
+                }
+            }
+            Ok(facts)
+        })() {
+            Ok(facts) => facts,
+            Err(error) => {
+                fail_authoritative_provider_call(
+                    &config.project_root,
+                    &envelope,
+                    &error.to_string(),
+                    false,
+                );
+                return Err(error);
+            }
+        };
         let executor = match domain.executor(envelope.executor_id.as_deref().unwrap_or("")) {
             Ok(Some(executor)) => executor,
             resolved => {
@@ -892,6 +935,7 @@ impl CanonicalProviderCallHandler {
             model: &provider_config.upstream_model_id,
             root: &config.project_root,
             envelope: &envelope,
+            projection: &tool_projection,
         };
         let task = input
             .get("context_task")
@@ -1030,6 +1074,20 @@ pub fn admit_provider_call_with_events(
     event_sender: Option<flume::Sender<ExecutionEvent>>,
     cancelled: CallCancellation,
 ) -> Result<(crate::orchestration::domain::Call, CallCancellation)> {
+    admit_provider_call_with_profile(
+        admission,
+        ToolProjectionProfile::Full,
+        event_sender,
+        cancelled,
+    )
+}
+
+pub fn admit_provider_call_with_profile(
+    admission: ProviderCallAdmission<'_>,
+    profile: ToolProjectionProfile,
+    event_sender: Option<flume::Sender<ExecutionEvent>>,
+    cancelled: CallCancellation,
+) -> Result<(crate::orchestration::domain::Call, CallCancellation)> {
     let ProviderCallAdmission {
         domain,
         authority,
@@ -1041,6 +1099,36 @@ pub fn admit_provider_call_with_events(
         provider_config,
         protocol,
     } = admission;
+    let first_input = domain.first_provider_call_input(&authority.attempt_id)?;
+    let (tools, tool_projection) = match first_input.as_ref() {
+        Some(input) => match projection::frozen(input)? {
+            Some(facts)
+                if facts.profile == profile
+                    && input["provider_protocol"].as_str() == Some(protocol.as_str()) =>
+            {
+                (
+                    input["arguments"]["tools"]
+                        .as_array()
+                        .cloned()
+                        .ok_or_else(|| OcgError::config("frozen tool projection has no schemas"))?,
+                    facts,
+                )
+            }
+            None if profile == ToolProjectionProfile::Full => {
+                projection::project(protocol, profile)?
+            }
+            _ => {
+                return Err(OcgError::config(
+                    "tool projection profile is frozen for this Attempt",
+                ))
+            }
+        },
+        None => projection::project(protocol, profile)?,
+    };
+    request
+        .as_object_mut()
+        .ok_or_else(|| OcgError::config("provider request must be an object"))?
+        .insert("tools".to_string(), Value::Array(tools));
     let job = domain
         .job(&authority.job_id)?
         .ok_or_else(|| OcgError::config("provider Call Job no longer exists"))?;
@@ -1066,7 +1154,7 @@ pub fn admit_provider_call_with_events(
         messages.retain(|message| !is_handoff_message(message));
     }
     if let Some(project) = domain.first_chat_project(&authority.attempt_id)? {
-        let capsule = match domain.first_provider_call_input(&authority.attempt_id)? {
+        let capsule = match first_input.as_ref() {
             Some(input) => input["arguments"]["messages"]
                 .as_array()
                 .and_then(|messages| messages.iter().find(|message| is_handoff_message(message)))
@@ -1095,6 +1183,7 @@ pub fn admit_provider_call_with_events(
         // re-deriving one from configuration that may since have changed.
         "provider_protocol": protocol.as_str(),
         "context_task": context_task,
+        "tool_projection": tool_projection,
         "arguments": request
     });
 
@@ -1613,27 +1702,22 @@ async fn execute_provider_loop(
         .unwrap_or_default();
     let mut pending_read_only = Vec::new();
 
-    // Inject native tools into request
-    let object = request
-        .as_object_mut()
-        .ok_or_else(|| OcgError::config("provider request must be an object"))?;
-    let tools = match &projection {
-        Some(projection) => projection.tools(),
-        None => NativeToolRegistry::definitions()
-            .into_iter()
-            .map(|definition| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": wire_name_of(definition.name),
-                        "description": definition.description,
-                        "parameters": definition.parameters,
-                    },
-                })
-            })
-            .collect(),
-    };
-    object.insert("tools".to_string(), Value::Array(tools));
+    let visible_names = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if visible_names.is_empty() {
+        request
+            .as_object_mut()
+            .and_then(|object| object.remove("tools"));
+    }
 
     // Assemble the active context once, before any round: the structured
     // projection and the compacted conversation together form the request this
@@ -1701,7 +1785,18 @@ async fn execute_provider_loop(
             // happens when the Runtime can already tell the Call is invalid.
             // Recovery decides, and only a Call that genuinely needs new
             // reasoning is reported as such. See `crate::call_recovery`.
-            match resolve_call(project_root, authority, call, projection.as_ref())? {
+            let resolved = if visible_names.iter().any(|name| name == &call.name) {
+                resolve_call(project_root, authority, call, projection.as_ref())?
+            } else {
+                let failure = recovery::CallFailure::UnknownTool {
+                    requested: call.name.clone(),
+                    candidates: visible_names.clone(),
+                };
+                ResolvedCall::Rejected(
+                    failure.compact_observation(&format!("tool_call {}", call.id)),
+                )
+            };
+            match resolved {
                 ResolvedCall::Admitted {
                     name: canonical_name,
                     arguments,
