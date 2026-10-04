@@ -490,6 +490,24 @@ function setMessages(snapshot: RuntimeSnapshot, sessionId: string, messages: Cha
 export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: AnyRuntimeEnvelope): ApplyResult {
   const sessionId = envelope.sessionId;
   switch (envelope.type) {
+    case "conversation.session-deleted": {
+      if (!sessionExists(snapshot, sessionId)) return { snapshot, diagnostics: [] };
+      const withoutSession = <T>(entries: Record<string, T>) => Object.fromEntries(
+        Object.entries(entries).filter(([id]) => id !== sessionId),
+      );
+      return {
+        snapshot: {
+          ...snapshot,
+          sessions: snapshot.sessions.filter(session => session.id !== sessionId),
+          messagesBySession: withoutSession(snapshot.messagesBySession),
+          observabilityBySession: withoutSession(snapshot.observabilityBySession),
+          executionBySession: withoutSession(snapshot.executionBySession),
+          accountingBySession: withoutSession(snapshot.accountingBySession),
+          ...(snapshot.chatQueues ? { chatQueues: withoutSession(snapshot.chatQueues) } : {}),
+        },
+        diagnostics: [],
+      };
+    }
     case "conversation.queue-updated": {
       if (!sessionExists(snapshot, sessionId)) {
         return { snapshot, diagnostics: [diag("unknown-session", "Queue for unknown session.", { sessionId })] };

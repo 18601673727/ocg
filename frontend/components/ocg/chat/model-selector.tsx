@@ -1,19 +1,24 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
+import { ChevronDown, LockKeyhole, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { cn } from "@/lib/utils";
 import type { ChatModelSelection, Model, ProfileView } from "../contracts";
 import { useI18n } from "../i18n";
 import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
 
-const WIRE_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const EFFORT_LABELS = {
+  none: "chat.effortNone", minimal: "chat.effortMinimal", low: "chat.effortLow",
+  medium: "chat.effortMedium", high: "chat.effortHigh", xhigh: "chat.effortXhigh",
+} as const;
 
 function efforts(model: Model | undefined, protocol: string | null | undefined): string[] {
-  if (!model || protocol === "anthropic") return [];
-  return [...new Set([
-    ...(model.metadata?.efforts ?? []), ...(model.variants ?? []),
-    ...(model.metadata?.variants ?? []),
-  ])].filter(effort => WIRE_EFFORTS.has(effort));
+  if (!model || model.metadata?.reasoning === false || protocol === "anthropic") return [];
+  const supported = new Set([
+    ...(model.metadata?.efforts ?? []), ...(model.variants ?? []), ...(model.metadata?.variants ?? []),
+  ]);
+  return Object.keys(EFFORT_LABELS).filter(effort => supported.has(effort));
 }
 
 export function ModelSelector({ selection, onChange, busy }: {
@@ -23,23 +28,26 @@ export function ModelSelector({ selection, onChange, busy }: {
 }) {
   const { t } = useI18n();
   const baseUrl = useOcgControlUrl();
-  const [view, setView] = useState<ProfileView | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const id = useId();
+  const [expanded, setExpanded] = useState(false);
   const [refresh, setRefresh] = useState(0);
+  const [result, setResult] = useState<{ baseUrl: string; refresh: number; view?: ProfileView; error?: string } | null>(null);
 
   useEffect(() => {
     if (!baseUrl) return;
     let disposed = false;
-    void createProfileClient(baseUrl, fetch).read().then(result => {
-      if (disposed) return;
-      setView(result);
-      setError(null);
+    void createProfileClient(baseUrl, fetch).read().then(view => {
+      if (!disposed) setResult({ baseUrl, refresh, view });
     }).catch((cause: unknown) => {
-      if (!disposed) setError(cause instanceof Error ? cause.message : String(cause));
+      if (!disposed) setResult({ baseUrl, refresh, error: cause instanceof Error ? cause.message : String(cause) });
     });
     return () => { disposed = true; };
   }, [baseUrl, refresh, busy]);
 
+  const current = result?.baseUrl === baseUrl && result?.refresh === refresh;
+  const view = result?.baseUrl === baseUrl ? result?.view : undefined;
+  const error = current ? result?.error : undefined;
+  const loading = Boolean(baseUrl && !current);
   const profile = view?.profile;
   const choices = view?.runnable_choices ?? [];
   const modelKey = selection && choices.includes(selection.model) ? selection.model : (choices.includes(profile?.defaultModel ?? "")
@@ -50,9 +58,15 @@ export function ModelSelector({ selection, onChange, busy }: {
   const options = choices.filter(key => profile?.models[key]?.provider === providerKey);
   const availableEfforts = efforts(model, profile?.providers[providerKey]?.protocol);
   const configuredEffort = model?.variant ?? model?.metadata?.effort ?? model?.metadata?.variant;
-  const effort = selection?.model === modelKey ? selection.effort ?? "" : (configuredEffort && availableEfforts.includes(configuredEffort) ? configuredEffort : "");
-  const disabled = busy || !model || Boolean(error);
+  const requestedEffort = selection?.model === modelKey ? selection.effort : configuredEffort;
+  const effort = requestedEffort && availableEfforts.includes(requestedEffort) ? requestedEffort : "";
+  const effortLabel = (value: string) => {
+    const key = Object.entries(EFFORT_LABELS).find(([effort]) => effort === value)?.[1];
+    return key ? t(key) : value;
+  };
+  const disabled = busy || loading || !baseUrl || !model || Boolean(error);
   const selectModel = (key: string) => {
+    if (disabled) return;
     const next = profile?.models[key];
     const supported = efforts(next, profile?.providers[next?.provider ?? ""]?.protocol);
     const configured = next?.variant ?? next?.metadata?.effort ?? next?.metadata?.variant;
@@ -61,43 +75,87 @@ export function ModelSelector({ selection, onChange, busy }: {
 
   // Publish the displayed default too: project defaults must not silently override it.
   useEffect(() => {
-    if (!busy && (!selection || selection.model !== modelKey) && modelKey && !error) onChange({ model: modelKey, effort: effort || null });
-  }, [busy, selection, modelKey, effort, error, onChange]);
+    if (!disabled && modelKey && (!selection || selection.model !== modelKey || (selection.effort ?? "") !== effort)) {
+      onChange({ model: modelKey, effort: effort || null });
+    }
+  }, [disabled, selection, modelKey, effort, onChange]);
+
+  const status = busy ? t("chat.settingsLocked") : !baseUrl ? t("chat.selectorUnavailable")
+    : loading ? t("chat.modelsLoading") : error ? t("chat.modelsFailed")
+      : !model ? t("chat.noModels") : t("chat.settingsNextTurn");
+  const selectClass = "h-9 w-full min-w-0 rounded-md border border-border bg-background px-2 text-[12px] text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60";
 
   return (
     <div className="border-b border-border px-3 py-2">
-      <fieldset disabled={disabled} aria-describedby="chat-model-status" className="flex flex-wrap gap-2 disabled:opacity-60">
-        <legend className="sr-only">{t("chat.executionSettings")}</legend>
-        <label className="flex min-w-0 flex-1 flex-col gap-1 text-[10px] text-muted-foreground">
-          {t("chat.provider")}
-          <select aria-label={t("chat.provider")} value={providerKey} onChange={event => {
-            const key = choices.find(key => profile?.models[key]?.provider === event.target.value);
-            if (key) selectModel(key);
-          }} className="w-full rounded border border-border bg-background p-1 text-xs text-foreground">
-            {!providers.length && <option value="">{t("chat.noModels")}</option>}
-            {providers.map(key => <option key={key} value={key}>{profile?.providers[key]?.label || key}</option>)}
-          </select>
-        </label>
-        <label className="flex min-w-0 flex-[2] flex-col gap-1 text-[10px] text-muted-foreground">
-          {t("chat.model")}
-          <select aria-label={t("chat.model")} value={modelKey} onChange={event => selectModel(event.target.value)} className="w-full rounded border border-border bg-background p-1 text-xs text-foreground">
-            {!options.length && <option value="">{t("chat.noModels")}</option>}
-            {options.map(key => <option key={key} value={key}>{profile?.models[key]?.label || profile?.models[key]?.id || key}</option>)}
-          </select>
-        </label>
-        <label className="flex min-w-0 flex-1 flex-col gap-1 text-[10px] text-muted-foreground">
-          {t("chat.effort")}
-          <select aria-label={t("chat.effort")} value={effort} disabled={!availableEfforts.length} onChange={event => onChange({ model: modelKey, effort: event.target.value || null })} className="w-full rounded border border-border bg-background p-1 text-xs text-foreground">
-            <option value="">{availableEfforts.length ? t("chat.providerDefault") : t("chat.effortUnsupported")}</option>
-            {availableEfforts.map(value => <option key={value} value={value}>{value}</option>)}
-          </select>
-        </label>
-      </fieldset>
-      <p id="chat-model-status" role="status" className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+      <div className="flex min-w-0 items-center gap-2">
+        <button
+          type="button"
+          aria-label={t("chat.executionSettings")}
+          aria-expanded={expanded}
+          aria-controls={id + "-panel"}
+          aria-describedby={id + "-status"}
+          onClick={() => setExpanded(value => !value)}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring/30"
+        >
+          <SlidersHorizontal className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[12px] font-medium">{model ? model.label || model.id : t("chat.executionSettings")}</span>
+            <span className="block truncate text-[10px] text-muted-foreground">
+              {model ? [profile?.providers[providerKey]?.label || providerKey, availableEfforts.length ? effort ? effortLabel(effort) : t("chat.providerDefault") : t("chat.effortUnsupported")].join(" · ") : status}
+            </span>
+          </span>
+          {busy && <LockKeyhole className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden="true" />}
+          <ChevronDown className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", expanded && "rotate-180")} aria-hidden="true" />
+        </button>
+        {baseUrl && <button
+          type="button"
+          aria-label={t(error ? "common.retry" : "chat.refreshModels")}
+          title={t(error ? "common.retry" : "chat.refreshModels")}
+          disabled={busy || loading}
+          onClick={() => setRefresh(value => value + 1)}
+          className="flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <RefreshCw className={cn("size-3.5", loading && "animate-spin")} aria-hidden="true" />
+        </button>}
+      </div>
+      <p id={id + "-status"} role="status" className={cn("mt-1 flex items-center gap-1.5 text-[10px]", busy ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground")}>
         {busy && <span className="size-1.5 animate-pulse rounded-full bg-amber-500" aria-hidden="true" />}
-        {busy ? t("chat.settingsLocked") : !baseUrl ? t("chat.selectorUnavailable") : error ?? (!view ? t("chat.modelsLoading") : !model ? t("chat.noModels") : t("chat.settingsNextTurn"))}
-        {!busy && baseUrl && <button type="button" onClick={() => setRefresh(value => value + 1)} className="ml-auto underline">{t("common.refresh")}</button>}
+        {status}
       </p>
+      {expanded && <div id={id + "-panel"} className="mt-2 space-y-2 border-t border-border pt-2">
+        <fieldset disabled={disabled} aria-describedby={id + "-status"} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-12">
+          <legend className="sr-only">{t("chat.executionSettings")}</legend>
+          <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground sm:col-span-3">
+            {t("chat.provider")}
+            <select aria-label={t("chat.provider")} value={providerKey} onChange={event => {
+              const key = choices.find(key => profile?.models[key]?.provider === event.target.value);
+              if (key) selectModel(key);
+            }} className={selectClass}>
+              {!providers.length && <option value="">{loading ? t("chat.modelsLoading") : t("chat.noModels")}</option>}
+              {providers.map(key => <option key={key} value={key}>{profile?.providers[key]?.label || key}</option>)}
+            </select>
+          </label>
+          <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground sm:col-span-6">
+            {t("chat.model")}
+            <select aria-label={t("chat.model")} value={modelKey} onChange={event => selectModel(event.target.value)} className={selectClass}>
+              {!options.length && <option value="">{loading ? t("chat.modelsLoading") : t("chat.noModels")}</option>}
+              {options.map(key => <option key={key} value={key}>{profile?.models[key]?.label || profile?.models[key]?.id || key}</option>)}
+            </select>
+          </label>
+          <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground sm:col-span-3">
+            {t("chat.effort")}
+            <select aria-label={t("chat.effort")} value={effort} disabled={!availableEfforts.length} onChange={event => {
+              if (!disabled) onChange({ model: modelKey, effort: event.target.value || null });
+            }} className={selectClass}>
+              <option value="">{availableEfforts.length ? t("chat.providerDefault") : t("chat.effortUnsupported")}</option>
+              {availableEfforts.map(value => <option key={value} value={value}>{effortLabel(value)}</option>)}
+            </select>
+          </label>
+        </fieldset>
+        {model?.label && model.label !== model.id && <p className="truncate font-mono text-[10px] text-muted-foreground" title={model.id}>{model.id}</p>}
+        {model && !availableEfforts.length && <p className="text-[10px] text-muted-foreground">{t("chat.effortUnsupportedHint")}</p>}
+      </div>}
+      {error && <p role="alert" className="mt-2 break-words text-[11px] text-destructive">{error}</p>}
     </div>
   );
 }

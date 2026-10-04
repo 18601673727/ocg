@@ -123,6 +123,7 @@ export type SendMessageInput = {
 export type QueuedChatMessage = { id: string; input: SendMessageInput };
 
 export type OcgRuntimeEvent =
+  | { type: "conversation.session-deleted"; sessionId: string }
   | { type: "conversation.message-image"; sessionId: string; messageId: string; image: import("./contracts").ChatImage }
   | { type: "conversation.queue-updated"; sessionId: string; queue: QueuedChatMessage[]; paused: boolean }
   | { type: "conversation.history-loaded"; sessionId: string; messages: ChatMessage[] }

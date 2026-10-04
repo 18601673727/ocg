@@ -306,6 +306,18 @@ export class RuntimeClientBase implements OcgRuntimeClient {
     }
   }
 
+  async deleteSession(sessionId: string): Promise<void> {
+    const snapshot = this.store.getSnapshot();
+    if ((snapshot.messagesBySession[sessionId] ?? []).some(message => message.role === "assistant" &&
+      (message.status === "pending" || message.status === "streaming"))) {
+      throw new Error("Conversation is running. Stop it before deleting.");
+    }
+    for (const timer of this.timers.get(sessionId) ?? []) clearTimeout(timer);
+    this.timers.delete(sessionId);
+    this.drainingQueues.delete(sessionId);
+    this.emit({ type: "conversation.session-deleted", sessionId });
+  }
+
   // This client deliberately does not implement `launchJob`. A mock cannot
   // create product execution: the normal path launches through the loopback
   // control plane (`CanonicalOcgRuntimeClient`) and projects the authoritative

@@ -23,6 +23,7 @@ type RuntimeContextValue = {
   /** Bounded, display-safe diagnostics observed by the reconciler. */
   diagnostics: readonly RuntimeDiagnostic[];
   createSession: (input: CreateSessionInput) => Promise<ChatSession>;
+  deleteSession: (sessionId: string) => Promise<void>;
   sendMessage: (sessionId: string, input: SendMessageInput) => Promise<void>;
   retryMessage: (sessionId: string, messageId: string) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
@@ -71,6 +72,10 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
   const sendMessage = useCallback(async (sessionId: string, input: SendMessageInput) => {
     await client.sendMessage(sessionId, input);
   }, [client]);
+  const deleteSession = useCallback(async (sessionId: string) => {
+    if (!client.deleteSession) throw new Error("This runtime does not support deleting chats.");
+    await client.deleteSession(sessionId);
+  }, [client]);
   const cancel = useCallback(async (sessionId: string) => {
     await client.cancel?.(sessionId);
   }, [client]);
@@ -115,6 +120,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       sync,
       diagnostics,
       createSession,
+      deleteSession,
       sendMessage,
       retryMessage,
       cancel,
@@ -125,7 +131,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
       setActiveProfile,
       launchJob,
     }),
-    [authority, cancel, client, completeOnboarding, createSession, diagnostics, launchJob, requestAccessHandoff, retryBootstrap, retryMessage, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
+    [authority, cancel, client, completeOnboarding, createSession, deleteSession, diagnostics, launchJob, requestAccessHandoff, retryBootstrap, retryMessage, sendMessage, setActiveProfile, setOnboardingStage, snapshot, sync],
   );
   if (!hydrated) return null;
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;

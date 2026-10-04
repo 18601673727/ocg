@@ -869,6 +869,20 @@ impl CanonicalControlService {
         })
     }
 
+    pub fn delete_chat_conversation(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<crate::contracts::ChatConversationsResponse> {
+        let (_, repository) = self.project_repository(project_id)?;
+        repository.delete_conversation(project_id, session_id)?;
+        self.active_chats
+            .lock()
+            .map_err(|_| invalid("active chats poisoned"))?
+            .remove(&(project_id.to_string(), session_id.to_string()));
+        self.chat_conversations(project_id)
+    }
+
     pub fn chat_messages(
         &self,
         project_id: &str,

@@ -151,7 +151,7 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, sendMessage, retryMessage, cancel, client, setActiveProfile, launchJob, sync } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, deleteSession, sendMessage, retryMessage, cancel, client, setActiveProfile, launchJob, sync } = useOcgRuntime();
   const {
     activeProjectId,
     activeProject,
@@ -171,7 +171,8 @@ export function RuntimeWorkspace({
   const rememberSession = useCallback((id: string) => {
     selectedSessions.current[activeProjectId] = id;
     const url = new URL(window.location.href);
-    url.searchParams.set("session", id);
+    if (id) url.searchParams.set("session", id);
+    else url.searchParams.delete("session");
     window.history.replaceState(null, "", `${url.pathname}${url.search}`);
   }, [activeProjectId]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -211,6 +212,27 @@ export function RuntimeWorkspace({
   const activeSession = snapshot.sessions.find((session) => session.id === activeSessionId) ?? snapshot.sessions[0];
   const activeSessionKey = activeSession?.id;
   const activeWorkType = activeSession?.workType;
+  const busySessionIds = snapshot.sessions.filter(session => (snapshot.messagesBySession[session.id] ?? []).some(message =>
+    message.role === "assistant" && (message.status === "pending" || message.status === "streaming"),
+  )).map(session => session.id);
+  const handleDeleteChat = useCallback(async (id: string) => {
+    const session = snapshot.sessions.find(item => item.id === id);
+    if (!session) throw new Error(t("sidebar.deleteMissing"));
+    await deleteSession(id);
+    const remaining = selectProjectSnapshot(client.getSnapshot(), activeProjectId, activeProjectSessionIds).sessions;
+    if (activeSessionKey === id) {
+      const nextId = remaining[0]?.id ?? "";
+      setActiveSessionId(nextId);
+      rememberSession(nextId);
+    }
+    const scope = draftScopeKey(activeProjectId, id);
+    const withoutDraft = <T,>(current: Record<string, T>) => Object.fromEntries(
+      Object.entries(current).filter(([key]) => key !== scope),
+    );
+    setJobDrafts(withoutDraft);
+    setVisibleDraftScopes(withoutDraft);
+    setLaunchResults(withoutDraft);
+  }, [activeProjectId, activeProjectSessionIds, activeSessionKey, client, deleteSession, rememberSession, snapshot.sessions, t]);
   useEffect(() => {
     if (runtimeAuthority === "canonical" && historyStatus === "ready" && activeSessionKey) rememberSession(activeSessionKey);
   }, [activeSessionKey, historyStatus, rememberSession, runtimeAuthority]);
@@ -535,6 +557,8 @@ export function RuntimeWorkspace({
       onToggle={() => setSidebarCollapsed((value) => !value)}
       onSelect={selectSession}
       onNewChat={activeSession ? handleNewChat : handleNewProjectChat}
+      onDelete={handleDeleteChat}
+      busySessionIds={busySessionIds}
       runtimeStatus={snapshot.status}
       runtimeAuthority={runtimeAuthority}
       projects={projects}
@@ -583,6 +607,8 @@ export function RuntimeWorkspace({
             onToggle={() => setMobileNavOpen(false)}
             onSelect={selectSession}
             onNewChat={activeSession ? handleNewChat : handleNewProjectChat}
+            onDelete={handleDeleteChat}
+            busySessionIds={busySessionIds}
             runtimeStatus={snapshot.status}
             runtimeAuthority={runtimeAuthority}
             projects={projects}

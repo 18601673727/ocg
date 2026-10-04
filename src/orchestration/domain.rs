@@ -665,6 +665,49 @@ impl DomainRepository {
         .collect()
     }
 
+    pub fn delete_conversation(&self, project_id: &str, session_id: &str) -> Result<()> {
+        validate_id(project_id)?;
+        validate_id(session_id)?;
+        let transaction = self.begin()?;
+        let record: Option<String> = transaction
+            .query_row(
+                "SELECT record FROM domain_conversations WHERE project_id=?1 AND session_id=?2",
+                params![project_id, session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        if let Some(record) = record {
+            let mut conversation: Conversation = decode_chat_record(&record)?;
+            let active: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM domain_chat_turns t JOIN domain_attempts a ON a.id=t.attempt_id
+                     WHERE t.conversation_id=?1 AND a.state IN ('queued','running','cancelling'))",
+                    [conversation.id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            if active {
+                return Err(invalid("Conversation is running. Stop it before deleting."));
+            }
+            if conversation.archived_at.is_none() {
+                // Keep execution and accounting references intact while making the chat inaccessible.
+                let timestamp = now().to_string();
+                conversation.archived_at = Some(timestamp.clone());
+                conversation.updated_at = timestamp;
+                conversation.revision += 1;
+                transaction
+                    .execute(
+                        "UPDATE domain_conversations SET record=?1 WHERE project_id=?2 AND session_id=?3",
+                        params![encode_chat_record(&conversation)?, project_id, session_id],
+                    )
+                    .map_err(sql)?;
+            }
+        }
+        transaction.commit().map_err(sql)?;
+        Ok(())
+    }
+
     pub fn conversation_history(
         &self,
         project_id: &str,
@@ -693,6 +736,9 @@ impl DomainRepository {
             return Ok(None);
         };
         let conversation: Conversation = decode_chat_record(&record)?;
+        if conversation.archived_at.is_some() {
+            return Ok(None);
+        }
         let messages = read_conversation_messages(&transaction, conversation.id.as_str())?;
         let mut statement = transaction
             .prepare(
@@ -784,6 +830,9 @@ impl DomainRepository {
             )
             .map_err(sql)?;
         let conversation: Conversation = decode_chat_record(&record)?;
+        if conversation.archived_at.is_some() {
+            return Err(invalid("Conversation has been deleted."));
+        }
         let turn_order: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(turn_order),0)+1 FROM domain_chat_turns WHERE conversation_id=?1",
             [conversation.id.as_str()], |row| row.get(0),

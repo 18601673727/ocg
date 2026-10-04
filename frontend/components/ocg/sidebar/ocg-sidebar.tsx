@@ -1,5 +1,6 @@
 "use client";
 
+import { useRef, useState } from "react";
 import {
   ChevronsLeft,
   Code2,
@@ -16,10 +17,13 @@ import {
   SlidersHorizontal,
   Table2,
   Workflow,
+  LoaderCircle,
+  Trash2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
   Tooltip,
   TooltipContent,
@@ -72,6 +76,8 @@ type OcgSidebarProps = {
   onToggle: () => void;
   onSelect: (id: string) => void;
   onNewChat: () => void;
+  onDelete?: (id: string) => Promise<void>;
+  busySessionIds?: readonly string[];
   runtimeStatus: RuntimeStatus;
   /** Which runtime answers Chat, so the footer never claims a fixture runtime. */
   runtimeAuthority: RuntimeAuthority;
@@ -132,6 +138,8 @@ export function OcgSidebar({
   onToggle,
   onSelect,
   onNewChat,
+  onDelete,
+  busySessionIds = [],
   runtimeStatus,
   runtimeAuthority,
   activeView = "chat",
@@ -142,6 +150,24 @@ export function OcgSidebar({
   onNavigate,
 }: OcgSidebarProps) {
   const { t } = useI18n();
+  const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const cancelDeleteRef = useRef<HTMLButtonElement>(null);
+  const targetBusy = deleteTarget !== null && busySessionIds.includes(deleteTarget.id);
+  const confirmDelete = async () => {
+    if (!deleteTarget || !onDelete || deleting || targetBusy) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await onDelete(deleteTarget.id);
+      setDeleteTarget(null);
+    } catch (cause: unknown) {
+      setDeleteError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setDeleting(false);
+    }
+  };
   const workspaceNav = runtimeAuthority === "canonical"
     ? WORKSPACE_NAV.filter(item => ["home", "attention", "chat", "job-execution"].includes(item.target))
     : WORKSPACE_NAV;
@@ -365,13 +391,13 @@ export function OcgSidebar({
                   {items.map((session) => {
                     const active = session.id === activeSessionId;
                     return (
-                      <li key={session.id}>
+                      <li key={session.id} className={cn("group/session flex min-w-0 items-center rounded-md transition-colors", active ? "bg-muted" : "hover:bg-muted/60")}>
                         <button
                           type="button"
                           onClick={() => onSelect(session.id)}
                           aria-current={active ? "true" : undefined}
                           className={cn(
-                            "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 transition-colors",
+                            "group flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
                             active
                               ? "bg-muted font-medium text-foreground"
                               : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -385,9 +411,19 @@ export function OcgSidebar({
                             )}
                           />
                           <span className="min-w-0 flex-1 truncate">
-                            {session.title}
+                            {session.title || t("sidebar.newChat")}
                           </span>
                         </button>
+                        {onDelete && <button
+                          type="button"
+                          aria-label={t("sidebar.deleteChatNamed", { title: session.title || t("sidebar.newChat") })}
+                          title={t(busySessionIds.includes(session.id) ? "sidebar.deleteRunning" : "sidebar.deleteChat")}
+                          disabled={busySessionIds.includes(session.id) || deleting}
+                          onClick={() => { setDeleteError(null); setDeleteTarget(session); }}
+                          className="mr-1 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/60 outline-none hover:bg-destructive/10 hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          <Trash2 className="size-3.5" aria-hidden="true" />
+                        </button>}
                       </li>
                     );
                   })}
@@ -431,6 +467,23 @@ export function OcgSidebar({
           </div>
         </div>
       </div>
+      <Dialog open={deleteTarget !== null} onOpenChange={open => { if (!open && !deleting) setDeleteTarget(null); }}>
+        <DialogContent initialFocus={cancelDeleteRef} showCloseButton={!deleting} className="rounded-lg">
+          <DialogHeader>
+            <DialogTitle className="normal-case tracking-normal">{t("sidebar.deleteChatTitle")}</DialogTitle>
+            <DialogDescription>{t("sidebar.deleteChatBody", { title: deleteTarget?.title || t("sidebar.newChat") })}</DialogDescription>
+          </DialogHeader>
+          {targetBusy && <p role="status" className="text-xs text-amber-600 dark:text-amber-400">{t("sidebar.deleteRunning")}</p>}
+          {deleteError && <p role="alert" className="break-words text-xs text-destructive">{t("sidebar.deleteFailed", { error: deleteError })}</p>}
+          <DialogFooter>
+            <Button ref={cancelDeleteRef} variant="outline" disabled={deleting} onClick={() => setDeleteTarget(null)}>{t("common.cancel")}</Button>
+            <Button variant="destructive" disabled={deleting || targetBusy} onClick={() => void confirmDelete()}>
+              {deleting && <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />}
+              {t(deleting ? "sidebar.deletingChat" : "sidebar.deleteChat")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </TooltipProvider>
   );
 }

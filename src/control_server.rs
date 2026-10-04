@@ -1156,6 +1156,12 @@ fn handle_canonical(
             Route::ChatConversations => {
                 answer!(service.chat_conversations(&query("project_id")?)?)
             }
+            Route::ChatConversationDelete => {
+                answer!(service.delete_chat_conversation(
+                    &query("project_id")?,
+                    &query("session_id")?
+                )?)
+            }
             Route::ChatMessages => {
                 answer!(service.chat_messages(&query("project_id")?, &query("session_id")?)?)
             }
@@ -1209,6 +1215,7 @@ fn handle_canonical(
             | Route::ChatImageUpload
             | Route::ChatImageGet { .. }
             | Route::ChatConversations
+            | Route::ChatConversationDelete
             | Route::ChatMessages
             | Route::ChatStream
             | Route::ChatCancel
@@ -1671,8 +1678,8 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, ApiError
     }
     // OPTIONS is accepted only so a browser preflight for the canonical
     // control surface can be answered; it is never a routable method.
-    if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "OPTIONS") {
-        return Err(ApiError::method_not_allowed("GET, POST, PUT, OPTIONS"));
+    if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS") {
+        return Err(ApiError::method_not_allowed("GET, POST, PUT, DELETE, OPTIONS"));
     }
 
     let mut headers = HashMap::new();
@@ -1876,6 +1883,7 @@ enum Route {
     ChatImageGet { project: String, image: String },
     ChatSend,
     ChatConversations,
+    ChatConversationDelete,
     ChatMessages,
     ChatStream,
     ChatCancel,
@@ -1936,6 +1944,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("POST", ["api", "v1", "canonical", "chat", "send"])
                 | ("GET", ["api", "v1", "canonical", "chat", "stream"])
                 | ("GET", ["api", "v1", "canonical", "chat", "conversations"])
+                | ("DELETE", ["api", "v1", "canonical", "chat", "conversations"])
                 | ("GET", ["api", "v1", "canonical", "chat", "messages"])
                 | ("POST", ["api", "v1", "canonical", "chat", "cancel"])
                 // A browser preflight is answered by the canonical CORS
@@ -2020,6 +2029,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         ("GET", ["api", "v1", "canonical", "chat", "conversations"]) => {
             Ok(Route::ChatConversations)
         }
+        ("DELETE", ["api", "v1", "canonical", "chat", "conversations"]) => {
+            Ok(Route::ChatConversationDelete)
+        }
         ("GET", ["api", "v1", "canonical", "chat", "messages"]) => Ok(Route::ChatMessages),
         ("POST", ["api", "v1", "canonical", "chat", "cancel"]) => Ok(Route::ChatCancel),
         ("OPTIONS", ["api", "v1", "canonical", ..]) => Ok(Route::CanonicalPreflight),
@@ -2098,9 +2110,9 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         | ["api", "v1", "canonical", "jobs", "events"]
         | ["api", "v1", "canonical", "dashboard"]
         | ["api", "v1", "canonical", "chat", "stream"]
-        | ["api", "v1", "canonical", "chat", "conversations"]
         | ["api", "v1", "canonical", "chat", "messages"]
         | ["api", "v1", "canonical", "projects"] => Some("GET"),
+        ["api", "v1", "canonical", "chat", "conversations"] => Some("GET, DELETE"),
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
         ["api", "v1", "canonical", "chat", "images", _, _] => Some("GET"),
         ["api", "v1", "canonical", "chat", "images"] => Some("POST"),

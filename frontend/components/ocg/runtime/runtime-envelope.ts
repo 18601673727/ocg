@@ -46,6 +46,7 @@ export type RuntimeResumeCursor = string;
 
 /** Per-event normalized payloads for every currently meaningful event. */
 export type RuntimeEnvelopePayloads = {
+  "conversation.session-deleted": Record<string, never>;
   "conversation.message-image": { messageId: string; image: import("../contracts").ChatImage };
   "conversation.history-loaded": { messages: ChatMessage[] };
   "job.execution-updated": { execution: import("../execution/domain").JobExecution; accounting: import("../execution/accounting").JobAccounting | null };
@@ -79,6 +80,7 @@ export type RuntimeEnvelopePayloads = {
 export type RuntimeEventType = keyof RuntimeEnvelopePayloads;
 
 export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
+  "conversation.session-deleted",
   "conversation.message-image",
   "conversation.queue-updated",
   "conversation.history-loaded",
@@ -238,6 +240,8 @@ export function envelopeFromRuntimeEvent(
   };
 
   switch (event.type) {
+    case "conversation.session-deleted":
+      return { ...base, type: event.type, payload: {} };
     case "conversation.queue-updated":
       return { ...base, type: event.type, payload: { queue: event.queue, paused: event.paused } };
     case "conversation.history-loaded":
@@ -364,6 +368,8 @@ export class RuntimeEnvelopeFactory {
 export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
   const sessionId = envelope.sessionId ?? "";
   switch (envelope.type) {
+    case "conversation.session-deleted":
+      return { type: envelope.type, sessionId };
     case "conversation.queue-updated":
       return { type: envelope.type, sessionId, queue: envelope.payload.queue, paused: envelope.payload.paused };
     case "conversation.history-loaded":
@@ -426,6 +432,8 @@ function diagnostic(
 function validatePayload(type: RuntimeEventType, payload: unknown): string | null {
   if (!isRecord(payload)) return `Event "${type}" payload must be an object.`;
   switch (type) {
+    case "conversation.session-deleted":
+      return null;
     case "conversation.queue-updated": {
       if (typeof payload.paused !== "boolean" || !Array.isArray(payload.queue) || payload.queue.some(item =>
         !isRecord(item) || !isNonEmptyString(item.id) || !isRecord(item.input) || typeof item.input.content !== "string"

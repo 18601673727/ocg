@@ -96,6 +96,7 @@ function isCanonicalRejection<T>(value: CanonicalResult<T>): value is CanonicalR
 export { isCanonicalRejection };
 
 export interface CanonicalControlClient {
+  deleteChatConversation?(projectId: string, sessionId: string): Promise<CanonicalResult<ChatConversationsResponse>>;
   uploadChatImage?(request: ChatImageUploadRequest, signal?: AbortSignal): Promise<CanonicalResult<ChatImage>>;
   readChatConversations(projectId: string): Promise<CanonicalResult<ChatConversationsResponse>>;
   readChatMessages(projectId: string, sessionId: string): Promise<CanonicalResult<ChatMessagesResponse>>;
@@ -244,6 +245,12 @@ export function createHttpCanonicalControlClient(
   }
 
   return {
+    async deleteChatConversation(projectId, sessionId) {
+      const { status, value, text } = await send("DELETE",
+        "/api/v1/canonical/chat/conversations?project_id=" + encodeURIComponent(projectId) + "&session_id=" + encodeURIComponent(sessionId), undefined);
+      if (status !== 200) return rejection("delete-conversation", status, text);
+      return decodeChatConversationsResponse(value);
+    },
     async uploadChatImage(request, signal) {
       const { status, value, text } = await send("POST", "/api/v1/canonical/chat/images", request, signal);
       if (status !== 200) return rejection("image-upload", status, text);

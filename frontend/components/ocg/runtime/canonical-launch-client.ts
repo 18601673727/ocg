@@ -82,6 +82,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string }>();
   private readonly sessionProjects = new Map<string, string>();
   private readonly projectHydrations = new Map<string, Promise<void>>();
+  private readonly deletedSessions = new Set<string>();
+  private readonly deletingSessions = new Set<string>();
   private availabilityProbed = false;
   private reportedStatus: RuntimeStatus | null = null;
 
@@ -196,6 +198,32 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     return hydration;
   }
 
+  override async deleteSession(sessionId: string): Promise<void> {
+    const session = this.store.getSnapshot().sessions.find(item => item.id === sessionId);
+    if (!session) return;
+    if (this.pendingSends.has(sessionId) || this.chatStreams.has(sessionId) || this.streamingMessage(sessionId)) {
+      throw new Error("Conversation is running. Stop it before deleting.");
+    }
+    if (!session.projectId || !session.sessionId || !this.control.deleteChatConversation) {
+      throw new Error("This runtime does not support deleting chats.");
+    }
+    if (this.deletingSessions.has(sessionId)) throw new Error("Conversation deletion is already in progress.");
+    this.deletingSessions.add(sessionId);
+    try {
+      const response = await this.control.deleteChatConversation(session.projectId, session.sessionId);
+      if (isCanonicalRejection(response)) throw new Error(response.message);
+      if (response.project_id !== session.projectId || response.conversations.some(item => item.session_id === session.sessionId)) {
+        throw new Error("Conversation deletion was not confirmed by the backend.");
+      }
+      this.deletedSessions.add(sessionId);
+      this.historyEpochs.set(sessionId, (this.historyEpochs.get(sessionId) ?? 0) + 1);
+      await super.deleteSession(sessionId);
+      this.sessionProjects.delete(sessionId);
+    } finally {
+      this.deletingSessions.delete(sessionId);
+    }
+  }
+
   private async loadProjectHistory(projectId: string): Promise<void> {
     const response = await this.control.readChatConversations(projectId);
     if (isCanonicalRejection(response)) throw new Error(response.message);
@@ -221,6 +249,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private installHistory(history: ChatMessagesResponse): void {
     const projectId = history.project_id;
     const id = chatSessionKey(projectId, history.conversation.session_id);
+    if (this.deletedSessions.has(id)) return;
     const session: ChatSession = {
       id, projectId, sessionId: history.conversation.session_id,
       title: history.conversation.title || history.messages.find(message => message.role === "user" && message.content.trim())?.content.trim().slice(0, 80) || history.messages.find(message => message.role === "user" && message.images.length)?.images[0]?.name || "",
@@ -261,6 +290,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
+    if (this.deletedSessions.has(sessionId) || this.deletingSessions.has(sessionId)) {
+      throw new Error("Conversation has been deleted or is being deleted.");
+    }
     if (this.enqueueIfBusy(sessionId, input)) return;
     const pending = this.pendingSends.get(sessionId);
     if (pending) await pending;
