@@ -977,7 +977,7 @@ pub fn admit_provider_call_with_events(
         domain,
         authority,
         executor_id,
-        request,
+        mut request,
         config,
         quota,
         dispatcher,
@@ -1003,6 +1003,32 @@ pub fn admit_provider_call_with_events(
                     .unwrap_or_default(),
             )
         });
+    // A caller may replay a frozen request for a new admission. Replace its
+    // internal handoff rather than duplicating a prior Attempt's facts.
+    if let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) {
+        messages.retain(|message| !is_handoff_message(message));
+    }
+    if let Some(project) = domain.first_chat_project(&authority.attempt_id)? {
+        let capsule = match domain.first_provider_call_input(&authority.attempt_id)? {
+            Some(input) => input["arguments"]["messages"]
+                .as_array()
+                .and_then(|messages| messages.iter().find(|message| is_handoff_message(message)))
+                .cloned(),
+            None => Some(crate::native_tools::handoff_capsule(
+                domain,
+                &project,
+                &job.id,
+                &|| cancelled.is_cancelled(),
+            )?),
+        };
+        if let Some(capsule) = capsule {
+            request
+                .get_mut("messages")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| OcgError::config("provider request messages are missing"))?
+                .insert(0, capsule);
+        }
+    }
     let payload = json!({
         "executor_transport": "provider",
         // The protocol travels in the durable Call payload. It is a property of
@@ -1953,11 +1979,21 @@ async fn apply_active_context<'p>(
     model: &str,
     task: &str,
 ) -> Result<()> {
-    let conversation = request
+    let mut conversation = request
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // Admission facts are frozen Provider input, never conversation history
+    // or summarizer input. Restore the exact system message after compaction.
+    let mut handoff = Vec::new();
+    conversation.retain(|message| {
+        let is_handoff = is_handoff_message(message);
+        if is_handoff {
+            handoff.push(message.clone());
+        }
+        !is_handoff
+    });
     let model = model.to_owned();
     // The summarizing call is awaited on the same runtime as the round itself,
     // so it reuses that execution context instead of blocking for a new one.
@@ -1994,7 +2030,8 @@ async fn apply_active_context<'p>(
         conversation_messages = assembled.messages.len(),
         "provider request context assembled"
     );
-    let mut messages = Vec::with_capacity(assembled.messages.len() + 1);
+    let mut messages = Vec::with_capacity(assembled.messages.len() + handoff.len() + 1);
+    messages.extend(handoff);
     messages.extend(assembled.system);
     messages.extend(assembled.messages);
     request
@@ -2002,6 +2039,14 @@ async fn apply_active_context<'p>(
         .ok_or_else(|| OcgError::config("provider request must be an object"))?
         .insert("messages".to_string(), Value::Array(messages));
     Ok(())
+}
+
+fn is_handoff_message(message: &Value) -> bool {
+    message["role"] == "system"
+        && message["content"]
+            .as_str()
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+            .is_some_and(|content| content["kind"] == "ocg_project_handoff")
 }
 
 /// The task text a context plan is ranked against.

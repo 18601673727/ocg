@@ -965,6 +965,34 @@ impl DomainRepository {
         Ok(history)
     }
 
+    pub(crate) fn first_chat_project(&self, attempt_id: &str) -> Result<Option<Project>> {
+        let transaction = self.begin()?;
+        // A replacement Attempt may own the original turn's Job. Later user
+        // turns remain ineligible even when an earlier turn failed.
+        let turn: Option<(String, i64, i64, Project)> = transaction.query_row(
+            "SELECT t.conversation_id,t.turn_order,(SELECT MIN(turn_order) FROM domain_chat_turns WHERE conversation_id=t.conversation_id),p.id,p.root,p.created_at
+             FROM domain_attempts a JOIN domain_chat_turns t ON t.job_id=a.job_id
+             JOIN domain_jobs j ON j.id=a.job_id JOIN domain_projects p ON p.id=j.project_id
+             JOIN domain_conversations c ON c.id=t.conversation_id AND c.project_id=p.id
+             WHERE a.id=?1 AND t.project_id=p.id ORDER BY t.turn_order LIMIT 1",
+            [attempt_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,Project {id:row.get(3)?,root:row.get(4)?,created_at:row.get(5)?})),
+        ).optional().map_err(sql)?;
+        let Some((conversation, order, first, project)) = turn else {
+            return Ok(None);
+        };
+        if order != first {
+            return Ok(None);
+        }
+        let completed_assistant = read_conversation_messages(&transaction, &conversation)?
+            .iter()
+            .any(|message| {
+                message.state == MessageLifecycle::Complete
+                    && matches!(message.author, Actor::Attempt { .. })
+            });
+        transaction.commit().map_err(sql)?;
+        Ok((!completed_assistant).then_some(project))
+    }
+
     pub fn accept_chat_turn(&self, attempt_id: &str) -> Result<()> {
         let transaction = self.begin()?;
         let turn: Option<(String, String, String, String)> = transaction.query_row(
@@ -3887,6 +3915,22 @@ impl DomainRepository {
             self.call(&id)
         })
         .collect()
+    }
+
+    pub(crate) fn first_provider_call_input(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let input: Option<String> = self.connection.query_row(
+            "SELECT request FROM domain_calls WHERE attempt_id=?1 AND CASE WHEN json_valid(request) THEN json_extract(request,'$.executor_transport')='provider' ELSE 1 END ORDER BY created_at,id LIMIT 1",
+            [attempt_id], |row| row.get(0),
+        ).optional().map_err(sql)?;
+        input
+            .map(|input| {
+                serde_json::from_str(&input)
+                    .map_err(|error| invalid(&format!("invalid frozen Provider input: {error}")))
+            })
+            .transpose()
     }
 
     /// Check for an existing launch command and return its outcome if found.

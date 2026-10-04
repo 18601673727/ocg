@@ -10,6 +10,8 @@ pub mod openai_projection;
 mod snapshot;
 mod validation;
 
+pub(crate) use snapshot::handoff_capsule;
+
 use crate::edit;
 use crate::error::{OcgError, Result};
 use crate::orchestration::call_schema;

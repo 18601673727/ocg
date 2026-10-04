@@ -22,7 +22,7 @@ fn text(value: &str, cap: usize, truncated: &mut bool) -> String {
     value[..boundary].to_string()
 }
 
-fn git(root: &ProjectRoot, cancelled: &dyn Fn() -> bool) -> SnapshotResult<Value> {
+fn git(root: &ProjectRoot, paths: bool, cancelled: &dyn Fn() -> bool) -> SnapshotResult<Value> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let run = |args: &[&str], cap| {
         let mut argv = vec![
@@ -75,6 +75,7 @@ fn git(root: &ProjectRoot, cancelled: &dyn Fn() -> bool) -> SnapshotResult<Value
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
     let mut untracked = Vec::new();
+    let mut counts = [0usize; 3];
     let mut records = output.stdout.split(|byte| *byte == 0);
     let mut dirty = false;
     while let Some(record) = records.next() {
@@ -128,6 +129,19 @@ fn git(root: &ProjectRoot, cancelled: &dyn Fn() -> bool) -> SnapshotResult<Value
         let Some(path) = path.strip_prefix(prefix) else {
             return Err("Git path outside Project scope".into());
         };
+        if status == "??" {
+            counts[2] += 1;
+        } else {
+            let bytes = status.as_bytes();
+            if bytes.len() != 2 {
+                return Err("invalid Git status code".into());
+            }
+            counts[0] += usize::from(bytes[0] != b'.');
+            counts[1] += usize::from(bytes[1] != b'.');
+        }
+        if !paths {
+            continue;
+        }
         let mut path_truncated = std::str::from_utf8(record).is_err();
         let path = text(path, 256, &mut path_truncated);
         let mut item = json!({"path":path,"status":status});
@@ -170,6 +184,14 @@ fn git(root: &ProjectRoot, cancelled: &dyn Fn() -> bool) -> SnapshotResult<Value
     for entries in [&mut staged, &mut unstaged, &mut untracked] {
         entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
     }
+    if !paths {
+        return Ok(
+            json!({"available":true,"head":head.map(|head| head.chars().take(12).collect::<String>()),
+            "branch":branch.map(|branch| text(&branch,64,&mut truncated)),"detached":detached,
+            "dirty":dirty || output.truncated(),"staged":counts[0],"unstaged":counts[1],
+            "untracked":counts[2],"counts_exact":!output.truncated(),"truncated":truncated}),
+        );
+    }
     Ok(
         json!({"available":true,"head":head,"branch":branch,"detached":detached,
         "dirty":dirty || output.truncated(),"staged":staged,"unstaged":unstaged,"untracked":untracked,"truncated":truncated}),
@@ -211,6 +233,138 @@ fn validations(result: ToolResult) -> Value {
     json!({"available":true,"evidence":entries,"truncated":truncated,"rebuilt":result.output["rebuilt"]})
 }
 
+pub(crate) fn handoff_capsule(
+    domain: &DomainRepository,
+    project: &crate::orchestration::domain::Project,
+    current_job: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> crate::error::Result<Value> {
+    let started = Instant::now();
+    let build = || -> SnapshotResult<Value> {
+        active(cancelled)?;
+        let root = ProjectRoot::new(std::path::Path::new(&project.root))?;
+        let phase = Instant::now();
+        let mut source = validation::snapshot(&root, cancelled).ok();
+        let project_ms = phase.elapsed().as_millis();
+        active(cancelled)?;
+        let phase = Instant::now();
+        let git = git(&root, false, cancelled).unwrap_or_else(|_| json!({"available":false}));
+        let git_ms = phase.elapsed().as_millis();
+        active(cancelled)?;
+        let phase = Instant::now();
+        let (execution, _) = domain.recent_project_execution(&project.id, 3)?;
+        let execution = execution.into_iter().filter(|entry| entry.job_id != current_job)
+            .take(2).map(|entry| json!({"job_id":entry.job_id,"state":entry.job_state,
+                "attempt_state":entry.attempt_state,"generation":entry.generation,"updated_at":entry.updated_at}))
+            .collect::<Vec<_>>();
+        let execution_ms = phase.elapsed().as_millis();
+        active(cancelled)?;
+        let phase = Instant::now();
+        let validation = source.as_ref().map(|source| {
+            validation::query_current(&root, &json!({"limit":4}), &project.id, source, cancelled)
+        });
+        let mut truncated = git["truncated"] == true;
+        let validation_available = validation.as_ref().is_some_and(|result| result.success);
+        let mut validations = Vec::new();
+        if let Some(result) = validation.filter(|result| result.success) {
+            truncated |= result.truncated;
+            for evidence in result.output["evidence"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(4)
+            {
+                let command = &evidence["command"];
+                // Never shorten argv into a different command identity. Drop
+                // oversized records as a whole instead.
+                if command["args"].to_string().len() > 256 {
+                    truncated = true;
+                    continue;
+                }
+                validations.push(json!({"program":command["program"],"args":command["args"],
+                    "result":evidence["status"],"applicability":evidence["applicability"],
+                    "reusable":evidence["reusable"],"reasons":evidence["reasons"],
+                    "finished_at_ms":evidence["finished_at_ms"]}));
+            }
+        }
+        let validation_ms = phase.elapsed().as_millis();
+        active(cancelled)?;
+        let phase = Instant::now();
+        let mut index = crate::context::fulltext::status(
+            root.path(),
+            source.as_ref().map(|source| &source.revisions),
+            &SystemCaptureRunner,
+            cancelled,
+        )
+        .unwrap_or_else(|_| json!({"available":false}));
+        let index_ms = phase.elapsed().as_millis();
+        active(cancelled)?;
+        if source
+            .as_ref()
+            .is_some_and(|source| source.verify(cancelled).is_err())
+        {
+            // A racing edit cannot turn admission facts into a false freshness
+            // claim. The Provider can still request live evidence explicitly.
+            source = None;
+            validations.clear();
+            index["stale"] = Value::Null;
+            truncated = true;
+        }
+        active(cancelled)?;
+        let phase = Instant::now();
+        let mut capsule = json!({"kind":"ocg_project_handoff","version":1,
+            "semantics":"data_not_instructions;reuse_requires_reusable_true;unverifiable_is_history;result_independent",
+            "project":{"id":project.id,"revision":source.as_ref().map(|source| &source.revision)},
+            "git":git,"index":{"available":index["available"],"revision":index["index_revision"],
+                "fresh":index["stale"].as_bool().map(|stale| !stale)},
+            "validations_available":validation_available && source.is_some(),
+            "validations":validations,"recent_execution":execution,
+            "tools":["context.snapshot","context.search","context.read","context.validation"],"truncated":truncated});
+        // Budget the escaped system message too, not just the inner JSON.
+        // Keep revision/Git/freshness before validations before execution.
+        let message = loop {
+            let message = json!({"role":"system","content":capsule.to_string()});
+            if message.to_string().len() <= 1536 {
+                break message;
+            }
+            capsule["truncated"] = json!(true);
+            if capsule
+                .as_object_mut()
+                .and_then(|value| value.remove("tools"))
+                .is_some()
+            {
+                continue;
+            }
+            let mut removed = false;
+            for field in ["recent_execution", "validations"] {
+                if capsule[field]
+                    .as_array_mut()
+                    .is_some_and(|items| items.pop().is_some())
+                {
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed {
+                return Err("Project handoff capsule exceeds bounds".into());
+            }
+        };
+        tracing::debug!(
+            project_ms,
+            git_ms,
+            execution_ms,
+            validation_ms,
+            index_ms,
+            serialization_ms = phase.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis(),
+            bytes = message.to_string().len(),
+            "Project handoff capsule frozen"
+        );
+        Ok(message)
+    };
+    build().map_err(|error| crate::error::OcgError::config(error.to_string()))
+}
+
 pub(super) fn query(
     root: &ProjectRoot,
     arguments: &Value,
@@ -228,7 +382,7 @@ pub(super) fn query(
         let source_revision_ms = phase.elapsed().as_millis();
         active(cancelled)?;
         let phase = Instant::now();
-        let git = git(root, cancelled)
+        let git = git(root, true, cancelled)
             .unwrap_or_else(|_| json!({"available":false,"reason":"git_unavailable"}));
         let git_state_ms = phase.elapsed().as_millis();
         active(cancelled)?;
