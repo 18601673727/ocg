@@ -6,6 +6,7 @@ import {
   Code2,
   FlaskConical,
   Home,
+  BarChart3,
   Bell,
   MessageSquare,
   PenTool,
@@ -51,10 +52,11 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
   devops: Server,
 };
 
-const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
+const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.usage" | "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
   { target: "home", labelKey: "nav.home", icon: Home },
   { target: "attention", labelKey: "nav.attention", icon: Bell },
   { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
+  { target: "usage", labelKey: "nav.usage", icon: BarChart3 },
   { target: "control-center", labelKey: "nav.controlCenter", icon: SlidersHorizontal },
   { target: "ledger", labelKey: "nav.ledger", icon: Table2 },
   { target: "job-execution", labelKey: "nav.jobExecution", icon: Workflow },
@@ -169,7 +171,7 @@ export function OcgSidebar({
     }
   };
   const workspaceNav = runtimeAuthority === "canonical"
-    ? WORKSPACE_NAV.filter(item => ["home", "attention", "chat", "job-execution"].includes(item.target))
+    ? WORKSPACE_NAV.filter(item => ["home", "attention", "chat", "usage", "job-execution"].includes(item.target))
     : WORKSPACE_NAV;
   const hasNav = Boolean(onNavigate);
   const connection = RUNTIME_CONNECTION[runtimeStatus.state];

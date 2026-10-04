@@ -11,6 +11,7 @@ import type { ScenarioId } from "../runtime/runtime-types";
 export type WorkspaceView =
   | "chat"
   | "home"
+  | "usage"
   | "attention"
   | "ledger"
   | "control-center"
@@ -23,6 +24,7 @@ export const WORKSPACE_VIEWS: readonly WorkspaceView[] = [
   "chat",
   "home",
   "attention",
+  "usage",
   "ledger",
   "control-center",
   "job-execution",
@@ -86,6 +88,7 @@ export type WorkspaceTarget = {
 const WORKSPACE_TARGETS: Record<WorkspaceView, WorkspaceTarget> = {
   chat: { href: "/?view=chat", toggles: false },
   home: { href: "/?view=home", toggles: false },
+  usage: { href: "/?view=usage", toggles: false },
   attention: { href: "/?view=attention", toggles: false },
   "control-center": { href: "/?view=control-center", toggles: true },
   ledger: { href: "/?view=ledger", toggles: true },

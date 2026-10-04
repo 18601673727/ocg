@@ -1189,6 +1189,18 @@ fn handle_canonical(
                 let job = query("job_id")?;
                 answer!(service.canonical_snapshot(&project, &job)?)
             }
+            Route::ProjectUsage => {
+                let window = request.query.get("window").map(String::as_str).unwrap_or("all");
+                let window = serde_json::from_value::<crate::contracts::UsageWindow>(Value::String(window.to_string()))
+                    .map_err(|_| OcgError::config("invalid usage window"))?;
+                answer!(service.project_usage(&query("project_id")?, window)?)
+            }
+            Route::ConversationUsage => {
+                answer!(service.conversation_usage(&query("project_id")?, &query("session_id")?)?)
+            }
+            Route::JobUsage => {
+                answer!(service.job_usage(&query("project_id")?, &query("job_id")?)?)
+            }
             Route::CanonicalDashboard => {
                 let project = query("project_id")?;
                 let job = request.query.get("job_id").map(String::as_str);
@@ -1211,6 +1223,9 @@ fn handle_canonical(
             | Route::CanonicalSnapshot
             | Route::CanonicalEvents
             | Route::CanonicalDashboard
+            | Route::ProjectUsage
+            | Route::ConversationUsage
+            | Route::JobUsage
             | Route::ChatSend
             | Route::ChatImageUpload
             | Route::ChatImageGet { .. }
@@ -1879,6 +1894,9 @@ enum Route {
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
+    ProjectUsage,
+    ConversationUsage,
+    JobUsage,
     ChatImageUpload,
     ChatImageGet { project: String, image: String },
     ChatSend,
@@ -1959,6 +1977,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "launch"])
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
+                | ("GET" | "OPTIONS", ["api", "v1", "canonical", "usage"])
+                | ("GET" | "OPTIONS", ["api", "v1", "canonical", "chat", "usage"])
+                | ("GET" | "OPTIONS", ["api", "v1", "canonical", "jobs", "usage"])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "images"])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "images", _, _])
                 | ("OPTIONS", ["api", "v1", "canonical", "chat", "send"])
@@ -2016,6 +2037,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         }
         ("GET", ["api", "v1", "canonical", "jobs"]) => Ok(Route::CanonicalSnapshot),
         ("GET", ["api", "v1", "canonical", "jobs", "events"]) => Ok(Route::CanonicalEvents),
+        ("GET", ["api", "v1", "canonical", "usage"]) => Ok(Route::ProjectUsage),
+        ("GET", ["api", "v1", "canonical", "chat", "usage"]) => Ok(Route::ConversationUsage),
+        ("GET", ["api", "v1", "canonical", "jobs", "usage"]) => Ok(Route::JobUsage),
         ("GET", ["api", "v1", "canonical", "dashboard"]) => Ok(Route::CanonicalDashboard),
         ("POST", ["api", "v1", "canonical", "chat", "images"]) => Ok(Route::ChatImageUpload),
         ("GET", ["api", "v1", "canonical", "chat", "images", project, image]) => {
@@ -2109,6 +2133,9 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         ["api", "v1", "canonical", "jobs"]
         | ["api", "v1", "canonical", "jobs", "events"]
         | ["api", "v1", "canonical", "dashboard"]
+        | ["api", "v1", "canonical", "usage"]
+        | ["api", "v1", "canonical", "jobs", "usage"]
+        | ["api", "v1", "canonical", "chat", "usage"]
         | ["api", "v1", "canonical", "chat", "stream"]
         | ["api", "v1", "canonical", "chat", "messages"]
         | ["api", "v1", "canonical", "projects"] => Some("GET"),

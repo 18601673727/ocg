@@ -4,6 +4,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ChatView } from "../chat/chat-view";
+import { UsageSurface } from "../usage/usage-surface";
+import { ConversationInspector } from "../usage/conversation-inspector";
+import { useConversationUsage, useJobUsage } from "../usage/use-usage";
 import { JobInspector } from "../execution/job-inspector";
 import { JobDraftSurface } from "../job/job-draft-surface";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
@@ -177,7 +180,7 @@ export function RuntimeWorkspace({
   }, [activeProjectId]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [inspectorMode, setInspectorMode] = useState<InspectorMode>("collapsed");
+  const [inspectorMode, setInspectorMode] = useState<InspectorMode>(runtimeAuthority === "canonical" ? "docked" : "collapsed");
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   // Job drafts are held keyed by Project + session scope so one Project's
   // in-progress launch can never appear in another.
@@ -236,6 +239,7 @@ export function RuntimeWorkspace({
   useEffect(() => {
     if (runtimeAuthority === "canonical" && historyStatus === "ready" && activeSessionKey) rememberSession(activeSessionKey);
   }, [activeSessionKey, historyStatus, rememberSession, runtimeAuthority]);
+  const isUsage = view === "usage";
   const isLedger = view === "ledger" && runtimeAuthority === "mock";
   const isControlCenter = view === "control-center" && runtimeAuthority === "mock";
   const isJobExecution = view === "job-execution";
@@ -545,7 +549,12 @@ export function RuntimeWorkspace({
   const execution = activeSession ? snapshot.executionBySession[activeSession.id] ?? null : null;
   const lastAssistant = messages.findLast(message => message.role === "assistant");
   const retryableMessage = lastAssistant && retryContent(messages, lastAssistant.id) ? lastAssistant.id : null;
-  const accounting = activeSession ? snapshot.accountingBySession[activeSession.id] ?? null : null;
+  const usageRefreshKey = messages.filter(message => message.role === "assistant" && ["completed", "failed", "cancelled"].includes(message.status)).map(message => `${message.id}:${message.status}`).join("|");
+  const usageBaseUrl = runtimeAuthority === "canonical" && view === "chat" ? ocgControlUrl : null;
+  const conversationUsage = useConversationUsage(usageBaseUrl, activeProjectId, activeSession?.sessionId ?? activeSession?.id ?? "", usageRefreshKey, messages.some(message => !message.optimistic));
+  const jobUsage = useJobUsage(usageBaseUrl, activeProjectId, execution?.jobId ?? "", `${usageRefreshKey}:${execution?.state ?? ""}`);
+  const recordedAccounting = activeSession ? snapshot.accountingBySession[activeSession.id] ?? null : null;
+  const accounting = jobUsage.data ? { ceiling: recordedAccounting?.ceiling ?? null, consumption: jobUsage.data.totals.cost } : recordedAccounting;
   const observability = activeSession ? snapshot.observabilityBySession[activeSession.id] : undefined;
   const inspectorOpen = inspectorMode !== "collapsed";
 
@@ -637,7 +646,14 @@ export function RuntimeWorkspace({
           runtimeAuthority={runtimeAuthority}
           syncStatus={sync?.status ?? null}
         />
-        {isLedger ? (
+        {isUsage ? (
+          <main aria-label={t("nav.usage")} className="flex min-h-0 flex-1 overflow-hidden">
+            <UsageSurface key={activeProjectId} baseUrl={runtimeAuthority === "canonical" ? ocgControlUrl : null} projectId={activeProjectId} onSelectSession={id => {
+              const session = snapshot.sessions.find(item => item.sessionId === id || item.id === id);
+              if (session) selectSession(session.id);
+            }} />
+          </main>
+        ) : isLedger ? (
           <main aria-label="Resource ledger" className="flex min-h-0 flex-1 overflow-hidden">
             <ResourceLedgerSurface key={activeProjectId} ledger={snapshot.resourceLedger} />
           </main>
@@ -756,14 +772,16 @@ export function RuntimeWorkspace({
             </div>
 
             <aside
-              aria-label="Job inspector"
+              aria-label={t("usage.inspector")}
               className={cn(
                 "hidden shrink-0 overflow-hidden border-border bg-background transition-[width,opacity] duration-200 ease-out lg:block",
                  inspectorMode === "expanded" ? "w-[min(640px,42vw)] border-l opacity-100" : inspectorMode === "docked" ? "w-[min(360px,28vw)] border-l opacity-100" : "w-0 border-l-0 opacity-0",
               )}
             >
               <div className={cn("h-full", inspectorMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
-                {execution && inspectorOpen && (
+                {inspectorOpen && runtimeAuthority === "canonical" ? (
+                  <ConversationInspector key={`${activeProjectId}:${activeSession.id}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode={inspectorMode} onModeChange={setInspectorMode} onClose={() => setInspectorMode("collapsed")} onOpenJobExecution={() => navigate("job-execution")} />
+                ) : execution && inspectorOpen ? (
                   <JobInspector
                     execution={execution}
                     accounting={accounting}
@@ -773,14 +791,14 @@ export function RuntimeWorkspace({
                     onClose={() => setInspectorMode("collapsed")}
                     onOpenJobExecution={() => navigate("job-execution")}
                   />
-                )}
+                ) : null}
               </div>
             </aside>
           </main>
         )}
       </div>
 
-      {!isLedger && !isControlCenter && !isJobExecution && !isLogs && !isSettings && !isHome && !isAttention && (
+      {!isUsage && !isLedger && !isControlCenter && !isJobExecution && !isLogs && !isSettings && !isHome && !isAttention && (
         <div
           className={cn("fixed inset-0 z-50 lg:hidden", !mobileInspectorOpen && "pointer-events-none")}
           aria-hidden={!mobileInspectorOpen}
@@ -793,13 +811,15 @@ export function RuntimeWorkspace({
             )}
           />
           <aside
-            aria-label="Job inspector"
+            aria-label={t("usage.inspector")}
             className={cn(
                "absolute inset-y-0 right-0 w-full max-w-none border-l border-border bg-background transition-transform duration-200 ease-out sm:w-[640px] sm:max-w-[85vw]",
                mobileInspectorOpen ? "translate-x-0" : "translate-x-full",
              )}
             >
-            {mobileInspectorOpen && execution && (
+            {mobileInspectorOpen && runtimeAuthority === "canonical" ? (
+              <ConversationInspector key={`${activeProjectId}:${activeSession?.id ?? ""}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode="expanded" onClose={() => setMobileInspectorOpen(false)} onOpenJobExecution={() => navigate("job-execution")} />
+            ) : mobileInspectorOpen && execution ? (
               <JobInspector
                 execution={execution}
                 accounting={accounting}
@@ -808,7 +828,7 @@ export function RuntimeWorkspace({
                 onClose={() => setMobileInspectorOpen(false)}
                 onOpenJobExecution={() => navigate("job-execution")}
               />
-            )}
+            ) : null}
           </aside>
         </div>
       )}

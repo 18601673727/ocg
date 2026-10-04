@@ -19,6 +19,8 @@ import type { ProjectId } from "../project/domain";
 import type { CanonicalBackendEvent } from "./canonical-store";
 import {
   ContractError,
+  decodeProjectUsageResponse, decodeConversationUsageResponse, decodeJobUsageResponse,
+  type ProjectUsageResponse, type ConversationUsageResponse, type JobUsageResponse, type UsageWindow,
   decodeChatImage,
   type ChatImage,
   type ChatImageUploadRequest,
@@ -96,6 +98,9 @@ function isCanonicalRejection<T>(value: CanonicalResult<T>): value is CanonicalR
 export { isCanonicalRejection };
 
 export interface CanonicalControlClient {
+  readProjectUsage?(projectId: string, window: UsageWindow, signal?: AbortSignal): Promise<CanonicalResult<ProjectUsageResponse>>;
+  readConversationUsage?(projectId: string, sessionId: string, signal?: AbortSignal): Promise<CanonicalResult<ConversationUsageResponse>>;
+  readJobUsage?(projectId: string, jobId: string, signal?: AbortSignal): Promise<CanonicalResult<JobUsageResponse>>;
   deleteChatConversation?(projectId: string, sessionId: string): Promise<CanonicalResult<ChatConversationsResponse>>;
   uploadChatImage?(request: ChatImageUploadRequest, signal?: AbortSignal): Promise<CanonicalResult<ChatImage>>;
   readChatConversations(projectId: string): Promise<CanonicalResult<ChatConversationsResponse>>;
@@ -195,7 +200,7 @@ function contractRejection(commandId: string, error: unknown): CanonicalRejectio
 
 export function createHttpCanonicalControlClient(
   options: HttpCanonicalControlClientOptions,
-): CanonicalControlClient {
+): CanonicalControlClient & Required<Pick<CanonicalControlClient, "readProjectUsage" | "readConversationUsage" | "readJobUsage">> {
   const base = options.baseUrl.replace(/\/$/, "");
   const fetch = options.fetch.bind(globalThis);
   async function send(
@@ -245,6 +250,21 @@ export function createHttpCanonicalControlClient(
   }
 
   return {
+    async readProjectUsage(projectId, window, signal) {
+      const { status, value, text } = await send("GET", `/api/v1/canonical/usage?project_id=${encodeURIComponent(projectId)}&window=${window}`, undefined, signal);
+      if (status !== 200) return rejection("usage", status, text);
+      return decodeProjectUsageResponse(value);
+    },
+    async readConversationUsage(projectId, sessionId, signal) {
+      const { status, value, text } = await send("GET", `/api/v1/canonical/chat/usage?project_id=${encodeURIComponent(projectId)}&session_id=${encodeURIComponent(sessionId)}`, undefined, signal);
+      if (status !== 200) return rejection("conversation-usage", status, text);
+      return decodeConversationUsageResponse(value);
+    },
+    async readJobUsage(projectId, jobId, signal) {
+      const { status, value, text } = await send("GET", `/api/v1/canonical/jobs/usage?project_id=${encodeURIComponent(projectId)}&job_id=${encodeURIComponent(jobId)}`, undefined, signal);
+      if (status !== 200) return rejection("job-usage", status, text);
+      return decodeJobUsageResponse(value);
+    },
     async deleteChatConversation(projectId, sessionId) {
       const { status, value, text } = await send("DELETE",
         "/api/v1/canonical/chat/conversations?project_id=" + encodeURIComponent(projectId) + "&session_id=" + encodeURIComponent(sessionId), undefined);

@@ -210,6 +210,170 @@ pub struct ChatConversationsResponse {
     pub conversations: Vec<ChatConversationView>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCompleteness {
+    #[default]
+    Complete,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct UsageQuantity {
+    pub value: Option<u64>,
+    pub completeness: UsageCompleteness,
+}
+
+impl Default for UsageQuantity {
+    fn default() -> Self {
+        Self {
+            value: Some(0),
+            completeness: UsageCompleteness::Complete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct UsageTokenTotals {
+    pub input: UsageQuantity,
+    pub output: UsageQuantity,
+    pub reasoning: UsageQuantity,
+    pub cache_read: UsageQuantity,
+    pub cache_write: UsageQuantity,
+    pub total: UsageQuantity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct UsageCurrencyCost {
+    pub currency: String,
+    pub actual_micros: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCostSource {
+    #[default]
+    CanonicalSettlement,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct UsageCost {
+    pub source: UsageCostSource,
+    pub actual_micros: Option<i64>,
+    pub currency: Option<String>,
+    pub currencies: Vec<UsageCurrencyCost>,
+    pub completeness: UsageCompleteness,
+    pub settled_calls: u64,
+    pub unresolved_calls: u64,
+    pub unavailable_calls: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ContextCostTotals {
+    pub canonical_message_bytes: UsageQuantity,
+    pub tool_schema_bytes: UsageQuantity,
+    pub full_schema_baseline_bytes: UsageQuantity,
+    pub schema_bytes_saved: UsageQuantity,
+    pub wire_bytes: UsageQuantity,
+    pub capsule_bytes: UsageQuantity,
+    pub capsule_injected_requests: UsageQuantity,
+    pub tool_result_bytes: UsageQuantity,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct UsageTotals {
+    pub turns: u64,
+    pub jobs: u64,
+    pub attempts: u64,
+    pub provider_calls: u64,
+    pub native_calls: u64,
+    pub provider_requests: UsageQuantity,
+    pub provider_rounds: UsageQuantity,
+    pub tokens: UsageTokenTotals,
+    pub cost: UsageCost,
+    pub context_costs: ContextCostTotals,
+    pub first_activity_at: Option<i64>,
+    pub last_activity_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct UsageBreakdown {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub totals: UsageTotals,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageWindow {
+    #[default]
+    All,
+    Today,
+    #[serde(rename = "7d")]
+    SevenDays,
+    #[serde(rename = "30d")]
+    ThirtyDays,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct UsageConversationRow {
+    pub conversation_id: String,
+    pub session_id: String,
+    pub title: Option<String>,
+    pub updated_at: String,
+    pub totals: UsageTotals,
+    pub providers: Vec<String>,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ProjectUsageResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub project_id: String,
+    pub window: UsageWindow,
+    pub window_started_at: Option<i64>,
+    pub generated_at: i64,
+    pub conversations: u64,
+    pub totals: UsageTotals,
+    pub providers: Vec<UsageBreakdown>,
+    pub models: Vec<UsageBreakdown>,
+    pub conversation_rows: Vec<UsageConversationRow>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ConversationUsageResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub project_id: String,
+    pub conversation_id: String,
+    pub session_id: String,
+    pub title: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub latest_job_state: Option<String>,
+    pub generated_at: i64,
+    pub totals: UsageTotals,
+    pub providers: Vec<UsageBreakdown>,
+    pub models: Vec<UsageBreakdown>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct JobUsageResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub project_id: String,
+    pub job_id: String,
+    pub generated_at: i64,
+    pub totals: UsageTotals,
+    pub providers: Vec<UsageBreakdown>,
+    pub models: Vec<UsageBreakdown>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatMessageRole {
@@ -413,6 +577,9 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     ChatSendRequest::export_all(cfg)?;
     ChatImageUploadRequest::export_all(cfg)?;
     ChatConversationsResponse::export_all(cfg)?;
+    ProjectUsageResponse::export_all(cfg)?;
+    ConversationUsageResponse::export_all(cfg)?;
+    JobUsageResponse::export_all(cfg)?;
     ChatMessagesResponse::export_all(cfg)?;
     JobLaunchResponse::export_all(cfg)?;
     ProfileView::export_all(cfg)?;

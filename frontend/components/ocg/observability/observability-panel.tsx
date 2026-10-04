@@ -115,7 +115,7 @@ function BudgetSection({ accounting, observability }: { accounting: JobAccountin
             <span className="text-[11px] text-muted-foreground">{budget.unit ?? "USD"} ceiling</span>
             <span className="ml-auto text-[10px] text-muted-foreground">{budget.source}</span>
           </div>
-          <p className="mt-1 text-[10px] text-muted-foreground">Consumption is not reported by the control plane; the ceiling stays authoritative.</p>
+          <p className="mt-1 text-[10px] text-muted-foreground">{t("usage.costSource")}</p>
           {budget.estimatedFinalSpend && <p className="mt-1 text-[10px] text-muted-foreground">Forecast is {budget.estimatedFinalSpend.provenance}; hard budget remains authoritative.</p>}
         </>
       )}

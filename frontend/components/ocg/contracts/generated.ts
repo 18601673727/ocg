@@ -203,6 +203,12 @@ export type CommandState = "received" | "awaiting_approval" | "accepted" | "reje
 export type Consistency = "read_your_writes" | "monotonic" | "eventual" | "snapshot";
 
 
+export type ContextCostTotals = { canonical_message_bytes: UsageQuantity, tool_schema_bytes: UsageQuantity, full_schema_baseline_bytes: UsageQuantity, schema_bytes_saved: UsageQuantity, wire_bytes: UsageQuantity, capsule_bytes: UsageQuantity, capsule_injected_requests: UsageQuantity, tool_result_bytes: UsageQuantity, };
+
+
+export type ConversationUsageResponse = { api_version: CanonicalApiVersion, project_id: string, conversation_id: string, session_id: string, title: string | null, created_at: string, updated_at: string, latest_job_state: string | null, generated_at: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, truncated: boolean, };
+
+
 export type DerivedMetric = { metric: string, value: string | null, unit: string, quality: MeasurementQuality, };
 
 
@@ -308,6 +314,9 @@ outcome: string, command_id: string, draft_id: string, project_id: string, sessi
 export type JobLifecycle = "pending" | "ready" | "settling" | "blocked" | "completed" | "failed" | "cancelled";
 
 
+export type JobUsageResponse = { api_version: CanonicalApiVersion, project_id: string, job_id: string, generated_at: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, truncated: boolean, };
+
+
 export type LeaseState = "active" | "fenced" | "expired";
 
 
@@ -411,6 +420,9 @@ export type ProjectRecord = { project_id: string, root: string, boundary: string
 
 
 export type ProjectScope = string;
+
+
+export type ProjectUsageResponse = { api_version: CanonicalApiVersion, project_id: string, window: UsageWindow, window_started_at: number | null, generated_at: number, conversations: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, conversation_rows: Array<UsageConversationRow>, truncated: boolean, };
 
 
 export type ProjectionEffect = "reducible" | "snapshot_barrier";
@@ -627,6 +639,36 @@ export type SyncWindowPolicy = { nonterminal_jobs_per_project: number, terminal_
 
 
 export type TransientMessageDelta = { project_scope: ProjectScope, generation: string, stream_id: string, message_ref: EntityRef, attempt_ref: EntityRef, chunk_index: string, delta_utf8: string, };
+
+
+export type UsageBreakdown = { provider: string | null, model: string | null, totals: UsageTotals, };
+
+
+export type UsageCompleteness = "complete" | "partial" | "unavailable";
+
+
+export type UsageConversationRow = { conversation_id: string, session_id: string, title: string | null, updated_at: string, totals: UsageTotals, providers: Array<string>, models: Array<string>, };
+
+
+export type UsageCost = { source: UsageCostSource, actual_micros: number | null, currency: string | null, currencies: Array<UsageCurrencyCost>, completeness: UsageCompleteness, settled_calls: number, unresolved_calls: number, unavailable_calls: number, };
+
+
+export type UsageCostSource = "canonical_settlement";
+
+
+export type UsageCurrencyCost = { currency: string, actual_micros: number, };
+
+
+export type UsageQuantity = { value: number | null, completeness: UsageCompleteness, };
+
+
+export type UsageTokenTotals = { input: UsageQuantity, output: UsageQuantity, reasoning: UsageQuantity, cache_read: UsageQuantity, cache_write: UsageQuantity, total: UsageQuantity, };
+
+
+export type UsageTotals = { turns: number, jobs: number, attempts: number, provider_calls: number, native_calls: number, provider_requests: UsageQuantity, provider_rounds: UsageQuantity, tokens: UsageTokenTotals, cost: UsageCost, context_costs: ContextCostTotals, first_activity_at: number | null, last_activity_at: number | null, };
+
+
+export type UsageWindow = "all" | "today" | "7d" | "30d";
 
 /**
  * The protocol versions this file was generated from. They are asserted equal to

@@ -556,6 +556,19 @@ impl SmokeHarness {
         })
     }
 
+    pub fn verify_usage_contract(&mut self, project_id: &str, session_id: &str) -> Result<()> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut command = Command::new("node");
+        command.current_dir(root)
+            .arg(root.join("tests/smoke/usage-contract.cjs"))
+            .arg(format!("http://{}", self.address.ok_or("no OCG address")?))
+            .args([project_id, session_id]);
+        let mut process = Process::spawn(&mut command, &self.path(""), "usage-contract", self.timeouts)?;
+        let status = process.wait_until(self.operation_deadline(self.timeouts.http))?.ok_or("usage contract timed out")?;
+        if !status.success() { return Err(format!("usage contract: {status}\n{}", log(&process.stderr)).into()); }
+        Ok(())
+    }
+
     pub fn send_chat(
         &mut self,
         project_id: &str,

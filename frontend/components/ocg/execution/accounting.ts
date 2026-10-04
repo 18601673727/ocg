@@ -1,19 +1,6 @@
-/**
- * Canonical accounting context for one Job.
- *
- * The execution snapshot carries no accounting. What the control plane does
- * expose is a *ceiling*: a hard budget recorded in global configuration, in a
- * Project's defaults, or in a Job's own pre-run configuration, which is the
- * configuration a DispatchIntent is admitted against. That is the only budget
- * fact this module states.
- *
- * Consumption is deliberately absent. No control route reports what a Job has
- * spent, so there is no number here to render, and every surface that shows a
- * budget says plainly that consumption is not reported rather than modelling,
- * estimating, or borrowing one from another surface.
- */
+/** Canonical Job ceiling and backend-projected settlement consumption. */
 
-import type { GlobalConfiguration, JsonValue } from "../contracts";
+import type { GlobalConfiguration, JsonValue, UsageCost } from "../contracts";
 
 export type BudgetUnit = string;
 
@@ -30,13 +17,7 @@ export type BudgetCeiling = {
 export type JobAccounting = {
   /** The hard limit that applies to this Job, or `null` when none is recorded. */
   ceiling: BudgetCeiling | null;
-  /**
-   * A placeholder for the consumption fact the control plane does not expose
-   * yet. It is typed `null` so no surface can render a modelled spend by
-   * accident; it becomes a real field when a Job-scoped measurement route
-   * exists, not before.
-   */
-  consumption: null;
+  consumption: UsageCost | null;
 };
 
 const CEILING_SOURCES: readonly BudgetCeilingSource[] = [

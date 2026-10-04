@@ -88,3 +88,51 @@ fn onboarding_same_session_two_chat_turns() -> Result<()> {
     );
     smoke.finish()
 }
+
+#[test]
+fn usage_routes_and_frontend_contract_cover_entire_conversation() -> Result<()> {
+    let mut smoke = SmokeHarness::start(Reply::Text(vec!["ready".into()]))?;
+    smoke.configure_provider()?;
+    let project = smoke.add_project("usage-project")?;
+    let project_id = string(&project, "project_id")?;
+    let session = smoke.create_untitled_session(&project_id)?;
+    for (n, reply) in [Reply::Text(vec!["ready".into()]), Reply::NativePwd, Reply::Text(vec!["done".into()])].into_iter().enumerate() {
+        smoke.provider_reply(reply)?;
+        let chat = smoke.send_chat(&project_id, &session, &format!("turn-{n}"))?;
+        smoke.consume_chat(&chat)?;
+        smoke.assert_terminal_execution(&chat, "completed")?;
+        let usage = smoke.json("GET", &format!("/api/v1/canonical/jobs/usage?project_id={project_id}&job_id={}", chat.job_id), None)?;
+        assert_eq!(usage["totals"]["provider_calls"], 1);
+    }
+    for window in ["today", "7d", "30d", "all"] {
+        let usage = smoke.json("GET", &format!("/api/v1/canonical/usage?project_id={project_id}&window={window}"), None)?;
+        assert_eq!(usage["window"], window);
+        assert_eq!(usage["totals"]["turns"], 3);
+        assert_eq!(usage["totals"]["provider_requests"]["value"], 4);
+        assert_eq!(usage["totals"]["cost"]["actual_micros"], serde_json::Value::Null);
+    }
+    smoke.verify_usage_contract(&project_id, &session)?;
+    smoke.finish()
+}
+
+#[test]
+fn failed_and_retried_chat_usage_preserves_both_provider_calls() -> Result<()> {
+    let mut smoke = SmokeHarness::start(Reply::Text(vec![]))?;
+    smoke.configure_provider()?;
+    let project = smoke.add_project("usage-retry")?;
+    let project_id = string(&project, "project_id")?;
+    let session = smoke.create_untitled_session(&project_id)?;
+    let failed = smoke.send_chat(&project_id, &session, "fail safely")?;
+    assert!(smoke.consume_chat(&failed).is_err());
+    smoke.assert_terminal_execution(&failed, "failed")?;
+    smoke.provider_reply(Reply::Text(vec!["recovered".into()]))?;
+    let retried = smoke.send_chat(&project_id, &session, "retry safely")?;
+    smoke.consume_chat(&retried)?;
+    smoke.assert_terminal_execution(&retried, "completed")?;
+    let usage = smoke.json("GET", &format!("/api/v1/canonical/chat/usage?project_id={project_id}&session_id={session}"), None)?;
+    assert_eq!(usage["totals"]["jobs"], 2);
+    assert_eq!(usage["totals"]["provider_calls"], 2);
+    assert_eq!(usage["totals"]["provider_requests"]["value"], 2);
+    assert_eq!(usage["totals"]["cost"]["actual_micros"], serde_json::Value::Null);
+    smoke.finish()
+}

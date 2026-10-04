@@ -948,6 +948,21 @@ impl CanonicalControlService {
         })
     }
 
+    pub fn project_usage(&self, project_id: &str, window: crate::contracts::UsageWindow) -> Result<crate::contracts::ProjectUsageResponse> {
+        let (_, repository) = self.project_repository(project_id)?;
+        repository.project_usage(project_id, window)
+    }
+
+    pub fn conversation_usage(&self, project_id: &str, session_id: &str) -> Result<crate::contracts::ConversationUsageResponse> {
+        let (_, repository) = self.project_repository(project_id)?;
+        repository.conversation_usage(project_id, session_id)
+    }
+
+    pub fn job_usage(&self, project_id: &str, job_id: &str) -> Result<crate::contracts::JobUsageResponse> {
+        let (_, repository) = self.project_repository(project_id)?;
+        repository.job_usage(project_id, job_id)
+    }
+
     pub fn chat_conversations(
         &self,
         project_id: &str,

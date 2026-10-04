@@ -1,5 +1,6 @@
 "use client";
 
+import { CostDetails } from "../usage/usage-values";
 import { CircleDot, ExternalLink, Maximize2, Minimize2, X } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
@@ -123,6 +124,7 @@ export function JobInspector({
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        {accounting?.consumption ? <section className="mb-3 border-b border-border pb-3"><CostDetails cost={accounting.consumption} /></section> : null}
         {!observability ? (
           <div className="flex flex-col gap-3">
             <JobContext execution={execution} />

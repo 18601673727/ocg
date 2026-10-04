@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use strum::{Display, EnumString};
 
+mod usage;
+
 /// Call states that are still unsettled. The fencing cascades and the journal
 /// use exactly the same live set, so a record is emitted for every row the SQL
 /// actually changed.
@@ -474,6 +476,8 @@ CREATE TABLE IF NOT EXISTS domain_settlements (
     settlement TEXT NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
+CREATE INDEX IF NOT EXISTS domain_settlements_by_call
+    ON domain_settlements(project_id,call_id,created_at,settlement_id);
 CREATE INDEX IF NOT EXISTS domain_settlements_by_reservation
     ON domain_settlements(reservation_id,created_at);
 CREATE TABLE IF NOT EXISTS domain_result_evidence (
