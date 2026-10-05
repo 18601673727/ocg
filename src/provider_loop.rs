@@ -1189,17 +1189,83 @@ pub fn admit_provider_call_with_profile(
         &payload.to_string(),
     )?;
 
+    complete_provider_call_admission(
+        ProviderCallAdmission {
+            domain,
+            authority,
+            executor_id,
+            request,
+            config,
+            quota,
+            dispatcher,
+            provider_config,
+            protocol,
+        },
+        call,
+        event_sender,
+        cancelled,
+    )
+}
+
+pub(crate) fn resume_provider_call_admission(
+    admission: ProviderCallAdmission<'_>,
+    call: crate::orchestration::domain::Call,
+) -> Result<crate::orchestration::domain::Call> {
+    complete_provider_call_admission(admission, call, None, CallCancellation::new())
+        .map(|(call, _)| call)
+}
+
+fn complete_provider_call_admission(
+    admission: ProviderCallAdmission<'_>,
+    call: crate::orchestration::domain::Call,
+    event_sender: Option<flume::Sender<ExecutionEvent>>,
+    cancelled: CallCancellation,
+) -> Result<(crate::orchestration::domain::Call, CallCancellation)> {
+    let ProviderCallAdmission {
+        domain,
+        authority,
+        executor_id,
+        config,
+        quota,
+        dispatcher,
+        mut provider_config,
+        ..
+    } = admission;
     // Freeze provider execution configuration for this Call
-    domain.set_provider_config(
-        &call.id,
-        &provider_config.provider_key,
-        &provider_config.model,
-        &provider_config.upstream_model_id,
-        &provider_config.endpoint,
-        provider_config.credential_ref.as_deref(),
-    )?;
+    let intent = domain
+        .dispatch_intent(&call.id)?
+        .ok_or_else(|| OcgError::config("provider DispatchIntent disappeared"))?;
+    if intent.provider_key.is_none() {
+        domain.set_provider_config(
+            &call.id,
+            &provider_config.provider_key,
+            &provider_config.model,
+            &provider_config.upstream_model_id,
+            &provider_config.endpoint,
+            provider_config.credential_ref.as_deref(),
+        )?;
+    } else {
+        provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
+            provider_key: intent
+                .provider_key
+                .ok_or_else(|| OcgError::config("durable provider missing"))?,
+            model: intent
+                .model
+                .ok_or_else(|| OcgError::config("durable model missing"))?,
+            upstream_model_id: intent
+                .upstream_model_id
+                .ok_or_else(|| OcgError::config("durable upstream model missing"))?,
+            endpoint: intent
+                .endpoint
+                .ok_or_else(|| OcgError::config("durable endpoint missing"))?,
+            credential_ref: intent.credential_ref,
+        };
+    }
 
     // Resolve canonical Project identity from Job ownership
+    let job = domain
+        .job(&authority.job_id)?
+        .ok_or_else(|| OcgError::config("provider Job disappeared"))?;
     let project_id = &job.project_id;
 
     // Execute true economic admission through canonical DomainRepository API
@@ -1231,7 +1297,7 @@ pub fn admit_provider_call_with_profile(
         attempt_id: authority.attempt_id.clone(),
         executor_id: Some(executor_id.to_string()),
         generation: authority.generation,
-        payload: payload.to_string(),
+        payload: call.request.clone(),
         dispatch_id: None,
         events: event_sender.unwrap_or(default_events),
         provider_config: Some(provider_config),

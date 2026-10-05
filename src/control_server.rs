@@ -242,6 +242,11 @@ impl ControlServer {
 
     /// Run the accept loop until `stop` is set.
     pub fn serve(self, stop: Arc<AtomicBool>) -> Result<()> {
+        let _job_admission = self
+            .canonical
+            .as_ref()
+            .map(|service| service.start_job_admission_worker())
+            .transpose()?;
         self.listener.set_nonblocking(true).map_err(|error| {
             OcgError::io(
                 "cannot put the control server listener in nonblocking mode",

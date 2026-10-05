@@ -805,6 +805,12 @@ impl DomainRepository {
             "TEXT",
         )?;
         ensure_column(&connection, "domain_jobs", "termination_reason", "TEXT")?;
+        ensure_column(
+            &connection,
+            "domain_jobs",
+            "automatic_admission",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(automatic_admission IN (0,1))",
+        )?;
         ensure_column(&connection, "domain_job_origins", "spawn_key", "TEXT")?;
         ensure_column(
             &connection,
@@ -3227,6 +3233,43 @@ impl DomainRepository {
         transaction.commit().map_err(sql)
     }
 
+    pub(crate) fn automatic_admission_jobs(&self, project_id: &str) -> Result<Vec<Job>> {
+        let ids: Vec<String> = query_all(
+            &self.connection,
+            "SELECT id FROM domain_jobs WHERE project_id=?1 AND ((state='eligible' AND authoritative_attempt_id IS NULL) OR (state='running' AND automatic_admission=1)) ORDER BY created_at,id",
+            &[&project_id],
+            |row| row.get(0),
+        )?;
+        ids.into_iter()
+            .map(|id| {
+                self.job(&id)?
+                    .ok_or_else(|| invalid("admission Job disappeared"))
+            })
+            .collect()
+    }
+
+    pub(crate) fn mark_automatic_admission(&self, job_id: &str) -> Result<bool> {
+        let transaction = self.begin()?;
+        // The marker survives a crash between claiming an Attempt and creating
+        // its first Call, so recovery resumes that authority instead of minting one.
+        let changed = transaction.execute(
+            "UPDATE domain_jobs SET automatic_admission=1 WHERE id=?1 AND ((state='eligible' AND authoritative_attempt_id IS NULL) OR (state='running' AND automatic_admission=1))",
+            [job_id],
+        ).map_err(sql)?;
+        transaction.commit().map_err(sql)?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn complete_automatic_admission(&self, job_id: &str) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE domain_jobs SET automatic_admission=0 WHERE id=?1",
+                [job_id],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
     /// Claim an eligible Job and establish its authoritative Attempt atomically.
     pub fn create_attempt(&mut self, job_id: &str) -> Result<Attempt> {
         let transaction = self
@@ -3768,6 +3811,23 @@ impl DomainRepository {
                     .and_then(|arguments| arguments.get("messages"))
                     .is_some_and(serde_json::Value::is_array);
             if !provider {
+                continue;
+            }
+            let automatic: bool = self
+                .connection
+                .query_row(
+                    "SELECT automatic_admission=1 FROM domain_jobs WHERE id=?1",
+                    [&intent.job_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            if automatic
+                && !intent.budget_admitted
+                && intent.state == "pending"
+                && intent.effect_state == EffectIntentState::NotStarted
+            {
+                // The automatic admission consumer can finish this unstarted
+                // Call through the same economic gate after the workers start.
                 continue;
             }
             let failure = if !intent.budget_admitted {

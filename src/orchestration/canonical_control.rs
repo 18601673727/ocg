@@ -9,7 +9,7 @@ use crate::core_contract::{Failure, FailureClass};
 use crate::error::{OcgError, Result};
 use crate::orchestration::domain::{
     Attempt, AttemptAuthority, Call, ChildPolicy, DispatchIntent, DomainRepository, Executor, Job,
-    JobOrigin, JobSpec,
+    JobOrigin, JobSpec, JobState,
 };
 use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
@@ -440,6 +440,30 @@ pub struct CanonicalControlService {
     registry_lock: Arc<Mutex<()>>,
     configuration_lock: Arc<Mutex<()>>,
     chat_forwarder: Arc<ChatForwarder>,
+}
+
+pub(crate) struct JobAdmissionWorker {
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    runtimes: Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
+}
+
+impl Drop for JobAdmissionWorker {
+    fn drop(&mut self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Closing the bounded queues also releases an admission blocked on send.
+        if let Some(registry) = &self.runtimes {
+            if let Err(error) = registry.shutdown() {
+                tracing::error!(%error, "automatic admission runtime shutdown failed");
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::error!("automatic Job admission worker panicked");
+            }
+        }
+    }
 }
 
 /// One registered Project considered as a candidate owner of a Job lookup.
@@ -1422,6 +1446,110 @@ impl CanonicalControlService {
         })
     }
 
+    pub(crate) fn start_job_admission_worker(&self) -> Result<JobAdmissionWorker> {
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let service = self.clone();
+        let stop = stopped.clone();
+        let thread = std::thread::Builder::new()
+            .name("job-admission".to_string())
+            .spawn(move || {
+                let mut last_error = None;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match service.admit_eligible_jobs() {
+                        Ok(()) => last_error = None,
+                        Err(error) => {
+                            let message = error.to_string();
+                            if last_error.as_ref() != Some(&message) {
+                                tracing::error!(%error, "automatic Job admission deferred");
+                                last_error = Some(message);
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .map_err(|error| invalid(format!("start Job admission worker: {error}")))?;
+        Ok(JobAdmissionWorker {
+            stopped,
+            thread: Some(thread),
+            runtimes: self.runtime_registry.clone(),
+        })
+    }
+
+    pub(crate) fn admit_eligible_jobs(&self) -> Result<()> {
+        let _launch = self
+            .launch_lock
+            .lock()
+            .map_err(|_| invalid("launch lock poisoned"))?;
+        let mut failure = None;
+        for project in self.projects()? {
+            let result = (|| -> Result<()> {
+                let (_, domain) = self.project_repository(&project.project_id)?;
+                // Serialize the complete Attempt-to-Call handoff across consumers;
+                // SQLite still guards every authoritative claim independently.
+                let lock = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(domain.path().with_extension("admission.lock"))
+                    .map_err(|error| OcgError::io("open Job admission lock", error))?;
+                match fs2::FileExt::try_lock_exclusive(&lock) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(error) => return Err(OcgError::io("lock Job admission", error)),
+                }
+                let jobs = domain.automatic_admission_jobs(&project.project_id)?;
+                if !domain.pending_dispatch_intents()?.is_empty() {
+                    if let Some(registry) = &self.runtime_registry {
+                        if registry.handle(&project.project_id)?.is_none() {
+                            let (_, defaults, _) = self.read_configuration()?;
+                            let concurrency = provider_concurrency(
+                                &defaults
+                                    .get(&project.project_id)
+                                    .cloned()
+                                    .unwrap_or_default()
+                                    .defaults,
+                            )?;
+                            registry.get_or_start(
+                                &project.project_id,
+                                Path::new(&project.root),
+                                concurrency,
+                            )?;
+                        }
+                    }
+                }
+                for job in jobs {
+                    let request = crate::contracts::JobLaunchRequest {
+                        command_id: format!("auto-{}", job.id),
+                        draft_id: job.id.clone(),
+                        project_id: job.project_id.clone(),
+                        session_id: String::new(),
+                        objective: job.spec.objective.clone().unwrap_or_default(),
+                        success_criteria: job.spec.success_criteria.clone(),
+                        constraints: job.spec.constraints.clone(),
+                        hard_budget_micros: job.spec.hard_budget_micros.unwrap_or(0),
+                        resource_commitment: job.spec.resource_commitment,
+                    };
+                    match self.launch_job_inner_for_existing(request, Some(job)) {
+                        Ok(response) if response.outcome == "accepted" => {}
+                        Ok(response) => {
+                            failure.get_or_insert_with(|| invalid(response.message));
+                        }
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub fn launch_job(
         &self,
         request: crate::contracts::JobLaunchRequest,
@@ -1678,6 +1806,14 @@ impl CanonicalControlService {
         &self,
         request: crate::contracts::JobLaunchRequest,
     ) -> Result<crate::contracts::JobLaunchResponse> {
+        self.launch_job_inner_for_existing(request, None)
+    }
+
+    fn launch_job_inner_for_existing(
+        &self,
+        request: crate::contracts::JobLaunchRequest,
+        existing_job: Option<Job>,
+    ) -> Result<crate::contracts::JobLaunchResponse> {
         use sha2::{Digest, Sha256};
 
         if !safe_id(&request.command_id) {
@@ -1752,8 +1888,11 @@ impl CanonicalControlService {
         let request_hash = format!("{:x}", hasher.finalize());
 
         // Check for existing command
-        if let Some((stored_hash, job_id, outcome, message)) =
+        if let Some((stored_hash, job_id, outcome, message)) = if existing_job.is_none() {
             domain.lookup_launch_command(&request.command_id, &request.project_id)?
+        } else {
+            None
+        }
         {
             if stored_hash != request_hash {
                 return Ok(crate::contracts::JobLaunchResponse {
@@ -1823,7 +1962,7 @@ impl CanonicalControlService {
                     &request.project_id,
                     &request_hash,
                     "failed",
-                    None,
+                    existing_job.as_ref().map(|job| job.id.as_str()),
                     &response.message,
                 )?;
                 return Ok(response);
@@ -1850,7 +1989,7 @@ impl CanonicalControlService {
                     &request.project_id,
                     &request_hash,
                     "rejected",
-                    None,
+                    existing_job.as_ref().map(|job| job.id.as_str()),
                     &response.message,
                 )?;
                 return Ok(response);
@@ -1878,9 +2017,14 @@ impl CanonicalControlService {
         };
 
         // Resolve provider and model from project configuration defaults
-        let provider_key = match selection
+        let provider_key = match existing_job
             .as_ref()
-            .and_then(|_| chat_selection.map(|(_, model)| model.provider.as_str()))
+            .and_then(|job| job.spec.provider.as_deref())
+            .or_else(|| {
+                selection
+                    .as_ref()
+                    .and_then(|_| chat_selection.map(|(_, model)| model.provider.as_str()))
+            })
             .or_else(|| {
                 project_config
                     .defaults
@@ -1907,16 +2051,17 @@ impl CanonicalControlService {
                     &request.project_id,
                     &request_hash,
                     "rejected",
-                    None,
+                    existing_job.as_ref().map(|job| job.id.as_str()),
                     &response.message,
                 )?;
                 return Ok(response);
             }
         };
 
-        let model = match selection
+        let model = match existing_job
             .as_ref()
-            .map(|selection| selection.model.as_str())
+            .and_then(|job| job.spec.model.as_deref())
+            .or_else(|| selection.as_ref().map(|selection| selection.model.as_str()))
             .or_else(|| project_config.defaults.get("model").and_then(Value::as_str))
             .or_else(|| chat_selection.map(|(key, _)| key))
         {
@@ -1938,7 +2083,7 @@ impl CanonicalControlService {
                     &request.project_id,
                     &request_hash,
                     "rejected",
-                    None,
+                    existing_job.as_ref().map(|job| job.id.as_str()),
                     &response.message,
                 )?;
                 return Ok(response);
@@ -1964,7 +2109,7 @@ impl CanonicalControlService {
                     &request.project_id,
                     &request_hash,
                     "rejected",
-                    None,
+                    existing_job.as_ref().map(|job| job.id.as_str()),
                     &response.message,
                 )?;
                 return Ok(response);
@@ -1992,7 +2137,7 @@ impl CanonicalControlService {
                     &request.project_id,
                     &request_hash,
                     "rejected",
-                    None,
+                    existing_job.as_ref().map(|job| job.id.as_str()),
                     &response.message,
                 )?;
                 return Ok(response);
@@ -2061,7 +2206,7 @@ impl CanonicalControlService {
                     &request.project_id,
                     &request_hash,
                     "rejected",
-                    None,
+                    existing_job.as_ref().map(|job| job.id.as_str()),
                     &response.message,
                 )?;
                 return Ok(response);
@@ -2087,7 +2232,7 @@ impl CanonicalControlService {
                 &request.project_id,
                 &request_hash,
                 "rejected",
-                None,
+                existing_job.as_ref().map(|job| job.id.as_str()),
                 &response.message,
             )?;
             return Ok(response);
@@ -2115,7 +2260,7 @@ impl CanonicalControlService {
                     &request.project_id,
                     &request_hash,
                     "rejected",
-                    None,
+                    existing_job.as_ref().map(|job| job.id.as_str()),
                     &response.message,
                 )?;
                 return Ok(response);
@@ -2156,7 +2301,16 @@ impl CanonicalControlService {
             resource_commitment: request.resource_commitment,
         };
 
-        let job = domain.create_job(&canonical_project.id, job_spec)?;
+        let job = if let Some(job) = existing_job.as_ref() {
+            if !domain.mark_automatic_admission(&job.id)? {
+                return Err(invalid("automatic admission Job is no longer ready"));
+            }
+            domain
+                .job(&job.id)?
+                .ok_or_else(|| invalid("admission Job disappeared"))?
+        } else {
+            domain.create_job(&canonical_project.id, job_spec)?
+        };
         // Admission is one canonical step, not three. `dispatch_job` is the
         // domain operation that makes a newly created Job dispatchable: inside
         // a single immediate transaction it performs the `pending -> eligible`
@@ -2166,7 +2320,25 @@ impl CanonicalControlService {
         // so a launch cannot create the Attempt directly off `create_job`;
         // reusing the transition keeps this lane on the same scheduler
         // semantics `ocg work dispatch` and admission already use.
-        let (attempt, executor) = domain.dispatch_job(&job.id, "provider")?;
+        let (attempt, executor) = if existing_job.is_some() && job.state == JobState::Running {
+            let attempt_id = job
+                .authoritative_attempt_id
+                .as_deref()
+                .ok_or_else(|| invalid("automatic admission lost Attempt authority"))?;
+            let attempt = domain
+                .attempt(attempt_id)?
+                .ok_or_else(|| invalid("automatic Attempt disappeared"))?;
+            let executor = domain
+                .executor_for_attempt(attempt_id)?
+                .ok_or_else(|| invalid("automatic Executor disappeared"))?;
+            if executor.kind != "provider" {
+                domain.complete_automatic_admission(&job.id)?;
+                return Err(invalid("Job was admitted by another executor"));
+            }
+            (attempt, executor)
+        } else {
+            domain.dispatch_job(&job.id, "provider")?
+        };
 
         let user_content = initial_user_message(&request);
         let messages = if is_chat {
@@ -2229,24 +2401,53 @@ impl CanonicalControlService {
                     (registration.sender.clone(), registration.cancelled.clone())
                 })
             });
-        let _call = match crate::provider_loop::admit_provider_call_with_events(
-            crate::provider_loop::ProviderCallAdmission {
-                domain: &mut domain,
-                authority: &authority,
-                executor_id: &executor.id,
-                request: provider_request,
-                config: &budget_config,
-                quota: quota_facts,
-                dispatcher: runtime_handle.provider_dispatcher(),
-                provider_config,
-                protocol,
-            },
-            chat.as_ref().map(|(sender, _)| sender.clone()),
-            chat.as_ref()
-                .map(|(_, cancelled)| cancelled.clone())
-                .unwrap_or_default(),
-        ) {
-            Ok((call, _)) => call,
+        let previous_call = if existing_job.is_some() {
+            domain.calls_for_attempt(&attempt.id)?.into_iter().next()
+        } else {
+            None
+        };
+        let resume_previous = previous_call
+            .as_ref()
+            .map(|call| -> Result<bool> {
+                Ok(call.state == "created"
+                    && !domain
+                        .dispatch_intent(&call.id)?
+                        .ok_or_else(|| invalid("automatic DispatchIntent disappeared"))?
+                        .budget_admitted)
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let admission = crate::provider_loop::ProviderCallAdmission {
+            domain: &mut domain,
+            authority: &authority,
+            executor_id: &executor.id,
+            request: provider_request,
+            config: &budget_config,
+            quota: quota_facts,
+            dispatcher: runtime_handle.provider_dispatcher(),
+            provider_config,
+            protocol,
+        };
+        let admitted = if let Some(call) = previous_call {
+            if resume_previous {
+                crate::provider_loop::resume_provider_call_admission(admission, call)
+            } else if call.state == "failed" {
+                Err(invalid("automatic provider Call admission previously failed"))
+            } else {
+                Ok(call)
+            }
+        } else {
+            crate::provider_loop::admit_provider_call_with_events(
+                admission,
+                chat.as_ref().map(|(sender, _)| sender.clone()),
+                chat.as_ref()
+                    .map(|(_, cancelled)| cancelled.clone())
+                    .unwrap_or_default(),
+            )
+            .map(|(call, _)| call)
+        };
+        let _call = match admitted {
+            Ok(call) => call,
             Err(e) => {
                 // Economic admission failed; finish the attempt as failed
                 domain.discard_unaccepted_chat_turn(&attempt.id)?;
@@ -2273,6 +2474,10 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
+
+        if existing_job.is_some() {
+            domain.complete_automatic_admission(&job.id)?;
+        }
 
         // Record successful launch
         let response = crate::contracts::JobLaunchResponse {
