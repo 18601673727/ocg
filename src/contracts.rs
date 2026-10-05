@@ -18,26 +18,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use ts_rs::{Config, TS};
 
-pub use crate::fingerprint::{
-    ChangeSetFingerprintInputV1, CommandFingerprintInputV1, SpawnChildSpecV1,
-    SpawnFingerprintInputV1,
-};
+pub use crate::fingerprint::{ChangeSetFingerprintInputV1, CommandFingerprintInputV1};
 
 pub use crate::core_contract::{
-    event_registry, ActivityCursor, Actor, Approval, ApprovalDecision, ApprovalState,
-    AttemptLifecycle, BlockerKind, BudgetScope, BudgetSnapshot, CallLifecycle,
-    CanonicalEntityProjection, CanonicalSyncProjection, CapabilityConstraints, CapabilityGrant,
-    CapabilityRef, CapabilityRevocation, CapabilityRevocationState, ChildCancellationPolicy,
-    ChildFailurePolicy, ChildJoinPolicy, ChildPolicy, ClientKind, Command, CommandState,
-    Consistency, DerivedMetric, EffectIntent, EffectIntentState, EntityId, EntityKind, EntityRef,
-    EventEnvelope, EventPayload, EventRegistryEntry, EventType, ExecutionGraphEdge,
-    ExecutionGraphNode, ExecutionGraphProjection, ExecutionLeaseRecord, ExecutionLimits,
-    ExecutionMode, ExecutionPolicy, ExecutionRetryPolicy, ExecutorContract, ExternalSourceKind,
-    Fact, Failure, FailureClass, JobBlocker, JobLifecycle, LeaseState, MeasurementQuality,
-    MeasurementView, Message, MessageBlock, MessageBlockKind, MessageLifecycle, ProjectScope,
-    ProjectionEffect, ProjectionEffectPolicy, ResumeCursor, SideEffectMode, Snapshot,
-    SpawnChildRequest, SyncWindowPolicy, TransientMessageDelta, CORE_CONTRACT_VERSION,
-    CURSOR_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION,
+    Actor, CapabilityConstraints, CapabilityGrant, CapabilityRef, ClientKind, DerivedMetric,
+    EntityId, EntityKind, EntityRef, ExecutionLimits, ExternalSourceKind, Failure, FailureClass,
+    MeasurementQuality, Message, MessageBlock, MessageBlockKind, MessageLifecycle, ProjectScope,
 };
 pub use crate::orchestration::canonical_control::{
     CanonicalConfigurationResponse, CanonicalDashboardResponse, CanonicalJobConfigResponse,
@@ -608,76 +594,27 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     SetupBrowseResponse::export_all(cfg)?;
     SetupProjectRequest::export_all(cfg)?;
     SetupProjectResponse::export_all(cfg)?;
-    ActivityCursor::export_all(cfg)?;
     ChangeSetFingerprintInputV1::export_all(cfg)?;
     CommandFingerprintInputV1::export_all(cfg)?;
-    Actor::export_all(cfg)?;
-    Approval::export_all(cfg)?;
-    ApprovalDecision::export_all(cfg)?;
-    ApprovalState::export_all(cfg)?;
-    BlockerKind::export_all(cfg)?;
-    CapabilityConstraints::export_all(cfg)?;
-    CapabilityGrant::export_all(cfg)?;
-    CapabilityRef::export_all(cfg)?;
-    CapabilityRevocation::export_all(cfg)?;
-    CapabilityRevocationState::export_all(cfg)?;
-    BudgetScope::export_all(cfg)?;
-    BudgetSnapshot::export_all(cfg)?;
-    CallLifecycle::export_all(cfg)?;
-    CanonicalEntityProjection::export_all(cfg)?;
-    CanonicalSyncProjection::export_all(cfg)?;
-    ChildCancellationPolicy::export_all(cfg)?;
-    ChildFailurePolicy::export_all(cfg)?;
-    ChildJoinPolicy::export_all(cfg)?;
-    ChildPolicy::export_all(cfg)?;
-    ClientKind::export_all(cfg)?;
-    Command::export_all(cfg)?;
-    CommandState::export_all(cfg)?;
-    Consistency::export_all(cfg)?;
-    DerivedMetric::export_all(cfg)?;
     EntityId::export_all(cfg)?;
     EntityKind::export_all(cfg)?;
     EntityRef::export_all(cfg)?;
-    EventEnvelope::export_all(cfg)?;
-    EventPayload::export_all(cfg)?;
-    EventRegistryEntry::export_all(cfg)?;
-    EventType::export_all(cfg)?;
-    EffectIntent::export_all(cfg)?;
-    EffectIntentState::export_all(cfg)?;
-    ExecutionGraphEdge::export_all(cfg)?;
-    ExecutionGraphNode::export_all(cfg)?;
-    ExecutionGraphProjection::export_all(cfg)?;
-    ExecutionLeaseRecord::export_all(cfg)?;
-    ExecutionLimits::export_all(cfg)?;
-    ExecutionMode::export_all(cfg)?;
-    ExecutionPolicy::export_all(cfg)?;
-    ExecutionRetryPolicy::export_all(cfg)?;
-    ExecutorContract::export_all(cfg)?;
-    ExternalSourceKind::export_all(cfg)?;
-    Fact::export_all(cfg)?;
-    Failure::export_all(cfg)?;
-    FailureClass::export_all(cfg)?;
-    LeaseState::export_all(cfg)?;
-    MeasurementQuality::export_all(cfg)?;
-    MeasurementView::export_all(cfg)?;
-    Message::export_all(cfg)?;
-    MessageBlock::export_all(cfg)?;
-    MessageBlockKind::export_all(cfg)?;
-    MessageLifecycle::export_all(cfg)?;
     ProjectScope::export_all(cfg)?;
-    ProjectionEffect::export_all(cfg)?;
-    ProjectionEffectPolicy::export_all(cfg)?;
-    ResumeCursor::export_all(cfg)?;
-    AttemptLifecycle::export_all(cfg)?;
-    Snapshot::export_all(cfg)?;
-    SpawnChildSpecV1::export_all(cfg)?;
-    SpawnFingerprintInputV1::export_all(cfg)?;
-    SideEffectMode::export_all(cfg)?;
-    SpawnChildRequest::export_all(cfg)?;
-    SyncWindowPolicy::export_all(cfg)?;
-    TransientMessageDelta::export_all(cfg)?;
-    JobBlocker::export_all(cfg)?;
-    JobLifecycle::export_all(cfg)?;
+    Actor::export_all(cfg)?;
+    ClientKind::export_all(cfg)?;
+    ExternalSourceKind::export_all(cfg)?;
+    FailureClass::export_all(cfg)?;
+    Failure::export_all(cfg)?;
+    MeasurementQuality::export_all(cfg)?;
+    DerivedMetric::export_all(cfg)?;
+    ExecutionLimits::export_all(cfg)?;
+    CapabilityRef::export_all(cfg)?;
+    CapabilityConstraints::export_all(cfg)?;
+    CapabilityGrant::export_all(cfg)?;
+    MessageBlockKind::export_all(cfg)?;
+    MessageBlock::export_all(cfg)?;
+    Message::export_all(cfg)?;
+    MessageLifecycle::export_all(cfg)?;
     Ok(())
 }
 

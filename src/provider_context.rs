@@ -97,15 +97,15 @@ pub async fn assemble<'a, 'f>(
     inputs: ContextInputs<'a, 'f>,
 ) -> Result<ActiveContext> {
     let config = config_data(project_root);
-    // One fail-soft read of the orchestration state, shared by every canonical
-    // source that lives in it: the compiler baseline and the compaction points.
+    // One fail-soft read of the disposable context caches: compiler baselines
+    // and compaction summaries have no execution authority.
     let state = crate::orchestration::state::load(project_root);
     let mut sources = Vec::new();
     let mut sections: Vec<(String, String)> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     if state.corrupt {
         notes.push(
-            "orchestration state could not be read; compiler feedback and stored compaction \
+            "context cache could not be read; compiler feedback and stored compaction \
              points are unavailable"
                 .to_string(),
         );
@@ -165,8 +165,7 @@ pub async fn assemble<'a, 'f>(
     })
 }
 
-/// Persist an accepted compaction point next to the rest of the Attempt's
-/// canonical state.
+/// Cache an accepted compaction summary for reuse by the provider context.
 ///
 /// Best effort by design: a summary that could not be written is still usable
 /// for this request, and losing it only means the next request re-sends the
@@ -246,9 +245,7 @@ fn repository_section(
 /// The delta is read from the same record the next compile compares against, so
 /// the model sees the delta the verification run actually reported rather than a
 /// recount. Raw compiler output is not consulted: it stays in `.ocg/logs/`.
-fn compiler_section(
-    state: &crate::orchestration::state::OrchestrationState,
-) -> Result<Option<String>> {
+fn compiler_section(state: &crate::orchestration::state::ContextCache) -> Result<Option<String>> {
     let Some((command, delta)) = state.latest_compiler_baseline() else {
         return Ok(None);
     };
@@ -338,7 +335,7 @@ async fn compact_conversation<'f>(
     conversation: &[Value],
     tools: Option<&Value>,
     config: &Result<Value>,
-    state: &crate::orchestration::state::OrchestrationState,
+    state: &crate::orchestration::state::ContextCache,
     attempt_id: &str,
     summarize: Option<Summarize<'f>>,
 ) -> (Vec<Value>, Option<CompactionPoint>) {

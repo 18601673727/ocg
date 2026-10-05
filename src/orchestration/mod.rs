@@ -48,7 +48,4 @@ pub use journal::{
     ResultEvidence, StoredJobConfiguration, StoredVerification, UsageEvidence, AUTHORITY_ACTOR,
     INITIAL_CURSOR, JOURNAL_SCHEMA_VERSION, MAX_EVENT_READ,
 };
-pub use state::{
-    Attempts, OrchestrationPhase, OrchestrationState, RepositoryBaseline, SessionState,
-    STATE_SCHEMA_VERSION,
-};
+pub use state::{ContextCache, STATE_SCHEMA_VERSION};

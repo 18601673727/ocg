@@ -4,7 +4,7 @@
 //! Presentation, lifecycle, identity, revision, and approval state do not enter
 //! these hashes.
 
-use crate::core_contract::{ChildPolicy, EntityRef, ExecutionPolicy, FailureClass, ProjectScope};
+use crate::core_contract::{EntityRef, ProjectScope};
 use crate::error::{OcgError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,7 +12,6 @@ use ts_rs::TS;
 
 const COMMAND_DOMAIN: &str = "OCG-FP/COMMAND/v1";
 const CHANGESET_DOMAIN: &str = "OCG-FP/CHANGESET/v1";
-const SPAWN_DOMAIN: &str = "OCG-FP/SPAWN/v1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 pub struct CommandFingerprintInputV1 {
@@ -80,99 +79,6 @@ impl ChangeSetFingerprintInputV1 {
             reject_binary_floats(value)?;
         }
         fingerprint(CHANGESET_DOMAIN, self)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-pub struct SpawnChildSpecV1 {
-    pub spec: serde_json::Value,
-    pub execution_policy: ExecutionPolicy,
-    pub dependency_refs: Vec<EntityRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-pub struct SpawnFingerprintInputV1 {
-    pub schema_version: u32,
-    pub project_scope: ProjectScope,
-    pub child_spec: SpawnChildSpecV1,
-    pub child_policy: ChildPolicy,
-}
-
-impl SpawnFingerprintInputV1 {
-    pub fn new(
-        project_scope: ProjectScope,
-        spec: serde_json::Value,
-        mut execution_policy: ExecutionPolicy,
-        dependency_refs: impl IntoIterator<Item = EntityRef>,
-        child_policy: ChildPolicy,
-    ) -> Self {
-        let mut dependency_refs: Vec<_> = dependency_refs.into_iter().collect();
-        dependency_refs.sort_by(|left, right| {
-            entity_kind_name(left)
-                .cmp(entity_kind_name(right))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        dependency_refs.dedup();
-        execution_policy
-            .retry
-            .retryable_failure_classes
-            .sort_by_key(|class| failure_class_name(*class));
-        execution_policy.retry.retryable_failure_classes.dedup();
-        Self {
-            schema_version: 1,
-            project_scope,
-            child_spec: SpawnChildSpecV1 {
-                spec,
-                execution_policy,
-                dependency_refs,
-            },
-            child_policy,
-        }
-    }
-
-    pub fn fingerprint(&self) -> Result<String> {
-        reject_binary_floats(&self.child_spec.spec)?;
-        fingerprint(SPAWN_DOMAIN, self)
-    }
-}
-
-fn entity_kind_name(reference: &EntityRef) -> &'static str {
-    use crate::core_contract::EntityKind::*;
-    match reference.kind {
-        Job => "job",
-        Attempt => "attempt",
-        Call => "call",
-        Command => "command",
-        Approval => "approval",
-        Artifact => "artifact",
-        ChangeSet => "change_set",
-        Conversation => "conversation",
-        Message => "message",
-        Fact => "fact",
-        BudgetScope => "budget_scope",
-        CapabilityRevocation => "capability_revocation",
-    }
-}
-
-fn failure_class_name(class: FailureClass) -> &'static str {
-    match class {
-        FailureClass::Validation => "validation",
-        FailureClass::Authentication => "authentication",
-        FailureClass::Authorization => "authorization",
-        FailureClass::Conflict => "conflict",
-        FailureClass::Concurrency => "concurrency",
-        FailureClass::NotFound => "not_found",
-        FailureClass::Sandbox => "sandbox",
-        FailureClass::Capability => "capability",
-        FailureClass::Provider => "provider",
-        FailureClass::Budget => "budget",
-        FailureClass::ResourceLimit => "resource_limit",
-        FailureClass::RateLimit => "rate_limit",
-        FailureClass::Timeout => "timeout",
-        FailureClass::Cancelled => "cancelled",
-        FailureClass::Preempted => "preempted",
-        FailureClass::Internal => "internal",
-        FailureClass::Unknown => "unknown",
     }
 }
 

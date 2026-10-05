@@ -389,16 +389,23 @@ fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Fai
     match subcommand.as_str() {
         "admit" | "create" => {
             let binding = option("session").or_else(|| option("binding")).unwrap_or_else(|| "cli".into());
-            let admission = repository.admit_job(project, &binding, &option("objective").unwrap_or_default(), &option("agent").unwrap_or_else(|| "lead".into()))?;
+            let spec = crate::orchestration::domain::JobSpec {
+                objective: Some(option("objective").unwrap_or_default()),
+                ..Default::default()
+            };
+            let admission = repository.admit_job(project, &binding, spec, &option("agent").unwrap_or_else(|| "lead".into()))?;
             print(json!({"project_id": admission.project.id, "job_id": admission.job.id, "attempt_id": admission.attempt.id, "executor_id": admission.executor.id, "generation": admission.attempt.generation}))
         }
         "plan" | "child" => {
             let session = required("session")?;
             let parent = repository.authority_for_binding(&project.id, &session)?.ok_or_else(|| Failure::Ocg(OcgError::config("session has no canonical authority")))?;
-            let payload = option("objective").unwrap_or_default();
+            let spec = crate::orchestration::domain::JobSpec {
+                objective: Some(option("objective").unwrap_or_default()),
+                ..Default::default()
+            };
             let dependencies = option("depends-on").map(|raw| raw.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
             let dependency_refs = dependencies.iter().map(|value| value.as_str()).collect::<Vec<_>>();
-            let job = repository.create_child_job(&parent, &payload, &dependency_refs)?;
+            let job = repository.create_child_job(&parent, spec, &dependency_refs)?;
             print(json!({"project_id": job.project_id, "job_id": job.id, "job": job}))
         }
         "dispatch" => {

@@ -1132,22 +1132,15 @@ pub fn admit_provider_call_with_profile(
     let job = domain
         .job(&authority.job_id)?
         .ok_or_else(|| OcgError::config("provider Call Job no longer exists"))?;
-    let context_task = serde_json::from_str::<Value>(&job.spec)
-        .ok()
-        .and_then(|spec| {
-            spec.get("objective")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| {
-            objective_of(
-                request
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            )
-        });
+    let context_task = job.spec.objective.clone().unwrap_or_else(|| {
+        objective_of(
+            request
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+    });
     // A caller may replay a frozen request for a new admission. Replace its
     // internal handoff rather than duplicating a prior Attempt's facts.
     if let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) {

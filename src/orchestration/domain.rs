@@ -57,7 +57,90 @@ fn validate_id(value: &str) -> Result<()> {
 /// boundary but remain separately named throughout the domain API.
 pub type JobId = String;
 pub type AttemptId = String;
-pub type JobSpec = String;
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JobSpec {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub objective: Option<String>,
+    pub success_criteria: Option<String>,
+    pub constraints: Option<String>,
+    pub hard_budget_micros: Option<i64>,
+    pub resource_commitment: Option<f64>,
+}
+
+impl JobSpec {
+    fn from_payload(payload: &str) -> Result<Self> {
+        // Older CLI Jobs stored the objective as plain text; control-plane Jobs
+        // already stored this object's JSON in the same TEXT column.
+        match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(value @ serde_json::Value::Object(_)) => serde_json::from_value(value)
+                .map_err(|error| invalid(&format!("invalid stored Job specification: {error}"))),
+            _ => Ok(Self {
+                objective: Some(payload.to_string()),
+                ..Self::default()
+            }),
+        }
+    }
+}
+
+impl TryFrom<&str> for JobSpec {
+    type Error = OcgError;
+
+    fn try_from(payload: &str) -> Result<Self> {
+        Self::from_payload(payload)
+    }
+}
+
+impl TryFrom<&String> for JobSpec {
+    type Error = OcgError;
+
+    fn try_from(payload: &String) -> Result<Self> {
+        Self::from_payload(payload)
+    }
+}
+
+impl rusqlite::types::FromSql for JobSpec {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        Self::from_payload(value.as_str()?)
+            .map_err(|error| rusqlite::types::FromSqlError::Other(Box::new(error)))
+    }
+}
+
+mod job_spec_payload {
+    use super::JobSpec;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        spec: &JobSpec,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        // Snapshots and journal post-images retain the existing string payload
+        // envelope; only the Rust API becomes typed.
+        let payload = serde_json::to_string(spec).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&payload)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<JobSpec, D::Error> {
+        let payload = String::deserialize(deserializer)?;
+        JobSpec::from_payload(&payload).map_err(serde::de::Error::custom)
+    }
+}
+
+fn stored_job_spec<S>(spec: S) -> Result<(JobSpec, String)>
+where
+    S: TryInto<JobSpec>,
+    S::Error: std::fmt::Display,
+{
+    let spec = spec
+        .try_into()
+        .map_err(|error| invalid(&format!("invalid Job specification: {error}")))?;
+    let payload = serde_json::to_string(&spec)
+        .map_err(|error| invalid(&format!("cannot serialize Job specification: {error}")))?;
+    Ok((spec, payload))
+}
 
 fn ensure_column(
     connection: &Connection,
@@ -90,14 +173,14 @@ pub struct Project {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
     pub project_id: String,
     pub state: JobState,
     pub generation: u64,
     pub authoritative_attempt_id: Option<AttemptId>,
-    #[serde(rename = "payload")]
+    #[serde(rename = "payload", with = "job_spec_payload")]
     pub spec: JobSpec,
     pub created_at: i64,
     pub updated_at: i64,
@@ -347,7 +430,7 @@ impl ExecutionWitness {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalAdmission {
     pub project: Project,
     pub job: Job,
@@ -2282,8 +2365,13 @@ impl DomainRepository {
         }
     }
 
-    pub fn create_job(&self, project_id: &str, payload: &str) -> Result<Job> {
+    pub fn create_job<S>(&self, project_id: &str, spec: S) -> Result<Job>
+    where
+        S: TryInto<JobSpec>,
+        S::Error: std::fmt::Display,
+    {
         validate_id(project_id)?;
+        let (spec, payload) = stored_job_spec(spec)?;
         let id = new_id("job");
         let timestamp = now();
         let transaction = self.begin()?;
@@ -2299,7 +2387,7 @@ impl DomainRepository {
             state: JobState::Pending,
             generation: 0,
             authoritative_attempt_id: None,
-            spec: payload.to_string(),
+            spec,
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -2311,12 +2399,17 @@ impl DomainRepository {
     /// Create a child Job while requiring the current parent Attempt authority.
     /// Dependency edges are committed with the Job in the same immediate
     /// transaction, so an executor cannot enqueue work from a stale parent.
-    pub fn create_child_job(
+    pub fn create_child_job<S>(
         &mut self,
         parent_authority: &AttemptAuthority,
-        payload: &str,
+        spec: S,
         prerequisite_job_ids: &[&str],
-    ) -> Result<Job> {
+    ) -> Result<Job>
+    where
+        S: TryInto<JobSpec>,
+        S::Error: std::fmt::Display,
+    {
+        let (spec, payload) = stored_job_spec(spec)?;
         validate_id(&parent_authority.attempt_id)?;
         validate_id(&parent_authority.job_id)?;
         let transaction = self
@@ -2403,7 +2496,7 @@ impl DomainRepository {
             state: JobState::Pending,
             generation: 0,
             authoritative_attempt_id: None,
-            spec: payload.to_string(),
+            spec,
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -2438,13 +2531,18 @@ impl DomainRepository {
     /// Attempt is checked while the child Job, dependency edges, Attempt and
     /// Executor are published, so a stale worker cannot create an orphaned
     /// execution branch.
-    pub fn admit_child(
+    pub fn admit_child<S>(
         &mut self,
         parent_authority: &AttemptAuthority,
-        payload: &str,
+        spec: S,
         prerequisite_job_ids: &[&str],
         executor_kind: &str,
-    ) -> Result<CanonicalAdmission> {
+    ) -> Result<CanonicalAdmission>
+    where
+        S: TryInto<JobSpec>,
+        S::Error: std::fmt::Display,
+    {
+        let (spec, payload) = stored_job_spec(spec)?;
         validate_id(&parent_authority.attempt_id)?;
         validate_id(&parent_authority.job_id)?;
         validate_id(executor_kind)?;
@@ -2571,7 +2669,7 @@ impl DomainRepository {
             state: JobState::Running,
             generation: 1,
             authoritative_attempt_id: Some(attempt_id.clone()),
-            spec: payload.to_string(),
+            spec,
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -2654,13 +2752,18 @@ impl DomainRepository {
     /// The binding key is the stable session/runtime identity supplied by the
     /// caller. Re-admission is idempotent and returns the existing authority;
     /// no legacy Job, Attempt, or JSON recovery record participates.
-    pub fn admit_job(
+    pub fn admit_job<S>(
         &mut self,
         project: Project,
         binding_key: &str,
-        payload: &str,
+        spec: S,
         executor_kind: &str,
-    ) -> Result<CanonicalAdmission> {
+    ) -> Result<CanonicalAdmission>
+    where
+        S: TryInto<JobSpec>,
+        S::Error: std::fmt::Display,
+    {
+        let (spec, payload) = stored_job_spec(spec)?;
         validate_id(&project.id)?;
         validate_id(binding_key)?;
         validate_id(executor_kind)?;
@@ -2737,7 +2840,7 @@ impl DomainRepository {
             state: JobState::Running,
             generation: 1,
             authoritative_attempt_id: Some(attempt_id.clone()),
-            spec: payload.to_string(),
+            spec,
             created_at: timestamp,
             updated_at: timestamp,
         };
@@ -3945,7 +4048,7 @@ impl DomainRepository {
             [job_id], |row| {
                 let state: String = row.get(2)?;
                 let generation: i64 = row.get(3)?;
-                Ok((row.get(0)?, row.get(1)?, state, generation, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
+                Ok((row.get(0)?, row.get(1)?, state, generation, row.get(4)?, row.get::<_, JobSpec>(5)?, row.get(6)?, row.get(7)?))
             },
         ).optional().map_err(sql)?.map(|(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at)| {
             Ok(Job { id, project_id, state: JobState::parse(&state)?, generation: u64::try_from(generation).map_err(|_| invalid("negative Job generation"))?, authoritative_attempt_id, spec: payload, created_at, updated_at })
@@ -4117,13 +4220,18 @@ impl DomainRepository {
     /// - Ok(Some(job_id)) if this call created the Job
     /// - Ok(None) if command_id already exists (duplicate/conflict detected)
     /// - Err if validation or database error
-    pub fn try_claim_command_and_create_job(
+    pub fn try_claim_command_and_create_job<S>(
         &mut self,
         command_id: &str,
         project_id: &str,
         request_hash: &str,
-        payload: &str,
-    ) -> Result<Option<Job>> {
+        spec: S,
+    ) -> Result<Option<Job>>
+    where
+        S: TryInto<JobSpec>,
+        S::Error: std::fmt::Display,
+    {
+        let (spec, payload) = stored_job_spec(spec)?;
         validate_id(command_id)?;
         validate_id(project_id)?;
 
@@ -4157,7 +4265,7 @@ impl DomainRepository {
                     state: JobState::Pending,
                     generation: 0,
                     authoritative_attempt_id: None,
-                    spec: payload.to_string(),
+                    spec,
                     created_at: timestamp,
                     updated_at: timestamp,
                 };

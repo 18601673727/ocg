@@ -81,7 +81,7 @@ pub fn execute(request: &VerifyRequest<'_>) -> Result<VerificationReport> {
     let mut state = loaded.state;
     if loaded.corrupt {
         notes.push(
-            "orchestration state could not be read; this run has no compiler diagnostic baseline"
+            "context cache could not be read; this run has no compiler diagnostic baseline"
                 .to_string(),
         );
     }

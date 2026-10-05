@@ -29,9 +29,6 @@ export type CanonicalApiVersion = "ocg.canonical.v1";
 export type ProfileApiVersion = "ocg.profile.v1";
 
 
-export type ActivityCursor = { generation: string, sequence: string, };
-
-
 export type Actor = { "kind": "user", user_id: string, } | { "kind": "client", client_kind: ClientKind, client_id: string | null, } | { "kind": "core" } | { "kind": "attempt", attempt_ref: EntityRef, } | { "kind": "call", call_ref: EntityRef, } | { "kind": "system", policy_ref: string | null, } | { "kind": "external", source_kind: ExternalSourceKind, source_ref: string, };
 
 
@@ -44,30 +41,6 @@ export type ApiErrorBody = { code: string, message: string, };
 export type ApiErrorEnvelope = { error: ApiErrorBody, };
 
 
-export type Approval = { id: EntityId, project_scope: ProjectScope, subject_ref: EntityRef, subject_fingerprint: string, requester: Actor, state: ApprovalState, decision: ApprovalDecision | null, expires_at: string | null, revision: number, created_at: string, resolved_at: string | null, };
-
-
-export type ApprovalDecision = { actor: Actor, rationale: string | null, };
-
-
-export type ApprovalState = "pending" | "approved" | "rejected" | "cancelled" | "expired";
-
-
-export type AttemptLifecycle = "created" | "queued" | "running" | "succeeded" | "failed" | "cancelled" | "preempted";
-
-
-export type BlockerKind = "dependency" | "required_child" | "approval" | "policy" | "budget";
-
-
-export type BudgetScope = { id: EntityId, project_scope: ProjectScope, job_ref: EntityRef, ceiling_tokens: number | null, ceiling_cost: string | null, reserved_tokens: number | null, reserved_cost: string | null, consumed_tokens: number | null, consumed_cost: string | null, revision: number, created_at: string, updated_at: string, };
-
-
-export type BudgetSnapshot = { tokens_remaining: number | null, cost_remaining: string | null, };
-
-
-export type CallLifecycle = "created" | "queued" | "running" | "succeeded" | "failed" | "cancelled";
-
-
 /**
  * The `configuration` envelope shared by the three configuration read routes.
  */
@@ -78,9 +51,6 @@ export type CanonicalConfigurationResponse = { api_version: CanonicalApiVersion,
 
 
 export type CanonicalDashboardResponse = { api_version: CanonicalApiVersion, project_id: string, jobs: Array<JsonValue>, selected_job: CanonicalJobSnapshot | null, };
-
-
-export type CanonicalEntityProjection = { entity_ref: EntityRef, project_scope: ProjectScope, revision: number, activity_cursor: ActivityCursor, state: JsonValue, };
 
 
 /**
@@ -125,9 +95,6 @@ export type CanonicalProjectResponse = { api_version: CanonicalApiVersion, comma
 export type CanonicalProjectsResponse = { api_version: CanonicalApiVersion, projects: Array<ProjectRecord>, };
 
 
-export type CanonicalSyncProjection = { project_scope: ProjectScope, sync_policy_version: string, window: SyncWindowPolicy, jobs: Array<CanonicalEntityProjection>, attempts: Array<CanonicalEntityProjection>, calls: Array<CanonicalEntityProjection>, commands: Array<CanonicalEntityProjection>, approvals: Array<CanonicalEntityProjection>, changesets: Array<CanonicalEntityProjection>, artifacts: Array<CanonicalEntityProjection>, conversations: Array<CanonicalEntityProjection>, messages: Array<CanonicalEntityProjection>, facts: Array<CanonicalEntityProjection>, budget_scopes: Array<CanonicalEntityProjection>, capability_revocations: Array<CanonicalEntityProjection>, ref_stubs: Array<EntityRef>, };
-
-
 export type CapabilityConstraints = { filesystem: JsonValue, network: JsonValue, process: JsonValue, environment: JsonValue, };
 
 
@@ -135,12 +102,6 @@ export type CapabilityGrant = { capability_ref: CapabilityRef, constraints: Capa
 
 
 export type CapabilityRef = { capability_id: string, version: number, };
-
-
-export type CapabilityRevocation = { id: EntityId, project_scope: ProjectScope, capability_ref: CapabilityRef, attempt_ref: EntityRef | null, actor: Actor, reason_code: string, state: CapabilityRevocationState, revision: number, created_at: string, lifted_at: string | null, };
-
-
-export type CapabilityRevocationState = "active" | "lifted";
 
 
 export type CatalogModel = { id: string, label: string, metadata: ModelMetadata, raw: JsonValue, };
@@ -176,31 +137,10 @@ export type ChatModelSelection = { model: string, effort: string | null, };
 export type ChatSendRequest = { selection: ChatModelSelection | null, image_ids: Array<string>, command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
 
 
-export type ChildCancellationPolicy = "cascade" | "soft_cascade" | "independent";
-
-
-export type ChildFailurePolicy = "block_parent" | "fail_parent" | "non_blocking";
-
-
-export type ChildJoinPolicy = "required" | "not_required";
-
-
-export type ChildPolicy = { join: ChildJoinPolicy, cancellation: ChildCancellationPolicy, failure: ChildFailurePolicy, grace_period_ms: number | null, };
-
-
 export type ClientKind = "pwa" | "cli";
 
 
-export type Command = { id: EntityId, project_scope: ProjectScope, origin: Actor, action: string, target: EntityRef | null, arguments: JsonValue, idempotency_key: string | null, request_fingerprint: string, correlation_id: EntityId, state: CommandState, result: JsonValue | null, failure: Failure | null, revision: number, created_at: string, completed_at: string | null, };
-
-
 export type CommandFingerprintInputV1 = { schema_version: number, project_scope: ProjectScope, action: string, target: EntityRef | null, arguments: JsonValue, };
-
-
-export type CommandState = "received" | "awaiting_approval" | "accepted" | "rejected" | "completed" | "failed" | "cancelled";
-
-
-export type Consistency = "read_your_writes" | "monotonic" | "eventual" | "snapshot";
 
 
 export type ContextCostTotals = { canonical_message_bytes: UsageQuantity, tool_schema_bytes: UsageQuantity, full_schema_baseline_bytes: UsageQuantity, schema_bytes_saved: UsageQuantity, wire_bytes: UsageQuantity, capsule_bytes: UsageQuantity, capsule_injected_requests: UsageQuantity, tool_result_bytes: UsageQuantity, };
@@ -210,15 +150,6 @@ export type ConversationUsageResponse = { api_version: CanonicalApiVersion, proj
 
 
 export type DerivedMetric = { metric: string, value: string | null, unit: string, quality: MeasurementQuality, };
-
-
-/**
- * Durable execution outbox record. It is intentionally not an EntityRef.
- */
-export type EffectIntent = { intent_id: EntityId, project_scope: ProjectScope, call_ref: EntityRef, capability_ref: CapabilityRef, reconciliation_key: string, input_fingerprint: string, effect_mode: SideEffectMode, admitted_fence_epoch: string, state: EffectIntentState, created_at: string, updated_at: string, };
-
-
-export type EffectIntentState = "intended" | "effected" | "reconciled" | "unknown";
 
 
 /**
@@ -233,57 +164,13 @@ export type EntityKind = "job" | "attempt" | "call" | "command" | "approval" | "
 export type EntityRef = { kind: EntityKind, id: EntityId, };
 
 
-export type EventEnvelope = { event_id: EntityId, project_scope: ProjectScope, entity_ref: EntityRef, generation: string, sequence: string, timestamp: string, correlation_id: EntityId, causation_event_id: EntityId | null, transaction_id: EntityId, transaction_index: number, transaction_count: number, event_type: EventType, schema_version: string, projection_effect: ProjectionEffect, payload: EventPayload, entity_post_image: JsonValue | null, };
-
-
-export type EventPayload = { "event_type": "job_created", "payload": JsonValue } | { "event_type": "job_state_changed", "payload": JsonValue } | { "event_type": "job_dependencies_changed", "payload": JsonValue } | { "event_type": "job_reopened", "payload": JsonValue } | { "event_type": "job_archived", "payload": JsonValue } | { "event_type": "job_blocker_added", "payload": JsonValue } | { "event_type": "job_blocker_resolved", "payload": JsonValue } | { "event_type": "job_ready", "payload": JsonValue } | { "event_type": "dependency_satisfied", "payload": JsonValue } | { "event_type": "spawn_requested", "payload": JsonValue } | { "event_type": "spawn_deduplicated", "payload": JsonValue } | { "event_type": "scheduler_decision", "payload": JsonValue } | { "event_type": "retry_requested", "payload": JsonValue } | { "event_type": "replacement_requested", "payload": JsonValue } | { "event_type": "recovery_requested", "payload": JsonValue } | { "event_type": "attempt_created", "payload": JsonValue } | { "event_type": "attempt_queued", "payload": JsonValue } | { "event_type": "attempt_started", "payload": JsonValue } | { "event_type": "attempt_succeeded", "payload": JsonValue } | { "event_type": "attempt_failed", "payload": JsonValue } | { "event_type": "attempt_cancelled", "payload": JsonValue } | { "event_type": "attempt_preempted", "payload": JsonValue } | { "event_type": "attempt_fenced", "payload": JsonValue } | { "event_type": "call_created", "payload": JsonValue } | { "event_type": "call_queued", "payload": JsonValue } | { "event_type": "call_started", "payload": JsonValue } | { "event_type": "call_succeeded", "payload": JsonValue } | { "event_type": "call_failed", "payload": JsonValue } | { "event_type": "call_cancelled", "payload": JsonValue } | { "event_type": "call_fenced", "payload": JsonValue } | { "event_type": "command_received", "payload": JsonValue } | { "event_type": "command_awaiting_approval", "payload": JsonValue } | { "event_type": "command_accepted", "payload": JsonValue } | { "event_type": "command_rejected", "payload": JsonValue } | { "event_type": "command_completed", "payload": JsonValue } | { "event_type": "command_failed", "payload": JsonValue } | { "event_type": "command_cancelled", "payload": JsonValue } | { "event_type": "approval_created", "payload": JsonValue } | { "event_type": "approval_approved", "payload": JsonValue } | { "event_type": "approval_rejected", "payload": JsonValue } | { "event_type": "approval_cancelled", "payload": JsonValue } | { "event_type": "approval_expired", "payload": JsonValue } | { "event_type": "change_set_created", "payload": JsonValue } | { "event_type": "change_set_validated", "payload": JsonValue } | { "event_type": "change_set_applying", "payload": JsonValue } | { "event_type": "change_set_applied", "payload": JsonValue } | { "event_type": "change_set_verifying", "payload": JsonValue } | { "event_type": "change_set_verified", "payload": JsonValue } | { "event_type": "change_set_conflict", "payload": JsonValue } | { "event_type": "change_set_failed", "payload": JsonValue } | { "event_type": "change_set_cancelled", "payload": JsonValue } | { "event_type": "artifact_created", "payload": JsonValue } | { "event_type": "artifact_metadata_updated", "payload": JsonValue } | { "event_type": "artifact_archived", "payload": JsonValue } | { "event_type": "conversation_created", "payload": JsonValue } | { "event_type": "conversation_updated", "payload": JsonValue } | { "event_type": "conversation_archived", "payload": JsonValue } | { "event_type": "message_created", "payload": JsonValue } | { "event_type": "message_streaming_started", "payload": JsonValue } | { "event_type": "message_completed", "payload": JsonValue } | { "event_type": "message_failed", "payload": JsonValue } | { "event_type": "message_updated", "payload": JsonValue } | { "event_type": "message_deleted", "payload": JsonValue } | { "event_type": "fact_recorded", "payload": JsonValue } | { "event_type": "budget_reserved", "payload": JsonValue } | { "event_type": "budget_committed", "payload": JsonValue } | { "event_type": "budget_released", "payload": JsonValue } | { "event_type": "budget_ceiling_raised", "payload": JsonValue } | { "event_type": "budget_exceeded", "payload": JsonValue } | { "event_type": "capability_revocation_created", "payload": JsonValue } | { "event_type": "capability_revocation_lifted", "payload": JsonValue };
-
-
-export type EventRegistryEntry = { event_type: EventType, subject_kind: EntityKind, schema_version: string, producer: string, post_image_policy: PostImagePolicy, projection_effect_policy: ProjectionEffectPolicy, };
-
-
-/**
- * The stable event names are part of the sync protocol. Transient message
- * deltas intentionally do not appear here: they are droppable transport data,
- * not canonical facts.
- */
-export type EventType = "job_created" | "job_state_changed" | "job_dependencies_changed" | "job_reopened" | "job_archived" | "job_blocker_added" | "job_blocker_resolved" | "job_ready" | "dependency_satisfied" | "spawn_requested" | "spawn_deduplicated" | "scheduler_decision" | "retry_requested" | "replacement_requested" | "recovery_requested" | "attempt_created" | "attempt_queued" | "attempt_started" | "attempt_succeeded" | "attempt_failed" | "attempt_cancelled" | "attempt_preempted" | "attempt_fenced" | "call_created" | "call_queued" | "call_started" | "call_succeeded" | "call_failed" | "call_cancelled" | "call_fenced" | "command_received" | "command_awaiting_approval" | "command_accepted" | "command_rejected" | "command_completed" | "command_failed" | "command_cancelled" | "approval_created" | "approval_approved" | "approval_rejected" | "approval_cancelled" | "approval_expired" | "change_set_created" | "change_set_validated" | "change_set_applying" | "change_set_applied" | "change_set_verifying" | "change_set_verified" | "change_set_conflict" | "change_set_failed" | "change_set_cancelled" | "artifact_created" | "artifact_metadata_updated" | "artifact_archived" | "conversation_created" | "conversation_updated" | "conversation_archived" | "message_created" | "message_streaming_started" | "message_completed" | "message_failed" | "message_updated" | "message_deleted" | "fact_recorded" | "budget_reserved" | "budget_committed" | "budget_released" | "budget_ceiling_raised" | "budget_exceeded" | "capability_revocation_created" | "capability_revocation_lifted";
-
-
-export type ExecutionGraphEdge = { from: EntityRef, to: EntityRef, relation: string, };
-
-
-export type ExecutionGraphNode = { entity_ref: EntityRef, level: string, state: string, activity_cursor: ActivityCursor | null, };
-
-
-export type ExecutionGraphProjection = { project_scope: ProjectScope, nodes: Array<ExecutionGraphNode>, edges: Array<ExecutionGraphEdge>, };
-
-
-export type ExecutionLeaseRecord = { attempt_ref: EntityRef, lease_id: EntityId, holder_id: string, fence_epoch: string, issued_at: string, expires_at: string, renewal_interval_ms: number, state: LeaseState, };
-
-
 export type ExecutionLimits = { cpu: string | null, memory: string | null, wall_time: string | null, concurrency: number | null, process_count: number | null, };
-
-
-export type ExecutionMode = "single_shot" | "change_set_edit";
-
-
-export type ExecutionPolicy = { schema_version: number, mode: ExecutionMode, retry: ExecutionRetryPolicy, };
-
-
-export type ExecutionRetryPolicy = { max_attempts_per_phase: number, retryable_failure_classes: Array<FailureClass>, };
 
 
 export type ExecutionWitness = { job_id: string, attempt_id: string, executor_id: string, call_id: string, generation: number, };
 
 
-export type ExecutorContract = { executor_contract_version: string, executor_ref: string, runtime_ref: string, provider_ref: EntityRef | null, model_ref: EntityRef | null, capability_grants: Array<CapabilityGrant>, execution_limits: ExecutionLimits, budget_scope_ref: EntityRef, budget_snapshot: BudgetSnapshot, deadline: string | null, execution_boundary: string, effective_config_fingerprint: string, created_at: string, };
-
-
 export type ExternalSourceKind = "provider" | "capability" | "runtime";
-
-
-export type Fact = { id: EntityId, project_scope: ProjectScope, subject_ref: EntityRef, metric: string, value: string | null, unit: string, source: Actor, observed_at: string, provenance: string | null, quality: MeasurementQuality, created_at: string, };
 
 
 export type Failure = { code: string, class: FailureClass, message: string, source: Actor, retryable: boolean, details: JsonValue | null, cause: EntityRef | null, entity_ref: EntityRef | null, };
@@ -293,9 +180,6 @@ export type FailureClass = "validation" | "authentication" | "authorization" | "
 
 
 export type GlobalConfiguration = { provider: string | null, model: string | null, profile: string | null, routing: string | null, runtime: string | null, resource_budget: ResourceBudget | null, };
-
-
-export type JobBlocker = { kind: BlockerKind, blocking_ref: EntityRef | null, reason_code: string, };
 
 
 /**
@@ -311,19 +195,10 @@ export type JobLaunchResponse = { api_version: CanonicalApiVersion,
 outcome: string, command_id: string, draft_id: string, project_id: string, session_id: string, job_id: string | null, message: string, duplicate: boolean, };
 
 
-export type JobLifecycle = "pending" | "ready" | "settling" | "blocked" | "completed" | "failed" | "cancelled";
-
-
 export type JobUsageResponse = { api_version: CanonicalApiVersion, project_id: string, job_id: string, generated_at: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, truncated: boolean, };
 
 
-export type LeaseState = "active" | "fenced" | "expired";
-
-
 export type MeasurementQuality = "measured" | "reported" | "estimated" | "derived" | "unknown";
-
-
-export type MeasurementView = { subject_ref: EntityRef, facts: Array<Fact>, derived_metrics: Array<DerivedMetric>, };
 
 
 export type Message = { id: EntityId, project_scope: ProjectScope, conversation_ref: EntityRef, author: Actor, produced_by_attempt_ref: EntityRef | null, blocks: Array<MessageBlock>, state: MessageLifecycle, revision: number, created_at: string, updated_at: string, deleted_at: string | null, };
@@ -349,9 +224,6 @@ export type ModelMetadata = { variant: string | null, variants: Array<string> | 
 
 
 export type Origin = "new";
-
-
-export type PostImagePolicy = "required" | "forbidden";
 
 
 export type Profile = { origin: Origin, defaultModel?: string | null, providers: { [key in string]: Provider }, models: { [key in string]: Model }, };
@@ -430,12 +302,6 @@ export type ProjectUsageResponse = { api_version: CanonicalApiVersion, project_i
 window_started_at: number | null, generated_at: number, conversations: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, conversation_rows: Array<UsageConversationRow>, truncated: boolean, };
 
 
-export type ProjectionEffect = "reducible" | "snapshot_barrier";
-
-
-export type ProjectionEffectPolicy = "reducible_only" | "barrier_allowed";
-
-
 export type Provider = { label: string,
 /**
  * HTTPS endpoint for provider API calls. Must not include userinfo.
@@ -479,9 +345,6 @@ export type ResourceBudget = {
  * Zero records "no explicit hard limit", not "a budget of nothing".
  */
 hard_limit: number, unit: string, };
-
-
-export type ResumeCursor = { cursor_schema_version: string, contract_version: string, project_scope: ProjectScope, generation: string, sequence: string, last_event_id: EntityId | null, };
 
 
 /**
@@ -623,27 +486,6 @@ export type SetupProjectResponse = { api_version: CanonicalApiVersion, project_i
 
 
 export type SetupRefreshRequest = { provider_key: string, revision: string, };
-
-
-export type SideEffectMode = "idempotent" | "strict_fenced" | "reconcilable" | "non_retryable";
-
-
-export type Snapshot = { project_scope: ProjectScope, generation: string, covered_sequence: string, last_event_id: EntityId | null, snapshot_schema_version: string, contract_version: string, captured_at: string, state_hash: string, state: CanonicalSyncProjection, };
-
-
-export type SpawnChildRequest = { project_scope: ProjectScope, parent_ref: EntityRef, spawn_key: string, spawn_fingerprint: string, child_spec: JsonValue, child_policy: ChildPolicy, causation_event_id: EntityId, idempotency_key: string, };
-
-
-export type SpawnChildSpecV1 = { spec: JsonValue, execution_policy: ExecutionPolicy, dependency_refs: Array<EntityRef>, };
-
-
-export type SpawnFingerprintInputV1 = { schema_version: number, project_scope: ProjectScope, child_spec: SpawnChildSpecV1, child_policy: ChildPolicy, };
-
-
-export type SyncWindowPolicy = { nonterminal_jobs_per_project: number, terminal_jobs_per_project: number, attempts_per_job: number, calls_per_attempt: number, commands_per_project: number, approvals_per_project: number, changesets_per_project: number, artifacts_per_project: number, active_conversations_per_project: number, messages_per_conversation: number, archived_conversations_per_project: number, facts_per_subject: number, capability_revocations_per_project: number, };
-
-
-export type TransientMessageDelta = { project_scope: ProjectScope, generation: string, stream_id: string, message_ref: EntityRef, attempt_ref: EntityRef, chunk_index: string, delta_utf8: string, };
 
 
 export type UsageBreakdown = { provider: string | null, model: string | null, totals: UsageTotals, };

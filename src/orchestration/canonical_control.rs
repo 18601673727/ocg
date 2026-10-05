@@ -1710,18 +1710,17 @@ impl CanonicalControlService {
         let canonical_project = domain
             .project_at_root(Path::new(&project.root))?
             .ok_or_else(|| invalid("registered Project identity is not durable at this root"))?;
-        let job_payload = serde_json::to_string(&serde_json::json!({
-            "provider": provider_key,
-            "model": model,
-            "objective": request.objective,
-            "success_criteria": request.success_criteria,
-            "constraints": request.constraints,
-            "hard_budget_micros": request.hard_budget_micros,
-            "resource_commitment": request.resource_commitment,
-        }))
-        .map_err(|e| invalid(format!("cannot serialize job payload: {e}")))?;
+        let job_spec = super::domain::JobSpec {
+            provider: Some(provider_key.to_string()),
+            model: Some(model.to_string()),
+            objective: Some(request.objective.clone()),
+            success_criteria: request.success_criteria.clone(),
+            constraints: request.constraints.clone(),
+            hard_budget_micros: Some(request.hard_budget_micros),
+            resource_commitment: request.resource_commitment,
+        };
 
-        let job = domain.create_job(&canonical_project.id, &job_payload)?;
+        let job = domain.create_job(&canonical_project.id, job_spec)?;
         // Admission is one canonical step, not three. `dispatch_job` is the
         // domain operation that makes a newly created Job dispatchable: inside
         // a single immediate transaction it performs the `pending -> eligible`
