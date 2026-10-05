@@ -12,6 +12,7 @@ pub mod context_governor;
 pub mod domain;
 pub mod execution_dispatch;
 pub mod execution_runtime;
+pub(crate) mod governor;
 pub mod handoff;
 pub mod health_probe;
 pub mod journal;

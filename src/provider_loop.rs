@@ -633,6 +633,8 @@ pub struct ProviderHandlerConfig {
     /// have in flight at once. Durable Attempt/Call fencing remains the source
     /// of execution authority; this is only a resource policy.
     pub in_flight_limit: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rate and capacity governor for provider execution resources.
+    pub governor: crate::orchestration::governor::Governor,
 }
 
 pub struct CanonicalProviderCallHandler {
@@ -911,6 +913,35 @@ impl CanonicalProviderCallHandler {
                     false,
                 );
                 return Err(error);
+            }
+        };
+
+        // Acquire governor permission before execution.
+        // This enforces provider rate and execution capacity limits.
+        let governor_scope = crate::orchestration::governor::GovernorScope::provider_model(
+            provider_config.provider_key.clone(),
+            provider_config.model.clone(),
+        );
+        let _permit = match config.governor.acquire(governor_scope)? {
+            Ok(permit) => permit,
+            Err(crate::orchestration::governor::GovernorDecision::RateLimited { retry_after }) => {
+                let message = format!(
+                    "provider {}:{} is rate limited (retry after {:?})",
+                    provider_config.provider_key, provider_config.model, retry_after
+                );
+                fail_authoritative_provider_call(&config.project_root, &envelope, &message, true);
+                return Err(OcgError::config(message));
+            }
+            Err(crate::orchestration::governor::GovernorDecision::CapacityUnavailable) => {
+                let message = format!(
+                    "provider {}:{} execution capacity is exhausted",
+                    provider_config.provider_key, provider_config.model
+                );
+                fail_authoritative_provider_call(&config.project_root, &envelope, &message, true);
+                return Err(OcgError::config(message));
+            }
+            Err(crate::orchestration::governor::GovernorDecision::AllowedNow) => {
+                unreachable!("AllowedNow is not an error variant")
             }
         };
 

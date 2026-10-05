@@ -4,6 +4,7 @@ use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
 use crate::native_tools::PermissionPolicy;
 use crate::orchestration::execution_dispatch::BoundedDispatcher;
+use crate::orchestration::governor::Governor;
 use crate::provider_loop::{run_recovered_provider_dispatcher, ProviderHandlerConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ pub struct ExecutionRuntime {
     native_tool_dispatcher: BoundedDispatcher,
     cancelled: Arc<AtomicBool>,
     provider_in_flight_limit: Arc<std::sync::atomic::AtomicUsize>,
+    governor: Governor,
     provider_thread: Option<JoinHandle<Result<()>>>,
     native_tool_thread: Option<JoinHandle<Result<()>>>,
 }
@@ -51,6 +53,7 @@ impl ExecutionRuntime {
         let provider_in_flight_limit = Arc::new(std::sync::atomic::AtomicUsize::new(
             provider_in_flight_limit,
         ));
+        let governor = Governor::new();
         let provider_config = ProviderHandlerConfig {
             transport,
             project_root: project_root.to_path_buf(),
@@ -58,6 +61,7 @@ impl ExecutionRuntime {
             cancelled: cancelled.clone(),
             native_tool_dispatcher: native_tool_dispatcher.clone(),
             in_flight_limit: provider_in_flight_limit.clone(),
+            governor: governor.clone(),
         };
 
         let native_tool_handler = crate::native_tools::NativeToolCallHandler::new(
@@ -106,6 +110,7 @@ impl ExecutionRuntime {
             native_tool_dispatcher,
             cancelled,
             provider_in_flight_limit,
+            governor,
             provider_thread: Some(provider_thread),
             native_tool_thread: Some(native_tool_thread),
         })
@@ -114,6 +119,11 @@ impl ExecutionRuntime {
     /// Get a handle to submit work to the provider dispatcher.
     pub fn provider_dispatcher(&self) -> &BoundedDispatcher {
         &self.provider_dispatcher
+    }
+
+    /// Get a reference to the governor.
+    pub fn governor(&self) -> &Governor {
+        &self.governor
     }
 
     pub fn set_provider_in_flight_limit(&self, limit: usize) -> Result<()> {
@@ -179,6 +189,7 @@ pub struct ExecutionRuntimeHandle {
     project_root: PathBuf,
     provider_dispatcher: BoundedDispatcher,
     cancelled: Arc<AtomicBool>,
+    governor: Governor,
 }
 
 impl ExecutionRuntimeHandle {
@@ -187,11 +198,16 @@ impl ExecutionRuntimeHandle {
             project_root: runtime.project_root.clone(),
             provider_dispatcher: runtime.provider_dispatcher.clone(),
             cancelled: runtime.cancelled.clone(),
+            governor: runtime.governor.clone(),
         }
     }
 
     pub fn provider_dispatcher(&self) -> &BoundedDispatcher {
         &self.provider_dispatcher
+    }
+
+    pub fn governor(&self) -> &Governor {
+        &self.governor
     }
 
     pub fn project_root(&self) -> &Path {
