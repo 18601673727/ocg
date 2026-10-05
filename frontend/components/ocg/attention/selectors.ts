@@ -154,6 +154,7 @@ export function selectDerivedAttention(snapshot: RuntimeSnapshot, fixtureQueue: 
         status: "pending",
         destination: "job-execution",
         source: "runtime",
+        jobId: execution.jobId,
         approval: null,
         blocked: null,
         resolution: null,

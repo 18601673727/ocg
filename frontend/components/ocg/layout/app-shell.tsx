@@ -213,6 +213,13 @@ export function RuntimeWorkspace({
 
   const activeSession = snapshot.sessions.find((session) => session.id === activeSessionId) ?? snapshot.sessions[0];
   const activeSessionKey = activeSession?.id;
+  useEffect(() => {
+    const requestedSessionId = searchParams.get("session");
+    const nextSessionId = requestedSessionId && snapshot.sessions.some((session) => session.id === requestedSessionId)
+      ? requestedSessionId
+      : resolveSelectedSessionId(selectedSessions.current[activeProjectId], snapshot.sessions) ?? "";
+    setActiveSessionId((current) => current === nextSessionId ? current : nextSessionId);
+  }, [activeProjectId, searchParams, snapshot.sessions]);
   const busySessionIds = snapshot.sessions.filter(session => (snapshot.messagesBySession[session.id] ?? []).some(message =>
     message.role === "assistant" && (message.status === "pending" || message.status === "streaming"),
   )).map(session => session.id);
@@ -512,10 +519,13 @@ export function RuntimeWorkspace({
       if (result.outcome === "accepted") {
         setVisibleDraftScopes((current) => ({ ...current, [activeDraftScope]: false }));
       }
-      if (result.outcome === "accepted" && activeDraftScopeRef.current === activeDraftScope && view !== "job-execution") {
+      if (result.outcome === "accepted" && activeDraftScopeRef.current === activeDraftScope) {
         // Keep the same scenario so the in-memory runtime instance (and its
-        // freshly projected Job execution) survives the navigation.
-        navigate("job-execution");
+        // freshly projected Job execution) survives the navigation. The
+        // backend Job ID is the durable route identity; the draft/session is
+        // only the presentation context that led to it.
+        if (result.jobId) openJob(result.jobId);
+        else if (view !== "job-execution") navigate("job-execution");
       }
     };
 
@@ -535,7 +545,7 @@ export function RuntimeWorkspace({
           duplicate: false,
         });
       });
-  }, [activeDraftScope, activeSession, launchJob, jobDrafts, navigate, view]);
+  }, [activeDraftScope, activeSession, launchJob, jobDrafts, navigate, openJob, view]);
 
   const handleComposerIntent = useCallback(async (intent: ComposerIntent) => {
     if (intent.kind === "chat") {
@@ -584,10 +594,16 @@ export function RuntimeWorkspace({
   const projectExecutions = Object.values(snapshot.executionsByProject?.[activeProjectId] ?? {})
     .sort((left, right) => right.updatedAt - left.updatedAt || left.jobId.localeCompare(right.jobId));
   const requestedJobId = searchParams.get("job");
-  const jobExecution = projectExecutions.find((item) => item.jobId === requestedJobId)
-    ?? projectExecutions.find((item) => item.jobId === execution?.jobId)
-    ?? projectExecutions[0]
-    ?? null;
+  // A URL-selected Job is authoritative. Never replace an unknown/stale Job
+  // ID with a session's latest Job or with the newest Project Job: doing so
+  // would render a different Job than the one the URL addresses. When the
+  // surface is opened without a Job parameter, retain the existing default
+  // entry behavior, but every explicit selection remains canonical job_id.
+  const jobExecution = requestedJobId !== null
+    ? projectExecutions.find((item) => item.jobId === requestedJobId) ?? null
+    : projectExecutions.find((item) => item.jobId === execution?.jobId)
+      ?? projectExecutions[0]
+      ?? null;
   const selectedJobSessionId = jobExecution
     ? Object.entries(snapshot.executionBySession).find(([, item]) => item?.jobId === jobExecution.jobId)?.[0]
     : undefined;
@@ -847,7 +863,7 @@ export function RuntimeWorkspace({
               <div className={cn("h-full", inspectorMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
                 {inspectorOpen && runtimeAuthority === "canonical" ? (
                   <ViewTransition enter="vt-panel" exit="vt-panel" default="none">
-                    <ConversationInspector key={`${activeProjectId}:${activeSession.id}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode={inspectorMode} onModeChange={(next) => startTransition(() => setInspectorMode(next))} onClose={() => startTransition(() => setInspectorMode("collapsed"))} onOpenJobExecution={() => navigate("job-execution")} />
+                    <ConversationInspector key={`${activeProjectId}:${activeSession.id}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode={inspectorMode} onModeChange={(next) => startTransition(() => setInspectorMode(next))} onClose={() => startTransition(() => setInspectorMode("collapsed"))} onOpenJobExecution={() => execution?.jobId ? openJob(execution.jobId) : navigate("job-execution")} />
                   </ViewTransition>
                 ) : execution && inspectorOpen ? (
                   <ViewTransition enter="vt-panel" exit="vt-panel" default="none">
@@ -858,7 +874,7 @@ export function RuntimeWorkspace({
                       mode={inspectorMode}
                       onModeChange={(next) => startTransition(() => setInspectorMode(next))}
                       onClose={() => startTransition(() => setInspectorMode("collapsed"))}
-                      onOpenJobExecution={() => navigate("job-execution")}
+                      onOpenJobExecution={() => openJob(execution.jobId)}
                     />
                   </ViewTransition>
                 ) : null}
@@ -890,7 +906,7 @@ export function RuntimeWorkspace({
             >
             {mobileInspectorOpen && runtimeAuthority === "canonical" ? (
               <ViewTransition enter="vt-panel" exit="vt-panel" default="none">
-                <ConversationInspector key={`${activeProjectId}:${activeSession?.id ?? ""}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode="expanded" onClose={() => startTransition(() => setMobileInspectorOpen(false))} onOpenJobExecution={() => navigate("job-execution")} />
+                <ConversationInspector key={`${activeProjectId}:${activeSession?.id ?? ""}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode="expanded" onClose={() => startTransition(() => setMobileInspectorOpen(false))} onOpenJobExecution={() => execution?.jobId ? openJob(execution.jobId) : navigate("job-execution")} />
               </ViewTransition>
             ) : mobileInspectorOpen && execution ? (
               <ViewTransition enter="vt-panel" exit="vt-panel" default="none">
@@ -900,7 +916,7 @@ export function RuntimeWorkspace({
                   observability={observability}
                   mode="expanded"
                   onClose={() => startTransition(() => setMobileInspectorOpen(false))}
-                  onOpenJobExecution={() => navigate("job-execution")}
+                  onOpenJobExecution={() => openJob(execution.jobId)}
                 />
               </ViewTransition>
             ) : null}

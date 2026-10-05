@@ -174,7 +174,7 @@ function AttentionSection({
 }: {
   items: AttentionItem[];
   onNavigate: (view: WorkspaceView) => void;
-  onSelectJob?: (sessionId: string) => void;
+  onSelectJob?: (jobId: string) => void;
   statusKnownAndHealthy: boolean;
 }) {
   const { t } = useI18n();
@@ -232,8 +232,8 @@ function AttentionSection({
               key={item.id}
               type="button"
               onClick={() => {
-                if (item.destination === "job-execution" && item.sessionId && onSelectJob) {
-                  onSelectJob(item.sessionId);
+                if (item.destination === "job-execution" && item.jobId && onSelectJob) {
+                  onSelectJob(item.jobId);
                 } else {
                   onNavigate(DESTINATION_VIEWS[item.destination]);
                 }
