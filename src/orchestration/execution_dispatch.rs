@@ -1,8 +1,9 @@
 //! Bounded handoff between canonical admission and execution workers.
 
 use crate::error::{OcgError, Result};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 fn invalid(message: &str) -> OcgError {
     OcgError::config(message)
@@ -332,6 +333,7 @@ pub struct BoundedDispatcher {
     capacity: usize,
     sender: Arc<Mutex<Option<flume::Sender<ExecutionEnvelope>>>>,
     receiver: flume::Receiver<ExecutionEnvelope>,
+    cancellations: Arc<Mutex<HashMap<String, Vec<Weak<CancellationInner>>>>>,
 }
 
 impl std::fmt::Debug for BoundedDispatcher {
@@ -348,6 +350,7 @@ impl Clone for BoundedDispatcher {
             capacity: self.capacity,
             sender: self.sender.clone(),
             receiver: self.receiver.clone(),
+            cancellations: self.cancellations.clone(),
         }
     }
 }
@@ -362,6 +365,7 @@ impl BoundedDispatcher {
             capacity,
             sender: Arc::new(Mutex::new(Some(sender))),
             receiver,
+            cancellations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -373,9 +377,37 @@ impl BoundedDispatcher {
             .map_err(|_| invalid("dispatcher lock poisoned"))?
             .clone()
             .ok_or_else(|| invalid("dispatcher is closed"))?;
+        {
+            let mut cancellations = self
+                .cancellations
+                .lock()
+                .map_err(|_| invalid("dispatcher cancellation lock poisoned"))?;
+            cancellations.retain(|_, tokens| {
+                tokens.retain(|token| token.strong_count() > 0);
+                !tokens.is_empty()
+            });
+            cancellations
+                .entry(value.attempt_id.clone())
+                .or_default()
+                .push(Arc::downgrade(&value.cancelled.inner));
+        }
         sender
             .send(value)
             .map_err(|_| invalid("dispatcher is closed"))
+    }
+
+    pub fn cancel_attempt(&self, attempt_id: &str) -> Result<bool> {
+        let mut cancellations = self
+            .cancellations
+            .lock()
+            .map_err(|_| invalid("dispatcher cancellation lock poisoned"))?;
+        let tokens = cancellations.entry(attempt_id.to_string()).or_default();
+        let mut signalled = false;
+        for inner in tokens.iter().filter_map(|token| token.upgrade()) {
+            CallCancellation { inner }.cancel();
+            signalled = true;
+        }
+        Ok(signalled)
     }
 
     /// Blocking consumer operation intended for a synchronous execution lane.

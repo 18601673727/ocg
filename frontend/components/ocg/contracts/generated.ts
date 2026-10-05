@@ -83,13 +83,22 @@ export type CanonicalJobEvent = { api_version: CanonicalApiVersion, project_id: 
 sequence: number, event_id: string, kind: string, payload: JsonValue, };
 
 
+export type CanonicalJobOperationRequest = { expected_generation: number, };
+
+
+export type CanonicalJobOperationResponse = { api_version: CanonicalApiVersion, job_id: string, accepted: boolean, snapshot: CanonicalJobSnapshot, };
+
+
+export type CanonicalJobOperations = { can_cancel: boolean, can_retry: boolean, };
+
+
 export type CanonicalJobRelations = { parent_job_id: string | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, };
 
 
 export type CanonicalJobSnapshot = { api_version: CanonicalApiVersion, project_id: string, job: JsonValue, cursor: number, };
 
 
-export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, parent_job_id: string | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, };
+export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null, parent_job_id: string | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, can_cancel: boolean, can_retry: boolean, };
 
 
 export type CanonicalProjectResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, project: ProjectRecord, };

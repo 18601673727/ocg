@@ -5,6 +5,7 @@
 //! the authority, and every response includes a protocol version and the
 //! canonical Job snapshot needed to reconcile a reconnect.
 
+use crate::core_contract::{Failure, FailureClass};
 use crate::error::{OcgError, Result};
 use crate::orchestration::domain::{
     Attempt, Call, DispatchIntent, DomainRepository, Executor, Job, JobState,
@@ -291,6 +292,41 @@ struct CanonicalJobView<'a> {
     job: &'a Job,
     #[serde(flatten)]
     relations: CanonicalJobRelations,
+    #[serde(flatten)]
+    operations: CanonicalJobOperations,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CanonicalJobOperations {
+    pub can_cancel: bool,
+    pub can_retry: bool,
+}
+
+impl CanonicalJobOperations {
+    fn for_job(job: &Job, blocked: bool) -> Self {
+        Self {
+            can_cancel: job.state.can_cancel(),
+            can_retry: job.state.can_retry()
+                && job.authoritative_attempt_id.is_none()
+                && job.generation < i64::MAX as u64
+                && !blocked,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalJobOperationRequest {
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CanonicalJobOperationResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub job_id: String,
+    pub accepted: bool,
+    pub snapshot: CanonicalJobSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -299,8 +335,11 @@ pub struct CanonicalJobSummary {
     pub created_at: i64,
     pub state: String,
     pub updated_at: i64,
+    pub termination_reason: Option<Failure>,
     #[serde(flatten)]
     pub relations: CanonicalJobRelations,
+    #[serde(flatten)]
+    pub operations: CanonicalJobOperations,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -1217,10 +1256,13 @@ impl CanonicalControlService {
             .filter(|intent| intent.job_id == job.id)
             .cloned()
             .collect();
+        let relations = CanonicalJobRelations::from_projection(job, projection, origins);
+        let operations = CanonicalJobOperations::for_job(job, relations.blocked);
         let value = json!({
             "job":CanonicalJobView {
                 job,
-                relations: CanonicalJobRelations::from_projection(job, projection, origins),
+                relations,
+                operations,
             },
             "attempts":attempts,
             "executors":executors,
@@ -1308,12 +1350,17 @@ impl CanonicalControlService {
             .jobs
             .values()
             .filter(|job| job.project_id == project_id)
-            .map(|job| CanonicalJobSummary {
-                job_id: job.id.clone(),
-                created_at: job.created_at,
-                state: job.state.to_string(),
-                updated_at: job.updated_at,
-                relations: CanonicalJobRelations::from_projection(job, &projection, &origins),
+            .map(|job| {
+                let relations = CanonicalJobRelations::from_projection(job, &projection, &origins);
+                CanonicalJobSummary {
+                    job_id: job.id.clone(),
+                    created_at: job.created_at,
+                    state: job.state.to_string(),
+                    updated_at: job.updated_at,
+                    termination_reason: job.termination_reason.clone(),
+                    operations: CanonicalJobOperations::for_job(job, relations.blocked),
+                    relations,
+                }
             })
             .collect();
         jobs.sort_by(|left, right| {
@@ -1340,6 +1387,214 @@ impl CanonicalControlService {
             .lock()
             .map_err(|_| invalid("launch lock poisoned"))?;
         self.launch_job_inner(request)
+    }
+
+    pub fn cancel_job(
+        &self,
+        job_id: &str,
+        expected_generation: u64,
+    ) -> Result<CanonicalJobOperationResponse> {
+        let mut domain = self.repository_for_job(job_id)?;
+        let job = domain
+            .job(job_id)?
+            .ok_or_else(|| invalid("unknown canonical Job"))?;
+        let accepted = job.state.can_cancel();
+        if let Some((authority, never_started)) =
+            domain.request_job_cancel(job_id, expected_generation)?
+        {
+            let runtime = if let Some(registry) = &self.runtime_registry {
+                registry.handle(&job.project_id)?
+            } else {
+                match &self.runtime_handle {
+                    Some(handle)
+                        if domain
+                            .project_at_root(handle.project_root())?
+                            .is_some_and(|project| project.id == job.project_id) =>
+                    {
+                        Some(handle.clone())
+                    }
+                    _ => None,
+                }
+            };
+            let signalled = match runtime {
+                Some(runtime) => runtime
+                    .provider_dispatcher()
+                    .cancel_attempt(&authority.attempt_id)?,
+                None => false,
+            };
+            domain.confirm_cancel(&authority.attempt_id, signalled || never_started)?;
+            if let Ok(chats) = self.active_chats.lock() {
+                for chat in chats
+                    .values()
+                    .filter(|chat| chat.attempt_id == authority.attempt_id)
+                {
+                    chat.cancelled.cancel();
+                    if let Err(error) = chat
+                        .sender
+                        .send(ExecutionEvent::Failed("chat cancelled".to_string()))
+                    {
+                        tracing::debug!(%error, "cancelled Job chat receiver closed");
+                    }
+                }
+            }
+        }
+        Ok(CanonicalJobOperationResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            job_id: job.id,
+            accepted,
+            snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
+        })
+    }
+
+    pub fn retry_job(
+        &self,
+        job_id: &str,
+        expected_generation: u64,
+    ) -> Result<CanonicalJobOperationResponse> {
+        let _launch = self
+            .launch_lock
+            .lock()
+            .map_err(|_| invalid("launch lock poisoned"))?;
+        let mut domain = self.repository_for_job(job_id)?;
+        let job = domain
+            .job(job_id)?
+            .ok_or_else(|| invalid("unknown canonical Job"))?;
+        if job.generation != expected_generation
+            || !job.state.can_retry()
+            || job.authoritative_attempt_id.is_some()
+        {
+            return Err(invalid("retry rejected: Job state or generation changed"));
+        }
+        if !domain.dependencies_satisfied(&job.project_id, job_id)? {
+            return Err(invalid("Job dependencies are not satisfied"));
+        }
+        let snapshot = domain.execution_snapshot()?;
+        let template = snapshot
+            .dispatch_intents
+            .iter()
+            .filter(|intent| intent.job_id == job_id && intent.provider_key.is_some())
+            .min_by_key(|intent| (intent.generation, intent.created_at, &intent.id));
+        let runtime = if template.is_some() {
+            let (project, _) = self.project_repository(&job.project_id)?;
+            let (_, defaults, _) = self.read_configuration()?;
+            let concurrency = provider_concurrency(
+                &defaults
+                    .get(&job.project_id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .defaults,
+            )?;
+            Some(if let Some(registry) = &self.runtime_registry {
+                registry.get_or_start(&job.project_id, Path::new(&project.root), concurrency)?
+            } else {
+                self.runtime_handle
+                    .clone()
+                    .filter(|handle| {
+                        handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
+                    })
+                    .ok_or_else(|| invalid("execution runtime is not available for this Project"))?
+            })
+        } else {
+            None
+        };
+        let replay = template
+            .map(|intent| -> Result<_> {
+                let input: Value = serde_json::from_str(&intent.request)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let request = input
+                    .get("arguments")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .ok_or_else(|| invalid("durable provider input is missing"))?;
+                let protocol = crate::provider_protocol::ProviderProtocol::from_wire(
+                    input.get("provider_protocol").and_then(Value::as_str),
+                );
+                let config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
+                    provider_key: intent
+                        .provider_key
+                        .clone()
+                        .ok_or_else(|| invalid("durable provider is missing"))?,
+                    model: intent
+                        .model
+                        .clone()
+                        .ok_or_else(|| invalid("durable model is missing"))?,
+                    upstream_model_id: intent
+                        .upstream_model_id
+                        .clone()
+                        .ok_or_else(|| invalid("durable upstream model is missing"))?,
+                    endpoint: intent
+                        .endpoint
+                        .clone()
+                        .ok_or_else(|| invalid("durable endpoint is missing"))?,
+                    credential_ref: intent.credential_ref.clone(),
+                };
+                Ok((request, protocol, config))
+            })
+            .transpose()?;
+        let executor_kind = if replay.is_some() {
+            "provider"
+        } else {
+            snapshot
+                .executors
+                .iter()
+                .find(|executor| {
+                    snapshot.attempts.iter().any(|attempt| {
+                        attempt.id == executor.attempt_id
+                            && attempt.job_id == job_id
+                            && attempt.generation == job.generation
+                    })
+                })
+                .map(|executor| executor.kind.as_str())
+                .unwrap_or("worker")
+        };
+        let (global, _, _) = self.read_configuration()?;
+        let budget_config = match global.resource_budget {
+            Some(budget) => crate::orchestration::budget::BudgetConfig::from_config(
+                &json!({"budget":{"currency":budget.unit,"hardLimitMicros":(budget.hard_limit * 1_000_000.0) as i64}}),
+            )?,
+            None => crate::orchestration::budget::BudgetConfig::default(),
+        };
+        let admission = domain.retry_job(job_id, executor_kind, expected_generation)?;
+        if let Some((request, protocol, provider_config)) = replay {
+            let authority = domain
+                .authority(&admission.attempt.id)?
+                .ok_or_else(|| invalid("retry Attempt authority disappeared"))?;
+            let runtime = runtime.ok_or_else(|| invalid("retry runtime disappeared"))?;
+            if let Err(error) = crate::provider_loop::admit_provider_call_with_events(
+                crate::provider_loop::ProviderCallAdmission {
+                    domain: &mut domain,
+                    authority: &authority,
+                    executor_id: &admission.executor.id,
+                    request,
+                    config: &budget_config,
+                    quota: crate::orchestration::budget::QuotaFacts::unknown(),
+                    dispatcher: runtime.provider_dispatcher(),
+                    provider_config,
+                    protocol,
+                },
+                None,
+                CallCancellation::new(),
+            ) {
+                if domain.authority(&admission.attempt.id)?.is_some() {
+                    domain.fail_attempt(
+                        &admission.attempt.id,
+                        &super::domain::job_failure(
+                            "retry_admission_failed",
+                            FailureClass::Unknown,
+                            &error.to_string(),
+                            true,
+                        ),
+                    )?;
+                }
+                return Err(error);
+            }
+        }
+        Ok(CanonicalJobOperationResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            job_id: job.id,
+            accepted: true,
+            snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
+        })
     }
 
     fn launch_job_inner(
@@ -2340,22 +2595,26 @@ impl CanonicalControlService {
         // If authority is already gone (completed/failed), or the turn has not
         // resolved its Attempt yet, there is nothing to revoke; still stop the
         // transport so a queued or running read cannot continue.
-        let mut domain = self
-            .project_repository(&active.project_id)
-            .map(|(_, repository)| repository);
-        let revocable = !active.attempt_id.is_empty()
-            && domain
-                .as_mut()
-                .is_ok_and(|domain| domain.request_cancel(&active.attempt_id).is_ok());
-        active.cancelled.cancel();
-        let _ = active
-            .sender
-            .send(ExecutionEvent::Failed("chat cancelled".to_string()));
-        let mut domain = domain?;
-        if revocable {
-            let _ = domain.confirm_cancel(&active.attempt_id, true);
-            return Ok(true);
+        if active.job_id.is_empty() || active.attempt_id.is_empty() {
+            active.cancelled.cancel();
+            return Ok(false);
         }
-        Ok(false)
+        let domain = self.repository_for_job(&active.job_id)?;
+        let job = domain
+            .job(&active.job_id)?
+            .ok_or_else(|| invalid("unknown canonical Job"))?;
+        if job.authoritative_attempt_id.as_deref() != Some(active.attempt_id.as_str()) {
+            active.cancelled.cancel();
+            return Ok(false);
+        }
+        let response = self.cancel_job(&job.id, job.generation)?;
+        active.cancelled.cancel();
+        if let Err(error) = active
+            .sender
+            .send(ExecutionEvent::Failed("chat cancelled".to_string()))
+        {
+            tracing::debug!(%error, "cancelled Job chat receiver closed");
+        }
+        Ok(response.accepted)
     }
 }

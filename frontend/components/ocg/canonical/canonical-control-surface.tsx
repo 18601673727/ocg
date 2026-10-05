@@ -171,6 +171,16 @@ export function CanonicalControlSurface({
     };
   }, [client]);
 
+  async function operateJob(action: "cancel" | "retry") {
+    const execution = selected.execution;
+    if (!execution) return;
+    const response = await (action === "cancel" ? client.cancelJob : client.retryJob)(execution.jobId, { expected_generation: execution.generation });
+    if (isCanonicalRejection(response)) throw new Error(response.message);
+    if (response.job_id !== execution.jobId || response.snapshot.project_id !== execution.projectId) throw new Error("Job operation identity mismatch.");
+    const next = store.applyCanonicalSnapshot({ payload: response.snapshot, projectId: execution.projectId, generation: store.getCanonical().generation + 1 });
+    setState(next);
+  }
+
   const run = useCallback(async (operation: () => Promise<void>) => {
     setBusy(true);
     setError(null);
@@ -450,7 +460,10 @@ export function CanonicalControlSurface({
           <Panel className="bg-background p-3" title={t("canonical.runningJob")} detail={t("canonical.runtimeState")}>
             {selected.execution ? (
               <div className="h-[420px] overflow-hidden rounded border border-border">
-                <JobExecutionSurface execution={selected.execution} embedded />
+                <JobExecutionSurface execution={selected.execution} embedded
+                  onCancelJob={() => operateJob("cancel")}
+                  onRetryJob={() => operateJob("retry")}
+                />
               </div>
             ) : (
               <p className="text-[11px] text-muted-foreground">

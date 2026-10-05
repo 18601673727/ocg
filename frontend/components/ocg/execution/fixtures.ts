@@ -57,6 +57,9 @@ function job(seed: JobSeed): CanonicalJob {
     blocks: [],
     blocked_by: [],
     blocked: false,
+    can_cancel: false,
+    can_retry: false,
+    termination_reason: null,
   };
 }
 

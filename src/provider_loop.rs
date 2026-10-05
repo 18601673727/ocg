@@ -2915,7 +2915,15 @@ fn fail_authoritative_provider_call(
         ) {
             tracing::debug!(error = %error, "provider failure receiver closed");
         }
-        domain.finish_attempt(&envelope.attempt_id, false)
+        domain.fail_attempt(
+            &envelope.attempt_id,
+            &crate::orchestration::domain::job_failure(
+                "provider_execution_failed",
+                crate::core_contract::FailureClass::Provider,
+                reason,
+                true,
+            ),
+        )
     })() {
         tracing::error!(error = %error, call_id = %envelope.call_id, "provider Attempt failure could not be settled");
     }

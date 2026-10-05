@@ -226,6 +226,17 @@ impl std::fmt::Debug for ProjectRuntimeRegistry {
 }
 
 impl ProjectRuntimeRegistry {
+    pub fn handle(&self, project_id: &str) -> Result<Option<ExecutionRuntimeHandle>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| OcgError::config("Project runtime registry poisoned"))?;
+        Ok(state
+            .runtimes
+            .get(project_id)
+            .map(ExecutionRuntimeHandle::new))
+    }
+
     pub fn new(
         transport: Arc<dyn HttpTransport>,
         permission_policy: PermissionPolicy,

@@ -135,6 +135,8 @@ export interface OcgRuntimeClient {
   getSnapshot(): RuntimeSnapshot;
   getSyncState?(): RuntimeSyncState;
   cancel?(sessionId: string): Promise<void>;
+  cancelJob?(jobId: string, expectedGeneration: number): Promise<void>;
+  retryJob?(jobId: string, expectedGeneration: number): Promise<void>;
   removeQueuedMessage?(sessionId: string, id: string): void;
   resumeQueue?(sessionId: string): void;
   /** Bind a session to its owning Project so a later send launches into that Project. */

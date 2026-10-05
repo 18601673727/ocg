@@ -22,6 +22,12 @@ import type {
   CanonicalJobConfigResponse,
   CanonicalJobEvent,
   CanonicalJobRelations,
+  CanonicalJobOperations,
+  CanonicalJobOperationResponse,
+  Failure,
+  FailureClass,
+  Actor,
+  EntityRef,
   CanonicalJobSnapshot,
   CanonicalJobSummary,
   CanonicalProjectResponse,
@@ -35,6 +41,7 @@ import type {
 import { CANONICAL_API_VERSION } from "./generated";
 import {
   array,
+  bad,
   atLeast,
   boolean,
   decode,
@@ -260,7 +267,8 @@ export const EFFECT_KINDS = [
 export type CanonicalEffectKind = (typeof EFFECT_KINDS)[number];
 
 /** One unit of work, owned by exactly one Project. */
-export type CanonicalJob = CanonicalJobRelations & {
+export type CanonicalJob = CanonicalJobRelations & CanonicalJobOperations & {
+  termination_reason: Failure | null;
   id: string;
   project_id: string;
   state: CanonicalJobState;
@@ -382,6 +390,87 @@ const jobState = oneOf<CanonicalJobState>(JOB_STATES);
 const attemptState = oneOf<CanonicalAttemptState>(ATTEMPT_STATES);
 const effectKind = oneOf<CanonicalEffectKind>(EFFECT_KINDS);
 
+const entityRef: Decoder<EntityRef> = (input, path) => {
+  const rec = record(input, path, "an entity reference");
+  if (!rec.ok) return rec;
+  const kind = req(rec.value, "kind", oneOf<EntityRef["kind"]>(["job", "attempt", "call", "command", "approval", "artifact", "change_set", "conversation", "message", "fact", "budget_scope", "capability_revocation"]), path);
+  if (!kind.ok) return kind;
+  const id = req(rec.value, "id", identity, path);
+  if (!id.ok) return id;
+  return yes({ kind: kind.value, id: id.value });
+};
+
+const actor: Decoder<Actor> = (input, path) => {
+  const rec = record(input, path, "a canonical actor");
+  if (!rec.ok) return rec;
+  switch (rec.value.kind) {
+    case "core": return yes({ kind: "core" });
+    case "user": {
+      const id = req(rec.value, "user_id", identity, path);
+      return id.ok ? yes({ kind: "user", user_id: id.value }) : id;
+    }
+    case "client": {
+      const kind = req(rec.value, "client_kind", oneOf<"pwa" | "cli">(["pwa", "cli"]), path);
+      if (!kind.ok) return kind;
+      const id = req(rec.value, "client_id", nullable(string), path);
+      return id.ok ? yes({ kind: "client", client_kind: kind.value, client_id: id.value }) : id;
+    }
+    case "attempt": {
+      const ref = req(rec.value, "attempt_ref", entityRef, path);
+      return ref.ok ? yes({ kind: "attempt", attempt_ref: ref.value }) : ref;
+    }
+    case "call": {
+      const ref = req(rec.value, "call_ref", entityRef, path);
+      return ref.ok ? yes({ kind: "call", call_ref: ref.value }) : ref;
+    }
+    case "system": {
+      const ref = req(rec.value, "policy_ref", nullable(string), path);
+      return ref.ok ? yes({ kind: "system", policy_ref: ref.value }) : ref;
+    }
+    case "external": {
+      const kind = req(rec.value, "source_kind", oneOf<"provider" | "capability" | "runtime">(["provider", "capability", "runtime"]), path);
+      if (!kind.ok) return kind;
+      const ref = req(rec.value, "source_ref", string, path);
+      return ref.ok ? yes({ kind: "external", source_kind: kind.value, source_ref: ref.value }) : ref;
+    }
+    default: return bad(`${path}.kind`, "a canonical actor kind");
+  }
+};
+
+const failure: Decoder<Failure> = (input, path) => {
+  const rec = record(input, path, "a canonical Failure");
+  if (!rec.ok) return rec;
+  const code = req(rec.value, "code", identity, path);
+  if (!code.ok) return code;
+  const classValue = req(rec.value, "class", oneOf<FailureClass>(["validation", "authentication", "authorization", "conflict", "concurrency", "not_found", "sandbox", "capability", "provider", "budget", "resource_limit", "rate_limit", "timeout", "cancelled", "preempted", "internal", "unknown"]), path);
+  if (!classValue.ok) return classValue;
+  const message = req(rec.value, "message", string, path);
+  if (!message.ok) return message;
+  const source = req(rec.value, "source", actor, path);
+  if (!source.ok) return source;
+  const retryable = req(rec.value, "retryable", boolean, path);
+  if (!retryable.ok) return retryable;
+  const details = req(rec.value, "details", nullable(jsonValue), path);
+  if (!details.ok) return details;
+  const cause = req(rec.value, "cause", nullable(entityRef), path);
+  if (!cause.ok) return cause;
+  const entity = req(rec.value, "entity_ref", nullable(entityRef), path);
+  if (!entity.ok) return entity;
+  return yes({ code: code.value, class: classValue.value, message: message.value, source: source.value, retryable: retryable.value, details: details.value, cause: cause.value, entity_ref: entity.value });
+};
+
+const jobOperations: Decoder<CanonicalJobOperations & { termination_reason: Failure | null }> = (input, path) => {
+  const rec = record(input, path, "canonical Job operation facts");
+  if (!rec.ok) return rec;
+  const cancel = req(rec.value, "can_cancel", boolean, path);
+  if (!cancel.ok) return cancel;
+  const retry = req(rec.value, "can_retry", boolean, path);
+  if (!retry.ok) return retry;
+  const reason = req(rec.value, "termination_reason", nullable(failure), path);
+  if (!reason.ok) return reason;
+  return yes({ can_cancel: cancel.value, can_retry: retry.value, termination_reason: reason.value });
+};
+
 const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
   const rec = record(input, path, "canonical Job relationships");
   if (!rec.ok) return rec;
@@ -428,6 +517,8 @@ const job: Decoder<CanonicalJob> = (input, path) => {
   if (!updatedAt.ok) return updatedAt;
   const relations = jobRelations(rec.value, path);
   if (!relations.ok) return relations;
+  const operations = jobOperations(rec.value, path);
+  if (!operations.ok) return operations;
   return yes({
     id: id.value,
     project_id: projectId.value,
@@ -438,6 +529,7 @@ const job: Decoder<CanonicalJob> = (input, path) => {
     created_at: createdAt.value,
     updated_at: updatedAt.value,
     ...relations.value,
+    ...operations.value,
   });
 };
 
@@ -801,12 +893,15 @@ const jobSummary: Decoder<CanonicalJobSummary> = (input, path) => {
   if (!updatedAt.ok) return updatedAt;
   const relations = jobRelations(rec.value, path);
   if (!relations.ok) return relations;
+  const operations = jobOperations(rec.value, path);
+  if (!operations.ok) return operations;
   return yes({
     job_id: jobId.value,
     state: state.value,
     created_at: createdAt.value,
     updated_at: updatedAt.value,
     ...relations.value,
+    ...operations.value,
   });
 };
 
@@ -954,6 +1049,22 @@ export const decodeJobLaunchResponse = (input: unknown): CanonicalJobLaunchAck =
 
 export const decodeEventsEnvelope = (input: unknown): CanonicalEventsEnvelope =>
   decode((value) => eventsEnvelope(value, ""), input);
+
+export const decodeJobOperationResponse = (input: unknown): CanonicalJobOperationResponse =>
+  decode((input) => {
+    const path = "";
+    const rec = record(input, path, "a canonical Job operation response");
+    if (!rec.ok) return rec;
+    const apiVersion = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
+    if (!apiVersion.ok) return apiVersion;
+    const jobId = req(rec.value, "job_id", identity, path);
+    if (!jobId.ok) return jobId;
+    const accepted = req(rec.value, "accepted", boolean, path);
+    if (!accepted.ok) return accepted;
+    const snapshot = req(rec.value, "snapshot", jobSnapshot, path);
+    if (!snapshot.ok) return snapshot;
+    return yes({ api_version: apiVersion.value, job_id: jobId.value, accepted: accepted.value, snapshot: snapshot.value });
+  }, input);
 
 export const decodeDashboardResponse = (input: unknown): CanonicalDashboardResponse =>
   decode((value) => dashboardResponse(value, ""), input);

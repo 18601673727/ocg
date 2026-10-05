@@ -731,6 +731,8 @@ export function RuntimeWorkspace({
                 execution={jobExecution}
                 executions={projectExecutions}
                 onSelectJob={openJob}
+                onCancelJob={client.cancelJob ? async () => { await client.cancelJob?.(jobExecution.jobId, jobExecution.generation); } : undefined}
+                onRetryJob={client.retryJob ? async () => { await client.retryJob?.(jobExecution.jobId, jobExecution.generation); } : undefined}
                 accounting={jobAccounting}
                 usage={jobUsage.data}
                 usageLoading={jobUsage.loading}

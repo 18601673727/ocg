@@ -24,6 +24,8 @@ import type {
   CanonicalEffectKind,
   CanonicalExecutor,
   CanonicalJobRelations,
+  CanonicalJobOperations,
+  Failure,
   CanonicalJobState,
 } from "../contracts";
 import type { ProjectId } from "../project/domain";
@@ -485,6 +487,9 @@ export type JobExecution = {
   blocks: string[];
   blockedBy: string[];
   blocked: boolean;
+  canCancel: boolean;
+  canRetry: boolean;
+  terminationReason: Failure | null;
   /** The journal cursor this snapshot was taken at. */
   cursor: number;
   /** The canonical Job state, unmodified. */
@@ -572,7 +577,8 @@ export function assembleJobExecution(input: {
   apiVersion: string;
   projectId: ProjectId;
   cursor: number;
-  job: CanonicalJobRelations & {
+  job: CanonicalJobRelations & CanonicalJobOperations & {
+    termination_reason: Failure | null;
     id: string;
     state: CanonicalJobState;
     generation: number;
@@ -602,6 +608,9 @@ export function assembleJobExecution(input: {
     blocks: input.job.blocks,
     blockedBy: input.job.blocked_by,
     blocked: input.job.blocked,
+    canCancel: input.job.can_cancel,
+    canRetry: input.job.can_retry,
+    terminationReason: input.job.termination_reason,
     cursor: input.cursor,
     state: input.job.state,
     generation: input.job.generation,

@@ -469,15 +469,41 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     return result;
   }
 
+  async cancelJob(jobId: string, expectedGeneration: number): Promise<void> {
+    const response = await this.control.cancelJob(jobId, { expected_generation: expectedGeneration });
+    if (isCanonicalRejection(response)) throw new Error(response.message);
+    if (response.job_id !== jobId) throw new Error("Job operation identity mismatch.");
+    await this.syncProjectJobs(response.snapshot.project_id, true);
+  }
+
+  async retryJob(jobId: string, expectedGeneration: number): Promise<void> {
+    const response = await this.control.retryJob(jobId, { expected_generation: expectedGeneration });
+    if (isCanonicalRejection(response)) throw new Error(response.message);
+    if (response.job_id !== jobId) throw new Error("Job operation identity mismatch.");
+    await this.syncProjectJobs(response.snapshot.project_id, true);
+  }
+
   override async cancel(sessionId: string): Promise<void> {
     this.pauseQueue(sessionId);
     this.historyEpochs.set(sessionId, (this.historyEpochs.get(sessionId) ?? 0) + 1);
     // Admission can still be in flight when an automatically dequeued turn is stopped.
     await this.pendingSends.get(sessionId);
     const session = this.store.getSnapshot().sessions.find((item) => item.id === sessionId);
-    const response = await this.control.cancelChatMessage(session?.sessionId ?? sessionId, session?.projectId);
-    if (isCanonicalRejection(response)) throw new Error(response.message);
-    if (!response.cancelled) {
+    const link = this.chatJobsBySession.get(sessionId);
+    let cancelled: boolean;
+    if (link) {
+      const execution = await this.projectCanonicalExecution(link.projectId, link.jobId);
+      if (!execution) throw new Error("Job snapshot is unavailable.");
+      const response = await this.control.cancelJob(link.jobId, { expected_generation: execution.generation });
+      if (isCanonicalRejection(response)) throw new Error(response.message);
+      cancelled = response.accepted;
+      await this.syncProjectJobs(link.projectId, true);
+    } else {
+      const response = await this.control.cancelChatMessage(session?.sessionId ?? sessionId, session?.projectId);
+      if (isCanonicalRejection(response)) throw new Error(response.message);
+      cancelled = response.cancelled;
+    }
+    if (!cancelled) {
       void this.refreshSessionHistory(sessionId);
       return;
     }
@@ -708,7 +734,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           typeof value.updated_at !== "number" || !Number.isSafeInteger(value.updated_at) || value.updated_at < 0) {
         throw new Error(`Project Jobs response contains a malformed Job summary at index ${index}.`);
       }
-      return { jobId: value.job_id, watermark: `${value.state}\u0000${value.updated_at}` };
+      return { jobId: value.job_id, watermark: JSON.stringify(value) };
     });
     const previous = this.projectJobWatermarks.get(projectId) ?? new Map<string, string>();
     const next = new Map<string, string>();

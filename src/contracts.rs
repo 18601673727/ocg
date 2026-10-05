@@ -27,7 +27,8 @@ pub use crate::core_contract::{
 };
 pub use crate::orchestration::canonical_control::{
     CanonicalConfigurationResponse, CanonicalDashboardResponse, CanonicalJobConfigResponse,
-    CanonicalJobEvent, CanonicalJobRelations, CanonicalJobSnapshot, CanonicalJobSummary,
+    CanonicalJobEvent, CanonicalJobOperationRequest, CanonicalJobOperationResponse,
+    CanonicalJobOperations, CanonicalJobRelations, CanonicalJobSnapshot, CanonicalJobSummary,
     CanonicalProjectResponse, GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView,
     ProjectRecord, ResourceBudget, CANONICAL_CONTROL_API_VERSION,
 };
@@ -568,6 +569,9 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     ExecutionWitness::export_all(cfg)?;
     CanonicalJobSnapshot::export_all(cfg)?;
     CanonicalJobRelations::export_all(cfg)?;
+    CanonicalJobOperations::export_all(cfg)?;
+    CanonicalJobOperationRequest::export_all(cfg)?;
+    CanonicalJobOperationResponse::export_all(cfg)?;
     CanonicalJobEvent::export_all(cfg)?;
     JobLaunchRequest::export_all(cfg)?;
     ChatSendRequest::export_all(cfg)?;

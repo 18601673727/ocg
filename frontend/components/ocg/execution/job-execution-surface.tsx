@@ -17,7 +17,7 @@ import type { JobUsageResponse } from "../contracts";
  * A Job exists because the Project owns it. A Chat session, when one presents
  * the same Job, only unlocks the conversational inspector route.
  */
-export function JobExecutionSurface({ execution, executions = [], onSelectJob, accounting = null, usage = null, usageLoading = false, usageError = null, onRetryUsage, onOpenInspector, embedded = false }: {
+export function JobExecutionSurface({ execution, executions = [], onSelectJob, accounting = null, usage = null, usageLoading = false, usageError = null, onRetryUsage, onOpenInspector, onCancelJob, onRetryJob, embedded = false }: {
   execution: JobExecution;
   executions?: readonly JobExecution[];
   onSelectJob?: (jobId: string) => void;
@@ -27,9 +27,24 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
   usageError?: string | null;
   onRetryUsage?: () => void;
   onOpenInspector?: () => void;
+  onCancelJob?: () => Promise<void>;
+  onRetryJob?: () => Promise<void>;
   embedded?: boolean;
 }) {
   const { t } = useI18n();
+  const [operationPending, setOperationPending] = useState(false);
+  const [operationError, setOperationError] = useState<string | null>(null);
+  async function operate(action: () => Promise<void>) {
+    setOperationPending(true);
+    setOperationError(null);
+    try {
+      await action();
+    } catch (cause) {
+      setOperationError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setOperationPending(false);
+    }
+  }
   const [query, setQuery] = useState("");
   const [attemptId, setAttemptId] = useState("");
   const calls = filterCalls(execution.calls, { query }).filter((call) => !attemptId || call.attemptId === attemptId);
@@ -68,8 +83,16 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
           <p className="mt-1 text-muted-foreground">{t("home.projectLabel", { project: execution.projectId })}</p>
         </div>
         <Pill tone={jobState.tone} dot pulse={jobState.pulse}>{runtimeStateLabel(t, execution.state)}</Pill>
+        {execution.canCancel && onCancelJob && <Button variant="outline" size="xs" disabled={operationPending} onClick={() => void operate(onCancelJob)}>{t("common.cancel")}</Button>}
+        {execution.canRetry && onRetryJob && <Button variant="outline" size="xs" disabled={operationPending} onClick={() => void operate(onRetryJob)}>{t("common.retry")}</Button>}
         {onOpenInspector && <Button variant="outline" size="xs" onClick={onOpenInspector}>{t("execution.openInspector")}</Button>}
       </header>
+
+      {operationError && <p role="alert" className="text-destructive">{operationError}</p>}
+      {execution.terminationReason && <section className="rounded border border-border p-3">
+        <p className="font-semibold">{execution.terminationReason.code} · {execution.terminationReason.class}</p>
+        <p className="mt-1 whitespace-pre-wrap break-words">{execution.terminationReason.message}</p>
+      </section>}
 
       <section aria-label={t("execution.currentActivity")} className="rounded-lg border border-border bg-card p-3">
         <SectionTitle>{t("execution.currentActivity")}</SectionTitle>

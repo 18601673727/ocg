@@ -35,6 +35,9 @@ import {
   decodeJobConfigResponse,
   decodeJobLaunchResponse,
   decodeJobSnapshot,
+  decodeJobOperationResponse,
+  type CanonicalJobOperationRequest,
+  type CanonicalJobOperationResponse,
   decodeProjectResponse,
   decodeProjectsResponse,
   type CanonicalDashboardResponse,
@@ -122,6 +125,8 @@ export interface CanonicalControlClient {
     jobId: string,
     configuration: JsonValue,
   ): Promise<CanonicalResult<CanonicalJobConfigAck>>;
+  cancelJob(jobId: string, request: CanonicalJobOperationRequest): Promise<CanonicalResult<CanonicalJobOperationResponse>>;
+  retryJob(jobId: string, request: CanonicalJobOperationRequest): Promise<CanonicalResult<CanonicalJobOperationResponse>>;
   readJobSnapshot(
     projectId: string,
     jobId: string,
@@ -369,6 +374,20 @@ export function createHttpCanonicalControlClient(
       } catch (error) {
         return contractRejection(commandId, error);
       }
+    },
+
+    async cancelJob(jobId, request) {
+      const { status, value, text } = await send("POST", `/api/v1/canonical/jobs/${encodeURIComponent(jobId)}/cancel`, request);
+      if (status !== 200) return rejection(jobId, status, text);
+      try { return decodeJobOperationResponse(value); }
+      catch (error) { return contractRejection(jobId, error); }
+    },
+
+    async retryJob(jobId, request) {
+      const { status, value, text } = await send("POST", `/api/v1/canonical/jobs/${encodeURIComponent(jobId)}/retry`, request);
+      if (status !== 200) return rejection(jobId, status, text);
+      try { return decodeJobOperationResponse(value); }
+      catch (error) { return contractRejection(jobId, error); }
     },
 
     async readJobSnapshot(projectId, jobId) {

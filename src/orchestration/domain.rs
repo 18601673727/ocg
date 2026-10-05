@@ -1,8 +1,8 @@
 //! SQLite-backed canonical Project, Job, Attempt, Executor and Call records.
 
 use crate::core_contract::{
-    Actor, Conversation, EntityId, EntityKind, EntityRef, Message, MessageBlock, MessageBlockKind,
-    MessageLifecycle, ProjectScope,
+    Actor, Conversation, EntityId, EntityKind, EntityRef, Failure, FailureClass, Message,
+    MessageBlock, MessageBlockKind, MessageLifecycle, ProjectScope,
 };
 use crate::error::{OcgError, Result};
 use crate::orchestration::budget::{self, BudgetConfig, QuotaFacts, SpendAction, SpendAssessment};
@@ -180,6 +180,8 @@ pub struct Job {
     pub state: JobState,
     pub generation: u64,
     pub authoritative_attempt_id: Option<AttemptId>,
+    #[serde(default)]
+    pub termination_reason: Option<Failure>,
     #[serde(rename = "payload", with = "job_spec_payload")]
     pub spec: JobSpec,
     pub created_at: i64,
@@ -202,6 +204,20 @@ pub enum JobState {
 }
 
 impl JobState {
+    pub fn can_cancel(self) -> bool {
+        matches!(
+            self,
+            Self::Pending | Self::Eligible | Self::Running | Self::Cancelling
+        )
+    }
+
+    pub fn can_retry(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Unknown | Self::Orphaned
+        )
+    }
+
     fn parse(value: &str) -> Result<Self> {
         value
             .parse()
@@ -733,6 +749,7 @@ impl DomainRepository {
             "upstream_model_id",
             "TEXT",
         )?;
+        ensure_column(&connection, "domain_jobs", "termination_reason", "TEXT")?;
         ensure_column(&connection, "domain_job_bindings", "attempt_id", "TEXT")?;
         connection.execute(
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
@@ -2388,6 +2405,7 @@ impl DomainRepository {
             state: JobState::Pending,
             generation: 0,
             authoritative_attempt_id: None,
+            termination_reason: None,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
@@ -2497,6 +2515,7 @@ impl DomainRepository {
             state: JobState::Pending,
             generation: 0,
             authoritative_attempt_id: None,
+            termination_reason: None,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
@@ -2670,6 +2689,7 @@ impl DomainRepository {
             state: JobState::Running,
             generation: 1,
             authoritative_attempt_id: Some(attempt_id.clone()),
+            termination_reason: None,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
@@ -2775,7 +2795,7 @@ impl DomainRepository {
 
         if let Some(existing) = transaction
             .query_row(
-                "SELECT j.id,j.project_id,j.state,j.generation,j.authoritative_attempt_id,j.payload,j.created_at,j.updated_at,a.id,a.job_id,a.generation,a.state,a.authoritative,a.created_at,a.finished_at,e.id,e.attempt_id,e.kind,e.state,e.created_at FROM domain_job_bindings b JOIN domain_jobs j ON j.id=b.job_id JOIN domain_attempts a ON a.id=b.attempt_id LEFT JOIN domain_executors e ON e.attempt_id=a.id WHERE b.binding_key=?1 AND b.project_id=?2",
+                "SELECT j.id,j.project_id,j.state,j.generation,j.authoritative_attempt_id,j.payload,j.created_at,j.updated_at,a.id,a.job_id,a.generation,a.state,a.authoritative,a.created_at,a.finished_at,e.id,e.attempt_id,e.kind,e.state,e.created_at,j.termination_reason FROM domain_job_bindings b JOIN domain_jobs j ON j.id=b.job_id JOIN domain_attempts a ON a.id=b.attempt_id LEFT JOIN domain_executors e ON e.attempt_id=a.id WHERE b.binding_key=?1 AND b.project_id=?2",
                 params![binding_key, project.id],
                 |row| {
                     Ok((
@@ -2784,6 +2804,7 @@ impl DomainRepository {
                             state: row.get::<_, String>(2)?.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
                             generation: u64::try_from(row.get::<_, i64>(3)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
                             authoritative_attempt_id: row.get(4)?, spec: row.get(5)?,
+                            termination_reason: failure_from_row(row, 20)?,
                             created_at: row.get(6)?, updated_at: row.get(7)?,
                         },
                         Attempt {
@@ -2841,6 +2862,7 @@ impl DomainRepository {
             state: JobState::Running,
             generation: 1,
             authoritative_attempt_id: Some(attempt_id.clone()),
+            termination_reason: None,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
@@ -3128,6 +3150,25 @@ impl DomainRepository {
         executor_kind: &str,
         expected_attempt: Option<&str>,
     ) -> Result<CanonicalAdmission> {
+        self.replace_attempt_inner(job_id, executor_kind, expected_attempt, None)
+    }
+
+    pub fn retry_job(
+        &mut self,
+        job_id: &str,
+        executor_kind: &str,
+        expected_generation: u64,
+    ) -> Result<CanonicalAdmission> {
+        self.replace_attempt_inner(job_id, executor_kind, None, Some(expected_generation))
+    }
+
+    fn replace_attempt_inner(
+        &mut self,
+        job_id: &str,
+        executor_kind: &str,
+        expected_attempt: Option<&str>,
+        retry_generation: Option<u64>,
+    ) -> Result<CanonicalAdmission> {
         validate_id(job_id)?;
         validate_id(executor_kind)?;
         let transaction = self
@@ -3153,7 +3194,16 @@ impl DomainRepository {
                 |row| row.get(0),
             )
             .map_err(sql)?;
-        if matches!(state.as_str(), "completed" | "cancelled") {
+        if let Some(expected) = retry_generation {
+            if u64::try_from(generation).map_err(|_| invalid("negative Job generation"))?
+                != expected
+            {
+                return Err(invalid("retry rejected: Job generation changed"));
+            }
+            if !JobState::parse(&state)?.can_retry() || old_attempt.is_some() {
+                return Err(invalid("Job is not retryable"));
+            }
+        } else if matches!(state.as_str(), "completed" | "cancelled") {
             return Err(invalid("terminal Job cannot be replaced"));
         }
         let blocked: bool = transaction
@@ -3220,7 +3270,7 @@ impl DomainRepository {
             .map_err(sql)?;
         transaction
             .execute(
-                "UPDATE domain_jobs SET state='running',generation=?2,authoritative_attempt_id=?3,updated_at=?4 WHERE id=?1",
+                "UPDATE domain_jobs SET state='running',generation=?2,authoritative_attempt_id=?3,termination_reason=NULL,updated_at=?4 WHERE id=?1",
                 params![job_id, next_generation, attempt_id, timestamp],
             )
             .map_err(sql)?;
@@ -4015,9 +4065,72 @@ impl DomainRepository {
         Ok(authority)
     }
 
+    pub fn request_job_cancel(
+        &mut self,
+        job_id: &str,
+        expected_generation: u64,
+    ) -> Result<Option<(AttemptAuthority, bool)>> {
+        validate_id(job_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        if job.generation != expected_generation {
+            return Err(invalid("cancel rejected: Job generation changed"));
+        }
+        if !job.state.can_cancel() {
+            transaction.commit().map_err(sql)?;
+            return Ok(None);
+        }
+        let Some(attempt_id) = job.authoritative_attempt_id.as_deref() else {
+            if !matches!(job.state, JobState::Pending | JobState::Eligible) {
+                return Err(invalid("active Job has no Attempt to cancel"));
+            }
+            let reason = job_failure(
+                "job_cancelled",
+                FailureClass::Cancelled,
+                "Job cancelled before execution",
+                true,
+            );
+            transaction.execute(
+                "UPDATE domain_jobs SET state='cancelled',termination_reason=?2,updated_at=?3 WHERE id=?1",
+                params![job_id, serde_json::to_string(&reason).map_err(|error| invalid(&error.to_string()))?, now()],
+            ).map_err(sql)?;
+            let job = read_job(&transaction, job_id)?
+                .ok_or_else(|| invalid("cancelled Job disappeared"))?;
+            emit_job(&transaction, EventKind::JobUpdated, &job, None)?;
+            transaction.commit().map_err(sql)?;
+            return Ok(None);
+        };
+        let attempt = read_attempt(&transaction, attempt_id)?;
+        let never_started = attempt.state == AttemptState::Queued
+            && !transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM domain_calls WHERE attempt_id=?1 AND state!='created') OR EXISTS(SELECT 1 FROM domain_dispatch_intents WHERE attempt_id=?1 AND effect_state IN ('started','unknown','settled'))",
+                [attempt_id], |row| row.get::<_, bool>(0),
+            ).map_err(sql)?;
+        finish_attempt_in(&transaction, attempt_id, "cancelling", false)?;
+        let authority = AttemptAuthority {
+            attempt_id: attempt.id,
+            job_id: job.id,
+            generation: attempt.generation,
+        };
+        transaction.commit().map_err(sql)?;
+        Ok(Some((authority, never_started)))
+    }
+
     pub fn finish_attempt(&mut self, attempt_id: &str, succeeded: bool) -> Result<()> {
         let state = if succeeded { "completed" } else { "failed" };
         self.set_attempt_terminal_or_cancelling(attempt_id, state, false)
+    }
+
+    pub fn fail_attempt(&mut self, attempt_id: &str, failure: &Failure) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        finish_attempt_with_reason_in(&transaction, attempt_id, "failed", false, Some(failure))?;
+        transaction.commit().map_err(sql)
     }
 
     pub fn confirm_cancel(&mut self, attempt_id: &str, stopped: bool) -> Result<()> {
@@ -4044,16 +4157,7 @@ impl DomainRepository {
     }
 
     pub fn job(&self, job_id: &str) -> Result<Option<Job>> {
-        self.connection.query_row(
-            "SELECT id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at FROM domain_jobs WHERE id=?1",
-            [job_id], |row| {
-                let state: String = row.get(2)?;
-                let generation: i64 = row.get(3)?;
-                Ok((row.get(0)?, row.get(1)?, state, generation, row.get(4)?, row.get::<_, JobSpec>(5)?, row.get(6)?, row.get(7)?))
-            },
-        ).optional().map_err(sql)?.map(|(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at)| {
-            Ok(Job { id, project_id, state: JobState::parse(&state)?, generation: u64::try_from(generation).map_err(|_| invalid("negative Job generation"))?, authoritative_attempt_id, spec: payload, created_at, updated_at })
-        }).transpose()
+        read_job(&self.connection, job_id)
     }
 
     pub fn attempt(&self, attempt_id: &str) -> Result<Option<Attempt>> {
@@ -4266,6 +4370,7 @@ impl DomainRepository {
                     state: JobState::Pending,
                     generation: 0,
                     authoritative_attempt_id: None,
+                    termination_reason: None,
                     spec,
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -4748,6 +4853,20 @@ fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
     })
 }
 
+fn failure_from_row(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<Failure>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
     let state: String = row.get(2)?;
     let state: JobState = state.parse().map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -4758,6 +4877,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         generation: u64::try_from(row.get::<_, i64>(3)?)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         authoritative_attempt_id: row.get(4)?,
+        termination_reason: failure_from_row(row, 8)?,
         spec: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
@@ -4765,7 +4885,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
 }
 
 const JOB_COLUMNS: &str =
-    "id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at";
+    "id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at,termination_reason";
 
 fn query_all<T>(
     connection: &Connection,
@@ -6162,6 +6282,61 @@ fn finish_attempt_in(
     state: &str,
     require_cancelling: bool,
 ) -> Result<()> {
+    let reason = match state {
+        "cancelled" => Some(job_failure(
+            "job_cancelled",
+            FailureClass::Cancelled,
+            "Job execution cancelled",
+            true,
+        )),
+        "unknown" if require_cancelling => Some(job_failure(
+            "cancel_stop_unknown",
+            FailureClass::Unknown,
+            "Cancellation revoked authority; execution stop is unconfirmed",
+            true,
+        )),
+        "orphaned" if require_cancelling => Some(job_failure(
+            "cancel_orphaned",
+            FailureClass::Unknown,
+            "Cancelled execution is orphaned",
+            true,
+        )),
+        _ => None,
+    };
+    finish_attempt_with_reason_in(
+        transaction,
+        attempt_id,
+        state,
+        require_cancelling,
+        reason.as_ref(),
+    )
+}
+
+pub(crate) fn job_failure(
+    code: &str,
+    class: FailureClass,
+    message: &str,
+    retryable: bool,
+) -> Failure {
+    Failure {
+        code: code.to_string(),
+        class,
+        message: message.to_string(),
+        source: Actor::Core,
+        retryable,
+        details: None,
+        cause: None,
+        entity_ref: None,
+    }
+}
+
+fn finish_attempt_with_reason_in(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    state: &str,
+    require_cancelling: bool,
+    reason: Option<&Failure>,
+) -> Result<()> {
     validate_id(attempt_id)?;
     let row: Option<(String, String, bool, i64)> = transaction
             .query_row(
@@ -6288,7 +6463,11 @@ fn finish_attempt_in(
                 params![attempt_id, state, timestamp],
             )
             .map_err(sql)?;
-        transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state=?2,updated_at=?3 WHERE id=?1 AND authoritative_attempt_id=?4", params![job_id,state,timestamp,attempt_id]).map_err(sql)?;
+        let reason = reason
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| invalid(&error.to_string()))?;
+        transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state=?2,updated_at=?3,termination_reason=?5 WHERE id=?1 AND authoritative_attempt_id=?4", params![job_id,state,timestamp,attempt_id,reason]).map_err(sql)?;
         // The Attempt leaving authority is the single causal fact for this
         // transition; everything it settles hangs off it in the same commit.
         let root = emit_attempt(
