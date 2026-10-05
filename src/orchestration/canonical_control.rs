@@ -9,7 +9,7 @@ use crate::core_contract::{Failure, FailureClass};
 use crate::error::{OcgError, Result};
 use crate::orchestration::domain::{
     Attempt, AttemptAuthority, Call, ChildPolicy, DispatchIntent, DomainRepository, Executor, Job,
-    JobOrigin, JobSpec, JobState,
+    JobOrigin, JobSpec,
 };
 use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
@@ -264,7 +264,7 @@ impl CanonicalJobRelations {
                 !projection
                     .jobs
                     .get(*id)
-                    .is_some_and(|prerequisite| prerequisite.state == JobState::Completed)
+                    .is_some_and(|prerequisite| prerequisite.state.satisfies_dependency())
             })
             .cloned()
             .collect();

@@ -253,6 +253,10 @@ pub enum JobState {
 }
 
 impl JobState {
+    pub fn satisfies_dependency(self) -> bool {
+        self == Self::Completed
+    }
+
     pub fn can_cancel(self) -> bool {
         matches!(
             self,
@@ -568,6 +572,8 @@ CREATE TABLE IF NOT EXISTS domain_job_dependencies (
     CHECK(job_id != prerequisite_job_id),
     PRIMARY KEY(project_id,job_id,prerequisite_job_id)
 ) STRICT;
+CREATE INDEX IF NOT EXISTS domain_dependencies_by_prerequisite
+    ON domain_job_dependencies(prerequisite_job_id,project_id,job_id);
 CREATE TABLE IF NOT EXISTS domain_job_origins (
     job_id TEXT PRIMARY KEY REFERENCES domain_jobs(id),
     parent_job_id TEXT NOT NULL REFERENCES domain_jobs(id),
@@ -815,7 +821,9 @@ impl DomainRepository {
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
             [],
         ).map_err(sql)?;
-        Ok(Self { connection, path })
+        let repository = Self { connection, path };
+        repository.recover_job_readiness()?;
+        Ok(repository)
     }
 
     /// Open the durable store and require a Project identity at this boundary.
@@ -2223,6 +2231,7 @@ impl DomainRepository {
                 |row| row.get(0),
             )
             .map_err(sql)?;
+        refresh_job_readiness_in(&transaction, job_id, None)?;
         transaction.commit().map_err(sql)?;
         u64::try_from(revision).map_err(|_| invalid("negative dependency revision"))
     }
@@ -2264,6 +2273,7 @@ impl DomainRepository {
                 |row| row.get(0),
             )
             .map_err(sql)?;
+        refresh_job_readiness_in(&transaction, job_id, None)?;
         transaction.commit().map_err(sql)?;
         u64::try_from(revision).map_err(|_| invalid("negative dependency revision"))
     }
@@ -2604,6 +2614,11 @@ impl DomainRepository {
                 Some(root),
             )?;
         }
+        if !prerequisite_job_ids.is_empty() {
+            refresh_job_readiness_in(&transaction, &job.id, Some(root))?;
+        }
+        let job = read_job(&transaction, &job.id)?
+            .ok_or_else(|| invalid("created Job disappeared"))?;
         transaction.commit().map_err(sql)?;
         Ok(job)
     }
@@ -2748,28 +2763,6 @@ impl DomainRepository {
             }
         }
 
-        // A child is only executable when every prerequisite has already
-        // completed. Check this while holding the admission transaction so a
-        // caller cannot publish an authoritative Attempt for blocked work.
-        for prerequisite in prerequisite_job_ids {
-            validate_id(prerequisite)?;
-            let status: Option<String> = transaction
-                .query_row(
-                    "SELECT state FROM domain_jobs WHERE id=?1 AND project_id=?2",
-                    params![prerequisite, project_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql)?;
-            match status.as_deref() {
-                Some("completed") => {}
-                Some(_) => {
-                    return Err(invalid("child dependencies are not satisfied"));
-                }
-                None => return Err(invalid("child dependency is not in the parent Project")),
-            }
-        }
-
         let job_id = new_id("job");
         let attempt_id = new_id("att");
         let executor_id = new_id("exec");
@@ -2826,6 +2819,9 @@ impl DomainRepository {
                     [&project_id],
                 )
                 .map_err(sql)?;
+        }
+        if !dependencies_satisfied_in(&transaction, &job_id)? {
+            return Err(invalid("child dependencies are not satisfied"));
         }
         transaction
             .execute(
@@ -3197,35 +3193,38 @@ impl DomainRepository {
 
     pub fn set_job_eligible(&self, job_id: &str) -> Result<()> {
         validate_id(job_id)?;
-        let timestamp = now();
         let transaction = self.begin()?;
-        let changed = transaction.execute(
-            "UPDATE domain_jobs SET state='eligible',updated_at=?2 WHERE id=?1 AND state='pending' AND authoritative_attempt_id IS NULL",
-            params![job_id, timestamp],
-        ).map_err(sql)?;
-        if changed != 1 {
-            return Err(invalid(
-                "Job is not pending or already has an authoritative Attempt",
-            ));
+        let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        if !matches!(job.state, JobState::Pending | JobState::Eligible)
+            || job.authoritative_attempt_id.is_some()
+        {
+            return Err(invalid("Job is not awaiting admission"));
         }
-        let job = self
-            .job(job_id)?
-            .ok_or_else(|| invalid("Job disappeared while becoming eligible"))?;
-        emit_job(&transaction, EventKind::JobUpdated, &job, None)?;
-        transaction.commit().map_err(sql)?;
-        Ok(())
+        refresh_job_readiness_in(&transaction, job_id, None)?;
+        transaction.commit().map_err(sql)
     }
 
     pub fn dependencies_satisfied(&self, project_id: &str, job_id: &str) -> Result<bool> {
-        let blocked: i64 = self
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM domain_job_dependencies d JOIN domain_jobs prerequisite ON prerequisite.id=d.prerequisite_job_id WHERE d.project_id=?1 AND d.job_id=?2 AND prerequisite.state NOT IN ('completed')",
-                params![project_id, job_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        Ok(blocked == 0)
+        let job = self.job(job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        if job.project_id != project_id {
+            return Err(invalid("Job does not belong to the requested Project"));
+        }
+        dependencies_satisfied_in(&self.connection, job_id)
+    }
+
+    pub fn recover_job_readiness(&self) -> Result<()> {
+        let transaction = self.begin()?;
+        // Jobs without dependencies still follow their existing launch path.
+        let jobs: Vec<String> = query_all(
+            &transaction,
+            "SELECT id FROM domain_jobs j WHERE state IN ('pending','eligible') AND authoritative_attempt_id IS NULL AND EXISTS(SELECT 1 FROM domain_job_dependencies d WHERE d.job_id=j.id) ORDER BY project_id,id",
+            &[],
+            |row| row.get(0),
+        )?;
+        for job_id in jobs {
+            refresh_job_readiness_in(&transaction, &job_id, None)?;
+        }
+        transaction.commit().map_err(sql)
     }
 
     /// Claim an eligible Job and establish its authoritative Attempt atomically.
@@ -3234,16 +3233,6 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let blocked: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM domain_job_dependencies d JOIN domain_jobs prerequisite ON prerequisite.id=d.prerequisite_job_id WHERE d.job_id=?1 AND prerequisite.state!='completed')",
-                [job_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        if blocked {
-            return Err(invalid("Job dependencies are not satisfied"));
-        }
         let (attempt, _root) = create_attempt_in(&transaction, job_id)?;
         transaction.commit().map_err(sql)?;
         Ok(attempt)
@@ -3259,17 +3248,10 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let blocked: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM domain_job_dependencies d JOIN domain_jobs prerequisite ON prerequisite.id=d.prerequisite_job_id WHERE d.job_id=?1 AND prerequisite.state!='completed')",
-                [job_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        if blocked {
+        if !dependencies_satisfied_in(&transaction, job_id)? {
             return Err(invalid("Job dependencies are not satisfied"));
         }
-        transaction.execute("UPDATE domain_jobs SET state='eligible',updated_at=?2 WHERE id=?1 AND state='pending' AND authoritative_attempt_id IS NULL", params![job_id,now()]).map_err(sql)?;
+        refresh_job_readiness_in(&transaction, job_id, None)?;
         let (attempt, root) = create_attempt_in(&transaction, job_id)?;
         let executor = Executor {
             id: new_id("exec"),
@@ -3362,14 +3344,7 @@ impl DomainRepository {
         } else if matches!(state.as_str(), "completed" | "cancelled") {
             return Err(invalid("terminal Job cannot be replaced"));
         }
-        let blocked: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM domain_job_dependencies d JOIN domain_jobs prerequisite ON prerequisite.id=d.prerequisite_job_id WHERE d.job_id=?1 AND prerequisite.state!='completed')",
-                [job_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        if blocked {
+        if !dependencies_satisfied_in(&transaction, job_id)? {
             return Err(invalid("Job dependencies are not satisfied"));
         }
         let next_generation = generation
@@ -3452,6 +3427,7 @@ impl DomainRepository {
             Some(root),
         )?;
         emit_job(&transaction, EventKind::JobUpdated, &job, Some(root))?;
+        refresh_dependents_in(&transaction, job_id, Some(root))?;
         transaction.commit().map_err(sql)?;
         let project = self
             .connection
@@ -6737,8 +6713,77 @@ fn finish_attempt_with_reason_in(
             generation,
             Some(root),
         )?;
+        if state == "completed" {
+            refresh_dependents_in(transaction, &job_id, Some(root))?;
+        }
     }
     settle_chat_turn(transaction, attempt_id, state)?;
+    Ok(())
+}
+
+fn refresh_dependents_in(
+    transaction: &rusqlite::Transaction<'_>,
+    prerequisite_job_id: &str,
+    caused_by: Option<u64>,
+) -> Result<()> {
+    let dependents: Vec<String> = query_all(
+        transaction,
+        "SELECT job_id FROM domain_job_dependencies WHERE prerequisite_job_id=?1 ORDER BY project_id,job_id",
+        &[&prerequisite_job_id],
+        |row| row.get(0),
+    )?;
+    for dependent in dependents {
+        refresh_job_readiness_in(transaction, &dependent, caused_by)?;
+    }
+    Ok(())
+}
+
+fn dependencies_satisfied_in(connection: &Connection, job_id: &str) -> Result<bool> {
+    let states: Vec<Option<String>> = query_all(
+        connection,
+        "SELECT prerequisite.state FROM domain_job_dependencies d LEFT JOIN domain_jobs prerequisite ON prerequisite.id=d.prerequisite_job_id AND prerequisite.project_id=d.project_id WHERE d.job_id=?1 ORDER BY d.prerequisite_job_id",
+        &[&job_id],
+        |row| row.get(0),
+    )?;
+    for state in states {
+        if !state
+            .as_deref()
+            .map(JobState::parse)
+            .transpose()?
+            .is_some_and(JobState::satisfies_dependency)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn refresh_job_readiness_in(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    caused_by: Option<u64>,
+) -> Result<()> {
+    let mut job = read_job(transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+    if !matches!(job.state, JobState::Pending | JobState::Eligible)
+        || job.authoritative_attempt_id.is_some()
+    {
+        return Ok(());
+    }
+    let state = if dependencies_satisfied_in(transaction, job_id)? {
+        JobState::Eligible
+    } else {
+        JobState::Pending
+    };
+    if job.state == state {
+        return Ok(());
+    }
+    job.state = state;
+    job.updated_at = now();
+    transaction.execute(
+        "UPDATE domain_jobs SET state=?2,updated_at=?3 WHERE id=?1 AND state IN ('pending','eligible') AND authoritative_attempt_id IS NULL",
+        params![job_id, state.to_string(), job.updated_at],
+    ).map_err(sql)?;
+    emit_job(transaction, EventKind::JobUpdated, &job, caused_by)?;
     Ok(())
 }
 
@@ -6763,14 +6808,7 @@ fn create_attempt_in(
     if state != "eligible" {
         return Err(invalid("Job is not eligible for an Attempt"));
     }
-    let blocked: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM domain_job_dependencies d JOIN domain_jobs prerequisite ON prerequisite.id=d.prerequisite_job_id WHERE d.job_id=?1 AND prerequisite.state!='completed')",
-                [job_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-    if blocked {
+    if !dependencies_satisfied_in(transaction, job_id)? {
         return Err(invalid("Job dependencies are not satisfied"));
     }
     let generation = generation
