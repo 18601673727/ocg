@@ -8,7 +8,8 @@
 use crate::core_contract::{Failure, FailureClass};
 use crate::error::{OcgError, Result};
 use crate::orchestration::domain::{
-    Attempt, Call, DispatchIntent, DomainRepository, Executor, Job, JobState,
+    Attempt, AttemptAuthority, Call, ChildPolicy, DispatchIntent, DomainRepository, Executor, Job,
+    JobOrigin, JobSpec, JobState,
 };
 use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
@@ -235,6 +236,8 @@ pub struct CanonicalJobSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct CanonicalJobRelations {
     pub parent_job_id: Option<String>,
+    #[serde(default)]
+    pub origin: Option<JobOrigin>,
     pub child_job_ids: Vec<String>,
     pub depends_on: Vec<String>,
     pub blocks: Vec<String>,
@@ -247,6 +250,7 @@ impl CanonicalJobRelations {
         job: &Job,
         projection: &ExecutionProjection,
         origins: &BTreeMap<String, String>,
+        origin_details: &BTreeMap<String, JobOrigin>,
     ) -> Self {
         let depends_on: Vec<String> = projection
             .dependencies
@@ -266,6 +270,7 @@ impl CanonicalJobRelations {
             .collect();
         Self {
             parent_job_id: origins.get(&job.id).cloned(),
+            origin: origin_details.get(&job.id).cloned(),
             child_job_ids: origins
                 .iter()
                 .filter(|(_, parent)| *parent == &job.id)
@@ -326,6 +331,29 @@ pub struct CanonicalJobOperationResponse {
     pub api_version: String,
     pub job_id: String,
     pub accepted: bool,
+    pub snapshot: CanonicalJobSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalJobSpawnRequest {
+    pub parent_attempt_id: String,
+    pub expected_generation: u64,
+    pub spawn_key: String,
+    pub spec: JobSpec,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    pub executor_kind: String,
+    #[serde(default)]
+    pub policy: ChildPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CanonicalJobSpawnResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub child_job_id: String,
+    pub duplicate: bool,
     pub snapshot: CanonicalJobSnapshot,
 }
 
@@ -1208,8 +1236,9 @@ impl CanonicalControlService {
         let (_, repository) = self.project_repository(project_id)?;
         let mut snapshot = repository.execution_snapshot()?;
         let origins = std::mem::take(&mut snapshot.job_origins);
+        let origin_details = std::mem::take(&mut snapshot.job_origin_details);
         let projection = ExecutionProjection::from(snapshot);
-        Self::snapshot_from_projection(project_id, job_id, &projection, &origins)
+        Self::snapshot_from_projection(project_id, job_id, &projection, &origins, &origin_details)
     }
 
     fn snapshot_from_projection(
@@ -1217,6 +1246,7 @@ impl CanonicalControlService {
         job_id: &str,
         projection: &ExecutionProjection,
         origins: &BTreeMap<String, String>,
+        origin_details: &BTreeMap<String, JobOrigin>,
     ) -> Result<CanonicalJobSnapshot> {
         let job = projection
             .jobs
@@ -1256,7 +1286,8 @@ impl CanonicalControlService {
             .filter(|intent| intent.job_id == job.id)
             .cloned()
             .collect();
-        let relations = CanonicalJobRelations::from_projection(job, projection, origins);
+        let relations =
+            CanonicalJobRelations::from_projection(job, projection, origins, origin_details);
         let operations = CanonicalJobOperations::for_job(job, relations.blocked);
         let value = json!({
             "job":CanonicalJobView {
@@ -1345,13 +1376,19 @@ impl CanonicalControlService {
         let (project, repository) = self.project_repository(project_id)?;
         let mut snapshot = repository.execution_snapshot()?;
         let origins = std::mem::take(&mut snapshot.job_origins);
+        let origin_details = std::mem::take(&mut snapshot.job_origin_details);
         let projection = ExecutionProjection::from(snapshot);
         let mut jobs: Vec<CanonicalJobSummary> = projection
             .jobs
             .values()
             .filter(|job| job.project_id == project_id)
             .map(|job| {
-                let relations = CanonicalJobRelations::from_projection(job, &projection, &origins);
+                let relations = CanonicalJobRelations::from_projection(
+                    job,
+                    &projection,
+                    &origins,
+                    &origin_details,
+                );
                 CanonicalJobSummary {
                     job_id: job.id.clone(),
                     created_at: job.created_at,
@@ -1367,7 +1404,15 @@ impl CanonicalControlService {
             (left.created_at, &left.job_id).cmp(&(right.created_at, &right.job_id))
         });
         let selected_job = job_id
-            .map(|id| Self::snapshot_from_projection(project_id, id, &projection, &origins))
+            .map(|id| {
+                Self::snapshot_from_projection(
+                    project_id,
+                    id,
+                    &projection,
+                    &origins,
+                    &origin_details,
+                )
+            })
             .transpose()?;
         Ok(CanonicalDashboardResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -1389,6 +1434,38 @@ impl CanonicalControlService {
         self.launch_job_inner(request)
     }
 
+    pub fn spawn_job(
+        &self,
+        parent_job_id: &str,
+        request: CanonicalJobSpawnRequest,
+    ) -> Result<CanonicalJobSpawnResponse> {
+        let mut domain = self.repository_for_job(parent_job_id)?;
+        let authority = AttemptAuthority {
+            job_id: parent_job_id.to_string(),
+            attempt_id: request.parent_attempt_id,
+            generation: request.expected_generation,
+        };
+        let prerequisites = request
+            .depends_on
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let (child, duplicate) = domain.spawn_child(
+            &authority,
+            &request.spawn_key,
+            request.spec,
+            &prerequisites,
+            &request.executor_kind,
+            &request.policy,
+        )?;
+        Ok(CanonicalJobSpawnResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            snapshot: self.canonical_snapshot(&child.project_id, &child.id)?,
+            child_job_id: child.id,
+            duplicate,
+        })
+    }
+
     pub fn cancel_job(
         &self,
         job_id: &str,
@@ -1399,8 +1476,8 @@ impl CanonicalControlService {
             .job(job_id)?
             .ok_or_else(|| invalid("unknown canonical Job"))?;
         let accepted = job.state.can_cancel();
-        if let Some((authority, never_started)) =
-            domain.request_job_cancel(job_id, expected_generation)?
+        for (authority, never_started) in
+            domain.request_job_cancel_cascade(job_id, expected_generation)?
         {
             let runtime = if let Some(registry) = &self.runtime_registry {
                 registry.handle(&job.project_id)?
@@ -2411,9 +2488,11 @@ impl CanonicalControlService {
         // create — `cancel_chat` could not, because it had no Attempt identity
         // then — and let the queued envelope be fenced by the worker.
         if cancelled.is_cancelled() {
-            let (_, mut domain) = self.project_repository(&request.project_id)?;
-            if domain.request_cancel(&attempt_id).is_ok() {
-                let _ = domain.confirm_cancel(&attempt_id, true);
+            let (_, domain) = self.project_repository(&request.project_id)?;
+            if let Some(job) = domain.job(&job_id)? {
+                if job.authoritative_attempt_id.as_deref() == Some(attempt_id.as_str()) {
+                    self.cancel_job(&job.id, job.generation)?;
+                }
             }
             return Ok(response);
         }
@@ -2439,9 +2518,11 @@ impl CanonicalControlService {
         if !published {
             // The turn was cancelled between launch and publication. Settle the
             // Attempt it created rather than leaving it live and unreachable.
-            let (_, mut domain) = self.project_repository(&request.project_id)?;
-            if domain.request_cancel(&attempt_id).is_ok() {
-                let _ = domain.confirm_cancel(&attempt_id, true);
+            let (_, domain) = self.project_repository(&request.project_id)?;
+            if let Some(job) = domain.job(&job_id)? {
+                if job.authoritative_attempt_id.as_deref() == Some(attempt_id.as_str()) {
+                    self.cancel_job(&job.id, job.generation)?;
+                }
             }
         }
         Ok(response)

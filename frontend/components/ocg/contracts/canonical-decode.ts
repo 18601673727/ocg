@@ -22,6 +22,9 @@ import type {
   CanonicalJobConfigResponse,
   CanonicalJobEvent,
   CanonicalJobRelations,
+  CanonicalJobSpawnResponse,
+  ChildPolicy,
+  JobOrigin,
   CanonicalJobOperations,
   CanonicalJobOperationResponse,
   Failure,
@@ -471,11 +474,44 @@ const jobOperations: Decoder<CanonicalJobOperations & { termination_reason: Fail
   return yes({ can_cancel: cancel.value, can_retry: retry.value, termination_reason: reason.value });
 };
 
+const childPolicy: Decoder<ChildPolicy> = (input, path) => {
+  const rec = record(input, path, "a child supervision policy");
+  if (!rec.ok) return rec;
+  const join = req(rec.value, "join", oneOf<ChildPolicy["join"]>(["required", "not_required"]), path);
+  if (!join.ok) return join;
+  const cancellation = req(rec.value, "cancellation", oneOf<ChildPolicy["cancellation"]>(["cascade", "independent"]), path);
+  if (!cancellation.ok) return cancellation;
+  const failure = req(rec.value, "failure", oneOf<ChildPolicy["failure"]>(["observe", "block_parent", "fail_parent"]), path);
+  if (!failure.ok) return failure;
+  return yes({ join: join.value, cancellation: cancellation.value, failure: failure.value });
+};
+
+const jobOrigin: Decoder<JobOrigin> = (input, path) => {
+  const rec = record(input, path, "a child Job origin");
+  if (!rec.ok) return rec;
+  const parent = req(rec.value, "parent_job_id", identity, path);
+  if (!parent.ok) return parent;
+  const attempt = req(rec.value, "attempt_id", identity, path);
+  if (!attempt.ok) return attempt;
+  const generation = req(rec.value, "generation", index, path);
+  if (!generation.ok) return generation;
+  const key = req(rec.value, "spawn_key", nullable(identity), path);
+  if (!key.ok) return key;
+  const fingerprint = req(rec.value, "spawn_fingerprint", nullable(identity), path);
+  if (!fingerprint.ok) return fingerprint;
+  const policy = req(rec.value, "policy", nullable(childPolicy), path);
+  if (!policy.ok) return policy;
+  return yes({ parent_job_id: parent.value, attempt_id: attempt.value, generation: generation.value, spawn_key: key.value, spawn_fingerprint: fingerprint.value, policy: policy.value });
+};
+
 const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
   const rec = record(input, path, "canonical Job relationships");
   if (!rec.ok) return rec;
   const parentJobId = req(rec.value, "parent_job_id", nullable(identity), path);
   if (!parentJobId.ok) return parentJobId;
+  const origin = opt(rec.value, "origin", nullable(jobOrigin), path);
+  if (!origin.ok) return origin;
+  if (origin.value && origin.value.parent_job_id !== parentJobId.value) return bad(`${path}.origin.parent_job_id`, "the projected parent Job identity");
   const childJobIds = req(rec.value, "child_job_ids", array(identity), path);
   if (!childJobIds.ok) return childJobIds;
   const dependsOn = req(rec.value, "depends_on", array(identity), path);
@@ -488,6 +524,7 @@ const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
   if (!blocked.ok) return blocked;
   return yes({
     parent_job_id: parentJobId.value,
+    origin: origin.value ?? null,
     child_job_ids: childJobIds.value,
     depends_on: dependsOn.value,
     blocks: blocks.value,
@@ -1049,6 +1086,22 @@ export const decodeJobLaunchResponse = (input: unknown): CanonicalJobLaunchAck =
 
 export const decodeEventsEnvelope = (input: unknown): CanonicalEventsEnvelope =>
   decode((value) => eventsEnvelope(value, ""), input);
+
+export const decodeJobSpawnResponse = (input: unknown): CanonicalJobSpawnResponse =>
+  decode((input) => {
+    const path = "";
+    const rec = record(input, path, "a canonical child Job spawn response");
+    if (!rec.ok) return rec;
+    const version = req(rec.value, "api_version", literal(CANONICAL_API_VERSION), path);
+    if (!version.ok) return version;
+    const childId = req(rec.value, "child_job_id", identity, path);
+    if (!childId.ok) return childId;
+    const duplicate = req(rec.value, "duplicate", boolean, path);
+    if (!duplicate.ok) return duplicate;
+    const snapshot = req(rec.value, "snapshot", jobSnapshot, path);
+    if (!snapshot.ok) return snapshot;
+    return yes({ api_version: version.value, child_job_id: childId.value, duplicate: duplicate.value, snapshot: snapshot.value });
+  }, input);
 
 export const decodeJobOperationResponse = (input: unknown): CanonicalJobOperationResponse =>
   decode((input) => {

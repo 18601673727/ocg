@@ -52,6 +52,7 @@ function job(seed: JobSeed): CanonicalJob {
     created_at: createdAt,
     updated_at: seed.updatedAt ?? createdAt,
     parent_job_id: null,
+    origin: null,
     child_job_ids: [],
     depends_on: [],
     blocks: [],

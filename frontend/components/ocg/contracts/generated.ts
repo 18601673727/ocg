@@ -92,13 +92,19 @@ export type CanonicalJobOperationResponse = { api_version: CanonicalApiVersion, 
 export type CanonicalJobOperations = { can_cancel: boolean, can_retry: boolean, };
 
 
-export type CanonicalJobRelations = { parent_job_id: string | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, };
+export type CanonicalJobRelations = { parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, };
 
 
 export type CanonicalJobSnapshot = { api_version: CanonicalApiVersion, project_id: string, job: JsonValue, cursor: number, };
 
 
-export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null, parent_job_id: string | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, can_cancel: boolean, can_retry: boolean, };
+export type CanonicalJobSpawnRequest = { parent_attempt_id: string, expected_generation: number, spawn_key: string, spec: JobSpec, depends_on: Array<string>, executor_kind: string, policy: ChildPolicy, };
+
+
+export type CanonicalJobSpawnResponse = { api_version: CanonicalApiVersion, child_job_id: string, duplicate: boolean, snapshot: CanonicalJobSnapshot, };
+
+
+export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null, parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, can_cancel: boolean, can_retry: boolean, };
 
 
 export type CanonicalProjectResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, project: ProjectRecord, };
@@ -150,6 +156,18 @@ export type ChatModelSelection = { model: string, effort: string | null, };
 
 
 export type ChatSendRequest = { selection: ChatModelSelection | null, image_ids: Array<string>, command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
+
+
+export type ChildCancellationPolicy = "cascade" | "independent";
+
+
+export type ChildFailurePolicy = "observe" | "block_parent" | "fail_parent";
+
+
+export type ChildJoinPolicy = "required" | "not_required";
+
+
+export type ChildPolicy = { join: ChildJoinPolicy, cancellation: ChildCancellationPolicy, failure: ChildFailurePolicy, };
 
 
 export type ClientKind = "pwa" | "cli";
@@ -208,6 +226,12 @@ export type JobLaunchResponse = { api_version: CanonicalApiVersion,
  * "accepted" | "rejected" | "failed"
  */
 outcome: string, command_id: string, draft_id: string, project_id: string, session_id: string, job_id: string | null, message: string, duplicate: boolean, };
+
+
+export type JobOrigin = { parent_job_id: string, attempt_id: string, generation: number, spawn_key: string | null, spawn_fingerprint: string | null, policy: ChildPolicy | null, };
+
+
+export type JobSpec = { provider: string | null, model: string | null, objective: string | null, success_criteria: string | null, constraints: string | null, hard_budget_micros: number | null, resource_commitment: number | null, };
 
 
 export type JobUsageResponse = { api_version: CanonicalApiVersion, project_id: string, job_id: string, generated_at: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, truncated: boolean, };

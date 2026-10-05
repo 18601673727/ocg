@@ -36,6 +36,9 @@ import {
   decodeJobLaunchResponse,
   decodeJobSnapshot,
   decodeJobOperationResponse,
+  decodeJobSpawnResponse,
+  type CanonicalJobSpawnRequest,
+  type CanonicalJobSpawnResponse,
   type CanonicalJobOperationRequest,
   type CanonicalJobOperationResponse,
   decodeProjectResponse,
@@ -125,6 +128,7 @@ export interface CanonicalControlClient {
     jobId: string,
     configuration: JsonValue,
   ): Promise<CanonicalResult<CanonicalJobConfigAck>>;
+  spawnJob(parentJobId: string, request: CanonicalJobSpawnRequest): Promise<CanonicalResult<CanonicalJobSpawnResponse>>;
   cancelJob(jobId: string, request: CanonicalJobOperationRequest): Promise<CanonicalResult<CanonicalJobOperationResponse>>;
   retryJob(jobId: string, request: CanonicalJobOperationRequest): Promise<CanonicalResult<CanonicalJobOperationResponse>>;
   readJobSnapshot(
@@ -374,6 +378,13 @@ export function createHttpCanonicalControlClient(
       } catch (error) {
         return contractRejection(commandId, error);
       }
+    },
+
+    async spawnJob(parentJobId, request) {
+      const { status, value, text } = await send("POST", `/api/v1/canonical/jobs/${encodeURIComponent(parentJobId)}/spawn`, request);
+      if (status !== 200) return rejection(parentJobId, status, text);
+      try { return decodeJobSpawnResponse(value); }
+      catch (error) { return contractRejection(parentJobId, error); }
     },
 
     async cancelJob(jobId, request) {

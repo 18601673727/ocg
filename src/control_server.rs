@@ -1136,6 +1136,12 @@ fn handle_canonical(
                     .map_err(|error| OcgError::config(error.to_string()))?;
                 answer!(service.launch_job(request, now)?)
             }
+            Route::CanonicalJobSpawn { job } => {
+                let request: crate::contracts::CanonicalJobSpawnRequest =
+                    serde_json::from_value(body()?)
+                        .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.spawn_job(job, request)?)
+            }
             Route::CanonicalJobCancel { job } | Route::CanonicalJobRetry { job } => {
                 let request: crate::contracts::CanonicalJobOperationRequest =
                     serde_json::from_value(body()?)
@@ -1232,6 +1238,7 @@ fn handle_canonical(
             | Route::CanonicalJobLaunch
             | Route::CanonicalJobCancel { .. }
             | Route::CanonicalJobRetry { .. }
+            | Route::CanonicalJobSpawn { .. }
             | Route::CanonicalSnapshot
             | Route::CanonicalEvents
             | Route::CanonicalDashboard
@@ -1905,6 +1912,7 @@ enum Route {
     CanonicalJobLaunch,
     CanonicalJobCancel { job: String },
     CanonicalJobRetry { job: String },
+    CanonicalJobSpawn { job: String },
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
@@ -1970,7 +1978,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("GET", ["api", "v1", "canonical", "jobs"])
                 | ("GET", ["api", "v1", "canonical", "jobs", "events"])
                 | ("POST", ["api", "v1", "canonical", "jobs", "launch"])
-                | ("POST", ["api", "v1", "canonical", "jobs", _, "cancel" | "retry"])
+                | ("POST", ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"])
                 | ("GET", ["api", "v1", "canonical", "dashboard"])
                 | ("POST", ["api", "v1", "canonical", "chat", "images"])
                 | ("GET", ["api", "v1", "canonical", "chat", "images", _, _])
@@ -1991,7 +1999,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "launch"])
-                | ("OPTIONS", ["api", "v1", "canonical", "jobs", _, "cancel" | "retry"])
+                | ("OPTIONS", ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"])
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
                 | ("GET" | "OPTIONS", ["api", "v1", "canonical", "usage"])
                 | ("GET" | "OPTIONS", ["api", "v1", "canonical", "chat", "usage"])
@@ -2049,6 +2057,9 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
             Ok(Route::CanonicalJobConfigPut { job: safe_id(job)? })
         }
         ("POST", ["api", "v1", "canonical", "jobs", "launch"]) => Ok(Route::CanonicalJobLaunch),
+        ("POST", ["api", "v1", "canonical", "jobs", job, "spawn"]) => {
+            Ok(Route::CanonicalJobSpawn { job: safe_id(job)? })
+        }
         ("POST", ["api", "v1", "canonical", "jobs", job, "cancel"]) => {
             Ok(Route::CanonicalJobCancel { job: safe_id(job)? })
         }
@@ -2163,7 +2174,7 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
         ["api", "v1", "canonical", "chat", "images", _, _] => Some("GET"),
         ["api", "v1", "canonical", "chat", "images"] => Some("POST"),
-        ["api", "v1", "canonical", "jobs", _, "cancel" | "retry"] => Some("POST"),
+        ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"] => Some("POST"),
         ["api", "v1", "canonical", "jobs", "launch"]
         | ["api", "v1", "canonical", "chat", "send"]
         | ["api", "v1", "canonical", "chat", "cancel"] => Some("POST"),

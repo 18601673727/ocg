@@ -396,6 +396,50 @@ fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Fai
             let admission = repository.admit_job(project, &binding, spec, &option("agent").unwrap_or_else(|| "lead".into()))?;
             print(json!({"project_id": admission.project.id, "job_id": admission.job.id, "attempt_id": admission.attempt.id, "executor_id": admission.executor.id, "generation": admission.attempt.generation}))
         }
+        "spawn" => {
+            let parent = crate::orchestration::domain::AttemptAuthority {
+                job_id: required("job")?,
+                attempt_id: required("attempt")?,
+                generation: required("generation")?
+                    .parse::<u64>()
+                    .map_err(|_| Failure::Usage("--generation must be an integer".into()))?,
+            };
+            let spec = crate::orchestration::domain::JobSpec {
+                objective: Some(required("objective")?),
+                ..Default::default()
+            };
+            let mut policy = serde_json::Map::new();
+            for dimension in ["join", "cancellation", "failure"] {
+                if let Some(value) = option(dimension) {
+                    policy.insert(dimension.to_string(), json!(value));
+                }
+            }
+            let policy = serde_json::from_value::<crate::orchestration::domain::ChildPolicy>(
+                Value::Object(policy),
+            )
+            .map_err(|error| OcgError::config(error.to_string()))?;
+            let dependencies = option("depends-on")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let prerequisites = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
+            let (job, duplicate) = repository.spawn_child(
+                &parent,
+                &required("spawn-key")?,
+                spec,
+                &prerequisites,
+                &option("agent").unwrap_or_else(|| "worker".into()),
+                &policy,
+            )?;
+            print(
+                json!({"project_id": job.project_id, "job_id": job.id, "duplicate": duplicate, "job": job}),
+            )
+        }
         "plan" | "child" => {
             let session = required("session")?;
             let parent = repository.authority_for_binding(&project.id, &session)?.ok_or_else(|| Failure::Ocg(OcgError::config("session has no canonical authority")))?;

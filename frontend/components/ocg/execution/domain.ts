@@ -25,6 +25,7 @@ import type {
   CanonicalExecutor,
   CanonicalJobRelations,
   CanonicalJobOperations,
+  JobOrigin,
   Failure,
   CanonicalJobState,
 } from "../contracts";
@@ -482,6 +483,7 @@ export type JobExecution = {
   projectId: ProjectId;
   jobId: string;
   parentJobId: string | null;
+  origin: JobOrigin | null;
   childJobIds: string[];
   dependsOn: string[];
   blocks: string[];
@@ -603,6 +605,7 @@ export function assembleJobExecution(input: {
     projectId,
     jobId: input.job.id,
     parentJobId: input.job.parent_job_id,
+    origin: input.job.origin,
     childJobIds: input.job.child_job_ids,
     dependsOn: input.job.depends_on,
     blocks: input.job.blocks,

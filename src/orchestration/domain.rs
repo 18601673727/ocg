@@ -57,7 +57,7 @@ fn validate_id(value: &str) -> Result<()> {
 /// boundary but remain separately named throughout the domain API.
 pub type JobId = String;
 pub type AttemptId = String;
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(default)]
 pub struct JobSpec {
     pub provider: Option<String>,
@@ -164,6 +164,55 @@ fn ensure_column(
             .map_err(sql)?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildJoinPolicy {
+    Required,
+    #[default]
+    NotRequired,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildCancellationPolicy {
+    #[default]
+    Cascade,
+    Independent,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildFailurePolicy {
+    #[default]
+    Observe,
+    BlockParent,
+    FailParent,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChildPolicy {
+    pub join: ChildJoinPolicy,
+    pub cancellation: ChildCancellationPolicy,
+    pub failure: ChildFailurePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+pub struct JobOrigin {
+    pub parent_job_id: JobId,
+    pub attempt_id: AttemptId,
+    pub generation: u64,
+    pub spawn_key: Option<String>,
+    pub spawn_fingerprint: Option<String>,
+    pub policy: Option<ChildPolicy>,
+}
+
+struct ChildSpawnMetadata<'a> {
+    key: &'a str,
+    fingerprint: String,
+    policy: &'a ChildPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -750,6 +799,17 @@ impl DomainRepository {
             "TEXT",
         )?;
         ensure_column(&connection, "domain_jobs", "termination_reason", "TEXT")?;
+        ensure_column(&connection, "domain_job_origins", "spawn_key", "TEXT")?;
+        ensure_column(
+            &connection,
+            "domain_job_origins",
+            "spawn_fingerprint",
+            "TEXT",
+        )?;
+        ensure_column(&connection, "domain_job_origins", "policy", "TEXT")?;
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS domain_job_spawn_keys ON domain_job_origins(parent_job_id,spawn_key) WHERE spawn_key IS NOT NULL", [],
+        ).map_err(sql)?;
         ensure_column(&connection, "domain_job_bindings", "attempt_id", "TEXT")?;
         connection.execute(
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
@@ -1239,6 +1299,7 @@ impl DomainRepository {
             dispatch_intents: all_dispatch_intents(view)?,
             dependencies: all_dependencies(view)?,
             job_origins: all_job_origins(view)?,
+            job_origin_details: all_job_origin_details(view)?,
             bindings: all_bindings(view)?,
             job_configurations: all_job_configurations(view)?,
             result_evidence: all_result_evidence(view)?,
@@ -2492,8 +2553,8 @@ impl DomainRepository {
                 .map_err(sql)?;
         }
         transaction.execute(
-            "INSERT INTO domain_job_origins(job_id,parent_job_id,attempt_id,generation) VALUES(?1,?2,?3,?4)",
-            params![job_id,parent_authority.job_id,parent_authority.attempt_id,parent_generation],
+            "INSERT INTO domain_job_origins(job_id,parent_job_id,attempt_id,generation,policy) VALUES(?1,?2,?3,?4,?5)",
+            params![job_id,parent_authority.job_id,parent_authority.attempt_id,parent_generation, serde_json::to_string(&ChildPolicy::default()).map_err(|error| invalid(&error.to_string()))?],
         ).map_err(sql)?;
         if !prerequisite_job_ids.is_empty() {
             transaction
@@ -2562,6 +2623,75 @@ impl DomainRepository {
         S: TryInto<JobSpec>,
         S::Error: std::fmt::Display,
     {
+        self.admit_child_inner(
+            parent_authority,
+            spec,
+            prerequisite_job_ids,
+            executor_kind,
+            None,
+        )
+        .map(|(admission, _)| admission)
+    }
+
+    pub fn spawn_child(
+        &mut self,
+        parent_authority: &AttemptAuthority,
+        spawn_key: &str,
+        spec: JobSpec,
+        prerequisite_job_ids: &[&str],
+        executor_kind: &str,
+        policy: &ChildPolicy,
+    ) -> Result<(Job, bool)> {
+        validate_id(spawn_key)?;
+        let project = self
+            .job(&parent_authority.job_id)?
+            .ok_or_else(|| invalid("unknown parent Job"))?;
+        let mut arguments =
+            serde_json::to_value(&spec).map_err(|error| invalid(&error.to_string()))?;
+        // The shared fingerprint profile requires semantic decimals as strings.
+        if let Some(commitment) = spec.resource_commitment {
+            if !commitment.is_finite() || commitment < 0.0 {
+                return Err(invalid("invalid child resource commitment"));
+            }
+            arguments["resource_commitment"] = serde_json::Value::String(commitment.to_string());
+        }
+        let mut prerequisites = prerequisite_job_ids.to_vec();
+        prerequisites.sort_unstable();
+        prerequisites.dedup();
+        let fingerprint = crate::fingerprint::CommandFingerprintInputV1::new(
+            ProjectScope::new(&project.project_id)?, "spawn_job",
+            Some(EntityRef { kind: EntityKind::Job,
+                id: EntityId::new(parent_authority.job_id.strip_prefix("job-").unwrap_or(&parent_authority.job_id))?,
+            }),
+            serde_json::json!({"spec": arguments, "depends_on": prerequisites, "executor_kind": executor_kind, "policy": policy}),
+        ).fingerprint()?;
+        let metadata = ChildSpawnMetadata {
+            key: spawn_key,
+            fingerprint,
+            policy,
+        };
+        self.admit_child_inner(
+            parent_authority,
+            spec,
+            &prerequisites,
+            executor_kind,
+            Some(&metadata),
+        )
+        .map(|(admission, duplicate)| (admission.job, duplicate))
+    }
+
+    fn admit_child_inner<S>(
+        &mut self,
+        parent_authority: &AttemptAuthority,
+        spec: S,
+        prerequisite_job_ids: &[&str],
+        executor_kind: &str,
+        spawn: Option<&ChildSpawnMetadata<'_>>,
+    ) -> Result<(CanonicalAdmission, bool)>
+    where
+        S: TryInto<JobSpec>,
+        S::Error: std::fmt::Display,
+    {
         let (spec, payload) = stored_job_spec(spec)?;
         validate_id(&parent_authority.attempt_id)?;
         validate_id(&parent_authority.job_id)?;
@@ -2581,6 +2711,42 @@ impl DomainRepository {
             .optional()
             .map_err(sql)?
             .ok_or_else(|| invalid("parent Attempt is no longer authoritative"))?;
+
+        if let Some(spawn) = spawn {
+            let existing: Option<(String, Option<String>)> = transaction.query_row(
+                "SELECT job_id,spawn_fingerprint FROM domain_job_origins WHERE parent_job_id=?1 AND spawn_key=?2",
+                params![parent_authority.job_id, spawn.key], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(sql)?;
+            if let Some((child_id, fingerprint)) = existing {
+                if fingerprint.as_deref() != Some(spawn.fingerprint.as_str()) {
+                    return Err(invalid(
+                        "spawn_key already used with different child inputs",
+                    ));
+                }
+                let job = read_job(&transaction, &child_id)?
+                    .ok_or_else(|| invalid("spawned Job disappeared"))?;
+                if job.project_id != project_id {
+                    return Err(invalid("spawned Job is not in the parent Project"));
+                }
+                let attempt_id: String = transaction.query_row("SELECT id FROM domain_attempts WHERE job_id=?1 ORDER BY generation,id LIMIT 1", [&child_id], |row| row.get(0)).map_err(sql)?;
+                let executor_id: String = transaction
+                    .query_row(
+                        "SELECT id FROM domain_executors WHERE attempt_id=?1 ORDER BY id LIMIT 1",
+                        [&attempt_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql)?;
+                let admission = CanonicalAdmission {
+                    project: read_project(&transaction, &project_id)?,
+                    job,
+                    attempt: read_attempt(&transaction, &attempt_id)?,
+                    executor: read_executor(&transaction, &executor_id)?
+                        .ok_or_else(|| invalid("spawned Executor disappeared"))?,
+                };
+                transaction.commit().map_err(sql)?;
+                return Ok((admission, true));
+            }
+        }
 
         // A child is only executable when every prerequisite has already
         // completed. Check this while holding the admission transaction so a
@@ -2615,8 +2781,8 @@ impl DomainRepository {
             )
             .map_err(sql)?;
         transaction.execute(
-            "INSERT INTO domain_job_origins(job_id,parent_job_id,attempt_id,generation) VALUES(?1,?2,?3,?4)",
-            params![job_id,parent_authority.job_id,parent_authority.attempt_id,parent_generation],
+            "INSERT INTO domain_job_origins(job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,policy) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![job_id,parent_authority.job_id,parent_authority.attempt_id,parent_generation,spawn.map(|value| value.key),spawn.map(|value| value.fingerprint.as_str()),serde_json::to_string(spawn.map(|value| value.policy).unwrap_or(&ChildPolicy::default())).map_err(|error| invalid(&error.to_string()))?],
         ).map_err(sql)?;
         for prerequisite in prerequisite_job_ids {
             validate_id(prerequisite)?;
@@ -2747,25 +2913,15 @@ impl DomainRepository {
         )?;
         transaction.commit().map_err(sql)?;
 
-        Ok(CanonicalAdmission {
-            project: self
-                .connection
-                .query_row(
-                    "SELECT id,root,created_at FROM domain_projects WHERE id=?1",
-                    [&project_id],
-                    |row| {
-                        Ok(Project {
-                            id: row.get(0)?,
-                            root: row.get(1)?,
-                            created_at: row.get(2)?,
-                        })
-                    },
-                )
-                .map_err(sql)?,
-            job,
-            attempt,
-            executor,
-        })
+        Ok((
+            CanonicalAdmission {
+                project: read_project(&self.connection, &project_id)?,
+                job,
+                attempt,
+                executor,
+            },
+            false,
+        ))
     }
 
     /// Admit one externally bound execution into the canonical domain.
@@ -4075,48 +4231,57 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
-        if job.generation != expected_generation {
+        let result = request_job_cancel_in(&transaction, job_id, expected_generation)?;
+        transaction.commit().map_err(sql)?;
+        Ok(result)
+    }
+
+    pub fn request_job_cancel_cascade(
+        &mut self,
+        job_id: &str,
+        expected_generation: u64,
+    ) -> Result<Vec<(AttemptAuthority, bool)>> {
+        validate_id(job_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let root = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        if root.generation != expected_generation {
             return Err(invalid("cancel rejected: Job generation changed"));
         }
-        if !job.state.can_cancel() {
-            transaction.commit().map_err(sql)?;
-            return Ok(None);
+        let mut authorities = Vec::new();
+        let cancelling = root.state.can_cancel()
+            || root.state == JobState::Cancelled
+            || root.termination_reason.as_ref().is_some_and(|reason| {
+                reason.code == "cancel_stop_unknown" || reason.code == "cancel_orphaned"
+            });
+        let mut pending = std::collections::BTreeSet::new();
+        let mut visited = std::collections::BTreeSet::new();
+        if cancelling {
+            pending.insert(job_id.to_string());
         }
-        let Some(attempt_id) = job.authoritative_attempt_id.as_deref() else {
-            if !matches!(job.state, JobState::Pending | JobState::Eligible) {
-                return Err(invalid("active Job has no Attempt to cancel"));
+        // Revoking the entire persisted cascade in one transaction prevents a
+        // child from spawning behind the traversal or replacing its Attempt.
+        while let Some(id) = pending.pop_first() {
+            if !visited.insert(id.clone()) {
+                continue;
             }
-            let reason = job_failure(
-                "job_cancelled",
-                FailureClass::Cancelled,
-                "Job cancelled before execution",
-                true,
-            );
-            transaction.execute(
-                "UPDATE domain_jobs SET state='cancelled',termination_reason=?2,updated_at=?3 WHERE id=?1",
-                params![job_id, serde_json::to_string(&reason).map_err(|error| invalid(&error.to_string()))?, now()],
-            ).map_err(sql)?;
-            let job = read_job(&transaction, job_id)?
-                .ok_or_else(|| invalid("cancelled Job disappeared"))?;
-            emit_job(&transaction, EventKind::JobUpdated, &job, None)?;
-            transaction.commit().map_err(sql)?;
-            return Ok(None);
-        };
-        let attempt = read_attempt(&transaction, attempt_id)?;
-        let never_started = attempt.state == AttemptState::Queued
-            && !transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM domain_calls WHERE attempt_id=?1 AND state!='created') OR EXISTS(SELECT 1 FROM domain_dispatch_intents WHERE attempt_id=?1 AND effect_state IN ('started','unknown','settled'))",
-                [attempt_id], |row| row.get::<_, bool>(0),
-            ).map_err(sql)?;
-        finish_attempt_in(&transaction, attempt_id, "cancelling", false)?;
-        let authority = AttemptAuthority {
-            attempt_id: attempt.id,
-            job_id: job.id,
-            generation: attempt.generation,
-        };
+            let job =
+                read_job(&transaction, &id)?.ok_or_else(|| invalid("cascade Job disappeared"))?;
+            if job.project_id != root.project_id {
+                return Err(invalid("child is not in the parent Project"));
+            }
+            if let Some(authority) = request_job_cancel_in(&transaction, &id, job.generation)? {
+                authorities.push(authority);
+            }
+            let children: Vec<String> = query_all(&transaction,
+                "SELECT job_id FROM domain_job_origins WHERE parent_job_id=?1 AND json_extract(policy,'$.cancellation')='cascade' ORDER BY job_id",
+                &[&id], |row| row.get(0))?;
+            pending.extend(children);
+        }
         transaction.commit().map_err(sql)?;
-        Ok(Some((authority, never_started)))
+        Ok(authorities)
     }
 
     pub fn finish_attempt(&mut self, attempt_id: &str, succeeded: bool) -> Result<()> {
@@ -5796,6 +5961,82 @@ fn all_dependencies(connection: &Connection) -> Result<Vec<journal::DependencyEd
             })
         },
     )
+}
+
+fn request_job_cancel_in(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    expected_generation: u64,
+) -> Result<Option<(AttemptAuthority, bool)>> {
+    let job = read_job(transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+    if job.generation != expected_generation {
+        return Err(invalid("cancel rejected: Job generation changed"));
+    }
+    if !job.state.can_cancel() {
+        return Ok(None);
+    }
+    let Some(attempt_id) = job.authoritative_attempt_id.as_deref() else {
+        if !matches!(job.state, JobState::Pending | JobState::Eligible) {
+            return Err(invalid("active Job has no Attempt to cancel"));
+        }
+        let reason = job_failure(
+            "job_cancelled",
+            FailureClass::Cancelled,
+            "Job cancelled before execution",
+            true,
+        );
+        transaction.execute(
+                "UPDATE domain_jobs SET state='cancelled',termination_reason=?2,updated_at=?3 WHERE id=?1",
+                params![job_id, serde_json::to_string(&reason).map_err(|error| invalid(&error.to_string()))?, now()],
+            ).map_err(sql)?;
+        let job =
+            read_job(transaction, job_id)?.ok_or_else(|| invalid("cancelled Job disappeared"))?;
+        emit_job(transaction, EventKind::JobUpdated, &job, None)?;
+        return Ok(None);
+    };
+    let attempt = read_attempt(transaction, attempt_id)?;
+    let never_started = attempt.state == AttemptState::Queued
+            && !transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM domain_calls WHERE attempt_id=?1 AND state!='created') OR EXISTS(SELECT 1 FROM domain_dispatch_intents WHERE attempt_id=?1 AND effect_state IN ('started','unknown','settled'))",
+                [attempt_id], |row| row.get::<_, bool>(0),
+            ).map_err(sql)?;
+    finish_attempt_in(transaction, attempt_id, "cancelling", false)?;
+    let authority = AttemptAuthority {
+        attempt_id: attempt.id,
+        job_id: job.id,
+        generation: attempt.generation,
+    };
+    Ok(Some((authority, never_started)))
+}
+
+fn read_project(connection: &Connection, project_id: &str) -> Result<Project> {
+    connection
+        .query_row(
+            "SELECT id,root,created_at FROM domain_projects WHERE id=?1",
+            [project_id],
+            |row| {
+                Ok(Project {
+                    id: row.get(0)?,
+                    root: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            },
+        )
+        .map_err(sql)
+}
+
+fn all_job_origin_details(
+    connection: &Connection,
+) -> Result<std::collections::BTreeMap<JobId, JobOrigin>> {
+    query_all(connection,
+        "SELECT job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,policy FROM domain_job_origins ORDER BY job_id", &[], |row| {
+            let policy = row.get::<_, Option<String>>(6)?.map(|value| serde_json::from_str(&value).map_err(|error| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error)))).transpose()?;
+            Ok((row.get(0)?, JobOrigin {
+                parent_job_id: row.get(1)?, attempt_id: row.get(2)?,
+                generation: u64::try_from(row.get::<_, i64>(3)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                spawn_key: row.get(4)?, spawn_fingerprint: row.get(5)?, policy,
+            }))
+        }).map(|origins| origins.into_iter().collect())
 }
 
 fn all_job_origins(connection: &Connection) -> Result<std::collections::BTreeMap<JobId, JobId>> {
