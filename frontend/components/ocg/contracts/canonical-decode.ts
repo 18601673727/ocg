@@ -359,10 +359,13 @@ export type CanonicalDispatchIntent = {
    * decision as it stood for *this* dispatch, so they are historical evidence
    * rather than a view of the current Profile.
    *
-   * Absent or `null` means no placement target was recorded — a native tool Call
-   * is dispatched without a Provider, and `upstream_model_id` arrived as a
-   * schema migration, so an older local store legitimately lacks the key. The
-   * budget reservation the dispatch admitted against is recorded alongside them.
+   * `null` means no target was recorded — a native tool Call is dispatched
+   * without a Provider. The budget reservation the dispatch admitted against is
+   * recorded alongside them.
+   *
+   * These are declared optional only so hand-built `CanonicalExecutionState`
+   * literals still typecheck; the decoder requires every key, so nothing decoded
+   * from a backend payload can leave them unset.
    */
   reservation_id?: string | null;
   provider_key?: string | null;
@@ -706,13 +709,16 @@ const dispatchIntent: Decoder<CanonicalDispatchIntent> = (input, path) => {
   if (!createdAt.ok) return createdAt;
   const updatedAt = req(rec.value, "updated_at", number, path);
   if (!updatedAt.ok) return updatedAt;
-  const reservationId = opt(rec.value, "reservation_id", string, path);
+  // The Rust contract serializes these as `Option<String>` without
+  // `skip_serializing_if`, so canonical output always carries the key holding a
+  // string or `null`. A missing key is a contract violation, not a `None`.
+  const reservationId = req(rec.value, "reservation_id", nullable(string), path);
   if (!reservationId.ok) return reservationId;
-  const providerKey = opt(rec.value, "provider_key", string, path);
+  const providerKey = req(rec.value, "provider_key", nullable(string), path);
   if (!providerKey.ok) return providerKey;
-  const model = opt(rec.value, "model", string, path);
+  const model = req(rec.value, "model", nullable(string), path);
   if (!model.ok) return model;
-  const upstreamModelId = opt(rec.value, "upstream_model_id", string, path);
+  const upstreamModelId = req(rec.value, "upstream_model_id", nullable(string), path);
   if (!upstreamModelId.ok) return upstreamModelId;
   return yes({
     id: id.value,

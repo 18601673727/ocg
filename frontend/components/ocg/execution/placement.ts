@@ -79,8 +79,20 @@ export type PlacementProjection = {
   targets: readonly PlacementTarget[];
   /** The recorded placement failure, when the backend produced one. */
   failure: Failure | null;
-  /** The newest recorded target, which is the one a reader means by "where". */
+  /**
+   * The current authoritative target: the frozen target belonging to the Job's
+   * current `authoritativeAttemptId`, and nothing else.
+   *
+   * `null` whenever that Attempt has not frozen a target yet, or when the Job
+   * has no authoritative Attempt. An older Attempt's target is real history and
+   * stays in `history`, but it is never promoted here: the backend can mint a
+   * new Attempt and Executor before the first provider DispatchIntent has its
+   * configuration frozen, and reading that window as "the selected target"
+   * would state a decision the current Attempt has not made.
+   */
   selected: PlacementTarget | null;
+  /** Recorded targets belonging to Attempts other than the selected one. */
+  history: readonly PlacementTarget[];
 };
 
 /** Stable grouping key for the dispatches that froze one target. */
@@ -130,11 +142,21 @@ export function placementOf(execution: JobExecution): PlacementProjection {
   const targets = [...grouped.values()].sort(
     (left, right) => left.generation - right.generation || left.createdAt - right.createdAt,
   );
+
+  // The current target is scoped to the authoritative Attempt alone. If that
+  // Attempt somehow recorded more than one distinct target group, the earliest
+  // group in canonical order is taken; no preference is expressed, because
+  // deciding between two targets of one Attempt would be scheduler semantics the
+  // backend never exposed.
+  const authoritative = execution.authoritativeAttemptId;
+  const selected = authoritative === null
+    ? null
+    : targets.find((target) => target.attemptId === authoritative) ?? null;
+  const history = selected === null ? targets : targets.filter((target) => target.attemptId !== selected.attemptId);
+
+  // `recorded` keeps meaning "the backend recorded placement evidence for this
+  // Job", so history alone still counts as recorded. The current target and the
+  // existence of history are separate facts.
   const outcome: PlacementOutcome = targets.length > 0 ? "recorded" : failure !== null ? "rejected" : "pending";
-  return {
-    outcome,
-    targets,
-    failure,
-    selected: targets.length > 0 ? targets[targets.length - 1] : null,
-  };
+  return { outcome, targets, failure, selected, history };
 }

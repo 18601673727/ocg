@@ -136,7 +136,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
 
       <section aria-label={t("placement.title")} className="rounded-lg border border-border bg-card p-4">
         <SectionTitle detail={t(`placement.${placement.outcome}`)}>{t("placement.title")}</SectionTitle>
-        {placement.outcome === "recorded" && placement.selected ? (
+        {placement.selected ? (
           <>
             <p className="mb-2 text-[11px] font-semibold text-muted-foreground uppercase">{t("placement.selectedTarget")}</p>
             <KeyValueList>
@@ -145,26 +145,34 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
               <KeyValue label={t("placement.upstreamModel")} mono>{placement.selected.upstreamModelId ?? t("common.notReported")}</KeyValue>
               <KeyValue label={t("placement.dispatches", { count: placement.selected.dispatchIntentIds.length })}>{placement.selected.firstDispatchIntentId}</KeyValue>
             </KeyValueList>
-            {/* Placement is decided per admission, so a Job with several Attempts
-                can hold several genuinely distinct targets. They stay listed. */}
-            {placement.targets.length > 1 && (
-              <ul className="mt-2 space-y-1">
-                {placement.targets.map((target) => (
-                  <li key={`${target.attemptId}:${target.providerKey}:${target.model}`} className="break-words text-[11px] text-muted-foreground">
-                    {t("placement.attemptTarget", { generation: String(target.generation) })}
-                    {target.authoritative ? ` · ${t("placement.authoritative")}` : ""} · {target.providerKey} / {target.model}
-                  </li>
-                ))}
-              </ul>
-            )}
           </>
         ) : placement.outcome === "rejected" && placement.failure ? (
           <KeyValueList>
             <KeyValue label={t("placement.reason")} mono>{placement.failure.code}</KeyValue>
             <KeyValue label={t("execution.reportedFailureDetail")}>{placement.failure.message}</KeyValue>
           </KeyValueList>
+        ) : placement.outcome === "recorded" ? (
+          /* Placement history exists, but the current authoritative Attempt has
+             not frozen a target yet. Its older target is not restated as the
+             current one. */
+          <p className="text-[11px] text-muted-foreground">{t("placement.currentNotRecorded")}</p>
         ) : (
           <p className="text-[11px] text-muted-foreground">{t("placement.notRecorded")}</p>
+        )}
+        {/* Placement is decided per admission, so earlier Attempts keep their own
+            targets as history. The key carries every field the projection groups
+            on, so two targets differing only by upstream model stay distinct. */}
+        {placement.history.length > 0 && (
+          <>
+            <p className="mb-2 mt-3 text-[11px] font-semibold text-muted-foreground uppercase">{t("placement.history")}</p>
+            <ul className="space-y-1">
+              {placement.history.map((target) => (
+                <li key={`${target.attemptId}:${target.providerKey}:${target.model}:${target.upstreamModelId ?? ""}`} className="break-words text-[11px] text-muted-foreground">
+                  {t("placement.attemptTarget", { generation: String(target.generation) })} · {target.providerKey} / {target.model}
+                </li>
+              ))}
+            </ul>
+          </>
         )}
         <p className="mt-3 text-[11px] leading-5 text-muted-foreground">{t("placement.historyNote")}</p>
       </section>
