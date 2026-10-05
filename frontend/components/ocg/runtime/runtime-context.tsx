@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useMemo, useSyncExternalStore } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { MockOcgRuntimeClient } from "./mock-client";
 import { CanonicalOcgRuntimeClient } from "./canonical-launch-client";
@@ -55,6 +55,7 @@ export function OcgRuntimeProvider({ scenario, children }: { scenario: ScenarioI
     if (controlUrl) return CanonicalOcgRuntimeClient.connect(scenario, controlUrl, fetch);
     return new MockOcgRuntimeClient(scenario);
   }, [scenario, controlUrl]);
+  useEffect(() => () => client.dispose?.(), [client]);
   const authority = client.authority;
   const subscribe = useCallback(
     (onStoreChange: () => void) => client.subscribe(() => onStoreChange()),

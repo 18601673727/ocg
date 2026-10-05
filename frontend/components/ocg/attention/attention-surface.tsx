@@ -70,6 +70,7 @@ type AttentionSurfaceProps = {
   /** Opens the workspace an item points at; the shell decides the address. */
   onNavigate: (view: WorkspaceView) => void;
   onSelectSession?: (sessionId: string) => void;
+  onSelectJob?: (jobId: string) => void;
 };
 
 const TAB_LABEL_KEY = {
@@ -126,18 +127,22 @@ const DESTINATION_VIEWS: Record<AttentionDestination, WorkspaceView> = {
 /** Local fixture decisions use a fixed clock so UI state stays deterministic. */
 const DECISION_CLOCK = "2026-09-25T10:00:00Z";
 
-function CanonicalAttentionSurface({ snapshot, onNavigate, onSelectSession }: AttentionSurfaceProps) {
+function CanonicalAttentionSurface({ snapshot, onNavigate, onSelectJob }: AttentionSurfaceProps) {
   const { t } = useI18n();
-  const failed = Object.entries(snapshot.executionBySession).filter(([, execution]) => execution?.state === "failed");
+  const executions = snapshot.executionsByProject !== undefined
+    ? Object.values(snapshot.executionsByProject).flatMap((jobs) => Object.values(jobs))
+    : [...new Map(Object.values(snapshot.executionBySession)
+      .filter((execution) => execution !== null)
+      .map((execution) => [execution.jobId, execution])).values()];
+  const failed = executions.filter((execution) => execution.state === "failed");
   return <PageSurface>
     <h1 className="text-xl font-semibold">{t("attention.title")}</h1>
     <p className="mt-1 text-sm text-muted-foreground">{t("attention.localReview")}</p>
-    {failed.length === 0 ? <p className="mt-6 text-sm text-muted-foreground">{t("attention.noFailedConversations")}</p> :
-      <ul className="mt-4 space-y-3">{failed.map(([sessionId, execution]) => <li key={sessionId} className="rounded-lg border border-border p-3">
-        <p className="text-sm font-medium">{t("home.failedJob", { id: execution!.jobId })}</p>
-        <p className="mt-1 text-xs text-muted-foreground">{snapshot.sessions.find(session => session.id === sessionId)?.title}</p>
-        <p className="mt-2 whitespace-pre-wrap break-words text-xs">{[...(snapshot.messagesBySession[sessionId] ?? [])].reverse().find(message => message.status === "failed")?.failureReason ?? t("chat.failureMissing")}</p>
-        <Button className="mt-3" size="xs" variant="outline" onClick={() => { onSelectSession?.(sessionId); onNavigate("chat"); }}>{t("nav.chat")}</Button>
+    {failed.length === 0 ? <p className="mt-6 text-sm text-muted-foreground">{t("attention.noFailedJobs")}</p> :
+      <ul className="mt-4 space-y-3">{failed.map((execution) => <li key={execution.jobId} className="rounded-lg border border-border p-3">
+        <p className="text-sm font-medium">{t("home.failedJob", { id: execution.jobId })}</p>
+        <p className="mt-1 text-xs text-muted-foreground">{t("home.failedSummary")}</p>
+        <Button className="mt-3" size="xs" variant="outline" onClick={() => onSelectJob ? onSelectJob(execution.jobId) : onNavigate("job-execution")}>{t("execution.title")}</Button>
       </li>)}</ul>}
   </PageSurface>;
 }

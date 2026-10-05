@@ -7,8 +7,10 @@ import { PageSurface, Pill, SectionTitle } from "../primitives";
 import { filterCalls, type JobExecution } from "./domain";
 import { runtimeStateLabel, useI18n } from "../i18n";
 
-export function JobExecutionSurface({ execution, onOpenInspector, onReexecute, embedded = false }: {
+export function JobExecutionSurface({ execution, executions = [], onSelectJob, onOpenInspector, onReexecute, embedded = false }: {
   execution: JobExecution;
+  executions?: readonly JobExecution[];
+  onSelectJob?: (jobId: string) => void;
   onOpenInspector?: () => void;
   onReexecute?: () => Promise<void>;
   embedded?: boolean;
@@ -32,6 +34,22 @@ export function JobExecutionSurface({ execution, onOpenInspector, onReexecute, e
 
   return (
     <PageSurface className={embedded ? "space-y-5 p-4 text-xs sm:p-4 lg:p-4" : "space-y-5 text-xs"}>
+      {executions.length > 0 && <nav aria-label="Project Jobs" className="rounded border border-border p-3">
+        <SectionTitle detail={`${executions.length} ${executions.length === 1 ? "Job" : "Jobs"}`}>Project Jobs</SectionTitle>
+        <ul className="mt-2 flex flex-wrap gap-2">
+          {executions.map((job) => <li key={`${job.projectId}:${job.jobId}`}>
+            <Button
+              size="xs"
+              variant={job.jobId === execution.jobId ? "secondary" : "outline"}
+              aria-current={job.jobId === execution.jobId ? "page" : undefined}
+              onClick={() => onSelectJob?.(job.jobId)}
+            >
+              <span className="max-w-56 truncate">{job.jobId}</span>
+              <span className="ml-1 text-muted-foreground">{runtimeStateLabel(t, job.state)}</span>
+            </Button>
+          </li>)}
+        </ul>
+      </nav>}
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
           <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("execution.title")}</p>

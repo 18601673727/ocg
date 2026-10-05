@@ -84,6 +84,7 @@ export function validateRuntimeSnapshotEnvelope(input: unknown): RuntimeSnapshot
   if (!isRecord(input.snapshot.messagesBySession)) return invalidSnapshot("Snapshot messagesBySession must be an object.");
   if (!isRecord(input.snapshot.observabilityBySession)) return invalidSnapshot("Snapshot observabilityBySession must be an object.");
   if (!isRecord(input.snapshot.executionBySession)) return invalidSnapshot("Snapshot executionBySession must be an object.");
+  if (input.snapshot.executionsByProject !== undefined && !isRecord(input.snapshot.executionsByProject)) return invalidSnapshot("Snapshot executionsByProject must be an object when present.");
   if (input.snapshot.resourceLedger !== null && (!isRecord(input.snapshot.resourceLedger) || !Array.isArray(input.snapshot.resourceLedger.entries) || input.snapshot.resourceLedger.entries.some((entry) => !isRecord(entry) || !isNonEmptyString(entry.id)))) {
     return invalidSnapshot("Snapshot resourceLedger must be null or contain an entries array.");
   }
@@ -119,6 +120,7 @@ export function emptyRuntimeSnapshot(scenario: ScenarioId): RuntimeSnapshot {
     sessions: [],
     messagesBySession: {},
     observabilityBySession: {},
+    executionsByProject: {},
     executionBySession: {},
     accountingBySession: {},
     resourceLedger: null,
@@ -131,11 +133,14 @@ export function emptyRuntimeSnapshot(scenario: ScenarioId): RuntimeSnapshot {
 /** Deep clone a fixture into the canonical snapshot shape. */
 export function createRuntimeSnapshotFromFixture(fixture: ScenarioFixture): RuntimeSnapshot {
   const executionBySession: RuntimeSnapshot["executionBySession"] = {};
+  const executionsByProject: NonNullable<RuntimeSnapshot["executionsByProject"]> = {};
   const accountingBySession: RuntimeSnapshot["accountingBySession"] = {};
   for (const session of fixture.sessions) {
     const state = executionFixtureForSession(session.id);
     if (state && isProjectId(state.job.project_id)) {
-      executionBySession[session.id] = assembleJobExecution({ ...state, apiVersion: CANONICAL_API_VERSION, projectId: state.job.project_id, cursor: 0 });
+      const execution = assembleJobExecution({ ...state, apiVersion: CANONICAL_API_VERSION, projectId: state.job.project_id, cursor: 0 });
+      executionBySession[session.id] = execution;
+      (executionsByProject[state.job.project_id] ??= {})[execution.jobId] = execution;
       accountingBySession[session.id] = accountingFixtureForSession(session.id, state.job.project_id);
     } else {
       executionBySession[session.id] = null;
@@ -148,6 +153,7 @@ export function createRuntimeSnapshotFromFixture(fixture: ScenarioFixture): Runt
     sessions: JSON.parse(JSON.stringify(fixture.sessions)),
     messagesBySession: JSON.parse(JSON.stringify(fixture.messagesBySession)),
     observabilityBySession: JSON.parse(JSON.stringify(fixture.observabilityBySession)),
+    executionsByProject,
     executionBySession,
     accountingBySession,
     resourceLedger: JSON.parse(JSON.stringify(fixture.resourceLedger)),

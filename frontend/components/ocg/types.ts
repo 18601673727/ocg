@@ -134,7 +134,7 @@ export type OcgRuntimeEvent =
   | { type: "conversation.message-delta"; sessionId: string; messageId: string; delta: string }
   | { type: "conversation.message-completed"; sessionId: string; message: ChatMessage }
   | { type: "activity.updated"; sessionId: string; messageId: string; activity: CallActivity }
-  | { type: "job.execution-updated"; sessionId: string; execution: import("./execution/domain").JobExecution; accounting: import("./execution/accounting").JobAccounting | null }
+  | { type: "job.execution-updated"; sessionId?: string; execution: import("./execution/domain").JobExecution; accounting: import("./execution/accounting").JobAccounting | null }
   | { type: "job.launch-updated"; sessionId: string; result: import("./runtime/runtime-types").JobLaunchResult }
   | { type: "observability.updated"; sessionId: string; observability: import("./runtime/observability").RuntimeObservability }
   | { type: "attention.updated"; item: import("./attention/domain").AttentionItem }

@@ -195,7 +195,7 @@ function isIsoDate(value: unknown): value is string {
 }
 
 export function eventSessionId(event: OcgRuntimeEvent): string | undefined {
-  if ("sessionId" in event && typeof event.sessionId === "string") return event.sessionId;
+  if ("sessionId" in event && typeof event.sessionId === "string" && event.sessionId.length > 0) return event.sessionId;
   if ((event.type === "conversation.session-created" || event.type === "conversation.session-updated") && typeof event.session.id === "string") {
     return event.session.id;
   }
@@ -375,7 +375,12 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
     case "conversation.history-loaded":
       return { type: envelope.type, sessionId, messages: envelope.payload.messages };
     case "job.execution-updated":
-      return { type: envelope.type, sessionId, execution: envelope.payload.execution, accounting: envelope.payload.accounting };
+      return {
+        type: envelope.type,
+        ...(envelope.sessionId ? { sessionId: envelope.sessionId } : {}),
+        execution: envelope.payload.execution,
+        accounting: envelope.payload.accounting,
+      };
     case "job.launch-updated":
       return { type: envelope.type, sessionId, result: envelope.payload.result };
     case "runtime.status-changed":

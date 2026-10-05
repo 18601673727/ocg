@@ -149,6 +149,7 @@ export const en = {
   "chat.streamClosed": "The connection to the conversation stream closed. Refresh to load its latest recorded state.",
 
   "attention.noFailedConversations": "No failed tasks in the current conversations.",
+  "attention.noFailedJobs": "No failed Jobs in this Project.",
   "chat.failed": "Failed",
   "chat.cancelled": "Cancelled",
   "chat.failureMissing": "The execution failed without a recorded diagnostic. Review the task details or retry.",
@@ -1007,6 +1008,7 @@ export const zh: Dictionary = {
   "chat.streamClosed": "对话流连接已关闭。请刷新以加载最新记录。",
 
   "attention.noFailedConversations": "当前对话暂无失败任务。",
+  "attention.noFailedJobs": "当前项目没有失败的 Job。",
   "chat.failed": "失败",
   "chat.cancelled": "已取消",
   "chat.failureMissing": "执行失败，未记录诊断信息。请查看任务详情或重试。",

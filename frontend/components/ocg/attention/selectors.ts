@@ -133,8 +133,12 @@ export function selectDerivedAttention(snapshot: RuntimeSnapshot, fixtureQueue: 
   history: AttentionItem[];
 }): AttentionItem[] {
   const items: AttentionItem[] = [...fixtureQueue.approvals, ...fixtureQueue.history];
-  for (const [, execution] of Object.entries(snapshot.executionBySession)) {
-    if (!execution) continue;
+  const executions = snapshot.executionsByProject !== undefined
+    ? Object.values(snapshot.executionsByProject).flatMap((jobs) => Object.values(jobs))
+    : [...new Map(Object.values(snapshot.executionBySession)
+      .filter((execution): execution is NonNullable<typeof execution> => execution !== null)
+      .map((execution) => [execution.jobId, execution])).values()];
+  for (const execution of executions) {
     if ("state" in execution && execution.state === "failed") {
       items.push({
         id: `derived-failed-${execution.jobId}`,

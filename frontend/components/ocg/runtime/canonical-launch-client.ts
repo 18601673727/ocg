@@ -61,9 +61,11 @@ import {
 } from "./canonical-client";
 import { selectCanonical } from "./canonical-store";
 import type { JobExecution } from "../execution/domain";
+import { isNonEmptyString, isRecord } from "@/lib/narrow";
 
 /** Bounds the snapshot/event refetch loop when the backend keeps demanding a resync. */
 const MAX_REFRESH_ROUNDS = 4;
+const PROJECT_JOB_REFRESH_MS = 2_000;
 
 /** Backend-computed readiness for one chat turn, plus the status that reports it. */
 type ChatAvailability = {
@@ -82,10 +84,16 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string }>();
   private readonly sessionProjects = new Map<string, string>();
   private readonly projectHydrations = new Map<string, Promise<void>>();
+  private readonly projectJobWatermarks = new Map<string, Map<string, string>>();
+  private readonly projectJobRefreshes = new Map<string, Promise<void>>();
+  private readonly chatJobsBySession = new Map<string, { projectId: string; jobId: string }>();
   private readonly deletedSessions = new Set<string>();
   private readonly deletingSessions = new Set<string>();
   private availabilityProbed = false;
   private reportedStatus: RuntimeStatus | null = null;
+  private projectJobRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  private projectJobRefreshProject: string | null = null;
+  private lastProjectJobRefreshError = new Map<string, string>();
 
   constructor(
     scenario: ScenarioId,
@@ -155,14 +163,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.emitLaunchResult(command, result);
 
     if (result.outcome === "accepted" && response.job_id !== null) {
+      this.chatJobsBySession.set(command.sessionId, { projectId: response.project_id, jobId: response.job_id });
       const execution = await this.projectCanonicalExecution(response.project_id, response.job_id);
       if (execution !== null) {
-        // The canonical execution's Project is the backend's identity, which is
-        // not necessarily a Project this fixture shell knows, so the update is
-        // emitted unscoped: the reconciler must not drop it as foreign.
+        // The backend's Project identity scopes this Job update independently
+        // of whether its Chat presentation session is currently attached.
         this.emit(
           { type: "job.execution-updated", sessionId: command.sessionId, execution, accounting: null },
-          { projectId: null, commandId: command.commandId },
+          { projectId: response.project_id, commandId: command.commandId },
         );
       }
     }
@@ -188,6 +196,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   hydrateProject(projectId: string): Promise<void> {
+    this.startProjectJobPolling(projectId);
+    void this.refreshProjectJobs(projectId, true);
     const existing = this.projectHydrations.get(projectId);
     if (existing) return existing;
     const hydration = this.loadProjectHistory(projectId).catch((cause: unknown) => {
@@ -196,6 +206,24 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     });
     this.projectHydrations.set(projectId, hydration);
     return hydration;
+  }
+
+  override dispose(): void {
+    if (this.projectJobRefreshTimer !== null) clearInterval(this.projectJobRefreshTimer);
+    this.projectJobRefreshTimer = null;
+    this.projectJobRefreshProject = null;
+    for (const tracked of this.chatStreams.values()) tracked.source.close();
+    this.chatStreams.clear();
+    super.dispose();
+  }
+
+  private startProjectJobPolling(projectId: string): void {
+    if (this.projectJobRefreshProject === projectId && this.projectJobRefreshTimer !== null) return;
+    if (this.projectJobRefreshTimer !== null) clearInterval(this.projectJobRefreshTimer);
+    this.projectJobRefreshProject = projectId;
+    this.projectJobRefreshTimer = setInterval(() => {
+      void this.refreshProjectJobs(projectId);
+    }, PROJECT_JOB_REFRESH_MS);
   }
 
   override async deleteSession(sessionId: string): Promise<void> {
@@ -219,6 +247,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.historyEpochs.set(sessionId, (this.historyEpochs.get(sessionId) ?? 0) + 1);
       await super.deleteSession(sessionId);
       this.sessionProjects.delete(sessionId);
+      this.chatJobsBySession.delete(sessionId);
     } finally {
       this.deletingSessions.delete(sessionId);
     }
@@ -266,7 +295,12 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     }));
     this.emit({ type: "conversation.history-loaded", sessionId: id, messages }, { projectId });
     const jobId = [...history.messages].reverse().find(message => message.role === "assistant" && message.job_id)?.job_id;
-    if (jobId) void this.refreshExecution(id, projectId, jobId);
+    if (jobId) {
+      this.chatJobsBySession.set(id, { projectId, jobId });
+      void this.refreshExecution(id, projectId, jobId);
+    } else {
+      this.chatJobsBySession.delete(id);
+    }
     if (this.chatStreams.has(id) || this.pendingSends.has(id)) return;
     const replay = history.messages.find((message) => message.replay_job_id !== null);
     const assistant = replay && this.store.getSnapshot().messagesBySession[id]?.find(message =>
@@ -422,6 +456,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
     // Only an accepted turn supersedes the previous Attempt on the backend.
     // Keep its EventSource alive until then so failed sends leave it streaming.
+    this.chatJobsBySession.set(sessionId, { projectId, jobId: response.job_id });
     this.closeChatStream(sessionId, true);
     this.openChatStream(sessionId, response.job_id, assistantId);
     void this.refreshExecution(sessionId, projectId, response.job_id);
@@ -636,6 +671,81 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       { type: "job.launch-updated", sessionId: command.sessionId, result },
       { projectId: null, commandId: command.commandId },
     );
+  }
+
+  /**
+   * Project Jobs are the operational collection. Chat history remains a
+   * separate presentation projection and is never consulted to discover work.
+   * The existing dashboard supplies canonical Job identities; each changed
+   * identity is expanded through its authoritative Job snapshot and committed
+   * through the one RuntimeStore event path.
+   */
+  private refreshProjectJobs(projectId: string, force = false): Promise<void> {
+    const existing = this.projectJobRefreshes.get(projectId);
+    if (existing) return existing;
+    const refresh = this.syncProjectJobs(projectId, force)
+      .then(() => { this.lastProjectJobRefreshError.delete(projectId); })
+      .catch((cause: unknown) => {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        if (this.lastProjectJobRefreshError.get(projectId) === message) return;
+        this.lastProjectJobRefreshError.set(projectId, message);
+        this.emit({ type: "warning", message: `Project Jobs refresh failed: ${message}` }, { projectId });
+      })
+      .finally(() => {
+        if (this.projectJobRefreshes.get(projectId) === refresh) this.projectJobRefreshes.delete(projectId);
+      });
+    this.projectJobRefreshes.set(projectId, refresh);
+    return refresh;
+  }
+
+  private async syncProjectJobs(projectId: string, force: boolean): Promise<void> {
+    const dashboard = await this.control.readDashboard(projectId);
+    if (isCanonicalRejection(dashboard)) throw new Error(dashboard.message);
+    if (dashboard.project_id !== projectId) throw new Error("Project Jobs response scope mismatch.");
+
+    const summaries = dashboard.jobs.map((value, index) => {
+      if (!isRecord(value) || !isNonEmptyString(value.job_id) || !isNonEmptyString(value.state) ||
+          typeof value.updated_at !== "number" || !Number.isSafeInteger(value.updated_at) || value.updated_at < 0) {
+        throw new Error(`Project Jobs response contains a malformed Job summary at index ${index}.`);
+      }
+      return { jobId: value.job_id, watermark: `${value.state}\u0000${value.updated_at}` };
+    });
+    const previous = this.projectJobWatermarks.get(projectId) ?? new Map<string, string>();
+    const next = new Map<string, string>();
+    const snapshotFailures: string[] = [];
+
+    for (const summary of summaries) {
+      if (!force && previous.get(summary.jobId) === summary.watermark) {
+        next.set(summary.jobId, summary.watermark);
+        continue;
+      }
+      let execution: JobExecution | null;
+      try {
+        execution = await this.projectCanonicalExecution(projectId, summary.jobId);
+      } catch (cause) {
+        snapshotFailures.push(`${summary.jobId}: ${cause instanceof Error ? cause.message : String(cause)}`);
+        continue;
+      }
+      if (!execution) {
+        snapshotFailures.push(`${summary.jobId}: authoritative snapshot was not available`);
+        continue;
+      }
+      if (execution.projectId !== projectId || execution.jobId !== summary.jobId) {
+        throw new Error(`Canonical Job snapshot identity mismatch for Job "${summary.jobId}".`);
+      }
+      const chatSession = [...this.chatJobsBySession].find(([, link]) =>
+        link.projectId === projectId && link.jobId === summary.jobId,
+      )?.[0];
+      this.emit({
+        type: "job.execution-updated",
+        ...(chatSession ? { sessionId: chatSession } : {}),
+        execution,
+        accounting: null,
+      }, { projectId });
+      next.set(summary.jobId, summary.watermark);
+    }
+    this.projectJobWatermarks.set(projectId, next);
+    if (snapshotFailures.length > 0) throw new Error(snapshotFailures.join("; "));
   }
 
   /**

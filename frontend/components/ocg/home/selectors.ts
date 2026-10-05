@@ -20,11 +20,12 @@ import { sumCostMicros } from "../resource-ledger/selectors";
 
 export function selectHomeAttention(snapshot: {
   bootstrap: BootstrapState;
+  executionsByProject?: Record<string, Record<string, JobExecution>>;
   executionBySession: Record<string, JobExecution | null>;
   accountingBySession: Record<string, JobAccounting | null>;
 }, t?: TranslateFn): AttentionItem[] {
   const items: AttentionItem[] = [];
-  const { bootstrap, executionBySession } = snapshot;
+  const { bootstrap } = snapshot;
 
   // Degraded provider
   const providers = bootstrap.providers ?? [];
@@ -75,18 +76,17 @@ export function selectHomeAttention(snapshot: {
     });
   }
 
-  // Failed executions
-  for (const [sessionId, execution] of Object.entries(executionBySession)) {
+  // Failed Jobs are Project work, whether or not a Chat session presents them.
+  for (const execution of executionsIn(snapshot)) {
     if (!execution) continue;
     if (execution.state === "failed") {
       items.push({
-        id: `attention-execution-failed-${sessionId}`,
+        id: `attention-execution-failed-${execution.jobId}`,
         severity: "warning",
         kind: "runtimeFailure",
         title: t ? t("home.failedJob", { id: execution.jobId }) : `Job ${execution.jobId} failed`,
-        summary: t ? t("home.failedSummary") : `Job execution failed in session ${sessionId}.`,
+        summary: t ? t("home.failedSummary") : "Job execution failed.",
         jobId: execution.jobId,
-        sessionId,
         createdAt: "now",
         status: "open",
         destination: "job-execution",
@@ -115,16 +115,16 @@ export type JobSummary = {
 };
 
 export function selectHomeActiveJobs(snapshot: {
-  sessions: { id: string; title: string }[];
+  executionsByProject?: Record<string, Record<string, JobExecution>>;
   executionBySession: Record<string, JobExecution | null>;
 }): ActiveJobProjection[] {
   const results: ActiveJobProjection[] = [];
-  for (const session of snapshot.sessions) {
-    const execution = snapshot.executionBySession[session.id];
-    if (!execution) continue;
+  const chatSessionByJob = new Map(Object.entries(snapshot.executionBySession)
+    .flatMap(([sessionId, execution]) => execution ? [[execution.jobId, sessionId] as const] : []));
+  for (const execution of executionsIn(snapshot)) {
     if ("state" in execution && (execution.state === "running" || execution.state === "pending")) {
       results.push({
-        sessionId: session.id,
+        sessionId: chatSessionByJob.get(execution.jobId),
         jobId: execution.jobId,
         projectId: execution.projectId,
         title: execution.jobId,
@@ -142,7 +142,19 @@ export function selectHomeActiveJobs(snapshot: {
       });
     }
   }
-  return results;
+  return results.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "") || a.jobId!.localeCompare(b.jobId!));
+}
+
+function executionsIn(snapshot: {
+  executionsByProject?: Record<string, Record<string, JobExecution>>;
+  executionBySession: Record<string, JobExecution | null>;
+}): JobExecution[] {
+  if (snapshot.executionsByProject !== undefined) {
+    return Object.values(snapshot.executionsByProject).flatMap((jobs) => Object.values(jobs));
+  }
+  return [...new Map(Object.values(snapshot.executionBySession)
+    .filter((execution): execution is JobExecution => execution !== null)
+    .map((execution) => [execution.jobId, execution])).values()];
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +255,7 @@ export function selectHomeUsageSummary(
 
 export function selectRecentProductActivity(snapshot: {
   sessions: { id: string; title: string; workType: string; updatedAt?: string }[];
+  executionsByProject?: Record<string, Record<string, JobExecution>>;
   executionBySession: Record<string, JobExecution | null>;
 }, t?: TranslateFn): RecentActivityItem[] {
   const items: RecentActivityItem[] = [];
@@ -259,10 +272,9 @@ export function selectRecentProductActivity(snapshot: {
       timeAgo: session.updatedAt ?? "now",
     });
   }
-  for (const [sessionId, execution] of Object.entries(snapshot.executionBySession)) {
-    if (!execution) continue;
+  for (const execution of executionsIn(snapshot)) {
     items.push({
-      id: `execution-${sessionId}`,
+      id: `execution-${execution.projectId}-${execution.jobId}`,
       summary: t ? t("home.executionActivity", {
         id: execution.jobId, state: runtimeStateLabel(t, execution.state), count: execution.calls.length,
       }) : `Job ${execution.jobId} · ${execution.state} · ${execution.calls.length} calls`,

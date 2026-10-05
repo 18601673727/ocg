@@ -292,6 +292,11 @@ export class RuntimeClientBase implements OcgRuntimeClient {
     return () => this.listeners.delete(listener);
   }
 
+  dispose(): void {
+    for (const timers of this.timers.values()) timers.forEach(clearTimeout);
+    this.timers.clear();
+  }
+
   async cancel(sessionId: string): Promise<void> {
     this.pauseQueue(sessionId);
     const timers = this.timers.get(sessionId) ?? [];
