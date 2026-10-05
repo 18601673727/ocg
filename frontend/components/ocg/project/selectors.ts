@@ -46,10 +46,10 @@ export function resolveSelectedSessionId(
 /**
  * Project-scoped RuntimeSnapshot projection.
  *
- * Sessions and their per-session maps are filtered to the project's session
- * IDs (plus any registered extras). The resource ledger is filtered by the
- * project's Job IDs. Everything else (scenario, status, bootstrap) is
- * shared and passes through unchanged.
+ * Project-owned Job projections are selected by Project ID. Sessions and
+ * their maps are filtered separately for conversational presentation. The
+ * resource ledger is filtered by the Project's Job IDs. Everything else
+ * (scenario, status, bootstrap) is shared and passes through unchanged.
  */
 export function selectProjectSnapshot(
   snapshot: RuntimeSnapshot,
@@ -72,6 +72,7 @@ export function selectProjectSnapshot(
     : null;
   const attentionItems = snapshot.attentionItems?.filter((item) => item.projectId === id) ?? [];
   const logs = snapshot.logs?.filter((entry) => entry.sessionId !== undefined && allowed.has(entry.sessionId)) ?? [];
+  const projectExecutions = snapshot.executionsByProject?.[id] ?? {};
 
   return {
     ...snapshot,
@@ -79,6 +80,7 @@ export function selectProjectSnapshot(
     messagesBySession: keepBySession(snapshot.messagesBySession),
     ...(snapshot.chatQueues ? { chatQueues: keepBySession(snapshot.chatQueues) } : {}),
     observabilityBySession: keepBySession(snapshot.observabilityBySession),
+    ...(snapshot.executionsByProject !== undefined ? { executionsByProject: id ? { [id]: projectExecutions } : {} } : {}),
     executionBySession: keepBySession(snapshot.executionBySession),
     accountingBySession: keepBySession(snapshot.accountingBySession),
     resourceLedger,

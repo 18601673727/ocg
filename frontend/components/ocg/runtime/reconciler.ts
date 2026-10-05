@@ -220,6 +220,9 @@ function hasScopeViolation(sync: RuntimeSyncState, envelope: AnyRuntimeEnvelope)
 function hasPayloadScopeViolation(sync: RuntimeSyncState, envelope: AnyRuntimeEnvelope): boolean {
   if (envelope.projectId === null) return false;
   if (hasScopeViolation(sync, envelope)) return true;
+  if (envelope.type === "job.execution-updated") {
+    return envelope.payload.execution.projectId !== envelope.projectId;
+  }
   if (envelope.type === "attention.updated") {
     return envelope.payload.item.projectId !== undefined && envelope.payload.item.projectId !== envelope.projectId;
   }
@@ -422,7 +425,9 @@ export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope
     return consumeEnvelope(state, envelope, [{
       code: "project-scope-mismatch",
       severity: "warning",
-      message: `Ignored event for session "${envelope.sessionId}" scoped to Project "${envelope.projectId}".`,
+      message: envelope.type === "job.execution-updated"
+        ? `Ignored Job "${envelope.payload.execution.jobId}" whose Project does not match the event scope.`
+        : `Ignored event for session "${envelope.sessionId}" scoped to Project "${envelope.projectId}".`,
       eventId: envelope.eventId,
       sequence: envelope.sequence,
       sessionId: envelope.sessionId,
@@ -686,14 +691,22 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
     }
 
     case "job.execution-updated": {
-      if (!sessionExists(snapshot, sessionId)) {
-        return { snapshot, diagnostics: [diag("unknown-session", `Execution update for unknown session "${sessionId ?? ""}".`, { sessionId })] };
-      }
+      const execution = envelope.payload.execution;
+      const projectId = execution.projectId;
+      const projectExecutions = snapshot.executionsByProject?.[projectId] ?? {};
+      const executionsByProject = {
+        ...snapshot.executionsByProject,
+        [projectId]: { ...projectExecutions, [execution.jobId]: execution },
+      };
+      const hasChatSession = sessionExists(snapshot, sessionId);
       return {
         snapshot: {
           ...snapshot,
-          executionBySession: { ...snapshot.executionBySession, [sessionId]: envelope.payload.execution },
-          accountingBySession: { ...snapshot.accountingBySession, [sessionId]: envelope.payload.accounting },
+          executionsByProject,
+          ...(hasChatSession ? {
+            executionBySession: { ...snapshot.executionBySession, [sessionId!]: execution },
+            accountingBySession: { ...snapshot.accountingBySession, [sessionId!]: envelope.payload.accounting },
+          } : {}),
         },
         diagnostics: [],
       };

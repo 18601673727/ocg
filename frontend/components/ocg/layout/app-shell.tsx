@@ -299,9 +299,21 @@ export function RuntimeWorkspace({
       // Update the view without replacing the page and its runtime providers,
       // including when the workspace was entered through a standalone route.
       const url = new URL(withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`), window.location.origin);
+      if (target !== "job-execution") url.searchParams.delete("job");
       if (new URLSearchParams(window.location.search).get("demo") === "1") url.searchParams.set("demo", "1");
       window.history.pushState(null, "", url.pathname + url.search);
     }
+  }, [snapshot.scenario, view, withProject]);
+
+  const openJob = useCallback((jobId: string) => {
+    setMobileNavOpen(false);
+    setMobileInspectorOpen(false);
+    const href = workspaceViewHref(view, "job-execution") ?? workspaceViewHref("chat", "job-execution");
+    if (!href) return;
+    const url = new URL(withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`), window.location.origin);
+    url.searchParams.set("job", jobId);
+    if (new URLSearchParams(window.location.search).get("demo") === "1") url.searchParams.set("demo", "1");
+    window.history.pushState(null, "", url.pathname + url.search);
   }, [snapshot.scenario, view, withProject]);
 
   const handleNewChat = useCallback(async () => {
@@ -544,12 +556,23 @@ export function RuntimeWorkspace({
       url.searchParams.set("project", id);
       if (nextSessionId) url.searchParams.set("session", nextSessionId);
       else url.searchParams.delete("session");
+      url.searchParams.delete("job");
       window.history.replaceState(null, "", `${url.pathname}${url.search}`);
     }
   }, [runtimeSnapshot.sessions, setActiveProject]);
 
   const messages = activeSession ? snapshot.messagesBySession[activeSession.id] ?? [] : [];
   const execution = activeSession ? snapshot.executionBySession[activeSession.id] ?? null : null;
+  const projectExecutions = Object.values(snapshot.executionsByProject?.[activeProjectId] ?? {})
+    .sort((left, right) => right.updatedAt - left.updatedAt || left.jobId.localeCompare(right.jobId));
+  const requestedJobId = searchParams.get("job");
+  const jobExecution = projectExecutions.find((item) => item.jobId === requestedJobId)
+    ?? projectExecutions.find((item) => item.jobId === execution?.jobId)
+    ?? projectExecutions[0]
+    ?? null;
+  const selectedJobSessionId = jobExecution
+    ? Object.entries(snapshot.executionBySession).find(([, item]) => item?.jobId === jobExecution.jobId)?.[0]
+    : undefined;
   const lastAssistant = messages.findLast(message => message.role === "assistant");
   const retryableMessage = lastAssistant && retryContent(messages, lastAssistant.id) ? lastAssistant.id : null;
   const usageRefreshKey = messages.filter(message => message.role === "assistant" && ["completed", "failed", "cancelled"].includes(message.status)).map(message => `${message.id}:${message.status}`).join("|");
@@ -672,12 +695,18 @@ export function RuntimeWorkspace({
           </main>
         ) : isJobExecution ? (
           <main aria-label="Job Execution" className="flex min-h-0 flex-1 overflow-hidden">
-            {execution ? (
+            {jobExecution ? (
               <JobExecutionSurface
-                key={`${activeProjectId}:${activeSession?.id}`}
-                execution={execution}
-                onOpenInspector={() => navigate("chat")}
-                onReexecute={activeSession && retryableMessage && snapshot.status.state === "connected" ? () => retryMessage(activeSession.id, retryableMessage) : undefined}
+                key={`${activeProjectId}:${jobExecution.jobId}`}
+                execution={jobExecution}
+                executions={projectExecutions}
+                onSelectJob={openJob}
+                onOpenInspector={selectedJobSessionId ? () => {
+                  setActiveSessionId(selectedJobSessionId);
+                  rememberSession(selectedJobSessionId);
+                  navigate("chat");
+                } : undefined}
+                onReexecute={activeSession && selectedJobSessionId === activeSession.id && retryableMessage && snapshot.status.state === "connected" ? () => retryMessage(activeSession.id, retryableMessage) : undefined}
               />
             ) : (
               <NoExecutionNotice />
@@ -709,6 +738,7 @@ export function RuntimeWorkspace({
               key={activeProjectId}
               snapshot={snapshot}
               onNavigate={navigate}
+              onSelectJob={openJob}
               onSelectSession={selectSession}
             />
           </main>
@@ -719,6 +749,7 @@ export function RuntimeWorkspace({
               snapshot={snapshot}
               queue={attentionQueue}
               onSelectSession={selectSession}
+              onSelectJob={openJob}
               onNavigate={navigate}
             />
           </main>

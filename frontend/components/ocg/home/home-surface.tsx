@@ -50,6 +50,7 @@ type HomeSurfaceProps = {
   /** Opens a workspace; the shell owns the address and the close-back-to-chat. */
   onNavigate: (view: WorkspaceView) => void;
   onSelectSession?: (sessionId: string) => void;
+  onSelectJob?: (jobId: string) => void;
 };
 
 /** Where a home attention row sends the operator. Onboarding lives in Settings. */
@@ -125,7 +126,7 @@ export function HomeSurface(props: HomeSurfaceProps) {
       <div className={cn("grid gap-5", !canonical && "lg:grid-cols-[1fr_320px] xl:grid-cols-[1fr_380px]")}>
         {/* Left column */}
         <div className="flex flex-col gap-5">
-          <ActiveJobsSection jobs={jobs} onNavigate={props.onNavigate} />
+          <ActiveJobsSection jobs={jobs} onNavigate={props.onNavigate} onSelectJob={props.onSelectJob} />
           <ContinueWorkingSection entries={recentWork} onSelectSession={props.onSelectSession ?? (() => props.onNavigate("chat"))} />
           <RecentActivitySection items={activity} />
         </div>
@@ -229,9 +230,11 @@ function AttentionSection({
 function ActiveJobsSection({
   jobs,
   onNavigate,
+  onSelectJob,
 }: {
   jobs: ActiveJobProjection[];
   onNavigate: (view: WorkspaceView) => void;
+  onSelectJob?: (jobId: string) => void;
 }) {
   const { t } = useI18n();
   const openJobExecution = () => onNavigate("job-execution");
@@ -252,7 +255,7 @@ function ActiveJobsSection({
       />
       <div className="flex flex-col gap-2">
         {jobs.map((job) => (
-          <JobCard key={job.id} job={job} onClick={openJobExecution} />
+          <JobCard key={job.id} job={job} onClick={() => job.jobId && onSelectJob ? onSelectJob(job.jobId) : openJobExecution()} />
         ))}
       </div>
     </section>

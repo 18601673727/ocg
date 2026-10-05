@@ -90,7 +90,7 @@ export type ScenarioId =
   | "attention-overview"
   | "attention-calm";
 
-/** Single execution read model: canonical Job/Attempt/Call + accounting ceiling. */
+/** Runtime projection: Project-owned canonical Jobs plus session-scoped Chat presentation. */
 export type RuntimeSnapshot = {
   authority?: RuntimeAuthority;
   scenario: ScenarioId;
@@ -99,6 +99,9 @@ export type RuntimeSnapshot = {
   messagesBySession: Record<string, ChatMessage[]>;
   chatQueues?: Record<string, { queue: import("../types").QueuedChatMessage[]; paused: boolean }>;
   observabilityBySession: Record<string, RuntimeObservability | null>;
+  /** Canonical Project-owned Jobs. Conversation/session maps are presentation-only. */
+  executionsByProject?: Record<ProjectId, Record<string, JobExecution>>;
+  /** Latest Job presented by each Chat session; never used to discover Project Jobs. */
   executionBySession: Record<string, JobExecution | null>;
   accountingBySession: Record<string, JobAccounting | null>;
   resourceLedger: ResourceLedger | null;
@@ -137,6 +140,8 @@ export interface OcgRuntimeClient {
   /** Bind a session to its owning Project so a later send launches into that Project. */
   bindSessionProject?(sessionId: string, projectId: string): void;
   hydrateProject?(projectId: string): Promise<void>;
+  /** Release runtime-owned polling/transport resources when its provider unmounts. */
+  dispose?(): void;
   /** Canonical Job launch boundary, projecting backend execution into session maps. */
   launchJob?(command: JobLaunchCommand): Promise<JobLaunchResult>;
   requestAccessHandoff?(): Promise<void>;
