@@ -264,12 +264,7 @@ export function SetupWizard() {
     <div className="flex min-h-dvh justify-center bg-background px-4 py-8 text-foreground sm:py-12">
       <div className="flex w-full max-w-2xl flex-col">
         <header>
-          <div className="flex items-center gap-2">
-            <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase">
-              {t("setup.title")}
-            </span>
-          </div>
-          <h1 className="mt-3 text-[18px] font-semibold tracking-tight">{t(STEP_LABELS[step])}</h1>
+          <h1 className="text-[18px] font-semibold tracking-tight">{t(STEP_LABELS[step])}</h1>
 
           {/* Step indicator */}
           <ol className="mt-4 grid grid-cols-3 gap-1" aria-label={t("setup.steps")}>
@@ -352,19 +347,6 @@ export function SetupWizard() {
         </div>
 
         <footer className="mt-5 flex items-center justify-between gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={currentIndex === 0 || loading}
-            onClick={() => {
-              setError(null);
-              setStep(STEPS[currentIndex - 1]);
-            }}
-          >
-            <ArrowLeft className="size-3.5" aria-hidden="true" />
-            Back
-          </Button>
-
           <span className="text-[11px] text-muted-foreground">
             {t("setup.progress", { step: currentIndex + 1, total: STEPS.length })}
           </span>

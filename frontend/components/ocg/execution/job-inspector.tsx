@@ -1,7 +1,7 @@
 "use client";
 
 import { CostDetails } from "../usage/usage-values";
-import { CircleDot, ExternalLink, Maximize2, Minimize2, X } from "lucide-react";
+import { ExternalLink, Maximize2, Minimize2, X } from "lucide-react";
 import { startTransition, useState, ViewTransition } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -84,9 +84,8 @@ export function JobInspector({
   const modeLabel = mode === "expanded" ? dockLabel : expandLabel;
   return (
     <div className="flex h-full w-full min-w-0 flex-col">
-      <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5">
-        <CircleDot className="size-4 text-muted-foreground" aria-hidden="true" />
-        <h2 className="flex-1 text-[13px] font-semibold tracking-tight">{t("execution.inspector")}</h2>
+      <header className="flex shrink-0 items-center gap-1 border-b border-border px-3 py-2">
+        <h2 className="min-w-0 flex-1 text-[12px] font-semibold">{t("execution.inspector")}</h2>
         {onOpenJobExecution && (
           <Button variant="ghost" size="icon-xs" onClick={onOpenJobExecution} aria-label={t("execution.openJobExecution")} title={t("execution.openJobExecution")}>
             <ExternalLink className="size-3.5" />

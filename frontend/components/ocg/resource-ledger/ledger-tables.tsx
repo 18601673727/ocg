@@ -233,7 +233,7 @@ export function AttributionSummary({ summary }: { summary: LedgerSummary }) {
           <span
             key={confidence}
             className={cn(
-              "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px]",
+              "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px]",
               TONE_CLASS[ATTRIBUTION_TONE[confidence]],
               summary.byAttribution[confidence] === 0 && "opacity-50",
             )}
@@ -287,7 +287,7 @@ export function AttributionBreakdown({
                 return (
                   <span
                     key={confidence}
-                    className={cn("rounded-full border px-1.5 py-0.5 text-[9px] capitalize", TONE_CLASS[ATTRIBUTION_TONE[confidence]])}
+                    className={cn("rounded-md border px-1.5 py-0.5 text-[9px] capitalize", TONE_CLASS[ATTRIBUTION_TONE[confidence]])}
                     title={`${ATTRIBUTION_CONFIDENCE_LABEL[confidence]} attribution: ${count}`}
                   >
                     {confidence} {count}

@@ -86,7 +86,7 @@ export function ModelSelector({ selection, onChange, busy }: {
   const selectClass = "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
 
   return (
-    <div className="border-b border-border px-3 py-2">
+    <div className="mb-2 px-1 py-1">
       <div className="flex min-w-0 items-center gap-2">
         <button
           type="button"

@@ -45,7 +45,7 @@ export function SegmentedTabs<Id extends string>({
     <div
       role="tablist"
       aria-label={ariaLabel}
-      className={cn("grid gap-1 rounded-md bg-muted/50 p-0.5", className)}
+      className={cn("grid gap-1 rounded-lg bg-muted/50 p-1", className)}
     >
       {tabs.map((tab) => {
         const selected = tab.id === value;
@@ -59,7 +59,7 @@ export function SegmentedTabs<Id extends string>({
             aria-controls={panelId ?? (panelIdBase ? `${panelIdBase}-${tab.id}` : undefined)}
             onClick={() => onSelect(tab.id)}
             className={cn(
-              "flex min-w-0 items-center justify-center gap-1.5 truncate rounded px-2 font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
+              "flex min-w-0 items-center justify-center gap-1.5 truncate rounded-md px-2 font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
               size === "sm" ? "py-1 text-[10px]" : "py-1.5 text-[11px]",
               selected ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
             )}

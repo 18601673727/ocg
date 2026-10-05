@@ -467,7 +467,7 @@ function AttentionInspector({
             <span className={cn("text-[10px] font-semibold uppercase", TEXT_TONE[SEVERITY_TONE[item.severity]])}>
               {ATTENTION_SEVERITY_LABELS[item.severity]}
             </span>
-            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+            <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
               {ATTENTION_STATUS_LABELS[item.status]}
             </span>
           </div>

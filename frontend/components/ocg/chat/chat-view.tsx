@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowUp,
   Square,
@@ -244,7 +244,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
           </span>
           <span
            className={cn(
-              "flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[11px]",
+              "flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px]",
               BORDER_TONE[tone],
               TEXT_TONE[tone],
             )}
@@ -458,7 +458,7 @@ function Composer({
   };
 
   return (
-    <div className="shrink-0 border-t border-border bg-background px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-5">
+    <div className="shrink-0 bg-background px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-5">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -494,8 +494,8 @@ function Composer({
           images.add(Array.from(event.target.files ?? []));
           event.target.value = "";
         }} />
-        <div className="rounded-lg border border-border bg-background shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition-colors focus-within:border-ring">
-          <ModelSelector selection={selection} onChange={onSelectionChange} busy={busy || submitting || cancelling} />
+        <ModelSelector selection={selection} onChange={onSelectionChange} busy={busy || submitting || cancelling} />
+        <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
           <AttachmentStaging state={images} disabled={submitting || cancelling} />
           <div className="relative">
             {suggestionsOpen && (
@@ -581,7 +581,7 @@ function Composer({
               aria-expanded={suggestionsOpen}
               aria-controls={suggestionsOpen ? "composer-suggestions" : undefined}
               aria-activedescendant={activeIndex >= 0 ? `composer-suggestion-${suggestions[activeIndex].id}` : undefined}
-              aria-describedby="composer-hint composer-status"
+              aria-describedby={chatReady ? "composer-hint" : "composer-hint composer-status"}
               aria-invalid={Boolean(error)}
               className="max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
             />
@@ -622,11 +622,9 @@ function Composer({
             </div>
           </div>
         </div>
-        <p id="composer-status" role="status" className="mt-1.5 text-center text-xs text-muted-foreground">
-          {chatReady
-            ? <><span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span><span className="pointer-coarse:hidden">{t("chat.repliesStream")}</span></>
-            : `${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
-        </p>
+        {!chatReady && <p id="composer-status" role="status" className="mt-1.5 text-center text-xs text-muted-foreground">
+          {`${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
+        </p>}
       </form>
     </div>
   );
@@ -673,6 +671,7 @@ export function ChatView({
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const following = useRef(true);
+  const lastScrollTop = useRef(0);
   const [showLatest, setShowLatest] = useState(false);
   const retryLock = useRef(false);
   const [retrying, setRetrying] = useState(false);
@@ -698,16 +697,39 @@ export function ChatView({
     following.current = true;
     setShowLatest(false);
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      lastScrollTop.current = el.scrollTop;
+    }
   };
+
+  useLayoutEffect(() => {
+    following.current = true;
+    const el = scrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      lastScrollTop.current = el.scrollTop;
+    }
+  }, [session.id]);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && following.current) {
+      el.scrollTop = el.scrollHeight;
+      lastScrollTop.current = el.scrollTop;
+    }
+  }, [messages, composerSurfaceKey]);
 
   useEffect(() => {
     const el = scrollRef.current;
     const content = contentRef.current;
     if (!el || !content) return;
     const followContent = () => {
-      if (following.current) el.scrollTop = el.scrollHeight;
-      else setShowLatest(el.scrollHeight - el.clientHeight - el.scrollTop > 80);
+      if (following.current) {
+        el.scrollTop = el.scrollHeight;
+        lastScrollTop.current = el.scrollTop;
+      }
+      setShowLatest(!following.current && el.scrollHeight - el.clientHeight - el.scrollTop > 80);
     };
     const observer = new ResizeObserver(followContent);
     observer.observe(content);
@@ -723,9 +745,11 @@ export function ChatView({
           const el = scrollRef.current;
           if (!el) return;
           const atBottom = el.scrollHeight - el.clientHeight - el.scrollTop <= 80;
-          following.current = atBottom;
-          setShowLatest(!atBottom);
-        }} className="min-h-0 flex-1 overflow-y-auto overscroll-contain" role="log" aria-label={t("chat.conversation", { title: session.title })}>
+          if (atBottom) following.current = true;
+          else if (el.scrollTop < lastScrollTop.current) following.current = false;
+          lastScrollTop.current = el.scrollTop;
+          setShowLatest(!following.current && !atBottom);
+        }} className="min-h-0 flex-1 overflow-y-auto overscroll-contain [overflow-anchor:none]" role="log" aria-label={t("chat.conversation", { title: session.title })}>
           {empty ? (
             <div ref={contentRef} className="relative mx-auto flex min-h-full max-w-3xl flex-col items-center justify-center px-5 py-8 text-center">
               <ActivityPulse className="size-20 opacity-80" label={t("chat.idleIllustration")} />
@@ -785,7 +809,7 @@ export function ChatView({
             </div>
           )}
         </div>
-        {showLatest && <Button type="button" size="sm" variant="secondary" onClick={scrollToLatest} className="absolute bottom-3 left-1/2 h-11 -translate-x-1/2 rounded-full border border-border tracking-normal normal-case shadow-md">
+        {showLatest && <Button type="button" size="sm" variant="secondary" onClick={scrollToLatest} className="absolute bottom-3 left-1/2 h-11 -translate-x-1/2 rounded-md border border-border tracking-normal normal-case shadow-md">
           <ChevronDown className="size-4" />{t("chat.jumpToLatest")}
         </Button>}
       </div>
@@ -815,6 +839,7 @@ export function ChatView({
         draft={draft}
         onDraftChange={setDraft}
         onIntent={async intent => {
+          scrollToLatest();
           await onComposerIntent(intent);
           scrollToLatest();
         }}

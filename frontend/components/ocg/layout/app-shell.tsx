@@ -213,7 +213,6 @@ export function RuntimeWorkspace({
 
   const activeSession = snapshot.sessions.find((session) => session.id === activeSessionId) ?? snapshot.sessions[0];
   const activeSessionKey = activeSession?.id;
-  const activeWorkType = activeSession?.workType;
   const busySessionIds = snapshot.sessions.filter(session => (snapshot.messagesBySession[session.id] ?? []).some(message =>
     message.role === "assistant" && (message.status === "pending" || message.status === "streaming"),
   )).map(session => session.id);
@@ -322,14 +321,13 @@ export function RuntimeWorkspace({
   }, [snapshot.scenario, withProject]);
 
   const handleNewChat = useCallback(async () => {
-    if (!activeWorkType) return;
-    const session = await createSession({ workType: activeWorkType, projectId: activeProjectId });
+    const session = await createSession({ workType: "coding", projectId: activeProjectId });
     // Register before selecting so the new chat stays in the current project.
     registerProjectSession(session.id);
     setActiveSessionId(session.id);
     navigate("chat");
     rememberSession(session.id);
-  }, [activeProjectId, activeWorkType, createSession, registerProjectSession, rememberSession, navigate]);
+  }, [activeProjectId, createSession, registerProjectSession, rememberSession, navigate]);
 
   const handleNewProjectChat = useCallback(async () => {
     const session = await createSession({ workType: "coding", projectId: activeProjectId });
@@ -691,16 +689,13 @@ export function RuntimeWorkspace({
         <OcgTopbar
           session={activeSession}
           projectName={activeProjectId ? activeProject.name : t("project.noProject")}
-          sidebarCollapsed={sidebarCollapsed}
           inspectorOpen={inspectorOpen}
           inspectorControls={Boolean(activeSession) && view === "chat"}
           activeView={view}
-          onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
+          onOpenSettings={() => navigate("settings")}
           onToggleInspector={() => startTransition(() => setInspectorMode((value) => value === "collapsed" ? "docked" : "collapsed"))}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileInspector={() => startTransition(() => setMobileInspectorOpen(true))}
-          runtimeStatus={snapshot.status}
-          runtimeAuthority={runtimeAuthority}
           syncStatus={sync?.status ?? null}
         />
         <ViewTransition key={view} enter="vt-surface" exit="vt-surface" default="none">

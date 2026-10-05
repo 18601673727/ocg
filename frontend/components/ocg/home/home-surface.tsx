@@ -248,7 +248,7 @@ function AttentionSection({
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="text-[13px] font-semibold">{item.title}</span>
-                  <span className={cn("rounded-full px-1.5 py-0.5 text-[10px] font-medium", SURFACE_TONE[tone], TEXT_TONE[tone])}>
+                  <span className={cn("rounded-md px-1.5 py-0.5 text-[10px] font-medium", SURFACE_TONE[tone], TEXT_TONE[tone])}>
                     {kindLabel(item.kind)}
                   </span>
                 </div>

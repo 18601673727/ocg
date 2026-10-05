@@ -121,7 +121,7 @@ export function TrafficChart({ points }: { points: LedgerTimePoint[] }) {
               onClick={() => toggle(series.key)}
               title={`${on ? "Hide" : "Show"} ${series.label} series`}
               className={cn(
-                "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
+                "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
                 on ? "border-border bg-muted font-medium text-foreground" : "border-border/60 text-muted-foreground",
               )}
             >

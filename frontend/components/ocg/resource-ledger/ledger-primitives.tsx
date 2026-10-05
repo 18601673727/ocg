@@ -113,7 +113,7 @@ export function CostsMix({ cost }: { cost: Record<CostProvenance, number> }) {
         <span
           key={key}
           className={cn(
-            "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] capitalize",
+            "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] capitalize",
             TONE_CLASS[COST_TONE[key]],
             cost[key] === 0 && "opacity-50",
           )}
@@ -152,7 +152,7 @@ export function ReconciliationIndicator({
       {RECONCILIATION_ORDER.map((status) => (
         <span
           key={status}
-          className={`inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] ${TONE_CLASS[RECONCILIATION_TONE[status]]}${counts[status] === 0 ? " opacity-50" : ""}`}
+          className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] ${TONE_CLASS[RECONCILIATION_TONE[status]]}${counts[status] === 0 ? " opacity-50" : ""}`}
           title={`${RECONCILIATION_LABEL[status]}: ${counts[status]} call(s). ${RECONCILIATION_DEFINITION[status]}`}
         >
           <span className="capitalize">{RECONCILIATION_LABEL[status]}</span>
