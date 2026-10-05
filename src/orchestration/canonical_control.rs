@@ -1753,12 +1753,7 @@ impl CanonicalControlService {
                 .unwrap_or("worker")
         };
         let (global, _, _) = self.read_configuration()?;
-        let budget_config = match global.resource_budget {
-            Some(budget) => crate::orchestration::budget::BudgetConfig::from_config(
-                &json!({"budget":{"currency":budget.unit,"hardLimitMicros":(budget.hard_limit * 1_000_000.0) as i64}}),
-            )?,
-            None => crate::orchestration::budget::BudgetConfig::default(),
-        };
+        let budget_config = self.provider_budget_config(&global)?;
         let admission = domain.retry_job(job_id, executor_kind, expected_generation)?;
         if let Some((request, protocol, provider_config)) = replay {
             let authority = domain
@@ -1800,6 +1795,22 @@ impl CanonicalControlService {
             accepted: true,
             snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
         })
+    }
+
+    fn provider_budget_config(
+        &self,
+        global: &GlobalConfiguration,
+    ) -> Result<super::budget::BudgetConfig> {
+        let mut config = self.profile_service.budget_config()?;
+        if let Some(budget) = global
+            .resource_budget
+            .as_ref()
+            .filter(|budget| budget.hard_limit > 0.0)
+        {
+            config.currency = Some(super::budget::normalize_currency(&budget.unit)?);
+            config.hard_limit_micros = Some((budget.hard_limit * 1_000_000.0) as i64);
+        }
+        Ok(config)
     }
 
     fn launch_job_inner(
@@ -1892,8 +1903,7 @@ impl CanonicalControlService {
             domain.lookup_launch_command(&request.command_id, &request.project_id)?
         } else {
             None
-        }
-        {
+        } {
             if stored_hash != request_hash {
                 return Ok(crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -1984,6 +1994,17 @@ impl CanonicalControlService {
                     message: "profile not configured".to_string(),
                     duplicate: false,
                 };
+                if let Some(job) = &existing_job {
+                    domain.record_admission_failure(
+                        &job.id,
+                        &super::domain::job_failure(
+                            "placement_incompatible",
+                            FailureClass::Validation,
+                            "Profile has no configured execution candidates",
+                            false,
+                        ),
+                    )?;
+                }
                 domain.record_launch_command(
                     &request.command_id,
                     &request.project_id,
@@ -2016,79 +2037,98 @@ impl CanonicalControlService {
             None
         };
 
-        // Resolve provider and model from project configuration defaults
-        let provider_key = match existing_job
+        let budget_config = self.provider_budget_config(&global_config)?;
+        let spec = existing_job
             .as_ref()
-            .and_then(|job| job.spec.provider.as_deref())
-            .or_else(|| {
-                selection
-                    .as_ref()
-                    .and_then(|_| chat_selection.map(|(_, model)| model.provider.as_str()))
-            })
-            .or_else(|| {
-                project_config
-                    .defaults
-                    .get("provider")
-                    .and_then(Value::as_str)
-            })
-            .or_else(|| chat_selection.map(|(_, model)| model.provider.as_str()))
+            .map(|job| job.spec.clone())
+            .unwrap_or_else(|| JobSpec {
+                provider: chat_selection.map(|(_, model)| model.provider.clone()),
+                model: chat_selection.map(|(key, _)| key.to_string()),
+                objective: Some(request.objective.clone()),
+                hard_budget_micros: Some(request.hard_budget_micros),
+                ..JobSpec::default()
+            });
+        let reserved_choice = if let Some(job) = existing_job
+            .as_ref()
+            .filter(|job| job.state == JobState::Running)
         {
-            Some(p) => p,
-            None => {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: "provider not configured".to_string(),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
+            let choice = domain.admission_selection(&job.id)?;
+            if choice.is_some() {
+                choice
+            } else if let Some(attempt_id) = job.authoritative_attempt_id.as_deref() {
+                domain
+                    .calls_for_attempt(attempt_id)?
+                    .into_iter()
+                    .next()
+                    .map(|call| domain.dispatch_intent(&call.id))
+                    .transpose()?
+                    .flatten()
+                    .and_then(|intent| {
+                        Some(super::placement::ProviderChoice {
+                            provider: intent.provider_key?,
+                            model: intent.model?,
+                        })
+                    })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let choice = if let Some(choice) = reserved_choice {
+            choice
+        } else {
+            match super::placement::choose(
+                &domain,
+                super::placement::PolicyInput {
+                    profile: &profile,
+                    root: Path::new(&project.root),
+                    project_id: &project.project_id,
+                    job_id: existing_job.as_ref().map(|job| job.id.as_str()),
+                    spec: &spec,
+                    requirements: super::placement::Requirements {
+                        images: !images.is_empty(),
+                        effort: selection
+                            .as_ref()
+                            .and_then(|selection| selection.effort.as_deref()),
+                    },
+                    preferred_provider: project_config
+                        .defaults
+                        .get("provider")
+                        .and_then(Value::as_str),
+                    preferred_model: project_config
+                        .defaults
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .or(profile.default_model.as_deref()),
+                    budget: &budget_config,
+                    // Chat's accepted-turn queue predates placement. Its worker
+                    // still acquires the existing execution slot before I/O.
+                    concurrency: (!is_chat).then_some(provider_concurrency),
+                    now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+                },
+            )? {
+                Ok(choice) => choice,
+                Err(reason) => {
+                    if let Some(job) = &existing_job {
+                        domain.record_admission_failure(&job.id, &reason)?;
+                    }
+                    return Ok(crate::contracts::JobLaunchResponse {
+                        api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                        outcome: "rejected".to_string(),
+                        command_id: request.command_id.clone(),
+                        draft_id: request.draft_id.clone(),
+                        project_id: project.project_id.clone(),
+                        session_id: request.session_id.clone(),
+                        job_id: existing_job.as_ref().map(|job| job.id.clone()),
+                        message: format!("{}: {}", reason.code, reason.message),
+                        duplicate: false,
+                    });
+                }
             }
         };
-
-        let model = match existing_job
-            .as_ref()
-            .and_then(|job| job.spec.model.as_deref())
-            .or_else(|| selection.as_ref().map(|selection| selection.model.as_str()))
-            .or_else(|| project_config.defaults.get("model").and_then(Value::as_str))
-            .or_else(|| chat_selection.map(|(key, _)| key))
-        {
-            Some(m) => m,
-            None => {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: "model not configured".to_string(),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
-            }
-        };
+        let provider_key = choice.provider.as_str();
+        let model = choice.model.as_str();
 
         let provider_entry = match profile.providers.get(provider_key) {
             Some(p) => p,
@@ -2165,14 +2205,7 @@ impl CanonicalControlService {
                 .models
                 .get(model)
                 .ok_or_else(|| invalid("selected model missing"))?;
-            let metadata = entry.metadata.as_ref();
-            let supported = metadata
-                .and_then(|metadata| metadata.efforts.as_ref())
-                .is_some_and(|efforts| efforts.iter().any(|candidate| candidate == effort))
-                || entry.variants.iter().any(|candidate| candidate == effort)
-                || metadata
-                    .and_then(|metadata| metadata.variants.as_ref())
-                    .is_some_and(|variants| variants.iter().any(|candidate| candidate == effort));
+            let supported = super::placement::supports_effort(entry, effort);
             if !supported
                 || !provider_entry.wire_protocol().is_openai_chat_completions()
                 || !matches!(
@@ -2267,19 +2300,6 @@ impl CanonicalControlService {
             }
         }
 
-        // Build budget config from resource_budget if present
-        let budget_config = if let Some(resource_budget) = &global_config.resource_budget {
-            let budget_data = serde_json::json!({
-                "budget": {
-                    "currency": &resource_budget.unit,
-                    "hardLimitMicros": (resource_budget.hard_limit * 1_000_000.0) as i64,
-                }
-            });
-            crate::orchestration::budget::BudgetConfig::from_config(&budget_data)?
-        } else {
-            crate::orchestration::budget::BudgetConfig::default()
-        };
-
         // Create canonical Job/Attempt/Executor. The Job spec is the durable
         // launch intent: what was asked, what success looks like, the
         // constraints, and the declared budget commitment. Frozen provider
@@ -2311,8 +2331,8 @@ impl CanonicalControlService {
         } else {
             domain.create_job(&canonical_project.id, job_spec)?
         };
-        // Admission is one canonical step, not three. `dispatch_job` is the
-        // domain operation that makes a newly created Job dispatchable: inside
+        // Admission uses the same canonical dispatch transaction. It
+        // makes a newly created Job dispatchable: inside
         // a single immediate transaction it performs the `pending -> eligible`
         // transition, claims the authoritative Attempt (which carries the Job
         // to `running` with its authoritative Attempt) and publishes the
@@ -2336,8 +2356,21 @@ impl CanonicalControlService {
                 return Err(invalid("Job was admitted by another executor"));
             }
             (attempt, executor)
-        } else {
+        } else if is_chat {
             domain.dispatch_job(&job.id, "provider")?
+        } else {
+            domain.dispatch_job_with_placement(
+                &job.id,
+                &choice,
+                provider_concurrency,
+                &budget_config,
+                super::placement::quota(
+                    Path::new(&project.root),
+                    &profile,
+                    &choice,
+                    crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+                ),
+            )?
         };
 
         let user_content = initial_user_message(&request);
@@ -2371,7 +2404,12 @@ impl CanonicalControlService {
         }
 
         // Resolve quota facts for economic admission
-        let quota_facts = crate::orchestration::budget::QuotaFacts::unknown();
+        let quota_facts = super::placement::quota(
+            Path::new(&project.root),
+            &profile,
+            &choice,
+            crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+        );
 
         // Admit the provider call
         let authority = domain
@@ -2432,7 +2470,9 @@ impl CanonicalControlService {
             if resume_previous {
                 crate::provider_loop::resume_provider_call_admission(admission, call)
             } else if call.state == "failed" {
-                Err(invalid("automatic provider Call admission previously failed"))
+                Err(invalid(
+                    "automatic provider Call admission previously failed",
+                ))
             } else {
                 Ok(call)
             }
@@ -2475,9 +2515,7 @@ impl CanonicalControlService {
             }
         };
 
-        if existing_job.is_some() {
-            domain.complete_automatic_admission(&job.id)?;
-        }
+        domain.complete_automatic_admission(&job.id)?;
 
         // Record successful launch
         let response = crate::contracts::JobLaunchResponse {

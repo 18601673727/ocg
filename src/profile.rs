@@ -434,6 +434,15 @@ impl ProfileService {
         )))
     }
 
+    pub(crate) fn budget_config(&self) -> Result<crate::orchestration::budget::BudgetConfig> {
+        if !self.config_path.exists() {
+            return Ok(crate::orchestration::budget::BudgetConfig::default());
+        }
+        crate::orchestration::budget::BudgetConfig::from_config(&crate::yaml::read_yaml_object(
+            &self.config_path,
+        )?)
+    }
+
     /// Backend-computed execution readiness: model keys that satisfy the
     /// same selection, endpoint, and credential rules as canonical launch.
     /// A missing Profile or an unreadable Vault yields no choices.

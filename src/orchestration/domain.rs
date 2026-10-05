@@ -811,6 +811,7 @@ impl DomainRepository {
             "automatic_admission",
             "INTEGER NOT NULL DEFAULT 0 CHECK(automatic_admission IN (0,1))",
         )?;
+        ensure_column(&connection, "domain_jobs", "admission_selection", "TEXT")?;
         ensure_column(&connection, "domain_job_origins", "spawn_key", "TEXT")?;
         ensure_column(
             &connection,
@@ -1721,6 +1722,13 @@ impl DomainRepository {
             )
             .filter(|reservation| reservation.state != budget::ReservationState::Released)
             .map(|reservation| reservation.reservation_id.clone());
+        if existing.is_none()
+            && before.as_ref().is_some_and(|intent| {
+                !matches!(intent.state.as_str(), "pending" | "queued")
+            })
+        {
+            return Err(invalid("dispatch intent is no longer budget-admittable"));
+        }
         let request = budget::SpendRequest {
             action: SpendAction::ProviderDispatch,
             operation_id,
@@ -1728,11 +1736,34 @@ impl DomainRepository {
             quota,
             already_reserved: existing.is_some(),
         };
-        let mut assessment = budget::admit(&ledger, config.require_quota, &request);
+        let mut assessment = assess_project_budget(&ledger, config, &request);
+        if assessment.is_allowed() {
+            let intent = before
+                .as_ref()
+                .ok_or_else(|| invalid("unknown dispatch intent"))?;
+            let job = read_job(&transaction, &intent.job_id)?
+                .ok_or_else(|| invalid("unknown dispatch Job"))?;
+            if let Some(job_assessment) = assess_job_budget_in(
+                &transaction,
+                &ledger,
+                &job.spec,
+                Some(&job.id),
+                config,
+                &request,
+            )? {
+                if !job_assessment.is_allowed() || assessment.amount.is_none() {
+                    assessment = job_assessment;
+                }
+            }
+        }
         let mut reserved_id = existing;
+        assessment.reservation_id = reserved_id.clone();
         let mut recorded_reservation = false;
         if assessment.is_allowed() {
             if let Some(amount) = assessment.amount.clone() {
+                if ledger.currency.is_empty() {
+                    ledger.currency = amount.currency.clone();
+                }
                 let reservation_id = budget::reservation_id(
                     SpendAction::ProviderDispatch,
                     project_id,
@@ -3248,6 +3279,64 @@ impl DomainRepository {
             .collect()
     }
 
+    pub(crate) fn admission_selection(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<super::placement::ProviderChoice>> {
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT admission_selection FROM domain_jobs WHERE id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|error| invalid(&error.to_string())))
+            .transpose()
+    }
+
+    pub(crate) fn record_admission_failure(&self, job_id: &str, failure: &Failure) -> Result<()> {
+        let transaction = self.begin()?;
+        let mut job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        if job.state != JobState::Eligible || job.termination_reason.as_ref() == Some(failure) {
+            return Ok(());
+        }
+        job.termination_reason = Some(failure.clone());
+        job.updated_at = now();
+        transaction
+            .execute(
+                "UPDATE domain_jobs SET termination_reason=?2,updated_at=?3 WHERE id=?1",
+                params![
+                    job_id,
+                    serde_json::to_string(failure).map_err(|error| invalid(&error.to_string()))?,
+                    job.updated_at
+                ],
+            )
+            .map_err(sql)?;
+        emit_job(&transaction, EventKind::JobUpdated, &job, None)?;
+        transaction.commit().map_err(sql)
+    }
+
+    pub(crate) fn preview_provider_admission(
+        &self,
+        project_id: &str,
+        job_id: Option<&str>,
+        spec: &JobSpec,
+        config: &BudgetConfig,
+        quota: QuotaFacts,
+    ) -> Result<SpendAssessment> {
+        preview_provider_admission_in(&self.connection, project_id, job_id, spec, config, quota)
+    }
+
+    pub(crate) fn provider_capacity_available(
+        &self,
+        project_id: &str,
+        job_id: Option<&str>,
+        limit: usize,
+    ) -> Result<bool> {
+        provider_capacity_available_in(&self.connection, project_id, job_id, limit)
+    }
+
     pub(crate) fn mark_automatic_admission(&self, job_id: &str) -> Result<bool> {
         let transaction = self.begin()?;
         // The marker survives a crash between claiming an Attempt and creating
@@ -3286,6 +3375,31 @@ impl DomainRepository {
         job_id: &str,
         executor_kind: &str,
     ) -> Result<(Attempt, Executor)> {
+        self.dispatch_job_inner(job_id, executor_kind, None)
+    }
+
+    pub(crate) fn dispatch_job_with_placement(
+        &mut self,
+        job_id: &str,
+        choice: &super::placement::ProviderChoice,
+        limit: usize,
+        config: &BudgetConfig,
+        quota: QuotaFacts,
+    ) -> Result<(Attempt, Executor)> {
+        self.dispatch_job_inner(job_id, "provider", Some((choice, limit, config, quota)))
+    }
+
+    fn dispatch_job_inner(
+        &mut self,
+        job_id: &str,
+        executor_kind: &str,
+        placement: Option<(
+            &super::placement::ProviderChoice,
+            usize,
+            &BudgetConfig,
+            QuotaFacts,
+        )>,
+    ) -> Result<(Attempt, Executor)> {
         validate_id(executor_kind)?;
         let transaction = self
             .connection
@@ -3295,6 +3409,35 @@ impl DomainRepository {
             return Err(invalid("Job dependencies are not satisfied"));
         }
         refresh_job_readiness_in(&transaction, job_id, None)?;
+        if let Some((choice, limit, config, quota)) = placement {
+            let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+            let assessment = preview_provider_admission_in(
+                &transaction,
+                &job.project_id,
+                Some(job_id),
+                &job.spec,
+                config,
+                quota,
+            )?;
+            if !assessment.is_allowed() {
+                return Err(invalid(&format!(
+                    "{}: {}",
+                    assessment.reason_code, assessment.reason
+                )));
+            }
+            if !provider_capacity_available_in(&transaction, &job.project_id, Some(job_id), limit)?
+            {
+                return Err(invalid(
+                    "placement_capacity: Project provider capacity is reserved",
+                ));
+            }
+            let selected =
+                serde_json::to_string(choice).map_err(|error| invalid(&error.to_string()))?;
+            // The existing authoritative Attempt is the capacity reservation.
+            // Freeze its choice in the same transaction, including the crash
+            // window before its first Call/DispatchIntent can exist.
+            transaction.execute("UPDATE domain_jobs SET admission_selection=?2,automatic_admission=1,termination_reason=NULL WHERE id=?1", params![job_id, selected]).map_err(sql)?;
+        }
         let (attempt, root) = create_attempt_in(&transaction, job_id)?;
         let executor = Executor {
             id: new_id("exec"),
@@ -6607,6 +6750,121 @@ pub(crate) fn job_failure(
     }
 }
 
+fn provider_capacity_available_in(
+    connection: &Connection,
+    project_id: &str,
+    job_id: Option<&str>,
+    limit: usize,
+) -> Result<bool> {
+    let reserved: i64 = connection.query_row(
+        "SELECT COUNT(DISTINCT a.id) FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1 AND (?2 IS NULL OR j.id!=?2) AND a.state IN ('queued','running','cancelling') AND (EXISTS(SELECT 1 FROM domain_executors e WHERE e.attempt_id=a.id AND e.kind='provider') OR EXISTS(SELECT 1 FROM domain_dispatch_intents d WHERE d.attempt_id=a.id AND d.provider_key IS NOT NULL))",
+        params![project_id,job_id], |row| row.get(0),
+    ).map_err(sql)?;
+    Ok(reserved < limit as i64)
+}
+
+fn assess_project_budget(
+    ledger: &budget::ProjectBudget,
+    config: &BudgetConfig,
+    request: &budget::SpendRequest<'_>,
+) -> SpendAssessment {
+    if !request.already_reserved
+        && config.hard_limit_micros.is_some()
+        && ledger.hard_limit.is_none()
+    {
+        return SpendAssessment::configured_but_unenforceable(
+            ledger,
+            budget::REASON_CURRENCY,
+            "Configured hard budget cannot be applied to the existing accounting currency",
+        );
+    }
+    budget::admit(ledger, config.require_quota, request)
+}
+fn preview_provider_admission_in(
+    connection: &Connection,
+    project_id: &str,
+    job_id: Option<&str>,
+    spec: &JobSpec,
+    config: &BudgetConfig,
+    quota: QuotaFacts,
+) -> Result<SpendAssessment> {
+    let mut ledger = read_budget(connection, project_id)?;
+    ledger.materialize_config(config);
+    let request = budget::SpendRequest {
+        action: SpendAction::ProviderDispatch,
+        operation_id: job_id.unwrap_or("placement-preview"),
+        estimate: config.estimated_cost(),
+        quota,
+        already_reserved: false,
+    };
+    let assessment = assess_project_budget(&ledger, config, &request);
+    if !assessment.is_allowed() {
+        return Ok(assessment);
+    }
+    Ok(
+        assess_job_budget_in(connection, &ledger, spec, job_id, config, &request)?
+            .unwrap_or(assessment),
+    )
+}
+
+fn assess_job_budget_in(
+    connection: &Connection,
+    ledger: &budget::ProjectBudget,
+    spec: &JobSpec,
+    job_id: Option<&str>,
+    config: &BudgetConfig,
+    request: &budget::SpendRequest<'_>,
+) -> Result<Option<SpendAssessment>> {
+    let Some(limit) = spec.hard_budget_micros.filter(|limit| *limit > 0) else {
+        return Ok(None);
+    };
+    // This is a view of the same reservation/settlement ledger, never a second
+    // budget store. Retry charges remain attached to the same durable Job.
+    let currency = if ledger.currency.is_empty() {
+        config.currency.clone().unwrap_or_default()
+    } else {
+        ledger.currency.clone()
+    };
+    let mut view = budget::ProjectBudget {
+        currency: currency.clone(),
+        hard_limit: Some(budget::Money::new(limit, currency.clone())),
+        settled: budget::Money::zero(currency),
+        ..budget::ProjectBudget::default()
+    };
+    if let Some(job_id) = job_id {
+        let calls: Vec<String> = query_all(
+            connection,
+            "SELECT call_id FROM domain_dispatch_intents WHERE job_id=?1",
+            &[&job_id],
+            |row| row.get(0),
+        )?;
+        view.reservations = ledger
+            .reservations
+            .iter()
+            .filter(|reservation| calls.contains(&reservation.operation_id))
+            .cloned()
+            .collect();
+        let settlements: Vec<String> = query_all(connection,
+            "SELECT s.settlement FROM domain_settlements s JOIN domain_attempts a ON a.id=s.attempt_id WHERE a.job_id=?1 AND s.disposition='settled' AND s.usage_authoritative=1 ORDER BY s.created_at,s.settlement_id",
+            &[&job_id], |row| row.get(0))?;
+        let mut counted = std::collections::HashSet::new();
+        for raw in settlements {
+            let settlement: budget::Settlement =
+                serde_json::from_str(&raw).map_err(|error| invalid(&error.to_string()))?;
+            if counted.insert(settlement.reservation_id) {
+                view.settled.micros = view
+                    .settled
+                    .micros
+                    .saturating_add(settlement.effect.actual.micros);
+            }
+        }
+    }
+    view.recompute();
+    let mut assessment = budget::admit(&view, config.require_quota, request);
+    assessment.reason = format!("Job hard budget: {}", assessment.reason);
+    Ok(Some(assessment))
+}
+
 fn finish_attempt_with_reason_in(
     transaction: &rusqlite::Transaction<'_>,
     attempt_id: &str,
@@ -6744,7 +7002,7 @@ fn finish_attempt_with_reason_in(
             .map(serde_json::to_string)
             .transpose()
             .map_err(|error| invalid(&error.to_string()))?;
-        transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state=?2,updated_at=?3,termination_reason=?5 WHERE id=?1 AND authoritative_attempt_id=?4", params![job_id,state,timestamp,attempt_id,reason]).map_err(sql)?;
+        transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state=?2,updated_at=?3,termination_reason=?5,automatic_admission=0 WHERE id=?1 AND authoritative_attempt_id=?4", params![job_id,state,timestamp,attempt_id,reason]).map_err(sql)?;
         // The Attempt leaving authority is the single causal fact for this
         // transition; everything it settles hangs off it in the same commit.
         let root = emit_attempt(

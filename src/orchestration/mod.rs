@@ -13,6 +13,7 @@ pub mod execution_dispatch;
 pub mod execution_runtime;
 pub mod handoff;
 pub mod journal;
+pub(crate) mod placement;
 pub mod projection;
 pub mod state;
 
