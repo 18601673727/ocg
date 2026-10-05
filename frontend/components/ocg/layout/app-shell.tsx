@@ -306,16 +306,20 @@ export function RuntimeWorkspace({
     }
   }, [snapshot.scenario, view, withProject]);
 
+  // Selecting a Project-owned Job addresses the Job surface directly. The
+  // toggle-back-to-chat resolution of workspaceViewHref is deliberately not used
+  // here: re-selecting another Job while already on the Job surface is a Job
+  // change, not a navigation away from it.
   const openJob = useCallback((jobId: string) => {
     setMobileNavOpen(false);
     setMobileInspectorOpen(false);
-    const href = workspaceViewHref(view, "job-execution") ?? workspaceViewHref("chat", "job-execution");
+    const href = workspaceViewHref("chat", "job-execution");
     if (!href) return;
     const url = new URL(withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`), window.location.origin);
     url.searchParams.set("job", jobId);
     if (new URLSearchParams(window.location.search).get("demo") === "1") url.searchParams.set("demo", "1");
     window.history.pushState(null, "", url.pathname + url.search);
-  }, [snapshot.scenario, view, withProject]);
+  }, [snapshot.scenario, withProject]);
 
   const handleNewChat = useCallback(async () => {
     if (!activeWorkType) return;
