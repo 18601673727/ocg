@@ -7,9 +7,12 @@
 
 use crate::core_contract::{Failure, FailureClass};
 use crate::error::{OcgError, Result};
+use crate::orchestration::admission::{
+    publish_call, reserve, AdmissionContext, AdmissionTarget, PayloadMode, PreparedExecution,
+};
 use crate::orchestration::domain::{
     Attempt, AttemptAuthority, Call, ChildPolicy, DispatchIntent, DomainRepository, Executor, Job,
-    JobOrigin, JobSpec, JobState,
+    JobOrigin, JobSpec,
 };
 use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use crate::orchestration::health_probe::HealthProbeObservation;
@@ -85,15 +88,6 @@ fn chat_conversation_view(
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
     }
-}
-
-fn endpoint_has_userinfo(endpoint: &str) -> bool {
-    endpoint.split_once("://").is_some_and(|(_, rest)| {
-        rest.split(['/', '?', '#'])
-            .next()
-            .unwrap_or("")
-            .contains('@')
-    })
 }
 
 /// The deterministic first model input: the launch intent and nothing else.
@@ -1769,38 +1763,70 @@ impl CanonicalControlService {
         let budget_config = self.provider_budget_config(&global)?;
         let admission = domain.retry_job(job_id, executor_kind, expected_generation)?;
         if let Some((request, protocol, provider_config)) = replay {
-            let authority = domain
-                .authority(&admission.attempt.id)?
-                .ok_or_else(|| invalid("retry Attempt authority disappeared"))?;
+            // Retry does not choose a new candidate. It republishes the Call
+            // against the target the previous Attempt already froze.
             let runtime = runtime.ok_or_else(|| invalid("retry runtime disappeared"))?;
-            if let Err(error) = crate::provider_loop::admit_provider_call_with_events(
-                crate::provider_loop::ProviderCallAdmission {
-                    domain: &mut domain,
-                    authority: &authority,
-                    executor_id: &admission.executor.id,
-                    request,
-                    config: &budget_config,
-                    quota: crate::orchestration::budget::QuotaFacts::unknown(),
-                    dispatcher: runtime.provider_dispatcher(),
-                    provider_config,
-                    protocol,
+            let (profile, _) = self
+                .profile_service
+                .current()?
+                .ok_or_else(|| invalid("profile not configured"))?;
+            let (project, _) = self.project_repository(&job.project_id)?;
+            let resolved = super::admission::ResolvedTarget {
+                protocol,
+                config: provider_config,
+                effort: request
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                reservation: super::admission::AdmissionReservation {
+                    choice: super::placement::ProviderChoice {
+                        provider: job.spec.provider.clone().unwrap_or_default(),
+                        model: job.spec.model.clone().unwrap_or_default(),
+                    },
+                    pickup: if job.spec.health_probe.is_some() {
+                        super::admission::AdmissionPickup::Explicit
+                    } else {
+                        super::admission::AdmissionPickup::Automatic
+                    },
+                    exact: job.spec.health_probe.as_ref().map(|intent| {
+                        super::admission::ExactTarget {
+                            provider: intent.provider.clone(),
+                            model: intent.model.clone(),
+                            effort: intent.effort.clone(),
+                        }
+                    }),
                 },
-                None,
-                CallCancellation::new(),
-            ) {
-                if domain.authority(&admission.attempt.id)?.is_some() {
-                    domain.fail_attempt(
-                        &admission.attempt.id,
-                        &super::domain::job_failure(
-                            "retry_admission_failed",
-                            FailureClass::Unknown,
-                            &error.to_string(),
-                            true,
-                        ),
-                    )?;
-                }
-                return Err(error);
-            }
+            };
+            publish_call(
+                &mut AdmissionContext {
+                    domain: &mut domain,
+                    profile: &profile,
+                    root: Path::new(&project.root),
+                    project_id: &project.project_id,
+                    budget: &budget_config,
+                    concurrency: None,
+                    now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+                },
+                &admission.job,
+                &resolved,
+                &super::admission::ReservedExecution {
+                    attempt: admission.attempt.clone(),
+                    executor: admission.executor.clone(),
+                    existing_call: false,
+                },
+                PreparedExecution {
+                    request,
+                    payload: if job.spec.health_probe.is_some() {
+                        PayloadMode::Probe
+                    } else {
+                        PayloadMode::Agent
+                    },
+                    event_sender: None,
+                    cancelled: CallCancellation::new(),
+                },
+                &runtime,
+            )?
+            .map_err(|refusal| invalid(refusal.message))?;
         }
         Ok(CanonicalJobOperationResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -2082,141 +2108,69 @@ impl CanonicalControlService {
                 hard_budget_micros: Some(request.hard_budget_micros),
                 ..JobSpec::default()
             });
-        let reserved_choice = if let Some(job) = existing_job
+        // Chat and generic launch both require candidate selection. An exact
+        // target, such as a Health Probe, never enters this function.
+        let preferred_provider = project_config
+            .defaults
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let preferred_model = project_config
+            .defaults
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| profile.default_model.clone());
+        let effort = selection
             .as_ref()
-            .filter(|job| job.state == JobState::Running)
-        {
-            let choice = domain.admission_selection(&job.id)?;
-            if choice.is_some() {
-                choice
-            } else if let Some(attempt_id) = job.authoritative_attempt_id.as_deref() {
-                domain
-                    .calls_for_attempt(attempt_id)?
-                    .into_iter()
-                    .next()
-                    .map(|call| domain.dispatch_intent(&call.id))
-                    .transpose()?
-                    .flatten()
-                    .and_then(|intent| {
-                        Some(super::placement::ProviderChoice {
-                            provider: intent.provider_key?,
-                            model: intent.model?,
-                        })
-                    })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let choice = if let Some(choice) = reserved_choice {
-            choice
-        } else {
-            match super::placement::choose(
-                &domain,
-                super::placement::PolicyInput {
-                    profile: &profile,
-                    root: Path::new(&project.root),
-                    project_id: &project.project_id,
-                    job_id: existing_job.as_ref().map(|job| job.id.as_str()),
-                    spec: &spec,
-                    requirements: super::placement::Requirements {
-                        images: !images.is_empty(),
-                        effort: selection
-                            .as_ref()
-                            .and_then(|selection| selection.effort.as_deref()),
-                    },
-                    preferred_provider: project_config
-                        .defaults
-                        .get("provider")
-                        .and_then(Value::as_str),
-                    preferred_model: project_config
-                        .defaults
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .or(profile.default_model.as_deref()),
-                    budget: &budget_config,
-                    // Chat's accepted-turn queue predates placement. Its worker
-                    // still acquires the existing execution slot before I/O.
-                    concurrency: (!is_chat).then_some(provider_concurrency),
-                    now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
-                },
-            )? {
-                Ok(choice) => choice,
-                Err(reason) => {
-                    if let Some(job) = &existing_job {
-                        domain.record_admission_failure(&job.id, &reason)?;
-                    }
-                    return Ok(crate::contracts::JobLaunchResponse {
-                        api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                        outcome: "rejected".to_string(),
-                        command_id: request.command_id.clone(),
-                        draft_id: request.draft_id.clone(),
-                        project_id: project.project_id.clone(),
-                        session_id: request.session_id.clone(),
-                        job_id: existing_job.as_ref().map(|job| job.id.clone()),
-                        message: format!("{}: {}", reason.code, reason.message),
-                        duplicate: false,
-                    });
+            .and_then(|selection| selection.effort.clone());
+        let resolved = match super::admission::resolve_target(
+            &AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                // Chat's accepted-turn queue predates placement. Its worker
+                // still acquires the existing execution slot before I/O.
+                concurrency: (!is_chat).then_some(provider_concurrency),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            existing_job.as_ref(),
+            &spec,
+            &AdmissionTarget::SelectCandidate,
+            super::placement::Requirements {
+                images: !images.is_empty(),
+                effort: effort.as_deref(),
+            },
+            preferred_provider.as_deref(),
+            preferred_model.as_deref(),
+        )? {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                if let Some(job) = &existing_job {
+                    domain.record_admission_failure(&job.id, &refusal.failure)?;
                 }
-            }
-        };
-        let provider_key = choice.provider.as_str();
-        let model = choice.model.as_str();
-
-        let provider_entry = match profile.providers.get(provider_key) {
-            Some(p) => p,
-            None => {
-                let response = crate::contracts::JobLaunchResponse {
+                return Ok(crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                     outcome: "rejected".to_string(),
                     command_id: request.command_id.clone(),
                     draft_id: request.draft_id.clone(),
                     project_id: project.project_id.clone(),
                     session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("provider not found: {}", provider_key),
+                    job_id: existing_job.as_ref().map(|job| job.id.clone()),
+                    message: refusal.message,
                     duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
+                });
             }
         };
+        let provider_key = resolved.reservation.choice.provider.as_str();
+        let model = resolved.reservation.choice.model.as_str();
 
-        let upstream_model_id = match profile.models.get(model) {
-            Some(entry) if entry.provider == provider_key && !entry.id.is_empty() => {
-                entry.id.clone()
-            }
-            _ => {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("model {model} is not runnable for provider {provider_key}"),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
-            }
-        };
+        let provider_entry = profile
+            .providers
+            .get(provider_key)
+            .ok_or_else(|| invalid("resolved provider disappeared"))?;
 
         if !images.is_empty()
             && profile
@@ -2253,95 +2207,11 @@ impl CanonicalControlService {
             }
         }
 
-        // Validate endpoint
-        let endpoint = match &provider_entry.endpoint {
-            Some(e) if !e.is_empty() => e.clone(),
-            _ => {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("provider {} has no endpoint configured", provider_key),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
-            }
-        };
-
-        // Credentials are optional: an endpoint that needs no bearer token is a
-        // legitimate provider, so only a declared reference has to resolve.
-        if endpoint_has_userinfo(&endpoint) {
-            let response = crate::contracts::JobLaunchResponse {
-                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                outcome: "rejected".to_string(),
-                command_id: request.command_id.clone(),
-                draft_id: request.draft_id.clone(),
-                project_id: project.project_id.clone(),
-                session_id: request.session_id.clone(),
-                job_id: None,
-                message: format!("provider {provider_key} endpoint must not contain userinfo"),
-                duplicate: false,
-            };
-            domain.record_launch_command(
-                &request.command_id,
-                &request.project_id,
-                &request_hash,
-                "rejected",
-                existing_job.as_ref().map(|job| job.id.as_str()),
-                &response.message,
-            )?;
-            return Ok(response);
-        }
-
-        let credential_ref = provider_entry.credential_ref.clone();
-        if let Some(reference) = credential_ref.as_deref() {
-            // Verify a declared credential exists without keeping it in memory;
-            // the raw value is only read again at execution time.
-            let vault = crate::vault::Vault::user_global()?;
-            if vault.get(reference)?.is_none() {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("credential not found: {reference}"),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
-            }
-        }
-
-        // Create canonical Job/Attempt/Executor. The Job spec is the durable
-        // launch intent: what was asked, what success looks like, the
-        // constraints, and the declared budget commitment. Frozen provider
-        // transport identity (endpoint, upstream model id, credential
-        // reference) belongs to the Call's DispatchIntent, not to the Job.
-        // The boundary already proved this Project identity; read it back
-        // rather than creating one, so a launch can never mint identity for a
-        // boundary whose durable row is missing.
+        // Create the Job, then hand it to canonical admission. The Job spec is
+        // the durable launch intent. Frozen provider transport identity belongs
+        // to the Call's DispatchIntent, which admission publishes. The boundary
+        // already proved this Project identity; read it back rather than
+        // creating one.
         let canonical_project = domain
             .project_at_root(Path::new(&project.root))?
             .ok_or_else(|| invalid("registered Project identity is not durable at this root"))?;
@@ -2366,105 +2236,73 @@ impl CanonicalControlService {
         } else {
             domain.create_job(&canonical_project.id, job_spec)?
         };
-        // Admission uses the same canonical dispatch transaction. It
-        // makes a newly created Job dispatchable: inside
-        // a single immediate transaction it performs the `pending -> eligible`
-        // transition, claims the authoritative Attempt (which carries the Job
-        // to `running` with its authoritative Attempt) and publishes the
-        // provider Executor. An Attempt may only be claimed out of `eligible`,
-        // so a launch cannot create the Attempt directly off `create_job`;
-        // reusing the transition keeps this lane on the same scheduler
-        // semantics `ocg work dispatch` and admission already use.
-        let (attempt, executor) = if existing_job.is_some() && job.state == JobState::Running {
-            let attempt_id = job
-                .authoritative_attempt_id
-                .as_deref()
-                .ok_or_else(|| invalid("automatic admission lost Attempt authority"))?;
-            let attempt = domain
-                .attempt(attempt_id)?
-                .ok_or_else(|| invalid("automatic Attempt disappeared"))?;
-            let executor = domain
-                .executor_for_attempt(attempt_id)?
-                .ok_or_else(|| invalid("automatic Executor disappeared"))?;
-            if executor.kind != "provider" {
-                domain.complete_automatic_admission(&job.id)?;
-                return Err(invalid("Job was admitted by another executor"));
+        // Reservation is the canonical admission transition. Chat and generic
+        // launch both pass through it; only the payload built afterwards differs.
+        let reserved = match reserve(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: (!is_chat).then_some(provider_concurrency),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            &job,
+            &resolved,
+        )? {
+            Ok(reserved) => reserved,
+            Err(refusal) => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "failed".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: Some(job.id.clone()),
+                    message: refusal.message,
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "failed",
+                    Some(&job.id),
+                    &response.message,
+                )?;
+                return Ok(response);
             }
-            (attempt, executor)
-        } else if is_chat {
-            domain.dispatch_job(&job.id, "provider")?
-        } else {
-            domain.dispatch_job_with_placement(
-                &job.id,
-                &choice,
-                provider_concurrency,
-                &budget_config,
-                super::placement::quota(
-                    Path::new(&project.root),
-                    &profile,
-                    &choice,
-                    crate::clock::Clock::now_unix(&crate::clock::SystemClock),
-                ),
-            )?
         };
-
         let user_content = initial_user_message(&request);
-        let messages = if is_chat {
+        let messages = if reserved.existing_call {
+            Vec::new()
+        } else if is_chat {
             match domain.prepare_chat_turn_with_images(
                 &request,
                 &request_hash,
-                &attempt,
+                &reserved.attempt,
                 &user_content,
                 &images,
             ) {
                 Ok(messages) => messages,
                 Err(error) => {
-                    domain.finish_attempt(&attempt.id, false)?;
+                    domain.finish_attempt(&reserved.attempt.id, false)?;
                     return Err(error);
                 }
             }
         } else {
             vec![json!({"role": "user", "content": user_content})]
         };
-        // This snapshot becomes the immutable Call/DispatchIntent input. The
-        // worker compacts these messages without reading the Conversation again.
         let mut provider_request = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": true,
         });
-
         if let Some(effort) = effort {
             provider_request["reasoning_effort"] = json!(effort);
         }
-
-        // Resolve quota facts for economic admission
-        let quota_facts = super::placement::quota(
-            Path::new(&project.root),
-            &profile,
-            &choice,
-            crate::clock::Clock::now_unix(&crate::clock::SystemClock),
-        );
-
-        // Admit the provider call
-        let authority = domain
-            .authority(&attempt.id)?
-            .ok_or_else(|| invalid("attempt authority disappeared"))?;
-
-        // Freeze provider execution configuration for this Call
-        let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
-            provider_key: provider_key.to_string(),
-            model: model.to_string(),
-            upstream_model_id,
-            endpoint: endpoint.clone(),
-            credential_ref,
-        };
-
-        // The protocol is declared by the provider the Profile names, not
-        // inferred from its key, label or host, and it is frozen with the rest
-        // of the dispatch.
-        let protocol = provider_entry.wire_protocol();
-
         let chat = self
             .chat_registrations
             .lock()
@@ -2474,59 +2312,34 @@ impl CanonicalControlService {
                     (registration.sender.clone(), registration.cancelled.clone())
                 })
             });
-        let previous_call = if existing_job.is_some() {
-            domain.calls_for_attempt(&attempt.id)?.into_iter().next()
-        } else {
-            None
-        };
-        let resume_previous = previous_call
-            .as_ref()
-            .map(|call| -> Result<bool> {
-                Ok(call.state == "created"
-                    && !domain
-                        .dispatch_intent(&call.id)?
-                        .ok_or_else(|| invalid("automatic DispatchIntent disappeared"))?
-                        .budget_admitted)
-            })
-            .transpose()?
-            .unwrap_or(false);
-        let admission = crate::provider_loop::ProviderCallAdmission {
-            domain: &mut domain,
-            authority: &authority,
-            executor_id: &executor.id,
+        let prepared = PreparedExecution {
             request: provider_request,
-            config: &budget_config,
-            quota: quota_facts,
-            dispatcher: runtime_handle.provider_dispatcher(),
-            provider_config,
-            protocol,
+            payload: PayloadMode::Agent,
+            event_sender: chat.as_ref().map(|(sender, _)| sender.clone()),
+            cancelled: chat
+                .as_ref()
+                .map(|(_, cancelled)| cancelled.clone())
+                .unwrap_or_default(),
         };
-        let admitted = if let Some(call) = previous_call {
-            if resume_previous {
-                crate::provider_loop::resume_provider_call_admission(admission, call)
-            } else if call.state == "failed" {
-                Err(invalid(
-                    "automatic provider Call admission previously failed",
-                ))
-            } else {
-                Ok(call)
-            }
-        } else {
-            crate::provider_loop::admit_provider_call_with_events(
-                admission,
-                chat.as_ref().map(|(sender, _)| sender.clone()),
-                chat.as_ref()
-                    .map(|(_, cancelled)| cancelled.clone())
-                    .unwrap_or_default(),
-            )
-            .map(|(call, _)| call)
-        };
-        let _call = match admitted {
-            Ok(call) => call,
-            Err(e) => {
-                // Economic admission failed; finish the attempt as failed
-                domain.discard_unaccepted_chat_turn(&attempt.id)?;
-                domain.finish_attempt(&attempt.id, false)?;
+        let admitted = publish_call(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: (!is_chat).then_some(provider_concurrency),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            &job,
+            &resolved,
+            &reserved,
+            prepared,
+            &runtime_handle,
+        )?;
+        let _admitted = match admitted {
+            Ok(admitted) => admitted,
+            Err(refusal) => {
                 let response = crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                     outcome: "failed".to_string(),
@@ -2535,7 +2348,7 @@ impl CanonicalControlService {
                     project_id: project.project_id.clone(),
                     session_id: request.session_id.clone(),
                     job_id: Some(job.id.clone()),
-                    message: format!("economic admission failed: {}", e),
+                    message: refusal.message,
                     duplicate: false,
                 };
                 domain.record_launch_command(
@@ -2550,9 +2363,6 @@ impl CanonicalControlService {
             }
         };
 
-        domain.complete_automatic_admission(&job.id)?;
-
-        // Record successful launch
         let response = crate::contracts::JobLaunchResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             outcome: "accepted".to_string(),
@@ -2656,24 +2466,60 @@ impl CanonicalControlService {
             health_probe: Some(intent.clone()),
             ..JobSpec::default()
         };
-        let job = domain.create_job(&project.project_id, spec)?;
+        let job = domain.create_job(&project.project_id, spec.clone())?;
         // A rejected probe is recorded on the Job before any Attempt is
-        // claimed. `record_admission_failure` requires an eligible Job, and the
-        // transition is the ordinary readiness refresh, so the rejection stays
-        // canonical durable evidence while leaving no Attempt or Executor behind:
-        // a target that cannot be executed never reaches `running`.
-        let record = |domain: &mut DomainRepository, code: &'static str, message: String| {
+        // claimed. The refusal is the same admission decision every other
+        // origin records: the Job becomes eligible evidence and is marked
+        // explicit, so the automatic worker cannot later place a different
+        // candidate for it.
+        let record = |domain: &mut DomainRepository, failure: &Failure| {
             domain.set_job_eligible(&job.id)?;
-            domain.record_admission_failure(
+            domain.freeze_explicit_admission(
                 &job.id,
-                &super::health_probe::unsupported_target(code, message),
-            )
+                &super::admission::AdmissionReservation {
+                    choice: super::placement::ProviderChoice {
+                        provider: intent.provider.clone(),
+                        model: intent.model.clone(),
+                    },
+                    pickup: super::admission::AdmissionPickup::Explicit,
+                    exact: Some(super::admission::ExactTarget {
+                        provider: intent.provider.clone(),
+                        model: intent.model.clone(),
+                        effort: intent.effort.clone(),
+                    }),
+                },
+            )?;
+            domain.record_admission_failure(&job.id, failure)
         };
-        macro_rules! refuse {
-            ($code:literal, $reason:expr) => {{
-                let reason: String = $reason;
-                record(&mut domain, $code, reason.clone())?;
-                let response = rejected(reason, Some(job.id.clone()));
+        let budget_config = self.provider_budget_config(&self.read_configuration()?.0)?;
+        let resolved = match super::admission::resolve_target(
+            &AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: None,
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            Some(&job),
+            &spec,
+            &AdmissionTarget::Exact(super::admission::ExactTarget {
+                provider: intent.provider.clone(),
+                model: intent.model.clone(),
+                effort: intent.effort.clone(),
+            }),
+            super::placement::Requirements {
+                images: false,
+                effort: intent.effort.as_deref(),
+            },
+            None,
+            None,
+        )? {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                record(&mut domain, &refusal.failure)?;
+                let response = rejected(refusal.message, Some(job.id.clone()));
                 domain.record_launch_command(
                     &request.command_id,
                     &project.project_id,
@@ -2683,92 +2529,8 @@ impl CanonicalControlService {
                     &response.message,
                 )?;
                 return Ok(response);
-            }};
-        }
-
-        let Some(provider) = profile.providers.get(&intent.provider) else {
-            refuse!(
-                "health_probe_unknown_provider",
-                format!("provider not found: {}", intent.provider)
-            )
-        };
-        let protocol = provider.wire_protocol();
-        if !protocol.is_openai_chat_completions() {
-            refuse!(
-                "health_probe_unsupported_protocol",
-                format!(
-                    "provider {} does not speak the OpenAI chat-completions protocol",
-                    intent.provider
-                )
-            )
-        }
-        let Some(entry) = profile.models.get(&intent.model) else {
-            refuse!(
-                "health_probe_unknown_model",
-                format!("model not found: {}", intent.model)
-            )
-        };
-        if entry.provider != intent.provider {
-            refuse!(
-                "health_probe_model_provider_mismatch",
-                format!(
-                    "model {} is not runnable for provider {}",
-                    intent.model, intent.provider
-                )
-            )
-        }
-        // Effort is part of the identity under test, so it is validated exactly
-        // as canonical launch validates it rather than sent and left to fail.
-        if let Some(effort) = intent.effort.as_deref() {
-            if !super::placement::supports_effort(entry, effort) {
-                refuse!(
-                    "health_probe_unsupported_effort",
-                    format!(
-                        "model {} does not support reasoning effort {}",
-                        intent.model, effort
-                    )
-                )
             }
-            if !super::health_probe::PROBE_EFFORTS.contains(&effort) {
-                refuse!(
-                    "health_probe_unsupported_effort",
-                    format!("unsupported reasoning effort: {effort}")
-                )
-            }
-        }
-        let Some(endpoint) = provider
-            .endpoint
-            .as_deref()
-            .filter(|endpoint| !endpoint.is_empty())
-            .map(str::to_owned)
-        else {
-            refuse!(
-                "health_probe_missing_endpoint",
-                format!("provider {} has no endpoint configured", intent.provider)
-            )
         };
-        if endpoint_has_userinfo(&endpoint) {
-            refuse!(
-                "health_probe_missing_endpoint",
-                format!(
-                    "provider {} endpoint must not contain userinfo",
-                    intent.provider
-                )
-            )
-        }
-        // A declared credential must resolve, exactly as at canonical launch.
-        // The raw value is never read here; the worker reads it again at
-        // execution time.
-        let credential_ref = provider.credential_ref.clone();
-        if let Some(reference) = credential_ref.as_deref() {
-            let vault = crate::vault::Vault::user_global()?;
-            if vault.get(reference)?.is_none() {
-                refuse!(
-                    "health_probe_missing_credential",
-                    format!("credential not found: {reference}")
-                )
-            }
-        }
         let runtime = if let Some(registry) = &self.runtime_registry {
             registry.get_or_start(&project.project_id, Path::new(&project.root), 1)
         } else {
@@ -2783,86 +2545,88 @@ impl CanonicalControlService {
         let runtime_handle = match runtime {
             Ok(handle) => handle,
             Err(error) => {
-                record(&mut domain, "health_probe_no_runtime", error.to_string())?;
+                record(
+                    &mut domain,
+                    &super::health_probe::unsupported_target(
+                        "health_probe_no_runtime",
+                        error.to_string(),
+                    ),
+                )?;
                 return Ok(rejected(error.to_string(), Some(job.id.clone())));
             }
         };
-        // The target is executable as far as OCG can tell without dispatching,
-        // so claim the Attempt and Executor through the ordinary canonical
-        // transition. Everything past this point is a real execution.
-        let (attempt, executor) = domain.dispatch_job(&job.id, "provider")?;
-        let authority = domain
-            .authority(&attempt.id)?
-            .ok_or_else(|| invalid("health probe Attempt authority disappeared"))?;
-        // The frozen probe request. It carries the resolved upstream model id,
-        // the effort under test, and nothing else: no tools, no images, no
-        // conversation, and no output cap that could turn a slow reasoning model
-        // into a false negative.
-        let request_payload =
-            super::health_probe::probe_request(&intent.model, intent.effort.as_deref());
-        let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
-            provider_key: intent.provider.clone(),
-            model: intent.model.clone(),
-            upstream_model_id: entry.id.clone(),
-            endpoint,
-            credential_ref,
+        // The exact target is frozen. Reservation claims the Attempt without
+        // asking Placement to choose, and the probe payload is built only after
+        // that reservation exists.
+        let reserved = match reserve(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: None,
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            &job,
+            &resolved,
+        )? {
+            Ok(reserved) => reserved,
+            Err(refusal) => {
+                let response = rejected(refusal.message, Some(job.id.clone()));
+                domain.record_launch_command(
+                    &request.command_id,
+                    &project.project_id,
+                    &Self::health_probe_command_hash(&request),
+                    "failed",
+                    Some(&job.id),
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
         };
-        let budget_config = self.provider_budget_config(&self.read_configuration()?.0)?;
-        let admission = crate::provider_loop::ProviderCallAdmission {
-            domain: &mut domain,
-            authority: &authority,
-            executor_id: &executor.id,
-            request: request_payload,
-            config: &budget_config,
-            quota: super::placement::quota(
-                Path::new(&project.root),
-                &profile,
-                &super::placement::ProviderChoice {
-                    provider: intent.provider.clone(),
-                    model: intent.model.clone(),
-                },
-                crate::clock::Clock::now_unix(&crate::clock::SystemClock),
-            ),
-            dispatcher: runtime_handle.provider_dispatcher(),
-            provider_config,
-            protocol: provider.wire_protocol(),
+        let prepared = PreparedExecution {
+            request: super::health_probe::probe_request(&intent.model, intent.effort.as_deref()),
+            payload: PayloadMode::Probe,
+            event_sender: None,
+            cancelled: CallCancellation::new(),
         };
-        let outcome = match crate::provider_loop::admit_health_probe_call(admission) {
-            Ok(call) => crate::contracts::HealthProbeResponse {
+        let outcome = match publish_call(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: None,
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            &job,
+            &resolved,
+            &reserved,
+            prepared,
+            &runtime_handle,
+        )? {
+            Ok(admitted) => crate::contracts::HealthProbeResponse {
                 api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                 outcome: "accepted".to_string(),
                 command_id: request.command_id.clone(),
                 project_id: project.project_id.clone(),
                 target: request.target.clone(),
                 job_id: Some(job.id.clone()),
-                message: format!("health probe launched: {}", call.id),
+                message: format!("health probe launched: {}", admitted.call_id),
                 duplicate: false,
             },
-            Err(error) => {
-                // Economic admission refused the spend. Settle the probe Job with
-                // the canonical reason instead of leaving a running Attempt
-                // behind a queue item that will never execute.
-                let message = format!("economic admission failed: {error}");
-                domain.fail_attempt(
-                    &attempt.id,
-                    &super::domain::job_failure(
-                        "health_probe_economic_admission",
-                        FailureClass::Budget,
-                        &message,
-                        true,
-                    ),
-                )?;
-                crate::contracts::HealthProbeResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "failed".to_string(),
-                    command_id: request.command_id.clone(),
-                    project_id: project.project_id.clone(),
-                    target: request.target.clone(),
-                    job_id: Some(job.id.clone()),
-                    message,
-                    duplicate: false,
-                }
-            }
+            Err(refusal) => crate::contracts::HealthProbeResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "failed".to_string(),
+                command_id: request.command_id.clone(),
+                project_id: project.project_id.clone(),
+                target: request.target.clone(),
+                job_id: Some(job.id.clone()),
+                message: refusal.message,
+                duplicate: false,
+            },
         };
         domain.record_launch_command(
             &request.command_id,

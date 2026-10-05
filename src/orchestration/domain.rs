@@ -135,6 +135,28 @@ mod job_spec_payload {
     }
 }
 
+/// Placement facts frozen with an automatic admission reservation.
+pub(crate) struct AdmissionPlacement<'a> {
+    pub limit: usize,
+    pub config: &'a BudgetConfig,
+    pub quota: QuotaFacts,
+}
+
+fn decode_admission_reservation(raw: &str) -> Result<super::admission::AdmissionReservation> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| invalid(&error.to_string()))?;
+    if value.get("pickup").is_some() || value.get("choice").is_some() {
+        return serde_json::from_value(value).map_err(|error| invalid(&error.to_string()));
+    }
+    let choice: super::placement::ProviderChoice =
+        serde_json::from_value(value).map_err(|error| invalid(&error.to_string()))?;
+    Ok(super::admission::AdmissionReservation {
+        choice,
+        pickup: super::admission::AdmissionPickup::Automatic,
+        exact: None,
+    })
+}
+
 fn stored_job_spec<S>(spec: S) -> Result<(JobSpec, String)>
 where
     S: TryInto<JobSpec>,
@@ -3382,16 +3404,17 @@ impl DomainRepository {
 
     /// The Jobs automatic admission may dispatch on its own.
     ///
-    /// A Health Probe is excluded. A probe is dispatched only when something
-    /// explicitly asks for one, and always against the exact target it declares;
-    /// letting this worker pick one up would route it through Placement, which
-    /// would substitute a different candidate and turn the probe into ordinary
-    /// work. A probe that was rejected and left `eligible` is therefore evidence
-    /// to read, not a Job to admit.
+    /// Pickup is an admission policy, not a Job-kind predicate. A Job whose
+    /// frozen reservation says `explicit` already has an exact target and waits
+    /// for the origin that named it. A Job with no reservation yet still needs
+    /// candidate selection, so the worker may admit it once it is eligible. A
+    /// running Job marked `automatic_admission` is a crash window between
+    /// claiming an Attempt and publishing its Call; that recovery is independent
+    /// of the pickup policy.
     pub(crate) fn automatic_admission_jobs(&self, project_id: &str) -> Result<Vec<Job>> {
         let ids: Vec<String> = query_all(
             &self.connection,
-            "SELECT id FROM domain_jobs WHERE project_id=?1 AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe') IS NULL AND ((state='eligible' AND authoritative_attempt_id IS NULL) OR (state='running' AND automatic_admission=1)) ORDER BY created_at,id",
+            "SELECT id FROM domain_jobs WHERE project_id=?1 AND ((state='eligible' AND authoritative_attempt_id IS NULL AND COALESCE(json_extract(admission_selection,'$.pickup'),'automatic')!='explicit') OR (state='running' AND automatic_admission=1)) ORDER BY created_at,id",
             &[&project_id],
             |row| row.get(0),
         )?;
@@ -3403,10 +3426,14 @@ impl DomainRepository {
             .collect()
     }
 
-    pub(crate) fn admission_selection(
+    /// The frozen admission decision, if Admission has already reserved one.
+    ///
+    /// Older rows stored only a [`super::placement::ProviderChoice`]. Those are
+    /// candidate selections, so they resume as automatic pickup.
+    pub(crate) fn admission_reservation(
         &self,
         job_id: &str,
-    ) -> Result<Option<super::placement::ProviderChoice>> {
+    ) -> Result<Option<super::admission::AdmissionReservation>> {
         let raw: Option<String> = self
             .connection
             .query_row(
@@ -3415,8 +3442,36 @@ impl DomainRepository {
                 |row| row.get(0),
             )
             .map_err(sql)?;
-        raw.map(|raw| serde_json::from_str(&raw).map_err(|error| invalid(&error.to_string())))
+        raw.map(|raw| decode_admission_reservation(&raw))
             .transpose()
+    }
+
+    /// Record that this Job already has an exact target and must not be placed.
+    ///
+    /// A rejected probe is eligible evidence, not work waiting for a candidate.
+    /// Freezing explicit pickup here is what keeps the automatic worker from
+    /// substituting a different Provider or Model for it.
+    pub(crate) fn freeze_explicit_admission(
+        &self,
+        job_id: &str,
+        reservation: &super::admission::AdmissionReservation,
+    ) -> Result<()> {
+        if reservation.pickup != super::admission::AdmissionPickup::Explicit
+            || reservation.exact.is_none()
+        {
+            return Err(invalid(
+                "explicit admission freeze requires an exact target",
+            ));
+        }
+        let selected =
+            serde_json::to_string(reservation).map_err(|error| invalid(&error.to_string()))?;
+        self.connection
+            .execute(
+                "UPDATE domain_jobs SET admission_selection=?2,automatic_admission=0 WHERE id=?1 AND state IN ('pending','eligible') AND authoritative_attempt_id IS NULL",
+                params![job_id, selected],
+            )
+            .map_err(sql)?;
+        Ok(())
     }
 
     pub(crate) fn record_admission_failure(&self, job_id: &str, failure: &Failure) -> Result<()> {
@@ -3499,30 +3554,29 @@ impl DomainRepository {
         job_id: &str,
         executor_kind: &str,
     ) -> Result<(Attempt, Executor)> {
-        self.dispatch_job_inner(job_id, executor_kind, None)
+        self.dispatch_job_inner(job_id, executor_kind, None, None)
     }
 
-    pub(crate) fn dispatch_job_with_placement(
+    /// Claim an eligible Job under a frozen admission reservation.
+    ///
+    /// `placement` is present only when the reservation still required candidate
+    /// selection. An exact target passes `None`: the Attempt is still claimed
+    /// by this function, but Placement capacity is not reserved for it.
+    pub(crate) fn dispatch_job_for_admission(
         &mut self,
         job_id: &str,
-        choice: &super::placement::ProviderChoice,
-        limit: usize,
-        config: &BudgetConfig,
-        quota: QuotaFacts,
+        reservation: &super::admission::AdmissionReservation,
+        placement: Option<AdmissionPlacement<'_>>,
     ) -> Result<(Attempt, Executor)> {
-        self.dispatch_job_inner(job_id, "provider", Some((choice, limit, config, quota)))
+        self.dispatch_job_inner(job_id, "provider", Some(reservation), placement)
     }
 
     fn dispatch_job_inner(
         &mut self,
         job_id: &str,
         executor_kind: &str,
-        placement: Option<(
-            &super::placement::ProviderChoice,
-            usize,
-            &BudgetConfig,
-            QuotaFacts,
-        )>,
+        reservation: Option<&super::admission::AdmissionReservation>,
+        placement: Option<AdmissionPlacement<'_>>,
     ) -> Result<(Attempt, Executor)> {
         validate_id(executor_kind)?;
         let transaction = self
@@ -3533,34 +3587,51 @@ impl DomainRepository {
             return Err(invalid("Job dependencies are not satisfied"));
         }
         refresh_job_readiness_in(&transaction, job_id, None)?;
-        if let Some((choice, limit, config, quota)) = placement {
-            let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
-            let assessment = preview_provider_admission_in(
-                &transaction,
-                &job.project_id,
-                Some(job_id),
-                &job.spec,
+        if let Some(reservation) = reservation {
+            let selected =
+                serde_json::to_string(reservation).map_err(|error| invalid(&error.to_string()))?;
+            if let Some(AdmissionPlacement {
+                limit,
                 config,
                 quota,
-            )?;
-            if !assessment.is_allowed() {
-                return Err(invalid(&format!(
-                    "{}: {}",
-                    assessment.reason_code, assessment.reason
-                )));
-            }
-            if !provider_capacity_available_in(&transaction, &job.project_id, Some(job_id), limit)?
+            }) = placement
             {
-                return Err(invalid(
-                    "placement_capacity: Project provider capacity is reserved",
-                ));
+                let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+                let assessment = preview_provider_admission_in(
+                    &transaction,
+                    &job.project_id,
+                    Some(job_id),
+                    &job.spec,
+                    config,
+                    quota,
+                )?;
+                if !assessment.is_allowed() {
+                    return Err(invalid(&format!(
+                        "{}: {}",
+                        assessment.reason_code, assessment.reason
+                    )));
+                }
+                if !provider_capacity_available_in(
+                    &transaction,
+                    &job.project_id,
+                    Some(job_id),
+                    limit,
+                )? {
+                    return Err(invalid(
+                        "placement_capacity: Project provider capacity is reserved",
+                    ));
+                }
             }
-            let selected =
-                serde_json::to_string(choice).map_err(|error| invalid(&error.to_string()))?;
-            // The existing authoritative Attempt is the capacity reservation.
-            // Freeze its choice in the same transaction, including the crash
-            // window before its first Call/DispatchIntent can exist.
-            transaction.execute("UPDATE domain_jobs SET admission_selection=?2,automatic_admission=1,termination_reason=NULL WHERE id=?1", params![job_id, selected]).map_err(sql)?;
+            let automatic = match reservation.pickup {
+                super::admission::AdmissionPickup::Automatic => 1,
+                // An exact target is claimed only by the explicit caller. The
+                // crash marker would otherwise let the worker rebuild it as
+                // ordinary placed work.
+                super::admission::AdmissionPickup::Explicit => 0,
+            };
+            // Freeze the reservation in the same transaction that claims the
+            // Attempt, including the crash window before its first Call exists.
+            transaction.execute("UPDATE domain_jobs SET admission_selection=?2,automatic_admission=?3,termination_reason=NULL WHERE id=?1", params![job_id, selected, automatic]).map_err(sql)?;
         }
         let (attempt, root) = create_attempt_in(&transaction, job_id)?;
         let executor = Executor {
@@ -7280,4 +7351,72 @@ fn create_attempt_in(
     let root = emit_attempt(transaction, EventKind::AttemptCreated, &attempt, None)?;
     emit_job(transaction, EventKind::JobUpdated, &job, Some(root))?;
     Ok((attempt, root))
+}
+
+#[cfg(test)]
+mod admission_pickup_tests {
+    use super::*;
+    use crate::orchestration::admission::{AdmissionPickup, AdmissionReservation, ExactTarget};
+    use crate::orchestration::placement::ProviderChoice;
+
+    #[test]
+    fn explicit_reservation_is_not_automatic_work() {
+        let directory = tempfile::tempdir().expect("temp");
+        let domain = DomainRepository::open(directory.path()).expect("domain");
+        let project = domain.ensure_project(directory.path()).expect("project");
+        let placed = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("placed".into()),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("placed job");
+        let probe = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("probe".into()),
+                    health_probe: Some(crate::orchestration::health_probe::HealthProbeIntent {
+                        provider: "probe-provider".into(),
+                        model: "probe-model".into(),
+                        effort: Some("low".into()),
+                    }),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("probe job");
+        domain.set_job_eligible(&placed.id).expect("place eligible");
+        domain.set_job_eligible(&probe.id).expect("probe eligible");
+        domain
+            .freeze_explicit_admission(
+                &probe.id,
+                &AdmissionReservation {
+                    choice: ProviderChoice {
+                        provider: "probe-provider".into(),
+                        model: "probe-model".into(),
+                    },
+                    pickup: AdmissionPickup::Explicit,
+                    exact: Some(ExactTarget {
+                        provider: "probe-provider".into(),
+                        model: "probe-model".into(),
+                        effort: Some("low".into()),
+                    }),
+                },
+            )
+            .expect("freeze");
+
+        let picked = domain
+            .automatic_admission_jobs(&project.id)
+            .expect("pickup");
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].id, placed.id);
+        let frozen = domain
+            .admission_reservation(&probe.id)
+            .expect("reservation")
+            .expect("frozen");
+        assert!(matches!(frozen.pickup, AdmissionPickup::Explicit));
+        assert_eq!(frozen.exact.expect("exact").effort.as_deref(), Some("low"));
+    }
 }

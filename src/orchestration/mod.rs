@@ -2,6 +2,7 @@
 //! state, plus independent runtime context and configuration facilities.
 //!
 //! Context hand-offs and checkpoints remain independent of execution identity.
+pub(crate) mod admission;
 pub mod budget;
 pub mod call_schema;
 pub mod canonical_control;

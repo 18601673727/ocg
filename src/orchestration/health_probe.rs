@@ -3,7 +3,7 @@
 //! Health is evidence about an executable placement target, not a mutable flag.
 //! A probe therefore is a real canonical Job. It declares its target on the Job
 //! specification ([`super::domain::JobSpec::health_probe`]), is admitted through
-//! the ordinary Job -> Attempt -> Executor -> Call -> DispatchIntent path, runs
+//! the canonical admission protocol with an exact frozen target, then runs
 //! one real provider round through the same
 //! [`crate::provider_loop::CanonicalProviderCallHandler`] every other Job uses,
 //! and settles under the ordinary terminal-state rules.
