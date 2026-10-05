@@ -21,7 +21,9 @@ import type {
   CanonicalJobConfigEnvelope,
   CanonicalJobConfigResponse,
   CanonicalJobEvent,
+  CanonicalJobRelations,
   CanonicalJobSnapshot,
+  CanonicalJobSummary,
   CanonicalProjectResponse,
   CanonicalProjectsResponse,
   GlobalConfiguration,
@@ -258,7 +260,7 @@ export const EFFECT_KINDS = [
 export type CanonicalEffectKind = (typeof EFFECT_KINDS)[number];
 
 /** One unit of work, owned by exactly one Project. */
-export type CanonicalJob = {
+export type CanonicalJob = CanonicalJobRelations & {
   id: string;
   project_id: string;
   state: CanonicalJobState;
@@ -380,6 +382,31 @@ const jobState = oneOf<CanonicalJobState>(JOB_STATES);
 const attemptState = oneOf<CanonicalAttemptState>(ATTEMPT_STATES);
 const effectKind = oneOf<CanonicalEffectKind>(EFFECT_KINDS);
 
+const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
+  const rec = record(input, path, "canonical Job relationships");
+  if (!rec.ok) return rec;
+  const parentJobId = req(rec.value, "parent_job_id", nullable(identity), path);
+  if (!parentJobId.ok) return parentJobId;
+  const childJobIds = req(rec.value, "child_job_ids", array(identity), path);
+  if (!childJobIds.ok) return childJobIds;
+  const dependsOn = req(rec.value, "depends_on", array(identity), path);
+  if (!dependsOn.ok) return dependsOn;
+  const blocks = req(rec.value, "blocks", array(identity), path);
+  if (!blocks.ok) return blocks;
+  const blockedBy = req(rec.value, "blocked_by", array(identity), path);
+  if (!blockedBy.ok) return blockedBy;
+  const blocked = req(rec.value, "blocked", boolean, path);
+  if (!blocked.ok) return blocked;
+  return yes({
+    parent_job_id: parentJobId.value,
+    child_job_ids: childJobIds.value,
+    depends_on: dependsOn.value,
+    blocks: blocks.value,
+    blocked_by: blockedBy.value,
+    blocked: blocked.value,
+  });
+};
+
 const job: Decoder<CanonicalJob> = (input, path) => {
   const rec = record(input, path, "a canonical Job");
   if (!rec.ok) return rec;
@@ -399,6 +426,8 @@ const job: Decoder<CanonicalJob> = (input, path) => {
   if (!createdAt.ok) return createdAt;
   const updatedAt = req(rec.value, "updated_at", number, path);
   if (!updatedAt.ok) return updatedAt;
+  const relations = jobRelations(rec.value, path);
+  if (!relations.ok) return relations;
   return yes({
     id: id.value,
     project_id: projectId.value,
@@ -408,6 +437,7 @@ const job: Decoder<CanonicalJob> = (input, path) => {
     payload: payload.value,
     created_at: createdAt.value,
     updated_at: updatedAt.value,
+    ...relations.value,
   });
 };
 
@@ -758,6 +788,28 @@ const eventsEnvelope: Decoder<CanonicalEventsEnvelope> = (input, path) => {
   });
 };
 
+const jobSummary: Decoder<CanonicalJobSummary> = (input, path) => {
+  const rec = record(input, path, "a canonical Job summary");
+  if (!rec.ok) return rec;
+  const jobId = req(rec.value, "job_id", identity, path);
+  if (!jobId.ok) return jobId;
+  const state = req(rec.value, "state", jobState, path);
+  if (!state.ok) return state;
+  const createdAt = req(rec.value, "created_at", number, path);
+  if (!createdAt.ok) return createdAt;
+  const updatedAt = req(rec.value, "updated_at", number, path);
+  if (!updatedAt.ok) return updatedAt;
+  const relations = jobRelations(rec.value, path);
+  if (!relations.ok) return relations;
+  return yes({
+    job_id: jobId.value,
+    state: state.value,
+    created_at: createdAt.value,
+    updated_at: updatedAt.value,
+    ...relations.value,
+  });
+};
+
 const dashboardResponse: Decoder<CanonicalDashboardResponse> = (input, path) => {
   const rec = record(input, path, "a CanonicalDashboardResponse");
   if (!rec.ok) return rec;
@@ -765,7 +817,7 @@ const dashboardResponse: Decoder<CanonicalDashboardResponse> = (input, path) => 
   if (!apiVersion.ok) return apiVersion;
   const projectId = req(rec.value, "project_id", string, path);
   if (!projectId.ok) return projectId;
-  const jobs = req(rec.value, "jobs", array(jsonValue), path);
+  const jobs = req(rec.value, "jobs", array(jobSummary), path);
   if (!jobs.ok) return jobs;
   const selectedJob = req(rec.value, "selected_job", nullable(jobSnapshot), path);
   if (!selectedJob.ok) return selectedJob;

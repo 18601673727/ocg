@@ -1268,6 +1268,8 @@ pub struct ExecutionSnapshot {
     pub calls: Vec<Call>,
     pub dispatch_intents: Vec<DispatchIntent>,
     pub dependencies: Vec<DependencyEdge>,
+    #[serde(default)]
+    pub job_origins: BTreeMap<String, String>,
     pub bindings: Vec<JobBinding>,
     pub job_configurations: Vec<StoredJobConfiguration>,
     pub result_evidence: Vec<ResultEvidence>,

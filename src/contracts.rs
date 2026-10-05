@@ -27,9 +27,9 @@ pub use crate::core_contract::{
 };
 pub use crate::orchestration::canonical_control::{
     CanonicalConfigurationResponse, CanonicalDashboardResponse, CanonicalJobConfigResponse,
-    CanonicalJobEvent, CanonicalJobSnapshot, CanonicalProjectResponse, GlobalConfiguration,
-    ProjectConfiguration, ProjectConfigurationView, ProjectRecord, ResourceBudget,
-    CANONICAL_CONTROL_API_VERSION,
+    CanonicalJobEvent, CanonicalJobRelations, CanonicalJobSnapshot, CanonicalJobSummary,
+    CanonicalProjectResponse, GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView,
+    ProjectRecord, ResourceBudget, CANONICAL_CONTROL_API_VERSION,
 };
 /// The authority record. It travels inside a canonical event payload, so the
 /// PWA reads it out of an opaque JSON value and must not be able to drift from
@@ -567,6 +567,7 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     ResourceBudget::export_all(cfg)?;
     ExecutionWitness::export_all(cfg)?;
     CanonicalJobSnapshot::export_all(cfg)?;
+    CanonicalJobRelations::export_all(cfg)?;
     CanonicalJobEvent::export_all(cfg)?;
     JobLaunchRequest::export_all(cfg)?;
     ChatSendRequest::export_all(cfg)?;

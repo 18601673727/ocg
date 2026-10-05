@@ -1221,6 +1221,7 @@ impl DomainRepository {
             calls: all_calls(view)?,
             dispatch_intents: all_dispatch_intents(view)?,
             dependencies: all_dependencies(view)?,
+            job_origins: all_job_origins(view)?,
             bindings: all_bindings(view)?,
             job_configurations: all_job_configurations(view)?,
             result_evidence: all_result_evidence(view)?,
@@ -5675,6 +5676,16 @@ fn all_dependencies(connection: &Connection) -> Result<Vec<journal::DependencyEd
             })
         },
     )
+}
+
+fn all_job_origins(connection: &Connection) -> Result<std::collections::BTreeMap<JobId, JobId>> {
+    query_all(
+        connection,
+        "SELECT job_id,parent_job_id FROM domain_job_origins ORDER BY job_id",
+        &[],
+        |row| Ok((row.get::<_, JobId>(0)?, row.get::<_, JobId>(1)?)),
+    )
+    .map(|origins| origins.into_iter().collect())
 }
 
 fn all_bindings(connection: &Connection) -> Result<Vec<journal::JobBinding>> {

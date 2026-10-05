@@ -51,6 +51,12 @@ function job(seed: JobSeed): CanonicalJob {
     payload: JSON.stringify({ objective: OBJECTIVE }),
     created_at: createdAt,
     updated_at: seed.updatedAt ?? createdAt,
+    parent_job_id: null,
+    child_job_ids: [],
+    depends_on: [],
+    blocks: [],
+    blocked_by: [],
+    blocked: false,
   };
 }
 

@@ -23,6 +23,7 @@ import type {
   CanonicalDispatchIntent,
   CanonicalEffectKind,
   CanonicalExecutor,
+  CanonicalJobRelations,
   CanonicalJobState,
 } from "../contracts";
 import type { ProjectId } from "../project/domain";
@@ -478,6 +479,12 @@ export type JobExecution = {
   apiVersion: string;
   projectId: ProjectId;
   jobId: string;
+  parentJobId: string | null;
+  childJobIds: string[];
+  dependsOn: string[];
+  blocks: string[];
+  blockedBy: string[];
+  blocked: boolean;
   /** The journal cursor this snapshot was taken at. */
   cursor: number;
   /** The canonical Job state, unmodified. */
@@ -565,7 +572,7 @@ export function assembleJobExecution(input: {
   apiVersion: string;
   projectId: ProjectId;
   cursor: number;
-  job: {
+  job: CanonicalJobRelations & {
     id: string;
     state: CanonicalJobState;
     generation: number;
@@ -589,6 +596,12 @@ export function assembleJobExecution(input: {
     apiVersion: input.apiVersion,
     projectId,
     jobId: input.job.id,
+    parentJobId: input.job.parent_job_id,
+    childJobIds: input.job.child_job_ids,
+    dependsOn: input.job.depends_on,
+    blocks: input.job.blocks,
+    blockedBy: input.job.blocked_by,
+    blocked: input.job.blocked,
     cursor: input.cursor,
     state: input.job.state,
     generation: input.job.generation,

@@ -6,12 +6,15 @@
 //! canonical Job snapshot needed to reconcile a reconnect.
 
 use crate::error::{OcgError, Result};
-use crate::orchestration::domain::{Attempt, Call, DispatchIntent, DomainRepository, Executor};
+use crate::orchestration::domain::{
+    Attempt, Call, DispatchIntent, DomainRepository, Executor, Job, JobState,
+};
 use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
 use crate::project::{self, ProjectBoundary};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -229,6 +232,78 @@ pub struct CanonicalJobSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CanonicalJobRelations {
+    pub parent_job_id: Option<String>,
+    pub child_job_ids: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub blocks: Vec<String>,
+    pub blocked_by: Vec<String>,
+    pub blocked: bool,
+}
+
+impl CanonicalJobRelations {
+    fn from_projection(
+        job: &Job,
+        projection: &ExecutionProjection,
+        origins: &BTreeMap<String, String>,
+    ) -> Self {
+        let depends_on: Vec<String> = projection
+            .dependencies
+            .iter()
+            .filter(|(project_id, job_id, _)| project_id == &job.project_id && job_id == &job.id)
+            .map(|(_, _, prerequisite)| prerequisite.clone())
+            .collect();
+        let blocked_by: Vec<String> = depends_on
+            .iter()
+            .filter(|id| {
+                !projection
+                    .jobs
+                    .get(*id)
+                    .is_some_and(|prerequisite| prerequisite.state == JobState::Completed)
+            })
+            .cloned()
+            .collect();
+        Self {
+            parent_job_id: origins.get(&job.id).cloned(),
+            child_job_ids: origins
+                .iter()
+                .filter(|(_, parent)| *parent == &job.id)
+                .map(|(child, _)| child.clone())
+                .collect(),
+            depends_on,
+            blocks: projection
+                .dependencies
+                .iter()
+                .filter(|(project_id, _, prerequisite)| {
+                    project_id == &job.project_id && prerequisite == &job.id
+                })
+                .map(|(_, dependent, _)| dependent.clone())
+                .collect(),
+            blocked: !blocked_by.is_empty(),
+            blocked_by,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalJobView<'a> {
+    #[serde(flatten)]
+    job: &'a Job,
+    #[serde(flatten)]
+    relations: CanonicalJobRelations,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CanonicalJobSummary {
+    pub job_id: String,
+    pub created_at: i64,
+    pub state: String,
+    pub updated_at: i64,
+    #[serde(flatten)]
+    pub relations: CanonicalJobRelations,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct CanonicalJobEvent {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
@@ -270,7 +345,7 @@ pub struct CanonicalDashboardResponse {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
     pub project_id: String,
-    pub jobs: Vec<Value>,
+    pub jobs: Vec<CanonicalJobSummary>,
     pub selected_job: Option<CanonicalJobSnapshot>,
 }
 
@@ -1092,12 +1167,21 @@ impl CanonicalControlService {
         job_id: &str,
     ) -> Result<CanonicalJobSnapshot> {
         let (_, repository) = self.project_repository(project_id)?;
-        let snapshot = repository.execution_snapshot()?;
+        let mut snapshot = repository.execution_snapshot()?;
+        let origins = std::mem::take(&mut snapshot.job_origins);
         let projection = ExecutionProjection::from(snapshot);
+        Self::snapshot_from_projection(project_id, job_id, &projection, &origins)
+    }
+
+    fn snapshot_from_projection(
+        project_id: &str,
+        job_id: &str,
+        projection: &ExecutionProjection,
+        origins: &BTreeMap<String, String>,
+    ) -> Result<CanonicalJobSnapshot> {
         let job = projection
             .jobs
             .get(job_id)
-            .cloned()
             .ok_or_else(|| invalid("unknown canonical Job"))?;
         if job.project_id != project_id {
             return Err(invalid("Job does not belong to the requested Project"));
@@ -1134,7 +1218,10 @@ impl CanonicalControlService {
             .cloned()
             .collect();
         let value = json!({
-            "job":job,
+            "job":CanonicalJobView {
+                job,
+                relations: CanonicalJobRelations::from_projection(job, projection, origins),
+            },
             "attempts":attempts,
             "executors":executors,
             "calls":calls,
@@ -1214,9 +1301,26 @@ impl CanonicalControlService {
         job_id: Option<&str>,
     ) -> Result<CanonicalDashboardResponse> {
         let (project, repository) = self.project_repository(project_id)?;
-        let jobs = repository.jobs(project_id)?.into_iter().map(|job| json!({"job_id":job.id,"created_at":job.created_at,"state":job.state,"updated_at":job.updated_at})).collect();
+        let mut snapshot = repository.execution_snapshot()?;
+        let origins = std::mem::take(&mut snapshot.job_origins);
+        let projection = ExecutionProjection::from(snapshot);
+        let mut jobs: Vec<CanonicalJobSummary> = projection
+            .jobs
+            .values()
+            .filter(|job| job.project_id == project_id)
+            .map(|job| CanonicalJobSummary {
+                job_id: job.id.clone(),
+                created_at: job.created_at,
+                state: job.state.to_string(),
+                updated_at: job.updated_at,
+                relations: CanonicalJobRelations::from_projection(job, &projection, &origins),
+            })
+            .collect();
+        jobs.sort_by(|left, right| {
+            (left.created_at, &left.job_id).cmp(&(right.created_at, &right.job_id))
+        });
         let selected_job = job_id
-            .map(|id| self.canonical_snapshot(&project.project_id, id))
+            .map(|id| Self::snapshot_from_projection(project_id, id, &projection, &origins))
             .transpose()?;
         Ok(CanonicalDashboardResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
