@@ -12,6 +12,7 @@ pub mod domain;
 pub mod execution_dispatch;
 pub mod execution_runtime;
 pub mod handoff;
+pub mod health_probe;
 pub mod journal;
 pub(crate) mod placement;
 pub mod projection;

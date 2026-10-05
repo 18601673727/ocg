@@ -1141,6 +1141,24 @@ fn handle_canonical(
                     .map_err(|error| OcgError::config(error.to_string()))?;
                 answer!(service.launch_job(request, now)?)
             }
+            Route::HealthProbeLaunch => {
+                let body = body()?;
+                let request: crate::contracts::HealthProbeRequest = serde_json::from_value(body)
+                    .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.launch_health_probe(request, now)?)
+            }
+            Route::HealthProbeQuery => {
+                let target: crate::contracts::HealthProbeTarget = serde_json::from_value(json!({
+                    "provider": query("provider")?,
+                    "model": query("model")?,
+                    "effort": request.query.get("effort").cloned(),
+                }))
+                .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.health_probe(crate::contracts::HealthProbeQuery {
+                    project_id: query("project_id")?,
+                    target,
+                })?)
+            }
             Route::CanonicalJobSpawn { job } => {
                 let request: crate::contracts::CanonicalJobSpawnRequest =
                     serde_json::from_value(body()?)
@@ -1241,6 +1259,8 @@ fn handle_canonical(
             | Route::CanonicalJobConfigGet { .. }
             | Route::CanonicalJobConfigPut { .. }
             | Route::CanonicalJobLaunch
+            | Route::HealthProbeLaunch
+            | Route::HealthProbeQuery
             | Route::CanonicalJobCancel { .. }
             | Route::CanonicalJobRetry { .. }
             | Route::CanonicalJobSpawn { .. }
@@ -1915,6 +1935,11 @@ enum Route {
     CanonicalJobConfigGet { job: String },
     CanonicalJobConfigPut { job: String },
     CanonicalJobLaunch,
+    /// Health Probe: launch a probe Job for one Provider x Model x Effort tuple,
+    /// and read the latest canonical evidence for one. Explicitly operator- and
+    /// client-driven; there is no scheduled probing anywhere in this service.
+    HealthProbeLaunch,
+    HealthProbeQuery,
     CanonicalJobCancel { job: String },
     CanonicalJobRetry { job: String },
     CanonicalJobSpawn { job: String },
@@ -1983,6 +2008,8 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("GET", ["api", "v1", "canonical", "jobs"])
                 | ("GET", ["api", "v1", "canonical", "jobs", "events"])
                 | ("POST", ["api", "v1", "canonical", "jobs", "launch"])
+                | ("GET", ["api", "v1", "canonical", "jobs", "health-probe"])
+                | ("POST", ["api", "v1", "canonical", "jobs", "health-probe"])
                 | ("POST", ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"])
                 | ("GET", ["api", "v1", "canonical", "dashboard"])
                 | ("POST", ["api", "v1", "canonical", "chat", "images"])
@@ -2004,6 +2031,7 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", "launch"])
+                | ("OPTIONS", ["api", "v1", "canonical", "jobs", "health-probe"])
                 | ("OPTIONS", ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"])
                 | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
                 | ("GET" | "OPTIONS", ["api", "v1", "canonical", "usage"])
@@ -2062,6 +2090,10 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
             Ok(Route::CanonicalJobConfigPut { job: safe_id(job)? })
         }
         ("POST", ["api", "v1", "canonical", "jobs", "launch"]) => Ok(Route::CanonicalJobLaunch),
+        ("GET", ["api", "v1", "canonical", "jobs", "health-probe"]) => Ok(Route::HealthProbeQuery),
+        ("POST", ["api", "v1", "canonical", "jobs", "health-probe"]) => {
+            Ok(Route::HealthProbeLaunch)
+        }
         ("POST", ["api", "v1", "canonical", "jobs", job, "spawn"]) => {
             Ok(Route::CanonicalJobSpawn { job: safe_id(job)? })
         }
@@ -2180,6 +2212,7 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         ["api", "v1", "canonical", "chat", "images", _, _] => Some("GET"),
         ["api", "v1", "canonical", "chat", "images"] => Some("POST"),
         ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"] => Some("POST"),
+        ["api", "v1", "canonical", "jobs", "health-probe"] => Some("GET, POST"),
         ["api", "v1", "canonical", "jobs", "launch"]
         | ["api", "v1", "canonical", "chat", "send"]
         | ["api", "v1", "canonical", "chat", "cancel"] => Some("POST"),

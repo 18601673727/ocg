@@ -67,6 +67,12 @@ pub struct JobSpec {
     pub constraints: Option<String>,
     pub hard_budget_micros: Option<i64>,
     pub resource_commitment: Option<f64>,
+    /// Set when this Job is a Health Probe. A probe is an ordinary Job whose
+    /// declared purpose is to produce execution evidence for one
+    /// Provider x Model x Effort tuple, so the target rides the durable Job
+    /// specification rather than a second top-level entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_probe: Option<super::health_probe::HealthProbeIntent>,
 }
 
 impl JobSpec {
@@ -2178,6 +2184,116 @@ impl DomainRepository {
             .transpose()
     }
 
+    /// Read the latest canonical execution evidence a Health Probe left for one
+    /// Provider x Model x Effort tuple in this Project.
+    ///
+    /// The evidence is the probe Job's own durable rows: the Job and its
+    /// termination reason, the highest-generation Attempt, and the provider Call
+    /// with the DispatchIntent it froze. There is no stored health value to fall
+    /// back on, so this cannot disagree with execution history.
+    ///
+    /// The newest probe wins whatever state it is in, so a caller can see that
+    /// evidence is being refreshed rather than silently reading a stale verdict.
+    /// `json_valid` guards the projection: older CLI Jobs stored their objective
+    /// as plain text, and `json_extract` raises on malformed JSON rather than
+    /// yielding `NULL`.
+    pub fn latest_health_probe(
+        &self,
+        project_id: &str,
+        target: &super::health_probe::HealthProbeIntent,
+    ) -> Result<Option<super::health_probe::HealthProbeOutcome>> {
+        use super::health_probe::{HealthProbeIntent, HealthProbeOutcome};
+        validate_id(project_id)?;
+        if target.provider.is_empty() || target.model.is_empty() {
+            return Ok(None);
+        }
+        let job_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM domain_jobs WHERE project_id=?1 \
+                 AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe.provider')=?2 \
+                 AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe.model')=?3 \
+                 AND COALESCE(json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe.effort'),'')=?4 \
+                 ORDER BY created_at DESC,id DESC LIMIT 1",
+                params![
+                    project_id,
+                    target.provider,
+                    target.model,
+                    target.effort.clone().unwrap_or_default()
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some(job_id) = job_id else {
+            return Ok(None);
+        };
+        let job = read_job(&self.connection, &job_id)?
+            .ok_or_else(|| invalid("health probe Job disappeared"))?;
+        let intent: HealthProbeIntent = job
+            .spec
+            .health_probe
+            .clone()
+            .ok_or_else(|| invalid("health probe Job lost its declared target"))?;
+        let attempt = self.latest_attempt(&job.id)?;
+        let call = attempt
+            .as_ref()
+            .and_then(|attempt| self.calls_for_attempt(&attempt.id).ok())
+            .and_then(|calls| calls.into_iter().next());
+        let dispatch = call
+            .as_ref()
+            .and_then(|call| self.dispatch_intent(&call.id).ok())
+            .flatten();
+        // Provider latency is measured on the Call when the probe reached
+        // dispatch, and on the Attempt when it failed before one existed.
+        let (started_at, completed_at) = match &call {
+            Some(call) => (
+                Some(call.created_at),
+                call.finished_at.or(Some(call.created_at)),
+            ),
+            None => (
+                attempt.as_ref().map(|attempt| attempt.created_at),
+                attempt.as_ref().and_then(|attempt| attempt.finished_at),
+            ),
+        };
+        Ok(Some(HealthProbeOutcome {
+            project_id: job.project_id.clone(),
+            intent,
+            job_id: job.id.clone(),
+            job_state: job.state,
+            attempt_id: attempt.as_ref().map(|attempt| attempt.id.clone()),
+            attempt_generation: attempt.as_ref().map(|attempt| attempt.generation),
+            attempt_state: attempt.as_ref().map(|attempt| attempt.state),
+            call_id: call.as_ref().map(|call| call.id.clone()),
+            dispatch_intent_id: dispatch.as_ref().map(|intent| intent.id.clone()),
+            upstream_model_id: dispatch
+                .as_ref()
+                .and_then(|intent| intent.upstream_model_id.clone()),
+            started_at,
+            completed_at,
+            latency_seconds: match (started_at, completed_at) {
+                (Some(start), Some(end)) => Some(end - start),
+                _ => None,
+            },
+            failure: job.termination_reason,
+        }))
+    }
+
+    /// The highest-generation Attempt a Job published.
+    fn latest_attempt(&self, job_id: &str) -> Result<Option<Attempt>> {
+        self.connection
+            .query_row(
+                "SELECT id FROM domain_attempts WHERE job_id=?1 ORDER BY generation DESC LIMIT 1",
+                [job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .map(|id| self.attempt(&id))
+            .transpose()
+            .map(|attempt| attempt.flatten())
+    }
+
     pub fn set_dependency(
         &mut self,
         project_id: &str,
@@ -3264,10 +3380,18 @@ impl DomainRepository {
         transaction.commit().map_err(sql)
     }
 
+    /// The Jobs automatic admission may dispatch on its own.
+    ///
+    /// A Health Probe is excluded. A probe is dispatched only when something
+    /// explicitly asks for one, and always against the exact target it declares;
+    /// letting this worker pick one up would route it through Placement, which
+    /// would substitute a different candidate and turn the probe into ordinary
+    /// work. A probe that was rejected and left `eligible` is therefore evidence
+    /// to read, not a Job to admit.
     pub(crate) fn automatic_admission_jobs(&self, project_id: &str) -> Result<Vec<Job>> {
         let ids: Vec<String> = query_all(
             &self.connection,
-            "SELECT id FROM domain_jobs WHERE project_id=?1 AND ((state='eligible' AND authoritative_attempt_id IS NULL) OR (state='running' AND automatic_admission=1)) ORDER BY created_at,id",
+            "SELECT id FROM domain_jobs WHERE project_id=?1 AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe') IS NULL AND ((state='eligible' AND authoritative_attempt_id IS NULL) OR (state='running' AND automatic_admission=1)) ORDER BY created_at,id",
             &[&project_id],
             |row| row.get(0),
         )?;

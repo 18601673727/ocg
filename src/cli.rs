@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -94,6 +95,7 @@ pub enum Command {
     Budget(Vec<OsString>),
     Serve(Vec<OsString>),
     Work(Vec<OsString>),
+    Health(Vec<OsString>),
     Version,
     Doctor,
     Help,
@@ -183,6 +185,7 @@ where
         Some("budget") => Command::Budget(rest),
         Some("serve") => Command::Serve(rest),
         Some("work") => Command::Work(rest),
+        Some("health") => Command::Health(rest),
         Some("doctor") => Command::Doctor,
         Some(other) => return Err(UsageError(format!("unknown command: {other}"))),
     };
@@ -197,7 +200,7 @@ fn next_value(args: &[OsString], index: &mut usize, name: &str) -> Result<String
 }
 
 fn usage() -> &'static str {
-    "OCG - native project orchestration and control plane\n\nUsage: ocg [--project DIR] [command]\n\nCommands:\n  (none)       open the OCG control surface\n  status       show OCG configuration\n  routing      show configured model routing\n  config       inspect or edit the OCG Profile\n  auth         manage OCG credentials\n  validate     validate configuration\n  context      build repository context\n  verify       run configured verification\n  tools        show capability policy\n  checkpoint   inspect or save checkpoints\n  reconcile    recover durable dispatch intents\n  resources    inspect native resources\n  budget       inspect the Project budget\n  serve        run the OCG control server\n  work         operate canonical Jobs and Calls\n  version      report the OCG version\n  doctor       run native diagnostics\n  init         create a global OCG Profile\n  help         show this help\n"
+    "OCG - native project orchestration and control plane\n\nUsage: ocg [--project DIR] [command]\n\nCommands:\n  (none)       open the OCG control surface\n  status       show OCG configuration\n  routing      show configured model routing\n  config       inspect or edit the OCG Profile\n  auth         manage OCG credentials\n  validate     validate configuration\n  context      build repository context\n  verify       run configured verification\n  tools        show capability policy\n  checkpoint   inspect or save checkpoints\n  reconcile    recover durable dispatch intents\n  resources    inspect native resources\n  budget       inspect the Project budget\n  serve        run the OCG control server\n  work         operate canonical Jobs and Calls\n  health       probe or read Health Probe evidence for a Provider/Model/Effort\n  version      report the OCG version\n  doctor       run native diagnostics\n  init         create a global OCG Profile\n  help         show this help\n"
 }
 
 #[derive(Debug)]
@@ -255,6 +258,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         Command::Budget(args) => native_budget(&effective, &project_root, &args, cli.pretty),
         Command::Serve(args) => serve_command(&project_root, &user_path, &args, cli.pretty, cli.disable_proxy),
         Command::Work(args) => work_command(&project_root, &args, cli.pretty),
+        Command::Health(args) => health_command(&project_root, &user_path, &args, cli.pretty),
         Command::Doctor => doctor_command(&effective, &project_root),
         Command::Help | Command::Version | Command::Init => unreachable!(),
     }
@@ -494,6 +498,193 @@ fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Fai
             print(json!({"job_id": job_id, "configuration": repository.job_configuration(&job_id)?}))
         }
         _ => Err(Failure::Usage(format!("unknown canonical work subcommand: {subcommand}"))),
+    }
+}
+
+/// Block until one probe Job reaches a canonical terminal state.
+///
+/// This waits on the single Job this command just created. It is a read of
+/// existing lifecycle evidence, not a second execution path and not a recurring
+/// schedule. The bound is generous because a reasoning model can legitimately
+/// take a while to answer a one-word question; exceeding it reports the Job's
+/// current state rather than inventing a verdict.
+fn wait_for_terminal_probe(
+    service: &crate::orchestration::canonical_control::CanonicalControlService,
+    job_id: &str,
+) -> Result<(), Failure> {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+    let start = std::time::Instant::now();
+    loop {
+        // Read the Job row directly rather than the snapshot: the snapshot also
+        // replays the whole journal, which grows without bound, so a long wait
+        // would get steadily slower for no new information.
+        let state = crate::orchestration::domain::DomainRepository::open(service.root())?
+            .job(job_id)?
+            .map(|job| job.state);
+        let terminal = matches!(
+            state,
+            Some(
+                crate::orchestration::domain::JobState::Completed
+                    | crate::orchestration::domain::JobState::Failed
+                    | crate::orchestration::domain::JobState::Cancelled
+                    | crate::orchestration::domain::JobState::Unknown
+                    | crate::orchestration::domain::JobState::Orphaned
+            )
+        );
+        if terminal || start.elapsed() >= DEADLINE {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Probe a Provider/Model/Effort tuple, or read the evidence a past probe left.
+///
+/// `ocg health probe <provider> <model> [--effort E]` launches one Health Probe
+/// Job, waits for it to settle, and prints the verdict. `ocg health show
+/// <provider> <model> [--effort E]` reads the latest canonical evidence without
+/// sending anything.
+///
+/// The provider and model are positional. `--model` is already a global
+/// routing flag parsed before the subcommand is seen, so a same-named
+/// subcommand flag would silently never arrive.
+///
+/// Neither subcommand schedules anything. A probe runs because it was asked for.
+fn health_command(
+    root: &Path,
+    user_path: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> Result<i32, Failure> {
+    let words: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let subcommand = words
+        .first()
+        .ok_or_else(|| Failure::Usage("ocg health requires a subcommand: probe or show".into()))?;
+    let option = |name: &str| -> Option<String> {
+        let flag = format!("--{name}");
+        let prefix = format!("{flag}=");
+        words
+            .windows(2)
+            .find_map(|pair| {
+                if pair[0] == flag {
+                    Some(pair[1].clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                words
+                    .iter()
+                    .find_map(|word| word.strip_prefix(&prefix).map(str::to_owned))
+            })
+    };
+    let repository = crate::orchestration::domain::DomainRepository::open(root)?;
+    let project = repository.ensure_project(root)?;
+    // Positional arguments are the provider and the model. A value-taking flag's
+    // argument is not positional, so skip it rather than mistaking a flag value
+    // for the model name.
+    let takes_value = ["--effort", "--command-id"];
+    let mut skip = false;
+    let mut positional: Vec<&String> = Vec::new();
+    for word in &words[1..] {
+        if takes_value.contains(&word.as_str()) {
+            skip = true;
+            continue;
+        }
+        if skip {
+            skip = false;
+            continue;
+        }
+        if !word.starts_with('-') {
+            positional.push(word);
+        }
+    }
+    const HEALTH_USAGE: &str = "usage: ocg health probe|show <provider> <model> [--effort E]";
+    if positional.len() != 2 {
+        return Err(Failure::Usage(HEALTH_USAGE.into()));
+    }
+    let target = crate::contracts::HealthProbeTarget {
+        provider: positional[0].clone(),
+        model: positional[1].clone(),
+        effort: option("effort"),
+    };
+    match subcommand.as_str() {
+        "show" => {
+            let observation = repository
+                .latest_health_probe(&project.id, &target.intent())?
+                .map(crate::contracts::HealthProbeObservation::from);
+            print_json(
+                &json!({
+                    "project_id": project.id,
+                    "target": target,
+                    "observation": observation,
+                }),
+                pretty,
+            )?;
+            Ok(0)
+        }
+        "probe" => {
+            // A probe executes through the ordinary canonical provider worker,
+            // so this borrows the same registry-backed runtime the control
+            // server uses rather than inventing a second execution host. The
+            // registry is dropped at the end of this process, which is what
+            // makes the probe one-shot: nothing reschedules it.
+            let service =
+                crate::orchestration::canonical_control::CanonicalControlService::open_process(
+                    root, user_path,
+                )?;
+            let selection = crate::proxy::resolve(
+                true,
+                &crate::proxy::SystemProxyEnv,
+                &crate::process::SystemStaticProxy,
+            );
+            let transport = Arc::new(crate::http::NativeHttp::with_policy(
+                selection.plan(),
+                None,
+            )?);
+            let registry = Arc::new(
+                crate::orchestration::execution_runtime::ProjectRuntimeRegistry::new(
+                    transport,
+                    crate::native_tools::PermissionPolicy::default(),
+                    16,
+                    16,
+                ),
+            );
+            let service = service.with_runtime_registry(registry.clone());
+            let response = service.launch_health_probe(
+                crate::contracts::HealthProbeRequest {
+                    command_id: option("command-id")
+                        .unwrap_or_else(|| format!("health-{}", uuid::Uuid::now_v7())),
+                    project_id: project.id.clone(),
+                    target,
+                },
+                crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            )?;
+            // Wait for the probe Job to reach a terminal state so the CLI can
+            // report the verdict rather than only that a Job exists. This is a
+            // bounded wait on one Job this command created, not a scheduler.
+            if let Some(job_id) = response.job_id.clone() {
+                wait_for_terminal_probe(&service, &job_id)?;
+            }
+            let observation = repository
+                .latest_health_probe(&project.id, &response.target.intent())?
+                .map(crate::contracts::HealthProbeObservation::from);
+            print_json(
+                &json!({
+                    "launch": response,
+                    "observation": observation,
+                }),
+                pretty,
+            )?;
+            registry.shutdown()?;
+            Ok(0)
+        }
+        other => Err(Failure::Usage(format!(
+            "unknown health subcommand: {other}; expected probe or show"
+        ))),
     }
 }
 

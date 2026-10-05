@@ -12,6 +12,7 @@ use crate::orchestration::domain::{
     JobOrigin, JobSpec, JobState,
 };
 use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
+use crate::orchestration::health_probe::HealthProbeObservation;
 use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
 use crate::project::{self, ProjectBoundary};
 use serde::{Deserialize, Serialize};
@@ -1797,6 +1798,27 @@ impl CanonicalControlService {
         })
     }
 
+    /// The idempotency digest for a Health Probe command.
+    ///
+    /// The command ledger is shared with canonical launch, which hashes a whole
+    /// request. A probe hashes its command identity and target only: which Job a
+    /// retry refers to is decided by the tuple, not by the caller's transport
+    /// details.
+    fn health_probe_command_hash(request: &crate::contracts::HealthProbeRequest) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(request.command_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.project_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.target.provider.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.target.model.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.target.effort.as_deref().unwrap_or("").as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
     fn provider_budget_config(
         &self,
         global: &GlobalConfiguration,
@@ -2319,6 +2341,7 @@ impl CanonicalControlService {
             constraints: request.constraints.clone(),
             hard_budget_micros: Some(request.hard_budget_micros),
             resource_commitment: request.resource_commitment,
+            health_probe: None,
         };
 
         let job = if let Some(job) = existing_job.as_ref() {
@@ -2539,6 +2562,327 @@ impl CanonicalControlService {
         )?;
 
         Ok(response)
+    }
+
+    /// Launch a Health Probe Job for one Provider x Model x Effort tuple.
+    ///
+    /// The probe is a real canonical Job: it is created with the target on its
+    /// specification, dispatched through the ordinary Job -> Attempt -> Executor
+    /// transition, and its Call is admitted and enqueued on the same bounded
+    /// provider dispatcher every other Job uses. There is no second execution
+    /// path and nothing here schedules anything — a probe runs when it is asked
+    /// for, and only then.
+    ///
+    /// A probe deliberately bypasses Placement. Placement ranks candidates for
+    /// work that is allowed to go anywhere; a probe names the exact tuple it
+    /// must prove, so choosing one for it would destroy the only fact the probe
+    /// exists to produce. For the same reason it does not take a per-Project
+    /// capacity reservation: it queues behind real work on the bounded
+    /// dispatcher instead of displacing it.
+    pub fn launch_health_probe(
+        &self,
+        request: crate::contracts::HealthProbeRequest,
+        _now: i64,
+    ) -> Result<crate::contracts::HealthProbeResponse> {
+        let _launch = self
+            .launch_lock
+            .lock()
+            .map_err(|_| invalid("launch lock poisoned"))?;
+        let rejected =
+            |message: String, job_id: Option<String>| crate::contracts::HealthProbeResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                project_id: request.project_id.clone(),
+                target: request.target.clone(),
+                job_id,
+                message,
+                duplicate: false,
+            };
+        if !safe_id(&request.command_id) || !safe_id(&request.project_id) {
+            return Ok(rejected(
+                "invalid command_id or project_id".to_string(),
+                None,
+            ));
+        }
+        let (project, mut domain) = match self.project_repository(&request.project_id) {
+            Ok(project) => project,
+            Err(error) => return Ok(rejected(error.to_string(), None)),
+        };
+        let intent = request.target.intent();
+        // Idempotency is the same command ledger canonical launch uses, so a
+        // retried probe never spends a second round.
+        if let Some((_, job_id, outcome, message)) =
+            domain.lookup_launch_command(&request.command_id, &request.project_id)?
+        {
+            return Ok(crate::contracts::HealthProbeResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome,
+                command_id: request.command_id.clone(),
+                project_id: request.project_id.clone(),
+                target: request.target.clone(),
+                job_id,
+                message,
+                duplicate: true,
+            });
+        }
+        let (profile, _) = match self.profile_service.current()? {
+            Some(profile) => profile,
+            None => return Ok(rejected("profile not configured".to_string(), None)),
+        };
+
+        // A probe Job is created before the target is validated, and a rejection
+        // is recorded on it. The verdict "OCG cannot execute this tuple" is
+        // itself health evidence, and evidence that only lives in an HTTP
+        // response body would be gone by the time Placement asked the question.
+        // The rejection path therefore produces the same canonical shape as a
+        // probe that ran: Job -> Attempt -> Executor -> terminal reason.
+        let spec = super::domain::JobSpec {
+            provider: Some(intent.provider.clone()),
+            model: Some(intent.model.clone()),
+            objective: Some(super::health_probe::PROBE_OBJECTIVE.to_string()),
+            health_probe: Some(intent.clone()),
+            ..JobSpec::default()
+        };
+        let job = domain.create_job(&project.project_id, spec)?;
+        // A rejected probe is recorded on the Job before any Attempt is
+        // claimed. `record_admission_failure` requires an eligible Job, and the
+        // transition is the ordinary readiness refresh, so the rejection stays
+        // canonical durable evidence while leaving no Attempt or Executor behind:
+        // a target that cannot be executed never reaches `running`.
+        let record = |domain: &mut DomainRepository, code: &'static str, message: String| {
+            domain.set_job_eligible(&job.id)?;
+            domain.record_admission_failure(
+                &job.id,
+                &super::health_probe::unsupported_target(code, message),
+            )
+        };
+        macro_rules! refuse {
+            ($code:literal, $reason:expr) => {{
+                let reason: String = $reason;
+                record(&mut domain, $code, reason.clone())?;
+                let response = rejected(reason, Some(job.id.clone()));
+                domain.record_launch_command(
+                    &request.command_id,
+                    &project.project_id,
+                    &Self::health_probe_command_hash(&request),
+                    "rejected",
+                    Some(&job.id),
+                    &response.message,
+                )?;
+                return Ok(response);
+            }};
+        }
+
+        let Some(provider) = profile.providers.get(&intent.provider) else {
+            refuse!(
+                "health_probe_unknown_provider",
+                format!("provider not found: {}", intent.provider)
+            )
+        };
+        let protocol = provider.wire_protocol();
+        if !protocol.is_openai_chat_completions() {
+            refuse!(
+                "health_probe_unsupported_protocol",
+                format!(
+                    "provider {} does not speak the OpenAI chat-completions protocol",
+                    intent.provider
+                )
+            )
+        }
+        let Some(entry) = profile.models.get(&intent.model) else {
+            refuse!(
+                "health_probe_unknown_model",
+                format!("model not found: {}", intent.model)
+            )
+        };
+        if entry.provider != intent.provider {
+            refuse!(
+                "health_probe_model_provider_mismatch",
+                format!(
+                    "model {} is not runnable for provider {}",
+                    intent.model, intent.provider
+                )
+            )
+        }
+        // Effort is part of the identity under test, so it is validated exactly
+        // as canonical launch validates it rather than sent and left to fail.
+        if let Some(effort) = intent.effort.as_deref() {
+            if !super::placement::supports_effort(entry, effort) {
+                refuse!(
+                    "health_probe_unsupported_effort",
+                    format!(
+                        "model {} does not support reasoning effort {}",
+                        intent.model, effort
+                    )
+                )
+            }
+            if !super::health_probe::PROBE_EFFORTS.contains(&effort) {
+                refuse!(
+                    "health_probe_unsupported_effort",
+                    format!("unsupported reasoning effort: {effort}")
+                )
+            }
+        }
+        let Some(endpoint) = provider
+            .endpoint
+            .as_deref()
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_owned)
+        else {
+            refuse!(
+                "health_probe_missing_endpoint",
+                format!("provider {} has no endpoint configured", intent.provider)
+            )
+        };
+        if endpoint_has_userinfo(&endpoint) {
+            refuse!(
+                "health_probe_missing_endpoint",
+                format!(
+                    "provider {} endpoint must not contain userinfo",
+                    intent.provider
+                )
+            )
+        }
+        // A declared credential must resolve, exactly as at canonical launch.
+        // The raw value is never read here; the worker reads it again at
+        // execution time.
+        let credential_ref = provider.credential_ref.clone();
+        if let Some(reference) = credential_ref.as_deref() {
+            let vault = crate::vault::Vault::user_global()?;
+            if vault.get(reference)?.is_none() {
+                refuse!(
+                    "health_probe_missing_credential",
+                    format!("credential not found: {reference}")
+                )
+            }
+        }
+        let runtime = if let Some(registry) = &self.runtime_registry {
+            registry.get_or_start(&project.project_id, Path::new(&project.root), 1)
+        } else {
+            self.runtime_handle
+                .as_ref()
+                .filter(|handle| {
+                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
+                })
+                .cloned()
+                .ok_or_else(|| invalid("execution runtime is not available for this Project"))
+        };
+        let runtime_handle = match runtime {
+            Ok(handle) => handle,
+            Err(error) => {
+                record(&mut domain, "health_probe_no_runtime", error.to_string())?;
+                return Ok(rejected(error.to_string(), Some(job.id.clone())));
+            }
+        };
+        // The target is executable as far as OCG can tell without dispatching,
+        // so claim the Attempt and Executor through the ordinary canonical
+        // transition. Everything past this point is a real execution.
+        let (attempt, executor) = domain.dispatch_job(&job.id, "provider")?;
+        let authority = domain
+            .authority(&attempt.id)?
+            .ok_or_else(|| invalid("health probe Attempt authority disappeared"))?;
+        // The frozen probe request. It carries the resolved upstream model id,
+        // the effort under test, and nothing else: no tools, no images, no
+        // conversation, and no output cap that could turn a slow reasoning model
+        // into a false negative.
+        let request_payload =
+            super::health_probe::probe_request(&intent.model, intent.effort.as_deref());
+        let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
+            provider_key: intent.provider.clone(),
+            model: intent.model.clone(),
+            upstream_model_id: entry.id.clone(),
+            endpoint,
+            credential_ref,
+        };
+        let budget_config = self.provider_budget_config(&self.read_configuration()?.0)?;
+        let admission = crate::provider_loop::ProviderCallAdmission {
+            domain: &mut domain,
+            authority: &authority,
+            executor_id: &executor.id,
+            request: request_payload,
+            config: &budget_config,
+            quota: super::placement::quota(
+                Path::new(&project.root),
+                &profile,
+                &super::placement::ProviderChoice {
+                    provider: intent.provider.clone(),
+                    model: intent.model.clone(),
+                },
+                crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            ),
+            dispatcher: runtime_handle.provider_dispatcher(),
+            provider_config,
+            protocol: provider.wire_protocol(),
+        };
+        let outcome = match crate::provider_loop::admit_health_probe_call(admission) {
+            Ok(call) => crate::contracts::HealthProbeResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "accepted".to_string(),
+                command_id: request.command_id.clone(),
+                project_id: project.project_id.clone(),
+                target: request.target.clone(),
+                job_id: Some(job.id.clone()),
+                message: format!("health probe launched: {}", call.id),
+                duplicate: false,
+            },
+            Err(error) => {
+                // Economic admission refused the spend. Settle the probe Job with
+                // the canonical reason instead of leaving a running Attempt
+                // behind a queue item that will never execute.
+                let message = format!("economic admission failed: {error}");
+                domain.fail_attempt(
+                    &attempt.id,
+                    &super::domain::job_failure(
+                        "health_probe_economic_admission",
+                        FailureClass::Budget,
+                        &message,
+                        true,
+                    ),
+                )?;
+                crate::contracts::HealthProbeResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "failed".to_string(),
+                    command_id: request.command_id.clone(),
+                    project_id: project.project_id.clone(),
+                    target: request.target.clone(),
+                    job_id: Some(job.id.clone()),
+                    message,
+                    duplicate: false,
+                }
+            }
+        };
+        domain.record_launch_command(
+            &request.command_id,
+            &project.project_id,
+            &Self::health_probe_command_hash(&request),
+            &outcome.outcome,
+            outcome.job_id.as_deref(),
+            &outcome.message,
+        )?;
+        Ok(outcome)
+    }
+
+    /// Read the latest usable health evidence for one candidate.
+    ///
+    /// The answer is projected from the probe Jobs' canonical rows on every
+    /// read, so it cannot lag or contradict execution history, and it costs
+    /// nothing when no probe has run.
+    pub fn health_probe(
+        &self,
+        request: crate::contracts::HealthProbeQuery,
+    ) -> Result<crate::contracts::HealthProbeQueryResponse> {
+        let domain = self.project_repository(&request.project_id)?.1;
+        let intent = request.target.intent();
+        let observation = domain
+            .latest_health_probe(&request.project_id, &intent)?
+            .map(HealthProbeObservation::from);
+        Ok(crate::contracts::HealthProbeQueryResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            project_id: request.project_id,
+            target: request.target,
+            observation,
+        })
     }
 
     /// Start a plain chat turn on the canonical Job/Attempt/Call lane.

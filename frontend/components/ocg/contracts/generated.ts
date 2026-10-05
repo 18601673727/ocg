@@ -216,6 +216,88 @@ export type GlobalConfiguration = { provider: string | null, model: string | nul
 
 
 /**
+ * The exact executable placement target a probe answers for.
+ *
+ * This is the health identity: the tuple Placement will later ask about. It is
+ * stored on the Job specification, so it is durable, journaled with the Job,
+ * and reconstructable from the canonical post-image.
+ */
+export type HealthProbeIntent = {
+/**
+ * Profile provider key.
+ */
+provider: string,
+/**
+ * Profile model key, not the upstream model id.
+ */
+model: string,
+/**
+ * Reasoning effort under test; `None` means the tuple carries no effort.
+ */
+effort: string | null, };
+
+
+/**
+ * The wire projection: the latest usable health evidence for one candidate.
+ *
+ * This is the shape later Placement work asks its question against. It is
+ * derived on read; nothing here is stored.
+ */
+export type HealthProbeObservation = { project_id: string, provider: string, model: string, effort: string | null, job_id: string, job_state: string, attempt_id: string | null, attempt_generation: number | null, attempt_state: string | null, call_id: string | null, dispatch_intent_id: string | null, upstream_model_id: string | null, started_at: number | null, completed_at: number | null, latency_seconds: number | null,
+/**
+ * `true` only when a probe Job completed a real provider round. This is
+ * the single answer to "reachable and executable"; every other state is
+ * described by `failure`.
+ */
+executable: boolean, failure: Failure | null, };
+
+
+/**
+ * `GET /api/v1/canonical/jobs/health-probe`
+ */
+export type HealthProbeQuery = { project_id: string, target: HealthProbeTarget, };
+
+
+/**
+ * `GET /api/v1/canonical/jobs/health-probe`
+ *
+ * `observation` is `null` when no probe has ever run for this candidate. That
+ * is "no evidence", which is deliberately not the same claim as "unhealthy".
+ */
+export type HealthProbeQueryResponse = { api_version: CanonicalApiVersion, project_id: string, target: HealthProbeTarget, observation: HealthProbeObservation | null, };
+
+
+/**
+ * `POST /api/v1/canonical/jobs/health-probe`
+ */
+export type HealthProbeRequest = { command_id: string, project_id: string, target: HealthProbeTarget, };
+
+
+/**
+ * `POST /api/v1/canonical/jobs/health-probe`
+ */
+export type HealthProbeResponse = { api_version: CanonicalApiVersion,
+/**
+ * `accepted`, `rejected` or `failed`.
+ */
+outcome: string, command_id: string, project_id: string, target: HealthProbeTarget,
+/**
+ * The canonical probe Job, when one was created. Follow it with the
+ * ordinary Job snapshot to read the terminal result.
+ */
+job_id: string | null, message: string, duplicate: boolean, };
+
+
+/**
+ * The executable placement target a Health Probe answers for.
+ *
+ * `effort` is part of the identity: a probe with `effort` proves a different
+ * tuple than one without it.
+ */
+export type HealthProbeTarget = { provider: string, model: string, effort: string | null, };
+
+
+/**
  * `POST /api/v1/canonical/jobs/launch`
  */
 export type JobLaunchRequest = { command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
@@ -231,7 +313,14 @@ outcome: string, command_id: string, draft_id: string, project_id: string, sessi
 export type JobOrigin = { parent_job_id: string, attempt_id: string, generation: number, spawn_key: string | null, spawn_fingerprint: string | null, policy: ChildPolicy | null, };
 
 
-export type JobSpec = { provider: string | null, model: string | null, objective: string | null, success_criteria: string | null, constraints: string | null, hard_budget_micros: number | null, resource_commitment: number | null, };
+export type JobSpec = { provider: string | null, model: string | null, objective: string | null, success_criteria: string | null, constraints: string | null, hard_budget_micros: number | null, resource_commitment: number | null,
+/**
+ * Set when this Job is a Health Probe. A probe is an ordinary Job whose
+ * declared purpose is to produce execution evidence for one
+ * Provider x Model x Effort tuple, so the target rides the durable Job
+ * specification rather than a second top-level entity.
+ */
+health_probe?: HealthProbeIntent | null, };
 
 
 export type JobUsageResponse = { api_version: CanonicalApiVersion, project_id: string, job_id: string, generated_at: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, truncated: boolean, };
