@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, ViewTransition } from "react";
 import {
   ArrowRight,
   Clock3,
@@ -37,19 +37,22 @@ import {
   EmptyPanel,
   PageSurface,
   SectionHeading,
+  JOB_STATE,
+  Pill,
   SURFACE_TONE,
   TEXT_TONE,
   type Tone,
 } from "@/components/ocg/primitives";
 import type { RuntimeSnapshot } from "../runtime/runtime-types";
 import type { WorkspaceView } from "../layout/view-domain";
-import { useI18n } from "../i18n";
+import { runtimeStateLabel, useI18n } from "../i18n";
 
 type HomeSurfaceProps = {
   snapshot: RuntimeSnapshot;
   /** Opens a workspace; the shell owns the address and the close-back-to-chat. */
   onNavigate: (view: WorkspaceView) => void;
   onSelectSession?: (sessionId: string) => void;
+  /** Opens a Project-owned Job. Keyed by jobId, not by Chat session. */
   onSelectJob?: (jobId: string) => void;
 };
 
@@ -77,6 +80,7 @@ export const HOME_KIND_LABELS: Record<AttentionItem["kind"], string> = {
   budgetGate: "Budget gate",
   blockedTask: "Blocked task",
   providerUnavailable: "Provider unavailable",
+  modelUnavailable: "Model unavailable",
   runtimeFailure: "Runtime failure",
   verificationFailure: "Verification failure",
   configurationIssue: "Configuration",
@@ -85,8 +89,15 @@ export const HOME_KIND_LABELS: Record<AttentionItem["kind"], string> = {
 };
 
 export const HOME_STATUS_LABELS: Record<ActiveJobProjection["status"], string> = {
+  unknown: "Unknown",
   running: "Running",
+  eligible: "Eligible",
+  cancelling: "Cancelling",
   pending: "Pending",
+  completed: "Completed",
+  failed: "Failed",
+  cancelled: "Cancelled",
+  orphaned: "Orphaned",
 };
 
 export function HomeSurface(props: HomeSurfaceProps) {
@@ -96,7 +107,17 @@ export function HomeSurface(props: HomeSurfaceProps) {
   const attention = useMemo(() => selectHomeAttention(snapshot, t), [snapshot, t]);
   const jobs = useMemo(() => selectHomeActiveJobs(snapshot), [snapshot]);
   const recentWork = useMemo(() => selectRecentWork(snapshot.sessions, t), [snapshot.sessions, t]);
-  const resourceHealth = useMemo(() => selectResourceHealthSummary(snapshot.bootstrap), [snapshot.bootstrap]);
+  const resourceHealth = useMemo(() => selectResourceHealthSummary(snapshot.bootstrap, snapshot.status), [snapshot.bootstrap, snapshot.status]);
+  const resourcesReportedHealthy =
+    resourceHealth.providerCount !== null &&
+    resourceHealth.providerCount > 0 &&
+    resourceHealth.connectedProviders !== null &&
+    resourceHealth.connectedProviders > 0 &&
+    resourceHealth.availableModels !== null &&
+    resourceHealth.availableModels > 0 &&
+    !resourceHealth.hasUnreportedResourceState &&
+    !resourceHealth.hasProviderIssues &&
+    resourceHealth.unavailableModels === 0;
   const usage = useMemo(() => selectHomeUsageSummary(snapshot.resourceLedger), [snapshot.resourceLedger]);
   const activity = useMemo(() => selectRecentProductActivity(snapshot, t), [snapshot, t]);
 
@@ -109,8 +130,8 @@ export function HomeSurface(props: HomeSurfaceProps) {
           <p className="mt-1 text-sm text-muted-foreground">
             {attention.length > 0
               ? t(attention.length === 1 ? "home.attention.one" : "home.attention.other", { count: attention.length })
-              : t(canonical ? "home.realWelcome" : "home.healthy")}
-            {resourceHealth.hasDegradedOrAuthRequired ? t("home.resourcesNeedReview") : ""}
+              : t("home.realWelcome")}
+            {resourceHealth.hasProviderIssues ? t("home.resourcesNeedReview") : ""}
           </p>
         </div>
         <Button variant="default" size="sm" onClick={() => props.onNavigate("chat")} className="shrink-0">
@@ -119,8 +140,8 @@ export function HomeSurface(props: HomeSurfaceProps) {
         </Button>
       </section>
 
-      {/* Attention summary — View all navigates to the Attention Center. */}
-      <AttentionSection items={attention} onNavigate={props.onNavigate} />
+      {/* Attention summary — the shell owns selection and drill-down. */}
+      <AttentionSection items={attention} onNavigate={props.onNavigate} onSelectJob={props.onSelectJob} statusKnownAndHealthy={resourcesReportedHealthy} />
 
       {/* Main grid */}
       <div className={cn("grid gap-5", !canonical && "lg:grid-cols-[1fr_320px] xl:grid-cols-[1fr_380px]")}>
@@ -148,9 +169,13 @@ export function HomeSurface(props: HomeSurfaceProps) {
 function AttentionSection({
   items,
   onNavigate,
+  onSelectJob,
+  statusKnownAndHealthy,
 }: {
   items: AttentionItem[];
   onNavigate: (view: WorkspaceView) => void;
+  onSelectJob?: (sessionId: string) => void;
+  statusKnownAndHealthy: boolean;
 }) {
   const { t } = useI18n();
   const kindLabel = (kind: AttentionItem["kind"]) =>
@@ -163,6 +188,8 @@ function AttentionSection({
             ? "home.kind.blocked"
             : kind === "providerUnavailable"
               ? "home.kind.provider"
+              : kind === "modelUnavailable"
+                ? "home.kind.model"
               : kind === "runtimeFailure"
                 ? "home.kind.runtime"
                 : kind === "verificationFailure"
@@ -177,9 +204,15 @@ function AttentionSection({
     return (
       <section aria-label={t("attention.title")}>
         <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/20 px-4 py-3">
-          <ShieldCheck className="size-4 text-emerald-500" aria-hidden="true" />
-          <span className="text-sm font-medium">{t("home.noAction")}</span>
-          <span className="ml-auto text-xs text-muted-foreground">{t("home.workspaceHealthy")}</span>
+          {statusKnownAndHealthy ? (
+            <ShieldCheck className="size-4 text-emerald-500" aria-hidden="true" />
+          ) : (
+            <Database className="size-4 text-muted-foreground" aria-hidden="true" />
+          )}
+          <span className="text-sm font-medium">{t(statusKnownAndHealthy ? "home.noAction" : "home.noAttentionRecorded")}</span>
+          <span className="ml-auto text-xs text-muted-foreground">
+            {t(statusKnownAndHealthy ? "home.workspaceHealthy" : "home.statusNotFullyReported")}
+          </span>
         </div>
       </section>
     );
@@ -198,7 +231,13 @@ function AttentionSection({
             <button
               key={item.id}
               type="button"
-              onClick={() => onNavigate(DESTINATION_VIEWS[item.destination])}
+              onClick={() => {
+                if (item.destination === "job-execution" && item.sessionId && onSelectJob) {
+                  onSelectJob(item.sessionId);
+                } else {
+                  onNavigate(DESTINATION_VIEWS[item.destination]);
+                }
+              }}
               className={cn(
                 "flex w-full items-start gap-3 rounded-lg border p-3 text-left transition-colors hover:opacity-90",
                 SURFACE_TONE[tone],
@@ -234,10 +273,14 @@ function ActiveJobsSection({
 }: {
   jobs: ActiveJobProjection[];
   onNavigate: (view: WorkspaceView) => void;
+  /** Opens a Project-owned Job. Keyed by jobId, not by Chat session. */
   onSelectJob?: (jobId: string) => void;
 }) {
   const { t } = useI18n();
-  const openJobExecution = () => onNavigate("job-execution");
+  const openJob = (job: ActiveJobProjection) => {
+    if (onSelectJob) onSelectJob(job.jobId);
+    else onNavigate("job-execution");
+  };
   if (jobs.length === 0) {
     return (
       <section aria-label="Active jobs">
@@ -251,11 +294,11 @@ function ActiveJobsSection({
     <section aria-label="Active jobs">
       <SectionHeading
         title={t("home.activeJobs")}
-        action={<Button variant="ghost" size="xs" onClick={openJobExecution}>{t("home.jobExecution")} <ArrowRight className="ml-1 size-3" /></Button>}
+        action={<Button variant="ghost" size="xs" onClick={() => openJob(jobs[0])}>{t("home.jobExecution")} <ArrowRight className="ml-1 size-3" /></Button>}
       />
       <div className="flex flex-col gap-2">
         {jobs.map((job) => (
-          <JobCard key={job.id} job={job} onClick={() => job.jobId && onSelectJob ? onSelectJob(job.jobId) : openJobExecution()} />
+          <JobCard key={job.id} job={job} onClick={() => openJob(job)} />
         ))}
       </div>
     </section>
@@ -264,37 +307,28 @@ function ActiveJobsSection({
 
 function JobCard({ job, onClick }: { job: ActiveJobProjection; onClick: () => void }) {
   const { t } = useI18n();
-  const statusLabel = t(job.status === "running" ? "home.status.running" : "home.status.pending");
-  const waveInfo = job.currentWave && job.totalWaves ? `Wave ${job.currentWave}/${job.totalWaves}` : null;
-  const budgetText = job.budgetSpent !== undefined && job.budgetLimit ? `$${job.budgetSpent.toFixed(2)} / $${job.budgetLimit.toFixed(2)}` : null;
+  const statusLabel = runtimeStateLabel(t, job.status);
+  const status = JOB_STATE[job.status];
 
   return (
     <button
       type="button"
       onClick={onClick}
       className="flex w-full items-start gap-3 rounded-lg border border-border bg-card p-3 text-left transition-colors hover:bg-muted/30"
-      aria-label={`${job.title} · ${statusLabel} · ${job.completed} of ${job.total} calls`}
+      aria-label={`${job.title} · ${statusLabel}`}
     >
       <div className="flex min-w-0 flex-1 flex-col gap-1.5">
         <div className="flex items-center gap-2">
-          <span className="truncate text-[13px] font-semibold">{job.title}</span>
-          <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium capitalize bg-muted text-muted-foreground">
+          <ViewTransition name={`job-${job.jobId}`} share="vt-shared" default="none">
+            <span className="truncate text-[13px] font-semibold">{job.title}</span>
+          </ViewTransition>
+          <Pill tone={status.tone} dot pulse={status.pulse}>
             {statusLabel}
-          </span>
+          </Pill>
         </div>
         <div className="flex items-center gap-3 text-[12px] text-muted-foreground">
-          <span>{t("home.callProgress", { settled: job.completed, total: job.total })}</span>
-          {job.activeWorkers > 0 && <span>{t("home.activeWorkers", { count: job.activeWorkers })}</span>}
-          {job.blockedWorkers > 0 && <span className="text-amber-600 dark:text-amber-400">{t("home.blockedWorkers", { count: job.blockedWorkers })}</span>}
-          {waveInfo && <span>{waveInfo}</span>}
-          <span className="ml-auto flex items-center gap-1"><Clock3 className="size-3" />{t("home.ongoing")}</span>
+          <span>{t("home.projectLabel", { project: job.projectId })}</span>
         </div>
-        {budgetText && (
-          <div className="flex items-center gap-2 text-[12px]">
-            <span className="text-muted-foreground">{budgetText}</span>
-            <span className="text-[11px] text-muted-foreground">({job.progress}%)</span>
-          </div>
-        )}
       </div>
       <ArrowRight className="size-4 shrink-0 text-muted-foreground mt-1" aria-hidden="true" />
     </button>
@@ -361,35 +395,60 @@ function ResourceHealthSection({
       />
       <div className="mt-2 space-y-2.5 rounded-lg border border-border bg-card p-3">
         <div className="flex items-center justify-between">
-          <span className="text-[12px] text-muted-foreground">{health.providerCount} providers</span>
-          <span className="text-[12px] font-medium">{health.healthyProviders} healthy</span>
+          <span className="text-[12px] text-muted-foreground">Providers</span>
+          <span className="text-[12px] font-medium">
+            {health.providerCount === null ? t("common.notReported") : `${health.providerCount} reported`}
+          </span>
         </div>
-        {health.degradedProviders > 0 && (
+        {health.connectedProviders !== null && health.connectedProviders > 0 && (
+          <div className="flex items-center justify-between">
+            <span className="text-[12px] text-muted-foreground">Connected</span>
+            <span className="text-[12px] font-medium">{health.connectedProviders}</span>
+          </div>
+        )}
+        {health.degradedProviders !== null && health.degradedProviders > 0 && (
           <div className="flex items-center justify-between">
             <span className="text-[12px] text-amber-600 dark:text-amber-400">{health.degradedProviders} degraded</span>
             <span className="text-[11px] text-muted-foreground">needs attention</span>
           </div>
         )}
-        {health.authRequiredProviders > 0 && (
+        {health.authRequiredProviders !== null && health.authRequiredProviders > 0 && (
           <div className="flex items-center justify-between">
             <span className="text-[12px] text-violet-600 dark:text-violet-400">{health.authRequiredProviders} auth required</span>
             <span className="text-[11px] text-muted-foreground">action needed</span>
           </div>
         )}
-        {health.unavailableProviders > 0 && (
+        {health.unavailableProviders !== null && health.unavailableProviders > 0 && (
           <div className="flex items-center justify-between">
             <span className="text-[12px] text-red-600 dark:text-red-400">{health.unavailableProviders} unavailable</span>
-            <span className="text-[11px] text-muted-foreground">offline</span>
+            <span className="text-[11px] text-muted-foreground">runtime reported</span>
+          </div>
+        )}
+        {health.unknownProviders !== null && health.unknownProviders > 0 && (
+          <div className="flex items-center justify-between">
+            <span className="text-[12px] text-muted-foreground">{health.unknownProviders} unknown</span>
+            <span className="text-[11px] text-muted-foreground">state not reported</span>
           </div>
         )}
         <div className="mt-1 h-px bg-border" aria-hidden="true" />
         <div className="flex items-center justify-between">
           <span className="text-[12px] text-muted-foreground">{t("home.activeProfile")}</span>
-          <span className="text-[12px] font-medium">{health.activeProfileLabel}</span>
+          <span className="text-[12px] font-medium">{health.activeProfileLabel ?? t("common.notReported")}</span>
         </div>
         <div className="flex items-center justify-between">
           <span className="text-[12px] text-muted-foreground">{t("home.models")}</span>
-          <span className="text-[12px] font-medium">{health.availableModels} / {health.modelCount} available</span>
+          <span className="text-[12px] font-medium">
+            {health.modelCount === null || health.availableModels === null
+              ? t("common.notReported")
+              : `${health.availableModels} available / ${health.modelCount} reported`}
+          </span>
+        </div>
+        {health.pendingModels !== null && health.pendingModels > 0 && <p className="text-[11px] text-muted-foreground">{health.pendingModels} pending</p>}
+        {health.unavailableModels !== null && health.unavailableModels > 0 && <p className="text-[11px] text-red-600 dark:text-red-400">{health.unavailableModels} unavailable</p>}
+        {health.unknownModels !== null && health.unknownModels > 0 && <p className="text-[11px] text-muted-foreground">{health.unknownModels} unknown</p>}
+        <div className="flex items-center justify-between">
+          <span className="text-[12px] text-muted-foreground">Runtime</span>
+          <span className="text-[12px] font-medium">{runtimeStateLabel(t, health.runtimeState)}</span>
         </div>
       </div>
     </section>

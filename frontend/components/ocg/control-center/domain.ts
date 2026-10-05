@@ -383,37 +383,45 @@ export function filterModels(
 }
 
 export type ControlCenterSummary = {
-  providerCount: number;
+  stateIncomplete: boolean;
+  providerCount: number | null;
   profileCount: number;
   modelCount: number;
   availableModelCount: number;
+  pendingModelCount: number;
   unavailableModelCount: number;
   unknownModelCount: number;
-  authRequiredProviderCount: number;
-  degradedProviderCount: number;
-  unavailableProviderCount: number;
-  unknownProviderCount: number;
+  authRequiredProviderCount: number | null;
+  degradedProviderCount: number | null;
+  unavailableProviderCount: number | null;
+  unknownProviderCount: number | null;
   activeProfileId: string | null;
   activeProfileLabel: string | null;
 };
 
 /** Single source of truth for the Control Center header counts. */
 export function selectControlCenterSummary(state: BootstrapState): ControlCenterSummary {
-  const providers = selectProviders(state);
-  const active = selectActiveProfile(state);
+  const providers = state.providers;
+  const active = state.activeProfileId
+    ? state.profiles.find((profile) => profile.id === state.activeProfileId) ?? null
+    : null;
   const counts = selectModelStatusCounts(state);
   return {
-    providerCount: providers.length,
+    stateIncomplete: !state.ready || providers === undefined ||
+      providers.some((provider) => provider.state === "unknown") ||
+      state.models.some((model) => model.status === "pending" || model.status === "unknown"),
+    providerCount: providers?.length ?? null,
     profileCount: state.profiles.length,
     modelCount: state.models.length,
     availableModelCount: counts.available,
+    pendingModelCount: counts.pending,
     unavailableModelCount: counts.unavailable,
     unknownModelCount: counts.unknown,
-    authRequiredProviderCount: providers.filter((provider) => provider.state === "auth-required").length,
-    degradedProviderCount: providers.filter((provider) => provider.state === "degraded").length,
-    unavailableProviderCount: providers.filter((provider) => provider.state === "unavailable").length,
-    unknownProviderCount: providers.filter((provider) => provider.state === "unknown").length,
-    activeProfileId: active?.id ?? null,
-    activeProfileLabel: active?.label ?? null,
+    authRequiredProviderCount: providers?.filter((provider) => provider.state === "auth-required").length ?? null,
+    degradedProviderCount: providers?.filter((provider) => provider.state === "degraded").length ?? null,
+    unavailableProviderCount: providers?.filter((provider) => provider.state === "unavailable").length ?? null,
+    unknownProviderCount: providers?.filter((provider) => provider.state === "unknown").length ?? null,
+    activeProfileId: state.ready ? active?.id ?? null : null,
+    activeProfileLabel: state.ready ? active?.label ?? null : null,
   };
 }

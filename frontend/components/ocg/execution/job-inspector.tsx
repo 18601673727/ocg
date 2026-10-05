@@ -2,14 +2,13 @@
 
 import { CostDetails } from "../usage/usage-values";
 import { CircleDot, ExternalLink, Maximize2, Minimize2, X } from "lucide-react";
-import { useState } from "react";
+import { startTransition, useState, ViewTransition } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
   EmptyState,
   JOB_STATE,
   Pill,
-  ProgressBar,
   SegmentedTabs,
   type TabItem,
 } from "@/components/ocg/primitives";
@@ -41,13 +40,10 @@ const TAB_LABEL_KEYS: Record<InspectorTab, I18nKey> = {
   usage: "execution.usage",
 };
 
-/** Canonical Job summary: state, Project, and settled Calls over the authoritative Attempt. */
+/** Canonical Job summary: identity, Project, and the reported Job state. */
 function JobContext({ execution, compact = false }: { execution: JobExecution; compact?: boolean }) {
   const { t } = useI18n();
-  const progress = execution.progress;
-  const settled = progress?.settled ?? 0;
-  const total = progress?.total ?? 0;
-  const pct = progress?.percent ?? 0;
+  const state = JOB_STATE[execution.state];
   return (
     <div className={cn(compact ? "rounded-md border border-border bg-muted/20 px-2.5 py-2" : "", "min-w-0")}>
       <p
@@ -58,24 +54,14 @@ function JobContext({ execution, compact = false }: { execution: JobExecution; c
       </p>
       <div className="mt-1.5 flex items-center gap-1.5">
         <Pill
-          tone={JOB_STATE[execution.state].tone}
+          tone={state.tone}
           dot
-          pulse={JOB_STATE[execution.state].pulse}
+          pulse={state.pulse}
         >
           {runtimeStateLabel(t, execution.state)}
         </Pill>
-        <span className="text-[11px] text-muted-foreground">
-          {t("execution.callsSettledShort", { settled, total })}
-        </span>
-        <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">{pct}%</span>
       </div>
-      <ProgressBar
-        className="mt-2"
-        value={settled}
-        max={total}
-        ariaLabel={t("execution.jobProgress")}
-      />
-      {!compact && <p className="mt-1 text-[11px] text-muted-foreground">{t("execution.authoritativeSettled", { percent: pct, project: execution.projectId })}</p>}
+      {!compact && <p className="mt-1 text-[11px] text-muted-foreground">{t("execution.jobDetailsNotReported")}</p>}
     </div>
   );
 }
@@ -137,15 +123,17 @@ export function JobInspector({
               <SegmentedTabs
                 tabs={tabs}
                 value={tab}
-                onSelect={setTab}
+                onSelect={(next) => startTransition(() => setTab(next))}
                 ariaLabel={t("execution.inspectorSurfaces")}
                 panelIdBase="job-inspector"
                 className="grid-cols-3"
               />
             </nav>
-            <div id={`job-inspector-${tab}`} role="tabpanel" aria-label={t(TAB_LABEL_KEYS[tab])} className="mt-3">
-              <ObservabilityPanel execution={execution} accounting={accounting} observability={observability} tab={tab} />
-            </div>
+            <ViewTransition key={tab} enter="vt-detail" exit="vt-detail" default="none">
+              <div id={`job-inspector-${tab}`} role="tabpanel" aria-label={t(TAB_LABEL_KEYS[tab])} className="mt-3">
+                <ObservabilityPanel execution={execution} accounting={accounting} observability={observability} tab={tab} />
+              </div>
+            </ViewTransition>
           </>
         )}
       </div>

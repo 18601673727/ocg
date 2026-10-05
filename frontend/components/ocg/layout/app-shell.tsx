@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState, ViewTransition } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { ChatView } from "../chat/chat-view";
@@ -20,7 +20,6 @@ import { CanonicalControlSurface } from "../canonical/canonical-control-surface"
 import { useOcgControlUrl } from "../profile/control-url";
 import type { ControlCenterView } from "../control-center/domain";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { retryContent } from "../chat/retry";
 import type { InspectorMode } from "../observability/inspector-state";
 import { HomeSurface } from "../home/home-surface";
 import { AttentionSurface } from "../attention/attention-surface";
@@ -241,10 +240,10 @@ export function RuntimeWorkspace({
   }, [activeSessionKey, historyStatus, rememberSession, runtimeAuthority]);
   const isUsage = view === "usage";
   const isLedger = view === "ledger" && runtimeAuthority === "mock";
-  const isControlCenter = view === "control-center" && runtimeAuthority === "mock";
+  const isControlCenter = view === "control-center";
   const isJobExecution = view === "job-execution";
   const isLogs = view === "logs" && runtimeAuthority === "mock";
-  const isSettings = view === "settings" || (runtimeAuthority === "canonical" && ["control-center", "ledger", "logs"].includes(view));
+  const isSettings = view === "settings" || (runtimeAuthority === "canonical" && ["ledger", "logs"].includes(view));
   const isCanonical = view === "canonical";
   const isHome = view === "home";
   const isAttention = view === "attention";
@@ -291,17 +290,19 @@ export function RuntimeWorkspace({
    * view lives, and whether selecting it again closes it, is decided by the
    * view domain, so the topbar, sidebar and surfaces all agree.
    */
-  const navigate = useCallback((target: WorkspaceView) => {
+  const navigate = useCallback((target: WorkspaceView, sessionId?: string) => {
     setMobileNavOpen(false);
-    setMobileInspectorOpen(false);
+    startTransition(() => setMobileInspectorOpen(false));
     const href = workspaceViewHref(view, target);
     if (href !== null) {
       // Update the view without replacing the page and its runtime providers,
       // including when the workspace was entered through a standalone route.
       const url = new URL(withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`), window.location.origin);
+      if (sessionId) url.searchParams.set("session", sessionId);
+      // A Job is selected by jobId; leaving the Job surface clears it.
       if (target !== "job-execution") url.searchParams.delete("job");
       if (new URLSearchParams(window.location.search).get("demo") === "1") url.searchParams.set("demo", "1");
-      window.history.pushState(null, "", url.pathname + url.search);
+      startTransition(() => window.history.pushState(null, "", url.pathname + url.search));
     }
   }, [snapshot.scenario, view, withProject]);
 
@@ -338,6 +339,19 @@ export function RuntimeWorkspace({
     setActiveSessionId(id);
     navigate("chat");
     rememberSession(id);
+  }, [navigate, rememberSession]);
+
+  // Opens the inspector in Chat. When a Chat session presents the selected Job,
+  // that session is selected first so the conversation matches the Job.
+  const openJobInspector = useCallback((sessionId?: string) => {
+    startTransition(() => setInspectorMode("docked"));
+    if (sessionId) {
+      setActiveSessionId(sessionId);
+      rememberSession(sessionId);
+    }
+    const isMobile = window.matchMedia("(max-width: 1023px)").matches;
+    navigate("chat");
+    if (isMobile) startTransition(() => setMobileInspectorOpen(true));
   }, [navigate, rememberSession]);
 
   // --- Job draft lifecycle (single pure reducer, scoped per Project) ----
@@ -563,6 +577,8 @@ export function RuntimeWorkspace({
 
   const messages = activeSession ? snapshot.messagesBySession[activeSession.id] ?? [] : [];
   const execution = activeSession ? snapshot.executionBySession[activeSession.id] ?? null : null;
+  // Project-owned Jobs are the general Job collection. The active Chat session
+  // only annotates which session, if any, presents the selected Job.
   const projectExecutions = Object.values(snapshot.executionsByProject?.[activeProjectId] ?? {})
     .sort((left, right) => right.updatedAt - left.updatedAt || left.jobId.localeCompare(right.jobId));
   const requestedJobId = searchParams.get("job");
@@ -573,14 +589,25 @@ export function RuntimeWorkspace({
   const selectedJobSessionId = jobExecution
     ? Object.entries(snapshot.executionBySession).find(([, item]) => item?.jobId === jobExecution.jobId)?.[0]
     : undefined;
-  const lastAssistant = messages.findLast(message => message.role === "assistant");
-  const retryableMessage = lastAssistant && retryContent(messages, lastAssistant.id) ? lastAssistant.id : null;
   const usageRefreshKey = messages.filter(message => message.role === "assistant" && ["completed", "failed", "cancelled"].includes(message.status)).map(message => `${message.id}:${message.status}`).join("|");
   const usageBaseUrl = runtimeAuthority === "canonical" && view === "chat" ? ocgControlUrl : null;
+  const jobUsageBaseUrl = runtimeAuthority === "canonical" && ["chat", "job-execution"].includes(view) ? ocgControlUrl : null;
   const conversationUsage = useConversationUsage(usageBaseUrl, activeProjectId, activeSession?.sessionId ?? activeSession?.id ?? "", usageRefreshKey, messages.some(message => !message.optimistic));
-  const jobUsage = useJobUsage(usageBaseUrl, activeProjectId, execution?.jobId ?? "", `${usageRefreshKey}:${execution?.state ?? ""}`);
-  const recordedAccounting = activeSession ? snapshot.accountingBySession[activeSession.id] ?? null : null;
-  const accounting = jobUsage.data ? { ceiling: recordedAccounting?.ceiling ?? null, consumption: jobUsage.data.totals.cost } : recordedAccounting;
+  // Job usage follows the selected Project Job, not the active Chat session.
+  const jobUsage = useJobUsage(
+    jobUsageBaseUrl,
+    activeProjectId,
+    jobExecution?.jobId ?? "",
+    `${jobExecution?.updatedAt ?? ""}:${jobExecution?.state ?? ""}`,
+  );
+  // Session accounting is a Chat-session projection. For the Job surface it
+  // only applies when a Chat session actually presents the selected Job.
+  const sessionAccounting = activeSession ? snapshot.accountingBySession[activeSession.id] ?? null : null;
+  const recordedJobAccounting = selectedJobSessionId ? snapshot.accountingBySession[selectedJobSessionId] ?? null : null;
+  const jobAccounting = jobUsage.data
+    ? { ceiling: recordedJobAccounting?.ceiling ?? null, consumption: jobUsage.data.totals.cost }
+    : recordedJobAccounting;
+  const accounting = sessionAccounting;
   const observability = activeSession ? snapshot.observabilityBySession[activeSession.id] : undefined;
   const inspectorOpen = inspectorMode !== "collapsed";
 
@@ -665,13 +692,14 @@ export function RuntimeWorkspace({
           inspectorControls={Boolean(activeSession) && view === "chat"}
           activeView={view}
           onToggleSidebar={() => setSidebarCollapsed((value) => !value)}
-          onToggleInspector={() => setInspectorMode((value) => value === "collapsed" ? "docked" : "collapsed")}
+          onToggleInspector={() => startTransition(() => setInspectorMode((value) => value === "collapsed" ? "docked" : "collapsed"))}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
-          onOpenMobileInspector={() => setMobileInspectorOpen(true)}
+          onOpenMobileInspector={() => startTransition(() => setMobileInspectorOpen(true))}
           runtimeStatus={snapshot.status}
           runtimeAuthority={runtimeAuthority}
           syncStatus={sync?.status ?? null}
         />
+        <ViewTransition key={view} enter="vt-surface" exit="vt-surface" default="none">
         {isUsage ? (
           <main aria-label={t("nav.usage")} className="flex min-h-0 flex-1 overflow-hidden">
             <UsageSurface key={activeProjectId} baseUrl={runtimeAuthority === "canonical" ? ocgControlUrl : null} projectId={activeProjectId} onSelectSession={id => {
@@ -686,27 +714,30 @@ export function RuntimeWorkspace({
         ) : isControlCenter ? (
           <main aria-label="Control Center" className="flex min-h-0 flex-1 overflow-hidden">
             <ControlCenterSurface
-              key={`${activeProjectId}:${controlCenterView}`}
+              key={`${activeProjectId}:${controlCenterView}:${runtimeAuthority}`}
               bootstrap={snapshot.bootstrap}
               ledger={snapshot.resourceLedger}
-              initialView={controlCenterView}
+              initialView={runtimeAuthority === "canonical" && controlCenterView === "profiles" ? "providers" : controlCenterView}
+              canActivateProfiles={runtimeAuthority === "mock"}
+              attentionCount={attentionCount}
+              onNavigate={navigate}
               onSelectProfile={handleSelectProfile}
             />
           </main>
         ) : isJobExecution ? (
-          <main aria-label="Job Execution" className="flex min-h-0 flex-1 overflow-hidden">
+          <main aria-label={t("nav.jobExecution")} className="flex min-h-0 flex-1 overflow-hidden">
             {jobExecution ? (
               <JobExecutionSurface
                 key={`${activeProjectId}:${jobExecution.jobId}`}
                 execution={jobExecution}
                 executions={projectExecutions}
                 onSelectJob={openJob}
-                onOpenInspector={selectedJobSessionId ? () => {
-                  setActiveSessionId(selectedJobSessionId);
-                  rememberSession(selectedJobSessionId);
-                  navigate("chat");
-                } : undefined}
-                onReexecute={activeSession && selectedJobSessionId === activeSession.id && retryableMessage && snapshot.status.state === "connected" ? () => retryMessage(activeSession.id, retryableMessage) : undefined}
+                accounting={jobAccounting}
+                usage={jobUsage.data}
+                usageLoading={jobUsage.loading}
+                usageError={jobUsage.error}
+                onRetryUsage={jobUsage.refresh}
+                onOpenInspector={selectedJobSessionId ? () => openJobInspector(selectedJobSessionId) : undefined}
               />
             ) : (
               <NoExecutionNotice />
@@ -814,22 +845,27 @@ export function RuntimeWorkspace({
             >
               <div className={cn("h-full", inspectorMode === "expanded" ? "w-[min(640px,42vw)]" : "w-[min(360px,28vw)]")}>
                 {inspectorOpen && runtimeAuthority === "canonical" ? (
-                  <ConversationInspector key={`${activeProjectId}:${activeSession.id}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode={inspectorMode} onModeChange={setInspectorMode} onClose={() => setInspectorMode("collapsed")} onOpenJobExecution={() => navigate("job-execution")} />
+                  <ViewTransition enter="vt-panel" exit="vt-panel" default="none">
+                    <ConversationInspector key={`${activeProjectId}:${activeSession.id}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode={inspectorMode} onModeChange={(next) => startTransition(() => setInspectorMode(next))} onClose={() => startTransition(() => setInspectorMode("collapsed"))} onOpenJobExecution={() => navigate("job-execution")} />
+                  </ViewTransition>
                 ) : execution && inspectorOpen ? (
-                  <JobInspector
-                    execution={execution}
-                    accounting={accounting}
-                    observability={observability}
-                    mode={inspectorMode}
-                    onModeChange={setInspectorMode}
-                    onClose={() => setInspectorMode("collapsed")}
-                    onOpenJobExecution={() => navigate("job-execution")}
-                  />
+                  <ViewTransition enter="vt-panel" exit="vt-panel" default="none">
+                    <JobInspector
+                      execution={execution}
+                      accounting={accounting}
+                      observability={observability}
+                      mode={inspectorMode}
+                      onModeChange={(next) => startTransition(() => setInspectorMode(next))}
+                      onClose={() => startTransition(() => setInspectorMode("collapsed"))}
+                      onOpenJobExecution={() => navigate("job-execution")}
+                    />
+                  </ViewTransition>
                 ) : null}
               </div>
             </aside>
           </main>
         )}
+        </ViewTransition>
       </div>
 
       {!isUsage && !isLedger && !isControlCenter && !isJobExecution && !isLogs && !isSettings && !isHome && !isAttention && (
@@ -838,7 +874,7 @@ export function RuntimeWorkspace({
           aria-hidden={!mobileInspectorOpen}
         >
           <div
-            onClick={() => setMobileInspectorOpen(false)}
+            onClick={() => startTransition(() => setMobileInspectorOpen(false))}
             className={cn(
               "absolute inset-0 bg-black/40 transition-opacity duration-200",
               mobileInspectorOpen ? "opacity-100" : "opacity-0",
@@ -852,16 +888,20 @@ export function RuntimeWorkspace({
              )}
             >
             {mobileInspectorOpen && runtimeAuthority === "canonical" ? (
-              <ConversationInspector key={`${activeProjectId}:${activeSession?.id ?? ""}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode="expanded" onClose={() => setMobileInspectorOpen(false)} onOpenJobExecution={() => navigate("job-execution")} />
+              <ViewTransition enter="vt-panel" exit="vt-panel" default="none">
+                <ConversationInspector key={`${activeProjectId}:${activeSession?.id ?? ""}`} usage={conversationUsage} execution={execution} accounting={accounting} observability={observability} mode="expanded" onClose={() => startTransition(() => setMobileInspectorOpen(false))} onOpenJobExecution={() => navigate("job-execution")} />
+              </ViewTransition>
             ) : mobileInspectorOpen && execution ? (
-              <JobInspector
-                execution={execution}
-                accounting={accounting}
-                observability={observability}
-                mode="expanded"
-                onClose={() => setMobileInspectorOpen(false)}
-                onOpenJobExecution={() => navigate("job-execution")}
-              />
+              <ViewTransition enter="vt-panel" exit="vt-panel" default="none">
+                <JobInspector
+                  execution={execution}
+                  accounting={accounting}
+                  observability={observability}
+                  mode="expanded"
+                  onClose={() => startTransition(() => setMobileInspectorOpen(false))}
+                  onOpenJobExecution={() => navigate("job-execution")}
+                />
+              </ViewTransition>
             ) : null}
           </aside>
         </div>

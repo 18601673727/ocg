@@ -54,12 +54,12 @@ const GROUP_ICON: Record<WorkType, typeof Search> = {
 
 const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.usage" | "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
   { target: "home", labelKey: "nav.home", icon: Home },
-  { target: "attention", labelKey: "nav.attention", icon: Bell },
   { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
+  { target: "job-execution", labelKey: "nav.jobExecution", icon: Workflow },
+  { target: "attention", labelKey: "nav.attention", icon: Bell },
   { target: "usage", labelKey: "nav.usage", icon: BarChart3 },
   { target: "control-center", labelKey: "nav.controlCenter", icon: SlidersHorizontal },
   { target: "ledger", labelKey: "nav.ledger", icon: Table2 },
-  { target: "job-execution", labelKey: "nav.jobExecution", icon: Workflow },
   { target: "logs", labelKey: "nav.logs", icon: ScrollText },
   { target: "canonical", labelKey: "nav.canonical", icon: SlidersHorizontal },
 ];
@@ -171,7 +171,7 @@ export function OcgSidebar({
     }
   };
   const workspaceNav = runtimeAuthority === "canonical"
-    ? WORKSPACE_NAV.filter(item => ["home", "attention", "chat", "usage", "job-execution"].includes(item.target))
+    ? WORKSPACE_NAV.filter(item => ["home", "chat", "job-execution", "attention", "usage", "control-center"].includes(item.target))
     : WORKSPACE_NAV;
   const hasNav = Boolean(onNavigate);
   const connection = RUNTIME_CONNECTION[runtimeStatus.state];
@@ -352,12 +352,12 @@ export function OcgSidebar({
         {hasNav && (
           <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
             <ul className="flex flex-col gap-px">
-              {(runtimeAuthority === "canonical" ? workspaceNav : workspaceNav.slice(0, 3)).map(renderWorkspaceItem)}
+              {(runtimeAuthority === "canonical" ? workspaceNav : workspaceNav.slice(0, 4)).map(renderWorkspaceItem)}
             </ul>
-            {runtimeAuthority === "mock" && <details open={workspaceNav.slice(3).some((item) => item.target === activeView) || undefined} className="mt-1">
+            {runtimeAuthority === "mock" && <details open={workspaceNav.slice(4).some((item) => item.target === activeView) || undefined} className="mt-1">
               <summary className="cursor-pointer rounded-md px-2 py-1.5 text-[12px] text-muted-foreground hover:bg-muted/60">{t("nav.tools")}</summary>
               <ul className="flex flex-col gap-px pl-2">
-                {workspaceNav.slice(3).map(renderWorkspaceItem)}
+                {workspaceNav.slice(4).map(renderWorkspaceItem)}
               </ul>
             </details>}
           </nav>

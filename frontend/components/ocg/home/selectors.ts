@@ -7,11 +7,13 @@
 
 import type { I18nKey, TranslateFn } from "../i18n";
 import { runtimeStateLabel } from "../i18n";
+import { JOB_STATE } from "../primitives";
 import type { AttentionItem, AttentionSeverity, ActiveJobProjection, ContinueWorkingEntry, ResourceHealthSummary as HomeResourceHealthSummary, UsageSummary, RecentActivityItem } from "./domain";
 import type { BootstrapState } from "../bootstrap/types";
 import type { JobExecution } from "../execution/domain";
 import type { JobAccounting } from "../execution/accounting";
 import type { ResourceLedger } from "../resource-ledger/types";
+import type { RuntimeStatus } from "../types";
 import { sumCostMicros } from "../resource-ledger/selectors";
 
 // ---------------------------------------------------------------------------
@@ -27,67 +29,82 @@ export function selectHomeAttention(snapshot: {
   const items: AttentionItem[] = [];
   const { bootstrap } = snapshot;
 
-  // Degraded provider
-  const providers = bootstrap.providers ?? [];
-  const degradedProvider = providers.find((p) => p.state === "degraded");
-  if (degradedProvider) {
+  // Provider state is canonical and may be absent entirely. Preserve each
+  // reported Provider state; unknown is not the same fact as unavailable.
+  for (const provider of bootstrap.providers ?? []) {
+    const createdAt = provider.lastCheckedAt;
+    const common = {
+      provider: provider.label,
+      ...(createdAt ? { createdAt } : {}),
+      status: "open" as const,
+      destination: "control-center" as const,
+    };
+    if (provider.state === "degraded") {
+      items.push({
+        ...common,
+        id: `attention-provider-degraded-${provider.id}`,
+        severity: "warning",
+        kind: "degradedResource",
+        title: `${provider.label} is degraded`,
+        summary: provider.detail ?? "Runtime reports this Provider as degraded.",
+      });
+    } else if (provider.state === "auth-required") {
+      items.push({
+        ...common,
+        id: `attention-provider-auth-${provider.id}`,
+        severity: "attention",
+        kind: "authenticationRequired",
+        title: `${provider.label} requires authentication`,
+        summary: provider.detail ?? "Runtime reports that authentication is required.",
+      });
+    } else if (provider.state === "unavailable") {
+      items.push({
+        ...common,
+        id: `attention-provider-unavailable-${provider.id}`,
+        severity: "critical",
+        kind: "providerUnavailable",
+        title: `${provider.label} is unavailable`,
+        summary: provider.detail ?? "Runtime reports this Provider as unavailable.",
+      });
+    }
+  }
+
+  // The model catalogue has a distinct unavailable state. Unknown and pending
+  // remain visible in resource summaries without being promoted to failures.
+  for (const model of bootstrap.models) {
+    if (model.status !== "unavailable") continue;
+    const provider = bootstrap.providers?.find((entry) => entry.id === model.providerId || entry.label === model.provider);
     items.push({
-      id: `attention-provider-degraded-${degradedProvider.id}`,
+      id: `attention-model-unavailable-${model.id}`,
       severity: "warning",
-      kind: "degradedResource",
-      title: `${degradedProvider.label} is degraded`,
-      summary: degradedProvider.detail ?? "Provider reporting elevated latency or reduced capacity.",
-      provider: degradedProvider.label,
-      createdAt: degradedProvider.lastCheckedAt ?? "now",
-      status: "open",
+      kind: "modelUnavailable",
+      title: `${model.displayName ?? model.model} is unavailable`,
+      summary: model.provenanceNote ?? "Runtime reports this Model as unavailable.",
+      provider: provider?.label ?? model.provider,
       destination: "control-center",
-    });
-  }
-
-  // Auth-required provider
-  const authProvider = providers.find((p) => p.state === "auth-required");
-  if (authProvider) {
-    items.push({
-      id: `attention-provider-auth-${authProvider.id}`,
-      severity: "attention",
-      kind: "authenticationRequired",
-      title: `${authProvider.label} requires authentication`,
-      summary: authProvider.detail ?? "Authentication is delegated to the provider runtime.",
-      provider: authProvider.label,
-      createdAt: authProvider.lastCheckedAt ?? "now",
       status: "open",
-      destination: "control-center",
-    });
-  }
-
-  // Unavailable provider
-  const unavailableProvider = providers.find((p) => p.state === "unavailable");
-  if (unavailableProvider) {
-    items.push({
-      id: `attention-provider-unavailable-${unavailableProvider.id}`,
-      severity: "critical",
-      kind: "providerUnavailable",
-      title: `${unavailableProvider.label} is unavailable`,
-      summary: unavailableProvider.detail ?? "Provider is explicitly unavailable and not selected for routing.",
-      provider: unavailableProvider.label,
-      createdAt: unavailableProvider.lastCheckedAt ?? "now",
-      status: "open",
-      destination: "control-center",
     });
   }
 
   // Failed Jobs are Project work, whether or not a Chat session presents them.
+  // A Chat session is recorded alongside an attention item only as an optional
+  // conversational route, never as the reason the Job exists.
+  const chatSessionByJob = chatSessionsByJobId(snapshot.executionBySession);
   for (const execution of executionsIn(snapshot)) {
     if (!execution) continue;
-    if (execution.state === "failed") {
+    if (execution.state === "failed" || execution.state === "orphaned") {
+      const orphaned = execution.state === "orphaned";
       items.push({
         id: `attention-execution-failed-${execution.jobId}`,
         severity: "warning",
         kind: "runtimeFailure",
-        title: t ? t("home.failedJob", { id: execution.jobId }) : `Job ${execution.jobId} failed`,
-        summary: t ? t("home.failedSummary") : "Job execution failed.",
+        title: t
+          ? t(orphaned ? "home.orphanedJob" : "home.failedJob", { id: execution.jobId })
+          : `Job ${execution.jobId} ${orphaned ? "is orphaned" : "failed"}`,
+        summary: t ? t(orphaned ? "home.orphanedSummary" : "home.failedSummary") : `Runtime reports this Job as ${orphaned ? "orphaned" : "failed"}.`,
         jobId: execution.jobId,
-        createdAt: "now",
+        ...(chatSessionByJob.get(execution.jobId) ? { sessionId: chatSessionByJob.get(execution.jobId)! } : {}),
+        createdAt: new Date(execution.updatedAt * 1000).toISOString(),
         status: "open",
         destination: "job-execution",
       });
@@ -119,30 +136,37 @@ export function selectHomeActiveJobs(snapshot: {
   executionBySession: Record<string, JobExecution | null>;
 }): ActiveJobProjection[] {
   const results: ActiveJobProjection[] = [];
-  const chatSessionByJob = new Map(Object.entries(snapshot.executionBySession)
-    .flatMap(([sessionId, execution]) => execution ? [[execution.jobId, sessionId] as const] : []));
+  const chatSessionByJob = chatSessionsByJobId(snapshot.executionBySession);
+  const seenJobIds = new Set<string>();
+  // Project-owned Jobs are the collection. A Chat session only annotates the
+  // projection when one happens to present the same Job.
   for (const execution of executionsIn(snapshot)) {
-    if ("state" in execution && (execution.state === "running" || execution.state === "pending")) {
+    if (["running", "cancelling", "eligible", "pending"].includes(execution.state) && !seenJobIds.has(execution.jobId)) {
+      seenJobIds.add(execution.jobId);
       results.push({
         sessionId: chatSessionByJob.get(execution.jobId),
         jobId: execution.jobId,
         projectId: execution.projectId,
         title: execution.jobId,
         id: execution.jobId,
-        completed: execution.progress?.settled ?? 0,
-        total: execution.progress?.total ?? 0,
-        activeWorkers: execution.executors.filter((executor) => executor.status === "running").length,
-        blockedWorkers: 0,
-        waitingWorkers: execution.executors.filter((executor) => executor.status === "queued").length,
-        elapsed: "ongoing",
-        progress: execution.progress?.percent ?? 0,
         destination: "job-execution",
-        status: execution.state === "running" ? "running" : "pending",
+        status: execution.state,
         updatedAt: new Date(execution.updatedAt * 1000).toISOString(),
       });
     }
   }
   return results.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? "") || a.jobId!.localeCompare(b.jobId!));
+}
+
+/**
+ * Chat sessions keyed by the Job they present. This is a conversational
+ * annotation only: a Job with no Chat session is still a Project-owned Job.
+ */
+function chatSessionsByJobId(
+  executionBySession: Record<string, JobExecution | null>,
+): Map<string, string> {
+  return new Map(Object.entries(executionBySession)
+    .flatMap(([sessionId, execution]) => execution ? [[execution.jobId, sessionId] as const] : []));
 }
 
 function executionsIn(snapshot: {
@@ -185,41 +209,50 @@ export function selectRecentWork(sessions: { id: string; title: string; updatedA
 // Resource health
 // ---------------------------------------------------------------------------
 
-export type ResourceHealthItem = {
-  id: string;
-  label: string;
-  state: "healthy" | "degraded" | "auth-required" | "unavailable";
-  detail: string | null;
-};
-
 export function selectResourceHealthSummary(
   bootstrap: BootstrapState,
+  runtimeStatus: RuntimeStatus,
 ): HomeResourceHealthSummary {
-  const items: ResourceHealthItem[] = [];
-  const providers = bootstrap.providers ?? [];
-  for (const provider of providers) {
-    if (provider.state !== "connected") {
-      items.push({
-        id: provider.id,
-        label: provider.label,
-        state: provider.state === "unknown" ? "unavailable" : provider.state,
-        detail: provider.detail ?? null,
-      });
-    }
-  }
+  const providers = bootstrap.providers;
+  const items: NonNullable<HomeResourceHealthSummary["items"]> = (providers ?? [])
+    .filter((provider) => provider.state !== "connected")
+    .map((provider) => ({
+      id: provider.id,
+      label: provider.label,
+      state: provider.state,
+      detail: provider.detail ?? null,
+    }));
+  const modelCountsKnown = bootstrap.ready;
+  const activeProfile = bootstrap.ready
+    ? bootstrap.profiles.find((profile) => profile.id === bootstrap.activeProfileId) ?? null
+    : null;
+  const hasProviderIssues = (providers ?? []).some((provider) =>
+    provider.state === "degraded" || provider.state === "auth-required" || provider.state === "unavailable",
+  );
+  const hasUnreportedResourceState =
+    !bootstrap.ready ||
+    providers === undefined ||
+    providers.some((provider) => provider.state === "unknown") ||
+    bootstrap.models.some((model) => model.status === "unknown" || model.status === "pending") ||
+    runtimeStatus.state !== "connected";
+
   return {
-    providerCount: providers.length,
-    healthyProviders: providers.filter((provider) => provider.state === "connected").length,
-    degradedProviders: providers.filter((provider) => provider.state === "degraded").length,
-    unavailableProviders: providers.filter((provider) => provider.state === "unavailable").length,
-    authRequiredProviders: providers.filter((provider) => provider.state === "auth-required").length,
-    unknownProviders: 0,
-    modelCount: 0,
-    availableModels: 0,
-    unavailableModels: 0,
-    activeProfileLabel: "Default",
-    runtimeState: "connected",
-    hasDegradedOrAuthRequired: items.some((item) => item.state === "degraded" || item.state === "auth-required"),
+    providerCount: providers?.length ?? null,
+    connectedProviders: providers?.filter((provider) => provider.state === "connected").length ?? null,
+    degradedProviders: providers?.filter((provider) => provider.state === "degraded").length ?? null,
+    unavailableProviders: providers?.filter((provider) => provider.state === "unavailable").length ?? null,
+    authRequiredProviders: providers?.filter((provider) => provider.state === "auth-required").length ?? null,
+    unknownProviders: providers?.filter((provider) => provider.state === "unknown").length ?? null,
+    modelCount: modelCountsKnown ? bootstrap.models.length : null,
+    availableModels: modelCountsKnown ? bootstrap.models.filter((model) => model.status === "available").length : null,
+    pendingModels: modelCountsKnown ? bootstrap.models.filter((model) => model.status === "pending").length : null,
+    unavailableModels: modelCountsKnown ? bootstrap.models.filter((model) => model.status === "unavailable").length : null,
+    unknownModels: modelCountsKnown ? bootstrap.models.filter((model) => model.status === "unknown").length : null,
+    activeProfileLabel: activeProfile?.label ?? null,
+    runtimeState: runtimeStatus.state,
+    hasProviderIssues,
+    hasUnreportedResourceState,
+    items,
   };
 }
 
@@ -267,7 +300,7 @@ export function selectRecentProductActivity(snapshot: {
         type: WORK_TYPE_KEYS[session.workType] ? t(WORK_TYPE_KEYS[session.workType]) : session.workType,
       }) : `Session · ${session.workType}`,
       timestamp: session.updatedAt,
-      kind: "job" as const,
+      kind: "chat" as const,
       tone: "slate" as const,
       timeAgo: session.updatedAt ?? "now",
     });
@@ -276,10 +309,10 @@ export function selectRecentProductActivity(snapshot: {
     items.push({
       id: `execution-${execution.projectId}-${execution.jobId}`,
       summary: t ? t("home.executionActivity", {
-        id: execution.jobId, state: runtimeStateLabel(t, execution.state), count: execution.calls.length,
-      }) : `Job ${execution.jobId} · ${execution.state} · ${execution.calls.length} calls`,
+        id: execution.jobId, state: runtimeStateLabel(t, execution.state),
+      }) : `Job ${execution.jobId} · ${execution.state}`,
       kind: "job" as const,
-      tone: execution.state === "failed" ? "red" as const : "emerald" as const,
+      tone: JOB_STATE[execution.state].tone,
       timeAgo: new Date(execution.updatedAt * 1000).toISOString(),
     });
   }

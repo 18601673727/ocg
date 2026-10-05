@@ -174,6 +174,52 @@ html[data-density="compact"] {
   }
 }
 
+/* Semantic React ViewTransition vocabulary: brief fades for surfaces and details,
+   with the browser's shared-element morph reserved for canonical entity identity. */
+:root {
+  --vt-exit-duration: 110ms;
+  --vt-enter-duration: 160ms;
+  --vt-shared-duration: 190ms;
+}
+
+::view-transition {
+  pointer-events: none;
+}
+
+::view-transition-old(.vt-surface),
+::view-transition-old(.vt-detail),
+::view-transition-old(.vt-panel) {
+  animation: var(--vt-exit-duration) ease-in both vt-fade-out;
+}
+
+::view-transition-new(.vt-surface),
+::view-transition-new(.vt-detail),
+::view-transition-new(.vt-panel) {
+  animation: var(--vt-enter-duration) ease-out both vt-fade-in;
+}
+
+::view-transition-group(.vt-shared) {
+  animation-duration: var(--vt-shared-duration);
+  animation-timing-function: cubic-bezier(0.2, 0.75, 0.25, 1);
+}
+
+@keyframes vt-fade-out {
+  to { opacity: 0; }
+}
+
+@keyframes vt-fade-in {
+  from { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(*),
+  ::view-transition-new(*),
+  ::view-transition-group(*) {
+    animation-duration: 0s !important;
+    animation-delay: 0s !important;
+  }
+}
+
 @custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
 
 @custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));

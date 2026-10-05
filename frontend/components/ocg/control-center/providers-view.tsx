@@ -5,7 +5,7 @@
  * profile routes point at them.
  */
 
-import { useMemo } from "react";
+import { useMemo, ViewTransition } from "react";
 import {
   AlertTriangle,
   Cpu,
@@ -174,6 +174,7 @@ export function ProvidersView({
   onStateFilterChange: (value: BootstrapProviderState | "all") => void;
 }) {
   const providers = selectProviders(bootstrap);
+  const providersReported = bootstrap.providers !== undefined;
   const filtered = useMemo(
     () => filterProviders(providers, query).filter((provider) => stateFilter === "all" || provider.state === stateFilter),
     [providers, query, stateFilter],
@@ -189,11 +190,17 @@ export function ProvidersView({
   return (
     <div className="flex min-w-0 flex-col gap-2">
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <Pill tone="emerald">{stateCounts.connected} connected</Pill>
-        <Pill tone="sky">{stateCounts["auth-required"]} auth required</Pill>
-        <Pill tone="amber">{stateCounts.degraded} degraded</Pill>
-        <Pill tone="red">{stateCounts.unavailable} unavailable</Pill>
-        <Pill tone="slate">{stateCounts.unknown} unknown</Pill>
+        {providersReported ? (
+          <>
+            <Pill tone="emerald">{stateCounts.connected} connected</Pill>
+            <Pill tone="sky">{stateCounts["auth-required"]} auth required</Pill>
+            <Pill tone="amber">{stateCounts.degraded} degraded</Pill>
+            <Pill tone="red">{stateCounts.unavailable} unavailable</Pill>
+            <Pill tone="slate">{stateCounts.unknown} unknown</Pill>
+          </>
+        ) : (
+          <Pill tone="slate">{t("common.notReported")}</Pill>
+        )}
         <label className="ml-auto flex min-w-0 items-center gap-1.5 rounded border border-border bg-background px-2 py-1">
           <Search className="size-3 shrink-0 text-muted-foreground" aria-hidden="true" />
           <input
@@ -221,9 +228,9 @@ export function ProvidersView({
 
       <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(220px,300px)_minmax(0,1fr)]">
         <section aria-label={t("control.providers")} className="min-w-0">
-          <SectionTitle detail={`${filtered.length} / ${providers.length}`}>{t("control.providers")}</SectionTitle>
+          <SectionTitle detail={providersReported ? `${filtered.length} / ${providers.length}` : t("common.notReported")}>{t("control.providers")}</SectionTitle>
           {filtered.length === 0 ? (
-            <EmptyState>{t("control.noProviderMatch")}</EmptyState>
+            <EmptyState>{providersReported ? t("control.noProviderMatch") : t("control.providersNotReported")}</EmptyState>
           ) : (
             <ul className="flex flex-col gap-1.5">
               {filtered.map((provider) => (
@@ -239,11 +246,13 @@ export function ProvidersView({
           )}
         </section>
         <section aria-label="Provider detail" className="min-w-0">
-          {selected ? (
-            <ProviderDetail bootstrap={bootstrap} provider={selected} />
-          ) : (
-            <EmptyState className="py-4">{t("control.selectProvider")}</EmptyState>
-          )}
+          <ViewTransition key={selected?.id ?? "empty"} enter="vt-detail" exit="vt-detail" default="none">
+            {selected ? (
+              <ProviderDetail bootstrap={bootstrap} provider={selected} />
+            ) : (
+              <EmptyState className="py-4">{t("control.selectProvider")}</EmptyState>
+            )}
+          </ViewTransition>
         </section>
       </div>
 

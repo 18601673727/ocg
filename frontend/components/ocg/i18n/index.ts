@@ -27,7 +27,9 @@ import type { I18nKey } from "./dictionaries";
 
 const STATE_KEYS: Record<string, I18nKey> = {
   "pending": "state.pending",
+  "eligible": "state.eligible",
   "running": "state.running",
+  "cancelling": "state.cancelling",
   "completed": "state.completed",
   "failed": "state.failed",
   "cancelled": "state.cancelled",

@@ -7,6 +7,8 @@
  */
 
 import type { Tone } from "../primitives";
+import type { RuntimeStatus } from "../types";
+import type { CanonicalJobState } from "../contracts";
 
 export type AttentionSeverity = "info" | "attention" | "warning" | "critical";
 
@@ -15,6 +17,7 @@ export type AttentionKind =
   | "budgetGate"
   | "blockedTask"
   | "providerUnavailable"
+  | "modelUnavailable"
   | "runtimeFailure"
   | "verificationFailure"
   | "configurationIssue"
@@ -41,7 +44,7 @@ export type AttentionItem = {
   workerId?: string;
   provider?: string;
   model?: string;
-  createdAt: string;
+  createdAt?: string;
   status: "open" | "investigating" | "resolved";
   destination: AttentionDestination;
 };
@@ -49,22 +52,12 @@ export type AttentionItem = {
 export type ActiveJobProjection = {
   id: string;
   title: string;
-  status: "running" | "pending";
-  completed: number;
-  total: number;
-  currentWave?: number;
-  totalWaves?: number;
-  activeWorkers: number;
-  blockedWorkers: number;
-  waitingWorkers: number;
-  elapsed: string;
-  budgetSpent?: number;
-  budgetLimit?: number;
-  progress: number;
+  status: CanonicalJobState;
   destination: "job-execution";
+  /** Chat session presenting this Job, when one does. Not a visibility condition. */
   sessionId?: string;
-  jobId?: string;
-  projectId?: string;
+  jobId: string;
+  projectId: string;
   updatedAt?: string;
 };
 
@@ -81,22 +74,25 @@ export type ContinueWorkingEntry = {
 };
 
 export type ResourceHealthSummary = {
-  providerCount: number;
-  healthyProviders: number;
-  degradedProviders: number;
-  unavailableProviders: number;
-  authRequiredProviders: number;
-  unknownProviders: number;
-  modelCount: number;
-  availableModels: number;
-  unavailableModels: number;
-  activeProfileLabel: string;
-  runtimeState: string;
-  hasDegradedOrAuthRequired: boolean;
+  providerCount: number | null;
+  connectedProviders: number | null;
+  degradedProviders: number | null;
+  unavailableProviders: number | null;
+  authRequiredProviders: number | null;
+  unknownProviders: number | null;
+  modelCount: number | null;
+  availableModels: number | null;
+  pendingModels: number | null;
+  unavailableModels: number | null;
+  unknownModels: number | null;
+  activeProfileLabel: string | null;
+  runtimeState: RuntimeStatus["state"];
+  hasProviderIssues: boolean;
+  hasUnreportedResourceState: boolean;
   items?: ResourceHealthItem[];
 };
 
-export type ResourceHealthItem = { id: string; label: string; state: "healthy" | "degraded" | "auth-required" | "unavailable"; detail: string | null };
+export type ResourceHealthItem = { id: string; label: string; state: "connected" | "degraded" | "auth-required" | "unavailable" | "unknown"; detail: string | null };
 
 export type UsageSummary = {
   costMicros: number | null;
@@ -113,13 +109,13 @@ export type UsageSummary = {
 };
 
 /** Subset of the shared tone scale the activity feed ranks itself by. */
-export type RecentActivityTone = Extract<Tone, "emerald" | "violet" | "amber" | "red" | "slate">;
+export type RecentActivityTone = Extract<Tone, "emerald" | "sky" | "amber" | "red" | "slate" | "violet">;
 
 export type RecentActivityItem = {
   id: string;
   timeAgo: string;
   summary: string;
-  kind: "job" | "worker" | "provider" | "model" | "budget" | "resource" | "verification";
+  kind: "chat" | "job" | "worker" | "provider" | "model" | "budget" | "resource" | "verification";
   tone: RecentActivityTone;
   title?: string;
   subtitle?: string;

@@ -1,8 +1,9 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { startTransition, useMemo, useState, ViewTransition } from "react";
 import { Activity, Coins, Cpu, Layers, Server, Users } from "lucide-react";
-import { formatCostMicros, formatCount } from "@/lib/format";
+import { formatCostMicros } from "@/lib/format";
+import { Button } from "@/components/ui/button";
 import { Metric, Pill, SegmentedTabs, type TabItem } from "@/components/ocg/primitives";
 import type {
   BootstrapModelStatus,
@@ -18,6 +19,7 @@ import {
 } from "./domain";
 import { summarize } from "../resource-ledger/selectors";
 import type { ResourceLedger } from "../resource-ledger/types";
+import type { WorkspaceView } from "../layout/view-domain";
 import { ModelsView } from "./models-view";
 import { ProfilesView } from "./profiles-view";
 import { ProvidersView } from "./providers-view";
@@ -40,24 +42,17 @@ function LedgerStrip({ ledger }: { ledger: ResourceLedger | null }) {
   if (!summary) {
     return (
       <p className="text-[10px] text-muted-foreground">
-        No normalized resource ledger for this scenario. Call and cost attribution stays with the Resource Ledger surface.
+        Cost data is not reported in this summary. Detailed attribution stays in the Resource Ledger.
       </p>
     );
   }
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
       <span className="inline-flex items-center gap-1">
-        <Layers className="size-3 shrink-0" aria-hidden="true" />
-        <strong className="font-semibold tabular-nums text-foreground">{formatCount(summary.entryCount)}</strong> calls
-      </span>
-      <span className="inline-flex items-center gap-1">
         <Coins className="size-3 shrink-0" aria-hidden="true" />
         <strong className="font-semibold tabular-nums text-foreground">{formatCostMicros(summary.costMicros)}</strong>
         <span>({summary.costProvenance})</span>
       </span>
-      <span>{summary.jobCount} jobs</span>
-      <span>{summary.workerCount} workers</span>
-      <span>{summary.leadEntryCount} lead calls</span>
     </div>
   );
 }
@@ -66,18 +61,23 @@ export type ControlCenterSurfaceProps = {
   bootstrap: BootstrapState;
   ledger: ResourceLedger | null;
   initialView?: ControlCenterView;
+  canActivateProfiles: boolean;
+  attentionCount: number;
+  onNavigate: (view: WorkspaceView) => void;
   onSelectProfile: (profileId: string) => void;
 };
 
 /**
- * Frontend-only Profiles + Providers + Models Control Center. All data is
- * derived from the normalized bootstrap state; the only mutation exposed is the
- * mock active-profile switch.
+ * Operational attention summary with Providers and Models as drill-downs.
+ * Profiles are shown only where the runtime supports their activation action.
  */
 export function ControlCenterSurface({
   bootstrap,
   ledger,
   initialView = "profiles",
+  canActivateProfiles,
+  attentionCount,
+  onNavigate,
   onSelectProfile,
 }: ControlCenterSurfaceProps) {
   const { t } = useI18n();
@@ -94,14 +94,18 @@ export function ControlCenterSurface({
   const [modelAssignmentFilter, setModelAssignmentFilter] = useState<"assigned" | "unassigned" | "all">("all");
   const [modelCapabilityFilter, setModelCapabilityFilter] = useState("");
   const summary = useMemo(() => selectControlCenterSummary(bootstrap), [bootstrap]);
+  const visibleViews = useMemo(
+    () => canActivateProfiles ? CONTROL_CENTER_VIEWS : CONTROL_CENTER_VIEWS.filter((id) => id !== "profiles"),
+    [canActivateProfiles],
+  );
   const tabs: TabItem<ControlCenterView>[] = useMemo(
     () =>
-      CONTROL_CENTER_VIEWS.map((id) => ({
+      visibleViews.map((id) => ({
         id,
         label: t(VIEW_LABEL_KEY[id]),
         icon: VIEW_ICON[id],
       })),
-    [t],
+    [t, visibleViews],
   );
 
   return (
@@ -109,22 +113,44 @@ export function ControlCenterSurface({
       <header className="shrink-0 border-b border-border px-3 py-2.5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <h1 className="text-[13px] font-semibold tracking-tight">{t("control.title")}</h1>
-          <Pill tone="sky" title="Active profile in the mock runtime">
-            {summary.activeProfileLabel ?? t("control.noProfile")}
+          <Pill tone="sky" title="Profile reported by the runtime">
+            {summary.activeProfileLabel ?? t("common.notReported")}
           </Pill>
           <span className="text-[10px] text-muted-foreground">
-            {summary.profileCount} profiles · {summary.providerCount} providers · {summary.modelCount} models
+            {summary.profileCount} profiles reported · {summary.providerCount === null ? t("common.notReported") : `${summary.providerCount} providers`} · {summary.modelCount} models reported
           </span>
           <span className="ml-auto flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
             <Activity className="size-3" aria-hidden="true" />
-            {summary.availableModelCount} available · {summary.unavailableModelCount} unavailable · {summary.unknownModelCount} unknown
+            {summary.availableModelCount} available · {summary.pendingModelCount} pending · {summary.unavailableModelCount} unavailable · {summary.unknownModelCount} unknown
           </span>
         </div>
+        {summary.stateIncomplete && <p className="mt-1 text-[10px] text-muted-foreground">{t("control.stateIncomplete")}</p>}
+        <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/10 px-2.5 py-2">
+          <div className="min-w-0 flex-1">
+            <p className="text-[11px] font-semibold">{t("control.needsAttention")}</p>
+            <p className="text-[10px] text-muted-foreground">
+              {attentionCount === 0 ? t("home.noAttentionRecorded") : t(attentionCount === 1 ? "home.attention.one" : "home.attention.other", { count: attentionCount })}
+            </p>
+          </div>
+          <Button size="xs" variant="outline" onClick={() => onNavigate("attention")}>{t("home.viewAll")}</Button>
+        </div>
         <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-4">
-          <Metric label={t("control.profiles")} value={String(summary.profileCount)} detail={`${summary.activeProfileLabel ?? "none"} active`} />
-          <Metric label={t("control.providers")} value={String(summary.providerCount)} detail={`${summary.degradedProviderCount} degraded · ${summary.unavailableProviderCount} unavailable`} />
-          <Metric label="Auth required" value={String(summary.authRequiredProviderCount)} detail={`${summary.unknownProviderCount} unknown`} />
-          <Metric label="Available models" value={String(summary.availableModelCount)} detail={`${summary.modelCount} total`} />
+          <Metric
+            label={t("control.profiles")}
+            value={String(summary.profileCount)}
+            detail={summary.activeProfileLabel ? `${summary.activeProfileLabel} active` : t("common.notReported")}
+          />
+          <Metric
+            label={t("control.providers")}
+            value={summary.providerCount === null ? t("common.notReported") : String(summary.providerCount)}
+            detail={`${summary.degradedProviderCount ?? t("common.notReported")} degraded · ${summary.unavailableProviderCount ?? t("common.notReported")} unavailable`}
+          />
+          <Metric
+            label="Auth required"
+            value={summary.authRequiredProviderCount === null ? t("common.notReported") : String(summary.authRequiredProviderCount)}
+            detail={`${summary.unknownProviderCount ?? t("common.notReported")} unknown`}
+          />
+          <Metric label="Available models" value={String(summary.availableModelCount)} detail={`${summary.modelCount} reported`} />
         </div>
         <div className="mt-2 min-w-0">
           <LedgerStrip ledger={ledger} />
@@ -135,59 +161,56 @@ export function ControlCenterSurface({
         <SegmentedTabs
           tabs={tabs}
           value={view}
-          onSelect={setView}
+          onSelect={(next) => startTransition(() => setView(next))}
           ariaLabel={t("control.surfaces")}
           panelIdBase="control-center"
-          className="grid-cols-3"
+          className={canActivateProfiles ? "grid-cols-3" : "grid-cols-2"}
         />
       </nav>
 
-      <div
-        id={`control-center-${view}`}
-        role="tabpanel"
-        aria-label={t(VIEW_LABEL_KEY[view])}
-        className="min-h-0 min-w-0 flex-1 overflow-y-auto px-3 py-3"
-      >
-        {view === "profiles" && (
-          <ProfilesView
-            bootstrap={bootstrap}
-            selectedProfileId={selectedProfileId}
-            onSelectProfile={setSelectedProfileId}
-            onActivateProfile={(id) => {
-              setSelectedProfileId(id);
-              onSelectProfile(id);
-            }}
-          />
-        )}
-        {view === "providers" && (
-          <ProvidersView
-            bootstrap={bootstrap}
-            selectedProviderId={selectedProviderId}
-            onSelectProvider={setSelectedProviderId}
-            query={providerQuery}
-            onQueryChange={setProviderQuery}
-            stateFilter={providerStateFilter}
-            onStateFilterChange={setProviderStateFilter}
-          />
-        )}
-        {view === "models" && (
-          <ModelsView
-            bootstrap={bootstrap}
-            selectedModelId={selectedModelId}
-            onSelectModel={setSelectedModelId}
-            query={modelQuery}
-            onQueryChange={setModelQuery}
-            providerFilter={modelProviderFilter}
-            onProviderFilterChange={setModelProviderFilter}
-            statusFilter={modelStatusFilter}
-            onStatusFilterChange={setModelStatusFilter}
-            assignmentFilter={modelAssignmentFilter}
-            onAssignmentFilterChange={setModelAssignmentFilter}
-            capabilityFilter={modelCapabilityFilter}
-            onCapabilityFilterChange={setModelCapabilityFilter}
-          />
-        )}
-      </div>
+      <ViewTransition key={view} enter="vt-detail" exit="vt-detail" default="none">
+        <div id={`control-center-${view}`} role="tabpanel" aria-label={t(VIEW_LABEL_KEY[view])} className="min-h-0 min-w-0 flex-1 overflow-y-auto px-3 py-3">
+          {view === "profiles" && canActivateProfiles && (
+            <ProfilesView
+              bootstrap={bootstrap}
+              selectedProfileId={selectedProfileId}
+              onSelectProfile={setSelectedProfileId}
+              onActivateProfile={(id) => {
+                setSelectedProfileId(id);
+                onSelectProfile(id);
+              }}
+            />
+          )}
+          {view === "providers" && (
+            <ProvidersView
+              bootstrap={bootstrap}
+              selectedProviderId={selectedProviderId}
+              onSelectProvider={(id) => startTransition(() => setSelectedProviderId(id))}
+              query={providerQuery}
+              onQueryChange={setProviderQuery}
+              stateFilter={providerStateFilter}
+              onStateFilterChange={setProviderStateFilter}
+            />
+          )}
+          {view === "models" && (
+            <ModelsView
+              bootstrap={bootstrap}
+              selectedModelId={selectedModelId}
+              onSelectModel={(id) => startTransition(() => setSelectedModelId(id))}
+              query={modelQuery}
+              onQueryChange={setModelQuery}
+              providerFilter={modelProviderFilter}
+              onProviderFilterChange={setModelProviderFilter}
+              statusFilter={modelStatusFilter}
+              onStatusFilterChange={setModelStatusFilter}
+              assignmentFilter={modelAssignmentFilter}
+              onAssignmentFilterChange={setModelAssignmentFilter}
+              capabilityFilter={modelCapabilityFilter}
+              onCapabilityFilterChange={setModelCapabilityFilter}
+            />
+          )}
+        </div>
+      </ViewTransition>
     </div>
   );
 }
