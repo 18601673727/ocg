@@ -300,7 +300,10 @@ impl ChatMessage {
         Ok(())
     }
 
-    fn require_text_content(&self, field: &str) -> Result<Vec<super::normalize::ContentPart>, TransportError> {
+    fn require_text_content(
+        &self,
+        field: &str,
+    ) -> Result<Vec<super::normalize::ContentPart>, TransportError> {
         let content = self.content.as_ref().ok_or_else(|| {
             TransportError::invalid(field.to_string(), "message content is required")
         })?;
@@ -329,7 +332,10 @@ pub enum MessageContentWire {
 }
 
 impl MessageContentWire {
-    fn to_text_parts(&self, field: &str) -> Result<Vec<super::normalize::ContentPart>, TransportError> {
+    fn to_text_parts(
+        &self,
+        field: &str,
+    ) -> Result<Vec<super::normalize::ContentPart>, TransportError> {
         let parts: Vec<super::normalize::ContentPart> = match self {
             Self::Text(text) => vec![super::normalize::ContentPart::text(text.clone())],
             Self::Parts(parts) => {
@@ -342,7 +348,9 @@ impl MessageContentWire {
                 parts
                     .iter()
                     .map(|part| match part {
-                        ContentPartWire::Text { text } => super::normalize::ContentPart::text(text.clone()),
+                        ContentPartWire::Text { text } => {
+                            super::normalize::ContentPart::text(text.clone())
+                        }
                     })
                     .collect()
             }
@@ -452,8 +460,12 @@ fn parse_tool_arguments(raw: &str, field: &str) -> Result<Value, TransportError>
     if raw.is_empty() {
         return Ok(Value::Object(serde_json::Map::new()));
     }
-    serde_json::from_str(raw)
-        .map_err(|error| TransportError::invalid(field.to_string(), format!("invalid tool arguments JSON: {error}")))
+    serde_json::from_str(raw).map_err(|error| {
+        TransportError::invalid(
+            field.to_string(),
+            format!("invalid tool arguments JSON: {error}"),
+        )
+    })
 }
 
 fn parse_reasoning_effort(effort: &str) -> Result<(), TransportError> {
@@ -470,11 +482,17 @@ fn validate_tool_choice(choice: &ToolChoiceWire) -> Result<(), TransportError> {
     match choice {
         ToolChoiceWire::Mode(mode) => match mode.as_str() {
             "auto" | "none" | "required" => Ok(()),
-            other => Err(TransportError::invalid("tool_choice", format!("unknown tool_choice `{other}`"))),
+            other => Err(TransportError::invalid(
+                "tool_choice",
+                format!("unknown tool_choice `{other}`"),
+            )),
         },
         ToolChoiceWire::Named(named) => {
             if named.kind != "function" {
-                return Err(TransportError::unsupported("tool_choice.type", format!("unsupported tool_choice type `{}`", named.kind)));
+                return Err(TransportError::unsupported(
+                    "tool_choice.type",
+                    format!("unsupported tool_choice type `{}`", named.kind),
+                ));
             }
             if named.function.name.trim().is_empty() {
                 Err(TransportError::invalid(
@@ -516,9 +534,7 @@ pub struct NamedFunctionWire {
 pub enum ResponseFormatWire {
     Text {},
     JsonObject {},
-    JsonSchema {
-        json_schema: JsonSchemaWire,
-    },
+    JsonSchema { json_schema: JsonSchemaWire },
 }
 
 #[derive(Debug, Clone, Deserialize)]

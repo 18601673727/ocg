@@ -75,7 +75,11 @@ fn expected_asset<'a>(
         .ok_or_else(|| OcgError::config(format!("release {} has no asset '{name}'", release.tag)))
 }
 
-fn expected_checksum(http: &dyn HttpTransport, release: &crate::release::Release, name: &str) -> Result<String> {
+fn expected_checksum(
+    http: &dyn HttpTransport,
+    release: &crate::release::Release,
+    name: &str,
+) -> Result<String> {
     let sums = release.asset("SHA256SUMS").ok_or_else(|| {
         OcgError::config(format!("release {} has no SHA256SUMS asset", release.tag))
     })?;

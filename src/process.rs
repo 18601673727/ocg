@@ -57,7 +57,6 @@ pub trait ProcessHost: Send + Sync {
 
     /// Run `<program> --version` and return the trimmed output.
     fn version(&self, program: &Path) -> Result<String>;
-
 }
 
 /// The real host, backed by `PATH` and `std::process::Command`.
@@ -120,7 +119,6 @@ impl ProcessHost for SystemProcessHost {
             program.display()
         )))
     }
-
 }
 
 /// A captured `git` invocation.
@@ -543,7 +541,11 @@ impl CaptureRunner for SystemCaptureRunner {
                     }
                 }
             }
-            if child.try_wait().map_err(|error| OcgError::io(format!("cannot poll {program}"), error))?.is_some() {
+            if child
+                .try_wait()
+                .map_err(|error| OcgError::io(format!("cannot poll {program}"), error))?
+                .is_some()
+            {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(10));
@@ -558,7 +560,11 @@ impl CaptureRunner for SystemCaptureRunner {
             .map(|handle| handle.join().unwrap_or_default())
             .unwrap_or_default();
         Ok(CapturedOutput {
-            exit: if cancelled_child { ProcessExit::Unknown } else { process_exit(&status) },
+            exit: if cancelled_child {
+                ProcessExit::Unknown
+            } else {
+                process_exit(&status)
+            },
             success: !cancelled_child && status.success(),
             stdout: stdout_bytes,
             stderr: stderr_bytes,

@@ -61,7 +61,9 @@ use std::collections::BTreeMap;
 pub const MAX_TRACKED_TARGETS: usize = 512;
 
 /// What one reduction changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ReductionKind {
     /// A payload exceeded its bound and was digested.
@@ -206,7 +208,10 @@ struct CallIdentity {
 /// A tool result is matched to its call by `tool_call_id`, so the mapping is
 /// exact rather than positional. A result with no matching call is left alone:
 /// guessing would risk collapsing an unrelated result.
-fn identity_of(message: &Value, calls: &BTreeMap<String, (String, String)>) -> Option<CallIdentity> {
+fn identity_of(
+    message: &Value,
+    calls: &BTreeMap<String, (String, String)>,
+) -> Option<CallIdentity> {
     let id = message.get("tool_call_id")?.as_str()?;
     let (tool, arguments) = calls.get(id)?;
     Some(CallIdentity {
@@ -363,14 +368,15 @@ fn bound_message(
     // Collect the oversized fields before taking a mutable borrow, so the
     // failure check above can read the message without aliasing.
     let mut pending: Vec<(&'static str, String, usize)> = Vec::new();
-    let record_field = |field: &'static str, cap: usize, pending: &mut Vec<(&'static str, String, usize)>| {
-        let Some(Value::String(text)) = object.get(field) else {
-            return;
+    let record_field =
+        |field: &'static str, cap: usize, pending: &mut Vec<(&'static str, String, usize)>| {
+            let Some(Value::String(text)) = object.get(field) else {
+                return;
+            };
+            if text.len() > cap {
+                pending.push((field, text.clone(), cap));
+            }
         };
-        if text.len() > cap {
-            pending.push((field, text.clone(), cap));
-        }
-    };
     record_field("content", content_cap, &mut pending);
     if role == "assistant" {
         record_field(
@@ -456,7 +462,10 @@ pub fn bound_text(text: &str, cap: usize, label: &str) -> String {
     if text.len() <= cap {
         return text.to_string();
     }
-    let marker = format!("\n[... {label} truncated: {} bytes elided ...]\n", text.len());
+    let marker = format!(
+        "\n[... {label} truncated: {} bytes elided ...]\n",
+        text.len()
+    );
     let budget = cap.saturating_sub(marker.len());
     if budget == 0 {
         return format!("[{label} truncated: {} bytes]", text.len());
@@ -509,7 +518,9 @@ fn record(
         reduced_bytes,
         reason: reason.into(),
     };
-    report.tokens_reclaimed = report.tokens_reclaimed.saturating_add(entry.tokens_reclaimed());
+    report.tokens_reclaimed = report
+        .tokens_reclaimed
+        .saturating_add(entry.tokens_reclaimed());
     report.records.push(entry);
 }
 
@@ -762,5 +773,13 @@ fn replace_with_digest(
             object.insert("content".to_string(), Value::String(payload.to_string()));
         }
     }
-    record(report, kind, index, subject, before, after, subject.to_string());
+    record(
+        report,
+        kind,
+        index,
+        subject,
+        before,
+        after,
+        subject.to_string(),
+    );
 }

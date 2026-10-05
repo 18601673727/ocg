@@ -91,6 +91,6 @@ pub use projection::{
 };
 pub use registry::{discover, resolve_named, SkillCollision, SkillRegistry};
 pub use resolve::{
-    enforce_budget, rematerialize, resolve, ActivationOrigin, ActivationRefusal,
-    ActivationRequest, ActivationSet, ActiveSkill,
+    enforce_budget, rematerialize, resolve, ActivationOrigin, ActivationRefusal, ActivationRequest,
+    ActivationSet, ActiveSkill,
 };

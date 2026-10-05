@@ -210,17 +210,15 @@ impl CompactionConfig {
             object,
             &["reasoningReserveTokens", "reasoning_reserve_tokens"],
         ) {
-            config.reasoning_reserve_tokens = parse_non_negative_u64(value, "reasoningReserveTokens")?;
+            config.reasoning_reserve_tokens =
+                parse_non_negative_u64(value, "reasoningReserveTokens")?;
         }
         if let Some(value) = first(object, &["safetyBufferTokens", "safety_buffer_tokens"]) {
             config.safety_buffer_tokens = parse_non_negative_u64(value, "safetyBufferTokens")?;
         }
         if let Some(value) = first(
             object,
-            &[
-                "maxAssumedReservePercent",
-                "max_assumed_reserve_percent",
-            ],
+            &["maxAssumedReservePercent", "max_assumed_reserve_percent"],
         ) {
             config.max_assumed_reserve_percent = parse_percent(value, "maxAssumedReservePercent")?;
         }
@@ -260,9 +258,7 @@ impl CompactionConfig {
                 "compactPercent must be greater than reducePercent; deterministic reduction runs first",
             ));
         }
-        if self.max_assumed_reserve_percent == 0
-            || self.max_assumed_reserve_percent > 100
-        {
+        if self.max_assumed_reserve_percent == 0 || self.max_assumed_reserve_percent > 100 {
             return Err(invalid_err(
                 "maxAssumedReservePercent must be between 1 and 100",
             ));
@@ -346,23 +342,20 @@ impl TailPolicy {
         }
         if let Some(value) = first(object, &["maxTurns", "max_turns"]) {
             if !value.is_null() {
-                policy.max_turns = Some(
-                    value
-                        .as_u64()
-                        .filter(|number| *number > 0)
-                        .ok_or_else(|| {
+                policy.max_turns =
+                    Some(
+                        value.as_u64().filter(|number| *number > 0).ok_or_else(|| {
                             invalid_err("tail.maxTurns must be a positive integer")
                         })? as usize,
-                );
+                    );
             }
         }
         if let Some(value) = first(object, &["scanLimit", "scan_limit"]) {
             policy.scan_limit = value
                 .as_u64()
                 .filter(|number| *number > 0)
-                .ok_or_else(|| {
-                    invalid_err("tail.scanLimit must be a positive integer")
-                })? as usize;
+                .ok_or_else(|| invalid_err("tail.scanLimit must be a positive integer"))?
+                as usize;
         }
         policy.validate_values()?;
         Ok(policy)
@@ -380,14 +373,10 @@ impl TailPolicy {
             )));
         }
         if self.ratio_percent == 0 || self.ratio_percent > 100 {
-            return Err(invalid_err(
-                "tail.ratioPercent must be between 1 and 100",
-            ));
+            return Err(invalid_err("tail.ratioPercent must be between 1 and 100"));
         }
         if self.scan_limit == 0 {
-            return Err(invalid_err(
-                "tail.scanLimit must be a positive integer",
-            ));
+            return Err(invalid_err("tail.scanLimit must be a positive integer"));
         }
         Ok(())
     }
@@ -470,15 +459,10 @@ impl ReducePolicy {
         }
         if let Some(value) = first(
             object,
-            &[
-                "protectRecentMessages",
-                "protect_recent_messages",
-            ],
+            &["protectRecentMessages", "protect_recent_messages"],
         ) {
-            policy.protect_recent_messages = parse_non_negative_usize(
-                value,
-                "protectRecentMessages",
-            )?;
+            policy.protect_recent_messages =
+                parse_non_negative_usize(value, "protectRecentMessages")?;
         }
         for (keys, slot, label) in [
             (
@@ -487,11 +471,7 @@ impl ReducePolicy {
                 "collapseRepeatReads",
             ),
             (
-                [
-                    "collapseSupersededReads",
-                    "collapse_superseded_reads",
-                ]
-                .as_slice(),
+                ["collapseSupersededReads", "collapse_superseded_reads"].as_slice(),
                 &mut policy.collapse_superseded_reads,
                 "collapseSupersededReads",
             ),
@@ -502,10 +482,7 @@ impl ReducePolicy {
                     .ok_or_else(|| invalid_err(format!("reduce.{label} must be a boolean")))?;
             }
         }
-        if let Some(value) = first(
-            object,
-            &["digestPreviewChars", "digest_preview_chars"],
-        ) {
+        if let Some(value) = first(object, &["digestPreviewChars", "digest_preview_chars"]) {
             policy.digest_preview_chars = parse_positive_usize(value, "digestPreviewChars")?;
         }
         policy.validate_values()?;
@@ -567,29 +544,17 @@ impl TranscriptPolicy {
         let mut policy = Self::default();
         for (keys, slot, label) in [
             (
-                [
-                    "maxToolResultChars",
-                    "max_tool_result_chars",
-                ]
-                .as_slice(),
+                ["maxToolResultChars", "max_tool_result_chars"].as_slice(),
                 &mut policy.max_tool_result_chars,
                 "maxToolResultChars",
             ),
             (
-                [
-                    "maxAssistantChars",
-                    "max_assistant_chars",
-                ]
-                .as_slice(),
+                ["maxAssistantChars", "max_assistant_chars"].as_slice(),
                 &mut policy.max_assistant_chars,
                 "maxAssistantChars",
             ),
             (
-                [
-                    "maxReasoningChars",
-                    "max_reasoning_chars",
-                ]
-                .as_slice(),
+                ["maxReasoningChars", "max_reasoning_chars"].as_slice(),
                 &mut policy.max_reasoning_chars,
                 "maxReasoningChars",
             ),
@@ -683,11 +648,7 @@ impl SummaryPolicy {
                 "requireAllSections",
             ),
             (
-                [
-                    "continueAfterCompaction",
-                    "continue_after_compaction",
-                ]
-                .as_slice(),
+                ["continueAfterCompaction", "continue_after_compaction"].as_slice(),
                 &mut policy.continue_after_compaction,
                 "continueAfterCompaction",
             ),
@@ -719,9 +680,7 @@ impl SummaryPolicy {
             ));
         }
         if self.max_calls == 0 {
-            return Err(invalid_err(
-                "summary.maxCalls must be a positive integer",
-            ));
+            return Err(invalid_err("summary.maxCalls must be a positive integer"));
         }
         Ok(())
     }
@@ -739,7 +698,10 @@ fn first<'a>(object: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Optio
     keys.iter().find_map(|key| object.get(*key))
 }
 
-fn as_object<'a>(value: &'a Value, label: &str) -> Result<Option<&'a serde_json::Map<String, Value>>> {
+fn as_object<'a>(
+    value: &'a Value,
+    label: &str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>> {
     if value.is_null() {
         return Ok(None);
     }

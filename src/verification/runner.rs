@@ -149,8 +149,8 @@ pub fn execute(request: &VerifyRequest<'_>) -> Result<VerificationReport> {
         // place would make the next compile report reintroduced diagnostics as
         // carried over rather than new.
         let key = command.display();
-        let machine_readable =
-            compiler::is_machine_readable_output(&stdout) || compiler::is_machine_readable_output(&stderr);
+        let machine_readable = compiler::is_machine_readable_output(&stdout)
+            || compiler::is_machine_readable_output(&stderr);
         let compiler_delta = if !machine_readable {
             None
         } else {
@@ -158,7 +158,9 @@ pub fn execute(request: &VerifyRequest<'_>) -> Result<VerificationReport> {
             if current.is_empty() {
                 current = compiler::from_json_lines(&stderr);
             }
-            let previous = state.compiler_baseline(&key).map(|baseline| baseline.current.clone());
+            let previous = state
+                .compiler_baseline(&key)
+                .map(|baseline| baseline.current.clone());
             let delta = compiler::delta(previous.as_ref(), current);
             live_commands.push(key.clone());
             state.record_compiler_baseline(&key, delta.clone(), now, &live_commands);

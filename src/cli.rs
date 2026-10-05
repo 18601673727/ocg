@@ -4,8 +4,8 @@
 //! orchestration state. Provider execution is admitted through the native
 //! Project / Job / Attempt / Call model; no external runtime is launched.
 
-use crate::config;
 use crate::clock::Clock;
+use crate::config;
 use crate::context::{ContextConfig, ContextEngine};
 use crate::defaults::{load_defaults, OcgSource};
 use crate::error::OcgError;
@@ -63,7 +63,9 @@ impl Env {
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from)
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -131,14 +133,21 @@ where
             model_choice = Some(value.to_string());
         } else if text == "--model" {
             model_choice = Some(next_value(&args, &mut index, "--model")?);
-        } else if let Some(value) = text.strip_prefix("--project=").or_else(|| text.strip_prefix("--cwd=")) {
+        } else if let Some(value) = text
+            .strip_prefix("--project=")
+            .or_else(|| text.strip_prefix("--cwd="))
+        {
             project = Some(PathBuf::from(value));
         } else if text == "--project" || text == "--cwd" {
             project = Some(PathBuf::from(next_value(&args, &mut index, &text)?));
         } else if let Some(value) = text.strip_prefix("--user-config=") {
             user_config = Some(PathBuf::from(value));
         } else if text == "--user-config" {
-            user_config = Some(PathBuf::from(next_value(&args, &mut index, "--user-config")?));
+            user_config = Some(PathBuf::from(next_value(
+                &args,
+                &mut index,
+                "--user-config",
+            )?));
         } else if text == "--pretty" {
             pretty = true;
         } else if text == "--disable-proxy" {
@@ -189,7 +198,14 @@ where
         Some("doctor") => Command::Doctor,
         Some(other) => return Err(UsageError(format!("unknown command: {other}"))),
     };
-    Ok(Cli { model_choice, project, pretty, user_config, disable_proxy, command })
+    Ok(Cli {
+        model_choice,
+        project,
+        pretty,
+        user_config,
+        disable_proxy,
+        command,
+    })
 }
 
 fn next_value(args: &[OsString], index: &mut usize, name: &str) -> Result<String, UsageError> {
@@ -210,53 +226,137 @@ enum Failure {
 }
 
 impl From<OcgError> for Failure {
-    fn from(error: OcgError) -> Self { Self::Ocg(error) }
+    fn from(error: OcgError) -> Self {
+        Self::Ocg(error)
+    }
 }
 
 pub fn run(args: impl Iterator<Item = OsString>) -> i32 {
     observability::init_tracing();
     match run_inner(args) {
         Ok(code) => code,
-        Err(Failure::Usage(message)) => { eprintln!("ocg: {message}"); 2 }
-        Err(Failure::Ocg(error)) => { eprintln!("ocg: {error}"); 2 }
+        Err(Failure::Usage(message)) => {
+            eprintln!("ocg: {message}");
+            2
+        }
+        Err(Failure::Ocg(error)) => {
+            eprintln!("ocg: {error}");
+            2
+        }
     }
 }
 
 fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let cli = parse(args).map_err(|error| Failure::Usage(error.0))?;
-    if matches!(cli.command, Command::Help) { print!("{}", usage()); return Ok(0); }
-    if matches!(cli.command, Command::Version) { println!("OCG {VERSION}"); return Ok(0); }
+    if matches!(cli.command, Command::Help) {
+        print!("{}", usage());
+        return Ok(0);
+    }
+    if matches!(cli.command, Command::Version) {
+        println!("OCG {VERSION}");
+        return Ok(0);
+    }
     let env = Env::from_process();
-    let root = cli.project.clone().unwrap_or(std::env::current_dir().map_err(|error| OcgError::io("cannot determine current directory", error))?);
-    if !root.is_dir() { return Err(Failure::Usage(format!("project is not a directory: {}", root.display()))); }
+    let root = cli.project.clone().unwrap_or(
+        std::env::current_dir()
+            .map_err(|error| OcgError::io("cannot determine current directory", error))?,
+    );
+    if !root.is_dir() {
+        return Err(Failure::Usage(format!(
+            "project is not a directory: {}",
+            root.display()
+        )));
+    }
     let boundary = project::resolve(&root);
     let project_root = boundary.root().to_path_buf();
-    let (source, home) = match env.home.clone() { Some(path) => (OcgSource::Dir(path.clone()), Some(path)), None => (OcgSource::Embedded, None) };
+    let (source, home) = match env.home.clone() {
+        Some(path) => (OcgSource::Dir(path.clone()), Some(path)),
+        None => (OcgSource::Embedded, None),
+    };
     let defaults = load_defaults(&source)?;
-    let user_path = config::user_config_path(cli.user_config.as_deref(), env.user_config.as_deref(), env.xdg_config_home.as_deref(), env.home_dir.as_deref());
-    if matches!(cli.command, Command::Init) { return init_command(&user_path); }
-    let mut effective = config::build_effective(defaults.clone(), home.clone(), &project_root, &user_path, &user_path, env.home_dir.clone())?;
-    crate::orchestration::OrchestrationConfig::apply_env_override(&mut effective.data, env.orchestration.as_deref());
-    let level = cli.model_choice.clone().or_else(|| crate::profile::Profile::from_ocg_config(&effective.data).ok().and_then(|profile| profile.default_model)).unwrap_or_default();
+    let user_path = config::user_config_path(
+        cli.user_config.as_deref(),
+        env.user_config.as_deref(),
+        env.xdg_config_home.as_deref(),
+        env.home_dir.as_deref(),
+    );
+    if matches!(cli.command, Command::Init) {
+        return init_command(&user_path);
+    }
+    let mut effective = config::build_effective(
+        defaults.clone(),
+        home.clone(),
+        &project_root,
+        &user_path,
+        &user_path,
+        env.home_dir.clone(),
+    )?;
+    crate::orchestration::OrchestrationConfig::apply_env_override(
+        &mut effective.data,
+        env.orchestration.as_deref(),
+    );
+    let level = cli
+        .model_choice
+        .clone()
+        .or_else(|| {
+            crate::profile::Profile::from_ocg_config(&effective.data)
+                .ok()
+                .and_then(|profile| profile.default_model)
+        })
+        .unwrap_or_default();
     match cli.command {
-        Command::Launch => crate::pwa::run(&project_root, &user_path, user_path.is_file(), cli.disable_proxy).map(|_| 0).map_err(Into::into),
-        Command::Status => { validate::require_valid(&effective)?; println!("{}", report::status_text(&effective, &level)?); Ok(0) }
-        Command::Routing => { validate::require_valid(&effective)?; println!("{}", report::routing_text(&effective)?); Ok(0) }
+        Command::Launch => crate::pwa::run(
+            &project_root,
+            &user_path,
+            user_path.is_file(),
+            cli.disable_proxy,
+        )
+        .map(|_| 0)
+        .map_err(Into::into),
+        Command::Status => {
+            validate::require_valid(&effective)?;
+            println!("{}", report::status_text(&effective, &level)?);
+            Ok(0)
+        }
+        Command::Routing => {
+            validate::require_valid(&effective)?;
+            println!("{}", report::routing_text(&effective)?);
+            Ok(0)
+        }
         Command::Config(args) => native_config(&args, &user_path, &project_root, &env),
         Command::Auth(args) => auth_command(&args),
         Command::Validate => validate_command(&effective),
-        Command::Layers => { println!("{}", report::layers_text(&effective, env.trace.as_deref())); Ok(0) }
-        Command::Trace(event) => { let event = event.as_deref().unwrap_or("command"); if let Some(path) = observability::record_event(&effective, event, &level, env.trace.as_deref()) { println!("{}", path.display()); } Ok(0) }
+        Command::Layers => {
+            println!("{}", report::layers_text(&effective, env.trace.as_deref()));
+            Ok(0)
+        }
+        Command::Trace(event) => {
+            let event = event.as_deref().unwrap_or("command");
+            if let Some(path) =
+                observability::record_event(&effective, event, &level, env.trace.as_deref())
+            {
+                println!("{}", path.display());
+            }
+            Ok(0)
+        }
         Command::Context(args) => context_command(&effective, &project_root, &args, cli.pretty),
         Command::Cache(args) => native_cache(&effective, &project_root, &args),
         Command::Stats(args) => native_stats(&effective, &project_root, &args, cli.pretty),
         Command::Verify(args) => native_verify(&effective, &project_root, &args, cli.pretty),
         Command::Tools(args) => native_tools(&effective, &args, cli.pretty),
-        Command::Checkpoint(args) => native_checkpoint(&effective, &project_root, &args, cli.pretty),
+        Command::Checkpoint(args) => {
+            native_checkpoint(&effective, &project_root, &args, cli.pretty)
+        }
         Command::Reconcile(args) => reconcile_command(&project_root, &args, cli.pretty),
         Command::Resources(args) => native_resources(&project_root, &args, cli.pretty),
         Command::Budget(args) => native_budget(&effective, &project_root, &args, cli.pretty),
-        Command::Serve(args) => serve_command(&project_root, &user_path, &args, cli.pretty, cli.disable_proxy),
+        Command::Serve(args) => serve_command(
+            &project_root,
+            &user_path,
+            &args,
+            cli.pretty,
+            cli.disable_proxy,
+        ),
         Command::Work(args) => work_command(&project_root, &args, cli.pretty),
         Command::Health(args) => health_command(&project_root, &user_path, &args, cli.pretty),
         Command::Doctor => doctor_command(&effective, &project_root),
@@ -265,14 +365,25 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
 }
 
 fn print_json(value: &Value, pretty: bool) -> Result<(), Failure> {
-    let text = if pretty { serde_json::to_string_pretty(value) } else { serde_json::to_string(value) }.map_err(|error| OcgError::config(format!("cannot serialize output: {error}")))?;
+    let text = if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    }
+    .map_err(|error| OcgError::config(format!("cannot serialize output: {error}")))?;
     println!("{text}");
     Ok(())
 }
 
 fn init_command(path: &Path) -> Result<i32, Failure> {
-    if path.exists() { println!("global config already exists: {}", path.display()); return Ok(0); }
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|error| OcgError::io("cannot create config directory", error))?; }
+    if path.exists() {
+        println!("global config already exists: {}", path.display());
+        return Ok(0);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| OcgError::io("cannot create config directory", error))?;
+    }
     crate::profile::persist_new(path, &crate::profile::Profile::new())?;
     println!("created {}", path.display());
     Ok(0)
@@ -280,35 +391,92 @@ fn init_command(path: &Path) -> Result<i32, Failure> {
 
 fn validate_command(effective: &config::Effective) -> Result<i32, Failure> {
     let errors = validate::validate(effective);
-    if errors.is_empty() { println!("configuration is structurally valid"); Ok(0) } else { for error in errors { eprintln!("  - {error}"); } Ok(1) }
+    if errors.is_empty() {
+        println!("configuration is structurally valid");
+        Ok(0)
+    } else {
+        for error in errors {
+            eprintln!("  - {error}");
+        }
+        Ok(1)
+    }
 }
 
 fn auth_command(args: &[OsString]) -> Result<i32, Failure> {
     let vault = crate::vault::Vault::user_global()?;
-    let words: Vec<String> = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    let words: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     match words.as_slice() {
-        [action] if action == "list" => { for name in vault.list()? { println!("{name}"); } }
-        [action, name] if action == "set" => { let value = rpassword::prompt_password(format!("Credential for {name}: ")).map_err(|_| OcgError::config("cannot read credential input"))?; vault.set(name, &value)?; }
-        [action, name] if action == "remove" => { if vault.remove(name)? { println!("removed credential {name}"); } }
-        _ => return Err(Failure::Usage("usage: ocg auth list | set ENV_NAME | remove ENV_NAME".into())),
+        [action] if action == "list" => {
+            for name in vault.list()? {
+                println!("{name}");
+            }
+        }
+        [action, name] if action == "set" => {
+            let value = rpassword::prompt_password(format!("Credential for {name}: "))
+                .map_err(|_| OcgError::config("cannot read credential input"))?;
+            vault.set(name, &value)?;
+        }
+        [action, name] if action == "remove" => {
+            if vault.remove(name)? {
+                println!("removed credential {name}");
+            }
+        }
+        _ => {
+            return Err(Failure::Usage(
+                "usage: ocg auth list | set ENV_NAME | remove ENV_NAME".into(),
+            ))
+        }
     }
     Ok(0)
 }
 
-fn context_command(effective: &config::Effective, root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
+fn context_command(
+    effective: &config::Effective,
+    root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> Result<i32, Failure> {
     let context = ContextConfig::from_config(&effective.data)?;
-    if !context.enabled { println!("context engine is disabled"); return Ok(0); }
+    if !context.enabled {
+        println!("context engine is disabled");
+        return Ok(0);
+    }
     let git = crate::process::SystemGitHost;
     let clock = crate::clock::SystemClock;
     let engine = ContextEngine::new(root, context, &git, &clock);
-    let words: Vec<String> = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
-    if words.first().map(String::as_str) == Some("symbols") { return print_json(&json!({"symbols": engine.search_symbols(&words[1..].join(" "), 100)?}), pretty).map(|_| 0); }
+    let words: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if words.first().map(String::as_str) == Some("symbols") {
+        return print_json(
+            &json!({"symbols": engine.search_symbols(&words[1..].join(" "), 100)?}),
+            pretty,
+        )
+        .map(|_| 0);
+    }
     let outcome = engine.plan(&words.join(" "), None)?;
-    print_json(&serde_json::to_value(outcome.plan).map_err(|error| OcgError::config(format!("cannot serialize context plan: {error}")))?, pretty).map(|_| 0)
+    print_json(
+        &serde_json::to_value(outcome.plan)
+            .map_err(|error| OcgError::config(format!("cannot serialize context plan: {error}")))?,
+        pretty,
+    )
+    .map(|_| 0)
 }
 
-fn native_cache(effective: &config::Effective, root: &Path, args: &[OsString]) -> Result<i32, Failure> {
-    if args.len() > 1 { return Err(Failure::Usage("cache takes at most one action: stats or clean".into())); }
+fn native_cache(
+    effective: &config::Effective,
+    root: &Path,
+    args: &[OsString],
+) -> Result<i32, Failure> {
+    if args.len() > 1 {
+        return Err(Failure::Usage(
+            "cache takes at most one action: stats or clean".into(),
+        ));
+    }
     let context_config = ContextConfig::from_config(&effective.data)?;
     let git = crate::process::SystemGitHost;
     let clock = crate::clock::SystemClock;
@@ -317,18 +485,33 @@ fn native_cache(effective: &config::Effective, root: &Path, args: &[OsString]) -
         None => {
             let stats = engine.cache_stats();
             println!("context cache: {}", stats.dir);
-            println!("  entries: {} bytes: {} corrupt: {}", stats.entries, stats.bytes, stats.corrupt);
+            println!(
+                "  entries: {} bytes: {} corrupt: {}",
+                stats.entries, stats.bytes, stats.corrupt
+            );
         }
         Some(action) if action == "stats" => {
             let stats = engine.cache_stats();
             println!("context cache: {}", stats.dir);
-            println!("  entries: {} bytes: {} corrupt: {}", stats.entries, stats.bytes, stats.corrupt);
-            if let Some(index) = engine.load_index() { println!("index: {} files, {} symbols", index.metrics.files, index.metrics.symbols); }
-            else { println!("index: not built"); }
+            println!(
+                "  entries: {} bytes: {} corrupt: {}",
+                stats.entries, stats.bytes, stats.corrupt
+            );
+            if let Some(index) = engine.load_index() {
+                println!(
+                    "index: {} files, {} symbols",
+                    index.metrics.files, index.metrics.symbols
+                );
+            } else {
+                println!("index: not built");
+            }
         }
         Some(action) if action == "clean" => {
             let report = engine.cache_clean()?;
-            println!("removed {} entries ({} bytes) from {}", report.removed_entries, report.removed_bytes, report.dir);
+            println!(
+                "removed {} entries ({} bytes) from {}",
+                report.removed_entries, report.removed_bytes, report.dir
+            );
         }
         Some(action) => return Err(Failure::Usage(format!("unknown cache action: {action}"))),
     }
@@ -378,9 +561,31 @@ fn serve_command(
 }
 
 fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
-    let words: Vec<String> = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
-    let subcommand = words.first().ok_or_else(|| OcgError::config("ocg work requires a subcommand"))?;
-    let option = |name: &str| -> Option<String> { let flag = format!("--{name}"); let prefix = format!("{flag}="); words.windows(2).find_map(|pair| if pair[0] == flag { Some(pair[1].clone()) } else { None }).or_else(|| words.iter().find_map(|word| word.strip_prefix(&prefix).map(str::to_string))) };
+    let words: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let subcommand = words
+        .first()
+        .ok_or_else(|| OcgError::config("ocg work requires a subcommand"))?;
+    let option = |name: &str| -> Option<String> {
+        let flag = format!("--{name}");
+        let prefix = format!("{flag}=");
+        words
+            .windows(2)
+            .find_map(|pair| {
+                if pair[0] == flag {
+                    Some(pair[1].clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                words
+                    .iter()
+                    .find_map(|word| word.strip_prefix(&prefix).map(str::to_string))
+            })
+    };
     let mut repository = crate::orchestration::domain::DomainRepository::open(root)?;
     let project = repository.ensure_project(root)?;
     let required = |name: &str| -> Result<String, Failure> {
@@ -392,13 +597,22 @@ fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Fai
     };
     match subcommand.as_str() {
         "admit" | "create" => {
-            let binding = option("session").or_else(|| option("binding")).unwrap_or_else(|| "cli".into());
+            let binding = option("session")
+                .or_else(|| option("binding"))
+                .unwrap_or_else(|| "cli".into());
             let spec = crate::orchestration::domain::JobSpec {
                 objective: Some(option("objective").unwrap_or_default()),
                 ..Default::default()
             };
-            let admission = repository.admit_job(project, &binding, spec, &option("agent").unwrap_or_else(|| "lead".into()))?;
-            print(json!({"project_id": admission.project.id, "job_id": admission.job.id, "attempt_id": admission.attempt.id, "executor_id": admission.executor.id, "generation": admission.attempt.generation}))
+            let admission = repository.admit_job(
+                project,
+                &binding,
+                spec,
+                &option("agent").unwrap_or_else(|| "lead".into()),
+            )?;
+            print(
+                json!({"project_id": admission.project.id, "job_id": admission.job.id, "attempt_id": admission.attempt.id, "executor_id": admission.executor.id, "generation": admission.attempt.generation}),
+            )
         }
         "spawn" => {
             let parent = crate::orchestration::domain::AttemptAuthority {
@@ -446,58 +660,101 @@ fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Fai
         }
         "plan" | "child" => {
             let session = required("session")?;
-            let parent = repository.authority_for_binding(&project.id, &session)?.ok_or_else(|| Failure::Ocg(OcgError::config("session has no canonical authority")))?;
+            let parent = repository
+                .authority_for_binding(&project.id, &session)?
+                .ok_or_else(|| {
+                    Failure::Ocg(OcgError::config("session has no canonical authority"))
+                })?;
             let spec = crate::orchestration::domain::JobSpec {
                 objective: Some(option("objective").unwrap_or_default()),
                 ..Default::default()
             };
-            let dependencies = option("depends-on").map(|raw| raw.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
-            let dependency_refs = dependencies.iter().map(|value| value.as_str()).collect::<Vec<_>>();
+            let dependencies = option("depends-on")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let dependency_refs = dependencies
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>();
             let job = repository.create_child_job(&parent, spec, &dependency_refs)?;
             print(json!({"project_id": job.project_id, "job_id": job.id, "job": job}))
         }
         "dispatch" => {
             let job_id = required("job")?;
-            let (attempt, executor) = repository.dispatch_job(&job_id, &option("agent").unwrap_or_else(|| "worker".into()))?;
-            print(json!({"job_id": job_id, "attempt_id": attempt.id, "executor_id": executor.id, "generation": attempt.generation}))
+            let (attempt, executor) = repository
+                .dispatch_job(&job_id, &option("agent").unwrap_or_else(|| "worker".into()))?;
+            print(
+                json!({"job_id": job_id, "attempt_id": attempt.id, "executor_id": executor.id, "generation": attempt.generation}),
+            )
         }
         "replace" => {
             let job_id = required("job")?;
-            let admission = repository.replace_attempt_checked(&job_id, &option("agent").unwrap_or_else(|| "worker".into()), Some(&required("attempt")?))?;
-            print(json!({"job_id": admission.job.id, "attempt_id": admission.attempt.id, "executor_id": admission.executor.id, "generation": admission.attempt.generation}))
+            let admission = repository.replace_attempt_checked(
+                &job_id,
+                &option("agent").unwrap_or_else(|| "worker".into()),
+                Some(&required("attempt")?),
+            )?;
+            print(
+                json!({"job_id": admission.job.id, "attempt_id": admission.attempt.id, "executor_id": admission.executor.id, "generation": admission.attempt.generation}),
+            )
         }
         "finish" | "deliver" => {
             let attempt_id = required("attempt")?;
             let outcome = option("outcome").unwrap_or_else(|| "completed".into());
-            if !matches!(outcome.as_str(), "completed" | "failed") { return Err(Failure::Usage("outcome must be completed or failed; cancellation requires confirmed stop".into())); }
+            if !matches!(outcome.as_str(), "completed" | "failed") {
+                return Err(Failure::Usage(
+                    "outcome must be completed or failed; cancellation requires confirmed stop"
+                        .into(),
+                ));
+            }
             if let Some(call_id) = option("call") {
-                let generation = required("generation")?.parse::<u64>().map_err(|_| Failure::Usage("--generation must be an integer".into()))?;
+                let generation = required("generation")?
+                    .parse::<u64>()
+                    .map_err(|_| Failure::Usage("--generation must be an integer".into()))?;
                 let result = option("result").unwrap_or_else(|| "null".into());
                 let witness = repository.witness_for_call(&call_id, &attempt_id, generation)?;
-                let disposition = repository.deliver_result(&witness, &result, outcome == "completed")?;
-                print(json!({"attempt_id": attempt_id, "call_id": call_id, "disposition": disposition, "applied": disposition == "authoritative"}))
+                let disposition =
+                    repository.deliver_result(&witness, &result, outcome == "completed")?;
+                print(
+                    json!({"attempt_id": attempt_id, "call_id": call_id, "disposition": disposition, "applied": disposition == "authoritative"}),
+                )
             } else if subcommand == "deliver" {
-                Err(Failure::Usage("deliver requires --call and --generation".into()))
+                Err(Failure::Usage(
+                    "deliver requires --call and --generation".into(),
+                ))
             } else {
                 repository.finish_attempt(&attempt_id, outcome == "completed")?;
                 print(json!({"attempt_id": attempt_id, "outcome": outcome, "applied": true}))
             }
         }
         "inspect" => print(repository.inspect_job(&required("job")?)?),
-        "ready" => print(json!({"project_id": project.id, "ready": repository.ready_jobs(&project.id)?})),
+        "ready" => {
+            print(json!({"project_id": project.id, "ready": repository.ready_jobs(&project.id)?}))
+        }
         "recover" | "reconcile" => print(repository.reconcile_dispatches()?),
         "status" => print(json!({"project": project, "jobs": repository.jobs(&project.id)?})),
         "set-config" => {
             let job_id = required("job")?;
-            let value: Value = serde_json::from_str(&required("json")?).map_err(|error| Failure::Usage(error.to_string()))?;
+            let value: Value = serde_json::from_str(&required("json")?)
+                .map_err(|error| Failure::Usage(error.to_string()))?;
             let revision = repository.set_job_configuration(&job_id, &value)?;
             print(json!({"job_id": job_id, "revision": revision, "configuration": value}))
         }
         "config" => {
             let job_id = required("job")?;
-            print(json!({"job_id": job_id, "configuration": repository.job_configuration(&job_id)?}))
+            print(
+                json!({"job_id": job_id, "configuration": repository.job_configuration(&job_id)?}),
+            )
         }
-        _ => Err(Failure::Usage(format!("unknown canonical work subcommand: {subcommand}"))),
+        _ => Err(Failure::Usage(format!(
+            "unknown canonical work subcommand: {subcommand}"
+        ))),
     }
 }
 
@@ -688,43 +945,140 @@ fn health_command(
     }
 }
 
-fn native_stats(effective: &config::Effective, root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
-    if !args.is_empty() { return Err(Failure::Usage("stats takes no arguments".into())); }
-    let telemetry_config = crate::telemetry::TelemetryConfig::from_config(&effective.data).unwrap_or_else(|_| crate::telemetry::TelemetryConfig::disabled());
-    let stats = crate::telemetry::TelemetryStats::collect(&crate::telemetry::TelemetryStore::new(root, telemetry_config));
-    if pretty { let value = serde_json::to_value(stats).map_err(|error| OcgError::config(format!("cannot serialize telemetry stats: {error}")))?; print_json(&value, true)?; } else { print!("{}", stats.render()); }
+fn native_stats(
+    effective: &config::Effective,
+    root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> Result<i32, Failure> {
+    if !args.is_empty() {
+        return Err(Failure::Usage("stats takes no arguments".into()));
+    }
+    let telemetry_config = crate::telemetry::TelemetryConfig::from_config(&effective.data)
+        .unwrap_or_else(|_| crate::telemetry::TelemetryConfig::disabled());
+    let stats = crate::telemetry::TelemetryStats::collect(&crate::telemetry::TelemetryStore::new(
+        root,
+        telemetry_config,
+    ));
+    if pretty {
+        let value = serde_json::to_value(stats).map_err(|error| {
+            OcgError::config(format!("cannot serialize telemetry stats: {error}"))
+        })?;
+        print_json(&value, true)?;
+    } else {
+        print!("{}", stats.render());
+    }
     Ok(0)
 }
-fn native_verify(effective: &config::Effective, root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
-    if args.len() > 1 { return Err(Failure::Usage("verify takes at most one stage (fast, normal or full)".into())); }
+fn native_verify(
+    effective: &config::Effective,
+    root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> Result<i32, Failure> {
+    if args.len() > 1 {
+        return Err(Failure::Usage(
+            "verify takes at most one stage (fast, normal or full)".into(),
+        ));
+    }
     let verify_config = crate::verification::Config::from_config(&effective.data)?;
-    let stage = args.first().map(|value| value.to_string_lossy().into_owned()).unwrap_or_else(|| verify_config.default_stage.clone());
+    let stage = args
+        .first()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| verify_config.default_stage.clone());
     verify_config.stage(&stage)?;
     let clock = crate::clock::SystemClock;
     let runner = crate::process::SystemCaptureRunner;
-    let report = crate::verification::runner::execute(&crate::verification::runner::VerifyRequest { root, config: &verify_config, stage, runner: &runner, clock: &clock, test_proposal: None })?;
-    if pretty { let value = serde_json::to_value(&report).map_err(|error| OcgError::config(format!("cannot serialize verification report: {error}")))?; print_json(&value, true)?; }
-    else { println!("verification stage: {} ({})", report.stage, report.overall().as_str()); for result in &report.results { println!("  [{}] {} ({})", if result.success { "ok" } else { "fail" }, result.display(), result.duration_ms); // A failing command's feedback is what the stage exists to report; for a
-            // Rust compile this is the structured diagnostic delta, which is
-            // already bounded and is not the re-sent compiler output. Print
-            // indented so it reads as belonging to the command above it.
-            if !result.success { for line in result.output.render().lines() { println!("      {line}"); } } } for note in &report.notes { println!("note: {note}"); } }
+    let report =
+        crate::verification::runner::execute(&crate::verification::runner::VerifyRequest {
+            root,
+            config: &verify_config,
+            stage,
+            runner: &runner,
+            clock: &clock,
+            test_proposal: None,
+        })?;
+    if pretty {
+        let value = serde_json::to_value(&report).map_err(|error| {
+            OcgError::config(format!("cannot serialize verification report: {error}"))
+        })?;
+        print_json(&value, true)?;
+    } else {
+        println!(
+            "verification stage: {} ({})",
+            report.stage,
+            report.overall().as_str()
+        );
+        for result in &report.results {
+            println!(
+                "  [{}] {} ({})",
+                if result.success { "ok" } else { "fail" },
+                result.display(),
+                result.duration_ms
+            ); // A failing command's feedback is what the stage exists to report; for a
+               // Rust compile this is the structured diagnostic delta, which is
+               // already bounded and is not the re-sent compiler output. Print
+               // indented so it reads as belonging to the command above it.
+            if !result.success {
+                for line in result.output.render().lines() {
+                    println!("      {line}");
+                }
+            }
+        }
+        for note in &report.notes {
+            println!("note: {note}");
+        }
+    }
     Ok(if report.failed() { 1 } else { 0 })
 }
-fn native_tools(effective: &config::Effective, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
-    let task = args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" ").trim().to_string();
-    if task.is_empty() { return Err(Failure::Usage("tools needs a task description".into())); }
+fn native_tools(
+    effective: &config::Effective,
+    args: &[OsString],
+    pretty: bool,
+) -> Result<i32, Failure> {
+    let task = args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if task.is_empty() {
+        return Err(Failure::Usage("tools needs a task description".into()));
+    }
     let capabilities = crate::capabilities::CapabilityConfig::from_config(&effective.data)?;
-    let plan = crate::capabilities::CapabilityPlan::plan_config(&task, &crate::capabilities::CapabilityEvidence::default(), &capabilities.custom, capabilities.enabled);
-    if pretty { let value = serde_json::to_value(plan).map_err(|error| OcgError::config(format!("cannot serialize capability plan: {error}")))?; print_json(&value, true)?; } else { print!("{}", plan.render()); }
+    let plan = crate::capabilities::CapabilityPlan::plan_config(
+        &task,
+        &crate::capabilities::CapabilityEvidence::default(),
+        &capabilities.custom,
+        capabilities.enabled,
+    );
+    if pretty {
+        let value = serde_json::to_value(plan).map_err(|error| {
+            OcgError::config(format!("cannot serialize capability plan: {error}"))
+        })?;
+        print_json(&value, true)?;
+    } else {
+        print!("{}", plan.render());
+    }
     Ok(0)
 }
-fn native_checkpoint(effective: &config::Effective, root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
-    let words = args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+fn native_checkpoint(
+    effective: &config::Effective,
+    root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> Result<i32, Failure> {
+    let words = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     let git = crate::process::SystemGitHost;
     match words.first().map(String::as_str) {
         None | Some("list") => {
-            if words.len() > 1 { return Err(Failure::Usage("checkpoint list takes no arguments".into())); }
+            if words.len() > 1 {
+                return Err(Failure::Usage("checkpoint list takes no arguments".into()));
+            }
             let (items, corrupt) = crate::orchestration::checkpoint::list(root);
             let value = json!({"checkpoints": items, "corrupt": corrupt});
             print_json(&value, pretty)?;
@@ -741,37 +1095,111 @@ fn native_checkpoint(effective: &config::Effective, root: &Path, args: &[OsStrin
             let mut index = 1;
             while index < words.len() {
                 match words[index].as_str() {
-                    "--phase" => { index += 1; phase = words.get(index).and_then(|value| Phase::parse(value)); if phase.is_none() { return Err(Failure::Usage("checkpoint save needs a valid --phase".into())); } }
-                    "--task" => { index += 1; task = words.get(index).cloned().ok_or_else(|| Failure::Usage("--task needs a value".into()))?; }
-                    "--decision" => { index += 1; decisions.push(words.get(index).cloned().ok_or_else(|| Failure::Usage("--decision needs a value".into()))?); }
-                    other => return Err(Failure::Usage(format!("unknown checkpoint save option: {other}"))),
+                    "--phase" => {
+                        index += 1;
+                        phase = words.get(index).and_then(|value| Phase::parse(value));
+                        if phase.is_none() {
+                            return Err(Failure::Usage(
+                                "checkpoint save needs a valid --phase".into(),
+                            ));
+                        }
+                    }
+                    "--task" => {
+                        index += 1;
+                        task = words
+                            .get(index)
+                            .cloned()
+                            .ok_or_else(|| Failure::Usage("--task needs a value".into()))?;
+                    }
+                    "--decision" => {
+                        index += 1;
+                        decisions.push(
+                            words
+                                .get(index)
+                                .cloned()
+                                .ok_or_else(|| Failure::Usage("--decision needs a value".into()))?,
+                        );
+                    }
+                    other => {
+                        return Err(Failure::Usage(format!(
+                            "unknown checkpoint save option: {other}"
+                        )))
+                    }
                 }
                 index += 1;
             }
-            let phase = phase.ok_or_else(|| Failure::Usage("checkpoint save needs --phase".into()))?;
+            let phase =
+                phase.ok_or_else(|| Failure::Usage("checkpoint save needs --phase".into()))?;
             let snapshot = crate::context::gitdiff::GitSnapshot::collect(root, &git);
             let fingerprint = crate::context::gitdiff::snapshot_fingerprint(&snapshot);
             let capsule = crate::context::capsule::TaskCapsule::new(&task);
-            let decisions = decisions.into_iter().map(|decision| crate::context::capsule::Decision { decision, rationale: None, date: None, date_unknown: true }).collect();
-            let checkpoint = crate::orchestration::checkpoint::Checkpoint::build(phase, capsule, snapshot.state, fingerprint, None, crate::context::freshness::Provenance::default(), decisions, crate::clock::SystemClock.now_unix());
+            let decisions = decisions
+                .into_iter()
+                .map(|decision| crate::context::capsule::Decision {
+                    decision,
+                    rationale: None,
+                    date: None,
+                    date_unknown: true,
+                })
+                .collect();
+            let checkpoint = crate::orchestration::checkpoint::Checkpoint::build(
+                phase,
+                capsule,
+                snapshot.state,
+                fingerprint,
+                None,
+                crate::context::freshness::Provenance::default(),
+                decisions,
+                crate::clock::SystemClock.now_unix(),
+            );
             let path = checkpoint.save(root)?;
             print_json(&json!({"id": checkpoint.id, "path": path}), pretty)?;
         }
-        Some(other) => return Err(Failure::Usage(format!("unknown checkpoint action: {other}"))),
+        Some(other) => {
+            return Err(Failure::Usage(format!(
+                "unknown checkpoint action: {other}"
+            )))
+        }
     }
     let _ = effective;
     Ok(0)
 }
-fn native_resources(root: &Path, _args: &[OsString], pretty: bool) -> Result<i32, Failure> { let loaded = crate::resources::load(root); print_json(&json!({"exists": loaded.exists, "corrupt": loaded.corrupt, "count": loaded.registry.list().len()}), pretty).map(|_| 0) }
-fn native_budget(effective: &config::Effective, root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
+fn native_resources(root: &Path, _args: &[OsString], pretty: bool) -> Result<i32, Failure> {
+    let loaded = crate::resources::load(root);
+    print_json(&json!({"exists": loaded.exists, "corrupt": loaded.corrupt, "count": loaded.registry.list().len()}), pretty).map(|_| 0)
+}
+fn native_budget(
+    effective: &config::Effective,
+    root: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> Result<i32, Failure> {
     let mut repository = crate::orchestration::domain::DomainRepository::open(root)?;
     let project = repository.ensure_project(root)?;
     if args.first().is_some_and(|arg| arg == "set") {
-        let value = |name: &str| -> Option<String> { let flag = format!("--{name}"); args.iter().enumerate().find_map(|(index, arg)| { let word = arg.to_string_lossy(); if word == flag { args.get(index + 1).map(|next| next.to_string_lossy().into_owned()) } else { word.strip_prefix(&format!("{flag}=")).map(str::to_string) } }) };
+        let value = |name: &str| -> Option<String> {
+            let flag = format!("--{name}");
+            args.iter().enumerate().find_map(|(index, arg)| {
+                let word = arg.to_string_lossy();
+                if word == flag {
+                    args.get(index + 1)
+                        .map(|next| next.to_string_lossy().into_owned())
+                } else {
+                    word.strip_prefix(&format!("{flag}=")).map(str::to_string)
+                }
+            })
+        };
         let project_id = value("project-id").unwrap_or_else(|| project.id.clone());
-        let limit = value("limit").ok_or_else(|| Failure::Usage("--limit is required".into()))?.parse::<i64>().map_err(|_| Failure::Usage("--limit must be an integer".into()))?;
-        let currency = value("currency").ok_or_else(|| Failure::Usage("--currency is required".into()))?;
-        repository.set_project_budget(&project_id, crate::orchestration::budget::Money::new(limit, currency))?;
+        let limit = value("limit")
+            .ok_or_else(|| Failure::Usage("--limit is required".into()))?
+            .parse::<i64>()
+            .map_err(|_| Failure::Usage("--limit must be an integer".into()))?;
+        let currency =
+            value("currency").ok_or_else(|| Failure::Usage("--currency is required".into()))?;
+        repository.set_project_budget(
+            &project_id,
+            crate::orchestration::budget::Money::new(limit, currency),
+        )?;
     }
     let config = crate::orchestration::budget::BudgetConfig::from_config(&effective.data)?;
     let budget = repository.project_budget(&project.id)?;
@@ -779,19 +1207,64 @@ fn native_budget(effective: &config::Effective, root: &Path, args: &[OsString], 
     print_json(&value, pretty)?;
     Ok(0)
 }
-fn doctor_command(effective: &config::Effective, root: &Path) -> Result<i32, Failure> { let errors = validate::validate(effective); println!("OCG {VERSION}"); println!("project: {}", root.display()); println!("configuration: {}", if errors.is_empty() { "valid" } else { "invalid" }); Ok(if errors.is_empty() { 0 } else { 1 }) }
+fn doctor_command(effective: &config::Effective, root: &Path) -> Result<i32, Failure> {
+    let errors = validate::validate(effective);
+    println!("OCG {VERSION}");
+    println!("project: {}", root.display());
+    println!(
+        "configuration: {}",
+        if errors.is_empty() {
+            "valid"
+        } else {
+            "invalid"
+        }
+    );
+    Ok(if errors.is_empty() { 0 } else { 1 })
+}
 
-fn native_config(args: &[OsString], user_path: &Path, project_root: &Path, env: &Env) -> Result<i32, Failure> {
+fn native_config(
+    args: &[OsString],
+    user_path: &Path,
+    project_root: &Path,
+    env: &Env,
+) -> Result<i32, Failure> {
     let request = crate::config_command::parse_request(args)?;
     let defaults = load_defaults(&OcgSource::Embedded)?;
-    let current = config::build_effective(defaults.clone(), None, project_root, user_path, user_path, env.home_dir.clone())?;
-    let context = crate::config_command::Context { defaults, ocg_home: None, project_root: project_root.to_path_buf(), invocation_dir: project_root.to_path_buf(), user_path: user_path.to_path_buf(), project_path: user_path.to_path_buf(), env, level: String::new(), current };
+    let current = config::build_effective(
+        defaults.clone(),
+        None,
+        project_root,
+        user_path,
+        user_path,
+        env.home_dir.clone(),
+    )?;
+    let context = crate::config_command::Context {
+        defaults,
+        ocg_home: None,
+        project_root: project_root.to_path_buf(),
+        invocation_dir: project_root.to_path_buf(),
+        user_path: user_path.to_path_buf(),
+        project_path: user_path.to_path_buf(),
+        env,
+        level: String::new(),
+        current,
+    };
     let probe = |_effective: &config::Effective, _level: &str| {};
     let activate = |_effective: &config::Effective, _level: &str| {};
     let mut input = std::io::BufReader::new(std::io::stdin());
     let mut output = std::io::stdout();
-    crate::config_command::execute(&request, &context, &probe, &activate, &mut input, &mut output).map_err(Failure::Ocg)
+    crate::config_command::execute(
+        &request,
+        &context,
+        &probe,
+        &activate,
+        &mut input,
+        &mut output,
+    )
+    .map_err(Failure::Ocg)
 }
 
 #[allow(dead_code)]
-fn _phase_name(phase: Phase) -> &'static str { phase.as_str() }
+fn _phase_name(phase: Phase) -> &'static str {
+    phase.as_str()
+}

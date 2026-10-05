@@ -958,7 +958,9 @@ impl CanonicalProviderCallHandler {
         // still structured when the diagnostic message is not. Nothing else
         // observes the decorator, so ordinary Jobs are unaffected.
         let probe_outcome = probe.as_ref().map(|_| {
-            crate::orchestration::health_probe::ProbeOutcomeTransport::new(&transport as &dyn HttpTransport)
+            crate::orchestration::health_probe::ProbeOutcomeTransport::new(
+                &transport as &dyn HttpTransport,
+            )
         });
         let provider_transport: &dyn HttpTransport = match &probe_outcome {
             Some(decorated) => decorated,

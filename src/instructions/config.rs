@@ -87,7 +87,10 @@ impl Default for InstructionsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            filenames: DEFAULT_FILENAMES.iter().map(|name| name.to_string()).collect(),
+            filenames: DEFAULT_FILENAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
             user_level: true,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,

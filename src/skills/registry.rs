@@ -226,8 +226,16 @@ pub fn discover(
     }
     if policy.project_skills {
         if let Some(root) = project_root {
-            let dir = root.join(crate::project::MARKER).join(config::PROJECT_SKILL_DIR);
-            scan(&dir, SkillSource::ProjectLocal, Some(root), policy, &mut registry);
+            let dir = root
+                .join(crate::project::MARKER)
+                .join(config::PROJECT_SKILL_DIR);
+            scan(
+                &dir,
+                SkillSource::ProjectLocal,
+                Some(root),
+                policy,
+                &mut registry,
+            );
         }
     }
     for relative in &policy.paths {
@@ -238,7 +246,8 @@ pub fn discover(
         let Some(root) = project_root else {
             registry.reject(SkillRejection {
                 path: relative.clone(),
-                reason: "a configured skill path needs a project root to be relative to".to_string(),
+                reason: "a configured skill path needs a project root to be relative to"
+                    .to_string(),
             });
             continue;
         };
@@ -332,7 +341,7 @@ pub fn resolve_named<'a>(
                 crate::error::OcgError::config(format!("no skill is registered at {name}"))
             });
     }
-    registry.get(name).ok_or_else(|| {
-        crate::error::OcgError::config(format!("no skill is named '{name}'"))
-    })
+    registry
+        .get(name)
+        .ok_or_else(|| crate::error::OcgError::config(format!("no skill is named '{name}'")))
 }

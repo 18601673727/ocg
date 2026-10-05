@@ -174,8 +174,9 @@ impl SkillDefinition {
     pub fn is_inside(&self, root: &Path) -> bool {
         match &self.base_dir {
             None => false,
-            Some(base) => crate::project::canonicalize(base)
-                .starts_with(crate::project::canonicalize(root)),
+            Some(base) => {
+                crate::project::canonicalize(base).starts_with(crate::project::canonicalize(root))
+            }
         }
     }
 
@@ -202,18 +203,23 @@ pub fn split_frontmatter(text: &str) -> Option<(String, String)> {
     let rest = text.strip_prefix("---")?;
     // The opening delimiter must be a line of its own, otherwise a body that
     // merely begins with a dash-dash-dash would be misread as frontmatter.
-    let rest = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n"))?;
-    let end = rest.find("\n---").map(|index| (index, 4)).or_else(|| {
-        rest.find("\r\n---")
-            .map(|index| (index, 5))
-    })?;
+    let rest = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))?;
+    let end = rest
+        .find("\n---")
+        .map(|index| (index, 4))
+        .or_else(|| rest.find("\r\n---").map(|index| (index, 5)))?;
     let (front, remainder) = rest.split_at(end.0);
     let after = &remainder[end.1..];
     let body = after
         .strip_prefix('\n')
         .or_else(|| after.strip_prefix("\r\n"))
         .unwrap_or(after);
-    Some((front.to_string(), body.trim_start_matches(['\r', '\n']).to_string()))
+    Some((
+        front.to_string(),
+        body.trim_start_matches(['\r', '\n']).to_string(),
+    ))
 }
 
 /// Read the frontmatter fields OCG understands.
@@ -222,7 +228,8 @@ pub fn split_frontmatter(text: &str) -> Option<(String, String)> {
 /// richer specification must still load here, and a field OCG cannot interpret
 /// cannot change what OCG does.
 pub fn parse_metadata(front: &str) -> SkillMetadata {
-    let value: serde_json::Value = serde_yaml_ng::from_str(front).unwrap_or(serde_json::Value::Null);
+    let value: serde_json::Value =
+        serde_yaml_ng::from_str(front).unwrap_or(serde_json::Value::Null);
     let object = match value.as_object() {
         Some(object) => object,
         None => {
@@ -237,7 +244,10 @@ pub fn parse_metadata(front: &str) -> SkillMetadata {
     };
     let mut extra = std::collections::BTreeMap::new();
     for (key, entry) in object {
-        if matches!(key.as_str(), "name" | "description" | "required-tools" | "requiredTools") {
+        if matches!(
+            key.as_str(),
+            "name" | "description" | "required-tools" | "requiredTools"
+        ) {
             continue;
         }
         if let Some(text) = entry.as_str() {
@@ -310,7 +320,8 @@ pub fn load(
     };
     let base_dir = manifest.parent().unwrap_or(manifest).to_path_buf();
     if let Some(root) = boundary_root {
-        if !crate::project::canonicalize(&base_dir).starts_with(crate::project::canonicalize(root)) {
+        if !crate::project::canonicalize(&base_dir).starts_with(crate::project::canonicalize(root))
+        {
             return Err(reject(
                 manifest,
                 "the package directory resolves outside the project root".to_string(),
@@ -326,17 +337,15 @@ pub fn load(
         ));
     };
     let mut metadata = parse_metadata(&front);
-    config::validate_name(&metadata.name)
-        .map_err(|error| reject(manifest, strip_prefix(error)))?;
+    config::validate_name(&metadata.name).map_err(|error| reject(manifest, strip_prefix(error)))?;
     config::validate_description(&metadata.description)
         .map_err(|error| reject(manifest, strip_prefix(error)))?;
     if policy.require_directory_name {
         if let Some(directory) = base_dir.file_name().and_then(|name| name.to_str()) {
             if directory != metadata.name {
-                metadata.extra.insert(
-                    "directoryNameMismatch".to_string(),
-                    directory.to_string(),
-                );
+                metadata
+                    .extra
+                    .insert("directoryNameMismatch".to_string(), directory.to_string());
                 return Err(reject(
                     manifest,
                     format!(
@@ -396,7 +405,9 @@ fn collect(base: &Path, directory: &Path, limit: usize, out: &mut Vec<SkillResou
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
-    let mut names: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect();
+    let mut names: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
     names.sort();
     for path in names {
         if out.len() >= limit {

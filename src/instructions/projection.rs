@@ -180,7 +180,11 @@ impl InstructionDiff {
     }
 
     /// The message to append, if any.
-    pub fn to_message(&self, projection: &InstructionProjection, role: InstructionRole) -> Option<Value> {
+    pub fn to_message(
+        &self,
+        projection: &InstructionProjection,
+        role: InstructionRole,
+    ) -> Option<Value> {
         match self.action {
             InstructionAction::Unchanged => None,
             InstructionAction::Remove => Some(InstructionProjection::removal_message(role)),

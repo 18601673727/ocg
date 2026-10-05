@@ -236,7 +236,10 @@ impl<'a> Context<'a> {
     /// summary follows it as the model-visible account of the work. The tail is
     /// last, unchanged, so the most recent exchange is still the most recent
     /// thing in the request.
-    fn project(&self, point: Option<&CompactionPoint>) -> Result<(Vec<serde_json::Value>, ReductionReport)> {
+    fn project(
+        &self,
+        point: Option<&CompactionPoint>,
+    ) -> Result<(Vec<serde_json::Value>, ReductionReport)> {
         let refs = self.canonical.references();
         let mut messages = vec![self.canonical.to_message()];
         // Reduction must never rewrite the two messages this module constructed:
@@ -250,12 +253,8 @@ impl<'a> Context<'a> {
         } else {
             messages.extend(self.history.messages.iter().cloned());
         }
-        let (reduced, report) = reduce_within(
-            &messages,
-            &self.config.reduce,
-            &refs,
-            protected_prefix,
-        )?;
+        let (reduced, report) =
+            reduce_within(&messages, &self.config.reduce, &refs, protected_prefix)?;
         Ok((reduced, report))
     }
 
@@ -299,11 +298,7 @@ impl<'a> Context<'a> {
             overflow,
         });
         let request = CompactionPoint {
-            id: compaction_id(
-                self.history.len(),
-                tail_start,
-                &self.config.fingerprint(),
-            ),
+            id: compaction_id(self.history.len(), tail_start, &self.config.fingerprint()),
             summary: String::new(),
             through: tail_start,
             tail_start,

@@ -153,7 +153,8 @@ impl CommandSpec {
 }
 
 /// Cargo subcommands whose output is compiler diagnostics.
-const CARGO_DIAGNOSTIC_SUBCOMMANDS: [&str; 6] = ["check", "build", "clippy", "test", "bench", "rustc"];
+const CARGO_DIAGNOSTIC_SUBCOMMANDS: [&str; 6] =
+    ["check", "build", "clippy", "test", "bench", "rustc"];
 
 /// Whether this command is a cargo invocation that emits compiler diagnostics.
 ///

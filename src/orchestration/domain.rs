@@ -1729,9 +1729,9 @@ impl DomainRepository {
             .filter(|reservation| reservation.state != budget::ReservationState::Released)
             .map(|reservation| reservation.reservation_id.clone());
         if existing.is_none()
-            && before.as_ref().is_some_and(|intent| {
-                !matches!(intent.state.as_str(), "pending" | "queued")
-            })
+            && before
+                .as_ref()
+                .is_some_and(|intent| !matches!(intent.state.as_str(), "pending" | "queued"))
         {
             return Err(invalid("dispatch intent is no longer budget-admittable"));
         }
@@ -2770,8 +2770,8 @@ impl DomainRepository {
         if !prerequisite_job_ids.is_empty() {
             refresh_job_readiness_in(&transaction, &job.id, Some(root))?;
         }
-        let job = read_job(&transaction, &job.id)?
-            .ok_or_else(|| invalid("created Job disappeared"))?;
+        let job =
+            read_job(&transaction, &job.id)?.ok_or_else(|| invalid("created Job disappeared"))?;
         transaction.commit().map_err(sql)?;
         Ok(job)
     }
@@ -4484,7 +4484,9 @@ impl DomainRepository {
                 }
             }
         }
-        let failure_response = tool_response.or(provider_response.as_deref()).unwrap_or(failure);
+        let failure_response = tool_response
+            .or(provider_response.as_deref())
+            .unwrap_or(failure);
         let changed = transaction
             .execute(
                 "UPDATE domain_calls SET state='failed',response=?2,finished_at=?3 WHERE id=?1 AND state IN ('created','running')",

@@ -64,13 +64,9 @@ pub enum ArgumentDefect {
     /// The field is not declared by the tool schema.
     Unexpected,
     /// The field is present but has the wrong type.
-    WrongType {
-        expected: String,
-    },
+    WrongType { expected: String },
     /// The field is present, correctly typed, and violates a schema constraint.
-    Constraint {
-        constraint: String,
-    },
+    Constraint { constraint: String },
 }
 
 impl ArgumentDefect {
@@ -103,7 +99,12 @@ impl FieldIssue {
     fn describe(&self) -> String {
         match &self.observed {
             Some(observed) => {
-                format!("{} ({}, saw {})", self.field, self.defect.detail(), observed)
+                format!(
+                    "{} ({}, saw {})",
+                    self.field,
+                    self.defect.detail(),
+                    observed
+                )
             }
             None => format!("{} ({})", self.field, self.defect.detail()),
         }
@@ -157,10 +158,7 @@ pub enum CallFailure {
         candidates: Vec<String>,
     },
     /// The arguments were not a JSON object, so no schema applies to them.
-    MalformedArguments {
-        tool: String,
-        reason: String,
-    },
+    MalformedArguments { tool: String, reason: String },
     /// The arguments are an object but violate the tool schema.
     InvalidArguments(InvalidArguments),
 }
@@ -204,9 +202,7 @@ impl CallFailure {
         let mut lines = vec![format!("Call failed: {}", self.kind())];
         lines.push(format!("tool: {}", self.tool()));
         match self {
-            Self::UnknownTool {
-                candidates, ..
-            } => {
+            Self::UnknownTool { candidates, .. } => {
                 if !candidates.is_empty() {
                     lines.push(format!("candidates: {}", joined(candidates)));
                 } else {
@@ -227,7 +223,11 @@ impl CallFailure {
                     if issues.is_empty() {
                         continue;
                     }
-                    let names: Vec<String> = issues.iter().take(MAX_LISTED_FIELDS).map(FieldIssue::describe).collect();
+                    let names: Vec<String> = issues
+                        .iter()
+                        .take(MAX_LISTED_FIELDS)
+                        .map(FieldIssue::describe)
+                        .collect();
                     let overflow = issues.len().saturating_sub(MAX_LISTED_FIELDS);
                     lines.push(format!(
                         "{label}: {}{}",
@@ -430,9 +430,7 @@ impl TargetBindings {
                 continue;
             }
             let already = bindings.iter().any(|binding: &TargetBinding| {
-                binding.tool == definition.name
-                    && binding.field == field
-                    && binding.value == value
+                binding.tool == definition.name && binding.field == field && binding.value == value
             });
             if !already {
                 bindings.push(TargetBinding {
@@ -500,7 +498,10 @@ pub fn tool_candidates(requested: &str) -> Vec<String> {
         .into_iter()
         .filter(|tool| {
             normalize(tool.name).contains(&normalized)
-                || tool.aliases.iter().any(|alias| normalize(alias) == normalized)
+                || tool
+                    .aliases
+                    .iter()
+                    .any(|alias| normalize(alias) == normalized)
         })
         .map(|tool| tool.name.to_string())
         .collect()
@@ -511,7 +512,10 @@ pub fn tool_candidates(requested: &str) -> Vec<String> {
 /// Returns `None` when the arguments are dispatchable. The failure it returns
 /// is classified, and no offending value larger than [`OBSERVED_VALUE_CAP`]
 /// survives classification.
-pub fn preflight(definition: &NativeToolDefinition, arguments: &Value) -> Result<Option<CallFailure>> {
+pub fn preflight(
+    definition: &NativeToolDefinition,
+    arguments: &Value,
+) -> Result<Option<CallFailure>> {
     if arguments.as_object().is_none() {
         return Ok(Some(CallFailure::MalformedArguments {
             tool: definition.name.to_string(),
@@ -529,8 +533,7 @@ pub fn preflight(definition: &NativeToolDefinition, arguments: &Value) -> Result
     // Every error is collected, not just the first: a Call missing `file` and
     // carrying a wrongly-typed `offset` should cost one observation, not two
     // round trips that each reveal one more field.
-    let errors: Vec<jsonschema::ValidationError<'_>> =
-        validator.iter_errors(arguments).collect();
+    let errors: Vec<jsonschema::ValidationError<'_>> = validator.iter_errors(arguments).collect();
     if errors.is_empty() {
         return Ok(None);
     }
@@ -541,10 +544,7 @@ pub fn preflight(definition: &NativeToolDefinition, arguments: &Value) -> Result
 }
 
 /// Group schema errors into the three things a caller could do about them.
-fn classify(
-    tool: &str,
-    errors: &[jsonschema::ValidationError<'_>],
-) -> InvalidArguments {
+fn classify(tool: &str, errors: &[jsonschema::ValidationError<'_>]) -> InvalidArguments {
     let mut missing = Vec::new();
     let mut invalid = Vec::new();
     let mut unexpected = Vec::new();
@@ -645,8 +645,11 @@ fn defect_of(error: &jsonschema::ValidationError<'_>) -> ArgumentDefect {
         Kind::Enum { .. } => ArgumentDefect::Constraint {
             constraint: "not an allowed value".to_string(),
         },
-        Kind::Minimum { .. } | Kind::Maximum { .. } | Kind::ExclusiveMinimum { .. }
-        | Kind::ExclusiveMaximum { .. } | Kind::MultipleOf { .. } => ArgumentDefect::Constraint {
+        Kind::Minimum { .. }
+        | Kind::Maximum { .. }
+        | Kind::ExclusiveMinimum { .. }
+        | Kind::ExclusiveMaximum { .. }
+        | Kind::MultipleOf { .. } => ArgumentDefect::Constraint {
             constraint: "out of numeric range".to_string(),
         },
         Kind::MinLength { .. } | Kind::MaxLength { .. } => ArgumentDefect::Constraint {
@@ -762,10 +765,7 @@ pub fn recover(
         return RecoveryAction::NeedsReasoning(failure);
     };
 
-    let mut repaired = arguments
-        .as_object()
-        .cloned()
-        .unwrap_or_else(Map::new);
+    let mut repaired = arguments.as_object().cloned().unwrap_or_else(Map::new);
 
     // Deterministic recovery: normalize an argument field the schema does not
     // declare to the one it does, when the registry declares the alias.

@@ -137,7 +137,8 @@ pub struct ControlServer {
     active_streams: Arc<AtomicUsize>,
     /// Process-owned registry of lazily activated Project execution workers.
     /// Only present when canonical control service is available.
-    execution_runtimes: Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
+    execution_runtimes:
+        Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
 }
 
 impl ControlServer {
@@ -188,10 +189,11 @@ impl ControlServer {
             )));
         }
 
-        let service = crate::orchestration::canonical_control::CanonicalControlService::open_process(
-            root,
-            profile_path,
-        )?;
+        let service =
+            crate::orchestration::canonical_control::CanonicalControlService::open_process(
+                root,
+                profile_path,
+            )?;
         let boundary = crate::project::resolve(root);
         if boundary.has_marker() {
             service.register_project("startup-register", boundary.root(), now_unix())?;
@@ -203,7 +205,10 @@ impl ControlServer {
             &crate::proxy::SystemProxyEnv,
             &crate::process::SystemStaticProxy,
         );
-        let transport = Arc::new(crate::http::NativeHttp::with_policy(selection.plan(), None)?);
+        let transport = Arc::new(crate::http::NativeHttp::with_policy(
+            selection.plan(),
+            None,
+        )?);
         let registry = Arc::new(
             crate::orchestration::execution_runtime::ProjectRuntimeRegistry::new(
                 transport,
@@ -573,7 +578,10 @@ fn write_preflight(stream: &mut TcpStream, request: &Request) -> std::io::Result
     let methods = allowed_methods(&borrowed).unwrap_or("GET, PUT, POST, OPTIONS");
     let body = b"{}";
     let mut headers = cors_headers(origin.as_deref(), &format!("{methods}, OPTIONS"));
-    headers.push(("Access-Control-Allow-Headers", "content-type, last-event-id".to_string()));
+    headers.push((
+        "Access-Control-Allow-Headers",
+        "content-type, last-event-id".to_string(),
+    ));
     headers.push(("Access-Control-Max-Age", "600".to_string()));
     write_response(stream, 204, "application/json", body, &headers)
 }
@@ -638,9 +646,10 @@ fn handle_profile(
                 let body = request
                     .json_body()
                     .map_err(|_| OcgError::config("invalid Profile bootstrap body"))?;
-                let choice = body.get("choice").and_then(Value::as_str).ok_or_else(|| {
-                    OcgError::config("explicit choice is required: new")
-                })?;
+                let choice = body
+                    .get("choice")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| OcgError::config("explicit choice is required: new"))?;
                 match choice {
                     "new" => {
                         service.bootstrap()?;
@@ -720,7 +729,9 @@ fn handle_setup(
         match route {
             Route::SetupProviderConnect => {
                 let body: crate::contracts::SetupConnectRequest = serde_json::from_value(
-                    request.json_body().map_err(|_| OcgError::config("invalid setup connect body"))?,
+                    request
+                        .json_body()
+                        .map_err(|_| OcgError::config("invalid setup connect body"))?,
                 )
                 .map_err(|_| OcgError::config("invalid setup connect request"))?;
                 let name = body.name.trim();
@@ -741,7 +752,8 @@ fn handle_setup(
                 let catalog = crate::setup::discover_catalog(&http, &body.endpoint, &body.api_key)?;
 
                 let current = service.current()?;
-                let (mut profile, revision) = current.as_ref()
+                let (mut profile, revision) = current
+                    .as_ref()
                     .ok_or_else(|| OcgError::config("profile must be bootstrapped first"))?
                     .clone();
 
@@ -765,7 +777,9 @@ fn handle_setup(
                         label: name.to_string(),
                         endpoint: Some(chat_endpoint),
                         credential_ref: Some(credential_ref.clone()),
-                        protocol: Some(crate::provider_protocol::ProviderProtocol::OpenAiCompatible),
+                        protocol: Some(
+                            crate::provider_protocol::ProviderProtocol::OpenAiCompatible,
+                        ),
                         catalog: Some(catalog.clone()),
                     },
                 );
@@ -809,7 +823,9 @@ fn handle_setup(
                     .get_mut(&body.provider_key)
                     .ok_or_else(|| OcgError::config("provider is not configured"))?;
                 if !provider.wire_protocol().is_openai_chat_completions() {
-                    return Err(OcgError::config("model catalog discovery requires an OpenAI Chat Completions provider"));
+                    return Err(OcgError::config(
+                        "model catalog discovery requires an OpenAI Chat Completions provider",
+                    ));
                 }
                 let endpoint = provider
                     .endpoint
@@ -844,19 +860,25 @@ fn handle_setup(
 
             Route::SetupModelsSave => {
                 let body: crate::contracts::SetupModelsRequest = serde_json::from_value(
-                    request.json_body().map_err(|_| OcgError::config("invalid setup models body"))?,
+                    request
+                        .json_body()
+                        .map_err(|_| OcgError::config("invalid setup models body"))?,
                 )
                 .map_err(|error| OcgError::config(format!("invalid setup models: {error}")))?;
 
                 // Get current profile
                 let current = service.current()?;
-                let (mut profile, _revision) = current.as_ref()
+                let (mut profile, _revision) = current
+                    .as_ref()
                     .ok_or_else(|| OcgError::config("profile must be bootstrapped first"))?
                     .clone();
 
                 // Ensure provider exists
                 if !profile.providers.contains_key(&body.provider_key) {
-                    return Err(OcgError::config(format!("provider '{}' not found", body.provider_key)));
+                    return Err(OcgError::config(format!(
+                        "provider '{}' not found",
+                        body.provider_key
+                    )));
                 }
 
                 if body.models.is_empty() {
@@ -939,16 +961,21 @@ fn handle_setup(
                     default_model: body.default_model.clone(),
                     runnable_choices: runnable,
                     revision: new_revision.clone(),
-                }).map_err(|error| OcgError::config(error.to_string()))?)
+                })
+                .map_err(|error| OcgError::config(error.to_string()))?)
             }
 
             Route::SetupBrowse => {
                 let body: crate::contracts::SetupBrowseRequest = serde_json::from_value(
-                    request.json_body().map_err(|_| OcgError::config("invalid setup browse body"))?,
+                    request
+                        .json_body()
+                        .map_err(|_| OcgError::config("invalid setup browse body"))?,
                 )
                 .map_err(|error| OcgError::config(format!("invalid setup browse: {error}")))?;
 
-                let path = body.path.as_ref()
+                let path = body
+                    .path
+                    .as_ref()
                     .map(Path::new)
                     .unwrap_or_else(|| Path::new(""));
 
@@ -957,19 +984,24 @@ fn handle_setup(
                 Ok(serde_json::to_value(crate::contracts::SetupBrowseResponse {
                     current: listing.current,
                     parent: listing.parent,
-                    entries: listing.entries.into_iter().map(|e| {
-                        crate::contracts::SetupDirectoryEntry {
+                    entries: listing
+                        .entries
+                        .into_iter()
+                        .map(|e| crate::contracts::SetupDirectoryEntry {
                             name: e.name,
                             path: e.path,
                             is_dir: e.is_dir,
-                        }
-                    }).collect(),
-                }).map_err(|error| OcgError::config(error.to_string()))?)
+                        })
+                        .collect(),
+                })
+                .map_err(|error| OcgError::config(error.to_string()))?)
             }
 
             Route::SetupProjectInit => {
                 let body: crate::contracts::SetupProjectRequest = serde_json::from_value(
-                    request.json_body().map_err(|_| OcgError::config("invalid setup project body"))?,
+                    request
+                        .json_body()
+                        .map_err(|_| OcgError::config("invalid setup project body"))?,
                 )
                 .map_err(|error| OcgError::config(format!("invalid setup project: {error}")))?;
 
@@ -978,10 +1010,12 @@ fn handle_setup(
                 // Initialize the .ocg marker if it doesn't exist
                 let canonical_root = crate::setup::initialize_project_marker(root)?;
 
-                let canonical = canonical.ok_or_else(|| OcgError::config("Project registry is not available"))?;
+                let canonical = canonical
+                    .ok_or_else(|| OcgError::config("Project registry is not available"))?;
 
                 let now = now_unix();
-                let response = canonical.register_project(&body.command_id, &canonical_root, now)?;
+                let response =
+                    canonical.register_project(&body.command_id, &canonical_root, now)?;
 
                 // Extract project name from root path
                 let name = canonical_root
@@ -989,12 +1023,17 @@ fn handle_setup(
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Project".to_string());
 
-                Ok(serde_json::to_value(crate::contracts::SetupProjectResponse {
-                    api_version: crate::orchestration::canonical_control::CANONICAL_CONTROL_API_VERSION.to_string(),
-                    project_id: response.project.project_id,
-                    name,
-                    root: canonical_root.display().to_string(),
-                }).map_err(|error| OcgError::config(error.to_string()))?)
+                Ok(
+                    serde_json::to_value(crate::contracts::SetupProjectResponse {
+                        api_version:
+                            crate::orchestration::canonical_control::CANONICAL_CONTROL_API_VERSION
+                                .to_string(),
+                        project_id: response.project.project_id,
+                        name,
+                        root: canonical_root.display().to_string(),
+                    })
+                    .map_err(|error| OcgError::config(error.to_string()))?,
+                )
             }
 
             _ => unreachable!("not a Setup route"),
@@ -1196,10 +1235,8 @@ fn handle_canonical(
                 answer!(service.chat_conversations(&query("project_id")?)?)
             }
             Route::ChatConversationDelete => {
-                answer!(service.delete_chat_conversation(
-                    &query("project_id")?,
-                    &query("session_id")?
-                )?)
+                answer!(service
+                    .delete_chat_conversation(&query("project_id")?, &query("session_id")?)?)
             }
             Route::ChatMessages => {
                 answer!(service.chat_messages(&query("project_id")?, &query("session_id")?)?)
@@ -1229,9 +1266,15 @@ fn handle_canonical(
                 answer!(service.canonical_snapshot(&project, &job)?)
             }
             Route::ProjectUsage => {
-                let window = request.query.get("window").map(String::as_str).unwrap_or("all");
-                let window = serde_json::from_value::<crate::contracts::UsageWindow>(Value::String(window.to_string()))
-                    .map_err(|_| OcgError::config("invalid usage window"))?;
+                let window = request
+                    .query
+                    .get("window")
+                    .map(String::as_str)
+                    .unwrap_or("all");
+                let window = serde_json::from_value::<crate::contracts::UsageWindow>(
+                    Value::String(window.to_string()),
+                )
+                .map_err(|_| OcgError::config("invalid usage window"))?;
                 answer!(service.project_usage(&query("project_id")?, window)?)
             }
             Route::ConversationUsage => {
@@ -1438,7 +1481,9 @@ fn handle_chat_stream(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n",
     );
     if let Some(origin) = origin.as_deref() {
-        head.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"));
+        head.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"
+        ));
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
@@ -1492,7 +1537,10 @@ fn handle_chat_stream(
             usize,
             Vec<crate::orchestration::execution_dispatch::ExecutionEvent>,
         ) = {
-            let guard = buffer.state.lock().map_err(|_| std::io::Error::other("chat buffer poisoned"))?;
+            let guard = buffer
+                .state
+                .lock()
+                .map_err(|_| std::io::Error::other("chat buffer poisoned"))?;
             if index < guard.events.len() {
                 let base = index;
                 let pending = guard.events[index..].to_vec();
@@ -1505,7 +1553,13 @@ fn handle_chat_stream(
                 drop(guard);
                 let guard = buffer
                     .cvar
-                    .wait_timeout(buffer.state.lock().map_err(|_| std::io::Error::other("chat buffer poisoned"))?, poll)
+                    .wait_timeout(
+                        buffer
+                            .state
+                            .lock()
+                            .map_err(|_| std::io::Error::other("chat buffer poisoned"))?,
+                        poll,
+                    )
                     .map_err(|_| std::io::Error::other("chat buffer poisoned"))?
                     .0;
                 if index < guard.events.len() {
@@ -1737,8 +1791,13 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, ApiError
     }
     // OPTIONS is accepted only so a browser preflight for the canonical
     // control surface can be answered; it is never a routable method.
-    if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS") {
-        return Err(ApiError::method_not_allowed("GET, POST, PUT, DELETE, OPTIONS"));
+    if !matches!(
+        method.as_str(),
+        "GET" | "POST" | "PUT" | "DELETE" | "OPTIONS"
+    ) {
+        return Err(ApiError::method_not_allowed(
+            "GET, POST, PUT, DELETE, OPTIONS",
+        ));
     }
 
     let mut headers = HashMap::new();
@@ -1928,21 +1987,35 @@ enum Route {
     // pre-attempt Job configuration, snapshots and the event tail).
     CanonicalProjects,
     CanonicalProjectImport,
-    CanonicalProjectsGet { project: String },
+    CanonicalProjectsGet {
+        project: String,
+    },
     CanonicalConfigurationGet,
     CanonicalConfigurationPut,
-    CanonicalConfigurationProjectPut { project: String },
-    CanonicalJobConfigGet { job: String },
-    CanonicalJobConfigPut { job: String },
+    CanonicalConfigurationProjectPut {
+        project: String,
+    },
+    CanonicalJobConfigGet {
+        job: String,
+    },
+    CanonicalJobConfigPut {
+        job: String,
+    },
     CanonicalJobLaunch,
     /// Health Probe: launch a probe Job for one Provider x Model x Effort tuple,
     /// and read the latest canonical evidence for one. Explicitly operator- and
     /// client-driven; there is no scheduled probing anywhere in this service.
     HealthProbeLaunch,
     HealthProbeQuery,
-    CanonicalJobCancel { job: String },
-    CanonicalJobRetry { job: String },
-    CanonicalJobSpawn { job: String },
+    CanonicalJobCancel {
+        job: String,
+    },
+    CanonicalJobRetry {
+        job: String,
+    },
+    CanonicalJobSpawn {
+        job: String,
+    },
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
@@ -1950,7 +2023,10 @@ enum Route {
     ConversationUsage,
     JobUsage,
     ChatImageUpload,
-    ChatImageGet { project: String, image: String },
+    ChatImageGet {
+        project: String,
+        image: String,
+    },
     ChatSend,
     ChatConversations,
     ChatConversationDelete,
@@ -1958,7 +2034,9 @@ enum Route {
     ChatStream,
     ChatCancel,
     CanonicalPreflight,
-    Product { path: String },
+    Product {
+        path: String,
+    },
 }
 
 fn classify(request: &Request) -> std::result::Result<Route, ApiError> {

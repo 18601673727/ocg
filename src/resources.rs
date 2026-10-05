@@ -29,7 +29,7 @@
 
 use crate::error::{OcgError, Result};
 use crate::model;
-use crate::observation::{ObservedModelMetadata, ObservationProvenance};
+use crate::observation::{ObservationProvenance, ObservedModelMetadata};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -366,7 +366,6 @@ impl HealthFacts {
             observed_at: Some(now),
         }
     }
-
 }
 
 /// A bounded quota window, when an authoritative source exists.
@@ -523,9 +522,7 @@ pub struct ConfiguredEntry {
 ///
 /// The selected Lead and every explicit routing role are derived from the
 /// configured provider/model identity.
-pub fn configured_entries(
-    data: &Value,
-) -> Result<Vec<ConfiguredEntry>> {
+pub fn configured_entries(data: &Value) -> Result<Vec<ConfiguredEntry>> {
     let mut entries = Vec::new();
     let profile = crate::profile::Profile::from_ocg_config(data)?;
     if let Some(selected) = profile.default_model.as_deref() {
@@ -672,8 +669,7 @@ impl ResourceRegistry {
         now: i64,
     ) -> ResourceId {
         let mut observation = ResourceObservation::for_identity(identity, now);
-        observation.effective =
-            Fact::known(effective, ResourceProvenance::Observed, Some(now));
+        observation.effective = Fact::known(effective, ResourceProvenance::Observed, Some(now));
         let id = observation.resource_id.clone();
         self.merge_observation(observation, now);
         id
@@ -708,8 +704,7 @@ impl ResourceRegistry {
             .or(metadata.context_limit)
             .filter(|limit| *limit > 0)
         {
-            observation.context_limit =
-                Fact::known(limit, ResourceProvenance::Observed, Some(now));
+            observation.context_limit = Fact::known(limit, ResourceProvenance::Observed, Some(now));
         }
         if metadata.provider_id.is_some() || metadata.model_id.is_some() {
             observation.effective = Fact::known(

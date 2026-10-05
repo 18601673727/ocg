@@ -195,10 +195,7 @@ impl DiagnosticDelta {
             ));
             lines.push(format!("outstanding: {}", codes(&self.current)));
         }
-        lines
-            .join("\n")
-            .trim()
-            .to_string()
+        lines.join("\n").trim().to_string()
     }
 
     /// Distinct outstanding codes, error first, for a one-glance read.
@@ -300,7 +297,9 @@ fn diagnostic_from(message: &Value) -> Option<Diagnostic> {
 }
 
 fn is_primary(span: &Value) -> bool {
-    span.get("is_primary").and_then(Value::as_bool).unwrap_or(false)
+    span.get("is_primary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn span_of(span: &Value) -> Option<Span> {

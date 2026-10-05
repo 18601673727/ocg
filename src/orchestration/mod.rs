@@ -21,7 +21,7 @@ pub mod state;
 pub use budget::{
     admit as admit_spend, conflict_settlement_id, reservation_id, settlement_id,
     settlement_payload_digest, BillableUsage, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
-    ProjectBudget, ProjectBudgetReceipt, Money, PriceOutcome, PriceRefusal, PricingBasis,
+    Money, PriceOutcome, PriceRefusal, PricingBasis, ProjectBudget, ProjectBudgetReceipt,
     QuotaFacts, QuotaState, Reservation, ReservationState, Settlement, SettlementDisposition,
     SettlementEffect, SettlementVariance, SpendAction, SpendAssessment, SpendBlock, SpendDecision,
     SpendRequest, TokenPrice, UsageRecord, UsageSource, MAX_RATE_MICROS_PER_MILLION,

@@ -191,10 +191,7 @@ pub fn snapshot_fingerprint(snapshot: &GitSnapshot) -> String {
             entry.untracked,
         ));
     }
-    format!(
-        "sha256:{}",
-        crate::hash::sha256_hex(material.as_bytes())
-    )
+    format!("sha256:{}", crate::hash::sha256_hex(material.as_bytes()))
 }
 
 fn empty_git_output() -> GitOutput {

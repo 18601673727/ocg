@@ -23,8 +23,8 @@
 //! whole layer for one process. A disabled layer writes no state and makes no
 //! context decision.
 
-use crate::error::{OcgError, Result};
 use crate::compaction::config::CompactionConfig;
+use crate::error::{OcgError, Result};
 use crate::orchestration::context_governor::ContextGovernorConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -2,8 +2,8 @@
 //!
 //! SSE framing for the OpenAI Chat Completions wire format.
 
-use serde_json::{json, Value};
 use super::stream::NormalizedUsage;
+use serde_json::{json, Value};
 
 /// A Chat Completion chunk for SSE streaming.
 #[derive(Debug, Clone)]
@@ -43,11 +43,7 @@ pub fn encode_chunk(
 }
 
 /// Encode a usage-only chunk as an SSE `data:` line.
-pub fn encode_usage_chunk(
-    id: &str,
-    model: &str,
-    usage: &NormalizedUsage,
-) -> Vec<u8> {
+pub fn encode_usage_chunk(id: &str, model: &str, usage: &NormalizedUsage) -> Vec<u8> {
     let value = usage.raw.clone().unwrap_or_else(|| {
         json!({
             "prompt_tokens": usage.input_tokens, "completion_tokens": usage.output_tokens,
@@ -64,7 +60,9 @@ pub fn encode_sse_done() -> Vec<u8> {
 
 /// Encode the protocol error body without binding it to an HTTP server.
 pub fn encode_error(message: &str) -> Vec<u8> {
-    json!({"error":{"message":message,"type":"invalid_request_error"}}).to_string().into_bytes()
+    json!({"error":{"message":message,"type":"invalid_request_error"}})
+        .to_string()
+        .into_bytes()
 }
 
 fn now() -> i64 {

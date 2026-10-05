@@ -206,10 +206,7 @@ fn render_projection(sections: &[(String, String)], notes: &[String]) -> (Option
     }
     let content = format!("OCG active context (structured projection)\n\n{body}");
     let bytes = content.len();
-    (
-        Some(json!({"role": "system", "content": content})),
-        bytes,
-    )
+    (Some(json!({"role": "system", "content": content})), bytes)
 }
 
 /// The bounded repository-context section, from the existing Context Engine.
@@ -217,11 +214,7 @@ fn render_projection(sections: &[(String, String)], notes: &[String]) -> (Option
 /// The plan is whatever ranking and the budget already selected — no second
 /// selection is applied here, and no unbounded dump of the repository is ever
 /// substituted for a plan.
-fn repository_section(
-    project_root: &Path,
-    task: &str,
-    config: &Value,
-) -> Result<Option<String>> {
+fn repository_section(project_root: &Path, task: &str, config: &Value) -> Result<Option<String>> {
     let context_config = ContextConfig::from_config(config)?;
     if !context_config.enabled {
         return Ok(None);
@@ -359,15 +352,13 @@ async fn compact_conversation<'f>(
     // the newest that still applies, so a point recorded against a longer
     // transcript than the one in hand is skipped rather than trusted.
     let points = state.compaction_points(attempt_id).to_vec();
-    let context = Context::new(
-        &history,
-        &points,
-        &canonical,
-        &compaction_config,
-        &limits,
-    );
+    let context = Context::new(&history, &points, &canonical, &compaction_config, &limits);
     match context.evaluate(None, tools, None) {
-        Ok(CompactionOutcome::Ready { messages, footprint, .. }) => {
+        Ok(CompactionOutcome::Ready {
+            messages,
+            footprint,
+            ..
+        }) => {
             tracing::debug!(
                 prompt_tokens = footprint.effective_prompt_tokens(),
                 tool_result_share_bp = footprint.tool_result_share_bp(),
@@ -501,11 +492,7 @@ async fn accept_summary<'f>(
 /// Keep the whole conversation when no summary stands in for it.
 fn keep_whole(transcript: Transcript) -> (Vec<Value>, Option<CompactionPoint>) {
     (
-        transcript
-            .head
-            .into_iter()
-            .chain(transcript.tail)
-            .collect(),
+        transcript.head.into_iter().chain(transcript.tail).collect(),
         None,
     )
 }
@@ -531,10 +518,7 @@ fn canonical_block(project_root: &Path) -> CanonicalBlock {
 fn config_data(project_root: &Path) -> Result<Value> {
     let env = crate::cli::Env::from_process();
     let (source, home) = match env.home.clone() {
-        Some(path) => (
-            crate::defaults::OcgSource::Dir(path.clone()),
-            Some(path),
-        ),
+        Some(path) => (crate::defaults::OcgSource::Dir(path.clone()), Some(path)),
         None => (crate::defaults::OcgSource::Embedded, None),
     };
     let user_path = crate::config::user_config_path(

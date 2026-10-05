@@ -55,9 +55,7 @@ impl TokenTotals {
 
     /// Whether any count at all was recorded.
     pub fn has_any(&self) -> bool {
-        self.provider_reported.is_some()
-            || self.estimated.is_some()
-            || self.unknown_events > 0
+        self.provider_reported.is_some() || self.estimated.is_some() || self.unknown_events > 0
     }
 }
 

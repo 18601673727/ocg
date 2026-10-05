@@ -98,7 +98,10 @@ impl ActivationSet {
     }
 
     pub fn names(&self) -> Vec<&str> {
-        self.active.iter().map(|entry| entry.name.as_str()).collect()
+        self.active
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect()
     }
 
     /// Whether a skill is active.
@@ -211,7 +214,8 @@ pub fn resolve(
     // Oldest first, so the head of the vector is the first thing dropped if a
     // later pass needs to make room.
     for entry in sized {
-        let missing = unsatisfied_dependencies(&entry.skill, available_tools, available_capabilities);
+        let missing =
+            unsatisfied_dependencies(&entry.skill, available_tools, available_capabilities);
         set.active.push(ActiveSkill {
             name: entry.skill.metadata.name.clone(),
             revision: entry.skill.revision.clone(),
