@@ -353,6 +353,21 @@ export type CanonicalDispatchIntent = {
   failure: string | null;
   created_at: number;
   updated_at: number;
+  /**
+   * The execution target the backend froze on this dispatch before the Provider
+   * ran. Placement decides it once per admission and these columns are that
+   * decision as it stood for *this* dispatch, so they are historical evidence
+   * rather than a view of the current Profile.
+   *
+   * Absent or `null` means no placement target was recorded — a native tool Call
+   * is dispatched without a Provider, and `upstream_model_id` arrived as a
+   * schema migration, so an older local store legitimately lacks the key. The
+   * budget reservation the dispatch admitted against is recorded alongside them.
+   */
+  reservation_id?: string | null;
+  provider_key?: string | null;
+  model?: string | null;
+  upstream_model_id?: string | null;
 };
 
 /**
@@ -691,6 +706,14 @@ const dispatchIntent: Decoder<CanonicalDispatchIntent> = (input, path) => {
   if (!createdAt.ok) return createdAt;
   const updatedAt = req(rec.value, "updated_at", number, path);
   if (!updatedAt.ok) return updatedAt;
+  const reservationId = opt(rec.value, "reservation_id", string, path);
+  if (!reservationId.ok) return reservationId;
+  const providerKey = opt(rec.value, "provider_key", string, path);
+  if (!providerKey.ok) return providerKey;
+  const model = opt(rec.value, "model", string, path);
+  if (!model.ok) return model;
+  const upstreamModelId = opt(rec.value, "upstream_model_id", string, path);
+  if (!upstreamModelId.ok) return upstreamModelId;
   return yes({
     id: id.value,
     call_id: callId.value,
@@ -706,6 +729,10 @@ const dispatchIntent: Decoder<CanonicalDispatchIntent> = (input, path) => {
     failure: failure.value,
     created_at: createdAt.value,
     updated_at: updatedAt.value,
+    reservation_id: reservationId.value,
+    provider_key: providerKey.value,
+    model: model.value,
+    upstream_model_id: upstreamModelId.value,
   });
 };
 

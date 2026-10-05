@@ -3,8 +3,9 @@
 import { useState, ViewTransition } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { PageSurface, JOB_STATE, Pill, SectionTitle } from "../primitives";
+import { PageSurface, JOB_STATE, KeyValue, KeyValueList, Pill, SectionTitle } from "../primitives";
 import { filterCalls, type JobExecution } from "./domain";
+import { placementOf } from "./placement";
 import { jobElapsedMs, type JobAccounting } from "./accounting";
 import { ContextMetrics, CostDetails, TokenMetrics } from "../usage/usage-values";
 import { runtimeStateLabel, useI18n } from "../i18n";
@@ -55,6 +56,8 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
   const updatedAt = new Date(execution.updatedAt * 1000).toISOString();
   const elapsed = jobElapsedMs(execution);
   const jobState = JOB_STATE[execution.state];
+  // Read-only projection of what the backend recorded for this Job's placement.
+  const placement = placementOf(execution);
 
   return (
     <PageSurface className={embedded ? "space-y-5 p-4 text-xs sm:p-4 lg:p-4" : "space-y-5 text-xs"}>
@@ -129,6 +132,41 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
           </div>
         )}
         <p className="mt-4 text-[11px] leading-5 text-muted-foreground">{t("execution.jobDetailsNotReported")}</p>
+      </section>
+
+      <section aria-label={t("placement.title")} className="rounded-lg border border-border bg-card p-4">
+        <SectionTitle detail={t(`placement.${placement.outcome}`)}>{t("placement.title")}</SectionTitle>
+        {placement.outcome === "recorded" && placement.selected ? (
+          <>
+            <p className="mb-2 text-[11px] font-semibold text-muted-foreground uppercase">{t("placement.selectedTarget")}</p>
+            <KeyValueList>
+              <KeyValue label={t("placement.provider")} mono>{placement.selected.providerKey}</KeyValue>
+              <KeyValue label={t("placement.model")} mono>{placement.selected.model}</KeyValue>
+              <KeyValue label={t("placement.upstreamModel")} mono>{placement.selected.upstreamModelId ?? t("common.notReported")}</KeyValue>
+              <KeyValue label={t("placement.dispatches", { count: placement.selected.dispatchIntentIds.length })}>{placement.selected.firstDispatchIntentId}</KeyValue>
+            </KeyValueList>
+            {/* Placement is decided per admission, so a Job with several Attempts
+                can hold several genuinely distinct targets. They stay listed. */}
+            {placement.targets.length > 1 && (
+              <ul className="mt-2 space-y-1">
+                {placement.targets.map((target) => (
+                  <li key={`${target.attemptId}:${target.providerKey}:${target.model}`} className="break-words text-[11px] text-muted-foreground">
+                    {t("placement.attemptTarget", { generation: String(target.generation) })}
+                    {target.authoritative ? ` · ${t("placement.authoritative")}` : ""} · {target.providerKey} / {target.model}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        ) : placement.outcome === "rejected" && placement.failure ? (
+          <KeyValueList>
+            <KeyValue label={t("placement.reason")} mono>{placement.failure.code}</KeyValue>
+            <KeyValue label={t("execution.reportedFailureDetail")}>{placement.failure.message}</KeyValue>
+          </KeyValueList>
+        ) : (
+          <p className="text-[11px] text-muted-foreground">{t("placement.notRecorded")}</p>
+        )}
+        <p className="mt-3 text-[11px] leading-5 text-muted-foreground">{t("placement.historyNote")}</p>
       </section>
 
       <section aria-label={t("execution.usage")} className="rounded-lg border border-border bg-card p-4">

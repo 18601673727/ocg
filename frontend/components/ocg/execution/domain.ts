@@ -338,6 +338,17 @@ export type ExecutionDispatchIntent = {
   effectState: string;
   request: string;
   budgetAdmitted: boolean;
+  /**
+   * The execution target placement froze for this dispatch before the Provider
+   * ran, as the substrate recorded it on the dispatch itself. `null` for a
+   * native tool Call, which placement never routes to a Provider.
+   */
+  providerKey: string | null;
+  model: string | null;
+  /** The provider-facing model id, frozen at admission rather than resolved later. */
+  upstreamModelId: string | null;
+  /** The budget reservation this dispatch was admitted against. */
+  reservationId: string | null;
   failure: string | null;
   createdAt: number;
   updatedAt: number;
@@ -360,6 +371,10 @@ export function dispatchIntentsOf(
     effectState: intent.effect_state,
     request: intent.request,
     budgetAdmitted: intent.budget_admitted,
+    providerKey: intent.provider_key ?? null,
+    model: intent.model ?? null,
+    upstreamModelId: intent.upstream_model_id ?? null,
+    reservationId: intent.reservation_id ?? null,
     failure: intent.failure,
     createdAt: intent.created_at,
     updatedAt: intent.updated_at,
