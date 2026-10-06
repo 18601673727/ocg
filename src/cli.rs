@@ -599,6 +599,21 @@ fn cli_disk_guard_config(
     crate::orchestration::disk_guard::DiskGuardConfig::default()
 }
 
+/// Resolve the execution disk-space guard for a low-level `work` operator.
+/// The guard is ephemeral per invocation and starts unobserved, so the first
+/// safety-critical check always measures the live filesystem synchronously:
+/// an operator action never runs on a stale cached observation.
+fn cli_disk_guard(
+    root: &Path,
+    user_path: &Path,
+) -> Result<crate::orchestration::disk_guard::DiskGuard, Failure> {
+    crate::orchestration::disk_guard::DiskGuard::for_root(
+        root,
+        cli_disk_guard_config(root, user_path),
+    )
+    .map_err(Failure::Ocg)
+}
+
 fn work_command(
     root: &Path,
     user_path: &Path,
@@ -644,6 +659,20 @@ fn work_command(
             let binding = option("session")
                 .or_else(|| option("binding"))
                 .unwrap_or_else(|| "cli".into());
+            // A bound session replays idempotently without creating state, so
+            // it needs no gate. Only genuinely new admission consults the
+            // reserve, and the check precedes the creating transaction. A
+            // binding created in between still returns the existing record
+            // without new state, so the race is safe in the guarded direction.
+            if repository
+                .authority_for_binding(&project.id, &binding)?
+                .is_none()
+            {
+                let guard = cli_disk_guard(root, user_path)?;
+                if let Some(deferral) = guard.check_execution_admission().deferral() {
+                    return Err(Failure::Ocg(OcgError::config(deferral.message())));
+                }
+            }
             let spec = crate::orchestration::domain::JobSpec {
                 objective: Some(option("objective").unwrap_or_default()),
                 ..Default::default()
@@ -670,10 +699,7 @@ fn work_command(
             // the canonical spawn path: an explicit request is not permission
             // to exhaust the host disk. The refusal happens before any lineage
             // write, so the spawn key stays unbound for retry after recovery.
-            let guard = crate::orchestration::disk_guard::DiskGuard::for_root(
-                root,
-                cli_disk_guard_config(root, user_path),
-            )?;
+            let guard = cli_disk_guard(root, user_path)?;
             if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
                 return Err(Failure::Ocg(OcgError::spawn_refused(
                     crate::error::SpawnRefusalReason::StorageProtection,
@@ -727,6 +753,17 @@ fn work_command(
                 .ok_or_else(|| {
                     Failure::Ocg(OcgError::config("session has no canonical authority"))
                 })?;
+            // Recursive expansion obeys the same Pressure/Critical policy as
+            // the canonical spawn path. The refusal precedes the lineage
+            // transaction, so no origin, dependency or counter residue is
+            // left behind.
+            let guard = cli_disk_guard(root, user_path)?;
+            if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
+                return Err(Failure::Ocg(OcgError::spawn_refused(
+                    crate::error::SpawnRefusalReason::StorageProtection,
+                    deferral.message(),
+                )));
+            }
             let spec = crate::orchestration::domain::JobSpec {
                 objective: Some(option("objective").unwrap_or_default()),
                 ..Default::default()
@@ -749,6 +786,13 @@ fn work_command(
         }
         "dispatch" => {
             let job_id = required("job")?;
+            // A dispatch always mints a new Attempt and Executor with fresh
+            // journal events. Under disk protection that expansion is
+            // deferred; the eligible Job itself is left untouched.
+            let guard = cli_disk_guard(root, user_path)?;
+            if let Some(deferral) = guard.check_execution_admission().deferral() {
+                return Err(Failure::Ocg(OcgError::config(deferral.message())));
+            }
             let (attempt, executor) = repository
                 .dispatch_job(&job_id, &option("agent").unwrap_or_else(|| "worker".into()))?;
             print(
@@ -757,6 +801,14 @@ fn work_command(
         }
         "replace" => {
             let job_id = required("job")?;
+            // Replacement fences the old authority in the same transaction
+            // that mints the new Attempt, so the Guard is consulted first: a
+            // refusal must leave the existing authoritative execution exactly
+            // as it was, never half-fenced with no successor.
+            let guard = cli_disk_guard(root, user_path)?;
+            if let Some(deferral) = guard.check_execution_admission().deferral() {
+                return Err(Failure::Ocg(OcgError::config(deferral.message())));
+            }
             let admission = repository.replace_attempt_checked(
                 &job_id,
                 &option("agent").unwrap_or_else(|| "worker".into()),
