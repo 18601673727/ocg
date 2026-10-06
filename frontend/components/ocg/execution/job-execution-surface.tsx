@@ -3,12 +3,12 @@
 import { useState, ViewTransition } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { PageSurface, JOB_STATE, KeyValue, KeyValueList, Pill, SectionTitle } from "../primitives";
+import { PageSurface, JOB_STATE, Pill, SectionTitle } from "../primitives";
 import { filterCalls, type JobExecution } from "./domain";
-import { placementOf } from "./placement";
+import { placementOf, type PlacementProjection, type PlacementTarget } from "./placement";
 import { jobElapsedMs, type JobAccounting } from "./accounting";
 import { ContextMetrics, CostDetails, TokenMetrics } from "../usage/usage-values";
-import { runtimeStateLabel, useI18n } from "../i18n";
+import { runtimeStateLabel, useI18n, type TranslateFn } from "../i18n";
 import { formatDuration, formatNumber } from "@/lib/format";
 import type { JobUsageResponse } from "../contracts";
 
@@ -134,48 +134,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
         <p className="mt-4 text-[11px] leading-5 text-muted-foreground">{t("execution.jobDetailsNotReported")}</p>
       </section>
 
-      <section aria-label={t("placement.title")} className="rounded-lg border border-border bg-card p-4">
-        <SectionTitle detail={t(`placement.${placement.outcome}`)}>{t("placement.title")}</SectionTitle>
-        {placement.selected ? (
-          <>
-            <p className="mb-2 text-[11px] font-semibold text-muted-foreground uppercase">{t("placement.selectedTarget")}</p>
-            <KeyValueList>
-              <KeyValue label={t("placement.provider")} mono>{placement.selected.providerKey}</KeyValue>
-              <KeyValue label={t("placement.model")} mono>{placement.selected.model}</KeyValue>
-              <KeyValue label={t("placement.upstreamModel")} mono>{placement.selected.upstreamModelId ?? t("common.notReported")}</KeyValue>
-              <KeyValue label={t("placement.dispatches", { count: placement.selected.dispatchIntentIds.length })}>{placement.selected.firstDispatchIntentId}</KeyValue>
-            </KeyValueList>
-          </>
-        ) : placement.outcome === "rejected" && placement.failure ? (
-          <KeyValueList>
-            <KeyValue label={t("placement.reason")} mono>{placement.failure.code}</KeyValue>
-            <KeyValue label={t("execution.reportedFailureDetail")}>{placement.failure.message}</KeyValue>
-          </KeyValueList>
-        ) : placement.outcome === "recorded" ? (
-          /* Placement history exists, but the current authoritative Attempt has
-             not frozen a target yet. Its older target is not restated as the
-             current one. */
-          <p className="text-[11px] text-muted-foreground">{t("placement.currentNotRecorded")}</p>
-        ) : (
-          <p className="text-[11px] text-muted-foreground">{t("placement.notRecorded")}</p>
-        )}
-        {/* Placement is decided per admission, so earlier Attempts keep their own
-            targets as history. The key carries every field the projection groups
-            on, so two targets differing only by upstream model stay distinct. */}
-        {placement.history.length > 0 && (
-          <>
-            <p className="mb-2 mt-3 text-[11px] font-semibold text-muted-foreground uppercase">{t("placement.history")}</p>
-            <ul className="space-y-1">
-              {placement.history.map((target) => (
-                <li key={`${target.attemptId}:${target.providerKey}:${target.model}:${target.upstreamModelId ?? ""}`} className="break-words text-[11px] text-muted-foreground">
-                  {t("placement.attemptTarget", { generation: String(target.generation) })} · {target.providerKey} / {target.model}
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
-        <p className="mt-3 text-[11px] leading-5 text-muted-foreground">{t("placement.historyNote")}</p>
-      </section>
+      <PlacementSection placement={placement} jobFailureShown={execution.terminationReason !== null} />
 
       <section aria-label={t("execution.usage")} className="rounded-lg border border-border bg-card p-4">
         <SectionTitle>{t("execution.usage")}</SectionTitle>
@@ -268,5 +227,123 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
         </div>
       </details>
     </PageSurface>
+  );
+}
+
+/**
+ * High-level placement situation, derived only from the recorded projection.
+ *
+ * The current target belongs to the authoritative Attempt alone, so recorded
+ * history does not become "current" while that Attempt is still unfrozen.
+ * A rejection is only claimed when the backend recorded one.
+ */
+type PlacementSituation = "current" | "rejected" | "historical" | "none";
+
+function placementSituation(placement: PlacementProjection): PlacementSituation {
+  if (placement.selected) return "current";
+  if (placement.outcome === "rejected" && placement.failure) return "rejected";
+  if (placement.history.length > 0) return "historical";
+  return "none";
+}
+
+const PLACEMENT_SITUATION_KEY = {
+  current: "placement.stateCurrent",
+  rejected: "placement.stateRejected",
+  historical: "placement.stateHistorical",
+  none: "placement.stateNone",
+} as const;
+
+const PLACEMENT_SITUATION_TONE = {
+  current: "emerald",
+  rejected: "red",
+  historical: "slate",
+  none: "slate",
+} as const;
+
+/**
+ * One frozen target, read provider-first.
+ *
+ * Canonical identities stay available for inspection but sit under the
+ * provider and model, which are what a reader needs in order to understand
+ * where the Attempt was aimed.
+ */
+function PlacementTargetFacts({ target, t }: { target: PlacementTarget; t: TranslateFn }) {
+  return (
+    <div className="min-w-0">
+      <p className="text-[11px] text-muted-foreground">{t("placement.attemptTarget", { generation: String(target.generation) })}</p>
+      <p className="mt-0.5 break-words text-[13px] font-medium text-foreground">{target.providerKey}</p>
+      <p className="break-words text-[12px]">{target.model}</p>
+      {target.upstreamModelId && (
+        <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
+          <span className="font-sans">{t("placement.upstreamModel")}</span>
+          {" "}
+          {target.upstreamModelId}
+        </p>
+      )}
+      <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground" title={t("placement.dispatches", { count: target.dispatchIntentIds.length })}>
+        <span className="font-sans">{t("placement.dispatchIntent")}</span>
+        {" "}
+        {target.firstDispatchIntentId}
+      </p>
+    </div>
+  );
+}
+
+function PlacementSection({ placement, jobFailureShown }: { placement: PlacementProjection; jobFailureShown: boolean }) {
+  const { t } = useI18n();
+  const situation = placementSituation(placement);
+  const selected = placement.selected;
+  const showHistory = placement.history.length > 0;
+  return (
+    <section aria-label={t("placement.title")} className="min-w-0 rounded-lg border border-border bg-card p-4">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+        <SectionTitle className="mb-0 min-w-0">{t("placement.title")}</SectionTitle>
+        <Pill tone={PLACEMENT_SITUATION_TONE[situation]} dot>{t(PLACEMENT_SITUATION_KEY[situation])}</Pill>
+      </div>
+
+      {selected ? (
+        <div className="mt-3 min-w-0">
+          <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.currentTarget")}</h4>
+          <div className="mt-2 min-w-0">
+            <PlacementTargetFacts target={selected} t={t} />
+          </div>
+        </div>
+      ) : situation === "rejected" && placement.failure ? (
+        <div className="mt-3 min-w-0">
+          {jobFailureShown ? (
+            <p className="text-[12px] text-muted-foreground">{t("placement.rejectedSummary")}</p>
+          ) : (
+            <>
+              <p className="break-words font-mono text-[12px] font-medium">{placement.failure.code}</p>
+              <p className="mt-1 whitespace-pre-wrap break-words text-[12px] text-muted-foreground">{placement.failure.message}</p>
+            </>
+          )}
+        </div>
+      ) : situation === "historical" ? (
+        <p className="mt-3 text-[12px] text-muted-foreground">{t("placement.currentNotRecorded")}</p>
+      ) : (
+        <p className="mt-3 text-[12px] text-muted-foreground">{t("placement.notRecorded")}</p>
+      )}
+
+      {showHistory && (
+        <div className="mt-4 min-w-0 border-t border-border/70 pt-3">
+          <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.history")}</h4>
+          {situation === "historical" && (
+            <p className="mt-1 text-[11px] text-muted-foreground">{t("placement.historyIsEarlier")}</p>
+          )}
+          {/* The key carries every field the projection groups on, so two
+              targets differing only by upstream model stay distinct. */}
+          <ul className="mt-2 space-y-2">
+            {placement.history.map((target) => (
+              <li key={`${target.attemptId}:${target.providerKey}:${target.model}:${target.upstreamModelId ?? ""}`} className="min-w-0">
+                <PlacementTargetFacts target={target} t={t} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <p className="mt-3 text-[11px] leading-5 text-muted-foreground">{t("placement.historyNote")}</p>
+    </section>
   );
 }
