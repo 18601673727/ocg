@@ -646,14 +646,18 @@ fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Fai
                 })
                 .unwrap_or_default();
             let prerequisites = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
-            let (job, duplicate) = repository.spawn_child(
-                &parent,
-                &required("spawn-key")?,
-                spec,
-                &prerequisites,
-                &option("agent").unwrap_or_else(|| "worker".into()),
-                &policy,
-            )?;
+            let spawn_key = required("spawn-key")?;
+            let executor_kind = option("agent").unwrap_or_else(|| "worker".into());
+            let (job, duplicate) =
+                repository.spawn_child(crate::orchestration::domain::SpawnChildRequest {
+                    parent_authority: &parent,
+                    spawn_key: &spawn_key,
+                    spec,
+                    prerequisite_job_ids: &prerequisites,
+                    executor_kind: &executor_kind,
+                    policy: &policy,
+                    call_id: None,
+                })?;
             print(
                 json!({"project_id": job.project_id, "job_id": job.id, "duplicate": duplicate, "job": job}),
             )

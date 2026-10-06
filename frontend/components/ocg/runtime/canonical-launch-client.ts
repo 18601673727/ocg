@@ -221,9 +221,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (this.projectJobRefreshProject === projectId && this.projectJobRefreshTimer !== null) return;
     if (this.projectJobRefreshTimer !== null) clearInterval(this.projectJobRefreshTimer);
     this.projectJobRefreshProject = projectId;
-    this.projectJobRefreshTimer = setInterval(() => {
+    const timer = setInterval(() => {
       void this.refreshProjectJobs(projectId);
     }, PROJECT_JOB_REFRESH_MS);
+    this.projectJobRefreshTimer = timer;
+    if (typeof timer === "object" && timer !== null && "unref" in timer && typeof timer.unref === "function") {
+      timer.unref();
+    }
   }
 
   override async deleteSession(sessionId: string): Promise<void> {

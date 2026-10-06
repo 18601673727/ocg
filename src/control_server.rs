@@ -395,6 +395,15 @@ impl ApiError {
     }
 }
 
+fn api_error_for(error: &OcgError) -> ApiError {
+    match error {
+        OcgError::SpawnRefused { reason, message } => {
+            ApiError::new(409, reason.code(), message.clone())
+        }
+        _ => ApiError::new(400, "invalid_request", error.to_string()),
+    }
+}
+
 fn bounded(message: String) -> String {
     let redacted = crate::telemetry::task::redact(&message);
     const MAX: usize = 400;
@@ -1067,7 +1076,7 @@ fn handle_canonical(
     let respond = |stream: &mut TcpStream, result: Result<Value>| match result {
         Ok(value) => write_json_with_origin(stream, 200, &value, allowed_origin.as_deref()),
         Err(error) => {
-            let error = ApiError::new(400, "invalid_request", error.to_string());
+            let error = api_error_for(&error);
             write_json_with_origin(stream, error.status, &error.body, allowed_origin.as_deref())
         }
     };

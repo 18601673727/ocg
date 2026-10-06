@@ -92,19 +92,19 @@ export type CanonicalJobOperationResponse = { api_version: CanonicalApiVersion, 
 export type CanonicalJobOperations = { can_cancel: boolean, can_retry: boolean, };
 
 
-export type CanonicalJobRelations = { parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, };
+export type CanonicalJobRelations = { parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, };
 
 
 export type CanonicalJobSnapshot = { api_version: CanonicalApiVersion, project_id: string, job: JsonValue, cursor: number, };
 
 
-export type CanonicalJobSpawnRequest = { parent_attempt_id: string, expected_generation: number, spawn_key: string, spec: JobSpec, depends_on: Array<string>, executor_kind: string, policy: ChildPolicy, };
+export type CanonicalJobSpawnRequest = { parent_attempt_id: string, expected_generation: number, call_id: string | null, spawn_key: string, spec: JobSpec, depends_on: Array<string>, executor_kind: string, policy: ChildPolicy, };
 
 
 export type CanonicalJobSpawnResponse = { api_version: CanonicalApiVersion, child_job_id: string, duplicate: boolean, snapshot: CanonicalJobSnapshot, };
 
 
-export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null, parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, can_cancel: boolean, can_retry: boolean, };
+export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null, parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, can_cancel: boolean, can_retry: boolean, };
 
 
 export type CanonicalProjectResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, project: ProjectRecord, };
@@ -310,10 +310,10 @@ export type JobLaunchResponse = { api_version: CanonicalApiVersion,
 outcome: string, command_id: string, draft_id: string, project_id: string, session_id: string, job_id: string | null, message: string, duplicate: boolean, };
 
 
-export type JobOrigin = { parent_job_id: string, attempt_id: string, generation: number, spawn_key: string | null, spawn_fingerprint: string | null, policy: ChildPolicy | null, };
+export type JobOrigin = { parent_job_id: string, attempt_id: string, generation: number, spawn_key: string | null, spawn_fingerprint: string | null, call_id: string | null, policy: ChildPolicy | null, };
 
 
-export type JobSpec = { provider: string | null, model: string | null, objective: string | null, success_criteria: string | null, constraints: string | null, hard_budget_micros: number | null, resource_commitment: number | null,
+export type JobSpec = { provider: string | null, model: string | null, objective: string | null, success_criteria: string | null, constraints: string | null, hard_budget_micros: number | null, resource_commitment: number | null, recursive_limits: RecursiveLimits,
 /**
  * Set when this Job is a Health Probe. A probe is an ordinary Job whose
  * declared purpose is to produce execution evidence for one
@@ -457,6 +457,9 @@ export type ProviderCatalog = { discovered_at: number, models: Array<CatalogMode
  * The protocol OCG speaks to a provider endpoint.
  */
 export type ProviderProtocol = "anthropic" | "openai" | "openai_compatible";
+
+
+export type RecursiveLimits = { max_depth: number, max_children_per_job: number, max_total_descendants_per_root: number, };
 
 
 /**

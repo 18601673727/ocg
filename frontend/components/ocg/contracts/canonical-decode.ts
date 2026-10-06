@@ -59,6 +59,7 @@ import {
   record,
   req,
   string,
+  stringMap,
   yes,
   type DecodeResult,
   type Decoder,
@@ -517,9 +518,11 @@ const jobOrigin: Decoder<JobOrigin> = (input, path) => {
   if (!key.ok) return key;
   const fingerprint = req(rec.value, "spawn_fingerprint", nullable(identity), path);
   if (!fingerprint.ok) return fingerprint;
+  const callId = req(rec.value, "call_id", nullable(identity), path);
+  if (!callId.ok) return callId;
   const policy = req(rec.value, "policy", nullable(childPolicy), path);
   if (!policy.ok) return policy;
-  return yes({ parent_job_id: parent.value, attempt_id: attempt.value, generation: generation.value, spawn_key: key.value, spawn_fingerprint: fingerprint.value, policy: policy.value });
+  return yes({ parent_job_id: parent.value, attempt_id: attempt.value, generation: generation.value, spawn_key: key.value, spawn_fingerprint: fingerprint.value, call_id: callId.value, policy: policy.value });
 };
 
 const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
@@ -540,6 +543,14 @@ const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
   if (!blockedBy.ok) return blockedBy;
   const blocked = req(rec.value, "blocked", boolean, path);
   if (!blocked.ok) return blocked;
+  const rootJobId = req(rec.value, "root_job_id", identity, path);
+  if (!rootJobId.ok) return rootJobId;
+  const depth = req(rec.value, "depth", index, path);
+  if (!depth.ok) return depth;
+  const descendantJobIds = req(rec.value, "descendant_job_ids", array(identity), path);
+  if (!descendantJobIds.ok) return descendantJobIds;
+  const descendantSummary = req(rec.value, "descendant_summary", stringMap(number), path);
+  if (!descendantSummary.ok) return descendantSummary;
   return yes({
     parent_job_id: parentJobId.value,
     origin: origin.value ?? null,
@@ -548,6 +559,10 @@ const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
     blocks: blocks.value,
     blocked_by: blockedBy.value,
     blocked: blocked.value,
+    root_job_id: rootJobId.value,
+    depth: depth.value,
+    descendant_job_ids: descendantJobIds.value,
+    descendant_summary: descendantSummary.value,
   });
 };
 

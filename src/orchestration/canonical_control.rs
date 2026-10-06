@@ -238,6 +238,10 @@ pub struct CanonicalJobRelations {
     pub blocks: Vec<String>,
     pub blocked_by: Vec<String>,
     pub blocked: bool,
+    pub root_job_id: String,
+    pub depth: u64,
+    pub descendant_job_ids: Vec<String>,
+    pub descendant_summary: BTreeMap<String, usize>,
 }
 
 impl CanonicalJobRelations {
@@ -263,6 +267,31 @@ impl CanonicalJobRelations {
             })
             .cloned()
             .collect();
+        let mut descendant_job_ids = origins
+            .iter()
+            .filter(|(_, parent)| *parent == &job.id)
+            .map(|(child, _)| child.clone())
+            .collect::<Vec<_>>();
+        let mut cursor = 0;
+        while cursor < descendant_job_ids.len() {
+            let parent = &descendant_job_ids[cursor];
+            let children = origins
+                .iter()
+                .filter(|(_, origin_parent)| origin_parent == &parent)
+                .map(|(child, _)| child.clone())
+                .filter(|child| !descendant_job_ids.contains(child))
+                .collect::<Vec<_>>();
+            descendant_job_ids.extend(children);
+            cursor += 1;
+        }
+        let mut descendant_summary = BTreeMap::new();
+        for descendant_id in &descendant_job_ids {
+            if let Some(descendant) = projection.jobs.get(descendant_id) {
+                *descendant_summary
+                    .entry(descendant.state.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
         Self {
             parent_job_id: origins.get(&job.id).cloned(),
             origin: origin_details.get(&job.id).cloned(),
@@ -282,6 +311,10 @@ impl CanonicalJobRelations {
                 .collect(),
             blocked: !blocked_by.is_empty(),
             blocked_by,
+            root_job_id: job.root_job_id.clone(),
+            depth: job.depth,
+            descendant_job_ids,
+            descendant_summary,
         }
     }
 }
@@ -334,6 +367,8 @@ pub struct CanonicalJobOperationResponse {
 pub struct CanonicalJobSpawnRequest {
     pub parent_attempt_id: String,
     pub expected_generation: u64,
+    #[serde(default)]
+    pub call_id: Option<String>,
     pub spawn_key: String,
     pub spec: JobSpec,
     #[serde(default)]
@@ -1637,14 +1672,16 @@ impl CanonicalControlService {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        let (child, duplicate) = domain.spawn_child(
-            &authority,
-            &request.spawn_key,
-            request.spec,
-            &prerequisites,
-            &request.executor_kind,
-            &request.policy,
-        )?;
+        let (child, duplicate) =
+            domain.spawn_child(crate::orchestration::domain::SpawnChildRequest {
+                parent_authority: &authority,
+                spawn_key: &request.spawn_key,
+                spec: request.spec,
+                prerequisite_job_ids: &prerequisites,
+                executor_kind: &request.executor_kind,
+                policy: &request.policy,
+                call_id: request.call_id.as_deref(),
+            })?;
         Ok(CanonicalJobSpawnResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             snapshot: self.canonical_snapshot(&child.project_id, &child.id)?,
@@ -2277,6 +2314,7 @@ impl CanonicalControlService {
             constraints: request.constraints.clone(),
             hard_budget_micros: Some(request.hard_budget_micros),
             resource_commitment: request.resource_commitment,
+            recursive_limits: super::domain::RecursiveLimits::default(),
             health_probe: None,
         };
 
