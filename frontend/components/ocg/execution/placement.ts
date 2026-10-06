@@ -22,7 +22,7 @@
  */
 
 import type { Failure } from "../contracts";
-import type { JobExecution } from "./domain";
+import { terminalProducingAttempt, type JobExecution } from "./domain";
 
 /**
  * The reason codes `placement::choose` records when it returns no target, plus
@@ -73,6 +73,21 @@ export type PlacementTarget = {
   createdAt: number;
 };
 
+/**
+ * The primary placement target, qualified by the Job's lifecycle position.
+ *
+ * - `current`: the Job names a live authoritative Attempt, and this is that
+ *   Attempt's frozen target.
+ * - `final`: the Job is terminal. Terminalization cleared
+ *   `authoritative_attempt_id`, so there is no current authority; this is
+ *   the frozen target of the Attempt whose generation the Job settled at —
+ *   the target that produced the terminal outcome, not a historical one.
+ */
+export type SelectedPlacementTarget = {
+  kind: "current" | "final";
+  target: PlacementTarget;
+};
+
 export type PlacementProjection = {
   outcome: PlacementOutcome;
   /** Targets in canonical order, oldest Attempt generation first. */
@@ -80,17 +95,21 @@ export type PlacementProjection = {
   /** The recorded placement failure, when the backend produced one. */
   failure: Failure | null;
   /**
-   * The current authoritative target: the frozen target belonging to the Job's
-   * current `authoritativeAttemptId`, and nothing else.
+   * The Job's primary target: the frozen target belonging to the Job's
+   * authority reference, and nothing else. The reference is the live
+   * authoritative Attempt while the Job names one, or the producing Attempt
+   * of a terminal Job, whose settled `generation` is the only correlation
+   * terminalization leaves behind.
    *
-   * `null` whenever that Attempt has not frozen a target yet, or when the Job
-   * has no authoritative Attempt. An older Attempt's target is real history and
-   * stays in `history`, but it is never promoted here: the backend can mint a
-   * new Attempt and Executor before the first provider DispatchIntent has its
-   * configuration frozen, and reading that window as "the selected target"
-   * would state a decision the current Attempt has not made.
+   * `null` whenever the referenced Attempt has not frozen a target yet, or
+   * when no Attempt can be referenced. An older Attempt's target is real
+   * history and stays in `history`, but it is never promoted here: the
+   * backend can mint a new Attempt and Executor before the first provider
+   * DispatchIntent has its configuration frozen, and reading that window as
+   * "the selected target" would state a decision the current Attempt has
+   * not made.
    */
-  selected: PlacementTarget | null;
+  selected: SelectedPlacementTarget | null;
   /** Recorded targets belonging to Attempts other than the selected one. */
   history: readonly PlacementTarget[];
 };
@@ -143,16 +162,31 @@ export function placementOf(execution: JobExecution): PlacementProjection {
     (left, right) => left.generation - right.generation || left.createdAt - right.createdAt,
   );
 
-  // The current target is scoped to the authoritative Attempt alone. If that
-  // Attempt somehow recorded more than one distinct target group, the earliest
-  // group in canonical order is taken; no preference is expressed, because
-  // deciding between two targets of one Attempt would be scheduler semantics the
-  // backend never exposed.
+  // The primary target is scoped to the Job's authority reference alone: the
+  // live authoritative Attempt while the Job names one, or — once
+  // terminalization has cleared that pointer — the Attempt whose generation
+  // the terminal Job settled at. An older Attempt's target is never promoted:
+  // a live replacement Attempt that has not frozen a target yet means no
+  // current target, and a terminal Job whose producing Attempt froze nothing
+  // (or cannot be identified) means no final target. If the referenced
+  // Attempt somehow recorded more than one distinct target group, the
+  // earliest group in canonical order is taken; no preference is expressed,
+  // because deciding between two targets of one Attempt would be scheduler
+  // semantics the backend never exposed.
   const authoritative = execution.authoritativeAttemptId;
-  const selected = authoritative === null
+  const producing = authoritative === null
+    ? terminalProducingAttempt(execution.state, execution.generation, execution.attempts)
+    : null;
+  const referenceAttemptId = authoritative ?? producing?.attemptId ?? null;
+  const referenceTarget = referenceAttemptId === null
     ? null
-    : targets.find((target) => target.attemptId === authoritative) ?? null;
-  const history = selected === null ? targets : targets.filter((target) => target.attemptId !== selected.attemptId);
+    : targets.find((target) => target.attemptId === referenceAttemptId) ?? null;
+  const selected: SelectedPlacementTarget | null = referenceTarget === null
+    ? null
+    : { kind: authoritative !== null ? "current" : "final", target: referenceTarget };
+  const history = referenceTarget === null
+    ? targets
+    : targets.filter((target) => target.attemptId !== referenceTarget.attemptId);
 
   // `recorded` keeps meaning "the backend recorded placement evidence for this
   // Job", so history alone still counts as recorded. The current target and the

@@ -4,7 +4,7 @@ import { useState, ViewTransition } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageSurface, JOB_STATE, Pill, SectionTitle } from "../primitives";
-import { filterCalls, type JobExecution } from "./domain";
+import { filterCalls, isTerminalJobState, type JobExecution } from "./domain";
 import { JobRecoveryPanel, JobRelationsPanel } from "./job-relations";
 import { placementOf, type PlacementProjection, type PlacementTarget } from "./placement";
 import { jobElapsedMs, type JobAccounting } from "./accounting";
@@ -139,7 +139,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
 
       <JobRecoveryPanel execution={execution} />
 
-      <PlacementSection placement={placement} jobFailureShown={execution.terminationReason !== null} />
+      <PlacementSection placement={placement} jobFailureShown={execution.terminationReason !== null} jobTerminal={isTerminalJobState(execution.state)} />
 
       <section aria-label={t("execution.usage")} className="rounded-lg border border-border bg-card p-4">
         <SectionTitle>{t("execution.usage")}</SectionTitle>
@@ -238,14 +238,17 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
 /**
  * High-level placement situation, derived only from the recorded projection.
  *
- * The current target belongs to the authoritative Attempt alone, so recorded
- * history does not become "current" while that Attempt is still unfrozen.
- * A rejection is only claimed when the backend recorded one.
+ * The primary target belongs to the Job's authority reference alone — the
+ * live authoritative Attempt, or the producing Attempt of a terminal Job —
+ * so recorded history does not become "current" while a live Attempt is
+ * still unfrozen, and a terminal Job's producing target reads as the
+ * execution target rather than as history. A rejection is only claimed when
+ * the backend recorded one.
  */
-type PlacementSituation = "current" | "rejected" | "historical" | "none";
+type PlacementSituation = "current" | "final" | "rejected" | "historical" | "none";
 
 function placementSituation(placement: PlacementProjection): PlacementSituation {
-  if (placement.selected) return "current";
+  if (placement.selected) return placement.selected.kind;
   if (placement.outcome === "rejected" && placement.failure) return "rejected";
   if (placement.history.length > 0) return "historical";
   return "none";
@@ -253,6 +256,7 @@ function placementSituation(placement: PlacementProjection): PlacementSituation 
 
 const PLACEMENT_SITUATION_KEY = {
   current: "placement.stateCurrent",
+  final: "placement.stateFinal",
   rejected: "placement.stateRejected",
   historical: "placement.stateHistorical",
   none: "placement.stateNone",
@@ -260,6 +264,7 @@ const PLACEMENT_SITUATION_KEY = {
 
 const PLACEMENT_SITUATION_TONE = {
   current: "emerald",
+  final: "emerald",
   rejected: "red",
   historical: "slate",
   none: "slate",
@@ -294,7 +299,7 @@ function PlacementTargetFacts({ target, t }: { target: PlacementTarget; t: Trans
   );
 }
 
-function PlacementSection({ placement, jobFailureShown }: { placement: PlacementProjection; jobFailureShown: boolean }) {
+function PlacementSection({ placement, jobFailureShown, jobTerminal }: { placement: PlacementProjection; jobFailureShown: boolean; jobTerminal: boolean }) {
   const { t } = useI18n();
   const situation = placementSituation(placement);
   const selected = placement.selected;
@@ -308,9 +313,11 @@ function PlacementSection({ placement, jobFailureShown }: { placement: Placement
 
       {selected ? (
         <div className="mt-3 min-w-0">
-          <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.currentTarget")}</h4>
+          <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
+            {t(selected.kind === "current" ? "placement.currentTarget" : "placement.executionTarget")}
+          </h4>
           <div className="mt-2 min-w-0">
-            <PlacementTargetFacts target={selected} t={t} />
+            <PlacementTargetFacts target={selected.target} t={t} />
           </div>
         </div>
       ) : situation === "rejected" && placement.failure ? (
@@ -325,7 +332,9 @@ function PlacementSection({ placement, jobFailureShown }: { placement: Placement
           )}
         </div>
       ) : situation === "historical" ? (
-        <p className="mt-3 text-[12px] text-muted-foreground">{t("placement.currentNotRecorded")}</p>
+        <p className="mt-3 text-[12px] text-muted-foreground">
+          {t(jobTerminal ? "placement.executionNotRecorded" : "placement.currentNotRecorded")}
+        </p>
       ) : (
         <p className="mt-3 text-[12px] text-muted-foreground">{t("placement.notRecorded")}</p>
       )}
@@ -333,7 +342,7 @@ function PlacementSection({ placement, jobFailureShown }: { placement: Placement
       {showHistory && (
         <div className="mt-4 min-w-0 border-t border-border/70 pt-3">
           <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.history")}</h4>
-          {situation === "historical" && (
+          {situation === "historical" && !jobTerminal && (
             <p className="mt-1 text-[11px] text-muted-foreground">{t("placement.historyIsEarlier")}</p>
           )}
           {/* The key carries every field the projection groups on, so two

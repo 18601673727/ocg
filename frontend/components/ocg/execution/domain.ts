@@ -494,6 +494,48 @@ export function latestCallOf(calls: readonly ExecutionCall[]): ExecutionCall | n
   );
 }
 
+/**
+ * The Job states in which the backend no longer names a live authority.
+ *
+ * Terminalization (`finish_attempt_with_reason_in` in
+ * `src/orchestration/domain.rs`) clears `authoritative_attempt_id` in the
+ * same write that moves the Job to one of these states, while the Job's
+ * final `generation` keeps identifying the Attempt generation that produced
+ * the outcome. `cancelling` is deliberately absent: a Job being cancelled
+ * still names the Attempt whose settlement will carry it to a terminal
+ * state.
+ */
+const TERMINAL_JOB_STATES: readonly CanonicalJobState[] = [
+  "completed",
+  "failed",
+  "cancelled",
+  "unknown",
+  "orphaned",
+];
+
+export function isTerminalJobState(state: CanonicalJobState): boolean {
+  return TERMINAL_JOB_STATES.includes(state);
+}
+
+/**
+ * The Attempt that produced a terminal Job's outcome.
+ *
+ * `domain_attempts` is `UNIQUE(job_id, generation)` and terminalization
+ * leaves the Job's `generation` naming the producing Attempt's generation,
+ * so at most one carried Attempt can match. A non-terminal Job, or a settled
+ * generation no carried Attempt holds, yields no reference rather than a
+ * guess.
+ */
+export function terminalProducingAttempt<T extends { generation: number }>(
+  state: CanonicalJobState,
+  generation: number,
+  attempts: readonly T[],
+): T | null {
+  if (!isTerminalJobState(state)) return null;
+  const matches = attempts.filter((attempt) => attempt.generation === generation);
+  return matches.length === 1 ? matches[0] : null;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Job tree                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -588,7 +630,13 @@ export type JobRecoveryEvent = {
   outcome: string;
   replacementAttemptId: string | null;
   createdAt: number;
-  /** The Attempt this record names is no longer the Job's authoritative Attempt. */
+  /**
+   * The Attempt this record names is not the Job's authority reference: the
+   * live authoritative Attempt while the Job names one, or the producing
+   * Attempt of a terminal Job, whose authority pointer terminalization has
+   * cleared. A record naming the producing Attempt is not superseded merely
+   * because that pointer is gone — the Attempt was never replaced.
+   */
   supersededAttempt: boolean;
 };
 
@@ -596,7 +644,7 @@ export type JobRecoveryEvent = {
 export function recoveryHistoryOf(
   jobId: string,
   watchdog: readonly CanonicalWatchdogAction[],
-  authoritativeAttemptId: string | null,
+  referenceAttemptId: string | null,
 ): JobRecoveryEvent[] {
   return watchdog
     .slice()
@@ -612,7 +660,7 @@ export function recoveryHistoryOf(
       outcome: item.outcome,
       replacementAttemptId: item.replacement_attempt_id,
       createdAt: item.created_at,
-      supersededAttempt: item.attempt_id !== null && item.attempt_id !== authoritativeAttemptId,
+      supersededAttempt: item.attempt_id !== null && item.attempt_id !== referenceAttemptId,
     }));
 }
 
@@ -754,6 +802,10 @@ export function assembleJobExecution(input: {
   const authoritativeCalls = input.job.authoritative_attempt_id === null
     ? []
     : calls.filter((call) => call.attemptId === input.job.authoritative_attempt_id);
+  // A terminal Job's authority reference is the Attempt whose generation it
+  // settled at, because terminalization cleared the pointer it was named by.
+  const producing = terminalProducingAttempt(input.job.state, input.job.generation, input.attempts);
+  const referenceAttemptId = input.job.authoritative_attempt_id ?? producing?.id ?? null;
 
   return {
     apiVersion: input.apiVersion,
@@ -772,7 +824,7 @@ export function assembleJobExecution(input: {
     descendantSummary: input.job.descendant_summary,
     waitingForChildren: input.job.waiting_for_children ?? false,
     recursiveLimits: input.job.recursive_limits,
-    recovery: recoveryHistoryOf(input.job.id, input.watchdog ?? [], input.job.authoritative_attempt_id),
+    recovery: recoveryHistoryOf(input.job.id, input.watchdog ?? [], referenceAttemptId),
     canCancel: input.job.can_cancel,
     canRetry: input.job.can_retry,
     terminationReason: input.job.termination_reason,

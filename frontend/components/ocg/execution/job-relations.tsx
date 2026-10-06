@@ -289,7 +289,14 @@ export function JobRecoveryPanel({ execution }: { execution: JobExecution }) {
                   <div className="break-all">
                     <span className="font-sans">{t("recovery.attempt")}: </span>
                     <span className="font-mono">{event.attemptId}</span>
-                    <span> · {event.supersededAttempt ? t("recovery.superseded") : t("recovery.current")}</span>
+                    <span>
+                      {" · "}
+                      {event.supersededAttempt
+                        ? t("recovery.superseded")
+                        : execution.authoritativeAttemptId !== null
+                          ? t("recovery.current")
+                          : t("recovery.producing")}
+                    </span>
                   </div>
                 )}
                 {event.executorId && (
