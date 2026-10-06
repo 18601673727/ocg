@@ -361,7 +361,9 @@ export function RuntimeWorkspace({
       rememberSession(sessionId);
     }
     const isMobile = window.matchMedia("(max-width: 1023px)").matches;
-    navigate("chat");
+    // The session rides on the navigation itself: the shell's own session
+    // parameter is still the previous selection at this point.
+    navigate("chat", sessionId);
     if (isMobile) startTransition(() => setMobileInspectorOpen(true));
   }, [navigate, rememberSession]);
 
@@ -758,6 +760,8 @@ export function RuntimeWorkspace({
                 onRetryUsage={jobUsage.refresh}
                 onOpenInspector={selectedJobSessionId ? () => openJobInspector(selectedJobSessionId) : undefined}
               />
+            ) : historyStatus === "loading" ? (
+              <p role="status" className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">{t("common.loading")}</p>
             ) : (
               <NoExecutionNotice />
             )}
