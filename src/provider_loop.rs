@@ -922,13 +922,29 @@ impl CanonicalProviderCallHandler {
             provider_config.provider_key.clone(),
             provider_config.model.clone(),
         );
-        let _permit = match config.governor.acquire(governor_scope)? {
-            Ok(permit) => permit,
+        let _permit = match config.governor.acquire(governor_scope.clone())? {
+            Ok(permit) => {
+                // Record successful acquisition
+                let outcome = crate::orchestration::placement_projection::AcquisitionOutcome {
+                    success: true,
+                    governor_decision: "allowed_now".to_string(),
+                    failure_reason: None,
+                };
+                let _ = domain.record_acquisition_outcome(&envelope.job_id, &outcome);
+                permit
+            }
             Err(crate::orchestration::governor::GovernorDecision::RateLimited { retry_after }) => {
                 let message = format!(
                     "provider {}:{} is rate limited (retry after {:?})",
                     provider_config.provider_key, provider_config.model, retry_after
                 );
+                // Record reservation lost due to rate limit
+                let outcome = crate::orchestration::placement_projection::AcquisitionOutcome {
+                    success: false,
+                    governor_decision: format!("rate_limited:{}", retry_after.as_millis()),
+                    failure_reason: Some(message.clone()),
+                };
+                let _ = domain.record_acquisition_outcome(&envelope.job_id, &outcome);
                 fail_authoritative_provider_call(&config.project_root, &envelope, &message, true);
                 return Err(OcgError::config(message));
             }
@@ -937,6 +953,13 @@ impl CanonicalProviderCallHandler {
                     "provider {}:{} execution capacity is exhausted",
                     provider_config.provider_key, provider_config.model
                 );
+                // Record reservation lost due to capacity
+                let outcome = crate::orchestration::placement_projection::AcquisitionOutcome {
+                    success: false,
+                    governor_decision: "capacity_unavailable".to_string(),
+                    failure_reason: Some(message.clone()),
+                };
+                let _ = domain.record_acquisition_outcome(&envelope.job_id, &outcome);
                 fail_authoritative_provider_call(&config.project_root, &envelope, &message, true);
                 return Err(OcgError::config(message));
             }

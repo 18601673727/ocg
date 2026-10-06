@@ -145,7 +145,6 @@ pub struct PlacementDecision {
 }
 
 /// Outcome of final atomic resource acquisition.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcquisitionOutcome {
     pub success: bool,

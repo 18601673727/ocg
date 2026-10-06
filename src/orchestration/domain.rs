@@ -841,6 +841,12 @@ impl DomainRepository {
         )?;
         ensure_column(&connection, "domain_jobs", "admission_selection", "TEXT")?;
         ensure_column(&connection, "domain_jobs", "placement_evidence", "TEXT")?;
+        ensure_column(
+            &connection,
+            "domain_jobs",
+            "final_acquisition_outcome",
+            "TEXT",
+        )?;
         ensure_column(&connection, "domain_job_origins", "spawn_key", "TEXT")?;
         ensure_column(
             &connection,
@@ -3593,6 +3599,23 @@ impl DomainRepository {
         executor_kind: &str,
     ) -> Result<(Attempt, Executor)> {
         self.dispatch_job_inner(job_id, executor_kind, None, None)
+    }
+
+    /// Record final governor acquisition outcome for a Job.
+    pub(crate) fn record_acquisition_outcome(
+        &mut self,
+        job_id: &str,
+        outcome: &super::placement_projection::AcquisitionOutcome,
+    ) -> Result<()> {
+        let serialized =
+            serde_json::to_string(outcome).map_err(|error| invalid(&error.to_string()))?;
+        self.connection
+            .execute(
+                "UPDATE domain_jobs SET final_acquisition_outcome=?2 WHERE id=?1",
+                params![job_id, serialized],
+            )
+            .map_err(sql)?;
+        Ok(())
     }
 
     /// Claim an eligible Job under a frozen admission reservation.
