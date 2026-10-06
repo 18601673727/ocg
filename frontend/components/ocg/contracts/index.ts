@@ -63,6 +63,7 @@ export type {
   ProjectRecord,
   Provider,
   ProviderProtocol,
+  RecursiveLimits,
 } from "./generated";
 
 export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./generated";
@@ -122,6 +123,7 @@ export type {
   CanonicalEffectKind,
   CanonicalExecutor,
   CanonicalExecutionState,
+  CanonicalWatchdogAction,
   CanonicalJob,
   CanonicalJobLaunchAck,
   CanonicalJobLaunchOutcome,

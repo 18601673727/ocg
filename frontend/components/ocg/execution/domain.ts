@@ -25,9 +25,11 @@ import type {
   CanonicalExecutor,
   CanonicalJobRelations,
   CanonicalJobOperations,
+  CanonicalWatchdogAction,
   JobOrigin,
   Failure,
   CanonicalJobState,
+  RecursiveLimits,
 } from "../contracts";
 import type { ProjectId } from "../project/domain";
 import { formatTimestamp } from "@/lib/format";
@@ -492,6 +494,128 @@ export function latestCallOf(calls: readonly ExecutionCall[]): ExecutionCall | n
   );
 }
 
+/* -------------------------------------------------------------------------- */
+/* Job tree                                                                   */
+/* -------------------------------------------------------------------------- */
+
+export type JobTreeNode = {
+  jobId: string;
+  /** `null` when this node has not been loaded into this Project's view. */
+  state: CanonicalJobState | null;
+  loaded: boolean;
+  isCurrent: boolean;
+  children: JobTreeNode[];
+};
+
+export type JobTreeProjection = {
+  root: JobTreeNode;
+  /** `false` when the walk stopped at a loaded ancestor short of the canonical root. */
+  reachedRoot: boolean;
+  /** A repeated Job id was found while descending; that branch stopped rather than looping. */
+  cyclic: boolean;
+  /** Descendants of the root this view has actually loaded (excludes the root itself). */
+  loadedDescendantCount: number;
+};
+
+/**
+ * The Job's ownership/spawn subtree, built only from already-loaded Project
+ * Jobs. Nothing outside `executions` is fetched to complete it: an ancestor or
+ * child this view has not loaded yet renders as an unresolved stub instead of
+ * triggering a request.
+ */
+export function jobTreeOf(
+  execution: JobExecution,
+  executions: readonly JobExecution[],
+): JobTreeProjection {
+  const byId = new Map(executions.map((item) => [item.jobId, item] as const));
+  byId.set(execution.jobId, execution);
+
+  let localRootId = execution.jobId;
+  const ancestry = new Set([localRootId]);
+  for (;;) {
+    const parentId = byId.get(localRootId)?.parentJobId ?? null;
+    if (parentId === null || !byId.has(parentId) || ancestry.has(parentId)) break;
+    localRootId = parentId;
+    ancestry.add(localRootId);
+  }
+
+  let cyclic = false;
+  let loadedDescendantCount = 0;
+  const visited = new Set<string>();
+  function build(jobId: string): JobTreeNode {
+    const loadedJob = byId.get(jobId);
+    if (visited.has(jobId)) {
+      cyclic = true;
+      return { jobId, state: loadedJob?.state ?? null, loaded: loadedJob !== undefined, isCurrent: jobId === execution.jobId, children: [] };
+    }
+    visited.add(jobId);
+    if (loadedJob !== undefined && jobId !== localRootId) loadedDescendantCount += 1;
+    return {
+      jobId,
+      state: loadedJob?.state ?? null,
+      loaded: loadedJob !== undefined,
+      isCurrent: jobId === execution.jobId,
+      children: (loadedJob?.childJobIds ?? []).map(build),
+    };
+  }
+
+  return {
+    root: build(localRootId),
+    reachedRoot: localRootId === execution.rootJobId,
+    cyclic,
+    loadedDescendantCount,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Recovery (watchdog classification/action/outcome history)                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One recorded Watchdog pass against this Job, as the substrate's
+ * `domain_watchdog_actions` log carries it. The vocabulary for
+ * `classification`/`action`/`outcome` is the substrate's own words, so the UI
+ * renders the ones it recognizes and shows any other word verbatim.
+ */
+export type JobRecoveryEvent = {
+  id: string;
+  attemptId: string | null;
+  generation: number | null;
+  callId: string | null;
+  executorId: string | null;
+  classification: string;
+  action: string;
+  outcome: string;
+  replacementAttemptId: string | null;
+  createdAt: number;
+  /** The Attempt this record names is no longer the Job's authoritative Attempt. */
+  supersededAttempt: boolean;
+};
+
+/** Recovery history for one Job, oldest first. */
+export function recoveryHistoryOf(
+  jobId: string,
+  watchdog: readonly CanonicalWatchdogAction[],
+  authoritativeAttemptId: string | null,
+): JobRecoveryEvent[] {
+  return watchdog
+    .slice()
+    .sort((left, right) => left.created_at - right.created_at)
+    .map((item, index) => ({
+      id: `${jobId}:recovery:${item.created_at}:${index}`,
+      attemptId: item.attempt_id,
+      generation: item.generation,
+      callId: item.call_id,
+      executorId: item.executor_id,
+      classification: item.classification,
+      action: item.action,
+      outcome: item.outcome,
+      replacementAttemptId: item.replacement_attempt_id,
+      createdAt: item.created_at,
+      supersededAttempt: item.attempt_id !== null && item.attempt_id !== authoritativeAttemptId,
+    }));
+}
+
 /** The execution of one canonical Job, ready to render. */
 export type JobExecution = {
   apiVersion: string;
@@ -504,6 +628,19 @@ export type JobExecution = {
   blocks: string[];
   blockedBy: string[];
   blocked: boolean;
+  /** The ultimate ancestor of this Job's spawn tree; equals `jobId` for a root Job. */
+  rootJobId: string;
+  /** Spawn depth below `rootJobId`; `0` for a root Job. */
+  depth: number;
+  descendantJobIds: string[];
+  /** Descendant counts by state, across the whole recorded subtree, loaded or not. */
+  descendantSummary: Record<string, number>;
+  /** The Job's Attempt settled while a required-join child is still unsettled. */
+  waitingForChildren: boolean;
+  /** The root's recursion guardrails, when the stored payload carried them. */
+  recursiveLimits: RecursiveLimits | undefined;
+  /** Watchdog recovery history for this Job, oldest first. */
+  recovery: JobRecoveryEvent[];
   canCancel: boolean;
   canRetry: boolean;
   terminationReason: Failure | null;
@@ -602,11 +739,14 @@ export function assembleJobExecution(input: {
     authoritative_attempt_id: string | null;
     created_at: number;
     updated_at: number;
+    waiting_for_children?: boolean;
+    recursive_limits?: RecursiveLimits;
   };
   attempts: readonly CanonicalAttempt[];
   executors: readonly CanonicalExecutor[];
   calls: readonly CanonicalCall[];
   dispatchIntents: readonly CanonicalDispatchIntent[];
+  watchdog?: readonly CanonicalWatchdogAction[];
 }): JobExecution {
   const { projectId } = input;
   const generationByAttempt = new Map(input.attempts.map((attempt) => [attempt.id, attempt.generation]));
@@ -626,6 +766,13 @@ export function assembleJobExecution(input: {
     blocks: input.job.blocks,
     blockedBy: input.job.blocked_by,
     blocked: input.job.blocked,
+    rootJobId: input.job.root_job_id,
+    depth: input.job.depth,
+    descendantJobIds: input.job.descendant_job_ids,
+    descendantSummary: input.job.descendant_summary,
+    waitingForChildren: input.job.waiting_for_children ?? false,
+    recursiveLimits: input.job.recursive_limits,
+    recovery: recoveryHistoryOf(input.job.id, input.watchdog ?? [], input.job.authoritative_attempt_id),
     canCancel: input.job.can_cancel,
     canRetry: input.job.can_retry,
     terminationReason: input.job.termination_reason,

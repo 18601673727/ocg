@@ -40,9 +40,11 @@ import type {
   DiskGuardStatus,
   DiskState,
   GlobalConfiguration,
+  JsonValue,
   ProjectConfiguration,
   ProjectConfigurationView,
   ProjectRecord,
+  RecursiveLimits,
   ResourceBudget,
 } from "./generated";
 import { CANONICAL_API_VERSION } from "./generated";
@@ -54,6 +56,7 @@ import {
   decode,
   identity,
   index,
+  isRecord,
   jsonValue,
   literal,
   nullable,
@@ -285,6 +288,42 @@ export type CanonicalJob = CanonicalJobRelations & CanonicalJobOperations & {
   payload: string;
   created_at: number;
   updated_at: number;
+  /**
+   * `domain_jobs.waiting_for_children`: the Job's Attempt completed while a
+   * required child Job is still unsettled, so the Job is held rather than
+   * completed. The backend emits it on every Job; it is optional here only so
+   * hand-built literals still typecheck, and the decoder requires the key.
+   */
+  waiting_for_children?: boolean;
+  /**
+   * The recursion guardrails recorded in the Job's own specification payload.
+   * A child copies its root's limits, so these are the root's limits wherever
+   * they are read. Absent when the stored payload predates them or is plain text.
+   */
+  recursive_limits?: RecursiveLimits;
+};
+
+/**
+ * One Watchdog action, as `domain_watchdog_actions` recorded it.
+ *
+ * `WatchdogActionRecord` is serialized straight into the snapshot's `watchdog`
+ * array and carries no `ts_rs` projection, so this mirrors its serde shape.
+ * `classification`, `action` and `outcome` are bare strings in the substrate and
+ * stay strings here: the UI renders the ones it recognizes and shows any other
+ * word verbatim rather than coercing it. Absent optional ids are `null`.
+ */
+export type CanonicalWatchdogAction = {
+  job_id: string;
+  attempt_id: string | null;
+  generation: number | null;
+  call_id: string | null;
+  executor_id: string | null;
+  classification: string;
+  action: string;
+  evidence: JsonValue;
+  outcome: string;
+  replacement_attempt_id: string | null;
+  created_at: number;
 };
 
 /**
@@ -408,6 +447,12 @@ export type CanonicalExecutionState = {
   executors: CanonicalExecutor[];
   calls: CanonicalCall[];
   dispatchIntents: CanonicalDispatchIntent[];
+  /**
+   * Watchdog actions for this Job, oldest first. An empty array means the
+   * backend carried the record and it holds none. Optional only so hand-built
+   * literals still typecheck; the decoder requires the key.
+   */
+  watchdog?: CanonicalWatchdogAction[];
   /** The backend's own note on its graph projection, kept verbatim. */
   executionGraph: string;
 };
@@ -570,6 +615,44 @@ const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
   });
 };
 
+const recursiveLimits: Decoder<RecursiveLimits> = (input, path) => {
+  const rec = record(input, path, "recursive limits");
+  if (!rec.ok) return rec;
+  const maxDepth = req(rec.value, "max_depth", index, path);
+  if (!maxDepth.ok) return maxDepth;
+  const maxChildren = req(rec.value, "max_children_per_job", index, path);
+  if (!maxChildren.ok) return maxChildren;
+  const maxDescendants = req(rec.value, "max_total_descendants_per_root", index, path);
+  if (!maxDescendants.ok) return maxDescendants;
+  return yes({
+    max_depth: maxDepth.value,
+    max_children_per_job: maxChildren.value,
+    max_total_descendants_per_root: maxDescendants.value,
+  });
+};
+
+/**
+ * The recursion limits inside a Job's specification payload.
+ *
+ * `payload` is the JSON-encoded `JobSpec`. Older CLI Jobs stored plain-text
+ * objectives, which the backend reads as an unconstrained default spec; here
+ * that is "not recorded", because the PWA will not restate backend defaults as
+ * though the Job had declared them. A JSON object that carries
+ * `recursive_limits` must carry a well-formed one.
+ */
+const payloadRecursiveLimits: Decoder<RecursiveLimits | undefined> = (input, path) => {
+  const payload = string(input, path);
+  if (!payload.ok) return payload;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload.value);
+  } catch {
+    return yes(undefined);
+  }
+  if (!isRecord(parsed)) return yes(undefined);
+  return opt(parsed, "recursive_limits", recursiveLimits, `${path}`);
+};
+
 const job: Decoder<CanonicalJob> = (input, path) => {
   const rec = record(input, path, "a canonical Job");
   if (!rec.ok) return rec;
@@ -593,6 +676,10 @@ const job: Decoder<CanonicalJob> = (input, path) => {
   if (!relations.ok) return relations;
   const operations = jobOperations(rec.value, path);
   if (!operations.ok) return operations;
+  const waitingForChildren = req(rec.value, "waiting_for_children", boolean, path);
+  if (!waitingForChildren.ok) return waitingForChildren;
+  const limits = payloadRecursiveLimits(payload.value, `${path}.payload`);
+  if (!limits.ok) return limits;
   return yes({
     id: id.value,
     project_id: projectId.value,
@@ -602,6 +689,8 @@ const job: Decoder<CanonicalJob> = (input, path) => {
     payload: payload.value,
     created_at: createdAt.value,
     updated_at: updatedAt.value,
+    waiting_for_children: waitingForChildren.value,
+    ...(limits.value ? { recursive_limits: limits.value } : {}),
     ...relations.value,
     ...operations.value,
   });
@@ -761,6 +850,47 @@ const dispatchIntent: Decoder<CanonicalDispatchIntent> = (input, path) => {
   });
 };
 
+const watchdogAction: Decoder<CanonicalWatchdogAction> = (input, path) => {
+  const rec = record(input, path, "a canonical Watchdog action");
+  if (!rec.ok) return rec;
+  const jobId = req(rec.value, "job_id", identity, path);
+  if (!jobId.ok) return jobId;
+  // The Rust record skips these when `None`, so an absent key is a real null.
+  const attemptId = opt(rec.value, "attempt_id", identity, path);
+  if (!attemptId.ok) return attemptId;
+  const generation = opt(rec.value, "generation", index, path);
+  if (!generation.ok) return generation;
+  const callId = opt(rec.value, "call_id", identity, path);
+  if (!callId.ok) return callId;
+  const executorId = opt(rec.value, "executor_id", identity, path);
+  if (!executorId.ok) return executorId;
+  const classification = req(rec.value, "classification", string, path);
+  if (!classification.ok) return classification;
+  const action = req(rec.value, "action", string, path);
+  if (!action.ok) return action;
+  const evidence = req(rec.value, "evidence", jsonValue, path);
+  if (!evidence.ok) return evidence;
+  const outcome = req(rec.value, "outcome", string, path);
+  if (!outcome.ok) return outcome;
+  const replacement = opt(rec.value, "replacement_attempt_id", identity, path);
+  if (!replacement.ok) return replacement;
+  const createdAt = req(rec.value, "created_at", number, path);
+  if (!createdAt.ok) return createdAt;
+  return yes({
+    job_id: jobId.value,
+    attempt_id: attemptId.value ?? null,
+    generation: generation.value ?? null,
+    call_id: callId.value ?? null,
+    executor_id: executorId.value ?? null,
+    classification: classification.value,
+    action: action.value,
+    evidence: evidence.value,
+    outcome: outcome.value,
+    replacement_attempt_id: replacement.value ?? null,
+    created_at: createdAt.value,
+  });
+};
+
 const executionState: Decoder<CanonicalExecutionState> = (input, path) => {
   const rec = record(input, path, "a canonical execution state");
   if (!rec.ok) return rec;
@@ -774,6 +904,8 @@ const executionState: Decoder<CanonicalExecutionState> = (input, path) => {
   if (!calls.ok) return calls;
   const dispatchIntents = req(rec.value, "dispatch_intents", array(dispatchIntent), path);
   if (!dispatchIntents.ok) return dispatchIntents;
+  const watchdog = req(rec.value, "watchdog", array(watchdogAction), path);
+  if (!watchdog.ok) return watchdog;
   const graph = req(rec.value, "execution_graph", string, path);
   if (!graph.ok) return graph;
   return yes({
@@ -782,6 +914,7 @@ const executionState: Decoder<CanonicalExecutionState> = (input, path) => {
     executors: executors.value,
     calls: calls.value,
     dispatchIntents: dispatchIntents.value,
+    watchdog: watchdog.value,
     executionGraph: graph.value,
   });
 };

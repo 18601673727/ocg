@@ -42,6 +42,7 @@ export type CanonicalExecutionProjection = {
   executors: CanonicalExecutionState["executors"];
   calls: CanonicalExecutionState["calls"];
   dispatchIntents: CanonicalExecutionState["dispatchIntents"];
+  watchdog: CanonicalExecutionState["watchdog"];
   /** The backend's note on its graph projection; the PWA draws no graph itself. */
   executionGraph: string;
 };
@@ -136,6 +137,7 @@ export function projectCanonicalSnapshot(
       executors: state.executors,
       calls: state.calls,
       dispatchIntents: state.dispatchIntents,
+      watchdog: state.watchdog,
       executionGraph: state.executionGraph,
     },
   };
@@ -161,6 +163,7 @@ export function assembleJobExecutionFromProjection(
     executors: projection.executors,
     calls: projection.calls,
     dispatchIntents: projection.dispatchIntents,
+    watchdog: projection.watchdog,
   });
 }
 

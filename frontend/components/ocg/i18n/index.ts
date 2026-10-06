@@ -63,6 +63,32 @@ export function runtimeStateLabel(t: TranslateFn, state: string): string {
   return key ? t(key) : state;
 }
 
+/**
+ * `domain_watchdog_actions.classification`/`action`/`outcome` are
+ * unconstrained columns, so only the words the substrate is actually known to
+ * write get a translation; any other word is shown verbatim.
+ */
+const RECOVERY_KEYS: Record<string, I18nKey> = {
+  "admission_pending": "recovery.classificationAdmissionPending",
+  "cancel_unconfirmed": "recovery.classificationCancelUnconfirmed",
+  "executor_disappeared": "recovery.classificationExecutorDisappeared",
+  "observe": "recovery.actionObserve",
+  "confirm_stopped": "recovery.actionConfirmStopped",
+  "confirm_unknown": "recovery.actionConfirmUnknown",
+  "readmit": "recovery.actionReadmit",
+  "fence_attempt": "recovery.actionFenceAttempt",
+  "observed": "recovery.outcomeObserved",
+  "fenced": "recovery.outcomeFenced",
+  "readmitted": "recovery.outcomeReadmitted",
+  "cancel_stopped": "recovery.outcomeCancelStopped",
+  "cancel_unknown": "recovery.outcomeCancelUnknown",
+};
+
+export function recoveryLabel(t: TranslateFn, value: string): string {
+  const key = RECOVERY_KEYS[value];
+  return key ? t(key) : value;
+}
+
 export function runtimeStatusDetail(t: TranslateFn, status: import("../types").RuntimeStatus): string | undefined {
   if (status.detailCode === "provider-ready") return t("chat.runtimeConnected");
   if (status.detailCode === "configuration-required") return t("chat.runtimeUnconfigured");

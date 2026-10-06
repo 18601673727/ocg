@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { PageSurface, JOB_STATE, Pill, SectionTitle } from "../primitives";
 import { filterCalls, type JobExecution } from "./domain";
+import { JobRecoveryPanel, JobRelationsPanel } from "./job-relations";
 import { placementOf, type PlacementProjection, type PlacementTarget } from "./placement";
 import { jobElapsedMs, type JobAccounting } from "./accounting";
 import { ContextMetrics, CostDetails, TokenMetrics } from "../usage/usage-values";
@@ -133,6 +134,10 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
         )}
         <p className="mt-4 text-[11px] leading-5 text-muted-foreground">{t("execution.jobDetailsNotReported")}</p>
       </section>
+
+      <JobRelationsPanel execution={execution} executions={executions} onSelectJob={onSelectJob} />
+
+      <JobRecoveryPanel execution={execution} />
 
       <PlacementSection placement={placement} jobFailureShown={execution.terminationReason !== null} />
 
