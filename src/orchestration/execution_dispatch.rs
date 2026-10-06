@@ -410,6 +410,29 @@ impl BoundedDispatcher {
         Ok(signalled)
     }
 
+    /// Whether this runtime still holds a live cancellation token for the Attempt.
+    ///
+    /// A live token is the provider worker's ownership of a queued or running
+    /// Call. It is not a heartbeat and it is not execution progress: the worker
+    /// may be blocked on an HTTP read whose deadline is the transport timeout.
+    /// Absence means this process no longer owns the Call, which is the only
+    /// fact a reconciler may treat as disappearance.
+    pub fn owns_attempt(&self, attempt_id: &str) -> Result<bool> {
+        let mut cancellations = self
+            .cancellations
+            .lock()
+            .map_err(|_| invalid("dispatcher cancellation lock poisoned"))?;
+        let Some(tokens) = cancellations.get_mut(attempt_id) else {
+            return Ok(false);
+        };
+        tokens.retain(|token| token.strong_count() > 0);
+        let owned = !tokens.is_empty();
+        if !owned {
+            cancellations.remove(attempt_id);
+        }
+        Ok(owned)
+    }
+
     /// Blocking consumer operation intended for a synchronous execution lane.
     pub fn recv(&self) -> Result<Option<ExecutionEnvelope>> {
         match self.receiver.recv() {

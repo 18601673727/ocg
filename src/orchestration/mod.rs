@@ -2,25 +2,31 @@
 //! state, plus independent runtime context and configuration facilities.
 //!
 //! Context hand-offs and checkpoints remain independent of execution identity.
+pub(crate) mod admission;
 pub mod budget;
 pub mod call_schema;
 pub mod canonical_control;
 pub mod checkpoint;
 pub mod config;
 pub mod context_governor;
+pub mod disk_guard;
 pub mod domain;
 pub mod execution_dispatch;
 pub mod execution_runtime;
+pub(crate) mod governor;
 pub mod handoff;
+pub mod health_probe;
 pub mod journal;
 pub(crate) mod placement;
+pub(crate) mod placement_projection;
 pub mod projection;
 pub mod state;
+pub(crate) mod watchdog;
 
 pub use budget::{
     admit as admit_spend, conflict_settlement_id, reservation_id, settlement_id,
     settlement_payload_digest, BillableUsage, BudgetConfig, BudgetOrigin, BudgetStatus, CostBasis,
-    ProjectBudget, ProjectBudgetReceipt, Money, PriceOutcome, PriceRefusal, PricingBasis,
+    Money, PriceOutcome, PriceRefusal, PricingBasis, ProjectBudget, ProjectBudgetReceipt,
     QuotaFacts, QuotaState, Reservation, ReservationState, Settlement, SettlementDisposition,
     SettlementEffect, SettlementVariance, SpendAction, SpendAssessment, SpendBlock, SpendDecision,
     SpendRequest, TokenPrice, UsageRecord, UsageSource, MAX_RATE_MICROS_PER_MILLION,

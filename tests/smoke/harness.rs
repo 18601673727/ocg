@@ -538,20 +538,28 @@ impl SmokeHarness {
         self.alive()?;
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut command = Command::new("node");
-        command.env_clear()
+        command
+            .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .current_dir(root)
             .arg(root.join("tests/smoke/canonical-session.cjs"))
             .arg(format!("http://{}", self.address.ok_or("no OCG address")?))
             .args([&chat.project_id, &chat.session_id, message_id]);
-        let mut process = Process::spawn(&mut command, &self.path(""), "canonical-retry", self.timeouts)?;
-        let status = process.wait_until(self.operation_deadline(self.timeouts.http))?
+        let mut process = Process::spawn(
+            &mut command,
+            &self.path(""),
+            "canonical-retry",
+            self.timeouts,
+        )?;
+        let status = process
+            .wait_until(self.operation_deadline(self.timeouts.http))?
             .ok_or("canonical retry timed out")?;
         if !status.success() {
             return Err(format!("canonical retry: {status}\n{}", log(&process.stderr)).into());
         }
         Ok(Chat {
-            project_id: chat.project_id.clone(), session_id: chat.session_id.clone(),
+            project_id: chat.project_id.clone(),
+            session_id: chat.session_id.clone(),
             job_id: string(&serde_json::from_str(&log(&process.stdout))?, "job_id")?,
         })
     }
@@ -559,13 +567,23 @@ impl SmokeHarness {
     pub fn verify_usage_contract(&mut self, project_id: &str, session_id: &str) -> Result<()> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut command = Command::new("node");
-        command.current_dir(root)
+        command
+            .current_dir(root)
             .arg(root.join("tests/smoke/usage-contract.cjs"))
             .arg(format!("http://{}", self.address.ok_or("no OCG address")?))
             .args([project_id, session_id]);
-        let mut process = Process::spawn(&mut command, &self.path(""), "usage-contract", self.timeouts)?;
-        let status = process.wait_until(self.operation_deadline(self.timeouts.http))?.ok_or("usage contract timed out")?;
-        if !status.success() { return Err(format!("usage contract: {status}\n{}", log(&process.stderr)).into()); }
+        let mut process = Process::spawn(
+            &mut command,
+            &self.path(""),
+            "usage-contract",
+            self.timeouts,
+        )?;
+        let status = process
+            .wait_until(self.operation_deadline(self.timeouts.http))?
+            .ok_or("usage contract timed out")?;
+        if !status.success() {
+            return Err(format!("usage contract: {status}\n{}", log(&process.stderr)).into());
+        }
         Ok(())
     }
 

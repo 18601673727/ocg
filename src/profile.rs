@@ -291,7 +291,9 @@ fn clean_legacy_resources(value: &mut Value) {
             !legacy
         });
     }
-    let legacy_provider_missing = value.get("providers").and_then(Value::as_object)
+    let legacy_provider_missing = value
+        .get("providers")
+        .and_then(Value::as_object)
         .is_some_and(|providers| !providers.contains_key("placeholder"));
     let mut removed_models = std::collections::BTreeSet::new();
     if let Some(models) = value.get_mut("models").and_then(Value::as_object_mut) {

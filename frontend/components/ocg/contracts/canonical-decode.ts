@@ -35,6 +35,9 @@ import type {
   CanonicalJobSummary,
   CanonicalProjectResponse,
   CanonicalProjectsResponse,
+  DiskGuardConfig,
+  DiskGuardStatus,
+  DiskState,
   GlobalConfiguration,
   ProjectConfiguration,
   ProjectConfigurationView,
@@ -59,6 +62,7 @@ import {
   record,
   req,
   string,
+  stringMap,
   yes,
   type DecodeResult,
   type Decoder,
@@ -517,9 +521,11 @@ const jobOrigin: Decoder<JobOrigin> = (input, path) => {
   if (!key.ok) return key;
   const fingerprint = req(rec.value, "spawn_fingerprint", nullable(identity), path);
   if (!fingerprint.ok) return fingerprint;
+  const callId = req(rec.value, "call_id", nullable(identity), path);
+  if (!callId.ok) return callId;
   const policy = req(rec.value, "policy", nullable(childPolicy), path);
   if (!policy.ok) return policy;
-  return yes({ parent_job_id: parent.value, attempt_id: attempt.value, generation: generation.value, spawn_key: key.value, spawn_fingerprint: fingerprint.value, policy: policy.value });
+  return yes({ parent_job_id: parent.value, attempt_id: attempt.value, generation: generation.value, spawn_key: key.value, spawn_fingerprint: fingerprint.value, call_id: callId.value, policy: policy.value });
 };
 
 const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
@@ -540,6 +546,14 @@ const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
   if (!blockedBy.ok) return blockedBy;
   const blocked = req(rec.value, "blocked", boolean, path);
   if (!blocked.ok) return blocked;
+  const rootJobId = req(rec.value, "root_job_id", identity, path);
+  if (!rootJobId.ok) return rootJobId;
+  const depth = req(rec.value, "depth", index, path);
+  if (!depth.ok) return depth;
+  const descendantJobIds = req(rec.value, "descendant_job_ids", array(identity), path);
+  if (!descendantJobIds.ok) return descendantJobIds;
+  const descendantSummary = req(rec.value, "descendant_summary", stringMap(number), path);
+  if (!descendantSummary.ok) return descendantSummary;
   return yes({
     parent_job_id: parentJobId.value,
     origin: origin.value ?? null,
@@ -548,6 +562,10 @@ const jobRelations: Decoder<CanonicalJobRelations> = (input, path) => {
     blocks: blocks.value,
     blocked_by: blockedBy.value,
     blocked: blocked.value,
+    root_job_id: rootJobId.value,
+    depth: depth.value,
+    descendant_job_ids: descendantJobIds.value,
+    descendant_summary: descendantSummary.value,
   });
 };
 
@@ -777,6 +795,62 @@ const resourceBudget: Decoder<ResourceBudget> = (input, path) => {
   return yes({ hard_limit: hardLimit.value, unit: unit.value });
 };
 
+const diskState: Decoder<DiskState> = (input, path) =>
+  oneOf<DiskState>(["healthy", "pressure", "critical", "unknown"])(input, path);
+
+const diskGuardConfig: Decoder<DiskGuardConfig> = (input, path) => {
+  const rec = record(input, path, "a DiskGuardConfig");
+  if (!rec.ok) return rec;
+  const minimum = req(rec.value, "minimum_free_bytes", number, path);
+  if (!minimum.ok) return minimum;
+  const pressure = req(rec.value, "pressure_free_bytes", number, path);
+  if (!pressure.ok) return pressure;
+  const resume = req(rec.value, "resume_free_bytes", number, path);
+  if (!resume.ok) return resume;
+  return yes({
+    minimum_free_bytes: minimum.value,
+    pressure_free_bytes: pressure.value,
+    resume_free_bytes: resume.value,
+  });
+};
+
+const diskGuardStatus: Decoder<DiskGuardStatus> = (input, path) => {
+  const rec = record(input, path, "a DiskGuardStatus");
+  if (!rec.ok) return rec;
+  const state = req(rec.value, "state", diskState, path);
+  if (!state.ok) return state;
+  const available = req(rec.value, "available_bytes", number, path);
+  if (!available.ok) return available;
+  const total = req(rec.value, "total_bytes", number, path);
+  if (!total.ok) return total;
+  const reserve = req(rec.value, "reserve_bytes", number, path);
+  if (!reserve.ok) return reserve;
+  const pressure = req(rec.value, "pressure_bytes", number, path);
+  if (!pressure.ok) return pressure;
+  const resume = req(rec.value, "resume_bytes", number, path);
+  if (!resume.ok) return resume;
+  const observedAt = req(rec.value, "observed_at", number, path);
+  if (!observedAt.ok) return observedAt;
+  const root = req(rec.value, "root", string, path);
+  if (!root.ok) return root;
+  const defersExecution = req(rec.value, "defers_new_execution", boolean, path);
+  if (!defersExecution.ok) return defersExecution;
+  const defersExpansion = req(rec.value, "defers_expansion", boolean, path);
+  if (!defersExpansion.ok) return defersExpansion;
+  return yes({
+    state: state.value,
+    available_bytes: available.value,
+    total_bytes: total.value,
+    reserve_bytes: reserve.value,
+    pressure_bytes: pressure.value,
+    resume_bytes: resume.value,
+    observed_at: observedAt.value,
+    root: root.value,
+    defers_new_execution: defersExecution.value,
+    defers_expansion: defersExpansion.value,
+  });
+};
+
 const globalConfiguration: Decoder<GlobalConfiguration> = (input, path) => {
   const rec = record(input, path, "a GlobalConfiguration");
   if (!rec.ok) return rec;
@@ -792,6 +866,8 @@ const globalConfiguration: Decoder<GlobalConfiguration> = (input, path) => {
   if (!runtime.ok) return runtime;
   const budget = req(rec.value, "resource_budget", nullable(resourceBudget), path);
   if (!budget.ok) return budget;
+  const storageGuard = req(rec.value, "storage_guard", nullable(diskGuardConfig), path);
+  if (!storageGuard.ok) return storageGuard;
   return yes({
     provider: provider.value,
     model: model.value,
@@ -799,6 +875,7 @@ const globalConfiguration: Decoder<GlobalConfiguration> = (input, path) => {
     routing: routing.value,
     runtime: runtime.value,
     resource_budget: budget.value,
+    storage_guard: storageGuard.value,
   });
 };
 
@@ -986,11 +1063,14 @@ const dashboardResponse: Decoder<CanonicalDashboardResponse> = (input, path) => 
   if (!jobs.ok) return jobs;
   const selectedJob = req(rec.value, "selected_job", nullable(jobSnapshot), path);
   if (!selectedJob.ok) return selectedJob;
+  const diskGuard = req(rec.value, "disk_guard", nullable(diskGuardStatus), path);
+  if (!diskGuard.ok) return diskGuard;
   return yes({
     api_version: apiVersion.value,
     project_id: projectId.value,
     jobs: jobs.value,
     selected_job: selectedJob.value,
+    disk_guard: diskGuard.value,
   });
 };
 

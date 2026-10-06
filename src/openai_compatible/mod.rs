@@ -18,19 +18,21 @@
 //! OpenAI-compatible endpoint
 //! ```
 
+pub mod error;
+pub mod normalize;
 pub mod request;
 pub mod response;
 pub mod stream;
-pub mod error;
-pub mod normalize;
 
+pub use error::{ProviderFailure, TransportError};
+pub use normalize::ToolCallNormalizer;
 pub use request::{
-    ChatRequest, ChatMessage, ChatRole, MessageContentWire, ContentPartWire,
-    ToolWire, FunctionDefinitionWire, ChatToolCallWire, ChatFunctionCallWire,
-    StreamOptions, StopSequences, ToolChoiceWire, NamedToolChoiceWire,
-    NamedFunctionWire, ResponseFormatWire, JsonSchemaWire,
+    ChatFunctionCallWire, ChatMessage, ChatRequest, ChatRole, ChatToolCallWire, ContentPartWire,
+    FunctionDefinitionWire, JsonSchemaWire, MessageContentWire, NamedFunctionWire,
+    NamedToolChoiceWire, ResponseFormatWire, StopSequences, StreamOptions, ToolChoiceWire,
+    ToolWire,
 };
 pub use response::ChatCompletionChunk;
-pub use stream::{ChatStreamEvent, ChatFinishReason, NormalizedUsage, CompletedToolCall, ChatStreamSummary};
-pub use error::{TransportError, ProviderFailure};
-pub use normalize::ToolCallNormalizer;
+pub use stream::{
+    ChatFinishReason, ChatStreamEvent, ChatStreamSummary, CompletedToolCall, NormalizedUsage,
+};

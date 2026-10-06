@@ -500,8 +500,14 @@ mod tests {
     #[test]
     fn test_normalize_credential_ref() {
         assert_eq!(normalize_credential_ref("openai", &[]), "OPENAI_KEY");
-        assert_eq!(normalize_credential_ref("My Provider", &[]), "MYPROVIDER_KEY");
-        assert_eq!(normalize_credential_ref("openai", &["OPENAI_KEY"]), "OPENAI_KEY_2");
+        assert_eq!(
+            normalize_credential_ref("My Provider", &[]),
+            "MYPROVIDER_KEY"
+        );
+        assert_eq!(
+            normalize_credential_ref("openai", &["OPENAI_KEY"]),
+            "OPENAI_KEY_2"
+        );
     }
 
     #[test]

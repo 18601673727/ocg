@@ -7,11 +7,16 @@
 
 use crate::core_contract::{Failure, FailureClass};
 use crate::error::{OcgError, Result};
+use crate::orchestration::admission::{
+    publish_call, reserve, AdmissionContext, AdmissionTarget, PayloadMode, PreparedExecution,
+};
+use crate::orchestration::disk_guard::{DiskGuard, DiskGuardConfig, DiskGuardStatus};
 use crate::orchestration::domain::{
     Attempt, AttemptAuthority, Call, ChildPolicy, DispatchIntent, DomainRepository, Executor, Job,
-    JobOrigin, JobSpec, JobState,
+    JobOrigin, JobSpec,
 };
 use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
+use crate::orchestration::health_probe::HealthProbeObservation;
 use crate::orchestration::journal::{EventDelta, ExecutionProjection, MAX_EVENT_READ};
 use crate::project::{self, ProjectBoundary};
 use serde::{Deserialize, Serialize};
@@ -84,15 +89,6 @@ fn chat_conversation_view(
         created_at: conversation.created_at,
         updated_at: conversation.updated_at,
     }
-}
-
-fn endpoint_has_userinfo(endpoint: &str) -> bool {
-    endpoint.split_once("://").is_some_and(|(_, rest)| {
-        rest.split(['/', '?', '#'])
-            .next()
-            .unwrap_or("")
-            .contains('@')
-    })
 }
 
 /// The deterministic first model input: the launch intent and nothing else.
@@ -168,6 +164,9 @@ pub struct GlobalConfiguration {
     pub routing: Option<String>,
     pub runtime: Option<String>,
     pub resource_budget: Option<ResourceBudget>,
+    /// Execution disk-space protection. `None` selects the conservative
+    /// built-in reserve; existing stored configurations keep loading unchanged.
+    pub storage_guard: Option<DiskGuardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
@@ -184,6 +183,12 @@ fn provider_concurrency(defaults: &Value) -> Result<usize> {
             .map(|limit| limit as usize)
             .ok_or_else(|| invalid("Project provider_concurrency must be between 1 and 64")),
     }
+}
+
+/// The effective disk-guard thresholds: the configured reserve, or the
+/// conservative built-in policy when the Project predates disk safety.
+fn disk_guard_config(global: &GlobalConfiguration) -> DiskGuardConfig {
+    global.storage_guard.unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -243,6 +248,10 @@ pub struct CanonicalJobRelations {
     pub blocks: Vec<String>,
     pub blocked_by: Vec<String>,
     pub blocked: bool,
+    pub root_job_id: String,
+    pub depth: u64,
+    pub descendant_job_ids: Vec<String>,
+    pub descendant_summary: BTreeMap<String, usize>,
 }
 
 impl CanonicalJobRelations {
@@ -268,6 +277,31 @@ impl CanonicalJobRelations {
             })
             .cloned()
             .collect();
+        let mut descendant_job_ids = origins
+            .iter()
+            .filter(|(_, parent)| *parent == &job.id)
+            .map(|(child, _)| child.clone())
+            .collect::<Vec<_>>();
+        let mut cursor = 0;
+        while cursor < descendant_job_ids.len() {
+            let parent = &descendant_job_ids[cursor];
+            let children = origins
+                .iter()
+                .filter(|(_, origin_parent)| origin_parent == &parent)
+                .map(|(child, _)| child.clone())
+                .filter(|child| !descendant_job_ids.contains(child))
+                .collect::<Vec<_>>();
+            descendant_job_ids.extend(children);
+            cursor += 1;
+        }
+        let mut descendant_summary = BTreeMap::new();
+        for descendant_id in &descendant_job_ids {
+            if let Some(descendant) = projection.jobs.get(descendant_id) {
+                *descendant_summary
+                    .entry(descendant.state.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
         Self {
             parent_job_id: origins.get(&job.id).cloned(),
             origin: origin_details.get(&job.id).cloned(),
@@ -287,6 +321,10 @@ impl CanonicalJobRelations {
                 .collect(),
             blocked: !blocked_by.is_empty(),
             blocked_by,
+            root_job_id: job.root_job_id.clone(),
+            depth: job.depth,
+            descendant_job_ids,
+            descendant_summary,
         }
     }
 }
@@ -339,6 +377,8 @@ pub struct CanonicalJobOperationResponse {
 pub struct CanonicalJobSpawnRequest {
     pub parent_attempt_id: String,
     pub expected_generation: u64,
+    #[serde(default)]
+    pub call_id: Option<String>,
     pub spawn_key: String,
     pub spec: JobSpec,
     #[serde(default)]
@@ -414,6 +454,9 @@ pub struct CanonicalDashboardResponse {
     pub project_id: String,
     pub jobs: Vec<CanonicalJobSummary>,
     pub selected_job: Option<CanonicalJobSnapshot>,
+    /// Cached execution disk-space state for this Project, if its runtime has
+    /// performed an observation. Absent before the first observation.
+    pub disk_guard: Option<DiskGuardStatus>,
 }
 
 /// Acknowledgement for cancelling one active chat turn. Transport state only;
@@ -903,6 +946,9 @@ impl CanonicalControlService {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
+        if let Some(storage_guard) = config.storage_guard.as_ref() {
+            storage_guard.validate()?;
+        }
         // One serialization boundary covers the whole read-modify-write: the
         // latest authoritative revision is read, mutated and committed while
         // no other configuration writer can interleave.
@@ -1022,6 +1068,49 @@ impl CanonicalControlService {
         }
     }
 
+    /// Resolve the execution disk-space guard for one Project. A live runtime
+    /// owns the shared cached guard; operator paths without a runtime get a
+    /// one-shot guard over the same root and the same configured thresholds.
+    /// Either way the configured policy is applied before the guard is used,
+    /// so threshold updates take effect without restart.
+    fn disk_guard_for_project(
+        &self,
+        project_id: &str,
+        root: &Path,
+        global: &GlobalConfiguration,
+    ) -> Result<DiskGuard> {
+        let config = disk_guard_config(global);
+        if let Some(registry) = &self.runtime_registry {
+            if let Some(handle) = registry.handle(project_id)? {
+                let guard = handle.disk_guard().clone();
+                guard.apply_config(&config)?;
+                return Ok(guard);
+            }
+        }
+        if let Some(handle) = &self.runtime_handle {
+            if handle.project_root() == root && !handle.is_cancelled() {
+                let guard = handle.disk_guard().clone();
+                guard.apply_config(&config)?;
+                return Ok(guard);
+            }
+        }
+        DiskGuard::for_root(root, config)
+    }
+
+    /// The cached disk-guard projection for one Project. Performs no
+    /// filesystem I/O: a missing runtime simply means no observation yet.
+    fn disk_guard_status(&self, project_id: &str, root: &Path) -> Option<DiskGuardStatus> {
+        if let Some(registry) = &self.runtime_registry {
+            if let Ok(Some(handle)) = registry.handle(project_id) {
+                return Some(handle.disk_guard().status());
+            }
+        }
+        self.runtime_handle
+            .as_ref()
+            .filter(|handle| handle.project_root() == root && !handle.is_cancelled())
+            .map(|handle| handle.disk_guard().status())
+    }
+
     /// Open one registered Project as a candidate owner of a Job lookup.
     ///
     /// Only a registry entry whose boundary itself is gone is reported as
@@ -1114,17 +1203,29 @@ impl CanonicalControlService {
         })
     }
 
-    pub fn project_usage(&self, project_id: &str, window: crate::contracts::UsageWindow) -> Result<crate::contracts::ProjectUsageResponse> {
+    pub fn project_usage(
+        &self,
+        project_id: &str,
+        window: crate::contracts::UsageWindow,
+    ) -> Result<crate::contracts::ProjectUsageResponse> {
         let (_, repository) = self.project_repository(project_id)?;
         repository.project_usage(project_id, window)
     }
 
-    pub fn conversation_usage(&self, project_id: &str, session_id: &str) -> Result<crate::contracts::ConversationUsageResponse> {
+    pub fn conversation_usage(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<crate::contracts::ConversationUsageResponse> {
         let (_, repository) = self.project_repository(project_id)?;
         repository.conversation_usage(project_id, session_id)
     }
 
-    pub fn job_usage(&self, project_id: &str, job_id: &str) -> Result<crate::contracts::JobUsageResponse> {
+    pub fn job_usage(
+        &self,
+        project_id: &str,
+        job_id: &str,
+    ) -> Result<crate::contracts::JobUsageResponse> {
         let (_, repository) = self.project_repository(project_id)?;
         repository.job_usage(project_id, job_id)
     }
@@ -1262,7 +1363,14 @@ impl CanonicalControlService {
         let origins = std::mem::take(&mut snapshot.job_origins);
         let origin_details = std::mem::take(&mut snapshot.job_origin_details);
         let projection = ExecutionProjection::from(snapshot);
-        Self::snapshot_from_projection(project_id, job_id, &projection, &origins, &origin_details)
+        Self::snapshot_from_projection(
+            project_id,
+            job_id,
+            &projection,
+            &origins,
+            &origin_details,
+            &repository,
+        )
     }
 
     fn snapshot_from_projection(
@@ -1271,6 +1379,7 @@ impl CanonicalControlService {
         projection: &ExecutionProjection,
         origins: &BTreeMap<String, String>,
         origin_details: &BTreeMap<String, JobOrigin>,
+        repository: &DomainRepository,
     ) -> Result<CanonicalJobSnapshot> {
         let job = projection
             .jobs
@@ -1323,6 +1432,8 @@ impl CanonicalControlService {
             "executors":executors,
             "calls":calls,
             "dispatch_intents":dispatch_intents,
+            "placement": repository.placement_projection(job_id)?,
+            "watchdog": repository.watchdog_actions(job_id)?,
             "execution_graph":"canonical state projection"
         });
         Ok(CanonicalJobSnapshot {
@@ -1435,14 +1546,16 @@ impl CanonicalControlService {
                     &projection,
                     &origins,
                     &origin_details,
+                    &repository,
                 )
             })
             .transpose()?;
         Ok(CanonicalDashboardResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-            project_id: project.project_id,
+            project_id: project.project_id.clone(),
             jobs,
             selected_job,
+            disk_guard: self.disk_guard_status(&project.project_id, Path::new(&project.root)),
         })
     }
 
@@ -1454,6 +1567,7 @@ impl CanonicalControlService {
             .name("job-admission".to_string())
             .spawn(move || {
                 let mut last_error = None;
+                let mut last_watchdog = Instant::now();
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                     match service.admit_eligible_jobs() {
                         Ok(()) => last_error = None,
@@ -1463,6 +1577,16 @@ impl CanonicalControlService {
                                 tracing::error!(%error, "automatic Job admission deferred");
                                 last_error = Some(message);
                             }
+                        }
+                    }
+                    // Watchdog shares this worker's lifetime and the Project
+                    // runtimes it already starts. It does not get its own loop
+                    // at the admission cadence: one pass every few seconds is a
+                    // reconciliation, not a second scheduler.
+                    if last_watchdog.elapsed() >= super::watchdog::WATCHDOG_INTERVAL {
+                        last_watchdog = Instant::now();
+                        if let Err(error) = service.reconcile_watchdog() {
+                            tracing::error!(%error, "fleet watchdog reconciliation deferred");
                         }
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -1476,13 +1600,72 @@ impl CanonicalControlService {
         })
     }
 
+    /// One Watchdog pass over every registered Project.
+    ///
+    /// The pass only opens stores that already exist and only signals a runtime
+    /// that admission has already started. It never starts a provider worker
+    /// merely to ask whether one owns a Call.
+    pub(crate) fn reconcile_watchdog(&self) -> Result<()> {
+        let mut failure = None;
+        let global = self
+            .read_configuration()
+            .map(|(global, _, _)| global)
+            .unwrap_or_default();
+        for project in self.projects()? {
+            // Watchdog reconciliation doubles as a bounded disk reassessment
+            // point. Fencing itself never consults the Guard — reconciliation
+            // is essential settlement — but replacement execution always flows
+            // back through Admission, where the Guard blocks it until recovery.
+            if let Ok(guard) =
+                self.disk_guard_for_project(&project.project_id, Path::new(&project.root), &global)
+            {
+                guard.refresh_if_stale();
+            }
+            let mut domain = match DomainRepository::open_existing(Path::new(&project.root)) {
+                Ok(domain) => domain,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            let runtime = if let Some(registry) = &self.runtime_registry {
+                registry.handle(&project.project_id)?
+            } else {
+                self.runtime_handle.clone().filter(|handle| {
+                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
+                })
+            };
+            if let Err(error) = super::watchdog::reconcile_repository(&mut domain, runtime.as_ref())
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub(crate) fn admit_eligible_jobs(&self) -> Result<()> {
         let _launch = self
             .launch_lock
             .lock()
             .map_err(|_| invalid("launch lock poisoned"))?;
+        // Thresholds are re-read every pass so configuration updates take
+        // effect without restart; observation refresh is cadence-gated inside
+        // the Guard, so most passes are a cached read.
+        let global = self
+            .read_configuration()
+            .map(|(global, _, _)| global)
+            .unwrap_or_default();
         let mut failure = None;
         for project in self.projects()? {
+            // Periodic runtime reassessment while OCG is active. Deferred Jobs
+            // stay eligible in the substrate, so recovery past the resume
+            // reserve lets this same worker admit them again with no new
+            // scheduler and no operator action.
+            if let Ok(guard) =
+                self.disk_guard_for_project(&project.project_id, Path::new(&project.root), &global)
+            {
+                guard.refresh_if_stale();
+            }
             let result = (|| -> Result<()> {
                 let (_, domain) = self.project_repository(&project.project_id)?;
                 // Serialize the complete Attempt-to-Call handoff across consumers;
@@ -1568,6 +1751,31 @@ impl CanonicalControlService {
         request: CanonicalJobSpawnRequest,
     ) -> Result<CanonicalJobSpawnResponse> {
         let mut domain = self.repository_for_job(parent_job_id)?;
+        // Recursive fan-out multiplies future durable writes, so the Guard is
+        // consulted before the spawn transaction commits anything. The refusal
+        // happens before any lineage, dependency, counter or idempotency-key
+        // write: a blocked spawn key stays unbound and the same logical spawn
+        // can succeed after recovery.
+        {
+            let parent = domain
+                .job(parent_job_id)?
+                .ok_or_else(|| invalid("unknown parent Job"))?;
+            let root = self
+                .read_projects()?
+                .into_iter()
+                .find(|project| project.project_id == parent.project_id)
+                .map(|project| project.root)
+                .ok_or_else(|| invalid("unknown Project identity"))?;
+            let (global, _, _) = self.read_configuration()?;
+            let guard =
+                self.disk_guard_for_project(&parent.project_id, Path::new(&root), &global)?;
+            if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
+                return Err(OcgError::spawn_refused(
+                    crate::error::SpawnRefusalReason::StorageProtection,
+                    deferral.message(),
+                ));
+            }
+        }
         let authority = AttemptAuthority {
             job_id: parent_job_id.to_string(),
             attempt_id: request.parent_attempt_id,
@@ -1578,14 +1786,16 @@ impl CanonicalControlService {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        let (child, duplicate) = domain.spawn_child(
-            &authority,
-            &request.spawn_key,
-            request.spec,
-            &prerequisites,
-            &request.executor_kind,
-            &request.policy,
-        )?;
+        let (child, duplicate) =
+            domain.spawn_child(crate::orchestration::domain::SpawnChildRequest {
+                parent_authority: &authority,
+                spawn_key: &request.spawn_key,
+                spec: request.spec,
+                prerequisite_job_ids: &prerequisites,
+                executor_kind: &request.executor_kind,
+                policy: &request.policy,
+                call_id: request.call_id.as_deref(),
+            })?;
         Ok(CanonicalJobSpawnResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             snapshot: self.canonical_snapshot(&child.project_id, &child.id)?,
@@ -1673,6 +1883,17 @@ impl CanonicalControlService {
         if !domain.dependencies_satisfied(&job.project_id, job_id)? {
             return Err(invalid("Job dependencies are not satisfied"));
         }
+        // Disk safety precedes the replacement Attempt: an explicit operator
+        // retry is not permission to exhaust the host disk. The Job stays
+        // retryable and deferred; no execution is created here.
+        let retry_guard = {
+            let (project, _) = self.project_repository(&job.project_id)?;
+            let (global, _, _) = self.read_configuration()?;
+            self.disk_guard_for_project(&job.project_id, Path::new(&project.root), &global)?
+        };
+        if let Some(deferral) = retry_guard.check_execution_admission().deferral() {
+            return Err(invalid(deferral.message()));
+        }
         let snapshot = domain.execution_snapshot()?;
         let template = snapshot
             .dispatch_intents
@@ -1756,38 +1977,72 @@ impl CanonicalControlService {
         let budget_config = self.provider_budget_config(&global)?;
         let admission = domain.retry_job(job_id, executor_kind, expected_generation)?;
         if let Some((request, protocol, provider_config)) = replay {
-            let authority = domain
-                .authority(&admission.attempt.id)?
-                .ok_or_else(|| invalid("retry Attempt authority disappeared"))?;
+            // Retry does not choose a new candidate. It republishes the Call
+            // against the target the previous Attempt already froze.
             let runtime = runtime.ok_or_else(|| invalid("retry runtime disappeared"))?;
-            if let Err(error) = crate::provider_loop::admit_provider_call_with_events(
-                crate::provider_loop::ProviderCallAdmission {
-                    domain: &mut domain,
-                    authority: &authority,
-                    executor_id: &admission.executor.id,
-                    request,
-                    config: &budget_config,
-                    quota: crate::orchestration::budget::QuotaFacts::unknown(),
-                    dispatcher: runtime.provider_dispatcher(),
-                    provider_config,
-                    protocol,
+            let (profile, _) = self
+                .profile_service
+                .current()?
+                .ok_or_else(|| invalid("profile not configured"))?;
+            let (project, _) = self.project_repository(&job.project_id)?;
+            let resolved = super::admission::ResolvedTarget {
+                protocol,
+                config: provider_config,
+                effort: request
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                reservation: super::admission::AdmissionReservation {
+                    choice: super::placement::ProviderChoice {
+                        provider: job.spec.provider.clone().unwrap_or_default(),
+                        model: job.spec.model.clone().unwrap_or_default(),
+                    },
+                    pickup: if job.spec.health_probe.is_some() {
+                        super::admission::AdmissionPickup::Explicit
+                    } else {
+                        super::admission::AdmissionPickup::Automatic
+                    },
+                    exact: job.spec.health_probe.as_ref().map(|intent| {
+                        super::admission::ExactTarget {
+                            provider: intent.provider.clone(),
+                            model: intent.model.clone(),
+                            effort: intent.effort.clone(),
+                        }
+                    }),
                 },
-                None,
-                CallCancellation::new(),
-            ) {
-                if domain.authority(&admission.attempt.id)?.is_some() {
-                    domain.fail_attempt(
-                        &admission.attempt.id,
-                        &super::domain::job_failure(
-                            "retry_admission_failed",
-                            FailureClass::Unknown,
-                            &error.to_string(),
-                            true,
-                        ),
-                    )?;
-                }
-                return Err(error);
-            }
+            };
+            publish_call(
+                &mut AdmissionContext {
+                    domain: &mut domain,
+                    profile: &profile,
+                    root: Path::new(&project.root),
+                    project_id: &project.project_id,
+                    budget: &budget_config,
+                    concurrency: None,
+                    governor: None,
+                    disk_guard: Some(retry_guard.clone()),
+                    now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+                },
+                &admission.job,
+                &resolved,
+                &super::admission::ReservedExecution {
+                    attempt: admission.attempt.clone(),
+                    executor: admission.executor.clone(),
+                    existing_call: false,
+                },
+                PreparedExecution {
+                    request,
+                    payload: if job.spec.health_probe.is_some() {
+                        PayloadMode::Probe
+                    } else {
+                        PayloadMode::Agent
+                    },
+                    event_sender: None,
+                    cancelled: CallCancellation::new(),
+                },
+                &runtime,
+            )?
+            .map_err(|refusal| invalid(refusal.message))?;
         }
         Ok(CanonicalJobOperationResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -1795,6 +2050,27 @@ impl CanonicalControlService {
             accepted: true,
             snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
         })
+    }
+
+    /// The idempotency digest for a Health Probe command.
+    ///
+    /// The command ledger is shared with canonical launch, which hashes a whole
+    /// request. A probe hashes its command identity and target only: which Job a
+    /// retry refers to is decided by the tuple, not by the caller's transport
+    /// details.
+    fn health_probe_command_hash(request: &crate::contracts::HealthProbeRequest) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(request.command_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.project_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.target.provider.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.target.model.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(request.target.effort.as_deref().unwrap_or("").as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 
     fn provider_budget_config(
@@ -1979,6 +2255,14 @@ impl CanonicalControlService {
             }
         };
 
+        // Disk safety precedes every other admission decision: resolve the
+        // guard before profile, Placement or payload work begins.
+        let disk_guard = self.disk_guard_for_project(
+            &project.project_id,
+            Path::new(&project.root),
+            &global_config,
+        )?;
+
         // Resolve profile from the user-global profile service
         let (profile, _) = match self.profile_service.current()? {
             Some(p) => p,
@@ -2048,141 +2332,74 @@ impl CanonicalControlService {
                 hard_budget_micros: Some(request.hard_budget_micros),
                 ..JobSpec::default()
             });
-        let reserved_choice = if let Some(job) = existing_job
+        // Chat and generic launch both require candidate selection. An exact
+        // target, such as a Health Probe, never enters this function.
+        let preferred_provider = project_config
+            .defaults
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let preferred_model = project_config
+            .defaults
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| profile.default_model.clone());
+        let effort = selection
             .as_ref()
-            .filter(|job| job.state == JobState::Running)
-        {
-            let choice = domain.admission_selection(&job.id)?;
-            if choice.is_some() {
-                choice
-            } else if let Some(attempt_id) = job.authoritative_attempt_id.as_deref() {
-                domain
-                    .calls_for_attempt(attempt_id)?
-                    .into_iter()
-                    .next()
-                    .map(|call| domain.dispatch_intent(&call.id))
-                    .transpose()?
-                    .flatten()
-                    .and_then(|intent| {
-                        Some(super::placement::ProviderChoice {
-                            provider: intent.provider_key?,
-                            model: intent.model?,
-                        })
-                    })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let choice = if let Some(choice) = reserved_choice {
-            choice
-        } else {
-            match super::placement::choose(
-                &domain,
-                super::placement::PolicyInput {
-                    profile: &profile,
-                    root: Path::new(&project.root),
-                    project_id: &project.project_id,
-                    job_id: existing_job.as_ref().map(|job| job.id.as_str()),
-                    spec: &spec,
-                    requirements: super::placement::Requirements {
-                        images: !images.is_empty(),
-                        effort: selection
-                            .as_ref()
-                            .and_then(|selection| selection.effort.as_deref()),
-                    },
-                    preferred_provider: project_config
-                        .defaults
-                        .get("provider")
-                        .and_then(Value::as_str),
-                    preferred_model: project_config
-                        .defaults
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .or(profile.default_model.as_deref()),
-                    budget: &budget_config,
-                    // Chat's accepted-turn queue predates placement. Its worker
-                    // still acquires the existing execution slot before I/O.
-                    concurrency: (!is_chat).then_some(provider_concurrency),
-                    now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
-                },
-            )? {
-                Ok(choice) => choice,
-                Err(reason) => {
-                    if let Some(job) = &existing_job {
-                        domain.record_admission_failure(&job.id, &reason)?;
-                    }
-                    return Ok(crate::contracts::JobLaunchResponse {
-                        api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                        outcome: "rejected".to_string(),
-                        command_id: request.command_id.clone(),
-                        draft_id: request.draft_id.clone(),
-                        project_id: project.project_id.clone(),
-                        session_id: request.session_id.clone(),
-                        job_id: existing_job.as_ref().map(|job| job.id.clone()),
-                        message: format!("{}: {}", reason.code, reason.message),
-                        duplicate: false,
-                    });
+            .and_then(|selection| selection.effort.clone());
+        let resolved = match super::admission::resolve_target(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                // Chat's accepted-turn queue predates placement. Its worker
+                // still acquires the existing execution slot before I/O.
+                concurrency: (!is_chat).then_some(provider_concurrency),
+                // Placement evaluation must observe the same Governor that
+                // execution-time acquisition enforces, so a recorded upstream
+                // cooldown is visible before a candidate is selected.
+                governor: Some(runtime_handle.governor()),
+                disk_guard: Some(disk_guard.clone()),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            existing_job.as_ref(),
+            &spec,
+            &AdmissionTarget::SelectCandidate,
+            super::placement::Requirements {
+                images: !images.is_empty(),
+                effort: effort.as_deref(),
+            },
+            preferred_provider.as_deref(),
+            preferred_model.as_deref(),
+        )? {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                if let Some(job) = &existing_job {
+                    domain.record_admission_failure(&job.id, &refusal.failure)?;
                 }
-            }
-        };
-        let provider_key = choice.provider.as_str();
-        let model = choice.model.as_str();
-
-        let provider_entry = match profile.providers.get(provider_key) {
-            Some(p) => p,
-            None => {
-                let response = crate::contracts::JobLaunchResponse {
+                return Ok(crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                     outcome: "rejected".to_string(),
                     command_id: request.command_id.clone(),
                     draft_id: request.draft_id.clone(),
                     project_id: project.project_id.clone(),
                     session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("provider not found: {}", provider_key),
+                    job_id: existing_job.as_ref().map(|job| job.id.clone()),
+                    message: refusal.message,
                     duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
+                });
             }
         };
+        let provider_key = resolved.reservation.choice.provider.as_str();
+        let model = resolved.reservation.choice.model.as_str();
 
-        let upstream_model_id = match profile.models.get(model) {
-            Some(entry) if entry.provider == provider_key && !entry.id.is_empty() => {
-                entry.id.clone()
-            }
-            _ => {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("model {model} is not runnable for provider {provider_key}"),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
-            }
-        };
+        let provider_entry = profile
+            .providers
+            .get(provider_key)
+            .ok_or_else(|| invalid("resolved provider disappeared"))?;
 
         if !images.is_empty()
             && profile
@@ -2219,95 +2436,11 @@ impl CanonicalControlService {
             }
         }
 
-        // Validate endpoint
-        let endpoint = match &provider_entry.endpoint {
-            Some(e) if !e.is_empty() => e.clone(),
-            _ => {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("provider {} has no endpoint configured", provider_key),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
-            }
-        };
-
-        // Credentials are optional: an endpoint that needs no bearer token is a
-        // legitimate provider, so only a declared reference has to resolve.
-        if endpoint_has_userinfo(&endpoint) {
-            let response = crate::contracts::JobLaunchResponse {
-                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                outcome: "rejected".to_string(),
-                command_id: request.command_id.clone(),
-                draft_id: request.draft_id.clone(),
-                project_id: project.project_id.clone(),
-                session_id: request.session_id.clone(),
-                job_id: None,
-                message: format!("provider {provider_key} endpoint must not contain userinfo"),
-                duplicate: false,
-            };
-            domain.record_launch_command(
-                &request.command_id,
-                &request.project_id,
-                &request_hash,
-                "rejected",
-                existing_job.as_ref().map(|job| job.id.as_str()),
-                &response.message,
-            )?;
-            return Ok(response);
-        }
-
-        let credential_ref = provider_entry.credential_ref.clone();
-        if let Some(reference) = credential_ref.as_deref() {
-            // Verify a declared credential exists without keeping it in memory;
-            // the raw value is only read again at execution time.
-            let vault = crate::vault::Vault::user_global()?;
-            if vault.get(reference)?.is_none() {
-                let response = crate::contracts::JobLaunchResponse {
-                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                    outcome: "rejected".to_string(),
-                    command_id: request.command_id.clone(),
-                    draft_id: request.draft_id.clone(),
-                    project_id: project.project_id.clone(),
-                    session_id: request.session_id.clone(),
-                    job_id: None,
-                    message: format!("credential not found: {reference}"),
-                    duplicate: false,
-                };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "rejected",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
-                return Ok(response);
-            }
-        }
-
-        // Create canonical Job/Attempt/Executor. The Job spec is the durable
-        // launch intent: what was asked, what success looks like, the
-        // constraints, and the declared budget commitment. Frozen provider
-        // transport identity (endpoint, upstream model id, credential
-        // reference) belongs to the Call's DispatchIntent, not to the Job.
-        // The boundary already proved this Project identity; read it back
-        // rather than creating one, so a launch can never mint identity for a
-        // boundary whose durable row is missing.
+        // Create the Job, then hand it to canonical admission. The Job spec is
+        // the durable launch intent. Frozen provider transport identity belongs
+        // to the Call's DispatchIntent, which admission publishes. The boundary
+        // already proved this Project identity; read it back rather than
+        // creating one.
         let canonical_project = domain
             .project_at_root(Path::new(&project.root))?
             .ok_or_else(|| invalid("registered Project identity is not durable at this root"))?;
@@ -2319,6 +2452,8 @@ impl CanonicalControlService {
             constraints: request.constraints.clone(),
             hard_budget_micros: Some(request.hard_budget_micros),
             resource_commitment: request.resource_commitment,
+            recursive_limits: super::domain::RecursiveLimits::default(),
+            health_probe: None,
         };
 
         let job = if let Some(job) = existing_job.as_ref() {
@@ -2331,105 +2466,75 @@ impl CanonicalControlService {
         } else {
             domain.create_job(&canonical_project.id, job_spec)?
         };
-        // Admission uses the same canonical dispatch transaction. It
-        // makes a newly created Job dispatchable: inside
-        // a single immediate transaction it performs the `pending -> eligible`
-        // transition, claims the authoritative Attempt (which carries the Job
-        // to `running` with its authoritative Attempt) and publishes the
-        // provider Executor. An Attempt may only be claimed out of `eligible`,
-        // so a launch cannot create the Attempt directly off `create_job`;
-        // reusing the transition keeps this lane on the same scheduler
-        // semantics `ocg work dispatch` and admission already use.
-        let (attempt, executor) = if existing_job.is_some() && job.state == JobState::Running {
-            let attempt_id = job
-                .authoritative_attempt_id
-                .as_deref()
-                .ok_or_else(|| invalid("automatic admission lost Attempt authority"))?;
-            let attempt = domain
-                .attempt(attempt_id)?
-                .ok_or_else(|| invalid("automatic Attempt disappeared"))?;
-            let executor = domain
-                .executor_for_attempt(attempt_id)?
-                .ok_or_else(|| invalid("automatic Executor disappeared"))?;
-            if executor.kind != "provider" {
-                domain.complete_automatic_admission(&job.id)?;
-                return Err(invalid("Job was admitted by another executor"));
+        // Reservation is the canonical admission transition. Chat and generic
+        // launch both pass through it; only the payload built afterwards differs.
+        let reserved = match reserve(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: (!is_chat).then_some(provider_concurrency),
+                governor: None,
+                disk_guard: Some(disk_guard.clone()),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            &job,
+            &resolved,
+        )? {
+            Ok(reserved) => reserved,
+            Err(refusal) => {
+                let response = crate::contracts::JobLaunchResponse {
+                    api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                    outcome: "failed".to_string(),
+                    command_id: request.command_id.clone(),
+                    draft_id: request.draft_id.clone(),
+                    project_id: project.project_id.clone(),
+                    session_id: request.session_id.clone(),
+                    job_id: Some(job.id.clone()),
+                    message: refusal.message,
+                    duplicate: false,
+                };
+                domain.record_launch_command(
+                    &request.command_id,
+                    &request.project_id,
+                    &request_hash,
+                    "failed",
+                    Some(&job.id),
+                    &response.message,
+                )?;
+                return Ok(response);
             }
-            (attempt, executor)
-        } else if is_chat {
-            domain.dispatch_job(&job.id, "provider")?
-        } else {
-            domain.dispatch_job_with_placement(
-                &job.id,
-                &choice,
-                provider_concurrency,
-                &budget_config,
-                super::placement::quota(
-                    Path::new(&project.root),
-                    &profile,
-                    &choice,
-                    crate::clock::Clock::now_unix(&crate::clock::SystemClock),
-                ),
-            )?
         };
-
         let user_content = initial_user_message(&request);
-        let messages = if is_chat {
+        let messages = if reserved.existing_call {
+            Vec::new()
+        } else if is_chat {
             match domain.prepare_chat_turn_with_images(
                 &request,
                 &request_hash,
-                &attempt,
+                &reserved.attempt,
                 &user_content,
                 &images,
             ) {
                 Ok(messages) => messages,
                 Err(error) => {
-                    domain.finish_attempt(&attempt.id, false)?;
+                    domain.finish_attempt(&reserved.attempt.id, false)?;
                     return Err(error);
                 }
             }
         } else {
             vec![json!({"role": "user", "content": user_content})]
         };
-        // This snapshot becomes the immutable Call/DispatchIntent input. The
-        // worker compacts these messages without reading the Conversation again.
         let mut provider_request = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": true,
         });
-
         if let Some(effort) = effort {
             provider_request["reasoning_effort"] = json!(effort);
         }
-
-        // Resolve quota facts for economic admission
-        let quota_facts = super::placement::quota(
-            Path::new(&project.root),
-            &profile,
-            &choice,
-            crate::clock::Clock::now_unix(&crate::clock::SystemClock),
-        );
-
-        // Admit the provider call
-        let authority = domain
-            .authority(&attempt.id)?
-            .ok_or_else(|| invalid("attempt authority disappeared"))?;
-
-        // Freeze provider execution configuration for this Call
-        let provider_config = crate::orchestration::execution_dispatch::ProviderExecutionConfig {
-            provider_key: provider_key.to_string(),
-            model: model.to_string(),
-            upstream_model_id,
-            endpoint: endpoint.clone(),
-            credential_ref,
-        };
-
-        // The protocol is declared by the provider the Profile names, not
-        // inferred from its key, label or host, and it is frozen with the rest
-        // of the dispatch.
-        let protocol = provider_entry.wire_protocol();
-
         let chat = self
             .chat_registrations
             .lock()
@@ -2439,59 +2544,36 @@ impl CanonicalControlService {
                     (registration.sender.clone(), registration.cancelled.clone())
                 })
             });
-        let previous_call = if existing_job.is_some() {
-            domain.calls_for_attempt(&attempt.id)?.into_iter().next()
-        } else {
-            None
-        };
-        let resume_previous = previous_call
-            .as_ref()
-            .map(|call| -> Result<bool> {
-                Ok(call.state == "created"
-                    && !domain
-                        .dispatch_intent(&call.id)?
-                        .ok_or_else(|| invalid("automatic DispatchIntent disappeared"))?
-                        .budget_admitted)
-            })
-            .transpose()?
-            .unwrap_or(false);
-        let admission = crate::provider_loop::ProviderCallAdmission {
-            domain: &mut domain,
-            authority: &authority,
-            executor_id: &executor.id,
+        let prepared = PreparedExecution {
             request: provider_request,
-            config: &budget_config,
-            quota: quota_facts,
-            dispatcher: runtime_handle.provider_dispatcher(),
-            provider_config,
-            protocol,
+            payload: PayloadMode::Agent,
+            event_sender: chat.as_ref().map(|(sender, _)| sender.clone()),
+            cancelled: chat
+                .as_ref()
+                .map(|(_, cancelled)| cancelled.clone())
+                .unwrap_or_default(),
         };
-        let admitted = if let Some(call) = previous_call {
-            if resume_previous {
-                crate::provider_loop::resume_provider_call_admission(admission, call)
-            } else if call.state == "failed" {
-                Err(invalid(
-                    "automatic provider Call admission previously failed",
-                ))
-            } else {
-                Ok(call)
-            }
-        } else {
-            crate::provider_loop::admit_provider_call_with_events(
-                admission,
-                chat.as_ref().map(|(sender, _)| sender.clone()),
-                chat.as_ref()
-                    .map(|(_, cancelled)| cancelled.clone())
-                    .unwrap_or_default(),
-            )
-            .map(|(call, _)| call)
-        };
-        let _call = match admitted {
-            Ok(call) => call,
-            Err(e) => {
-                // Economic admission failed; finish the attempt as failed
-                domain.discard_unaccepted_chat_turn(&attempt.id)?;
-                domain.finish_attempt(&attempt.id, false)?;
+        let admitted = publish_call(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: (!is_chat).then_some(provider_concurrency),
+                governor: None,
+                disk_guard: Some(disk_guard.clone()),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            &job,
+            &resolved,
+            &reserved,
+            prepared,
+            &runtime_handle,
+        )?;
+        let _admitted = match admitted {
+            Ok(admitted) => admitted,
+            Err(refusal) => {
                 let response = crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                     outcome: "failed".to_string(),
@@ -2500,7 +2582,7 @@ impl CanonicalControlService {
                     project_id: project.project_id.clone(),
                     session_id: request.session_id.clone(),
                     job_id: Some(job.id.clone()),
-                    message: format!("economic admission failed: {}", e),
+                    message: refusal.message,
                     duplicate: false,
                 };
                 domain.record_launch_command(
@@ -2515,9 +2597,6 @@ impl CanonicalControlService {
             }
         };
 
-        domain.complete_automatic_admission(&job.id)?;
-
-        // Record successful launch
         let response = crate::contracts::JobLaunchResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             outcome: "accepted".to_string(),
@@ -2539,6 +2618,296 @@ impl CanonicalControlService {
         )?;
 
         Ok(response)
+    }
+
+    /// Launch a Health Probe Job for one Provider x Model x Effort tuple.
+    ///
+    /// The probe is a real canonical Job: it is created with the target on its
+    /// specification, dispatched through the ordinary Job -> Attempt -> Executor
+    /// transition, and its Call is admitted and enqueued on the same bounded
+    /// provider dispatcher every other Job uses. There is no second execution
+    /// path and nothing here schedules anything — a probe runs when it is asked
+    /// for, and only then.
+    ///
+    /// A probe deliberately bypasses Placement. Placement ranks candidates for
+    /// work that is allowed to go anywhere; a probe names the exact tuple it
+    /// must prove, so choosing one for it would destroy the only fact the probe
+    /// exists to produce. For the same reason it does not take a per-Project
+    /// capacity reservation: it queues behind real work on the bounded
+    /// dispatcher instead of displacing it.
+    pub fn launch_health_probe(
+        &self,
+        request: crate::contracts::HealthProbeRequest,
+        _now: i64,
+    ) -> Result<crate::contracts::HealthProbeResponse> {
+        let _launch = self
+            .launch_lock
+            .lock()
+            .map_err(|_| invalid("launch lock poisoned"))?;
+        let rejected =
+            |message: String, job_id: Option<String>| crate::contracts::HealthProbeResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "rejected".to_string(),
+                command_id: request.command_id.clone(),
+                project_id: request.project_id.clone(),
+                target: request.target.clone(),
+                job_id,
+                message,
+                duplicate: false,
+            };
+        if !safe_id(&request.command_id) || !safe_id(&request.project_id) {
+            return Ok(rejected(
+                "invalid command_id or project_id".to_string(),
+                None,
+            ));
+        }
+        let (project, mut domain) = match self.project_repository(&request.project_id) {
+            Ok(project) => project,
+            Err(error) => return Ok(rejected(error.to_string(), None)),
+        };
+        let intent = request.target.intent();
+        // Idempotency is the same command ledger canonical launch uses, so a
+        // retried probe never spends a second round.
+        if let Some((_, job_id, outcome, message)) =
+            domain.lookup_launch_command(&request.command_id, &request.project_id)?
+        {
+            return Ok(crate::contracts::HealthProbeResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome,
+                command_id: request.command_id.clone(),
+                project_id: request.project_id.clone(),
+                target: request.target.clone(),
+                job_id,
+                message,
+                duplicate: true,
+            });
+        }
+        let (profile, _) = match self.profile_service.current()? {
+            Some(profile) => profile,
+            None => return Ok(rejected("profile not configured".to_string(), None)),
+        };
+
+        // A probe Job is created before the target is validated, and a rejection
+        // is recorded on it. The verdict "OCG cannot execute this tuple" is
+        // itself health evidence, and evidence that only lives in an HTTP
+        // response body would be gone by the time Placement asked the question.
+        // The rejection path therefore produces the same canonical shape as a
+        // probe that ran: Job -> Attempt -> Executor -> terminal reason.
+        let spec = super::domain::JobSpec {
+            provider: Some(intent.provider.clone()),
+            model: Some(intent.model.clone()),
+            objective: Some(super::health_probe::PROBE_OBJECTIVE.to_string()),
+            health_probe: Some(intent.clone()),
+            ..JobSpec::default()
+        };
+        let job = domain.create_job(&project.project_id, spec.clone())?;
+        // A rejected probe is recorded on the Job before any Attempt is
+        // claimed. The refusal is the same admission decision every other
+        // origin records: the Job becomes eligible evidence and is marked
+        // explicit, so the automatic worker cannot later place a different
+        // candidate for it.
+        let record = |domain: &mut DomainRepository, failure: &Failure| {
+            domain.set_job_eligible(&job.id)?;
+            domain.freeze_explicit_admission(
+                &job.id,
+                &super::admission::AdmissionReservation {
+                    choice: super::placement::ProviderChoice {
+                        provider: intent.provider.clone(),
+                        model: intent.model.clone(),
+                    },
+                    pickup: super::admission::AdmissionPickup::Explicit,
+                    exact: Some(super::admission::ExactTarget {
+                        provider: intent.provider.clone(),
+                        model: intent.model.clone(),
+                        effort: intent.effort.clone(),
+                    }),
+                },
+            )?;
+            domain.record_admission_failure(&job.id, failure)
+        };
+        let budget_config = self.provider_budget_config(&self.read_configuration()?.0)?;
+        // Probes are Exact diagnostic targets: they fan out durable state
+        // without producing user work, so disk safety gates them before the
+        // target is even validated.
+        let (probe_global, _, _) = self.read_configuration()?;
+        let probe_guard = self.disk_guard_for_project(
+            &project.project_id,
+            Path::new(&project.root),
+            &probe_global,
+        )?;
+        let resolved = match super::admission::resolve_target(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: None,
+                governor: None,
+                disk_guard: Some(probe_guard.clone()),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            Some(&job),
+            &spec,
+            &AdmissionTarget::Exact(super::admission::ExactTarget {
+                provider: intent.provider.clone(),
+                model: intent.model.clone(),
+                effort: intent.effort.clone(),
+            }),
+            super::placement::Requirements {
+                images: false,
+                effort: intent.effort.as_deref(),
+            },
+            None,
+            None,
+        )? {
+            Ok(resolved) => resolved,
+            Err(refusal) => {
+                record(&mut domain, &refusal.failure)?;
+                let response = rejected(refusal.message, Some(job.id.clone()));
+                domain.record_launch_command(
+                    &request.command_id,
+                    &project.project_id,
+                    &Self::health_probe_command_hash(&request),
+                    "rejected",
+                    Some(&job.id),
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+        let runtime = if let Some(registry) = &self.runtime_registry {
+            registry.get_or_start(&project.project_id, Path::new(&project.root), 1)
+        } else {
+            self.runtime_handle
+                .as_ref()
+                .filter(|handle| {
+                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
+                })
+                .cloned()
+                .ok_or_else(|| invalid("execution runtime is not available for this Project"))
+        };
+        let runtime_handle = match runtime {
+            Ok(handle) => handle,
+            Err(error) => {
+                record(
+                    &mut domain,
+                    &super::health_probe::unsupported_target(
+                        "health_probe_no_runtime",
+                        error.to_string(),
+                    ),
+                )?;
+                return Ok(rejected(error.to_string(), Some(job.id.clone())));
+            }
+        };
+        // The exact target is frozen. Reservation claims the Attempt without
+        // asking Placement to choose, and the probe payload is built only after
+        // that reservation exists.
+        let reserved = match reserve(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: None,
+                governor: None,
+                disk_guard: Some(probe_guard.clone()),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            &job,
+            &resolved,
+        )? {
+            Ok(reserved) => reserved,
+            Err(refusal) => {
+                let response = rejected(refusal.message, Some(job.id.clone()));
+                domain.record_launch_command(
+                    &request.command_id,
+                    &project.project_id,
+                    &Self::health_probe_command_hash(&request),
+                    "failed",
+                    Some(&job.id),
+                    &response.message,
+                )?;
+                return Ok(response);
+            }
+        };
+        let prepared = PreparedExecution {
+            request: super::health_probe::probe_request(&intent.model, intent.effort.as_deref()),
+            payload: PayloadMode::Probe,
+            event_sender: None,
+            cancelled: CallCancellation::new(),
+        };
+        let outcome = match publish_call(
+            &mut AdmissionContext {
+                domain: &mut domain,
+                profile: &profile,
+                root: Path::new(&project.root),
+                project_id: &project.project_id,
+                budget: &budget_config,
+                concurrency: None,
+                governor: None,
+                disk_guard: Some(probe_guard.clone()),
+                now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
+            },
+            &job,
+            &resolved,
+            &reserved,
+            prepared,
+            &runtime_handle,
+        )? {
+            Ok(admitted) => crate::contracts::HealthProbeResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "accepted".to_string(),
+                command_id: request.command_id.clone(),
+                project_id: project.project_id.clone(),
+                target: request.target.clone(),
+                job_id: Some(job.id.clone()),
+                message: format!("health probe launched: {}", admitted.call_id),
+                duplicate: false,
+            },
+            Err(refusal) => crate::contracts::HealthProbeResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                outcome: "failed".to_string(),
+                command_id: request.command_id.clone(),
+                project_id: project.project_id.clone(),
+                target: request.target.clone(),
+                job_id: Some(job.id.clone()),
+                message: refusal.message,
+                duplicate: false,
+            },
+        };
+        domain.record_launch_command(
+            &request.command_id,
+            &project.project_id,
+            &Self::health_probe_command_hash(&request),
+            &outcome.outcome,
+            outcome.job_id.as_deref(),
+            &outcome.message,
+        )?;
+        Ok(outcome)
+    }
+
+    /// Read the latest usable health evidence for one candidate.
+    ///
+    /// The answer is projected from the probe Jobs' canonical rows on every
+    /// read, so it cannot lag or contradict execution history, and it costs
+    /// nothing when no probe has run.
+    pub fn health_probe(
+        &self,
+        request: crate::contracts::HealthProbeQuery,
+    ) -> Result<crate::contracts::HealthProbeQueryResponse> {
+        let domain = self.project_repository(&request.project_id)?.1;
+        let intent = request.target.intent();
+        let observation = domain
+            .latest_health_probe(&request.project_id, &intent)?
+            .map(HealthProbeObservation::from);
+        Ok(crate::contracts::HealthProbeQueryResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            project_id: request.project_id,
+            target: request.target,
+            observation,
+        })
     }
 
     /// Start a plain chat turn on the canonical Job/Attempt/Call lane.

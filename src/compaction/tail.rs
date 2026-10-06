@@ -78,10 +78,7 @@ pub fn turns(messages: &[serde_json::Value]) -> Vec<Turn> {
         .enumerate()
         .map(|(position, start)| Turn {
             start: *start,
-            end: starts
-                .get(position + 1)
-                .copied()
-                .unwrap_or(messages.len()),
+            end: starts.get(position + 1).copied().unwrap_or(messages.len()),
         })
         .collect()
 }

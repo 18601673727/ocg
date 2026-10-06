@@ -32,10 +32,7 @@ impl TokenSource {
 
     /// Whether the number is an exact measurement rather than an estimate.
     pub fn is_exact(self) -> bool {
-        matches!(
-            self,
-            TokenSource::ProviderReported
-        )
+        matches!(self, TokenSource::ProviderReported)
     }
 }
 

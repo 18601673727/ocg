@@ -50,7 +50,12 @@ export type CanonicalConfigurationEnvelope = { api_version: CanonicalApiVersion,
 export type CanonicalConfigurationResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, project_id: string, revision: number, configuration: ProjectConfigurationView, };
 
 
-export type CanonicalDashboardResponse = { api_version: CanonicalApiVersion, project_id: string, jobs: Array<CanonicalJobSummary>, selected_job: CanonicalJobSnapshot | null, };
+export type CanonicalDashboardResponse = { api_version: CanonicalApiVersion, project_id: string, jobs: Array<CanonicalJobSummary>, selected_job: CanonicalJobSnapshot | null,
+/**
+ * Cached execution disk-space state for this Project, if its runtime has
+ * performed an observation. Absent before the first observation.
+ */
+disk_guard: DiskGuardStatus | null, };
 
 
 /**
@@ -92,19 +97,19 @@ export type CanonicalJobOperationResponse = { api_version: CanonicalApiVersion, 
 export type CanonicalJobOperations = { can_cancel: boolean, can_retry: boolean, };
 
 
-export type CanonicalJobRelations = { parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, };
+export type CanonicalJobRelations = { parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, };
 
 
 export type CanonicalJobSnapshot = { api_version: CanonicalApiVersion, project_id: string, job: JsonValue, cursor: number, };
 
 
-export type CanonicalJobSpawnRequest = { parent_attempt_id: string, expected_generation: number, spawn_key: string, spec: JobSpec, depends_on: Array<string>, executor_kind: string, policy: ChildPolicy, };
+export type CanonicalJobSpawnRequest = { parent_attempt_id: string, expected_generation: number, call_id: string | null, spawn_key: string, spec: JobSpec, depends_on: Array<string>, executor_kind: string, policy: ChildPolicy, };
 
 
 export type CanonicalJobSpawnResponse = { api_version: CanonicalApiVersion, child_job_id: string, duplicate: boolean, snapshot: CanonicalJobSnapshot, };
 
 
-export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null, parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, can_cancel: boolean, can_retry: boolean, };
+export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null, parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, can_cancel: boolean, can_retry: boolean, };
 
 
 export type CanonicalProjectResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, project: ProjectRecord, };
@@ -186,6 +191,41 @@ export type DerivedMetric = { metric: string, value: string | null, unit: string
 
 
 /**
+ * Threshold policy for one Guard. An absolute byte reserve is the core
+ * requirement; OCG cannot accurately predict per-Job byte cost, so no
+ * per-Job reservation is attempted.
+ */
+export type DiskGuardConfig = {
+/**
+ * Entering `Critical` when free space drops below this reserve.
+ */
+minimum_free_bytes: number,
+/**
+ * Entering `Pressure` when free space drops below this level.
+ */
+pressure_free_bytes: number,
+/**
+ * Guarded execution resumes only at or above this level (hysteresis).
+ */
+resume_free_bytes: number, };
+
+
+/**
+ * The smallest canonical read projection for operators: current state, live
+ * bytes, configured reserve, last observation, measured root, and whether
+ * new execution is currently being deferred.
+ */
+export type DiskGuardStatus = { state: DiskState, available_bytes: number, total_bytes: number, reserve_bytes: number, pressure_bytes: number, resume_bytes: number, observed_at: number, root: string, defers_new_execution: boolean, defers_expansion: boolean, };
+
+
+/**
+ * The Guard's current safety range. The names are deliberately coarse: this
+ * is an execution gate, not a storage dashboard.
+ */
+export type DiskState = "healthy" | "pressure" | "critical" | "unknown";
+
+
+/**
  * A lowercase canonical UUIDv7 text identifier.
  */
 export type EntityId = string;
@@ -212,7 +252,94 @@ export type Failure = { code: string, class: FailureClass, message: string, sour
 export type FailureClass = "validation" | "authentication" | "authorization" | "conflict" | "concurrency" | "not_found" | "sandbox" | "capability" | "provider" | "budget" | "resource_limit" | "rate_limit" | "timeout" | "cancelled" | "preempted" | "internal" | "unknown";
 
 
-export type GlobalConfiguration = { provider: string | null, model: string | null, profile: string | null, routing: string | null, runtime: string | null, resource_budget: ResourceBudget | null, };
+export type GlobalConfiguration = { provider: string | null, model: string | null, profile: string | null, routing: string | null, runtime: string | null, resource_budget: ResourceBudget | null,
+/**
+ * Execution disk-space protection. `None` selects the conservative
+ * built-in reserve; existing stored configurations keep loading unchanged.
+ */
+storage_guard: DiskGuardConfig | null, };
+
+
+/**
+ * The exact executable placement target a probe answers for.
+ *
+ * This is the health identity: the tuple Placement will later ask about. It is
+ * stored on the Job specification, so it is durable, journaled with the Job,
+ * and reconstructable from the canonical post-image.
+ */
+export type HealthProbeIntent = {
+/**
+ * Profile provider key.
+ */
+provider: string,
+/**
+ * Profile model key, not the upstream model id.
+ */
+model: string,
+/**
+ * Reasoning effort under test; `None` means the tuple carries no effort.
+ */
+effort: string | null, };
+
+
+/**
+ * The wire projection: the latest usable health evidence for one candidate.
+ *
+ * This is the shape later Placement work asks its question against. It is
+ * derived on read; nothing here is stored.
+ */
+export type HealthProbeObservation = { project_id: string, provider: string, model: string, effort: string | null, job_id: string, job_state: string, attempt_id: string | null, attempt_generation: number | null, attempt_state: string | null, call_id: string | null, dispatch_intent_id: string | null, upstream_model_id: string | null, started_at: number | null, completed_at: number | null, latency_seconds: number | null,
+/**
+ * `true` only when a probe Job completed a real provider round. This is
+ * the single answer to "reachable and executable"; every other state is
+ * described by `failure`.
+ */
+executable: boolean, failure: Failure | null, };
+
+
+/**
+ * `GET /api/v1/canonical/jobs/health-probe`
+ */
+export type HealthProbeQuery = { project_id: string, target: HealthProbeTarget, };
+
+
+/**
+ * `GET /api/v1/canonical/jobs/health-probe`
+ *
+ * `observation` is `null` when no probe has ever run for this candidate. That
+ * is "no evidence", which is deliberately not the same claim as "unhealthy".
+ */
+export type HealthProbeQueryResponse = { api_version: CanonicalApiVersion, project_id: string, target: HealthProbeTarget, observation: HealthProbeObservation | null, };
+
+
+/**
+ * `POST /api/v1/canonical/jobs/health-probe`
+ */
+export type HealthProbeRequest = { command_id: string, project_id: string, target: HealthProbeTarget, };
+
+
+/**
+ * `POST /api/v1/canonical/jobs/health-probe`
+ */
+export type HealthProbeResponse = { api_version: CanonicalApiVersion,
+/**
+ * `accepted`, `rejected` or `failed`.
+ */
+outcome: string, command_id: string, project_id: string, target: HealthProbeTarget,
+/**
+ * The canonical probe Job, when one was created. Follow it with the
+ * ordinary Job snapshot to read the terminal result.
+ */
+job_id: string | null, message: string, duplicate: boolean, };
+
+
+/**
+ * The executable placement target a Health Probe answers for.
+ *
+ * `effort` is part of the identity: a probe with `effort` proves a different
+ * tuple than one without it.
+ */
+export type HealthProbeTarget = { provider: string, model: string, effort: string | null, };
 
 
 /**
@@ -228,10 +355,17 @@ export type JobLaunchResponse = { api_version: CanonicalApiVersion,
 outcome: string, command_id: string, draft_id: string, project_id: string, session_id: string, job_id: string | null, message: string, duplicate: boolean, };
 
 
-export type JobOrigin = { parent_job_id: string, attempt_id: string, generation: number, spawn_key: string | null, spawn_fingerprint: string | null, policy: ChildPolicy | null, };
+export type JobOrigin = { parent_job_id: string, attempt_id: string, generation: number, spawn_key: string | null, spawn_fingerprint: string | null, call_id: string | null, policy: ChildPolicy | null, };
 
 
-export type JobSpec = { provider: string | null, model: string | null, objective: string | null, success_criteria: string | null, constraints: string | null, hard_budget_micros: number | null, resource_commitment: number | null, };
+export type JobSpec = { provider: string | null, model: string | null, objective: string | null, success_criteria: string | null, constraints: string | null, hard_budget_micros: number | null, resource_commitment: number | null, recursive_limits: RecursiveLimits,
+/**
+ * Set when this Job is a Health Probe. A probe is an ordinary Job whose
+ * declared purpose is to produce execution evidence for one
+ * Provider x Model x Effort tuple, so the target rides the durable Job
+ * specification rather than a second top-level entity.
+ */
+health_probe?: HealthProbeIntent | null, };
 
 
 export type JobUsageResponse = { api_version: CanonicalApiVersion, project_id: string, job_id: string, generated_at: number, totals: UsageTotals, providers: Array<UsageBreakdown>, models: Array<UsageBreakdown>, truncated: boolean, };
@@ -368,6 +502,9 @@ export type ProviderCatalog = { discovered_at: number, models: Array<CatalogMode
  * The protocol OCG speaks to a provider endpoint.
  */
 export type ProviderProtocol = "anthropic" | "openai" | "openai_compatible";
+
+
+export type RecursiveLimits = { max_depth: number, max_children_per_job: number, max_total_descendants_per_root: number, };
 
 
 /**

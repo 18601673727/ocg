@@ -302,7 +302,9 @@ pub fn budget_for(limits: &ModelLimits, config: &CompactionConfig) -> TokenBudge
     let output_reserve = config
         .response_reserve_tokens
         .or(declared_output)
-        .or(Some(crate::compaction::config::DEFAULT_ASSUMED_RESPONSE_RESERVE))
+        .or(Some(
+            crate::compaction::config::DEFAULT_ASSUMED_RESPONSE_RESERVE,
+        ))
         .unwrap_or(0);
     let output_reserve = match ceiling {
         Some(ceiling) => output_reserve.min(ceiling),
@@ -438,18 +440,20 @@ pub fn decide(
         } else {
             decision.state = CompactionState::Unknown;
             decision.reason =
-                "no trustworthy context window was reported; compaction was not attempted".to_string();
+                "no trustworthy context window was reported; compaction was not attempted"
+                    .to_string();
         }
         return decision;
     }
 
     // Overflow is decided by headroom, not by utilization. Utilization is a ratio,
-// so it is undefined when the available budget is zero — and a zero available
-// budget is the *most* over-budget state there is, not an unknown one. Deciding
-// by ratio would silently skip compaction in exactly the case where it is
-// mandatory, which is how a session ends up looping on a provider rejection.
-let over_budget = available.is_some_and(|available| used > available);
-    let state = if absolute || over_budget
+    // so it is undefined when the available budget is zero — and a zero available
+    // budget is the *most* over-budget state there is, not an unknown one. Deciding
+    // by ratio would silently skip compaction in exactly the case where it is
+    // mandatory, which is how a session ends up looping on a provider rejection.
+    let over_budget = available.is_some_and(|available| used > available);
+    let state = if absolute
+        || over_budget
         || decision
             .utilization_bp
             .is_some_and(|bp| bp >= config.compact_percent as u64 * 100)

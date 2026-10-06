@@ -13,7 +13,7 @@
 //! the concrete provider execution plane.
 
 use crate::error::{OcgError, Result};
-use crate::observation::{ContextUsage, ObservedModelMetadata, ObservationProvenance};
+use crate::observation::{ContextUsage, ObservationProvenance, ObservedModelMetadata};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};

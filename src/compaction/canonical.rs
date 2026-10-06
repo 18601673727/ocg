@@ -109,15 +109,9 @@ impl CanonicalBlock {
     ///
     /// This is the live path: a caller holding a current projection gets the
     /// block without re-reading the journal.
-    pub fn from_projection(
-        projection: &ExecutionProjection,
-        project_root: Option<&str>,
-    ) -> Self {
-        let settlements: Vec<crate::orchestration::budget::Settlement> = projection
-            .settlements
-            .values()
-            .cloned()
-            .collect();
+    pub fn from_projection(projection: &ExecutionProjection, project_root: Option<&str>) -> Self {
+        let settlements: Vec<crate::orchestration::budget::Settlement> =
+            projection.settlements.values().cloned().collect();
         Self::assemble(
             &projection.jobs,
             &projection.attempts,

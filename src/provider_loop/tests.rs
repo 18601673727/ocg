@@ -256,6 +256,7 @@ impl Fixture {
             cancelled: Arc::new(AtomicBool::new(false)),
             native_tool_dispatcher: tools.clone(),
             in_flight_limit: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            governor: crate::orchestration::governor::Governor::new(),
         });
         Self {
             root,

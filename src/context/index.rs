@@ -434,10 +434,7 @@ pub fn generation_id(
         material.push(',');
         material.push_str(&file.symbols.len().to_string());
     }
-    format!(
-        "sha256:{}",
-        crate::hash::sha256_hex(material.as_bytes())
-    )
+    format!("sha256:{}", crate::hash::sha256_hex(material.as_bytes()))
 }
 
 /// A stable repository identity: the canonical root path plus, when known, the
@@ -449,8 +446,5 @@ pub fn repo_id(root: &Path, git: &crate::context::gitdiff::GitState) -> String {
         material.push('|');
         material.push_str(git_root);
     }
-    format!(
-        "repo:{}",
-        crate::hash::sha256_hex(material.as_bytes())
-    )
+    format!("repo:{}", crate::hash::sha256_hex(material.as_bytes()))
 }

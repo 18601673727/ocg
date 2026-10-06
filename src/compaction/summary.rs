@@ -320,8 +320,9 @@ fn normalize_heading(heading: &str) -> String {
 
 /// Validate and return a summary, converting a rejection into an [`OcgError`].
 pub fn accept(summary: &str, max_chars: usize, canonical_refs: &[String]) -> Result<String> {
-    validate(summary, max_chars, canonical_refs)
-        .map_err(|rejection| OcgError::config(format!("compaction summary rejected: {rejection}")))?;
+    validate(summary, max_chars, canonical_refs).map_err(|rejection| {
+        OcgError::config(format!("compaction summary rejected: {rejection}"))
+    })?;
     Ok(summary.to_string())
 }
 
@@ -390,7 +391,9 @@ pub fn transcript(
                     out.push_str(&text);
                     out.push_str("\n\n");
                 }
-                if let Some(calls) = message.get("tool_calls").and_then(serde_json::Value::as_array)
+                if let Some(calls) = message
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
                 {
                     for call in calls {
                         if tool_calls >= policy.max_tool_calls {

@@ -633,6 +633,8 @@ pub struct ProviderHandlerConfig {
     /// have in flight at once. Durable Attempt/Call fencing remains the source
     /// of execution authority; this is only a resource policy.
     pub in_flight_limit: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rate and capacity governor for provider execution resources.
+    pub governor: crate::orchestration::governor::Governor,
 }
 
 pub struct CanonicalProviderCallHandler {
@@ -666,6 +668,19 @@ impl CanonicalProviderCallHandler {
             return Err(OcgError::config("provider Call cancelled before execution"));
         }
         let mut domain = DomainRepository::open(&config.project_root)?;
+
+        // A Health Probe is an ordinary Job that declares one Provider x Model x
+        // Effort target on its specification. The probe is identified here, from
+        // the durable Job row, so nothing about it travels in the queue envelope
+        // and a recovered envelope re-probes exactly the Job it was admitted
+        // for. It selects the round shape below and nothing else: every
+        // invariant above and every settlement below is the shared path.
+        let probe = domain
+            .job(&envelope.job_id)?
+            .and_then(|job| job.spec.health_probe);
+        if probe.is_none() && domain.job(&envelope.job_id)?.is_none() {
+            return Err(OcgError::config("provider Call has no durable Job"));
+        }
 
         let authority = domain
             .authority(&envelope.attempt_id)?
@@ -901,6 +916,70 @@ impl CanonicalProviderCallHandler {
             }
         };
 
+        // Acquire governor permission before execution.
+        // This enforces provider rate and execution capacity limits.
+        let governor_scope = crate::orchestration::governor::GovernorScope::provider_model(
+            provider_config.provider_key.clone(),
+            provider_config.model.clone(),
+        );
+        let _permit = match config.governor.acquire(governor_scope.clone())? {
+            Ok(permit) => {
+                // Record successful acquisition
+                let outcome = crate::orchestration::placement_projection::AcquisitionOutcome {
+                    success: true,
+                    governor_decision: "allowed_now".to_string(),
+                    failure_reason: None,
+                };
+                let _ = domain.record_acquisition_outcome(
+                    &envelope.job_id,
+                    &envelope.attempt_id,
+                    &outcome,
+                );
+                permit
+            }
+            Err(crate::orchestration::governor::GovernorDecision::RateLimited { retry_after }) => {
+                let message = format!(
+                    "provider {}:{} is rate limited (retry after {:?})",
+                    provider_config.provider_key, provider_config.model, retry_after
+                );
+                // Record reservation lost due to rate limit
+                let outcome = crate::orchestration::placement_projection::AcquisitionOutcome {
+                    success: false,
+                    governor_decision: format!("rate_limited:{}", retry_after.as_millis()),
+                    failure_reason: Some(message.clone()),
+                };
+                let _ = domain.record_acquisition_outcome(
+                    &envelope.job_id,
+                    &envelope.attempt_id,
+                    &outcome,
+                );
+                fail_authoritative_provider_call(&config.project_root, &envelope, &message, true);
+                return Err(OcgError::config(message));
+            }
+            Err(crate::orchestration::governor::GovernorDecision::CapacityUnavailable) => {
+                let message = format!(
+                    "provider {}:{} execution capacity is exhausted",
+                    provider_config.provider_key, provider_config.model
+                );
+                // Record reservation lost due to capacity
+                let outcome = crate::orchestration::placement_projection::AcquisitionOutcome {
+                    success: false,
+                    governor_decision: "capacity_unavailable".to_string(),
+                    failure_reason: Some(message.clone()),
+                };
+                let _ = domain.record_acquisition_outcome(
+                    &envelope.job_id,
+                    &envelope.attempt_id,
+                    &outcome,
+                );
+                fail_authoritative_provider_call(&config.project_root, &envelope, &message, true);
+                return Err(OcgError::config(message));
+            }
+            Err(crate::orchestration::governor::GovernorDecision::AllowedNow) => {
+                unreachable!("AllowedNow is not an error variant")
+            }
+        };
+
         if let Err(error) =
             domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)
         {
@@ -920,23 +999,6 @@ impl CanonicalProviderCallHandler {
             inner: config.transport.as_ref(),
             costs: costs.clone(),
         };
-        let provider = context_cost::AccountingProvider {
-            inner: provider_client(
-                ProviderBinding::of(protocol),
-                &transport,
-                provider_config,
-                bearer,
-                envelope.cancelled.clone(),
-                Some(envelope.events.clone()),
-            ),
-            costs: costs.clone(),
-            protocol,
-            provider: &provider_config.provider_key,
-            model: &provider_config.upstream_model_id,
-            root: &config.project_root,
-            envelope: &envelope,
-            projection: &tool_projection,
-        };
         let task = input
             .get("context_task")
             .and_then(Value::as_str)
@@ -950,6 +1012,43 @@ impl CanonicalProviderCallHandler {
                         .unwrap_or_default(),
                 )
             });
+        // A Health Probe sends exactly one round of the frozen request and stops.
+        // Context assembly, native-tool dispatch and compaction are agent
+        // behaviour: they cost tokens and can fail for reasons that say nothing
+        // about whether this tuple executes. The round below is the real one —
+        // same transport, same protocol decoder, same credential, same
+        // cancellation racing — and the terminal rules applied to its answer are
+        // the ones the ordinary loop applies.
+        //
+        // The transport is decorated so the provider's actual HTTP status is
+        // still structured when the diagnostic message is not. Nothing else
+        // observes the decorator, so ordinary Jobs are unaffected.
+        let probe_outcome = probe.as_ref().map(|_| {
+            crate::orchestration::health_probe::ProbeOutcomeTransport::new(
+                &transport as &dyn HttpTransport,
+            )
+        });
+        let provider_transport: &dyn HttpTransport = match &probe_outcome {
+            Some(decorated) => decorated,
+            None => &transport,
+        };
+        let provider = context_cost::AccountingProvider {
+            inner: provider_client(
+                ProviderBinding::of(protocol),
+                provider_transport,
+                provider_config,
+                bearer,
+                envelope.cancelled.clone(),
+                Some(envelope.events.clone()),
+            ),
+            costs: costs.clone(),
+            protocol,
+            provider: &provider_config.provider_key,
+            model: &provider_config.upstream_model_id,
+            root: &config.project_root,
+            envelope: &envelope,
+            projection: &tool_projection,
+        };
         let response = match execute_provider_loop(
             &provider,
             &config.project_root,
@@ -964,11 +1063,30 @@ impl CanonicalProviderCallHandler {
                 native_tool_dispatcher: &config.native_tool_dispatcher,
                 task: &task,
             },
+            probe
+                .as_ref()
+                .zip(probe_outcome.as_ref())
+                .map(|(intent, _)| intent),
         )
         .await
         {
             Ok(response) => response,
             Err(error) => {
+                // A reliable upstream 429 is rate governance, not a stall and
+                // not a health failure. Only a parsed Retry-After duration is
+                // recorded; an absent or unparsable value keeps the existing
+                // provider failure path and invents no cooldown.
+                if let Some(retry_after) = crate::http::reliable_retry_after(&error) {
+                    let _ = config
+                        .governor
+                        .record_throttling(governor_scope.clone(), retry_after);
+                    let _ = config.governor.record_throttling(
+                        crate::orchestration::governor::GovernorScope::provider(
+                            provider_config.provider_key.clone(),
+                        ),
+                        retry_after,
+                    );
+                }
                 // Cancellation is not a provider failure. The cancellation
                 // lifecycle already terminalized this Attempt and its Job, so
                 // settling it again here as a failure would overwrite `cancelled`
@@ -981,13 +1099,26 @@ impl CanonicalProviderCallHandler {
                 // A failed provider round is a terminal Call failure, never a
                 // completion. This worker still holds the Attempt authority it
                 // validated above, so the failure settles the whole execution
-                // rather than only the Call.
-                fail_authoritative_provider_call(
-                    &config.project_root,
-                    &envelope,
-                    &error.to_string(),
-                    true,
-                );
+                // rather than only the Call. A probe settles the same way, with
+                // the class the provider's own answer implies.
+                match (&probe, &probe_outcome) {
+                    (Some(_), Some(decorated)) => settle_authoritative_provider_call(
+                        &config.project_root,
+                        &envelope,
+                        crate::orchestration::health_probe::classify_failure(
+                            decorated.observer().outcome(),
+                            false,
+                            &error.to_string(),
+                        ),
+                        true,
+                    ),
+                    _ => fail_authoritative_provider_call(
+                        &config.project_root,
+                        &envelope,
+                        &error.to_string(),
+                        true,
+                    ),
+                }
                 costs.persist(&config.project_root, &envelope);
                 return Err(error);
             }
@@ -1012,12 +1143,24 @@ impl CanonicalProviderCallHandler {
             Ok(())
         })();
         if let Err(error) = settlement {
-            fail_authoritative_provider_call(
-                &config.project_root,
-                &envelope,
-                &error.to_string(),
-                true,
-            );
+            // An actual disk-full terminal write is storage safety, never a
+            // provider failure: the Attempt carries `storage_full` so recovery
+            // waits on disk rather than retrying the provider.
+            if error.is_storage_full() {
+                fail_authoritative_provider_call_with_failure(
+                    &config.project_root,
+                    &envelope,
+                    crate::orchestration::domain::storage_full_failure(&error.to_string()),
+                    true,
+                );
+            } else {
+                fail_authoritative_provider_call(
+                    &config.project_root,
+                    &envelope,
+                    &error.to_string(),
+                    true,
+                );
+            }
             costs.persist(&config.project_root, &envelope);
             return Err(error);
         }
@@ -1080,6 +1223,26 @@ pub fn admit_provider_call_with_events(
         event_sender,
         cancelled,
     )
+}
+
+/// Admit a Health Probe Call on the canonical provider lane.
+///
+/// A probe is admitted like any other provider Call — same Job, Attempt,
+/// Executor, economic admission and bounded dispatch — with one difference that
+/// matters for cost: it freezes the empty tool projection, because a health
+/// probe asks whether a tuple executes and never intends to call a Native Tool.
+/// Sending the full registry would spend most of the probe's tokens describing
+/// tools it must not use.
+pub fn admit_health_probe_call(
+    admission: ProviderCallAdmission<'_>,
+) -> Result<crate::orchestration::domain::Call> {
+    admit_provider_call_with_profile(
+        admission,
+        ToolProjectionProfile::NoTools,
+        None,
+        CallCancellation::new(),
+    )
+    .map(|(call, _)| call)
 }
 
 pub fn admit_provider_call_with_profile(
@@ -1733,6 +1896,13 @@ struct PendingNativeToolCall {
     durable_call_id: String,
 }
 
+/// Drive the provider rounds for one Call.
+///
+/// A Health Probe supplies `probe`. It shares every pre-execution invariant and
+/// every settlement with an ordinary Job; what it skips is the agent loop below
+/// — context assembly, native-tool dispatch, compaction — because a probe asks
+/// whether the frozen tuple executes, not what the model can do. It sends one
+/// round of the frozen request and returns.
 async fn execute_provider_loop(
     provider: &dyn ProviderClient,
     project_root: &Path,
@@ -1740,6 +1910,7 @@ async fn execute_provider_loop(
     request: &mut Value,
     binding: ProviderBinding,
     admission: ProviderAdmission<'_>,
+    probe: Option<&crate::orchestration::health_probe::HealthProbeIntent>,
 ) -> Result<ProviderFinalResponse> {
     let ProviderAdmission {
         authority,
@@ -1749,6 +1920,24 @@ async fn execute_provider_loop(
         native_tool_dispatcher,
         task,
     } = admission;
+    if probe.is_some() {
+        crate::orchestration::health_probe::run_probe_round(
+            provider,
+            project_root,
+            envelope,
+            request,
+            shutdown.as_ref(),
+        )
+        .await?;
+        // A probe records the round, not its content: reasoning is never
+        // retained or projected for a probe Call.
+        return Ok(ProviderFinalResponse {
+            images: Vec::new(),
+            content: String::new(),
+            reasoning: String::new(),
+            rounds: 1,
+        });
+    }
     let protocol = binding.protocol;
     let projection = protocol
         .is_openai_chat_completions()
@@ -2294,7 +2483,13 @@ fn push_tool_message(request: &mut Value, call: &CompletedToolCall, content: Str
     Ok(())
 }
 
-fn ensure_provider_active(
+/// Re-check the shutdown flag, the Cancellation token, the Attempt authority and
+/// the Call claim.
+///
+/// The provider loop calls this before and after every round. A Health Probe
+/// shares the same check on its one round: a probe that outlived its authority
+/// must stop exactly like any other Call.
+pub(crate) fn ensure_provider_active(
     project_root: &Path,
     envelope: &ExecutionEnvelope,
     shutdown: &AtomicBool,
@@ -2709,18 +2904,40 @@ fn accept_for(streaming: bool) -> String {
 }
 
 /// Normalize a non-2xx OpenAI-compatible response into a canonical failure.
-fn openai_http_failure(status: u16, body: &[u8]) -> OcgError {
-    let excerpt = String::from_utf8_lossy(body);
-    OcgError::config(format!(
-        "OpenAI-compatible provider returned HTTP {status}: {excerpt}"
-    ))
+fn openai_http_failure(status: u16, body: &[u8], retry_after: Option<u64>) -> OcgError {
+    provider_http_failure("OpenAI-compatible", status, body, retry_after)
 }
 
 /// Normalize a non-2xx Anthropic response into a canonical failure, keeping the
 /// provider's own error type alongside the HTTP status.
-fn anthropic_http_failure(status: u16, body: &[u8]) -> OcgError {
+fn anthropic_http_failure(status: u16, body: &[u8], retry_after: Option<u64>) -> OcgError {
     let failure = crate::anthropic::error::anthropic_failure_from_body(status, body);
-    OcgError::config(crate::anthropic::describe(&failure))
+    provider_http_failure(
+        "Anthropic",
+        status,
+        crate::anthropic::describe(&failure).as_bytes(),
+        retry_after,
+    )
+}
+
+/// Keep a reliable Retry-After visible without inventing one.
+///
+/// `retry_after` is the delta-seconds header the HTTP layer parsed. A missing
+/// or unparsable header stays absent; the body is never mined for a duration.
+fn provider_http_failure(
+    protocol: &str,
+    status: u16,
+    body: &[u8],
+    retry_after: Option<u64>,
+) -> OcgError {
+    let excerpt = String::from_utf8_lossy(body);
+    let retry_after = retry_after
+        .filter(|_| status == 429)
+        .map(|seconds| format!(" retry-after={seconds}s"))
+        .unwrap_or_default();
+    OcgError::config(format!(
+        "{protocol} provider returned HTTP {status}: {excerpt}{retry_after}"
+    ))
 }
 
 /// Drive one streamed provider round.
@@ -2738,7 +2955,7 @@ struct ProviderRequest<'a> {
     headers: &'a [(String, String)],
     body: &'a Value,
     secret: Option<&'a str>,
-    on_http_failure: fn(u16, &[u8]) -> OcgError,
+    on_http_failure: fn(u16, &[u8], Option<u64>) -> OcgError,
 }
 
 async fn run_streamed_round<S: ProviderRoundState + 'static>(
@@ -2867,7 +3084,11 @@ async fn run_streamed_round_inner<S: ProviderRoundState + 'static>(
         if let Some(secret) = wire.secret {
             excerpt = excerpt.replace(secret, "<redacted>");
         }
-        return Err((wire.on_http_failure)(response.status, excerpt.as_bytes()));
+        return Err((wire.on_http_failure)(
+            response.status,
+            excerpt.as_bytes(),
+            response.rate_limit.retry_after,
+        ));
     }
 
     // If cancellation interrupted the stream, this round is not a completion.
@@ -2933,6 +3154,50 @@ fn fail_authoritative_provider_call(
     reason: &str,
     call_claimed: bool,
 ) {
+    fail_authoritative_provider_call_with_failure(
+        project_root,
+        envelope,
+        crate::orchestration::domain::job_failure(
+            "provider_execution_failed",
+            crate::core_contract::FailureClass::Provider,
+            reason,
+            true,
+        ),
+        call_claimed,
+    );
+}
+
+/// Settle a provider execution that failed while this worker still held its
+/// Attempt authority, with a preclassified canonical [`Failure`].
+///
+/// This is the path an actual disk-full settlement failure takes: when the
+/// terminal write itself hits `ENOSPC` / `SQLITE_FULL`, the Attempt is settled
+/// (or fails to settle) as `storage_full`, never as a provider failure.
+fn fail_authoritative_provider_call_with_failure(
+    project_root: &Path,
+    envelope: &ExecutionEnvelope,
+    failure: crate::core_contract::Failure,
+    call_claimed: bool,
+) {
+    settle_authoritative_provider_call(project_root, envelope, failure, call_claimed);
+}
+
+/// Settle a provider execution that failed while this worker still held its
+/// Attempt authority, with the caller's own canonical [`Failure`].
+///
+/// The failure vocabulary is a parameter so a Health Probe can record what the
+/// provider actually answered — an authentication rejection is not the same
+/// fact as an unreachable host — while ordinary Jobs keep the single
+/// `provider_execution_failed` reason they have always recorded. The authority
+/// discipline below is identical in both cases and is deliberately not
+/// duplicated per caller.
+fn settle_authoritative_provider_call(
+    project_root: &Path,
+    envelope: &ExecutionEnvelope,
+    failure: crate::core_contract::Failure,
+    call_claimed: bool,
+) {
+    let reason = failure.message.as_str();
     if let Err(error) = (|| -> Result<()> {
         let mut domain = DomainRepository::open(project_root)?;
         let held = domain
@@ -2981,16 +3246,15 @@ fn fail_authoritative_provider_call(
         ) {
             tracing::debug!(error = %error, "provider failure receiver closed");
         }
-        domain.fail_attempt(
-            &envelope.attempt_id,
-            &crate::orchestration::domain::job_failure(
-                "provider_execution_failed",
-                crate::core_contract::FailureClass::Provider,
-                reason,
-                true,
-            ),
-        )
+        domain.fail_attempt(&envelope.attempt_id, &failure)
     })() {
-        tracing::error!(error = %error, call_id = %envelope.call_id, "provider Attempt failure could not be settled");
+        // A storage-full settlement failure is reported as storage safety, not
+        // as a provider failure: retrying it as provider work cannot help, and
+        // the Guard's reserve policy (not the provider path) owns recovery.
+        if error.is_storage_full() {
+            tracing::error!(error = %error, call_id = %envelope.call_id, "local storage is full; provider Attempt settlement could not be persisted");
+        } else {
+            tracing::error!(error = %error, call_id = %envelope.call_id, "provider Attempt failure could not be settled");
+        }
     }
 }

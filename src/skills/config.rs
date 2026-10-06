@@ -232,10 +232,9 @@ pub fn validate_name(name: &str) -> Result<()> {
             "a skill name must not start or end with '-' or contain '--'",
         ));
     }
-    if !name
-        .chars()
-        .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
-    {
+    if !name.chars().all(|character| {
+        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+    }) {
         return Err(invalid_err(
             "a skill name may contain only lowercase letters, digits and '-'",
         ));
@@ -273,10 +272,7 @@ fn validate_relative_dir(path: &str) -> Result<()> {
     if path.contains('\0') {
         return Err(invalid_err("skills.paths must not contain a NUL"));
     }
-    if path
-        .split(['/', '\\'])
-        .any(|segment| segment == "..")
-    {
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
         return Err(invalid_err(format!(
             "skills.paths entries must not escape upwards, but '{path}' contains '..'"
         )));

@@ -147,7 +147,10 @@ pub fn render_catalog(registry: &SkillRegistry, policy: &SkillsConfig) -> SkillP
 
     if dropped > 0 {
         let _ = writeln!(text, "{CATALOG_TRUNCATED_NOTICE}");
-        let _ = writeln!(text, "// {dropped} skill(s) with the lowest precedence were not listed.");
+        let _ = writeln!(
+            text,
+            "// {dropped} skill(s) with the lowest precedence were not listed."
+        );
     }
 
     SkillProjection {
@@ -177,9 +180,7 @@ fn catalog_line(skill: &SkillDefinition) -> String {
 }
 
 fn count_lines(text: &str) -> usize {
-    text.lines()
-        .filter(|line| line.starts_with("- **"))
-        .count()
+    text.lines().filter(|line| line.starts_with("- **")).count()
 }
 
 /// A rendered section plus what it accounts for.
@@ -245,10 +246,7 @@ impl SkillProjection {
         } else {
             SectionAction::Replace
         };
-        SectionDiff {
-            transition,
-            action,
-        }
+        SectionDiff { transition, action }
     }
 
     /// Project into a request message.
@@ -367,9 +365,7 @@ pub fn project(
     let catalog = render_catalog(registry, policy);
     let diff = catalog.diff(previous);
     if diff.should_emit() {
-        if let Some(message) =
-            catalog.to_message(role, diff.action == SectionAction::Replace)
-        {
+        if let Some(message) = catalog.to_message(role, diff.action == SectionAction::Replace) {
             messages.push(message);
         }
     }

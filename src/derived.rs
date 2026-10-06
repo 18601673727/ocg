@@ -337,7 +337,9 @@ impl DerivedBindings {
 
     /// Only the bindings of one kind.
     pub fn of_kind(&self, kind: DerivedKind) -> impl Iterator<Item = &DerivedBinding> {
-        self.entries.values().filter(move |entry| entry.kind == kind)
+        self.entries
+            .values()
+            .filter(move |entry| entry.kind == kind)
     }
 
     /// A stable fingerprint of the whole set.

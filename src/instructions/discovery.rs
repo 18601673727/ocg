@@ -148,10 +148,7 @@ impl InstructionSet {
 
     /// Total retained characters across the chain.
     pub fn chars(&self) -> usize {
-        self.files
-            .iter()
-            .map(InstructionFile::retained_chars)
-            .sum()
+        self.files.iter().map(InstructionFile::retained_chars).sum()
     }
 
     /// The chain's combined revision.
@@ -188,16 +185,13 @@ impl InstructionSet {
     /// instructions.
     pub fn governing(&self, path: &Path) -> Option<&InstructionFile> {
         let canonical = resolve_query(path);
-        self.files
-            .iter()
-            .rev()
-            .find(|file| match file.scope {
-                InstructionScope::UserLevel => true,
-                _ => file
-                    .path
-                    .parent()
-                    .is_some_and(|directory| canonical.starts_with(directory)),
-            })
+        self.files.iter().rev().find(|file| match file.scope {
+            InstructionScope::UserLevel => true,
+            _ => file
+                .path
+                .parent()
+                .is_some_and(|directory| canonical.starts_with(directory)),
+        })
     }
 
     /// Every file whose directory contains `path`, in precedence order.

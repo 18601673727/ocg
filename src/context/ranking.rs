@@ -457,10 +457,7 @@ pub fn provenance(
 
 /// A stable, short fingerprint of any text.
 pub fn fingerprint_text(text: &str) -> String {
-    format!(
-        "sha256:{}",
-        crate::hash::sha256_hex(text.as_bytes())
-    )
+    format!("sha256:{}", crate::hash::sha256_hex(text.as_bytes()))
 }
 
 /// Assemble the plan from already-computed pieces.

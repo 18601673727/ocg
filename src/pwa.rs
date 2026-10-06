@@ -31,7 +31,12 @@ fn entry_path() -> &'static str {
 }
 
 /// Bind the loopback server, serve the embedded UI, and wait for termination.
-pub fn run(root: &Path, profile_path: &Path, _has_profile: bool, disable_proxy: bool) -> Result<()> {
+pub fn run(
+    root: &Path,
+    profile_path: &Path,
+    _has_profile: bool,
+    disable_proxy: bool,
+) -> Result<()> {
     if !crate::ui_assets::is_packaged() {
         return Err(OcgError::config(format!(
             "the OCG product UI is not embedded; {}",

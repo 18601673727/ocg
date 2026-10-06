@@ -4,7 +4,7 @@ use crate::core_contract::{
     Actor, Conversation, EntityId, EntityKind, EntityRef, Failure, FailureClass, Message,
     MessageBlock, MessageBlockKind, MessageLifecycle, ProjectScope,
 };
-use crate::error::{OcgError, Result};
+use crate::error::{OcgError, Result, SpawnRefusalReason};
 use crate::orchestration::budget::{self, BudgetConfig, QuotaFacts, SpendAction, SpendAssessment};
 use crate::orchestration::journal::{
     self, EventDelta, EventDraft, EventKind, ExecutionEvent, ExecutionSnapshot, JournalBoundary,
@@ -31,8 +31,99 @@ fn invalid(message: &str) -> OcgError {
     OcgError::config(message)
 }
 
+fn spawn_refused(reason: SpawnRefusalReason, message: &str) -> OcgError {
+    OcgError::spawn_refused(reason, message)
+}
+
 fn sql(error: rusqlite::Error) -> OcgError {
+    if is_disk_full(&error) {
+        return OcgError::storage_full("canonical domain SQLite", error.to_string());
+    }
     OcgError::config(format!("canonical domain SQLite: {error}"))
+}
+
+/// True when SQLite itself reports the database or disk is full. Preflight
+/// checks can never rule this out: another process, WAL growth or filesystem
+/// metadata can exhaust space between the Guard's observation and the write.
+fn is_disk_full(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::DiskFull
+    )
+}
+
+/// Classify an open-time SQLite failure. An exhausted filesystem usually fails
+/// at open — WAL/shared-memory files cannot be created — with `CANTOPEN`
+/// rather than `FULL`. A `CANTOPEN` is therefore confirmed with a writability
+/// probe in the database directory before reclassifying: only an actual
+/// write rejection (`ENOSPC`, read-only mount) becomes storage safety, so
+/// permission or path errors can never masquerade as it.
+fn open_sql(root: &Path, error: rusqlite::Error) -> OcgError {
+    let cant_open = matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::CannotOpen
+    );
+    let mapped = sql(error);
+    if mapped.is_storage_full() || !cant_open {
+        return mapped;
+    }
+    match probe_writable(root) {
+        ProbeOutcome::Unwritable(reason) => OcgError::storage_full(
+            "canonical domain SQLite",
+            format!("{mapped}; host storage rejects writes ({reason})"),
+        ),
+        ProbeOutcome::Writable => mapped,
+    }
+}
+
+enum ProbeOutcome {
+    Writable,
+    Unwritable(&'static str),
+}
+
+/// Try to create, write and remove one tiny file beside the substrate. Only a
+/// write rejection proves exhaustion; anything else (including a probe that
+/// cannot even be attempted cleanly) leaves the original error untouched.
+fn probe_writable(root: &Path) -> ProbeOutcome {
+    use std::io::Write;
+    let directory = crate::orchestration::state::state_dir(root);
+    for attempt in 0..4 {
+        let path = directory.join(format!(
+            ".ocg-open-probe-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let mut file = match created {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return classify_probe_error(&error),
+        };
+        let outcome = match file.write_all(&[0]) {
+            Ok(()) => ProbeOutcome::Writable,
+            Err(error) => classify_probe_error(&error),
+        };
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return outcome;
+    }
+    ProbeOutcome::Writable
+}
+
+fn classify_probe_error(error: &std::io::Error) -> ProbeOutcome {
+    if error.raw_os_error() == Some(libc::ENOSPC) {
+        return ProbeOutcome::Unwritable("no space left on device");
+    }
+    // `libc` exposes `EROFS` on all supported targets; a read-only mount
+    // cannot take durable state either.
+    if error.raw_os_error() == Some(libc::EROFS) {
+        return ProbeOutcome::Unwritable("filesystem is read-only");
+    }
+    ProbeOutcome::Writable
 }
 
 fn now() -> i64 {
@@ -67,6 +158,52 @@ pub struct JobSpec {
     pub constraints: Option<String>,
     pub hard_budget_micros: Option<i64>,
     pub resource_commitment: Option<f64>,
+    #[serde(default)]
+    pub recursive_limits: RecursiveLimits,
+    /// Set when this Job is a Health Probe. A probe is an ordinary Job whose
+    /// declared purpose is to produce execution evidence for one
+    /// Provider x Model x Effort tuple, so the target rides the durable Job
+    /// specification rather than a second top-level entity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_probe: Option<super::health_probe::HealthProbeIntent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct RecursiveLimits {
+    pub max_depth: u64,
+    pub max_children_per_job: u64,
+    pub max_total_descendants_per_root: u64,
+}
+
+impl Default for RecursiveLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 8,
+            max_children_per_job: 16,
+            max_total_descendants_per_root: 128,
+        }
+    }
+}
+
+impl RecursiveLimits {
+    fn validate(self) -> Result<Self> {
+        if self.max_depth > 64 {
+            return Err(invalid("max_depth must not exceed 64"));
+        }
+        if self.max_children_per_job > 256 {
+            return Err(invalid("max_children_per_job must not exceed 256"));
+        }
+        if self.max_total_descendants_per_root > 4096 {
+            return Err(invalid(
+                "max_total_descendants_per_root must not exceed 4096",
+            ));
+        }
+        if self.max_depth > 0 && self.max_total_descendants_per_root == 0 {
+            return Err(invalid("max_total_descendants_per_root must be positive"));
+        }
+        Ok(self)
+    }
 }
 
 impl JobSpec {
@@ -129,6 +266,28 @@ mod job_spec_payload {
     }
 }
 
+/// Placement facts frozen with an automatic admission reservation.
+pub(crate) struct AdmissionPlacement<'a> {
+    pub limit: usize,
+    pub config: &'a BudgetConfig,
+    pub quota: QuotaFacts,
+}
+
+fn decode_admission_reservation(raw: &str) -> Result<super::admission::AdmissionReservation> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| invalid(&error.to_string()))?;
+    if value.get("pickup").is_some() || value.get("choice").is_some() {
+        return serde_json::from_value(value).map_err(|error| invalid(&error.to_string()));
+    }
+    let choice: super::placement::ProviderChoice =
+        serde_json::from_value(value).map_err(|error| invalid(&error.to_string()))?;
+    Ok(super::admission::AdmissionReservation {
+        choice,
+        pickup: super::admission::AdmissionPickup::Automatic,
+        exact: None,
+    })
+}
+
 fn stored_job_spec<S>(spec: S) -> Result<(JobSpec, String)>
 where
     S: TryInto<JobSpec>,
@@ -137,6 +296,8 @@ where
     let spec = spec
         .try_into()
         .map_err(|error| invalid(&format!("invalid Job specification: {error}")))?;
+    let mut spec = spec;
+    spec.recursive_limits = spec.recursive_limits.validate()?;
     let payload = serde_json::to_string(&spec)
         .map_err(|error| invalid(&format!("cannot serialize Job specification: {error}")))?;
     Ok((spec, payload))
@@ -206,12 +367,15 @@ pub struct JobOrigin {
     pub generation: u64,
     pub spawn_key: Option<String>,
     pub spawn_fingerprint: Option<String>,
+    #[serde(default)]
+    pub call_id: Option<String>,
     pub policy: Option<ChildPolicy>,
 }
 
 struct ChildSpawnMetadata<'a> {
     key: &'a str,
     fingerprint: String,
+    call_id: Option<&'a str>,
     policy: &'a ChildPolicy,
 }
 
@@ -231,6 +395,12 @@ pub struct Job {
     pub authoritative_attempt_id: Option<AttemptId>,
     #[serde(default)]
     pub termination_reason: Option<Failure>,
+    #[serde(default)]
+    pub root_job_id: JobId,
+    #[serde(default)]
+    pub depth: u64,
+    #[serde(default)]
+    pub waiting_for_children: bool,
     #[serde(rename = "payload", with = "job_spec_payload")]
     pub spec: JobSpec,
     pub created_at: i64,
@@ -393,11 +563,62 @@ pub struct DispatchIntent {
     pub updated_at: i64,
 }
 
+/// One non-terminal execution as Watchdog observes it.
+///
+/// This is a read model. It does not decide a stall and it does not mutate
+/// authority. `created_at` on the nested records is an identity fact, not a
+/// deadline.
+#[derive(Debug, Clone)]
+pub(crate) struct WatchdogObservation {
+    pub job: Job,
+    pub attempt: Option<Attempt>,
+    pub executor: Option<Executor>,
+    pub calls: Vec<Call>,
+    pub intents: Vec<DispatchIntent>,
+    pub reservation: Option<super::admission::AdmissionReservation>,
+    pub acquisition: Option<super::placement_projection::AcquisitionOutcome>,
+    pub automatic_admission: bool,
+}
+
+/// One persisted Watchdog classification and the recovery it performed.
+///
+/// Rows are append-only and unique per Attempt generation, classification, and
+/// action. A repeated pass that finds the same condition records nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WatchdogActionRecord {
+    pub job_id: JobId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<AttemptId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_id: Option<String>,
+    pub classification: String,
+    pub action: String,
+    pub evidence: serde_json::Value,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_attempt_id: Option<AttemptId>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptAuthority {
     pub attempt_id: AttemptId,
     pub job_id: JobId,
     pub generation: u64,
+}
+
+pub struct SpawnChildRequest<'a> {
+    pub parent_authority: &'a AttemptAuthority,
+    pub spawn_key: &'a str,
+    pub spec: JobSpec,
+    pub prerequisite_job_ids: &'a [&'a str],
+    pub executor_kind: &'a str,
+    pub policy: &'a ChildPolicy,
+    pub call_id: Option<&'a str>,
 }
 
 /// The identity a settlement caller *claims*. It is verified against canonical
@@ -519,6 +740,9 @@ CREATE TABLE IF NOT EXISTS domain_jobs (
     state TEXT NOT NULL CHECK(state IN ('pending','eligible','running','cancelling','completed','failed','cancelled','unknown','orphaned')),
     generation INTEGER NOT NULL CHECK(generation >= 0),
     authoritative_attempt_id TEXT,
+    root_job_id TEXT,
+    depth INTEGER NOT NULL DEFAULT 0 CHECK(depth >= 0),
+    waiting_for_children INTEGER NOT NULL DEFAULT 0 CHECK(waiting_for_children IN (0,1)),
     payload TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -578,7 +802,8 @@ CREATE TABLE IF NOT EXISTS domain_job_origins (
     job_id TEXT PRIMARY KEY REFERENCES domain_jobs(id),
     parent_job_id TEXT NOT NULL REFERENCES domain_jobs(id),
     attempt_id TEXT NOT NULL REFERENCES domain_attempts(id),
-    generation INTEGER NOT NULL
+    generation INTEGER NOT NULL,
+    call_id TEXT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS domain_dispatch_intents (
     id TEXT PRIMARY KEY,
@@ -758,17 +983,19 @@ impl DomainRepository {
             .ok_or_else(|| invalid("canonical database has no parent directory"))?;
         std::fs::create_dir_all(parent)
             .map_err(|error| OcgError::io("create canonical database directory", error))?;
-        let connection = Connection::open(&path).map_err(sql)?;
+        let connection = Connection::open(&path).map_err(|error| open_sql(root, error))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(sql)?;
+            .map_err(|error| open_sql(root, error))?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql)?;
+            .map_err(|error| open_sql(root, error))?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
-            .map_err(sql)?;
-        connection.execute_batch(DOMAIN_SCHEMA).map_err(sql)?;
+            .map_err(|error| open_sql(root, error))?;
+        connection
+            .execute_batch(DOMAIN_SCHEMA)
+            .map_err(|error| open_sql(root, error))?;
         // The durable execution event journal shares this database so a state
         // change and its event commit in one transaction. It is evidence, never
         // a decision input: nothing in this file reads it back to choose an
@@ -805,6 +1032,25 @@ impl DomainRepository {
             "TEXT",
         )?;
         ensure_column(&connection, "domain_jobs", "termination_reason", "TEXT")?;
+        ensure_column(&connection, "domain_jobs", "root_job_id", "TEXT")?;
+        ensure_column(
+            &connection,
+            "domain_jobs",
+            "depth",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(depth >= 0)",
+        )?;
+        ensure_column(
+            &connection,
+            "domain_jobs",
+            "waiting_for_children",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(waiting_for_children IN (0,1))",
+        )?;
+        connection
+            .execute(
+                "UPDATE domain_jobs SET root_job_id=id WHERE root_job_id IS NULL",
+                [],
+            )
+            .map_err(sql)?;
         ensure_column(
             &connection,
             "domain_jobs",
@@ -812,6 +1058,46 @@ impl DomainRepository {
             "INTEGER NOT NULL DEFAULT 0 CHECK(automatic_admission IN (0,1))",
         )?;
         ensure_column(&connection, "domain_jobs", "admission_selection", "TEXT")?;
+        ensure_column(&connection, "domain_jobs", "placement_evidence", "TEXT")?;
+        ensure_column(
+            &connection,
+            "domain_jobs",
+            "final_acquisition_outcome",
+            "TEXT",
+        )?;
+        // Staged candidate evidence is adopted by the Attempt that consumes it.
+        // The history itself is append-only and keyed by Attempt, so a later
+        // replacement cannot overwrite an earlier decision.
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS domain_placement_decisions (
+    job_id TEXT NOT NULL REFERENCES domain_jobs(id),
+    attempt_id TEXT REFERENCES domain_attempts(id),
+    generation INTEGER,
+    decision TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    ordinal INTEGER PRIMARY KEY AUTOINCREMENT
+) STRICT;
+CREATE INDEX IF NOT EXISTS domain_placement_by_job
+    ON domain_placement_decisions(job_id,ordinal);
+CREATE TABLE IF NOT EXISTS domain_watchdog_actions (
+    job_id TEXT NOT NULL REFERENCES domain_jobs(id),
+    attempt_id TEXT,
+    generation INTEGER,
+    call_id TEXT,
+    executor_id TEXT,
+    classification TEXT NOT NULL,
+    action TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    replacement_attempt_id TEXT,
+    created_at INTEGER NOT NULL,
+    ordinal INTEGER PRIMARY KEY AUTOINCREMENT
+) STRICT;
+CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
+    ON domain_watchdog_actions(job_id,ordinal);",
+            )
+            .map_err(sql)?;
         ensure_column(&connection, "domain_job_origins", "spawn_key", "TEXT")?;
         ensure_column(
             &connection,
@@ -820,9 +1106,29 @@ impl DomainRepository {
             "TEXT",
         )?;
         ensure_column(&connection, "domain_job_origins", "policy", "TEXT")?;
+        ensure_column(&connection, "domain_job_origins", "call_id", "TEXT")?;
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS domain_job_spawn_keys ON domain_job_origins(parent_job_id,spawn_key) WHERE spawn_key IS NOT NULL", [],
         ).map_err(sql)?;
+        connection
+            .execute_batch(
+                "WITH RECURSIVE lineage(job_id,root_job_id,depth) AS (
+                    SELECT j.id,j.id,0
+                    FROM domain_jobs j
+                    WHERE NOT EXISTS(
+                        SELECT 1 FROM domain_job_origins o WHERE o.job_id=j.id
+                    )
+                    UNION ALL
+                    SELECT o.job_id,lineage.root_job_id,lineage.depth+1
+                    FROM domain_job_origins o
+                    JOIN lineage ON lineage.job_id=o.parent_job_id
+                )
+                UPDATE domain_jobs
+                SET root_job_id=(SELECT lineage.root_job_id FROM lineage WHERE lineage.job_id=domain_jobs.id),
+                    depth=(SELECT lineage.depth FROM lineage WHERE lineage.job_id=domain_jobs.id)
+                WHERE EXISTS(SELECT 1 FROM lineage WHERE lineage.job_id=domain_jobs.id);",
+            )
+            .map_err(sql)?;
         ensure_column(&connection, "domain_job_bindings", "attempt_id", "TEXT")?;
         connection.execute(
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
@@ -1723,9 +2029,9 @@ impl DomainRepository {
             .filter(|reservation| reservation.state != budget::ReservationState::Released)
             .map(|reservation| reservation.reservation_id.clone());
         if existing.is_none()
-            && before.as_ref().is_some_and(|intent| {
-                !matches!(intent.state.as_str(), "pending" | "queued")
-            })
+            && before
+                .as_ref()
+                .is_some_and(|intent| !matches!(intent.state.as_str(), "pending" | "queued"))
         {
             return Err(invalid("dispatch intent is no longer budget-admittable"));
         }
@@ -2178,6 +2484,116 @@ impl DomainRepository {
             .transpose()
     }
 
+    /// Read the latest canonical execution evidence a Health Probe left for one
+    /// Provider x Model x Effort tuple in this Project.
+    ///
+    /// The evidence is the probe Job's own durable rows: the Job and its
+    /// termination reason, the highest-generation Attempt, and the provider Call
+    /// with the DispatchIntent it froze. There is no stored health value to fall
+    /// back on, so this cannot disagree with execution history.
+    ///
+    /// The newest probe wins whatever state it is in, so a caller can see that
+    /// evidence is being refreshed rather than silently reading a stale verdict.
+    /// `json_valid` guards the projection: older CLI Jobs stored their objective
+    /// as plain text, and `json_extract` raises on malformed JSON rather than
+    /// yielding `NULL`.
+    pub fn latest_health_probe(
+        &self,
+        project_id: &str,
+        target: &super::health_probe::HealthProbeIntent,
+    ) -> Result<Option<super::health_probe::HealthProbeOutcome>> {
+        use super::health_probe::{HealthProbeIntent, HealthProbeOutcome};
+        validate_id(project_id)?;
+        if target.provider.is_empty() || target.model.is_empty() {
+            return Ok(None);
+        }
+        let job_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM domain_jobs WHERE project_id=?1 \
+                 AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe.provider')=?2 \
+                 AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe.model')=?3 \
+                 AND COALESCE(json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe.effort'),'')=?4 \
+                 ORDER BY created_at DESC,id DESC LIMIT 1",
+                params![
+                    project_id,
+                    target.provider,
+                    target.model,
+                    target.effort.clone().unwrap_or_default()
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        let Some(job_id) = job_id else {
+            return Ok(None);
+        };
+        let job = read_job(&self.connection, &job_id)?
+            .ok_or_else(|| invalid("health probe Job disappeared"))?;
+        let intent: HealthProbeIntent = job
+            .spec
+            .health_probe
+            .clone()
+            .ok_or_else(|| invalid("health probe Job lost its declared target"))?;
+        let attempt = self.latest_attempt(&job.id)?;
+        let call = attempt
+            .as_ref()
+            .and_then(|attempt| self.calls_for_attempt(&attempt.id).ok())
+            .and_then(|calls| calls.into_iter().next());
+        let dispatch = call
+            .as_ref()
+            .and_then(|call| self.dispatch_intent(&call.id).ok())
+            .flatten();
+        // Provider latency is measured on the Call when the probe reached
+        // dispatch, and on the Attempt when it failed before one existed.
+        let (started_at, completed_at) = match &call {
+            Some(call) => (
+                Some(call.created_at),
+                call.finished_at.or(Some(call.created_at)),
+            ),
+            None => (
+                attempt.as_ref().map(|attempt| attempt.created_at),
+                attempt.as_ref().and_then(|attempt| attempt.finished_at),
+            ),
+        };
+        Ok(Some(HealthProbeOutcome {
+            project_id: job.project_id.clone(),
+            intent,
+            job_id: job.id.clone(),
+            job_state: job.state,
+            attempt_id: attempt.as_ref().map(|attempt| attempt.id.clone()),
+            attempt_generation: attempt.as_ref().map(|attempt| attempt.generation),
+            attempt_state: attempt.as_ref().map(|attempt| attempt.state),
+            call_id: call.as_ref().map(|call| call.id.clone()),
+            dispatch_intent_id: dispatch.as_ref().map(|intent| intent.id.clone()),
+            upstream_model_id: dispatch
+                .as_ref()
+                .and_then(|intent| intent.upstream_model_id.clone()),
+            started_at,
+            completed_at,
+            latency_seconds: match (started_at, completed_at) {
+                (Some(start), Some(end)) => Some(end - start),
+                _ => None,
+            },
+            failure: job.termination_reason,
+        }))
+    }
+
+    /// The highest-generation Attempt a Job published.
+    fn latest_attempt(&self, job_id: &str) -> Result<Option<Attempt>> {
+        self.connection
+            .query_row(
+                "SELECT id FROM domain_attempts WHERE job_id=?1 ORDER BY generation DESC LIMIT 1",
+                [job_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .map(|id| self.attempt(&id))
+            .transpose()
+            .map(|attempt| attempt.flatten())
+    }
+
     pub fn set_dependency(
         &mut self,
         project_id: &str,
@@ -2503,7 +2919,7 @@ impl DomainRepository {
         let transaction = self.begin()?;
         transaction
             .execute(
-                "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?4)",
+                "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,root_job_id,depth,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?1,0,?3,?4,?4)",
                 params![id, project_id, payload, timestamp],
             )
             .map_err(sql)?;
@@ -2514,6 +2930,9 @@ impl DomainRepository {
             generation: 0,
             authoritative_attempt_id: None,
             termination_reason: None,
+            root_job_id: id.clone(),
+            depth: 0,
+            waiting_for_children: false,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
@@ -2536,168 +2955,39 @@ impl DomainRepository {
         S: TryInto<JobSpec>,
         S::Error: std::fmt::Display,
     {
-        let (spec, payload) = stored_job_spec(spec)?;
-        validate_id(&parent_authority.attempt_id)?;
-        validate_id(&parent_authority.job_id)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql)?;
-        let parent_generation = i64::try_from(parent_authority.generation)
-            .map_err(|_| invalid("parent Attempt generation exceeds SQLite range"))?;
-        let parent_valid: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE a.id=?1 AND a.job_id=?2 AND a.generation=?3 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.state IN ('queued','running'))",
-                params![parent_authority.attempt_id, parent_authority.job_id, parent_generation],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        if !parent_valid {
-            return Err(invalid("parent Attempt is no longer authoritative"));
-        }
-        let project_id: String = transaction
-            .query_row(
-                "SELECT project_id FROM domain_jobs WHERE id=?1",
-                [&parent_authority.job_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        let job_id = new_id("job");
-        let timestamp = now();
-        transaction
-            .execute(
-                "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?4)",
-                params![job_id, project_id, payload, timestamp],
-            )
-            .map_err(sql)?;
-        for prerequisite in prerequisite_job_ids {
-            validate_id(prerequisite)?;
-            let same_project: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM domain_jobs WHERE id=?1 AND project_id=?2)",
-                    params![prerequisite, project_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql)?;
-            if !same_project {
-                return Err(invalid("child dependency is not in the parent Project"));
-            }
-            let would_cycle: bool = transaction
-                .query_row(
-                    "WITH RECURSIVE dependents(id) AS (SELECT ?2 UNION SELECT dependencies.prerequisite_job_id FROM domain_job_dependencies dependencies JOIN dependents ON dependencies.job_id=dependents.id WHERE dependencies.project_id=?3) SELECT EXISTS(SELECT 1 FROM dependents WHERE id=?1)",
-                    params![job_id, prerequisite, project_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql)?;
-            if would_cycle {
-                return Err(invalid("child dependency would create a cycle"));
-            }
-            transaction
-                .execute(
-                    "INSERT INTO domain_job_dependencies(project_id,job_id,prerequisite_job_id) VALUES(?1,?2,?3)",
-                    params![project_id, job_id, prerequisite],
-                )
-                .map_err(sql)?;
-        }
-        transaction.execute(
-            "INSERT INTO domain_job_origins(job_id,parent_job_id,attempt_id,generation,policy) VALUES(?1,?2,?3,?4,?5)",
-            params![job_id,parent_authority.job_id,parent_authority.attempt_id,parent_generation, serde_json::to_string(&ChildPolicy::default()).map_err(|error| invalid(&error.to_string()))?],
-        ).map_err(sql)?;
-        if !prerequisite_job_ids.is_empty() {
-            transaction
-                .execute(
-                    "INSERT INTO domain_dependency_revisions(project_id,revision) VALUES(?1,0) ON CONFLICT(project_id) DO NOTHING",
-                    [&project_id],
-                )
-                .map_err(sql)?;
-            transaction
-                .execute(
-                    "UPDATE domain_dependency_revisions SET revision=revision+1 WHERE project_id=?1",
-                    [&project_id],
-                )
-                .map_err(sql)?;
-        }
-        let job = Job {
-            id: job_id.clone(),
-            project_id: project_id.clone(),
-            state: JobState::Pending,
-            generation: 0,
-            authoritative_attempt_id: None,
-            termination_reason: None,
-            spec,
-            created_at: timestamp,
-            updated_at: timestamp,
-        };
-        // The spawned Job is the root fact; its prerequisite edges are caused
-        // by the same spawn, and the parent Attempt that authorized it is the
-        // event's authority identity.
-        let root = journal::append(
-            &transaction,
-            EventDraft::new(EventKind::JobCreated, "job", &job.id, journal::value(&job)?)
-                .project(&project_id)
-                .job(&job.id)
-                .authority(&parent_authority.attempt_id, parent_authority.generation)
-                .causation_key(&parent_authority.attempt_id),
-        )?;
-        for prerequisite in prerequisite_job_ids {
-            emit_dependency(
-                &transaction,
-                EventKind::DependencyAdded,
-                &journal::DependencyEdge {
-                    project_id: project_id.clone(),
-                    job_id: job_id.clone(),
-                    prerequisite_job_id: (*prerequisite).to_string(),
-                },
-                Some(root),
-            )?;
-        }
-        if !prerequisite_job_ids.is_empty() {
-            refresh_job_readiness_in(&transaction, &job.id, Some(root))?;
-        }
-        let job = read_job(&transaction, &job.id)?
-            .ok_or_else(|| invalid("created Job disappeared"))?;
-        transaction.commit().map_err(sql)?;
-        Ok(job)
+        self.create_spawned_job(
+            parent_authority,
+            spec.try_into()
+                .map_err(|error| invalid(&format!("invalid Job specification: {error}")))?,
+            prerequisite_job_ids,
+            None,
+        )
+        .map(|(job, _)| job)
     }
 
-    /// Admit a child execution in one canonical transaction. The parent
-    /// Attempt is checked while the child Job, dependency edges, Attempt and
-    /// Executor are published, so a stale worker cannot create an orphaned
-    /// execution branch.
-    pub fn admit_child<S>(
-        &mut self,
-        parent_authority: &AttemptAuthority,
-        spec: S,
-        prerequisite_job_ids: &[&str],
-        executor_kind: &str,
-    ) -> Result<CanonicalAdmission>
-    where
-        S: TryInto<JobSpec>,
-        S::Error: std::fmt::Display,
-    {
-        self.admit_child_inner(
+    /// Create a durable child Job. Admission owns the later Attempt,
+    /// Executor, and provider reservation.
+    pub fn spawn_child(&mut self, request: SpawnChildRequest<'_>) -> Result<(Job, bool)> {
+        let SpawnChildRequest {
             parent_authority,
+            spawn_key,
             spec,
             prerequisite_job_ids,
             executor_kind,
-            None,
-        )
-        .map(|(admission, _)| admission)
-    }
-
-    pub fn spawn_child(
-        &mut self,
-        parent_authority: &AttemptAuthority,
-        spawn_key: &str,
-        spec: JobSpec,
-        prerequisite_job_ids: &[&str],
-        executor_kind: &str,
-        policy: &ChildPolicy,
-    ) -> Result<(Job, bool)> {
+            policy,
+            call_id,
+        } = request;
         validate_id(spawn_key)?;
+        validate_id(executor_kind)?;
+        if let Some(call_id) = call_id {
+            validate_id(call_id)?;
+        }
         let project = self
             .job(&parent_authority.job_id)?
             .ok_or_else(|| invalid("unknown parent Job"))?;
+        let mut spec = spec;
+        spec.provider = None;
+        spec.model = None;
         let mut arguments =
             serde_json::to_value(&spec).map_err(|error| invalid(&error.to_string()))?;
         // The shared fingerprint profile requires semantic decimals as strings.
@@ -2715,105 +3005,147 @@ impl DomainRepository {
             Some(EntityRef { kind: EntityKind::Job,
                 id: EntityId::new(parent_authority.job_id.strip_prefix("job-").unwrap_or(&parent_authority.job_id))?,
             }),
-            serde_json::json!({"spec": arguments, "depends_on": prerequisites, "executor_kind": executor_kind, "policy": policy}),
+            serde_json::json!({"spec": arguments, "depends_on": prerequisites, "executor_kind": executor_kind, "call_id": call_id, "policy": policy}),
         ).fingerprint()?;
         let metadata = ChildSpawnMetadata {
             key: spawn_key,
             fingerprint,
+            call_id,
             policy,
         };
-        self.admit_child_inner(
-            parent_authority,
-            spec,
-            &prerequisites,
-            executor_kind,
-            Some(&metadata),
-        )
-        .map(|(admission, duplicate)| (admission.job, duplicate))
+        self.create_spawned_job(parent_authority, spec, &prerequisites, Some(&metadata))
     }
 
-    fn admit_child_inner<S>(
+    fn create_spawned_job(
         &mut self,
         parent_authority: &AttemptAuthority,
-        spec: S,
+        mut spec: JobSpec,
         prerequisite_job_ids: &[&str],
-        executor_kind: &str,
         spawn: Option<&ChildSpawnMetadata<'_>>,
-    ) -> Result<(CanonicalAdmission, bool)>
-    where
-        S: TryInto<JobSpec>,
-        S::Error: std::fmt::Display,
-    {
-        let (spec, payload) = stored_job_spec(spec)?;
+    ) -> Result<(Job, bool)> {
         validate_id(&parent_authority.attempt_id)?;
         validate_id(&parent_authority.job_id)?;
-        validate_id(executor_kind)?;
         let parent_generation = i64::try_from(parent_authority.generation)
             .map_err(|_| invalid("parent Attempt generation exceeds SQLite range"))?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let project_id: String = transaction
-            .query_row(
-                "SELECT j.project_id FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE a.id=?1 AND a.job_id=?2 AND a.generation=?3 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.state IN ('queued','running')",
-                params![parent_authority.attempt_id, parent_authority.job_id, parent_generation],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql)?
-            .ok_or_else(|| invalid("parent Attempt is no longer authoritative"))?;
-
+        let (project_id, root_job_id, parent_depth, root_payload): (String, String, i64, String) =
+            transaction
+                .query_row(
+                    "SELECT j.project_id,COALESCE(j.root_job_id,j.id),j.depth,r.payload FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id JOIN domain_jobs r ON r.id=COALESCE(j.root_job_id,j.id) WHERE a.id=?1 AND a.job_id=?2 AND a.generation=?3 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.state IN ('queued','running')",
+                    params![parent_authority.attempt_id, parent_authority.job_id, parent_generation],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(sql)?
+                .ok_or_else(|| {
+                    spawn_refused(
+                        SpawnRefusalReason::ParentAuthorityStale,
+                        "parent Attempt is no longer authoritative",
+                    )
+                })?;
         if let Some(spawn) = spawn {
-            let existing: Option<(String, Option<String>)> = transaction.query_row(
-                "SELECT job_id,spawn_fingerprint FROM domain_job_origins WHERE parent_job_id=?1 AND spawn_key=?2",
-                params![parent_authority.job_id, spawn.key], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional().map_err(sql)?;
-            if let Some((child_id, fingerprint)) = existing {
+            let existing: Option<(String, Option<String>)> = transaction
+                .query_row(
+                    "SELECT job_id,spawn_fingerprint FROM domain_job_origins WHERE parent_job_id=?1 AND spawn_key=?2",
+                    params![parent_authority.job_id, spawn.key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            if let Some((job_id, fingerprint)) = existing {
                 if fingerprint.as_deref() != Some(spawn.fingerprint.as_str()) {
-                    return Err(invalid(
+                    return Err(spawn_refused(
+                        SpawnRefusalReason::SpawnKeyConflict,
                         "spawn_key already used with different child inputs",
                     ));
                 }
-                let job = read_job(&transaction, &child_id)?
+                let job = read_job(&transaction, &job_id)?
                     .ok_or_else(|| invalid("spawned Job disappeared"))?;
-                if job.project_id != project_id {
-                    return Err(invalid("spawned Job is not in the parent Project"));
-                }
-                let attempt_id: String = transaction.query_row("SELECT id FROM domain_attempts WHERE job_id=?1 ORDER BY generation,id LIMIT 1", [&child_id], |row| row.get(0)).map_err(sql)?;
-                let executor_id: String = transaction
+                transaction.commit().map_err(sql)?;
+                return Ok((job, true));
+            }
+        }
+        if let Some(spawn) = spawn {
+            if let Some(call_id) = spawn.call_id {
+                let valid_call: bool = transaction
                     .query_row(
-                        "SELECT id FROM domain_executors WHERE attempt_id=?1 ORDER BY id LIMIT 1",
-                        [&attempt_id],
+                        "SELECT EXISTS(SELECT 1 FROM domain_calls WHERE id=?1 AND attempt_id=?2)",
+                        params![call_id, parent_authority.attempt_id],
                         |row| row.get(0),
                     )
                     .map_err(sql)?;
-                let admission = CanonicalAdmission {
-                    project: read_project(&transaction, &project_id)?,
-                    job,
-                    attempt: read_attempt(&transaction, &attempt_id)?,
-                    executor: read_executor(&transaction, &executor_id)?
-                        .ok_or_else(|| invalid("spawned Executor disappeared"))?,
-                };
-                transaction.commit().map_err(sql)?;
-                return Ok((admission, true));
+                if !valid_call {
+                    return Err(spawn_refused(
+                        SpawnRefusalReason::CallMismatch,
+                        "Call is not owned by the parent Attempt",
+                    ));
+                }
             }
         }
-
+        let limits = JobSpec::from_payload(&root_payload)?
+            .recursive_limits
+            .validate()?;
+        let child_depth = u64::try_from(parent_depth)
+            .map_err(|_| invalid("invalid parent Job depth"))?
+            .checked_add(1)
+            .ok_or_else(|| spawn_refused(SpawnRefusalReason::DepthLimit, "depth overflow"))?;
+        if child_depth > limits.max_depth {
+            return Err(spawn_refused(
+                SpawnRefusalReason::DepthLimit,
+                "max_depth reached",
+            ));
+        }
+        let child_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM domain_job_origins WHERE parent_job_id=?1",
+                [&parent_authority.job_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if u64::try_from(child_count).map_err(|_| invalid("invalid child count"))?
+            >= limits.max_children_per_job
+        {
+            return Err(spawn_refused(
+                SpawnRefusalReason::ChildLimit,
+                "max_children_per_job reached",
+            ));
+        }
+        let descendant_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM domain_jobs WHERE root_job_id=?1 AND id!=?1",
+                [&root_job_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if u64::try_from(descendant_count).map_err(|_| invalid("invalid descendant count"))?
+            >= limits.max_total_descendants_per_root
+        {
+            return Err(spawn_refused(
+                SpawnRefusalReason::DescendantLimit,
+                "max_total_descendants_per_root reached",
+            ));
+        }
+        spec.recursive_limits = limits;
+        let (_, payload) = stored_job_spec(spec.clone())?;
         let job_id = new_id("job");
-        let attempt_id = new_id("att");
-        let executor_id = new_id("exec");
         let timestamp = now();
         transaction
             .execute(
-                "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?4)",
-                params![job_id, project_id, payload, timestamp],
+                "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,root_job_id,depth,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?5,?6,?6)",
+                params![
+                    job_id,
+                    project_id,
+                    root_job_id,
+                    i64::try_from(child_depth)
+                        .map_err(|_| invalid("child Job depth exceeds SQLite range"))?,
+                    payload,
+                    timestamp
+                ],
             )
             .map_err(sql)?;
-        transaction.execute(
-            "INSERT INTO domain_job_origins(job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,policy) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![job_id,parent_authority.job_id,parent_authority.attempt_id,parent_generation,spawn.map(|value| value.key),spawn.map(|value| value.fingerprint.as_str()),serde_json::to_string(spawn.map(|value| value.policy).unwrap_or(&ChildPolicy::default())).map_err(|error| invalid(&error.to_string()))?],
-        ).map_err(sql)?;
         for prerequisite in prerequisite_job_ids {
             validate_id(prerequisite)?;
             let same_project: bool = transaction
@@ -2834,7 +3166,10 @@ impl DomainRepository {
                 )
                 .map_err(sql)?;
             if would_cycle {
-                return Err(invalid("child dependency would create a cycle"));
+                return Err(spawn_refused(
+                    SpawnRefusalReason::DependencyCycle,
+                    "child dependency would create a cycle",
+                ));
             }
             transaction
                 .execute(
@@ -2857,61 +3192,36 @@ impl DomainRepository {
                 )
                 .map_err(sql)?;
         }
-        if !dependencies_satisfied_in(&transaction, &job_id)? {
-            return Err(invalid("child dependencies are not satisfied"));
-        }
         transaction
             .execute(
-                "INSERT INTO domain_attempts(id,job_id,generation,state,authoritative,created_at,finished_at) VALUES(?1,?2,1,'queued',1,?3,NULL)",
-                params![attempt_id, job_id, timestamp],
+                "INSERT INTO domain_job_origins(job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,call_id,policy) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    job_id,
+                    parent_authority.job_id,
+                    parent_authority.attempt_id,
+                    parent_generation,
+                    spawn.map(|value| value.key),
+                    spawn.map(|value| value.fingerprint.as_str()),
+                    spawn.and_then(|value| value.call_id),
+                    serde_json::to_string(spawn.map(|value| value.policy).unwrap_or(&ChildPolicy::default()))
+                        .map_err(|error| invalid(&error.to_string()))?
+                ],
             )
             .map_err(sql)?;
-        let changed = transaction
-            .execute(
-                "UPDATE domain_jobs SET state='running',generation=1,authoritative_attempt_id=?2,updated_at=?3 WHERE id=?1 AND state='pending'",
-                params![job_id, attempt_id, timestamp],
-            )
-            .map_err(sql)?;
-        if changed != 1 {
-            return Err(invalid("child Job changed while creating Attempt"));
-        }
-        transaction
-            .execute(
-                "INSERT INTO domain_executors(id,attempt_id,kind,state,created_at) VALUES(?1,?2,?3,'ready',?4)",
-                params![executor_id, attempt_id, executor_kind, timestamp],
-            )
-            .map_err(sql)?;
-
         let job = Job {
             id: job_id.clone(),
             project_id: project_id.clone(),
-            state: JobState::Running,
-            generation: 1,
-            authoritative_attempt_id: Some(attempt_id.clone()),
+            state: JobState::Pending,
+            generation: 0,
+            authoritative_attempt_id: None,
             termination_reason: None,
+            root_job_id,
+            depth: child_depth,
+            waiting_for_children: false,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
         };
-        let attempt = Attempt {
-            id: attempt_id.clone(),
-            job_id: job_id.clone(),
-            generation: 1,
-            state: AttemptState::Queued,
-            authoritative: true,
-            created_at: timestamp,
-            finished_at: None,
-        };
-        let executor = Executor {
-            id: executor_id.clone(),
-            attempt_id: attempt_id.clone(),
-            kind: executor_kind.to_string(),
-            state: "ready".to_string(),
-            created_at: timestamp,
-        };
-        // A spawn is one causal fact committed under the parent Attempt's
-        // authority: the child Job, its prerequisite edges, its first Attempt
-        // and its Executor all become canonical together.
         let root = journal::append(
             &transaction,
             EventDraft::new(EventKind::JobCreated, "job", &job.id, journal::value(&job)?)
@@ -2926,35 +3236,17 @@ impl DomainRepository {
                 EventKind::DependencyAdded,
                 &journal::DependencyEdge {
                     project_id: project_id.clone(),
-                    job_id: job_id.clone(),
+                    job_id: job.id.clone(),
                     prerequisite_job_id: (*prerequisite).to_string(),
                 },
                 Some(root),
             )?;
         }
-        emit_attempt(
-            &transaction,
-            EventKind::AttemptCreated,
-            &attempt,
-            Some(root),
-        )?;
-        emit_executor(
-            &transaction,
-            EventKind::ExecutorCreated,
-            &executor,
-            Some(root),
-        )?;
+        refresh_job_readiness_in(&transaction, &job.id, Some(root))?;
+        let job =
+            read_job(&transaction, &job.id)?.ok_or_else(|| invalid("created Job disappeared"))?;
         transaction.commit().map_err(sql)?;
-
-        Ok((
-            CanonicalAdmission {
-                project: read_project(&self.connection, &project_id)?,
-                job,
-                attempt,
-                executor,
-            },
-            false,
-        ))
+        Ok((job, false))
     }
 
     /// Admit one externally bound execution into the canonical domain.
@@ -2984,7 +3276,7 @@ impl DomainRepository {
 
         if let Some(existing) = transaction
             .query_row(
-                "SELECT j.id,j.project_id,j.state,j.generation,j.authoritative_attempt_id,j.payload,j.created_at,j.updated_at,a.id,a.job_id,a.generation,a.state,a.authoritative,a.created_at,a.finished_at,e.id,e.attempt_id,e.kind,e.state,e.created_at,j.termination_reason FROM domain_job_bindings b JOIN domain_jobs j ON j.id=b.job_id JOIN domain_attempts a ON a.id=b.attempt_id LEFT JOIN domain_executors e ON e.attempt_id=a.id WHERE b.binding_key=?1 AND b.project_id=?2",
+                "SELECT j.id,j.project_id,j.state,j.generation,j.authoritative_attempt_id,j.payload,j.created_at,j.updated_at,a.id,a.job_id,a.generation,a.state,a.authoritative,a.created_at,a.finished_at,e.id,e.attempt_id,e.kind,e.state,e.created_at,j.termination_reason,j.root_job_id,j.depth,j.waiting_for_children FROM domain_job_bindings b JOIN domain_jobs j ON j.id=b.job_id JOIN domain_attempts a ON a.id=b.attempt_id LEFT JOIN domain_executors e ON e.attempt_id=a.id WHERE b.binding_key=?1 AND b.project_id=?2",
                 params![binding_key, project.id],
                 |row| {
                     Ok((
@@ -2994,6 +3286,9 @@ impl DomainRepository {
                             generation: u64::try_from(row.get::<_, i64>(3)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
                             authoritative_attempt_id: row.get(4)?, spec: row.get(5)?,
                             termination_reason: failure_from_row(row, 20)?,
+                            root_job_id: row.get(21)?,
+                            depth: u64::try_from(row.get::<_, i64>(22)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                            waiting_for_children: row.get(23)?,
                             created_at: row.get(6)?, updated_at: row.get(7)?,
                         },
                         Attempt {
@@ -3021,7 +3316,7 @@ impl DomainRepository {
         // transaction: admission publishes an eligible Job, then claims its
         // authoritative Attempt before exposing the Executor.
         transaction.execute(
-            "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at) VALUES(?1,?2,'eligible',0,NULL,?3,?4,?4)",
+            "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,root_job_id,depth,waiting_for_children,payload,created_at,updated_at) VALUES(?1,?2,'eligible',0,NULL,?1,0,0,?3,?4,?4)",
             params![job_id, project.id, payload, timestamp],
         ).map_err(sql)?;
         transaction.execute(
@@ -3052,6 +3347,9 @@ impl DomainRepository {
             generation: 1,
             authoritative_attempt_id: Some(attempt_id.clone()),
             termination_reason: None,
+            root_job_id: job_id.clone(),
+            depth: 0,
+            waiting_for_children: false,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
@@ -3264,10 +3562,19 @@ impl DomainRepository {
         transaction.commit().map_err(sql)
     }
 
+    /// The Jobs automatic admission may dispatch on its own.
+    ///
+    /// Pickup is an admission policy, not a Job-kind predicate. A Job whose
+    /// frozen reservation says `explicit` already has an exact target and waits
+    /// for the origin that named it. A Job with no reservation yet still needs
+    /// candidate selection, so the worker may admit it once it is eligible. A
+    /// running Job marked `automatic_admission` is a crash window between
+    /// claiming an Attempt and publishing its Call; that recovery is independent
+    /// of the pickup policy.
     pub(crate) fn automatic_admission_jobs(&self, project_id: &str) -> Result<Vec<Job>> {
         let ids: Vec<String> = query_all(
             &self.connection,
-            "SELECT id FROM domain_jobs WHERE project_id=?1 AND ((state='eligible' AND authoritative_attempt_id IS NULL) OR (state='running' AND automatic_admission=1)) ORDER BY created_at,id",
+            "SELECT id FROM domain_jobs WHERE project_id=?1 AND waiting_for_children=0 AND ((state='eligible' AND authoritative_attempt_id IS NULL AND COALESCE(json_extract(admission_selection,'$.pickup'),'automatic')!='explicit') OR (state='running' AND automatic_admission=1)) ORDER BY created_at,id",
             &[&project_id],
             |row| row.get(0),
         )?;
@@ -3279,10 +3586,14 @@ impl DomainRepository {
             .collect()
     }
 
-    pub(crate) fn admission_selection(
+    /// The frozen admission decision, if Admission has already reserved one.
+    ///
+    /// Older rows stored only a [`super::placement::ProviderChoice`]. Those are
+    /// candidate selections, so they resume as automatic pickup.
+    pub(crate) fn admission_reservation(
         &self,
         job_id: &str,
-    ) -> Result<Option<super::placement::ProviderChoice>> {
+    ) -> Result<Option<super::admission::AdmissionReservation>> {
         let raw: Option<String> = self
             .connection
             .query_row(
@@ -3291,8 +3602,36 @@ impl DomainRepository {
                 |row| row.get(0),
             )
             .map_err(sql)?;
-        raw.map(|raw| serde_json::from_str(&raw).map_err(|error| invalid(&error.to_string())))
+        raw.map(|raw| decode_admission_reservation(&raw))
             .transpose()
+    }
+
+    /// Record that this Job already has an exact target and must not be placed.
+    ///
+    /// A rejected probe is eligible evidence, not work waiting for a candidate.
+    /// Freezing explicit pickup here is what keeps the automatic worker from
+    /// substituting a different Provider or Model for it.
+    pub(crate) fn freeze_explicit_admission(
+        &self,
+        job_id: &str,
+        reservation: &super::admission::AdmissionReservation,
+    ) -> Result<()> {
+        if reservation.pickup != super::admission::AdmissionPickup::Explicit
+            || reservation.exact.is_none()
+        {
+            return Err(invalid(
+                "explicit admission freeze requires an exact target",
+            ));
+        }
+        let selected =
+            serde_json::to_string(reservation).map_err(|error| invalid(&error.to_string()))?;
+        self.connection
+            .execute(
+                "UPDATE domain_jobs SET admission_selection=?2,automatic_admission=0 WHERE id=?1 AND state IN ('pending','eligible') AND authoritative_attempt_id IS NULL",
+                params![job_id, selected],
+            )
+            .map_err(sql)?;
+        Ok(())
     }
 
     pub(crate) fn record_admission_failure(&self, job_id: &str, failure: &Failure) -> Result<()> {
@@ -3359,6 +3698,259 @@ impl DomainRepository {
         Ok(())
     }
 
+    /// Stage candidate evidence until the Attempt that consumes it exists.
+    ///
+    /// Placement runs before Attempt creation, so this column is only a staging
+    /// slot. [`Self::adopt_placement_evidence`] moves it into the append-only
+    /// decision history. A later decision replaces the staging slot, never a
+    /// decision that an Attempt already owns.
+    pub(crate) fn record_placement_evidence(
+        &mut self,
+        job_id: &str,
+        evidence: &[super::placement_projection::CandidateEvidence],
+    ) -> Result<()> {
+        let serialized =
+            serde_json::to_string(evidence).map_err(|error| invalid(&error.to_string()))?;
+        self.connection
+            .execute(
+                "UPDATE domain_jobs SET placement_evidence=?2 WHERE id=?1",
+                params![job_id, serialized],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Bind staged candidate evidence to the Attempt that just claimed it.
+    ///
+    /// Idempotent for the same Attempt. A replacement Attempt adopts only the
+    /// evidence staged after the previous decision was bound.
+    pub(crate) fn adopt_placement_evidence(
+        &mut self,
+        job_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        mode: super::placement_projection::PlacementMode,
+    ) -> Result<()> {
+        let transaction = self.begin()?;
+        adopt_placement_evidence_in(&transaction, job_id, attempt_id, generation, mode)?;
+        transaction.commit().map_err(sql)
+    }
+
+    /// Non-terminal execution Watchdog may observe.
+    ///
+    /// Terminal Jobs are excluded. A pending or eligible Job with no Attempt is
+    /// admission work, not a stall, so it is excluded too. The returned facts are
+    /// a read; classification and recovery happen outside this query.
+    pub(crate) fn watchdog_observations(&self) -> Result<Vec<WatchdogObservation>> {
+        let ids: Vec<String> = query_all(
+            &self.connection,
+            "SELECT id FROM domain_jobs WHERE state IN ('running','cancelling','unknown','orphaned') OR authoritative_attempt_id IS NOT NULL ORDER BY created_at,id",
+            &[],
+            |row| row.get(0),
+        )?;
+        ids.into_iter()
+            .map(|job_id| self.watchdog_observation(&job_id))
+            .collect()
+    }
+
+    fn watchdog_observation(&self, job_id: &str) -> Result<WatchdogObservation> {
+        let job = read_job(&self.connection, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        let attempt = job
+            .authoritative_attempt_id
+            .as_deref()
+            .map(|attempt_id| {
+                self.attempt(attempt_id)?
+                    .ok_or_else(|| invalid("authoritative Attempt disappeared"))
+            })
+            .transpose()?;
+        let executor = attempt
+            .as_ref()
+            .map(|attempt| self.executor_for_attempt(&attempt.id))
+            .transpose()?
+            .flatten();
+        let calls = attempt
+            .as_ref()
+            .map(|attempt| self.calls_for_attempt(&attempt.id))
+            .transpose()?
+            .unwrap_or_default();
+        let intents = self
+            .pending_dispatch_intents()?
+            .into_iter()
+            .filter(|intent| intent.job_id == job.id)
+            .collect();
+        let reservation = self.admission_reservation(job_id)?;
+        let acquisition = self.acquisition_outcome(job_id)?;
+        Ok(WatchdogObservation {
+            job,
+            attempt,
+            executor,
+            calls,
+            intents,
+            reservation,
+            acquisition,
+            automatic_admission: self.automatic_admission(job_id)?,
+        })
+    }
+
+    fn automatic_admission(&self, job_id: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT automatic_admission=1 FROM domain_jobs WHERE id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)
+    }
+
+    fn acquisition_outcome(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<super::placement_projection::AcquisitionOutcome>> {
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT final_acquisition_outcome FROM domain_jobs WHERE id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|error| invalid(&error.to_string())))
+            .transpose()
+    }
+
+    /// Append one Watchdog action when this generation has not already recorded it.
+    ///
+    /// The same classification and action for the same Attempt generation is one
+    /// fact. A later pass that finds the same condition does not append another
+    /// row, so recovery stays idempotent without a second scheduler.
+    pub(crate) fn record_watchdog_action(&mut self, action: &WatchdogActionRecord) -> Result<bool> {
+        let transaction = self.begin()?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM domain_watchdog_actions WHERE job_id=?1 AND COALESCE(attempt_id,'')=COALESCE(?2,'') AND COALESCE(generation,-1)=COALESCE(?3,-1) AND classification=?4 AND action=?5)",
+                params![
+                    action.job_id,
+                    action.attempt_id,
+                    action.generation.map(|generation| generation as i64),
+                    action.classification,
+                    action.action
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if exists {
+            transaction.commit().map_err(sql)?;
+            return Ok(false);
+        }
+        let evidence =
+            serde_json::to_string(&action.evidence).map_err(|error| invalid(&error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO domain_watchdog_actions(job_id,attempt_id,generation,call_id,executor_id,classification,action,evidence,outcome,replacement_attempt_id,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    action.job_id,
+                    action.attempt_id,
+                    action.generation.map(|generation| generation as i64),
+                    action.call_id,
+                    action.executor_id,
+                    action.classification,
+                    action.action,
+                    evidence,
+                    action.outcome,
+                    action.replacement_attempt_id,
+                    now()
+                ],
+            )
+            .map_err(sql)?;
+        transaction.commit().map_err(sql)?;
+        Ok(true)
+    }
+
+    /// Watchdog actions for one Job, oldest first.
+    pub(crate) fn watchdog_actions(&self, job_id: &str) -> Result<Vec<WatchdogActionRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT job_id,attempt_id,generation,call_id,executor_id,classification,action,evidence,outcome,replacement_attempt_id,created_at FROM domain_watchdog_actions WHERE job_id=?1 ORDER BY ordinal",
+            )
+            .map_err(sql)?;
+        let rows = statement
+            .query_map([job_id], |row| {
+                let evidence: String = row.get(7)?;
+                Ok(WatchdogActionRecord {
+                    job_id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    generation: row
+                        .get::<_, Option<i64>>(2)?
+                        .map(|generation| u64::try_from(generation).unwrap_or(0)),
+                    call_id: row.get(3)?,
+                    executor_id: row.get(4)?,
+                    classification: row.get(5)?,
+                    action: row.get(6)?,
+                    evidence: serde_json::from_str(&evidence).unwrap_or(serde_json::Value::Null),
+                    outcome: row.get(8)?,
+                    replacement_attempt_id: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })
+            .map_err(sql)?;
+        rows.map(|row| row.map_err(sql)).collect()
+    }
+
+    /// Placement decisions for one Job, oldest first.
+    pub(crate) fn placement_decisions(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<super::placement_projection::PlacementDecision>> {
+        placement_decisions_in(&self.connection, job_id)
+    }
+
+    /// The canonical placement read model for one Job.
+    pub(crate) fn placement_projection(
+        &self,
+        job_id: &str,
+    ) -> Result<super::placement_projection::PlacementProjection> {
+        let job = read_job(&self.connection, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        let decisions = self.placement_decisions(job_id)?;
+        let dispatched = self.dispatched_target(job_id, job.authoritative_attempt_id.as_deref())?;
+        Ok(
+            super::placement_projection::PlacementProjection::from_decisions(
+                &decisions,
+                job.authoritative_attempt_id.as_deref(),
+                dispatched,
+            ),
+        )
+    }
+
+    fn dispatched_target(
+        &self,
+        job_id: &str,
+        attempt_id: Option<&str>,
+    ) -> Result<Option<super::placement_projection::DispatchedTarget>> {
+        let Some(attempt_id) = attempt_id else {
+            return Ok(None);
+        };
+        self.connection
+            .query_row(
+                "SELECT id,call_id,attempt_id,generation,provider_key,model,upstream_model_id,state FROM domain_dispatch_intents WHERE job_id=?1 AND attempt_id=?2 AND provider_key IS NOT NULL ORDER BY created_at,id LIMIT 1",
+                params![job_id, attempt_id],
+                |row| {
+                    Ok(super::placement_projection::DispatchedTarget {
+                        dispatch_intent_id: row.get(0)?,
+                        call_id: row.get(1)?,
+                        attempt_id: row.get(2)?,
+                        generation: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        provider: row.get(4)?,
+                        model: row.get(5)?,
+                        upstream_model_id: row.get(6)?,
+                        state: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql)
+    }
+
     /// Claim an eligible Job and establish its authoritative Attempt atomically.
     pub fn create_attempt(&mut self, job_id: &str) -> Result<Attempt> {
         let transaction = self
@@ -3375,68 +3967,135 @@ impl DomainRepository {
         job_id: &str,
         executor_kind: &str,
     ) -> Result<(Attempt, Executor)> {
-        self.dispatch_job_inner(job_id, executor_kind, None)
+        self.dispatch_job_inner(job_id, executor_kind, None, None)
     }
 
-    pub(crate) fn dispatch_job_with_placement(
+    /// Record the final Governor acquisition for the Attempt that attempted it.
+    ///
+    /// The Job column remains a staging mirror of the latest outcome. The
+    /// decision history is the durable fact, and only the named Attempt's open
+    /// decision is updated. A late acquisition from a fenced Attempt is ignored.
+    pub(crate) fn record_acquisition_outcome(
         &mut self,
         job_id: &str,
-        choice: &super::placement::ProviderChoice,
-        limit: usize,
-        config: &BudgetConfig,
-        quota: QuotaFacts,
+        attempt_id: &str,
+        outcome: &super::placement_projection::AcquisitionOutcome,
+    ) -> Result<()> {
+        let serialized =
+            serde_json::to_string(outcome).map_err(|error| invalid(&error.to_string()))?;
+        let transaction = self.begin()?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT authoritative_attempt_id FROM domain_jobs WHERE id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .flatten();
+        if current.as_deref() != Some(attempt_id) {
+            transaction.commit().map_err(sql)?;
+            return Ok(());
+        }
+        transaction
+            .execute(
+                "UPDATE domain_jobs SET final_acquisition_outcome=?2 WHERE id=?1 AND authoritative_attempt_id=?3",
+                params![job_id, serialized, attempt_id],
+            )
+            .map_err(sql)?;
+        let decisions = placement_decisions_in(&transaction, job_id)?;
+        if let Some(mut decision) = decisions
+            .into_iter()
+            .rev()
+            .find(|decision| decision.attempt_id.as_deref() == Some(attempt_id))
+        {
+            if decision.acquisition_outcome.as_ref() != Some(outcome) {
+                decision.acquisition_outcome = Some(outcome.clone());
+                let updated = serde_json::to_string(&decision)
+                    .map_err(|error| invalid(&error.to_string()))?;
+                transaction
+                    .execute(
+                        "UPDATE domain_placement_decisions SET decision=?3 WHERE job_id=?1 AND attempt_id=?2",
+                        params![job_id, attempt_id, updated],
+                    )
+                    .map_err(sql)?;
+            }
+        }
+        transaction.commit().map_err(sql)
+    }
+
+    /// Claim an eligible Job under a frozen admission reservation.
+    ///
+    /// `placement` is present only when the reservation still required candidate
+    /// selection. An exact target passes `None`: the Attempt is still claimed
+    /// by this function, but Placement capacity is not reserved for it.
+    pub(crate) fn dispatch_job_for_admission(
+        &mut self,
+        job_id: &str,
+        reservation: &super::admission::AdmissionReservation,
+        placement: Option<AdmissionPlacement<'_>>,
     ) -> Result<(Attempt, Executor)> {
-        self.dispatch_job_inner(job_id, "provider", Some((choice, limit, config, quota)))
+        self.dispatch_job_inner(job_id, "provider", Some(reservation), placement)
     }
 
     fn dispatch_job_inner(
         &mut self,
         job_id: &str,
         executor_kind: &str,
-        placement: Option<(
-            &super::placement::ProviderChoice,
-            usize,
-            &BudgetConfig,
-            QuotaFacts,
-        )>,
+        reservation: Option<&super::admission::AdmissionReservation>,
+        placement: Option<AdmissionPlacement<'_>>,
     ) -> Result<(Attempt, Executor)> {
         validate_id(executor_kind)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        if !dependencies_satisfied_in(&transaction, job_id)? {
-            return Err(invalid("Job dependencies are not satisfied"));
-        }
         refresh_job_readiness_in(&transaction, job_id, None)?;
-        if let Some((choice, limit, config, quota)) = placement {
-            let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
-            let assessment = preview_provider_admission_in(
-                &transaction,
-                &job.project_id,
-                Some(job_id),
-                &job.spec,
+        if let Some(reservation) = reservation {
+            let selected =
+                serde_json::to_string(reservation).map_err(|error| invalid(&error.to_string()))?;
+            if let Some(AdmissionPlacement {
+                limit,
                 config,
                 quota,
-            )?;
-            if !assessment.is_allowed() {
-                return Err(invalid(&format!(
-                    "{}: {}",
-                    assessment.reason_code, assessment.reason
-                )));
-            }
-            if !provider_capacity_available_in(&transaction, &job.project_id, Some(job_id), limit)?
+            }) = placement
             {
-                return Err(invalid(
-                    "placement_capacity: Project provider capacity is reserved",
-                ));
+                let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+                let assessment = preview_provider_admission_in(
+                    &transaction,
+                    &job.project_id,
+                    Some(job_id),
+                    &job.spec,
+                    config,
+                    quota,
+                )?;
+                if !assessment.is_allowed() {
+                    return Err(invalid(&format!(
+                        "{}: {}",
+                        assessment.reason_code, assessment.reason
+                    )));
+                }
+                if !provider_capacity_available_in(
+                    &transaction,
+                    &job.project_id,
+                    Some(job_id),
+                    limit,
+                )? {
+                    return Err(invalid(
+                        "placement_capacity: Project provider capacity is reserved",
+                    ));
+                }
             }
-            let selected =
-                serde_json::to_string(choice).map_err(|error| invalid(&error.to_string()))?;
-            // The existing authoritative Attempt is the capacity reservation.
-            // Freeze its choice in the same transaction, including the crash
-            // window before its first Call/DispatchIntent can exist.
-            transaction.execute("UPDATE domain_jobs SET admission_selection=?2,automatic_admission=1,termination_reason=NULL WHERE id=?1", params![job_id, selected]).map_err(sql)?;
+            let automatic = match reservation.pickup {
+                super::admission::AdmissionPickup::Automatic => 1,
+                // An exact target is claimed only by the explicit caller. The
+                // crash marker would otherwise let the worker rebuild it as
+                // ordinary placed work.
+                super::admission::AdmissionPickup::Explicit => 0,
+            };
+            // Freeze the reservation in the same transaction that claims the
+            // Attempt, including the crash window before its first Call exists.
+            transaction.execute("UPDATE domain_jobs SET admission_selection=?2,automatic_admission=?3,termination_reason=NULL WHERE id=?1", params![job_id, selected, automatic]).map_err(sql)?;
         }
         let (attempt, root) = create_attempt_in(&transaction, job_id)?;
         let executor = Executor {
@@ -3477,6 +4136,52 @@ impl DomainRepository {
         self.replace_attempt_inner(job_id, executor_kind, expected_attempt, None)
     }
 
+    /// Fence the authoritative Attempt and return a candidate Job to admission.
+    ///
+    /// No replacement Attempt is minted. The admission worker is the only
+    /// component that runs Placement, and it does so when it claims the next
+    /// Attempt. Exact pickup is refused: a probe target stays frozen for an
+    /// operator retry instead of being selected again here.
+    pub(crate) fn fence_attempt_for_readmission(
+        &mut self,
+        job_id: &str,
+        expected_attempt: &str,
+    ) -> Result<()> {
+        validate_id(job_id)?;
+        validate_id(expected_attempt)?;
+        let transaction = self.begin()?;
+        let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        if job.authoritative_attempt_id.as_deref() != Some(expected_attempt) {
+            return Err(invalid("replacement rejected: Attempt authority changed"));
+        }
+        if job.spec.health_probe.is_some() {
+            return Err(invalid("exact target cannot be re-placed"));
+        }
+        let explicit: bool = transaction
+            .query_row(
+                "SELECT COALESCE(json_extract(admission_selection,'$.pickup'),'automatic')='explicit' FROM domain_jobs WHERE id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if explicit {
+            return Err(invalid("exact target cannot be re-placed"));
+        }
+        fence_attempt_in(&transaction, expected_attempt)?;
+        let timestamp = now();
+        transaction
+            .execute(
+                "UPDATE domain_jobs SET state='eligible',generation=generation+1,authoritative_attempt_id=NULL,automatic_admission=0,admission_selection=NULL,placement_evidence=NULL,termination_reason=NULL,updated_at=?2 WHERE id=?1 AND authoritative_attempt_id=?3",
+                params![job_id, timestamp, expected_attempt],
+            )
+            .map_err(sql)?;
+        let job =
+            read_job(&transaction, job_id)?.ok_or_else(|| invalid("released Job disappeared"))?;
+        emit_job(&transaction, EventKind::JobUpdated, &job, None)?;
+        refresh_dependents_in(&transaction, job_id, None)?;
+        transaction.commit().map_err(sql)
+    }
+
     pub fn retry_job(
         &mut self,
         job_id: &str,
@@ -3501,7 +4206,7 @@ impl DomainRepository {
             .map_err(sql)?;
         let (project_id, _payload, generation, old_attempt): (String, String, i64, Option<String>) = transaction
             .query_row(
-                "SELECT project_id,payload,generation,authoritative_attempt_id FROM domain_jobs WHERE id=?1",
+            "SELECT project_id,payload,generation,authoritative_attempt_id FROM domain_jobs WHERE id=?1",
                 [job_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -3537,44 +4242,7 @@ impl DomainRepository {
             .checked_add(1)
             .ok_or_else(|| invalid("Job generation overflow"))?;
         if let Some(old_attempt) = &old_attempt {
-            // Capture exactly the rows the fence will change, so the journal
-            // records each one that actually moved rather than the whole
-            // Attempt's history.
-            let fenced_executors = attempt_executors(&transaction, old_attempt)?;
-            let fenced_intents = attempt_intents(&transaction, old_attempt)?;
-            let fenced_calls = attempt_calls(&transaction, old_attempt)?;
-            transaction
-                .execute(
-                    "UPDATE domain_executors SET state='fenced' WHERE attempt_id=?1",
-                    [old_attempt],
-                )
-                .map_err(sql)?;
-            transaction.execute(
-                "UPDATE domain_dispatch_intents SET state='fenced',failure='attempt_replaced',effect_state=CASE WHEN effect_state='started' THEN 'unknown' ELSE effect_state END,updated_at=?2 WHERE attempt_id=?1 AND state IN ('pending','queued','running')",
-                params![old_attempt, now()],
-            ).map_err(sql)?;
-            transaction.execute(
-                "UPDATE domain_calls SET state='unknown',finished_at=?2 WHERE attempt_id=?1 AND state IN ('created','running')",
-                params![old_attempt, now()],
-            ).map_err(sql)?;
-            transaction
-                .execute(
-                    "UPDATE domain_attempts SET authoritative=0,state='failed',finished_at=?2 WHERE id=?1 AND authoritative=1",
-                    params![old_attempt, now()],
-                )
-                .map_err(sql)?;
-            // The revocation is the causal root: the replaced Attempt stops
-            // being authoritative first, and every cascade it forces is
-            // recorded as caused by it in this same commit.
-            let root = emit_attempt(
-                &transaction,
-                EventKind::AttemptUpdated,
-                &read_attempt(&transaction, old_attempt)?,
-                None,
-            )?;
-            emit_changed_executors(&transaction, &fenced_executors, Some(root))?;
-            emit_changed_intents(&transaction, &fenced_intents, Some(root))?;
-            emit_changed_calls(&transaction, &fenced_calls, Some(root))?;
+            fence_attempt_in(&transaction, old_attempt)?;
         }
         let attempt_id = new_id("att");
         let executor_id = new_id("exec");
@@ -4360,7 +5028,9 @@ impl DomainRepository {
                 }
             }
         }
-        let failure_response = tool_response.or(provider_response.as_deref()).unwrap_or(failure);
+        let failure_response = tool_response
+            .or(provider_response.as_deref())
+            .unwrap_or(failure);
         let changed = transaction
             .execute(
                 "UPDATE domain_calls SET state='failed',response=?2,finished_at=?3 WHERE id=?1 AND state IN ('created','running')",
@@ -4703,7 +5373,7 @@ impl DomainRepository {
 
                 transaction
                     .execute(
-                        "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?4)",
+                        "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,root_job_id,depth,waiting_for_children,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?1,0,0,?3,?4,?4)",
                         params![job_id, project_id, payload, timestamp],
                     )
                     .map_err(sql)?;
@@ -4715,6 +5385,9 @@ impl DomainRepository {
                     generation: 0,
                     authoritative_attempt_id: None,
                     termination_reason: None,
+                    root_job_id: job_id.clone(),
+                    depth: 0,
+                    waiting_for_children: false,
                     spec,
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -5211,6 +5884,160 @@ fn failure_from_row(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<Fai
         .transpose()
 }
 
+/// Revoke one Attempt and fence the execution rows it still owns.
+///
+/// The Attempt update is the journal root. Executor, Call, and DispatchIntent
+/// changes are caused by it in the same transaction. Callers decide what the
+/// Job does next: replacement publishes a new Attempt, readmission clears the
+/// authority pointer.
+fn fence_attempt_in(transaction: &rusqlite::Transaction<'_>, attempt_id: &str) -> Result<()> {
+    let fenced_executors = attempt_executors(transaction, attempt_id)?;
+    let fenced_intents = attempt_intents(transaction, attempt_id)?;
+    let fenced_calls = attempt_calls(transaction, attempt_id)?;
+    transaction
+        .execute(
+            "UPDATE domain_executors SET state='fenced' WHERE attempt_id=?1",
+            [attempt_id],
+        )
+        .map_err(sql)?;
+    transaction.execute(
+        "UPDATE domain_dispatch_intents SET state='fenced',failure='attempt_replaced',effect_state=CASE WHEN effect_state='started' THEN 'unknown' ELSE effect_state END,updated_at=?2 WHERE attempt_id=?1 AND state IN ('pending','queued','running')",
+        params![attempt_id, now()],
+    ).map_err(sql)?;
+    transaction.execute(
+        "UPDATE domain_calls SET state='unknown',finished_at=?2 WHERE attempt_id=?1 AND state IN ('created','running')",
+        params![attempt_id, now()],
+    ).map_err(sql)?;
+    transaction
+        .execute(
+            "UPDATE domain_attempts SET authoritative=0,state='failed',finished_at=?2 WHERE id=?1 AND authoritative=1",
+            params![attempt_id, now()],
+        )
+        .map_err(sql)?;
+    let root = emit_attempt(
+        transaction,
+        EventKind::AttemptUpdated,
+        &read_attempt(transaction, attempt_id)?,
+        None,
+    )?;
+    emit_changed_executors(transaction, &fenced_executors, Some(root))?;
+    emit_changed_intents(transaction, &fenced_intents, Some(root))?;
+    emit_changed_calls(transaction, &fenced_calls, Some(root))?;
+    Ok(())
+}
+
+fn adopt_placement_evidence_in(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &str,
+    attempt_id: &str,
+    generation: u64,
+    mode: super::placement_projection::PlacementMode,
+) -> Result<()> {
+    let bound: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM domain_placement_decisions WHERE job_id=?1 AND attempt_id=?2)",
+            params![job_id, attempt_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if bound {
+        return Ok(());
+    }
+    let staged: Option<String> = transaction
+        .query_row(
+            "SELECT placement_evidence FROM domain_jobs WHERE id=?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)?
+        .flatten();
+    let Some(staged) = staged else {
+        return Ok(());
+    };
+    let evidence: Vec<super::placement_projection::CandidateEvidence> =
+        serde_json::from_str(&staged).map_err(|error| invalid(&error.to_string()))?;
+    let decision = super::placement_projection::PlacementDecision {
+        job_id: job_id.to_string(),
+        attempt_id: Some(attempt_id.to_string()),
+        generation: Some(generation),
+        mode: decision_mode(mode, &evidence),
+        decided_at: now(),
+        acquisition_outcome: None,
+    };
+    insert_placement_decision(transaction, &decision)?;
+    transaction
+        .execute(
+            "UPDATE domain_jobs SET placement_evidence=NULL WHERE id=?1",
+            [job_id],
+        )
+        .map_err(sql)?;
+    Ok(())
+}
+
+fn decision_mode(
+    mode: super::placement_projection::PlacementMode,
+    evidence: &[super::placement_projection::CandidateEvidence],
+) -> super::placement_projection::PlacementMode {
+    match mode {
+        super::placement_projection::PlacementMode::SelectCandidate { .. } => {
+            let (provider, model) = evidence
+                .iter()
+                .find_map(|candidate| match &candidate.reason {
+                    super::placement_projection::PlacementReason::Selected { .. } => {
+                        Some((candidate.provider.clone(), candidate.model.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            super::placement_projection::PlacementMode::SelectCandidate {
+                candidates_considered: evidence.to_vec(),
+                selected_provider: provider,
+                selected_model: model,
+            }
+        }
+        exact => exact,
+    }
+}
+
+fn insert_placement_decision(
+    connection: &Connection,
+    decision: &super::placement_projection::PlacementDecision,
+) -> Result<()> {
+    let serialized =
+        serde_json::to_string(decision).map_err(|error| invalid(&error.to_string()))?;
+    connection
+        .execute(
+            "INSERT INTO domain_placement_decisions(job_id,attempt_id,generation,decision,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                decision.job_id,
+                decision.attempt_id,
+                decision.generation.map(|generation| generation as i64),
+                serialized,
+                decision.decided_at
+            ],
+        )
+        .map_err(sql)?;
+    Ok(())
+}
+
+fn placement_decisions_in(
+    connection: &Connection,
+    job_id: &str,
+) -> Result<Vec<super::placement_projection::PlacementDecision>> {
+    let mut statement = connection
+        .prepare("SELECT decision FROM domain_placement_decisions WHERE job_id=?1 ORDER BY ordinal")
+        .map_err(sql)?;
+    let rows = statement
+        .query_map([job_id], |row| row.get::<_, String>(0))
+        .map_err(sql)?;
+    rows.map(|row| {
+        let raw = row.map_err(sql)?;
+        serde_json::from_str(&raw).map_err(|error| invalid(&error.to_string()))
+    })
+    .collect()
+}
+
 fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
     let state: String = row.get(2)?;
     let state: JobState = state.parse().map_err(|_| rusqlite::Error::InvalidQuery)?;
@@ -5222,6 +6049,9 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
         authoritative_attempt_id: row.get(4)?,
         termination_reason: failure_from_row(row, 8)?,
+        root_job_id: row.get(9)?,
+        depth: u64::try_from(row.get::<_, i64>(10)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        waiting_for_children: row.get(11)?,
         spec: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
@@ -5229,7 +6059,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
 }
 
 const JOB_COLUMNS: &str =
-    "id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at,termination_reason";
+    "id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at,termination_reason,root_job_id,depth,waiting_for_children";
 
 fn query_all<T>(
     connection: &Connection,
@@ -6171,6 +7001,7 @@ fn request_job_cancel_in(
         let job =
             read_job(transaction, job_id)?.ok_or_else(|| invalid("cancelled Job disappeared"))?;
         emit_job(transaction, EventKind::JobUpdated, &job, None)?;
+        refresh_parent_after_child_in(transaction, job_id, None)?;
         return Ok(None);
     };
     let attempt = read_attempt(transaction, attempt_id)?;
@@ -6188,32 +7019,16 @@ fn request_job_cancel_in(
     Ok(Some((authority, never_started)))
 }
 
-fn read_project(connection: &Connection, project_id: &str) -> Result<Project> {
-    connection
-        .query_row(
-            "SELECT id,root,created_at FROM domain_projects WHERE id=?1",
-            [project_id],
-            |row| {
-                Ok(Project {
-                    id: row.get(0)?,
-                    root: row.get(1)?,
-                    created_at: row.get(2)?,
-                })
-            },
-        )
-        .map_err(sql)
-}
-
 fn all_job_origin_details(
     connection: &Connection,
 ) -> Result<std::collections::BTreeMap<JobId, JobOrigin>> {
     query_all(connection,
-        "SELECT job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,policy FROM domain_job_origins ORDER BY job_id", &[], |row| {
-            let policy = row.get::<_, Option<String>>(6)?.map(|value| serde_json::from_str(&value).map_err(|error| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error)))).transpose()?;
+        "SELECT job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,call_id,policy FROM domain_job_origins ORDER BY job_id", &[], |row| {
+            let policy = row.get::<_, Option<String>>(7)?.map(|value| serde_json::from_str(&value).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))).transpose()?;
             Ok((row.get(0)?, JobOrigin {
                 parent_job_id: row.get(1)?, attempt_id: row.get(2)?,
                 generation: u64::try_from(row.get::<_, i64>(3)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                spawn_key: row.get(4)?, spawn_fingerprint: row.get(5)?, policy,
+                spawn_key: row.get(4)?, spawn_fingerprint: row.get(5)?, call_id: row.get(6)?, policy,
             }))
         }).map(|origins| origins.into_iter().collect())
 }
@@ -6750,6 +7565,13 @@ pub(crate) fn job_failure(
     }
 }
 
+/// The canonical classification for an actual disk-full write failure
+/// (`ENOSPC` / `SQLITE_FULL`). Temporary by construction — freed space
+/// recovers — and never a provider, Placement, rate-limit or health failure.
+pub(crate) fn storage_full_failure(detail: &str) -> Failure {
+    job_failure("storage_full", FailureClass::ResourceLimit, detail, true)
+}
+
 fn provider_capacity_available_in(
     connection: &Connection,
     project_id: &str,
@@ -7002,7 +7824,16 @@ fn finish_attempt_with_reason_in(
             .map(serde_json::to_string)
             .transpose()
             .map_err(|error| invalid(&error.to_string()))?;
-        transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state=?2,updated_at=?3,termination_reason=?5,automatic_admission=0 WHERE id=?1 AND authoritative_attempt_id=?4", params![job_id,state,timestamp,attempt_id,reason]).map_err(sql)?;
+        let waiting_for_children = state == "completed" && transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM domain_job_origins WHERE parent_job_id=?1 AND json_extract(policy,'$.join')='required')",
+            [&job_id], |row| row.get::<_, bool>(0),
+        ).map_err(sql)?;
+        let persisted_state = if waiting_for_children {
+            "eligible"
+        } else {
+            state
+        };
+        transaction.execute("UPDATE domain_jobs SET authoritative_attempt_id=NULL,state=?2,waiting_for_children=?6,updated_at=?3,termination_reason=?5,automatic_admission=0 WHERE id=?1 AND authoritative_attempt_id=?4", params![job_id,persisted_state,timestamp,attempt_id,reason,waiting_for_children]).map_err(sql)?;
         // The Attempt leaving authority is the single causal fact for this
         // transition; everything it settles hangs off it in the same commit.
         let root = emit_attempt(
@@ -7031,9 +7862,13 @@ fn finish_attempt_with_reason_in(
             generation,
             Some(root),
         )?;
-        if state == "completed" {
+        if state == "completed" && !waiting_for_children {
             refresh_dependents_in(transaction, &job_id, Some(root))?;
         }
+        if waiting_for_children {
+            reconcile_child_join_in(transaction, &job_id, Some(root))?;
+        }
+        refresh_parent_after_child_in(transaction, &job_id, Some(root))?;
     }
     settle_chat_turn(transaction, attempt_id, state)?;
     Ok(())
@@ -7052,6 +7887,88 @@ fn refresh_dependents_in(
     )?;
     for dependent in dependents {
         refresh_job_readiness_in(transaction, &dependent, caused_by)?;
+    }
+    Ok(())
+}
+
+fn refresh_parent_after_child_in(
+    transaction: &rusqlite::Transaction<'_>,
+    child_job_id: &str,
+    caused_by: Option<u64>,
+) -> Result<()> {
+    let parent_id: Option<String> = transaction
+        .query_row(
+            "SELECT parent_job_id FROM domain_job_origins WHERE job_id=?1",
+            [child_job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    if let Some(parent_id) = parent_id {
+        reconcile_child_join_in(transaction, &parent_id, caused_by)?;
+    }
+    Ok(())
+}
+
+fn reconcile_child_join_in(
+    transaction: &rusqlite::Transaction<'_>,
+    parent_id: &str,
+    caused_by: Option<u64>,
+) -> Result<()> {
+    let parent = read_job(transaction, parent_id)?.ok_or_else(|| invalid("unknown parent Job"))?;
+    if !parent.waiting_for_children
+        || parent.authoritative_attempt_id.is_some()
+        || !matches!(parent.state, JobState::Pending | JobState::Eligible)
+    {
+        return Ok(());
+    }
+    let children: Vec<(String, String)> = query_all(transaction,
+        "SELECT child.state,COALESCE(json_extract(o.policy,'$.failure'),'observe') FROM domain_job_origins o JOIN domain_jobs child ON child.id=o.job_id WHERE o.parent_job_id=?1 AND json_extract(o.policy,'$.join')='required' ORDER BY child.id",
+        &[&parent_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    if children.is_empty() {
+        return Ok(());
+    }
+    let mut pending = false;
+    let mut failed = false;
+    for (state, policy) in children {
+        match state.as_str() {
+            "completed" => {}
+            "failed" | "cancelled" | "unknown" | "orphaned" => match policy.as_str() {
+                "observe" => {}
+                "block_parent" => pending = true,
+                _ => failed = true,
+            },
+            _ => pending = true,
+        }
+    }
+    if failed || !pending {
+        let target = if failed { "failed" } else { "completed" };
+        let updated = transaction
+            .execute(
+                "UPDATE domain_jobs SET state=?2,waiting_for_children=0,updated_at=?3,termination_reason=CASE WHEN ?2='failed' THEN COALESCE(termination_reason,?4) ELSE termination_reason END WHERE id=?1 AND state IN ('pending','eligible') AND authoritative_attempt_id IS NULL AND waiting_for_children=1",
+                params![
+                    parent_id,
+                    target,
+                    now(),
+                    serde_json::to_string(&job_failure(
+                        "required_child_failed",
+                        FailureClass::Unknown,
+                        "A required child Job failed or was cancelled",
+                        false,
+                    ))
+                    .map_err(|error| invalid(&error.to_string()))?
+                ],
+            )
+            .map_err(sql)?;
+        if updated == 1 {
+            let parent = read_job(transaction, parent_id)?
+                .ok_or_else(|| invalid("parent Job disappeared"))?;
+            emit_job(transaction, EventKind::JobUpdated, &parent, caused_by)?;
+            if target == "completed" {
+                refresh_dependents_in(transaction, parent_id, caused_by)?;
+            }
+            refresh_parent_after_child_in(transaction, parent_id, caused_by)?;
+        }
     }
     Ok(())
 }
@@ -7082,6 +7999,9 @@ fn refresh_job_readiness_in(
     caused_by: Option<u64>,
 ) -> Result<()> {
     let mut job = read_job(transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+    if job.waiting_for_children {
+        return reconcile_child_join_in(transaction, job_id, caused_by);
+    }
     if !matches!(job.state, JobState::Pending | JobState::Eligible)
         || job.authoritative_attempt_id.is_some()
     {
@@ -7114,16 +8034,16 @@ fn create_attempt_in(
     job_id: &str,
 ) -> Result<(Attempt, u64)> {
     validate_id(job_id)?;
-    let (state, generation): (String, i64) = transaction
+    let (state, generation, waiting): (String, i64, bool) = transaction
         .query_row(
-            "SELECT state,generation FROM domain_jobs WHERE id=?1",
+            "SELECT state,generation,waiting_for_children FROM domain_jobs WHERE id=?1",
             [job_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(sql)?
         .ok_or_else(|| invalid("unknown Job"))?;
-    if state != "eligible" {
+    if state != "eligible" || waiting {
         return Err(invalid("Job is not eligible for an Attempt"));
     }
     if !dependencies_satisfied_in(transaction, job_id)? {
@@ -7154,4 +8074,72 @@ fn create_attempt_in(
     let root = emit_attempt(transaction, EventKind::AttemptCreated, &attempt, None)?;
     emit_job(transaction, EventKind::JobUpdated, &job, Some(root))?;
     Ok((attempt, root))
+}
+
+#[cfg(test)]
+mod admission_pickup_tests {
+    use super::*;
+    use crate::orchestration::admission::{AdmissionPickup, AdmissionReservation, ExactTarget};
+    use crate::orchestration::placement::ProviderChoice;
+
+    #[test]
+    fn explicit_reservation_is_not_automatic_work() {
+        let directory = tempfile::tempdir().expect("temp");
+        let domain = DomainRepository::open(directory.path()).expect("domain");
+        let project = domain.ensure_project(directory.path()).expect("project");
+        let placed = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("placed".into()),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("placed job");
+        let probe = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("probe".into()),
+                    health_probe: Some(crate::orchestration::health_probe::HealthProbeIntent {
+                        provider: "probe-provider".into(),
+                        model: "probe-model".into(),
+                        effort: Some("low".into()),
+                    }),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("probe job");
+        domain.set_job_eligible(&placed.id).expect("place eligible");
+        domain.set_job_eligible(&probe.id).expect("probe eligible");
+        domain
+            .freeze_explicit_admission(
+                &probe.id,
+                &AdmissionReservation {
+                    choice: ProviderChoice {
+                        provider: "probe-provider".into(),
+                        model: "probe-model".into(),
+                    },
+                    pickup: AdmissionPickup::Explicit,
+                    exact: Some(ExactTarget {
+                        provider: "probe-provider".into(),
+                        model: "probe-model".into(),
+                        effort: Some("low".into()),
+                    }),
+                },
+            )
+            .expect("freeze");
+
+        let picked = domain
+            .automatic_admission_jobs(&project.id)
+            .expect("pickup");
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].id, placed.id);
+        let frozen = domain
+            .admission_reservation(&probe.id)
+            .expect("reservation")
+            .expect("frozen");
+        assert!(matches!(frozen.pickup, AdmissionPickup::Explicit));
+        assert_eq!(frozen.exact.expect("exact").effort.as_deref(), Some("low"));
+    }
 }

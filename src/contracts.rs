@@ -37,6 +37,9 @@ pub use crate::orchestration::canonical_control::{
 /// PWA reads it out of an opaque JSON value and must not be able to drift from
 /// the definition that actually confers authority.
 pub use crate::orchestration::domain::ExecutionWitness;
+pub use crate::orchestration::health_probe::{
+    HealthProbeIntent, HealthProbeObservation, PROBE_EFFORTS, PROBE_OBJECTIVE,
+};
 pub use crate::profile::{Model, Origin, Profile, Provider, PROVIDER_PROFILE_API_VERSION};
 pub use crate::provider_protocol::ProviderProtocol;
 
@@ -134,6 +137,73 @@ pub struct ProfileCredentialRequest {
     pub name: String,
     /// The secret value. Written to the Vault only; never returned.
     pub value: String,
+}
+
+/// The executable placement target a Health Probe answers for.
+///
+/// `effort` is part of the identity: a probe with `effort` proves a different
+/// tuple than one without it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct HealthProbeTarget {
+    pub provider: String,
+    pub model: String,
+    pub effort: Option<String>,
+}
+
+impl HealthProbeTarget {
+    /// The domain target this wire request names.
+    pub fn intent(&self) -> crate::orchestration::health_probe::HealthProbeIntent {
+        crate::orchestration::health_probe::HealthProbeIntent {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
+}
+
+/// `POST /api/v1/canonical/jobs/health-probe`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct HealthProbeRequest {
+    pub command_id: String,
+    pub project_id: String,
+    pub target: HealthProbeTarget,
+}
+
+/// `POST /api/v1/canonical/jobs/health-probe`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct HealthProbeResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    /// `accepted`, `rejected` or `failed`.
+    pub outcome: String,
+    pub command_id: String,
+    pub project_id: String,
+    pub target: HealthProbeTarget,
+    /// The canonical probe Job, when one was created. Follow it with the
+    /// ordinary Job snapshot to read the terminal result.
+    pub job_id: Option<String>,
+    pub message: String,
+    pub duplicate: bool,
+}
+
+/// `GET /api/v1/canonical/jobs/health-probe`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct HealthProbeQuery {
+    pub project_id: String,
+    pub target: HealthProbeTarget,
+}
+
+/// `GET /api/v1/canonical/jobs/health-probe`
+///
+/// `observation` is `null` when no probe has ever run for this candidate. That
+/// is "no evidence", which is deliberately not the same claim as "unhealthy".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct HealthProbeQueryResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub project_id: String,
+    pub target: HealthProbeTarget,
+    pub observation: Option<HealthProbeObservation>,
 }
 
 /// `POST /api/v1/canonical/jobs/launch`
@@ -577,6 +647,13 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     CanonicalJobOperationResponse::export_all(cfg)?;
     CanonicalJobEvent::export_all(cfg)?;
     JobLaunchRequest::export_all(cfg)?;
+    HealthProbeRequest::export_all(cfg)?;
+    HealthProbeResponse::export_all(cfg)?;
+    HealthProbeQuery::export_all(cfg)?;
+    HealthProbeQueryResponse::export_all(cfg)?;
+    HealthProbeTarget::export_all(cfg)?;
+    HealthProbeIntent::export_all(cfg)?;
+    HealthProbeObservation::export_all(cfg)?;
     ChatSendRequest::export_all(cfg)?;
     ChatImageUploadRequest::export_all(cfg)?;
     ChatConversationsResponse::export_all(cfg)?;

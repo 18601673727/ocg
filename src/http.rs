@@ -252,6 +252,43 @@ fn parse_u64(value: &str) -> Option<u64> {
     value.trim().parse::<u64>().ok()
 }
 
+/// The Retry-After duration a provider response actually supplied.
+///
+/// Only a delta-seconds `Retry-After` on HTTP 429 counts. An HTTP-date, a
+/// missing header, or any other status returns `None`; callers must not invent
+/// a cooldown from those cases.
+pub fn reliable_retry_after(error: &OcgError) -> Option<Duration> {
+    let message = error.to_string();
+    let status = message
+        .split("HTTP ")
+        .nth(1)
+        .and_then(|rest| rest.split([':', ' ']).next())
+        .and_then(|status| status.parse::<u16>().ok());
+    if status != Some(429) {
+        return None;
+    }
+    message
+        .split("retry-after=")
+        .nth(1)
+        .and_then(|rest| rest.split(['s', ',', ' ', ')']).next())
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// Capture only the throttling headers a provider response actually sent.
+///
+/// `Retry-After` is accepted as a delta-seconds value. An HTTP-date, a missing
+/// header, or an unparsable value stays absent: callers must not invent a
+/// cooldown from it.
+fn provider_rate_limit(response: &ntex::client::ClientResponse) -> RateLimit {
+    RateLimit::from_pairs(
+        response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+    )
+}
+
 /// A structured HTTP response. `status` and [`RateLimit`] are preserved so a
 /// caller can diagnose a refusal without losing the body.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -359,14 +396,11 @@ pub trait HttpTransport: Send + Sync {
     /// Send one bounded JSON request through the same native HTTP surface.
     /// Provider execution uses this narrow extension; it is not a second
     /// transport implementation.
-    fn post_json(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-        body: &Value,
-    ) -> Result<HttpResponse> {
+    fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<HttpResponse> {
         let _ = (url, headers, body);
-        Err(OcgError::config("native HTTP transport does not support JSON POST"))
+        Err(OcgError::config(
+            "native HTTP transport does not support JSON POST",
+        ))
     }
 
     /// Send one JSON request and deliver the response body incrementally.
@@ -457,12 +491,23 @@ impl NativeHttp {
     pub fn with_policy(proxy: &ProxyPlan, token: Option<GithubToken>) -> Result<Self> {
         let ops = proxy_builder_ops(proxy);
         if ops.first() != Some(&ProxyBuilderOp::DisableAutomaticDiscovery) {
-            return Err(OcgError::config("native HTTP policy must disable automatic proxy discovery first"));
+            return Err(OcgError::config(
+                "native HTTP policy must disable automatic proxy discovery first",
+            ));
         }
-        if proxy.endpoints().iter().any(|endpoint| endpoint.scheme() == ProxyScheme::All) {
-            return Err(OcgError::config("native HTTP client does not support an untyped proxy endpoint"));
+        if proxy
+            .endpoints()
+            .iter()
+            .any(|endpoint| endpoint.scheme() == ProxyScheme::All)
+        {
+            return Err(OcgError::config(
+                "native HTTP client does not support an untyped proxy endpoint",
+            ));
         }
-        Ok(Self { token, proxy: proxy.clone() })
+        Ok(Self {
+            token,
+            proxy: proxy.clone(),
+        })
     }
 
     /// Decide the outbound route for one URL from the stored [`ProxyPlan`].
@@ -478,7 +523,10 @@ impl NativeHttp {
         if self.proxy.matches_no_proxy(&host) {
             return Ok(None);
         }
-        let scheme = url.split_once("://").map(|(scheme, _)| scheme).unwrap_or("");
+        let scheme = url
+            .split_once("://")
+            .map(|(scheme, _)| scheme)
+            .unwrap_or("");
         // The proxy connector is a TLS CONNECT tunnel. Keep cleartext
         // OpenAI-compatible endpoints on the direct ntex path rather than
         // inventing a plaintext forward-proxy mode.
@@ -494,7 +542,9 @@ impl NativeHttp {
 
 fn validate_provider_url(url: &str) -> Result<()> {
     let Some((scheme, _)) = url.split_once("://") else {
-        return Err(OcgError::config(format!("provider URL has no scheme: {url}")));
+        return Err(OcgError::config(format!(
+            "provider URL has no scheme: {url}"
+        )));
     };
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return Err(OcgError::config(format!(
@@ -534,13 +584,20 @@ fn parse_proxy_dial(raw: &str) -> Result<ProxyDial> {
         return Err(OcgError::config("proxy endpoint has no host"));
     }
     let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
-        let end = inner.find(']').ok_or_else(|| OcgError::config("proxy endpoint has a malformed IPv6 host"))?;
+        let end = inner
+            .find(']')
+            .ok_or_else(|| OcgError::config("proxy endpoint has a malformed IPv6 host"))?;
         let host = inner[..end].to_string();
-        let port = inner[end + 1..].strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).unwrap_or(80);
+        let port = inner[end + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(80);
         (host, port)
     } else if hostport.matches(':').count() == 1 {
         let (host, port) = hostport.split_once(':').unwrap_or((hostport, ""));
-        let port = port.parse::<u16>().map_err(|_| OcgError::config("proxy endpoint has an invalid port"))?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| OcgError::config("proxy endpoint has an invalid port"))?;
         (host.to_string(), port)
     } else {
         (hostport.to_string(), 80)
@@ -597,7 +654,10 @@ impl ntex::service::ServiceFactory<ntex::connect::Connect<ntex::http::Uri>, ntex
     type Service = ProxySecureService;
     type InitError = std::convert::Infallible;
 
-    async fn create(&self, _cfg: ntex::SharedCfg) -> std::result::Result<Self::Service, Self::InitError> {
+    async fn create(
+        &self,
+        _cfg: ntex::SharedCfg,
+    ) -> std::result::Result<Self::Service, Self::InitError> {
         Ok(ProxySecureService {
             proxy_host: self.proxy_host.clone(),
             proxy_port: self.proxy_port,
@@ -621,11 +681,11 @@ impl ntex::service::Service<ntex::connect::Connect<ntex::http::Uri>> for ProxySe
         if target_host.is_empty() || target_port == 0 {
             return Err(ntex::connect::ConnectError::InvalidInput);
         }
-        let io_err = |message: String| {
-            ntex::connect::ConnectError::Io(std::io::Error::other(message))
-        };
+        let io_err =
+            |message: String| ntex::connect::ConnectError::Io(std::io::Error::other(message));
         // Plain TCP to the proxy; the target URL is untouched above.
-        let proxy_msg = ntex::connect::Connect::new(self.proxy_host.clone()).set_port(self.proxy_port);
+        let proxy_msg =
+            ntex::connect::Connect::new(self.proxy_host.clone()).set_port(self.proxy_port);
         let io = ntex::connect::connect(proxy_msg).await?;
         // Minimal CONNECT. Only `Proxy-Authorization` is added when the
         // proxy URL carried userinfo; the credential never enters a log.
@@ -637,17 +697,22 @@ impl ntex::service::Service<ntex::connect::Connect<ntex::http::Uri>> for ProxySe
         request.push_str("\r\n");
         io.encode_slice(request.as_bytes())
             .map_err(ntex::connect::ConnectError::Io)?;
-        io.flush(true).await.map_err(ntex::connect::ConnectError::Io)?;
+        io.flush(true)
+            .await
+            .map_err(ntex::connect::ConnectError::Io)?;
         // Read until the end of the proxy response head.
         let mut head: Vec<u8> = Vec::new();
         loop {
             if head.len() > 16 * 1024 {
-                return Err(io_err(format!("proxy CONNECT response too large for {target_host}")));
+                return Err(io_err(format!(
+                    "proxy CONNECT response too large for {target_host}"
+                )));
             }
-            let chunk = io
-                .recv(&ntex::codec::BytesCodec)
-                .await
-                .map_err(|error| io_err(format!("proxy CONNECT read failed for {target_host}: {error:?}")))?;
+            let chunk = io.recv(&ntex::codec::BytesCodec).await.map_err(|error| {
+                io_err(format!(
+                    "proxy CONNECT read failed for {target_host}: {error:?}"
+                ))
+            })?;
             let Some(bytes) = chunk else {
                 return Err(io_err(format!("proxy closed CONNECT for {target_host}")));
             };
@@ -656,8 +721,11 @@ impl ntex::service::Service<ntex::connect::Connect<ntex::http::Uri>> for ProxySe
                 break;
             }
         }
-        let end = find_connect_head_end(&head)
-            .ok_or_else(|| io_err(format!("proxy CONNECT response incomplete for {target_host}")))?;
+        let end = find_connect_head_end(&head).ok_or_else(|| {
+            io_err(format!(
+                "proxy CONNECT response incomplete for {target_host}"
+            ))
+        })?;
         let header = String::from_utf8_lossy(&head[..end]);
         let status = header
             .split("\r\n")
@@ -668,17 +736,22 @@ impl ntex::service::Service<ntex::connect::Connect<ntex::http::Uri>> for ProxySe
             .and_then(|code| code.parse::<u16>().ok())
             .unwrap_or(0);
         if status != 200 {
-            return Err(io_err(format!("proxy CONNECT refused with HTTP {status} for {target_host}")));
+            return Err(io_err(format!(
+                "proxy CONNECT refused with HTTP {status} for {target_host}"
+            )));
         }
         if head.len() != end + 4 {
-            return Err(io_err(format!("proxy sent unexpected bytes after CONNECT for {target_host}")));
+            return Err(io_err(format!(
+                "proxy sent unexpected bytes after CONNECT for {target_host}"
+            )));
         }
         // TLS to the original target with its host as SNI, over the tunnel.
         let domain = rustls::pki_types::ServerName::try_from(target_host.clone())
             .map_err(|_| io_err(format!("invalid TLS server name for {target_host}")))?;
-        let tls = ntex::connect::rustls::TlsClientFilter::create(io, self.tls_config.clone(), domain)
-            .await
-            .map_err(ntex::connect::ConnectError::Io)?;
+        let tls =
+            ntex::connect::rustls::TlsClientFilter::create(io, self.tls_config.clone(), domain)
+                .await
+                .map_err(ntex::connect::ConnectError::Io)?;
         Ok(tls.boxed())
     }
 }
@@ -788,17 +861,14 @@ impl HttpTransport for NativeHttp {
         runtime.block_on(async move {
             match proxy {
                 None => native_get_with_headers(&url, &headers).await,
-                Some(endpoint) => native_get_with_headers_via_proxy(&url, &headers, &endpoint).await,
+                Some(endpoint) => {
+                    native_get_with_headers_via_proxy(&url, &headers, &endpoint).await
+                }
             }
         })
     }
 
-    fn post_json(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-        body: &Value,
-    ) -> Result<HttpResponse> {
+    fn post_json(&self, url: &str, headers: &[(&str, &str)], body: &Value) -> Result<HttpResponse> {
         validate_provider_url(url)?;
         let proxy = self.proxy_endpoint_for(url)?;
         let url = url.to_owned();
@@ -812,7 +882,9 @@ impl HttpTransport for NativeHttp {
         runtime.block_on(async move {
             match proxy {
                 None => native_post_json(&url, &headers, &body).await,
-                Some(endpoint) => native_post_json_via_proxy(&url, &headers, &body, &endpoint).await,
+                Some(endpoint) => {
+                    native_post_json_via_proxy(&url, &headers, &body, &endpoint).await
+                }
             }
         })
     }
@@ -837,13 +909,7 @@ impl HttpTransport for NativeHttp {
         body: &Value,
         on_chunk: ChunkSink,
     ) -> BoxFuture<'static, Result<HttpResponse>> {
-        self.post_json_stream_observed_in_runtime(
-            url,
-            headers,
-            body,
-            on_chunk,
-            Box::new(|_, _| {}),
-        )
+        self.post_json_stream_observed_in_runtime(url, headers, body, on_chunk, Box::new(|_, _| {}))
     }
 
     fn post_json_stream_observed_in_runtime(
@@ -887,8 +953,7 @@ impl HttpTransport for NativeHttp {
     }
 }
 
-impl RateLimit {
-}
+impl RateLimit {}
 
 async fn native_get(url: &str, token: Option<&GithubToken>) -> Result<HttpResponse> {
     // `Client::new()` would inherit the library's payload limits, and
@@ -906,21 +971,49 @@ async fn native_get(url: &str, token: Option<&GithubToken>) -> Result<HttpRespon
         .map_err(|error| {
             OcgError::config(format!("cannot build the native HTTP client: {error}"))
         })?;
-    let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     let headers = github_headers_for(url, token.is_some());
-    if headers.authorization { if let Some(token) = token { request = request.header("Authorization", format!("Bearer {}", token.expose())); } }
-    if headers.accept { request = request.header("Accept", "application/vnd.github+json"); }
-    if headers.api_version { request = request.header("X-GitHub-Api-Version", "2022-11-28"); }
-    let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    if headers.authorization {
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {}", token.expose()));
+        }
+    }
+    if headers.accept {
+        request = request.header("Accept", "application/vnd.github+json");
+    }
+    if headers.api_version {
+        request = request.header("X-GitHub-Api-Version", "2022-11-28");
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
-    let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {
-        value.to_str().ok().map(|value| (name.as_str(), value))
-    }));
-    let body = response.body().await.map_err(|error| OcgError::config(format!("cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}")))?;
+    let rate_limit = RateLimit::from_pairs(
+        response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+    );
+    let body = response.body().await.map_err(|error| {
+        OcgError::config(format!(
+            "cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}"
+        ))
+    })?;
     // The payload reader rejects an oversized body before this point; kept as a
     // cheap second gate so `MAX_BODY_BYTES` stays the single declared envelope.
-    if body.len() as u64 > MAX_BODY_BYTES { return Err(OcgError::config(format!("response from {url} exceeded the {MAX_BODY_BYTES} byte limit"))); }
-    Ok(HttpResponse { status, rate_limit, body: body.to_vec() })
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    Ok(HttpResponse {
+        status,
+        rate_limit,
+        body: body.to_vec(),
+    })
 }
 
 async fn native_post_json(
@@ -942,7 +1035,9 @@ async fn native_post_json(
         .map_err(|error| {
             OcgError::config(format!("cannot build the native HTTP client: {error}"))
         })?;
-    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let mut request = client
+        .post(url)
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
@@ -951,10 +1046,9 @@ async fn native_post_json(
         .await
         .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
-    let response_body = response
-        .body()
-        .await
-        .map_err(|error| OcgError::config(format!("cannot read the response from {url}: {error}")))?;
+    let response_body = response.body().await.map_err(|error| {
+        OcgError::config(format!("cannot read the response from {url}: {error}"))
+    })?;
     if response_body.len() as u64 > MAX_BODY_BYTES {
         return Err(OcgError::config(format!(
             "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
@@ -995,7 +1089,9 @@ async fn native_post_json_stream(
         .map_err(|error| {
             OcgError::config(format!("cannot build the native HTTP client: {error}"))
         })?;
-    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let mut request = client
+        .post(url)
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
@@ -1004,6 +1100,7 @@ async fn native_post_json_stream(
         .await
         .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
+    let rate_limit = provider_rate_limit(&response);
     let mut response = Box::pin(response);
 
     if !(200..300).contains(&status) {
@@ -1012,7 +1109,9 @@ async fn native_post_json_stream(
         let mut diagnostic = Vec::new();
         while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
             let chunk = chunk.map_err(|error| {
-                OcgError::config(format!("cannot read the error response from {url}: {error}"))
+                OcgError::config(format!(
+                    "cannot read the error response from {url}: {error}"
+                ))
             })?;
             if diagnostic.len() + chunk.len() > MAX_PROVIDER_ERROR_BODY {
                 break;
@@ -1021,7 +1120,7 @@ async fn native_post_json_stream(
         }
         return Ok(HttpResponse {
             status,
-            rate_limit: RateLimit::default(),
+            rate_limit,
             body: diagnostic,
         });
     }
@@ -1032,7 +1131,9 @@ async fn native_post_json_stream(
     let mut total: u64 = 0;
     while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
         let chunk = chunk.map_err(|error| {
-            OcgError::config(format!("error reading streamed response from {url}: {error}"))
+            OcgError::config(format!(
+                "error reading streamed response from {url}: {error}"
+            ))
         })?;
         total += chunk.len() as u64;
         if total > MAX_BODY_BYTES {
@@ -1073,26 +1174,56 @@ async fn proxy_client_for(endpoint: &str, head_timeout: Duration) -> Result<ntex
         .connector::<()>(connector)
         .build(ntex::SharedCfg::default())
         .await
-        .map_err(|error| {
-            OcgError::config(format!("cannot build the proxied HTTP client: {error}"))
-        })
+        .map_err(|error| OcgError::config(format!("cannot build the proxied HTTP client: {error}")))
 }
 
-async fn native_get_via_proxy(url: &str, token: Option<&GithubToken>, endpoint: &str) -> Result<HttpResponse> {
+async fn native_get_via_proxy(
+    url: &str,
+    token: Option<&GithubToken>,
+    endpoint: &str,
+) -> Result<HttpResponse> {
     let client = proxy_client_for(endpoint, RESPONSE_HEAD_TIMEOUT).await?;
-    let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     let headers = github_headers_for(url, token.is_some());
-    if headers.authorization { if let Some(token) = token { request = request.header("Authorization", format!("Bearer {}", token.expose())); } }
-    if headers.accept { request = request.header("Accept", "application/vnd.github+json"); }
-    if headers.api_version { request = request.header("X-GitHub-Api-Version", "2022-11-28"); }
-    let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    if headers.authorization {
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {}", token.expose()));
+        }
+    }
+    if headers.accept {
+        request = request.header("Accept", "application/vnd.github+json");
+    }
+    if headers.api_version {
+        request = request.header("X-GitHub-Api-Version", "2022-11-28");
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
-    let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {
-        value.to_str().ok().map(|value| (name.as_str(), value))
-    }));
-    let body = response.body().await.map_err(|error| OcgError::config(format!("cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}")))?;
-    if body.len() as u64 > MAX_BODY_BYTES { return Err(OcgError::config(format!("response from {url} exceeded the {MAX_BODY_BYTES} byte limit"))); }
-    Ok(HttpResponse { status, rate_limit, body: body.to_vec() })
+    let rate_limit = RateLimit::from_pairs(
+        response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+    );
+    let body = response.body().await.map_err(|error| {
+        OcgError::config(format!(
+            "cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}"
+        ))
+    })?;
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    Ok(HttpResponse {
+        status,
+        rate_limit,
+        body: body.to_vec(),
+    })
 }
 
 async fn native_get_with_headers(url: &str, headers: &[(String, String)]) -> Result<HttpResponse> {
@@ -1102,19 +1233,41 @@ async fn native_get_with_headers(url: &str, headers: &[(String, String)]) -> Res
         .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
         .build(ntex::SharedCfg::default())
         .await
-        .map_err(|error| OcgError::config(format!("cannot build the native HTTP client: {error}")))?;
-    let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+        .map_err(|error| {
+            OcgError::config(format!("cannot build the native HTTP client: {error}"))
+        })?;
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
-    let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {
-        value.to_str().ok().map(|value| (name.as_str(), value))
-    }));
-    let body = response.body().await.map_err(|error| OcgError::config(format!("cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}")))?;
-    if body.len() as u64 > MAX_BODY_BYTES { return Err(OcgError::config(format!("response from {url} exceeded the {MAX_BODY_BYTES} byte limit"))); }
-    Ok(HttpResponse { status, rate_limit, body: body.to_vec() })
+    let rate_limit = RateLimit::from_pairs(
+        response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+    );
+    let body = response.body().await.map_err(|error| {
+        OcgError::config(format!(
+            "cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}"
+        ))
+    })?;
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    Ok(HttpResponse {
+        status,
+        rate_limit,
+        body: body.to_vec(),
+    })
 }
 
 async fn native_get_with_headers_via_proxy(
@@ -1123,18 +1276,38 @@ async fn native_get_with_headers_via_proxy(
     endpoint: &str,
 ) -> Result<HttpResponse> {
     let client = proxy_client_for(endpoint, RESPONSE_HEAD_TIMEOUT).await?;
-    let mut request = client.get(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    let response = request.send().await.map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
-    let rate_limit = RateLimit::from_pairs(response.headers().iter().filter_map(|(name, value)| {
-        value.to_str().ok().map(|value| (name.as_str(), value))
-    }));
-    let body = response.body().await.map_err(|error| OcgError::config(format!("cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}")))?;
-    if body.len() as u64 > MAX_BODY_BYTES { return Err(OcgError::config(format!("response from {url} exceeded the {MAX_BODY_BYTES} byte limit"))); }
-    Ok(HttpResponse { status, rate_limit, body: body.to_vec() })
+    let rate_limit = RateLimit::from_pairs(
+        response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+    );
+    let body = response.body().await.map_err(|error| {
+        OcgError::config(format!(
+            "cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}"
+        ))
+    })?;
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(OcgError::config(format!(
+            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+        )));
+    }
+    Ok(HttpResponse {
+        status,
+        rate_limit,
+        body: body.to_vec(),
+    })
 }
 
 async fn native_post_json_via_proxy(
@@ -1149,7 +1322,9 @@ async fn native_post_json_via_proxy(
         )));
     }
     let client = proxy_client_for(endpoint, RESPONSE_HEAD_TIMEOUT).await?;
-    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let mut request = client
+        .post(url)
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
@@ -1158,10 +1333,9 @@ async fn native_post_json_via_proxy(
         .await
         .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
-    let response_body = response
-        .body()
-        .await
-        .map_err(|error| OcgError::config(format!("cannot read the response from {url}: {error}")))?;
+    let response_body = response.body().await.map_err(|error| {
+        OcgError::config(format!("cannot read the response from {url}: {error}"))
+    })?;
     if response_body.len() as u64 > MAX_BODY_BYTES {
         return Err(OcgError::config(format!(
             "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
@@ -1187,7 +1361,9 @@ async fn native_post_json_stream_via_proxy(
         )));
     }
     let client = proxy_client_for(endpoint, PROVIDER_RESPONSE_HEAD_TIMEOUT).await?;
-    let mut request = client.post(url).header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
+    let mut request = client
+        .post(url)
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")));
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
@@ -1196,13 +1372,16 @@ async fn native_post_json_stream_via_proxy(
         .await
         .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
+    let rate_limit = provider_rate_limit(&response);
     let mut response = Box::pin(response);
 
     if !(200..300).contains(&status) {
         let mut diagnostic = Vec::new();
         while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
             let chunk = chunk.map_err(|error| {
-                OcgError::config(format!("cannot read the error response from {url}: {error}"))
+                OcgError::config(format!(
+                    "cannot read the error response from {url}: {error}"
+                ))
             })?;
             if diagnostic.len() + chunk.len() > MAX_PROVIDER_ERROR_BODY {
                 break;
@@ -1211,7 +1390,7 @@ async fn native_post_json_stream_via_proxy(
         }
         return Ok(HttpResponse {
             status,
-            rate_limit: RateLimit::default(),
+            rate_limit,
             body: diagnostic,
         });
     }
@@ -1219,7 +1398,9 @@ async fn native_post_json_stream_via_proxy(
     let mut total: u64 = 0;
     while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
         let chunk = chunk.map_err(|error| {
-            OcgError::config(format!("error reading streamed response from {url}: {error}"))
+            OcgError::config(format!(
+                "error reading streamed response from {url}: {error}"
+            ))
         })?;
         total += chunk.len() as u64;
         if total > MAX_BODY_BYTES {
