@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import {
   ChevronsLeft,
+  Activity,
   Home,
   BarChart3,
   Bell,
@@ -33,10 +34,11 @@ import { DEFAULT_PROJECT_ID } from "../project/domain";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
 
-const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.usage" | "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
+const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.usage" | "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.health" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
   { target: "home", labelKey: "nav.home", icon: Home },
   { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
   { target: "job-execution", labelKey: "nav.jobExecution", icon: Workflow },
+  { target: "health", labelKey: "nav.health", icon: Activity },
   { target: "attention", labelKey: "nav.attention", icon: Bell },
   { target: "usage", labelKey: "nav.usage", icon: BarChart3 },
   { target: "control-center", labelKey: "nav.controlCenter", icon: SlidersHorizontal },
@@ -144,7 +146,7 @@ export function OcgSidebar({
     }
   };
   const workspaceNav = runtimeAuthority === "canonical"
-    ? WORKSPACE_NAV.filter(item => ["home", "chat", "job-execution", "attention", "usage", "control-center"].includes(item.target))
+    ? WORKSPACE_NAV.filter(item => ["home", "chat", "job-execution", "health", "attention", "usage", "control-center"].includes(item.target))
     : WORKSPACE_NAV;
   const hasNav = Boolean(onNavigate);
   const navLabel = (item: (typeof WORKSPACE_NAV)[number]) => t(item.labelKey);

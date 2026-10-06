@@ -109,7 +109,13 @@ export type CanonicalJobSpawnRequest = { parent_attempt_id: string, expected_gen
 export type CanonicalJobSpawnResponse = { api_version: CanonicalApiVersion, child_job_id: string, duplicate: boolean, snapshot: CanonicalJobSnapshot, };
 
 
-export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null, parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, can_cancel: boolean, can_retry: boolean, };
+export type CanonicalJobSummary = { job_id: string, created_at: number, state: string, updated_at: number, termination_reason: Failure | null,
+/**
+ * Set when this Job is a Health Probe. The dashboard already carries the
+ * Job, so the declared Provider × Model × Effort target rides with it
+ * rather than requiring a second read of every probe.
+ */
+health_probe?: HealthProbeIntent | null, parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, can_cancel: boolean, can_retry: boolean, };
 
 
 export type CanonicalProjectResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, project: ProjectRecord, };

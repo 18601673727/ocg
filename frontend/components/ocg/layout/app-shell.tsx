@@ -14,6 +14,7 @@ import { OcgTopbar } from "../topbar/ocg-topbar";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
 import { ControlCenterSurface } from "../control-center/control-center-surface";
 import { JobExecutionSurface } from "../execution/job-execution-surface";
+import { HealthSurface } from "../health/health-surface";
 import { LogsSurface } from "../logs/logs-surface";
 import { SettingsSurface } from "../settings/settings-surface";
 import { CanonicalControlSurface } from "../canonical/canonical-control-surface";
@@ -248,6 +249,7 @@ export function RuntimeWorkspace({
   const isLedger = view === "ledger" && runtimeAuthority === "mock";
   const isControlCenter = view === "control-center";
   const isJobExecution = view === "job-execution";
+  const isHealth = view === "health";
   const isLogs = view === "logs" && runtimeAuthority === "mock";
   const isSettings = view === "settings" || (runtimeAuthority === "canonical" && ["ledger", "logs"].includes(view));
   const isCanonical = view === "canonical";
@@ -760,6 +762,10 @@ export function RuntimeWorkspace({
               <NoExecutionNotice />
             )}
           </main>
+        ) : isHealth ? (
+          <main aria-label={t("nav.health")} className="flex min-h-0 flex-1 overflow-hidden">
+            <HealthSurface baseUrl={runtimeAuthority === "canonical" ? ocgControlUrl : null} projectId={activeProjectId} />
+          </main>
         ) : isLogs ? (
           <main aria-label="Logs and diagnostics" className="flex min-h-0 flex-1 overflow-hidden">
             <LogsSurface
@@ -885,7 +891,7 @@ export function RuntimeWorkspace({
         </ViewTransition>
       </div>
 
-      {!isUsage && !isLedger && !isControlCenter && !isJobExecution && !isLogs && !isSettings && !isHome && !isAttention && (
+      {!isUsage && !isLedger && !isControlCenter && !isJobExecution && !isHealth && !isLogs && !isSettings && !isHome && !isAttention && (
         <div
           className={cn("fixed inset-0 z-50 lg:hidden", !mobileInspectorOpen && "pointer-events-none")}
           aria-hidden={!mobileInspectorOpen}

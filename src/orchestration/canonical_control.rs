@@ -404,6 +404,11 @@ pub struct CanonicalJobSummary {
     pub state: String,
     pub updated_at: i64,
     pub termination_reason: Option<Failure>,
+    /// Set when this Job is a Health Probe. The dashboard already carries the
+    /// Job, so the declared Provider × Model × Effort target rides with it
+    /// rather than requiring a second read of every probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_probe: Option<super::health_probe::HealthProbeIntent>,
     #[serde(flatten)]
     pub relations: CanonicalJobRelations,
     #[serde(flatten)]
@@ -1530,6 +1535,7 @@ impl CanonicalControlService {
                     state: job.state.to_string(),
                     updated_at: job.updated_at,
                     termination_reason: job.termination_reason.clone(),
+                    health_probe: job.spec.health_probe.clone(),
                     operations: CanonicalJobOperations::for_job(job, relations.blocked),
                     relations,
                 }

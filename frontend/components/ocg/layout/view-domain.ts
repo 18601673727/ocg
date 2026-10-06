@@ -16,6 +16,7 @@ export type WorkspaceView =
   | "ledger"
   | "control-center"
   | "job-execution"
+  | "health"
   | "logs"
   | "settings"
   | "canonical";
@@ -28,6 +29,7 @@ export const WORKSPACE_VIEWS: readonly WorkspaceView[] = [
   "ledger",
   "control-center",
   "job-execution",
+  "health",
   "logs",
   "settings",
   "canonical",
@@ -93,6 +95,7 @@ const WORKSPACE_TARGETS: Record<WorkspaceView, WorkspaceTarget> = {
   "control-center": { href: "/?view=control-center", toggles: true },
   ledger: { href: "/?view=ledger", toggles: true },
   "job-execution": { href: "/?view=job-execution", toggles: true },
+  health: { href: "/?view=health", toggles: true },
   logs: { href: "/?view=logs", toggles: true },
   settings: { href: "/?view=settings", toggles: true },
   canonical: { href: "/?view=canonical", toggles: false },

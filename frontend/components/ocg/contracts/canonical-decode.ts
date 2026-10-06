@@ -33,6 +33,7 @@ import type {
   EntityRef,
   CanonicalJobSnapshot,
   CanonicalJobSummary,
+  HealthProbeIntent,
   CanonicalProjectResponse,
   CanonicalProjectsResponse,
   DiskGuardConfig,
@@ -1027,6 +1028,24 @@ const eventsEnvelope: Decoder<CanonicalEventsEnvelope> = (input, path) => {
   });
 };
 
+/**
+ * The Provider × Model × Effort a Health Probe declared.
+ *
+ * `effort` is optional on the wire (`#[serde(default)]`), and `null` is a real
+ * identity: a probe without effort is a different tuple from one that names one.
+ */
+const healthProbeIntent: Decoder<HealthProbeIntent> = (input, path) => {
+  const rec = record(input, path, "a Health Probe target");
+  if (!rec.ok) return rec;
+  const provider = req(rec.value, "provider", identity, path);
+  if (!provider.ok) return provider;
+  const model = req(rec.value, "model", identity, path);
+  if (!model.ok) return model;
+  const effort = opt(rec.value, "effort", string, path);
+  if (!effort.ok) return effort;
+  return yes({ provider: provider.value, model: model.value, effort: effort.value ?? null });
+};
+
 const jobSummary: Decoder<CanonicalJobSummary> = (input, path) => {
   const rec = record(input, path, "a canonical Job summary");
   if (!rec.ok) return rec;
@@ -1042,11 +1061,15 @@ const jobSummary: Decoder<CanonicalJobSummary> = (input, path) => {
   if (!relations.ok) return relations;
   const operations = jobOperations(rec.value, path);
   if (!operations.ok) return operations;
+  // Absent on ordinary Jobs. Present only when the backend serialized a probe.
+  const healthProbe = opt(rec.value, "health_probe", healthProbeIntent, path);
+  if (!healthProbe.ok) return healthProbe;
   return yes({
     job_id: jobId.value,
     state: state.value,
     created_at: createdAt.value,
     updated_at: updatedAt.value,
+    ...(healthProbe.value ? { health_probe: healthProbe.value } : {}),
     ...relations.value,
     ...operations.value,
   });
