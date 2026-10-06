@@ -17,6 +17,7 @@ pub mod handoff;
 pub mod health_probe;
 pub mod journal;
 pub(crate) mod placement;
+pub(crate) mod placement_projection;
 pub mod projection;
 pub mod state;
 

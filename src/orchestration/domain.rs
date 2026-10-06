@@ -840,6 +840,7 @@ impl DomainRepository {
             "INTEGER NOT NULL DEFAULT 0 CHECK(automatic_admission IN (0,1))",
         )?;
         ensure_column(&connection, "domain_jobs", "admission_selection", "TEXT")?;
+        ensure_column(&connection, "domain_jobs", "placement_evidence", "TEXT")?;
         ensure_column(&connection, "domain_job_origins", "spawn_key", "TEXT")?;
         ensure_column(
             &connection,
@@ -3536,6 +3537,43 @@ impl DomainRepository {
             )
             .map_err(sql)?;
         Ok(())
+    }
+
+    /// Record placement evidence for a Job after candidate selection.
+    pub(crate) fn record_placement_evidence(
+        &mut self,
+        job_id: &str,
+        evidence: &[super::placement_projection::CandidateEvidence],
+    ) -> Result<()> {
+        let serialized =
+            serde_json::to_string(evidence).map_err(|error| invalid(&error.to_string()))?;
+        self.connection
+            .execute(
+                "UPDATE domain_jobs SET placement_evidence=?2 WHERE id=?1",
+                params![job_id, serialized],
+            )
+            .map_err(sql)?;
+        Ok(())
+    }
+
+    /// Retrieve placement evidence for a Job.
+    #[allow(dead_code)]
+    pub(crate) fn placement_evidence(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<Vec<super::placement_projection::CandidateEvidence>>> {
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT placement_evidence FROM domain_jobs WHERE id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .flatten();
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|error| invalid(&error.to_string())))
+            .transpose()
     }
 
     /// Claim an eligible Job and establish its authoritative Attempt atomically.

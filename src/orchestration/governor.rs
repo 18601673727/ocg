@@ -301,6 +301,80 @@ impl Governor {
             .get(scope)
             .map(|capacity| (capacity.current, capacity.config.max_concurrent)))
     }
+
+    /// Evaluate rate eligibility without consuming a rate token.
+    ///
+    /// This is a non-consuming read-only check for placement evaluation.
+    /// Returns (is_available, retry_after_millis).
+    pub fn evaluate_rate(&self, scope: &GovernorScope) -> Result<(bool, Option<u64>)> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("governor lock poisoned"))?;
+
+        state.ensure_rate_limiter(scope);
+
+        if let Some(rate_limiter) = state.rate_limiters.get(scope) {
+            let now = Instant::now();
+
+            // Check upstream cooldown first
+            if let Some(until) = rate_limiter.cooldown_until {
+                if now < until {
+                    let retry_after = until.duration_since(now);
+                    return Ok((false, Some(retry_after.as_millis() as u64)));
+                }
+            }
+
+            // Check sliding window without modifying it
+            let window_start = now.checked_sub(rate_limiter.config.window).unwrap_or(now);
+            let active_requests = rate_limiter
+                .requests
+                .iter()
+                .filter(|&&timestamp| timestamp > window_start)
+                .count();
+
+            if active_requests >= rate_limiter.config.max_requests as usize {
+                // Calculate when oldest will expire
+                let retry_after = rate_limiter
+                    .requests
+                    .iter()
+                    .filter(|&&timestamp| timestamp > window_start)
+                    .min()
+                    .and_then(|&oldest| {
+                        oldest
+                            .checked_add(rate_limiter.config.window)
+                            .and_then(|expiry| expiry.checked_duration_since(now))
+                    })
+                    .unwrap_or(Duration::from_secs(1));
+                return Ok((false, Some(retry_after.as_millis() as u64)));
+            }
+
+            Ok((true, None))
+        } else {
+            // No rate limiter configured = available
+            Ok((true, None))
+        }
+    }
+
+    /// Evaluate capacity eligibility without acquiring a permit.
+    ///
+    /// This is a non-consuming read-only check for placement evaluation.
+    /// Returns true if capacity is currently available.
+    pub fn evaluate_capacity(&self, scope: &GovernorScope) -> Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("governor lock poisoned"))?;
+
+        state.ensure_capacity_state(scope);
+
+        if let Some(capacity) = state.capacity_state.get(scope) {
+            Ok(capacity.current < capacity.config.max_concurrent)
+        } else {
+            // No capacity config = available
+            Ok(true)
+        }
+    }
 }
 
 impl Default for Governor {

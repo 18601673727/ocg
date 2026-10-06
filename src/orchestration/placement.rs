@@ -7,6 +7,11 @@ use std::path::Path;
 
 use super::budget::{BudgetConfig, QuotaFacts, SpendDecision};
 use super::domain::{job_failure, DomainRepository, JobSpec};
+use super::governor::Governor;
+use super::placement_projection::{
+    evaluate_governor, serialize_spend_decision, CandidateEvidence, PlacementHealthEvidence,
+    PlacementReason,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProviderChoice {
@@ -41,7 +46,14 @@ pub(crate) struct PolicyInput<'a> {
     pub preferred_model: Option<&'a str>,
     pub budget: &'a BudgetConfig,
     pub concurrency: Option<usize>,
+    pub governor: Option<&'a Governor>,
     pub now: i64,
+}
+
+/// Result of placement candidate selection with evidence.
+pub(crate) struct PlacementResult {
+    pub choice: ProviderChoice,
+    pub evidence: Vec<CandidateEvidence>,
 }
 
 // This decision is transient. Job/Attempt/DispatchIntent remain the durable
@@ -49,7 +61,7 @@ pub(crate) struct PolicyInput<'a> {
 pub(crate) fn choose(
     domain: &DomainRepository,
     input: PolicyInput<'_>,
-) -> Result<std::result::Result<ProviderChoice, Failure>> {
+) -> Result<std::result::Result<PlacementResult, Failure>> {
     let vault = crate::vault::Vault::user_global()?;
     let executable = input.profile.executable_choices(&vault);
     let loaded = crate::resources::load(input.root);
@@ -61,9 +73,12 @@ pub(crate) fn choose(
             true,
         )));
     }
+
+    let mut all_evidence = Vec::new();
     let mut candidates = Vec::new();
     let mut unavailable = false;
     let mut budget_failure = None;
+
     for (key, model) in input.profile.runnable_models() {
         if !executable.contains(key)
             || input
@@ -97,35 +112,95 @@ pub(crate) fn choose(
         let multimodal = metadata
             .and_then(|metadata| metadata.multimodal)
             .or_else(|| reported.and_then(|metadata| metadata.multimodal));
-        // The existing provider loop always supplies native tools. Unknown
-        // capability metadata stays unknown; only an explicit denial excludes it.
-        if tools == Some(false)
-            || (input.requirements.images
-                && (images == Some(false) || (images.is_none() && multimodal == Some(false))))
-            || input.requirements.effort.is_some_and(|effort| {
-                !provider.wire_protocol().is_openai_chat_completions()
-                    || !matches!(
-                        effort,
-                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
-                    )
-                    || !supports_effort(model, effort)
-            })
-        {
+
+        // Capability check - record rejections
+        if tools == Some(false) {
+            all_evidence.push(CandidateEvidence {
+                provider: model.provider.clone(),
+                model: key.clone(),
+                health: None,
+                governor_evaluation: None,
+                ranking_tuple: None,
+                reason: PlacementReason::CapabilityRejected {
+                    detail: "tools not supported".to_string(),
+                },
+            });
             continue;
         }
+        if input.requirements.images
+            && (images == Some(false) || (images.is_none() && multimodal == Some(false)))
+        {
+            all_evidence.push(CandidateEvidence {
+                provider: model.provider.clone(),
+                model: key.clone(),
+                health: None,
+                governor_evaluation: None,
+                ranking_tuple: None,
+                reason: PlacementReason::CapabilityRejected {
+                    detail: "images not supported".to_string(),
+                },
+            });
+            continue;
+        }
+        if input.requirements.effort.is_some_and(|effort| {
+            !provider.wire_protocol().is_openai_chat_completions()
+                || !matches!(
+                    effort,
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+                )
+                || !supports_effort(model, effort)
+        }) {
+            all_evidence.push(CandidateEvidence {
+                provider: model.provider.clone(),
+                model: key.clone(),
+                health: None,
+                governor_evaluation: None,
+                ranking_tuple: None,
+                reason: PlacementReason::CapabilityRejected {
+                    detail: "reasoning effort not supported".to_string(),
+                },
+            });
+            continue;
+        }
+
+        // Health check
         let identity = ResourceIdentity::for_model(&model.provider, &model.id);
         let record = loaded.registry.resource(&ResourceId::derive(&identity));
-        let health = record.as_ref().map(|record| &record.health);
-        if health.is_some_and(|health| health.state == ResourceHealth::Unavailable) {
+        let health_record = record.as_ref().map(|record| &record.health);
+
+        if health_record.is_some_and(|health| health.state == ResourceHealth::Unavailable) {
+            let health_evidence = health_record.map(|h| PlacementHealthEvidence {
+                state: h.state,
+                provenance: h.provenance,
+                observed_at: h.observed_at,
+            });
+            all_evidence.push(CandidateEvidence {
+                provider: model.provider.clone(),
+                model: key.clone(),
+                health: health_evidence,
+                governor_evaluation: None,
+                ranking_tuple: None,
+                reason: PlacementReason::HealthRejected {
+                    health_state: "unavailable".to_string(),
+                },
+            });
             unavailable = true;
             continue;
         }
-        let health = health.filter(|health| health.provenance != ResourceProvenance::Unknown);
-        // Rank the last persisted observation, not an invented live probe or
-        // clock-dependent score. Missing evidence never becomes Available.
-        let health = health
+
+        let health_filtered =
+            health_record.filter(|health| health.provenance != ResourceProvenance::Unknown);
+        let health = health_filtered
             .map(|health| health.state)
             .unwrap_or(ResourceHealth::Unknown);
+
+        let health_evidence = health_filtered.map(|h| PlacementHealthEvidence {
+            state: h.state,
+            provenance: h.provenance,
+            observed_at: h.observed_at,
+        });
+
+        // Budget check
         let quota = super::budget::quota_facts(input.root, &identity, input.now);
         let assessment = domain.preview_provider_admission(
             input.project_id,
@@ -134,7 +209,19 @@ pub(crate) fn choose(
             input.budget,
             quota,
         )?;
+
         if !assessment.is_allowed() {
+            all_evidence.push(CandidateEvidence {
+                provider: model.provider.clone(),
+                model: key.clone(),
+                health: health_evidence,
+                governor_evaluation: None,
+                ranking_tuple: None,
+                reason: PlacementReason::BudgetRejected {
+                    reason_code: assessment.reason_code.clone(),
+                    decision: serialize_spend_decision(assessment.decision),
+                },
+            });
             budget_failure.get_or_insert_with(|| {
                 job_failure(
                     &assessment.reason_code,
@@ -145,20 +232,66 @@ pub(crate) fn choose(
             });
             continue;
         }
+
+        // Governor evaluation (non-consuming)
+        let governor_eval = if let Some(governor) = input.governor {
+            let scope =
+                super::governor::GovernorScope::provider_model(model.provider.clone(), key.clone());
+            let eval = evaluate_governor(governor, &scope)?;
+
+            // Reject if governor says unavailable
+            if !eval.rate_available {
+                all_evidence.push(CandidateEvidence {
+                    provider: model.provider.clone(),
+                    model: key.clone(),
+                    health: health_evidence,
+                    governor_evaluation: Some(eval.clone()),
+                    ranking_tuple: None,
+                    reason: PlacementReason::RateEvaluationUnavailable {
+                        retry_after_millis: eval.rate_retry_after_millis,
+                    },
+                });
+                continue;
+            }
+            if !eval.capacity_available {
+                all_evidence.push(CandidateEvidence {
+                    provider: model.provider.clone(),
+                    model: key.clone(),
+                    health: health_evidence,
+                    governor_evaluation: Some(eval),
+                    ranking_tuple: None,
+                    reason: PlacementReason::CapacityEvaluationUnavailable,
+                });
+                continue;
+            }
+
+            Some(eval)
+        } else {
+            None
+        };
+
+        // This candidate is eligible for ranking
         let health_rank = match health {
             ResourceHealth::Available => 0,
             ResourceHealth::Unknown => 1,
             ResourceHealth::Degraded => 2,
             ResourceHealth::Unavailable => continue,
         };
+
+        let model_mismatch = input.preferred_model != Some(key.as_str());
+        let provider_mismatch = input.preferred_provider != Some(model.provider.as_str());
+
         candidates.push((
             health_rank,
-            input.preferred_model != Some(key.as_str()),
-            input.preferred_provider != Some(model.provider.as_str()),
+            model_mismatch,
+            provider_mismatch,
             model.provider.clone(),
             key.clone(),
+            health_evidence,
+            governor_eval,
         ));
     }
+
     if candidates.is_empty() {
         return Ok(Err(budget_failure.unwrap_or_else(|| {
             if unavailable {
@@ -170,6 +303,8 @@ pub(crate) fn choose(
             }
         })));
     }
+
+    // Project capacity check (not per-candidate)
     if let Some(limit) = input.concurrency {
         if !domain.provider_capacity_available(input.project_id, input.job_id, limit)? {
             return Ok(Err(job_failure(
@@ -180,8 +315,28 @@ pub(crate) fn choose(
             )));
         }
     }
-    candidates.sort();
-    let Some((_, _, _, provider, model)) = candidates.into_iter().next() else {
+
+    // Sort by ranking criteria only, then extract winner
+    candidates.sort_by_key(|(health, model_mis, prov_mis, provider, model, _, _)| {
+        (
+            *health,
+            *model_mis,
+            *prov_mis,
+            provider.clone(),
+            model.clone(),
+        )
+    });
+
+    let Some((
+        winner_health,
+        winner_model_mis,
+        winner_prov_mis,
+        winner_provider,
+        winner_model,
+        winner_health_ev,
+        winner_gov,
+    )) = candidates.into_iter().next()
+    else {
         return Ok(Err(job_failure(
             "placement_incompatible",
             FailureClass::Capability,
@@ -189,7 +344,28 @@ pub(crate) fn choose(
             false,
         )));
     };
-    Ok(Ok(ProviderChoice { provider, model }))
+
+    // Record winner as Selected
+    all_evidence.push(CandidateEvidence {
+        provider: winner_provider.clone(),
+        model: winner_model.clone(),
+        health: winner_health_ev,
+        governor_evaluation: winner_gov,
+        ranking_tuple: Some((winner_health, winner_model_mis, winner_prov_mis)),
+        reason: PlacementReason::Selected {
+            health_rank: winner_health,
+            model_preference_mismatch: winner_model_mis,
+            provider_preference_mismatch: winner_prov_mis,
+        },
+    });
+
+    Ok(Ok(PlacementResult {
+        choice: ProviderChoice {
+            provider: winner_provider,
+            model: winner_model,
+        },
+        evidence: all_evidence,
+    }))
 }
 
 pub(crate) fn quota(

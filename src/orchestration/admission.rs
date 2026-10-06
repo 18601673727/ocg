@@ -143,6 +143,7 @@ pub(crate) struct AdmissionContext<'a> {
     pub project_id: &'a str,
     pub budget: &'a BudgetConfig,
     pub concurrency: Option<usize>,
+    pub governor: Option<&'a super::governor::Governor>,
     pub now: i64,
 }
 
@@ -151,7 +152,7 @@ pub(crate) struct AdmissionContext<'a> {
 /// A refusal is a decision, not a panic: the caller records it on the Job when
 /// a Job already exists. No Attempt is created here.
 pub(crate) fn resolve_target(
-    context: &AdmissionContext<'_>,
+    context: &mut AdmissionContext<'_>,
     job: Option<&Job>,
     spec: &JobSpec,
     target: &AdmissionTarget,
@@ -174,7 +175,7 @@ pub(crate) fn resolve_target(
 }
 
 fn prepare_target(
-    context: &AdmissionContext<'_>,
+    context: &mut AdmissionContext<'_>,
     job: Option<&Job>,
     spec: &JobSpec,
     target: &AdmissionTarget,
@@ -202,11 +203,23 @@ fn prepare_target(
                     preferred_model,
                     budget: context.budget,
                     concurrency: context.concurrency,
+                    governor: context.governor,
                     now: context.now,
                 },
             )? {
-                Ok(choice) => {
-                    materialize_choice(context.profile, choice, None, AdmissionPickup::Automatic)
+                Ok(result) => {
+                    // Store placement evidence if we have a job
+                    if let Some(job) = job {
+                        context
+                            .domain
+                            .record_placement_evidence(&job.id, &result.evidence)?;
+                    }
+                    materialize_choice(
+                        context.profile,
+                        result.choice,
+                        None,
+                        AdmissionPickup::Automatic,
+                    )
                 }
                 Err(failure) => Ok(PreparedTarget::Refused(AdmissionRefusal {
                     message: format!("{}: {}", failure.code, failure.message),

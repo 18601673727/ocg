@@ -1805,6 +1805,7 @@ impl CanonicalControlService {
                     project_id: &project.project_id,
                     budget: &budget_config,
                     concurrency: None,
+                    governor: None,
                     now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
                 },
                 &admission.job,
@@ -2125,7 +2126,7 @@ impl CanonicalControlService {
             .as_ref()
             .and_then(|selection| selection.effort.clone());
         let resolved = match super::admission::resolve_target(
-            &AdmissionContext {
+            &mut AdmissionContext {
                 domain: &mut domain,
                 profile: &profile,
                 root: Path::new(&project.root),
@@ -2134,6 +2135,7 @@ impl CanonicalControlService {
                 // Chat's accepted-turn queue predates placement. Its worker
                 // still acquires the existing execution slot before I/O.
                 concurrency: (!is_chat).then_some(provider_concurrency),
+                governor: None,
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             existing_job.as_ref(),
@@ -2246,6 +2248,7 @@ impl CanonicalControlService {
                 project_id: &project.project_id,
                 budget: &budget_config,
                 concurrency: (!is_chat).then_some(provider_concurrency),
+                governor: None,
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             &job,
@@ -2329,6 +2332,7 @@ impl CanonicalControlService {
                 project_id: &project.project_id,
                 budget: &budget_config,
                 concurrency: (!is_chat).then_some(provider_concurrency),
+                governor: None,
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             &job,
@@ -2493,13 +2497,14 @@ impl CanonicalControlService {
         };
         let budget_config = self.provider_budget_config(&self.read_configuration()?.0)?;
         let resolved = match super::admission::resolve_target(
-            &AdmissionContext {
+            &mut AdmissionContext {
                 domain: &mut domain,
                 profile: &profile,
                 root: Path::new(&project.root),
                 project_id: &project.project_id,
                 budget: &budget_config,
                 concurrency: None,
+                governor: None,
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             Some(&job),
@@ -2566,6 +2571,7 @@ impl CanonicalControlService {
                 project_id: &project.project_id,
                 budget: &budget_config,
                 concurrency: None,
+                governor: None,
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             &job,
@@ -2599,6 +2605,7 @@ impl CanonicalControlService {
                 project_id: &project.project_id,
                 budget: &budget_config,
                 concurrency: None,
+                governor: None,
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             &job,
