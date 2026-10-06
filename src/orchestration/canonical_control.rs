@@ -1269,7 +1269,14 @@ impl CanonicalControlService {
         let origins = std::mem::take(&mut snapshot.job_origins);
         let origin_details = std::mem::take(&mut snapshot.job_origin_details);
         let projection = ExecutionProjection::from(snapshot);
-        Self::snapshot_from_projection(project_id, job_id, &projection, &origins, &origin_details)
+        Self::snapshot_from_projection(
+            project_id,
+            job_id,
+            &projection,
+            &origins,
+            &origin_details,
+            &repository,
+        )
     }
 
     fn snapshot_from_projection(
@@ -1278,6 +1285,7 @@ impl CanonicalControlService {
         projection: &ExecutionProjection,
         origins: &BTreeMap<String, String>,
         origin_details: &BTreeMap<String, JobOrigin>,
+        repository: &DomainRepository,
     ) -> Result<CanonicalJobSnapshot> {
         let job = projection
             .jobs
@@ -1330,6 +1338,8 @@ impl CanonicalControlService {
             "executors":executors,
             "calls":calls,
             "dispatch_intents":dispatch_intents,
+            "placement": repository.placement_projection(job_id)?,
+            "watchdog": repository.watchdog_actions(job_id)?,
             "execution_graph":"canonical state projection"
         });
         Ok(CanonicalJobSnapshot {
@@ -1442,6 +1452,7 @@ impl CanonicalControlService {
                     &projection,
                     &origins,
                     &origin_details,
+                    &repository,
                 )
             })
             .transpose()?;
@@ -1461,6 +1472,7 @@ impl CanonicalControlService {
             .name("job-admission".to_string())
             .spawn(move || {
                 let mut last_error = None;
+                let mut last_watchdog = Instant::now();
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                     match service.admit_eligible_jobs() {
                         Ok(()) => last_error = None,
@@ -1472,6 +1484,16 @@ impl CanonicalControlService {
                             }
                         }
                     }
+                    // Watchdog shares this worker's lifetime and the Project
+                    // runtimes it already starts. It does not get its own loop
+                    // at the admission cadence: one pass every few seconds is a
+                    // reconciliation, not a second scheduler.
+                    if last_watchdog.elapsed() >= super::watchdog::WATCHDOG_INTERVAL {
+                        last_watchdog = Instant::now();
+                        if let Err(error) = service.reconcile_watchdog() {
+                            tracing::error!(%error, "fleet watchdog reconciliation deferred");
+                        }
+                    }
                     std::thread::sleep(Duration::from_millis(100));
                 }
             })
@@ -1481,6 +1503,36 @@ impl CanonicalControlService {
             thread: Some(thread),
             runtimes: self.runtime_registry.clone(),
         })
+    }
+
+    /// One Watchdog pass over every registered Project.
+    ///
+    /// The pass only opens stores that already exist and only signals a runtime
+    /// that admission has already started. It never starts a provider worker
+    /// merely to ask whether one owns a Call.
+    pub(crate) fn reconcile_watchdog(&self) -> Result<()> {
+        let mut failure = None;
+        for project in self.projects()? {
+            let mut domain = match DomainRepository::open_existing(Path::new(&project.root)) {
+                Ok(domain) => domain,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            let runtime = if let Some(registry) = &self.runtime_registry {
+                registry.handle(&project.project_id)?
+            } else {
+                self.runtime_handle.clone().filter(|handle| {
+                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
+                })
+            };
+            if let Err(error) = super::watchdog::reconcile_repository(&mut domain, runtime.as_ref())
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     pub(crate) fn admit_eligible_jobs(&self) -> Result<()> {

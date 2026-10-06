@@ -20,6 +20,7 @@ pub(crate) mod placement;
 pub(crate) mod placement_projection;
 pub mod projection;
 pub mod state;
+pub(crate) mod watchdog;
 
 pub use budget::{
     admit as admit_spend, conflict_settlement_id, reservation_id, settlement_id,
