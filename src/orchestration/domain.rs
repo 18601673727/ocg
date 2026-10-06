@@ -36,7 +36,94 @@ fn spawn_refused(reason: SpawnRefusalReason, message: &str) -> OcgError {
 }
 
 fn sql(error: rusqlite::Error) -> OcgError {
+    if is_disk_full(&error) {
+        return OcgError::storage_full("canonical domain SQLite", error.to_string());
+    }
     OcgError::config(format!("canonical domain SQLite: {error}"))
+}
+
+/// True when SQLite itself reports the database or disk is full. Preflight
+/// checks can never rule this out: another process, WAL growth or filesystem
+/// metadata can exhaust space between the Guard's observation and the write.
+fn is_disk_full(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::DiskFull
+    )
+}
+
+/// Classify an open-time SQLite failure. An exhausted filesystem usually fails
+/// at open — WAL/shared-memory files cannot be created — with `CANTOPEN`
+/// rather than `FULL`. A `CANTOPEN` is therefore confirmed with a writability
+/// probe in the database directory before reclassifying: only an actual
+/// write rejection (`ENOSPC`, read-only mount) becomes storage safety, so
+/// permission or path errors can never masquerade as it.
+fn open_sql(root: &Path, error: rusqlite::Error) -> OcgError {
+    let cant_open = matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::CannotOpen
+    );
+    let mapped = sql(error);
+    if mapped.is_storage_full() || !cant_open {
+        return mapped;
+    }
+    match probe_writable(root) {
+        ProbeOutcome::Unwritable(reason) => OcgError::storage_full(
+            "canonical domain SQLite",
+            format!("{mapped}; host storage rejects writes ({reason})"),
+        ),
+        ProbeOutcome::Writable => mapped,
+    }
+}
+
+enum ProbeOutcome {
+    Writable,
+    Unwritable(&'static str),
+}
+
+/// Try to create, write and remove one tiny file beside the substrate. Only a
+/// write rejection proves exhaustion; anything else (including a probe that
+/// cannot even be attempted cleanly) leaves the original error untouched.
+fn probe_writable(root: &Path) -> ProbeOutcome {
+    use std::io::Write;
+    let directory = crate::orchestration::state::state_dir(root);
+    for attempt in 0..4 {
+        let path = directory.join(format!(
+            ".ocg-open-probe-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        let mut file = match created {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return classify_probe_error(&error),
+        };
+        let outcome = match file.write_all(&[0]) {
+            Ok(()) => ProbeOutcome::Writable,
+            Err(error) => classify_probe_error(&error),
+        };
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return outcome;
+    }
+    ProbeOutcome::Writable
+}
+
+fn classify_probe_error(error: &std::io::Error) -> ProbeOutcome {
+    if error.raw_os_error() == Some(libc::ENOSPC) {
+        return ProbeOutcome::Unwritable("no space left on device");
+    }
+    // `libc` exposes `EROFS` on all supported targets; a read-only mount
+    // cannot take durable state either.
+    if error.raw_os_error() == Some(libc::EROFS) {
+        return ProbeOutcome::Unwritable("filesystem is read-only");
+    }
+    ProbeOutcome::Writable
 }
 
 fn now() -> i64 {
@@ -896,17 +983,19 @@ impl DomainRepository {
             .ok_or_else(|| invalid("canonical database has no parent directory"))?;
         std::fs::create_dir_all(parent)
             .map_err(|error| OcgError::io("create canonical database directory", error))?;
-        let connection = Connection::open(&path).map_err(sql)?;
+        let connection = Connection::open(&path).map_err(|error| open_sql(root, error))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(sql)?;
+            .map_err(|error| open_sql(root, error))?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql)?;
+            .map_err(|error| open_sql(root, error))?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
-            .map_err(sql)?;
-        connection.execute_batch(DOMAIN_SCHEMA).map_err(sql)?;
+            .map_err(|error| open_sql(root, error))?;
+        connection
+            .execute_batch(DOMAIN_SCHEMA)
+            .map_err(|error| open_sql(root, error))?;
         // The durable execution event journal shares this database so a state
         // change and its event commit in one transaction. It is evidence, never
         // a decision input: nothing in this file reads it back to choose an
@@ -7474,6 +7563,13 @@ pub(crate) fn job_failure(
         cause: None,
         entity_ref: None,
     }
+}
+
+/// The canonical classification for an actual disk-full write failure
+/// (`ENOSPC` / `SQLITE_FULL`). Temporary by construction — freed space
+/// recovers — and never a provider, Placement, rate-limit or health failure.
+pub(crate) fn storage_full_failure(detail: &str) -> Failure {
+    job_failure("storage_full", FailureClass::ResourceLimit, detail, true)
 }
 
 fn provider_capacity_available_in(

@@ -9,6 +9,7 @@ pub mod canonical_control;
 pub mod checkpoint;
 pub mod config;
 pub mod context_governor;
+pub mod disk_guard;
 pub mod domain;
 pub mod execution_dispatch;
 pub mod execution_runtime;

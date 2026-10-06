@@ -3,6 +3,7 @@
 use crate::error::{OcgError, Result};
 use crate::http::HttpTransport;
 use crate::native_tools::PermissionPolicy;
+use crate::orchestration::disk_guard::{DiskGuard, DiskGuardConfig};
 use crate::orchestration::execution_dispatch::BoundedDispatcher;
 use crate::orchestration::governor::Governor;
 use crate::provider_loop::{run_recovered_provider_dispatcher, ProviderHandlerConfig};
@@ -20,6 +21,7 @@ pub struct ExecutionRuntime {
     cancelled: Arc<AtomicBool>,
     provider_in_flight_limit: Arc<std::sync::atomic::AtomicUsize>,
     governor: Governor,
+    disk_guard: DiskGuard,
     provider_thread: Option<JoinHandle<Result<()>>>,
     native_tool_thread: Option<JoinHandle<Result<()>>>,
 }
@@ -54,6 +56,14 @@ impl ExecutionRuntime {
             provider_in_flight_limit,
         ));
         let governor = Governor::new();
+        // Measure disk before exposing a handle for new admissions: execution
+        // must not begin under an uninitialized assumption of infinite free
+        // space. A failed first observation leaves the Guard Unknown, which
+        // defers new expansion but still allows essential settlement.
+        let disk_guard = DiskGuard::for_root(project_root, DiskGuardConfig::default())?;
+        if let Err(error) = disk_guard.refresh() {
+            tracing::warn!(%error, "disk guard initial observation failed");
+        }
         let provider_config = ProviderHandlerConfig {
             transport,
             project_root: project_root.to_path_buf(),
@@ -111,6 +121,7 @@ impl ExecutionRuntime {
             cancelled,
             provider_in_flight_limit,
             governor,
+            disk_guard,
             provider_thread: Some(provider_thread),
             native_tool_thread: Some(native_tool_thread),
         })
@@ -124,6 +135,11 @@ impl ExecutionRuntime {
     /// Get a reference to the governor.
     pub fn governor(&self) -> &Governor {
         &self.governor
+    }
+
+    /// Get a reference to the execution disk-space guard.
+    pub fn disk_guard(&self) -> &DiskGuard {
+        &self.disk_guard
     }
 
     pub fn set_provider_in_flight_limit(&self, limit: usize) -> Result<()> {
@@ -190,6 +206,7 @@ pub struct ExecutionRuntimeHandle {
     provider_dispatcher: BoundedDispatcher,
     cancelled: Arc<AtomicBool>,
     governor: Governor,
+    disk_guard: DiskGuard,
 }
 
 impl ExecutionRuntimeHandle {
@@ -199,6 +216,7 @@ impl ExecutionRuntimeHandle {
             provider_dispatcher: runtime.provider_dispatcher.clone(),
             cancelled: runtime.cancelled.clone(),
             governor: runtime.governor.clone(),
+            disk_guard: runtime.disk_guard.clone(),
         }
     }
 
@@ -208,6 +226,11 @@ impl ExecutionRuntimeHandle {
 
     pub fn governor(&self) -> &Governor {
         &self.governor
+    }
+
+    /// The shared execution disk-space guard for this Project root.
+    pub fn disk_guard(&self) -> &DiskGuard {
+        &self.disk_guard
     }
 
     pub fn project_root(&self) -> &Path {

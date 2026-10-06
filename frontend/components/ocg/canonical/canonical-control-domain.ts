@@ -122,6 +122,9 @@ export function toGlobalConfiguration(draft: ConfigurationDraft): CanonicalGloba
     // same struct the backend returns rather than a partial guess at it.
     runtime: null,
     resource_budget: { hard_limit: draft.hardBudget, unit: "USD" },
+    // Disk reserve stays backend-owned: the PWA draft never sets storage
+    // policy, so it states null rather than guessing at a reserve.
+    storage_guard: null,
   };
 }
 

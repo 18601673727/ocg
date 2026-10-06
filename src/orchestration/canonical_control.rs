@@ -10,6 +10,7 @@ use crate::error::{OcgError, Result};
 use crate::orchestration::admission::{
     publish_call, reserve, AdmissionContext, AdmissionTarget, PayloadMode, PreparedExecution,
 };
+use crate::orchestration::disk_guard::{DiskGuard, DiskGuardConfig, DiskGuardStatus};
 use crate::orchestration::domain::{
     Attempt, AttemptAuthority, Call, ChildPolicy, DispatchIntent, DomainRepository, Executor, Job,
     JobOrigin, JobSpec,
@@ -163,6 +164,9 @@ pub struct GlobalConfiguration {
     pub routing: Option<String>,
     pub runtime: Option<String>,
     pub resource_budget: Option<ResourceBudget>,
+    /// Execution disk-space protection. `None` selects the conservative
+    /// built-in reserve; existing stored configurations keep loading unchanged.
+    pub storage_guard: Option<DiskGuardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
@@ -179,6 +183,12 @@ fn provider_concurrency(defaults: &Value) -> Result<usize> {
             .map(|limit| limit as usize)
             .ok_or_else(|| invalid("Project provider_concurrency must be between 1 and 64")),
     }
+}
+
+/// The effective disk-guard thresholds: the configured reserve, or the
+/// conservative built-in policy when the Project predates disk safety.
+fn disk_guard_config(global: &GlobalConfiguration) -> DiskGuardConfig {
+    global.storage_guard.unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -444,6 +454,9 @@ pub struct CanonicalDashboardResponse {
     pub project_id: String,
     pub jobs: Vec<CanonicalJobSummary>,
     pub selected_job: Option<CanonicalJobSnapshot>,
+    /// Cached execution disk-space state for this Project, if its runtime has
+    /// performed an observation. Absent before the first observation.
+    pub disk_guard: Option<DiskGuardStatus>,
 }
 
 /// Acknowledgement for cancelling one active chat turn. Transport state only;
@@ -933,6 +946,9 @@ impl CanonicalControlService {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
+        if let Some(storage_guard) = config.storage_guard.as_ref() {
+            storage_guard.validate()?;
+        }
         // One serialization boundary covers the whole read-modify-write: the
         // latest authoritative revision is read, mutated and committed while
         // no other configuration writer can interleave.
@@ -1050,6 +1066,49 @@ impl CanonicalControlService {
             CandidateRepository::Unavailable(reason) => Err(invalid(reason)),
             CandidateRepository::Ready(repository) => Ok((project, repository)),
         }
+    }
+
+    /// Resolve the execution disk-space guard for one Project. A live runtime
+    /// owns the shared cached guard; operator paths without a runtime get a
+    /// one-shot guard over the same root and the same configured thresholds.
+    /// Either way the configured policy is applied before the guard is used,
+    /// so threshold updates take effect without restart.
+    fn disk_guard_for_project(
+        &self,
+        project_id: &str,
+        root: &Path,
+        global: &GlobalConfiguration,
+    ) -> Result<DiskGuard> {
+        let config = disk_guard_config(global);
+        if let Some(registry) = &self.runtime_registry {
+            if let Some(handle) = registry.handle(project_id)? {
+                let guard = handle.disk_guard().clone();
+                guard.apply_config(&config)?;
+                return Ok(guard);
+            }
+        }
+        if let Some(handle) = &self.runtime_handle {
+            if handle.project_root() == root && !handle.is_cancelled() {
+                let guard = handle.disk_guard().clone();
+                guard.apply_config(&config)?;
+                return Ok(guard);
+            }
+        }
+        DiskGuard::for_root(root, config)
+    }
+
+    /// The cached disk-guard projection for one Project. Performs no
+    /// filesystem I/O: a missing runtime simply means no observation yet.
+    fn disk_guard_status(&self, project_id: &str, root: &Path) -> Option<DiskGuardStatus> {
+        if let Some(registry) = &self.runtime_registry {
+            if let Ok(Some(handle)) = registry.handle(project_id) {
+                return Some(handle.disk_guard().status());
+            }
+        }
+        self.runtime_handle
+            .as_ref()
+            .filter(|handle| handle.project_root() == root && !handle.is_cancelled())
+            .map(|handle| handle.disk_guard().status())
     }
 
     /// Open one registered Project as a candidate owner of a Job lookup.
@@ -1493,9 +1552,10 @@ impl CanonicalControlService {
             .transpose()?;
         Ok(CanonicalDashboardResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-            project_id: project.project_id,
+            project_id: project.project_id.clone(),
             jobs,
             selected_job,
+            disk_guard: self.disk_guard_status(&project.project_id, Path::new(&project.root)),
         })
     }
 
@@ -1547,7 +1607,20 @@ impl CanonicalControlService {
     /// merely to ask whether one owns a Call.
     pub(crate) fn reconcile_watchdog(&self) -> Result<()> {
         let mut failure = None;
+        let global = self
+            .read_configuration()
+            .map(|(global, _, _)| global)
+            .unwrap_or_default();
         for project in self.projects()? {
+            // Watchdog reconciliation doubles as a bounded disk reassessment
+            // point. Fencing itself never consults the Guard — reconciliation
+            // is essential settlement — but replacement execution always flows
+            // back through Admission, where the Guard blocks it until recovery.
+            if let Ok(guard) =
+                self.disk_guard_for_project(&project.project_id, Path::new(&project.root), &global)
+            {
+                guard.refresh_if_stale();
+            }
             let mut domain = match DomainRepository::open_existing(Path::new(&project.root)) {
                 Ok(domain) => domain,
                 Err(error) => {
@@ -1575,8 +1648,24 @@ impl CanonicalControlService {
             .launch_lock
             .lock()
             .map_err(|_| invalid("launch lock poisoned"))?;
+        // Thresholds are re-read every pass so configuration updates take
+        // effect without restart; observation refresh is cadence-gated inside
+        // the Guard, so most passes are a cached read.
+        let global = self
+            .read_configuration()
+            .map(|(global, _, _)| global)
+            .unwrap_or_default();
         let mut failure = None;
         for project in self.projects()? {
+            // Periodic runtime reassessment while OCG is active. Deferred Jobs
+            // stay eligible in the substrate, so recovery past the resume
+            // reserve lets this same worker admit them again with no new
+            // scheduler and no operator action.
+            if let Ok(guard) =
+                self.disk_guard_for_project(&project.project_id, Path::new(&project.root), &global)
+            {
+                guard.refresh_if_stale();
+            }
             let result = (|| -> Result<()> {
                 let (_, domain) = self.project_repository(&project.project_id)?;
                 // Serialize the complete Attempt-to-Call handoff across consumers;
@@ -1662,6 +1751,31 @@ impl CanonicalControlService {
         request: CanonicalJobSpawnRequest,
     ) -> Result<CanonicalJobSpawnResponse> {
         let mut domain = self.repository_for_job(parent_job_id)?;
+        // Recursive fan-out multiplies future durable writes, so the Guard is
+        // consulted before the spawn transaction commits anything. The refusal
+        // happens before any lineage, dependency, counter or idempotency-key
+        // write: a blocked spawn key stays unbound and the same logical spawn
+        // can succeed after recovery.
+        {
+            let parent = domain
+                .job(parent_job_id)?
+                .ok_or_else(|| invalid("unknown parent Job"))?;
+            let root = self
+                .read_projects()?
+                .into_iter()
+                .find(|project| project.project_id == parent.project_id)
+                .map(|project| project.root)
+                .ok_or_else(|| invalid("unknown Project identity"))?;
+            let (global, _, _) = self.read_configuration()?;
+            let guard =
+                self.disk_guard_for_project(&parent.project_id, Path::new(&root), &global)?;
+            if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
+                return Err(OcgError::spawn_refused(
+                    crate::error::SpawnRefusalReason::StorageProtection,
+                    deferral.message(),
+                ));
+            }
+        }
         let authority = AttemptAuthority {
             job_id: parent_job_id.to_string(),
             attempt_id: request.parent_attempt_id,
@@ -1768,6 +1882,17 @@ impl CanonicalControlService {
         }
         if !domain.dependencies_satisfied(&job.project_id, job_id)? {
             return Err(invalid("Job dependencies are not satisfied"));
+        }
+        // Disk safety precedes the replacement Attempt: an explicit operator
+        // retry is not permission to exhaust the host disk. The Job stays
+        // retryable and deferred; no execution is created here.
+        let retry_guard = {
+            let (project, _) = self.project_repository(&job.project_id)?;
+            let (global, _, _) = self.read_configuration()?;
+            self.disk_guard_for_project(&job.project_id, Path::new(&project.root), &global)?
+        };
+        if let Some(deferral) = retry_guard.check_execution_admission().deferral() {
+            return Err(invalid(deferral.message()));
         }
         let snapshot = domain.execution_snapshot()?;
         let template = snapshot
@@ -1895,6 +2020,7 @@ impl CanonicalControlService {
                     budget: &budget_config,
                     concurrency: None,
                     governor: None,
+                    disk_guard: Some(retry_guard.clone()),
                     now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
                 },
                 &admission.job,
@@ -2129,6 +2255,14 @@ impl CanonicalControlService {
             }
         };
 
+        // Disk safety precedes every other admission decision: resolve the
+        // guard before profile, Placement or payload work begins.
+        let disk_guard = self.disk_guard_for_project(
+            &project.project_id,
+            Path::new(&project.root),
+            &global_config,
+        )?;
+
         // Resolve profile from the user-global profile service
         let (profile, _) = match self.profile_service.current()? {
             Some(p) => p,
@@ -2228,6 +2362,7 @@ impl CanonicalControlService {
                 // execution-time acquisition enforces, so a recorded upstream
                 // cooldown is visible before a candidate is selected.
                 governor: Some(runtime_handle.governor()),
+                disk_guard: Some(disk_guard.clone()),
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             existing_job.as_ref(),
@@ -2342,6 +2477,7 @@ impl CanonicalControlService {
                 budget: &budget_config,
                 concurrency: (!is_chat).then_some(provider_concurrency),
                 governor: None,
+                disk_guard: Some(disk_guard.clone()),
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             &job,
@@ -2426,6 +2562,7 @@ impl CanonicalControlService {
                 budget: &budget_config,
                 concurrency: (!is_chat).then_some(provider_concurrency),
                 governor: None,
+                disk_guard: Some(disk_guard.clone()),
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             &job,
@@ -2589,6 +2726,15 @@ impl CanonicalControlService {
             domain.record_admission_failure(&job.id, failure)
         };
         let budget_config = self.provider_budget_config(&self.read_configuration()?.0)?;
+        // Probes are Exact diagnostic targets: they fan out durable state
+        // without producing user work, so disk safety gates them before the
+        // target is even validated.
+        let (probe_global, _, _) = self.read_configuration()?;
+        let probe_guard = self.disk_guard_for_project(
+            &project.project_id,
+            Path::new(&project.root),
+            &probe_global,
+        )?;
         let resolved = match super::admission::resolve_target(
             &mut AdmissionContext {
                 domain: &mut domain,
@@ -2598,6 +2744,7 @@ impl CanonicalControlService {
                 budget: &budget_config,
                 concurrency: None,
                 governor: None,
+                disk_guard: Some(probe_guard.clone()),
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             Some(&job),
@@ -2665,6 +2812,7 @@ impl CanonicalControlService {
                 budget: &budget_config,
                 concurrency: None,
                 governor: None,
+                disk_guard: Some(probe_guard.clone()),
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             &job,
@@ -2699,6 +2847,7 @@ impl CanonicalControlService {
                 budget: &budget_config,
                 concurrency: None,
                 governor: None,
+                disk_guard: Some(probe_guard.clone()),
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             &job,

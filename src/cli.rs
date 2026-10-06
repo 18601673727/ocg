@@ -357,7 +357,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
             cli.pretty,
             cli.disable_proxy,
         ),
-        Command::Work(args) => work_command(&project_root, &args, cli.pretty),
+        Command::Work(args) => work_command(&project_root, &user_path, &args, cli.pretty),
         Command::Health(args) => health_command(&project_root, &user_path, &args, cli.pretty),
         Command::Doctor => doctor_command(&effective, &project_root),
         Command::Help | Command::Version | Command::Init => unreachable!(),
@@ -560,7 +560,51 @@ fn serve_command(
     Ok(0)
 }
 
-fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Failure> {
+/// Disk-guard thresholds for low-level `work` operators. Reads the same global
+/// configuration the control plane enforces, checking the process control
+/// state first and the legacy project-adjacent state second (the service's own
+/// adoption order). Any unreadable or absent file falls back to the
+/// conservative built-in reserve, which still measures the real filesystem.
+fn cli_disk_guard_config(
+    root: &Path,
+    user_path: &Path,
+) -> crate::orchestration::disk_guard::DiskGuardConfig {
+    let process_control = user_path
+        .canonicalize()
+        .unwrap_or_else(|_| user_path.to_path_buf())
+        .parent()
+        .map(|parent| {
+            parent
+                .join("state")
+                .join("control")
+                .join("configuration.json")
+        });
+    let legacy = Some(crate::orchestration::state::state_dir(root).join("configuration.json"));
+    for candidate in process_control.into_iter().chain(legacy) {
+        let guard = std::fs::read(&candidate)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("global").cloned())
+            .and_then(|global| {
+                serde_json::from_value::<
+                    crate::orchestration::canonical_control::GlobalConfiguration,
+                >(global)
+                .ok()
+            })
+            .and_then(|global| global.storage_guard);
+        if let Some(guard) = guard {
+            return guard;
+        }
+    }
+    crate::orchestration::disk_guard::DiskGuardConfig::default()
+}
+
+fn work_command(
+    root: &Path,
+    user_path: &Path,
+    args: &[OsString],
+    pretty: bool,
+) -> Result<i32, Failure> {
     let words: Vec<String> = args
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -622,6 +666,20 @@ fn work_command(root: &Path, args: &[OsString], pretty: bool) -> Result<i32, Fai
                     .parse::<u64>()
                     .map_err(|_| Failure::Usage("--generation must be an integer".into()))?,
             };
+            // The low-level spawn operator consults the same disk reserve as
+            // the canonical spawn path: an explicit request is not permission
+            // to exhaust the host disk. The refusal happens before any lineage
+            // write, so the spawn key stays unbound for retry after recovery.
+            let guard = crate::orchestration::disk_guard::DiskGuard::for_root(
+                root,
+                cli_disk_guard_config(root, user_path),
+            )?;
+            if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
+                return Err(Failure::Ocg(OcgError::spawn_refused(
+                    crate::error::SpawnRefusalReason::StorageProtection,
+                    deferral.message(),
+                )));
+            }
             let spec = crate::orchestration::domain::JobSpec {
                 objective: Some(required("objective")?),
                 ..Default::default()

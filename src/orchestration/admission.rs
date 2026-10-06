@@ -29,6 +29,7 @@ use crate::profile::Profile;
 use crate::provider_protocol::ProviderProtocol;
 
 use super::budget::BudgetConfig;
+use super::disk_guard::DiskGuard;
 use super::domain::{job_failure, Attempt, DomainRepository, Executor, Job, JobSpec, JobState};
 use super::execution_dispatch::{CallCancellation, ExecutionEvent, ProviderExecutionConfig};
 use super::placement::{self, ProviderChoice};
@@ -144,6 +145,7 @@ pub(crate) struct AdmissionContext<'a> {
     pub budget: &'a BudgetConfig,
     pub concurrency: Option<usize>,
     pub governor: Option<&'a super::governor::Governor>,
+    pub disk_guard: Option<DiskGuard>,
     pub now: i64,
 }
 
@@ -186,6 +188,25 @@ fn prepare_target(
     if let Some(job) = job {
         if let Some(existing) = context.domain.admission_reservation(&job.id)? {
             return materialize_reservation(context.profile, existing);
+        }
+    }
+    // Disk safety precedes Placement: a Job blocked by the storage reserve
+    // must not continue into candidate ranking or provider dispatch. A Job
+    // that already holds a reservation resumes below without consulting the
+    // Guard, because completing already-reserved work is bounded settlement,
+    // not new expansion. Exact (diagnostic) targets fan out future writes, so
+    // they already defer under Pressure; candidate selection defers under
+    // Critical.
+    if let Some(guard) = &context.disk_guard {
+        let decision = match target {
+            AdmissionTarget::SelectCandidate => guard.check_execution_admission(),
+            AdmissionTarget::Exact(_) => guard.check_amplifying_expansion(),
+        };
+        if let Some(deferral) = decision.deferral() {
+            return Ok(PreparedTarget::Refused(AdmissionRefusal {
+                message: deferral.message(),
+                failure: deferral.failure(),
+            }));
         }
     }
     match target {

@@ -1143,12 +1143,24 @@ impl CanonicalProviderCallHandler {
             Ok(())
         })();
         if let Err(error) = settlement {
-            fail_authoritative_provider_call(
-                &config.project_root,
-                &envelope,
-                &error.to_string(),
-                true,
-            );
+            // An actual disk-full terminal write is storage safety, never a
+            // provider failure: the Attempt carries `storage_full` so recovery
+            // waits on disk rather than retrying the provider.
+            if error.is_storage_full() {
+                fail_authoritative_provider_call_with_failure(
+                    &config.project_root,
+                    &envelope,
+                    crate::orchestration::domain::storage_full_failure(&error.to_string()),
+                    true,
+                );
+            } else {
+                fail_authoritative_provider_call(
+                    &config.project_root,
+                    &envelope,
+                    &error.to_string(),
+                    true,
+                );
+            }
             costs.persist(&config.project_root, &envelope);
             return Err(error);
         }
@@ -3142,7 +3154,7 @@ fn fail_authoritative_provider_call(
     reason: &str,
     call_claimed: bool,
 ) {
-    settle_authoritative_provider_call(
+    fail_authoritative_provider_call_with_failure(
         project_root,
         envelope,
         crate::orchestration::domain::job_failure(
@@ -3153,6 +3165,21 @@ fn fail_authoritative_provider_call(
         ),
         call_claimed,
     );
+}
+
+/// Settle a provider execution that failed while this worker still held its
+/// Attempt authority, with a preclassified canonical [`Failure`].
+///
+/// This is the path an actual disk-full settlement failure takes: when the
+/// terminal write itself hits `ENOSPC` / `SQLITE_FULL`, the Attempt is settled
+/// (or fails to settle) as `storage_full`, never as a provider failure.
+fn fail_authoritative_provider_call_with_failure(
+    project_root: &Path,
+    envelope: &ExecutionEnvelope,
+    failure: crate::core_contract::Failure,
+    call_claimed: bool,
+) {
+    settle_authoritative_provider_call(project_root, envelope, failure, call_claimed);
 }
 
 /// Settle a provider execution that failed while this worker still held its
@@ -3221,6 +3248,13 @@ fn settle_authoritative_provider_call(
         }
         domain.fail_attempt(&envelope.attempt_id, &failure)
     })() {
-        tracing::error!(error = %error, call_id = %envelope.call_id, "provider Attempt failure could not be settled");
+        // A storage-full settlement failure is reported as storage safety, not
+        // as a provider failure: retrying it as provider work cannot help, and
+        // the Guard's reserve policy (not the provider path) owns recovery.
+        if error.is_storage_full() {
+            tracing::error!(error = %error, call_id = %envelope.call_id, "local storage is full; provider Attempt settlement could not be persisted");
+        } else {
+            tracing::error!(error = %error, call_id = %envelope.call_id, "provider Attempt failure could not be settled");
+        }
     }
 }

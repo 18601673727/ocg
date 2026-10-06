@@ -50,7 +50,12 @@ export type CanonicalConfigurationEnvelope = { api_version: CanonicalApiVersion,
 export type CanonicalConfigurationResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, project_id: string, revision: number, configuration: ProjectConfigurationView, };
 
 
-export type CanonicalDashboardResponse = { api_version: CanonicalApiVersion, project_id: string, jobs: Array<CanonicalJobSummary>, selected_job: CanonicalJobSnapshot | null, };
+export type CanonicalDashboardResponse = { api_version: CanonicalApiVersion, project_id: string, jobs: Array<CanonicalJobSummary>, selected_job: CanonicalJobSnapshot | null,
+/**
+ * Cached execution disk-space state for this Project, if its runtime has
+ * performed an observation. Absent before the first observation.
+ */
+disk_guard: DiskGuardStatus | null, };
 
 
 /**
@@ -186,6 +191,41 @@ export type DerivedMetric = { metric: string, value: string | null, unit: string
 
 
 /**
+ * Threshold policy for one Guard. An absolute byte reserve is the core
+ * requirement; OCG cannot accurately predict per-Job byte cost, so no
+ * per-Job reservation is attempted.
+ */
+export type DiskGuardConfig = {
+/**
+ * Entering `Critical` when free space drops below this reserve.
+ */
+minimum_free_bytes: number,
+/**
+ * Entering `Pressure` when free space drops below this level.
+ */
+pressure_free_bytes: number,
+/**
+ * Guarded execution resumes only at or above this level (hysteresis).
+ */
+resume_free_bytes: number, };
+
+
+/**
+ * The smallest canonical read projection for operators: current state, live
+ * bytes, configured reserve, last observation, measured root, and whether
+ * new execution is currently being deferred.
+ */
+export type DiskGuardStatus = { state: DiskState, available_bytes: number, total_bytes: number, reserve_bytes: number, pressure_bytes: number, resume_bytes: number, observed_at: number, root: string, defers_new_execution: boolean, defers_expansion: boolean, };
+
+
+/**
+ * The Guard's current safety range. The names are deliberately coarse: this
+ * is an execution gate, not a storage dashboard.
+ */
+export type DiskState = "healthy" | "pressure" | "critical" | "unknown";
+
+
+/**
  * A lowercase canonical UUIDv7 text identifier.
  */
 export type EntityId = string;
@@ -212,7 +252,12 @@ export type Failure = { code: string, class: FailureClass, message: string, sour
 export type FailureClass = "validation" | "authentication" | "authorization" | "conflict" | "concurrency" | "not_found" | "sandbox" | "capability" | "provider" | "budget" | "resource_limit" | "rate_limit" | "timeout" | "cancelled" | "preempted" | "internal" | "unknown";
 
 
-export type GlobalConfiguration = { provider: string | null, model: string | null, profile: string | null, routing: string | null, runtime: string | null, resource_budget: ResourceBudget | null, };
+export type GlobalConfiguration = { provider: string | null, model: string | null, profile: string | null, routing: string | null, runtime: string | null, resource_budget: ResourceBudget | null,
+/**
+ * Execution disk-space protection. `None` selects the conservative
+ * built-in reserve; existing stored configurations keep loading unchanged.
+ */
+storage_guard: DiskGuardConfig | null, };
 
 
 /**

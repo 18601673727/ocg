@@ -12,6 +12,7 @@ pub enum SpawnRefusalReason {
     ChildLimit,
     DescendantLimit,
     DependencyCycle,
+    StorageProtection,
 }
 
 impl SpawnRefusalReason {
@@ -24,6 +25,7 @@ impl SpawnRefusalReason {
             Self::ChildLimit => "spawn_child_limit_reached",
             Self::DescendantLimit => "spawn_descendant_limit_reached",
             Self::DependencyCycle => "spawn_dependency_cycle",
+            Self::StorageProtection => "spawn_storage_protection",
         }
     }
 }
@@ -38,6 +40,11 @@ pub enum OcgError {
         reason: SpawnRefusalReason,
         message: String,
     },
+    /// The host has no usable disk space left for durable execution state.
+    /// This is storage safety, never a provider, Placement, rate or health
+    /// failure: callers must not retry it as one.
+    #[error("storage full ({context}): {message}")]
+    StorageFull { context: String, message: String },
     /// A configuration problem. The message is already user-facing.
     #[error("{0}")]
     Config(String),
@@ -60,6 +67,29 @@ impl OcgError {
 
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
+    }
+
+    pub fn storage_full(context: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::StorageFull {
+            context: context.into(),
+            message: message.into(),
+        }
+    }
+
+    /// True when this error means the local filesystem cannot take more
+    /// durable state: either an explicit storage-full report or an I/O
+    /// failure with `ENOSPC` (or a read-only mount, which cannot take durable
+    /// state either). There is always a race with other processes, so
+    /// preflight checks can never make this impossible.
+    pub fn is_storage_full(&self) -> bool {
+        match self {
+            Self::StorageFull { .. } => true,
+            Self::Io { source, .. } => {
+                let code = source.raw_os_error();
+                code == Some(libc::ENOSPC) || code == Some(libc::EROFS)
+            }
+            _ => false,
+        }
     }
 
     pub fn io(context: impl Into<String>, source: std::io::Error) -> Self {

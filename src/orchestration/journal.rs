@@ -120,6 +120,13 @@ fn invalid(message: &str) -> OcgError {
 }
 
 fn sql(error: rusqlite::Error) -> OcgError {
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::DiskFull
+    ) {
+        return OcgError::storage_full("execution journal SQLite", error.to_string());
+    }
     OcgError::config(format!("execution journal SQLite: {error}"))
 }
 
