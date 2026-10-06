@@ -9,7 +9,7 @@ import { formatCount } from "@/lib/format";
 import type { UsageBreakdown, UsageWindow } from "../contracts";
 import { useI18n, type I18nKey } from "../i18n";
 import { useProjectUsage } from "./use-usage";
-import { ContextMetrics, CostDetails, TokenMetrics, UsageMoney, UsageNumber, UsageMetric, usageTimestamp } from "./usage-values";
+import { ActivityMetrics, ContextMetrics, CostDetails, hasRecordedUsage, TokenMetrics, UsageMoney, UsageNumber, UsageMetric, UsageScopeNote, usageTimestamp } from "./usage-values";
 
 const WINDOWS: readonly { id: UsageWindow; label: I18nKey }[] = [
   { id: "today", label: "usage.today" }, { id: "7d", label: "usage.sevenDays" },
@@ -31,7 +31,7 @@ function BreakdownTable({ rows, models = false }: { rows: UsageBreakdown[]; mode
       {(["usage.requests", "usage.input", "usage.output", "usage.total", "usage.cost"] as const).map(key => <th key={key} className="pb-2 pl-3 text-right font-medium">{t(key)}</th>)}
     </tr></thead>
     <tbody>{rows.map((row, index) => <tr key={`${row.provider}:${row.model}:${index}`} className="border-t border-border/60">
-      <td className="max-w-56 break-all py-2.5 pr-3 font-medium">{row.provider ?? "—"}{models ? <span className="block font-normal text-muted-foreground">{row.model ?? "—"}</span> : null}</td>
+      <td className="max-w-56 break-all py-2.5 pr-3 font-medium">{row.provider ?? t("common.notReported")}{models ? <span className="block font-normal text-muted-foreground">{row.model ?? t("common.notReported")}</span> : null}</td>
       <td className="pl-3 text-right"><UsageNumber quantity={row.totals.provider_requests} /></td>
       <td className="pl-3 text-right"><UsageNumber quantity={row.totals.tokens.input} /></td>
       <td className="pl-3 text-right"><UsageNumber quantity={row.totals.tokens.output} /></td>
@@ -64,19 +64,17 @@ export function UsageSurface({ baseUrl, projectId, onSelectSession }: { baseUrl:
       <div className="max-w-md"><SegmentedTabs tabs={WINDOWS.map(value => ({ id: value.id, label: t(value.label) }))} value={window} onSelect={selectWindow} ariaLabel={t("usage.window")} className="grid-cols-4" /></div>
       {!baseUrl || !projectId ? <p className="text-sm text-muted-foreground">{t("usage.noEndpoint")}</p> : usage.error ? <div role="alert" className="text-sm text-destructive">{t("usage.failed", { error: usage.error })}</div> : usage.loading ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
       {data ? <>
+        <div className="max-w-3xl"><UsageScopeNote scope="project" generatedAt={data.generated_at} /></div>
         {data.truncated ? <p className="text-[11px] text-amber-600 dark:text-amber-400">{t("usage.limited")}</p> : null}
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <Section title={t("usage.tokens")}><TokenMetrics totals={data.totals} /></Section>
+        {!hasRecordedUsage(data.totals) ? <p className="text-[12px] text-muted-foreground">{t("usage.noProjectUsage")}</p> : null}
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           <Section title={t("usage.cost")}><CostDetails cost={data.totals.cost} /></Section>
+          <Section title={t("usage.tokens")}><TokenMetrics totals={data.totals} /></Section>
           <Section title={t("usage.activity")}><dl>
-            <UsageMetric label="usage.requests" field="requests"><UsageNumber quantity={data.totals.provider_requests} /></UsageMetric>
-            <UsageMetric label="usage.rounds"><UsageNumber quantity={data.totals.provider_rounds} /></UsageMetric>
-            <UsageMetric label="usage.nativeCalls" field="native_calls">{formatCount(data.totals.native_calls)}</UsageMetric>
             <UsageMetric label="usage.conversations">{formatCount(data.conversations)}</UsageMetric>
             <UsageMetric label="usage.turns">{formatCount(data.totals.turns)}</UsageMetric>
             <UsageMetric label="usage.jobs">{formatCount(data.totals.jobs)}</UsageMetric>
-          </dl></Section>
-          <Section title={t("usage.context")}><ContextMetrics totals={data.totals} /></Section>
+          </dl><ActivityMetrics totals={data.totals} /></Section>
         </div>
         <div className="grid gap-3 xl:grid-cols-2">
           <Section title={t("usage.providers")}><BreakdownTable rows={data.providers} /></Section>

@@ -13,7 +13,7 @@ import type { ConversationUsageResponse } from "../contracts";
 import { useI18n, runtimeStateLabel } from "../i18n";
 import { formatCount } from "@/lib/format";
 import type { UsageRead } from "./use-usage";
-import { ContextMetrics, CostDetails, TokenMetrics, UsageMetric, UsageNumber, usageTimestamp } from "./usage-values";
+import { ActivityMetrics, ContextMetrics, CostDetails, hasRecordedUsage, TokenMetrics, UsageBreakdownList, UsageMetric, UsageScopeNote, usageTimestamp } from "./usage-values";
 
 export function ConversationInspector({ usage, execution, accounting, observability, mode, onModeChange, onClose, onOpenJobExecution }: {
   usage: UsageRead<ConversationUsageResponse>; execution: JobExecution | null; accounting: JobAccounting | null;
@@ -39,16 +39,18 @@ export function ConversationInspector({ usage, execution, accounting, observabil
             {usage.error ? <p role="alert" className="text-[12px] text-destructive">{t("usage.failed", { error: usage.error })}</p> : null}
             {!usage.loading && !usage.error && !data ? <p className="text-[12px] text-muted-foreground">{t("usage.noActivity")}</p> : null}
             {data ? <>
+              <UsageScopeNote scope="conversation" generatedAt={data.generated_at} />
               {data.truncated ? <p className="text-[11px] text-amber-600 dark:text-amber-400">{t("usage.limited")}</p> : null}
-              <section><h3 className="text-[11px] font-semibold">{t("usage.activity")}</h3><dl>
-                <UsageMetric label="usage.turns" field="turns">{formatCount(data.totals.turns)}</UsageMetric>
-                <UsageMetric label="usage.requests" field="requests"><UsageNumber quantity={data.totals.provider_requests} /></UsageMetric>
-                <UsageMetric label="usage.rounds"><UsageNumber quantity={data.totals.provider_rounds} /></UsageMetric>
-                <UsageMetric label="usage.nativeCalls" field="native_calls">{formatCount(data.totals.native_calls)}</UsageMetric>
-              </dl><CostDetails cost={data.totals.cost} /></section>
-              <section className="border-t border-border pt-3"><h3 className="text-[11px] font-semibold">{t("usage.tokens")}</h3><TokenMetrics totals={data.totals} /></section>
-              <section className="border-t border-border pt-3"><h3 className="text-[11px] font-semibold">{t("usage.providerModel")}</h3>{data.models.map((value, index) => <div key={`${value.provider}:${value.model}:${index}`} className="mt-2 text-[11px]"><p className="break-all">{value.provider ?? "—"} / {value.model ?? "—"}</p><dl><UsageMetric label="usage.requests"><UsageNumber quantity={value.totals.provider_requests} /></UsageMetric><UsageMetric label="usage.total"><UsageNumber quantity={value.totals.tokens.total} /></UsageMetric></dl></div>)}</section>
-              <section className="border-t border-border pt-3"><h3 className="text-[11px] font-semibold">{t("usage.context")}</h3><ContextMetrics totals={data.totals} /><p className="mt-2 text-[10px] text-muted-foreground">{t("usage.efficiencyNote")}</p></section>
+              {hasRecordedUsage(data.totals) ? <>
+                <section><h3 className="text-[11px] font-semibold">{t("usage.cost")}</h3><CostDetails cost={data.totals.cost} /></section>
+                <section className="border-t border-border pt-3"><h3 className="text-[11px] font-semibold">{t("usage.tokens")}</h3><TokenMetrics totals={data.totals} /></section>
+                <section className="border-t border-border pt-3"><h3 className="text-[11px] font-semibold">{t("usage.activity")}</h3><dl>
+                  <UsageMetric label="usage.turns" field="turns">{formatCount(data.totals.turns)}</UsageMetric>
+                  <UsageMetric label="usage.jobs" field="jobs">{formatCount(data.totals.jobs)}</UsageMetric>
+                </dl><ActivityMetrics totals={data.totals} /></section>
+                <section className="border-t border-border pt-3"><h3 className="text-[11px] font-semibold">{t("usage.breakdown")}</h3><UsageBreakdownList rows={data.models} /></section>
+                <section className="border-t border-border pt-3"><h3 className="text-[11px] font-semibold">{t("usage.context")}</h3><ContextMetrics totals={data.totals} /><p className="mt-2 text-[10px] text-muted-foreground">{t("usage.efficiencyNote")}</p></section>
+              </> : <p className="text-[12px] text-muted-foreground">{t("usage.noActivity")}</p>}
               <section className="border-t border-border pt-3"><dl>
                 <UsageMetric label="usage.created">{usageTimestamp(data.created_at, locale)}</UsageMetric>
                 <UsageMetric label="usage.updated">{usageTimestamp(data.updated_at, locale)}</UsageMetric>

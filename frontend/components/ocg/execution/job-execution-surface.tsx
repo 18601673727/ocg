@@ -8,7 +8,7 @@ import { filterCalls, type JobExecution } from "./domain";
 import { JobRecoveryPanel, JobRelationsPanel } from "./job-relations";
 import { placementOf, type PlacementProjection, type PlacementTarget } from "./placement";
 import { jobElapsedMs, type JobAccounting } from "./accounting";
-import { ContextMetrics, CostDetails, TokenMetrics } from "../usage/usage-values";
+import { ActivityMetrics, ContextMetrics, CostDetails, hasRecordedUsage, TokenMetrics, UsageBreakdownList, UsageScopeNote } from "../usage/usage-values";
 import { runtimeStateLabel, useI18n, type TranslateFn } from "../i18n";
 import { formatDuration, formatNumber } from "@/lib/format";
 import type { JobUsageResponse } from "../contracts";
@@ -143,40 +143,40 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
 
       <section aria-label={t("execution.usage")} className="rounded-lg border border-border bg-card p-4">
         <SectionTitle>{t("execution.usage")}</SectionTitle>
+        <div className="mt-2"><UsageScopeNote scope="job" generatedAt={usage?.generated_at} /></div>
         {accounting?.ceiling && (
           <p className="mt-3 text-[11px] text-muted-foreground">
             {t("execution.budgetCeiling")}: <strong className="font-medium text-foreground">{formatNumber(accounting.ceiling.amount)} {accounting.ceiling.unit}</strong>
             <span> · {t("execution.budgetCeilingSource", { source: accounting.ceiling.source })}</span>
+            <span className="block">{t("execution.budgetNotSpend")}</span>
           </p>
         )}
-        {usage ? (
+        {usage ? hasRecordedUsage(usage.totals) ? (
           <div className="mt-3 space-y-3">
+            <section aria-label={t("usage.cost")}>
+              <SectionTitle>{t("usage.cost")}</SectionTitle>
+              <CostDetails cost={usage.totals.cost} />
+            </section>
             <section aria-label={t("usage.tokens")}>
               <SectionTitle>{t("usage.tokens")}</SectionTitle>
               <TokenMetrics totals={usage.totals} />
+            </section>
+            <section aria-label={t("usage.activity")}>
+              <SectionTitle>{t("usage.activity")}</SectionTitle>
+              <ActivityMetrics totals={usage.totals} />
+            </section>
+            <section aria-label={t("usage.breakdown")}>
+              <SectionTitle>{t("usage.breakdown")}</SectionTitle>
+              <UsageBreakdownList rows={usage.models} />
             </section>
             <section aria-label={t("usage.context")}>
               <SectionTitle>{t("usage.context")}</SectionTitle>
               <ContextMetrics totals={usage.totals} />
             </section>
-            <section aria-label={t("usage.cost")}>
-              <SectionTitle>{t("usage.cost")}</SectionTitle>
-              <CostDetails cost={usage.totals.cost} />
-            </section>
-            {usage.providers.length > 0 && (
-              <section aria-label={t("execution.providersInUsage")}>
-                <SectionTitle>{t("execution.providersInUsage")}</SectionTitle>
-                <ul className="mt-1 flex flex-wrap gap-1">{usage.providers.map((row, index) => <li key={`${row.provider ?? "unknown"}-${index}`}><Pill tone="slate">{row.provider ?? t("common.notReported")}</Pill></li>)}</ul>
-              </section>
-            )}
-            {usage.models.length > 0 && (
-              <section aria-label={t("execution.modelsInUsage")}>
-                <SectionTitle>{t("execution.modelsInUsage")}</SectionTitle>
-                <ul className="mt-1 flex flex-wrap gap-1">{usage.models.map((row, index) => <li key={`${row.provider ?? "unknown"}-${row.model ?? "unknown"}-${index}`}><Pill tone="slate">{[row.provider, row.model].filter(Boolean).join(" · ") || t("common.notReported")}</Pill></li>)}</ul>
-              </section>
-            )}
             {usage.truncated && <p className="text-[10px] text-muted-foreground">{t("usage.limited")}</p>}
           </div>
+        ) : (
+          <p className="mt-3 text-[11px] text-muted-foreground">{t("usage.noJobUsage")}</p>
         ) : (
           <div className="mt-3 space-y-3">
             {accounting?.consumption && <CostDetails cost={accounting.consumption} />}
