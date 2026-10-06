@@ -252,6 +252,43 @@ fn parse_u64(value: &str) -> Option<u64> {
     value.trim().parse::<u64>().ok()
 }
 
+/// The Retry-After duration a provider response actually supplied.
+///
+/// Only a delta-seconds `Retry-After` on HTTP 429 counts. An HTTP-date, a
+/// missing header, or any other status returns `None`; callers must not invent
+/// a cooldown from those cases.
+pub fn reliable_retry_after(error: &OcgError) -> Option<Duration> {
+    let message = error.to_string();
+    let status = message
+        .split("HTTP ")
+        .nth(1)
+        .and_then(|rest| rest.split([':', ' ']).next())
+        .and_then(|status| status.parse::<u16>().ok());
+    if status != Some(429) {
+        return None;
+    }
+    message
+        .split("retry-after=")
+        .nth(1)
+        .and_then(|rest| rest.split(['s', ',', ' ', ')']).next())
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// Capture only the throttling headers a provider response actually sent.
+///
+/// `Retry-After` is accepted as a delta-seconds value. An HTTP-date, a missing
+/// header, or an unparsable value stays absent: callers must not invent a
+/// cooldown from it.
+fn provider_rate_limit(response: &ntex::client::ClientResponse) -> RateLimit {
+    RateLimit::from_pairs(
+        response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str(), value))),
+    )
+}
+
 /// A structured HTTP response. `status` and [`RateLimit`] are preserved so a
 /// caller can diagnose a refusal without losing the body.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1063,6 +1100,7 @@ async fn native_post_json_stream(
         .await
         .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
+    let rate_limit = provider_rate_limit(&response);
     let mut response = Box::pin(response);
 
     if !(200..300).contains(&status) {
@@ -1082,7 +1120,7 @@ async fn native_post_json_stream(
         }
         return Ok(HttpResponse {
             status,
-            rate_limit: RateLimit::default(),
+            rate_limit,
             body: diagnostic,
         });
     }
@@ -1334,6 +1372,7 @@ async fn native_post_json_stream_via_proxy(
         .await
         .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
     let status = response.status().as_u16();
+    let rate_limit = provider_rate_limit(&response);
     let mut response = Box::pin(response);
 
     if !(200..300).contains(&status) {
@@ -1351,7 +1390,7 @@ async fn native_post_json_stream_via_proxy(
         }
         return Ok(HttpResponse {
             status,
-            rate_limit: RateLimit::default(),
+            rate_limit,
             body: diagnostic,
         });
     }

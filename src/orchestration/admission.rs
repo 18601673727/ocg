@@ -208,7 +208,9 @@ fn prepare_target(
                 },
             )? {
                 Ok(result) => {
-                    // Store placement evidence if we have a job
+                    // Stage candidate evidence until the Attempt that consumes
+                    // it exists. The Attempt adopts it; this write never
+                    // overwrites a decision that already belongs to one.
                     if let Some(job) = job {
                         context
                             .domain
@@ -507,11 +509,31 @@ pub(crate) fn reserve(
         .domain
         .dispatch_job_for_admission(&job.id, &resolved.reservation, placement)
     {
-        Ok((attempt, executor)) => Ok(Ok(ReservedExecution {
-            attempt,
-            executor,
-            existing_call: false,
-        })),
+        Ok((attempt, executor)) => {
+            let mode = match &resolved.reservation.exact {
+                Some(exact) => super::placement_projection::PlacementMode::Exact {
+                    provider: exact.provider.clone(),
+                    model: exact.model.clone(),
+                    effort: exact.effort.clone(),
+                },
+                None => super::placement_projection::PlacementMode::SelectCandidate {
+                    candidates_considered: Vec::new(),
+                    selected_provider: resolved.reservation.choice.provider.clone(),
+                    selected_model: resolved.reservation.choice.model.clone(),
+                },
+            };
+            context.domain.adopt_placement_evidence(
+                &job.id,
+                &attempt.id,
+                attempt.generation,
+                mode,
+            )?;
+            Ok(Ok(ReservedExecution {
+                attempt,
+                executor,
+                existing_call: false,
+            }))
+        }
         Err(error) => Ok(Err(AdmissionRefusal {
             message: error.to_string(),
             failure: job_failure(

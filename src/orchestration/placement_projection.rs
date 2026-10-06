@@ -65,7 +65,7 @@ pub enum PlacementReason {
 }
 
 /// Evidence about a candidate's health state during placement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementHealthEvidence {
     pub state: ResourceHealth,
     pub provenance: ResourceProvenance,
@@ -74,7 +74,7 @@ pub struct PlacementHealthEvidence {
 }
 
 /// Evidence for one candidate considered during placement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateEvidence {
     pub provider: String,
     pub model: String,
@@ -96,7 +96,7 @@ pub struct CandidateEvidence {
 }
 
 /// Non-consuming evaluation of governor state for a candidate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernorEvaluation {
     pub rate_available: bool,
     pub capacity_available: bool,
@@ -107,7 +107,7 @@ pub struct GovernorEvaluation {
 
 /// The mode of target selection used.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum PlacementMode {
     /// Placement ranked candidates and selected one.
@@ -126,26 +126,128 @@ pub enum PlacementMode {
     },
 }
 
-/// Complete durable record of a placement decision.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Complete durable record of one placement decision.
+///
+/// A decision is bound to the Attempt that consumed it, not only to the Job.
+/// Placement currently runs before that Attempt exists, so the evidence is
+/// staged on the Job and adopted when the Attempt is claimed. A later Attempt
+/// appends its own record. Historical rows are never overwritten.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlacementDecision {
     /// Which Job this decision belongs to.
     pub job_id: String,
 
+    /// The Attempt that consumed this decision, once one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+
+    /// The generation of that Attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+
     /// Mode of target selection.
     pub mode: PlacementMode,
 
-    /// When the decision was made (Unix timestamp millis).
+    /// When the decision was made (Unix timestamp seconds).
     pub decided_at: i64,
 
     /// Final acquisition outcome after selection (if applicable).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acquisition_outcome: Option<AcquisitionOutcome>,
 }
 
+/// The read-model projection of one Job's placement history.
+///
+/// `selected` and `acquisition` are the authoritative Attempt's facts when an
+/// Attempt is current, otherwise the latest decision. Earlier decisions remain
+/// in `decisions` so a replacement cannot erase them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlacementProjection {
+    pub decisions: Vec<PlacementDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<PlacementSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acquisition: Option<AcquisitionOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched: Option<DispatchedTarget>,
+}
+
+/// The candidate Placement actually selected, or the exact target it preserved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementSelection {
+    pub provider: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    pub mode: String,
+}
+
+/// The target a DispatchIntent actually froze for provider execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchedTarget {
+    pub dispatch_intent_id: String,
+    pub call_id: String,
+    pub attempt_id: String,
+    pub generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_model_id: Option<String>,
+    pub state: String,
+}
+
+impl PlacementProjection {
+    pub fn from_decisions(
+        decisions: &[PlacementDecision],
+        authoritative_attempt_id: Option<&str>,
+        dispatched: Option<DispatchedTarget>,
+    ) -> Self {
+        let current = authoritative_attempt_id
+            .and_then(|attempt_id| {
+                decisions
+                    .iter()
+                    .rev()
+                    .find(|decision| decision.attempt_id.as_deref() == Some(attempt_id))
+            })
+            .or_else(|| decisions.last());
+        Self {
+            selected: current.map(selection_of),
+            acquisition: current.and_then(|decision| decision.acquisition_outcome.clone()),
+            dispatched,
+            decisions: decisions.to_vec(),
+        }
+    }
+}
+
+fn selection_of(decision: &PlacementDecision) -> PlacementSelection {
+    match &decision.mode {
+        PlacementMode::SelectCandidate {
+            selected_provider,
+            selected_model,
+            ..
+        } => PlacementSelection {
+            provider: selected_provider.clone(),
+            model: selected_model.clone(),
+            effort: None,
+            mode: "select_candidate".to_string(),
+        },
+        PlacementMode::Exact {
+            provider,
+            model,
+            effort,
+        } => PlacementSelection {
+            provider: provider.clone(),
+            model: model.clone(),
+            effort: effort.clone(),
+            mode: "exact".to_string(),
+        },
+    }
+}
+
 /// Outcome of final atomic resource acquisition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcquisitionOutcome {
     pub success: bool,
     pub governor_decision: String, // GovernorDecision serialized

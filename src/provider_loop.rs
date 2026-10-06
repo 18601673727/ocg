@@ -930,7 +930,11 @@ impl CanonicalProviderCallHandler {
                     governor_decision: "allowed_now".to_string(),
                     failure_reason: None,
                 };
-                let _ = domain.record_acquisition_outcome(&envelope.job_id, &outcome);
+                let _ = domain.record_acquisition_outcome(
+                    &envelope.job_id,
+                    &envelope.attempt_id,
+                    &outcome,
+                );
                 permit
             }
             Err(crate::orchestration::governor::GovernorDecision::RateLimited { retry_after }) => {
@@ -944,7 +948,11 @@ impl CanonicalProviderCallHandler {
                     governor_decision: format!("rate_limited:{}", retry_after.as_millis()),
                     failure_reason: Some(message.clone()),
                 };
-                let _ = domain.record_acquisition_outcome(&envelope.job_id, &outcome);
+                let _ = domain.record_acquisition_outcome(
+                    &envelope.job_id,
+                    &envelope.attempt_id,
+                    &outcome,
+                );
                 fail_authoritative_provider_call(&config.project_root, &envelope, &message, true);
                 return Err(OcgError::config(message));
             }
@@ -959,7 +967,11 @@ impl CanonicalProviderCallHandler {
                     governor_decision: "capacity_unavailable".to_string(),
                     failure_reason: Some(message.clone()),
                 };
-                let _ = domain.record_acquisition_outcome(&envelope.job_id, &outcome);
+                let _ = domain.record_acquisition_outcome(
+                    &envelope.job_id,
+                    &envelope.attempt_id,
+                    &outcome,
+                );
                 fail_authoritative_provider_call(&config.project_root, &envelope, &message, true);
                 return Err(OcgError::config(message));
             }
@@ -1060,6 +1072,21 @@ impl CanonicalProviderCallHandler {
         {
             Ok(response) => response,
             Err(error) => {
+                // A reliable upstream 429 is rate governance, not a stall and
+                // not a health failure. Only a parsed Retry-After duration is
+                // recorded; an absent or unparsable value keeps the existing
+                // provider failure path and invents no cooldown.
+                if let Some(retry_after) = crate::http::reliable_retry_after(&error) {
+                    let _ = config
+                        .governor
+                        .record_throttling(governor_scope.clone(), retry_after);
+                    let _ = config.governor.record_throttling(
+                        crate::orchestration::governor::GovernorScope::provider(
+                            provider_config.provider_key.clone(),
+                        ),
+                        retry_after,
+                    );
+                }
                 // Cancellation is not a provider failure. The cancellation
                 // lifecycle already terminalized this Attempt and its Job, so
                 // settling it again here as a failure would overwrite `cancelled`
@@ -2865,18 +2892,40 @@ fn accept_for(streaming: bool) -> String {
 }
 
 /// Normalize a non-2xx OpenAI-compatible response into a canonical failure.
-fn openai_http_failure(status: u16, body: &[u8]) -> OcgError {
-    let excerpt = String::from_utf8_lossy(body);
-    OcgError::config(format!(
-        "OpenAI-compatible provider returned HTTP {status}: {excerpt}"
-    ))
+fn openai_http_failure(status: u16, body: &[u8], retry_after: Option<u64>) -> OcgError {
+    provider_http_failure("OpenAI-compatible", status, body, retry_after)
 }
 
 /// Normalize a non-2xx Anthropic response into a canonical failure, keeping the
 /// provider's own error type alongside the HTTP status.
-fn anthropic_http_failure(status: u16, body: &[u8]) -> OcgError {
+fn anthropic_http_failure(status: u16, body: &[u8], retry_after: Option<u64>) -> OcgError {
     let failure = crate::anthropic::error::anthropic_failure_from_body(status, body);
-    OcgError::config(crate::anthropic::describe(&failure))
+    provider_http_failure(
+        "Anthropic",
+        status,
+        crate::anthropic::describe(&failure).as_bytes(),
+        retry_after,
+    )
+}
+
+/// Keep a reliable Retry-After visible without inventing one.
+///
+/// `retry_after` is the delta-seconds header the HTTP layer parsed. A missing
+/// or unparsable header stays absent; the body is never mined for a duration.
+fn provider_http_failure(
+    protocol: &str,
+    status: u16,
+    body: &[u8],
+    retry_after: Option<u64>,
+) -> OcgError {
+    let excerpt = String::from_utf8_lossy(body);
+    let retry_after = retry_after
+        .filter(|_| status == 429)
+        .map(|seconds| format!(" retry-after={seconds}s"))
+        .unwrap_or_default();
+    OcgError::config(format!(
+        "{protocol} provider returned HTTP {status}: {excerpt}{retry_after}"
+    ))
 }
 
 /// Drive one streamed provider round.
@@ -2894,7 +2943,7 @@ struct ProviderRequest<'a> {
     headers: &'a [(String, String)],
     body: &'a Value,
     secret: Option<&'a str>,
-    on_http_failure: fn(u16, &[u8]) -> OcgError,
+    on_http_failure: fn(u16, &[u8], Option<u64>) -> OcgError,
 }
 
 async fn run_streamed_round<S: ProviderRoundState + 'static>(
@@ -3023,7 +3072,11 @@ async fn run_streamed_round_inner<S: ProviderRoundState + 'static>(
         if let Some(secret) = wire.secret {
             excerpt = excerpt.replace(secret, "<redacted>");
         }
-        return Err((wire.on_http_failure)(response.status, excerpt.as_bytes()));
+        return Err((wire.on_http_failure)(
+            response.status,
+            excerpt.as_bytes(),
+            response.rate_limit.retry_after,
+        ));
     }
 
     // If cancellation interrupted the stream, this round is not a completion.
