@@ -1,27 +1,34 @@
 "use client";
 
 import { useI18n, type I18nKey } from "../i18n";
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, ArrowRight, Check, Loader2, FolderOpen, ChevronRight, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
+import { createHttpCanonicalControlClient } from "../runtime/canonical-client";
 import { createSetupClient } from "./setup-client";
-import { useOcgRuntime } from "../runtime/runtime-context";
-import { useProject } from "../project/project-context";
-import type { SetupModel, SetupBrowseResponse } from "../contracts";
+import type { ProfileView, SetupModel, SetupBrowseResponse } from "../contracts";
 
-type SetupStep = "provider" | "models" | "projects";
+/**
+ * First-run and repair setup: Welcome → Connect model → Verify → Enter Chat.
+ *
+ * Readiness is never decided here. `GET /api/v1/profile` returns the backend's
+ * `runnable_choices` (selection + usable endpoint + Vault credential), which is
+ * the same authority the shell gate and canonical launch use; Chat additionally
+ * needs one registered Project, read from the canonical Project registry.
+ */
+type SetupStep = "checking" | "welcome" | "connect" | "models" | "verified";
 
-const STEP_LABELS: Record<SetupStep, I18nKey> = {
-  provider: "setup.provider",
-  models: "setup.models",
-  projects: "setup.projects",
-};
+type Progress = "connect" | "verify" | "chat";
 
-const STEPS: SetupStep[] = ["provider", "models", "projects"];
+const PROGRESS: readonly { id: Progress; label: I18nKey }[] = [
+  { id: "connect", label: "setup.stepConnect" },
+  { id: "verify", label: "setup.stepVerify" },
+  { id: "chat", label: "setup.stepChat" },
+];
 
 interface ProviderState {
   name: string;
@@ -33,37 +40,103 @@ interface ConnectResult {
   models: SetupModel[];
 }
 
+/** What the verified summary shows, all read back from the canonical Profile view. */
+interface Verified {
+  provider: string | null;
+  model: string;
+  runnable: number;
+}
+
+function verifiedFrom(view: ProfileView): Verified | null {
+  const profile = view.profile;
+  if (!profile || view.runnable_choices.length === 0) return null;
+  // The default model is what a new Chat uses; fall back to the first
+  // backend-runnable key only for presentation when no default is recorded.
+  const key = profile.defaultModel && view.runnable_choices.includes(profile.defaultModel)
+    ? profile.defaultModel
+    : view.runnable_choices[0];
+  const model = profile.models[key];
+  return {
+    provider: model ? profile.providers[model.provider]?.label ?? model.provider : null,
+    model: model?.label ?? model?.id ?? key,
+    runnable: view.runnable_choices.length,
+  };
+}
+
 export function SetupWizard() {
   const { t } = useI18n();
   const router = useRouter();
   const controlUrl = useOcgControlUrl();
-  const { completeOnboarding } = useOcgRuntime();
-  const { setActiveProject } = useProject();
 
-  const [step, setStep] = useState<SetupStep>("provider");
-  const [loading, setLoading] = useState(false);
+  const [step, setStep] = useState<SetupStep>("checking");
+  const [checkAttempt, setCheckAttempt] = useState(0);
+  const [checkError, setCheckError] = useState<string | null>(null);
+  const [repair, setRepair] = useState(false);
+  const [busy, setBusy] = useState<"connect" | "refresh" | "verify" | "project" | null>(null);
+  const loading = busy !== null;
   const [error, setError] = useState<string | null>(null);
 
-  // Provider state
-  const [provider, setProvider] = useState<ProviderState>({
-    name: "",
-    endpoint: "",
-  });
+  const [provider, setProvider] = useState<ProviderState>({ name: "", endpoint: "" });
+  // The API key lives only in the uncontrolled input and is cleared after each
+  // attempt; it never enters React state, storage, or a URL.
   const apiKeyInput = useRef<HTMLInputElement>(null);
   const [connectResult, setConnectResult] = useState<ConnectResult | null>(null);
 
-  // Models state
   const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set());
   const [defaultModel, setDefaultModel] = useState<string>("");
   const [profileRevision, setProfileRevision] = useState<string>("");
 
-  // Projects state
+  const [verified, setVerified] = useState<Verified | null>(null);
+  const [projects, setProjects] = useState<Array<{ id: string; name: string; root: string }>>([]);
+
   const [browseResult, setBrowseResult] = useState<SetupBrowseResponse | null>(null);
   const [selectedFolders, setSelectedFolders] = useState<string[]>([]);
   const [manualPath, setManualPath] = useState<string>("");
-  const [importedProjects, setImportedProjects] = useState<Array<{ id: string; name: string; root: string }>>([]);
 
-  const currentIndex = STEPS.indexOf(step);
+  // Decide where setup starts from canonical state: a runnable installation
+  // with a Project skips setup entirely; a saved but non-runnable connection
+  // is a repair, not a fresh install.
+  useEffect(() => {
+    if (!controlUrl) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const view = await createProfileClient(controlUrl, fetch).read();
+        const registered = await createHttpCanonicalControlClient({ baseUrl: controlUrl, fetch }).listProjects();
+        if (cancelled) return;
+        const ready = verifiedFrom(view);
+        const known = registered.map((record) => ({ id: record.project_id, name: record.root, root: record.root }));
+        setProjects(known);
+        setCheckError(null);
+        if (ready && known.length > 0) {
+          router.replace("/?scenario=local-ready");
+          return;
+        }
+        if (ready) {
+          setVerified(ready);
+          setStep("verified");
+          return;
+        }
+        const configured = Object.keys(view.profile?.providers ?? {}).length > 0;
+        setRepair(configured);
+        setStep(configured ? "connect" : "welcome");
+      } catch (cause) {
+        if (!cancelled) setCheckError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [controlUrl, router, checkAttempt]);
+
+  useEffect(() => {
+    if (step !== "verified" || projects.length > 0 || browseResult || !controlUrl) return;
+    let cancelled = false;
+    createSetupClient(controlUrl, fetch).browseDirectory().then((value) => {
+      if (!cancelled) setBrowseResult(value);
+    }).catch(() => {
+      // Browsing is a convenience; a typed path still works.
+    });
+    return () => { cancelled = true; };
+  }, [step, projects.length, browseResult, controlUrl]);
 
   const handleConnectProvider = useCallback(async () => {
     if (!controlUrl) {
@@ -76,7 +149,7 @@ export function SetupWizard() {
       return;
     }
 
-    setLoading(true);
+    setBusy("connect");
     setError(null);
     try {
       // The Profile must exist before a provider can be filed under it. On a
@@ -87,42 +160,32 @@ export function SetupWizard() {
         await profileClient.createNew();
       }
 
-      // The backend owns the whole provider step: it derives both the
-      // `/models` URL and the canonical chat endpoint, writes the credential to
-      // the Vault, persists the Provider, and returns what it actually found.
-      const setupClient = createSetupClient(controlUrl, fetch);
-      const result = await setupClient.connectProvider(
+      // The backend owns the whole provider step: it lists `/models` before
+      // writing anything, writes the credential to the Vault, persists the
+      // Provider, and returns the catalog it actually found.
+      const result = await createSetupClient(controlUrl, fetch).connectProvider(
         provider.name.trim(),
         provider.endpoint.trim(),
         apiKey,
       );
 
       setProfileRevision(result.revision);
-      setConnectResult({
-        providerKey: result.provider_key,
-        models: result.models,
-      });
-
-      // Default: the first model is both selected and the default, so a first
-      // run that only presses through still reaches a runnable configuration.
+      setConnectResult({ providerKey: result.provider_key, models: result.models });
       const first = result.models[0];
-      if (first) {
-        setSelectedModels(new Set([first.key]));
-        setDefaultModel(first.key);
-      }
-
+      setSelectedModels(first ? new Set([first.key]) : new Set());
+      setDefaultModel(first?.key ?? "");
       setStep("models");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("setup.connectFailed"));
     } finally {
       if (apiKeyInput.current) apiKeyInput.current.value = "";
-      setLoading(false);
+      setBusy(null);
     }
   }, [controlUrl, provider, t]);
 
   const handleRefreshModels = useCallback(async () => {
     if (!controlUrl || !connectResult) return;
-    setLoading(true);
+    setBusy("refresh");
     setError(null);
     try {
       const result = await createSetupClient(controlUrl, fetch).refreshModels(connectResult.providerKey, profileRevision);
@@ -135,11 +198,11 @@ export function SetupWizard() {
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("setup.refreshFailed"));
     } finally {
-      setLoading(false);
+      setBusy(null);
     }
   }, [controlUrl, connectResult, profileRevision, selectedModels, defaultModel, t]);
 
-  const handleSaveModels = useCallback(async () => {
+  const handleVerify = useCallback(async () => {
     if (!controlUrl || !connectResult) return;
     if (selectedModels.size === 0) {
       setError(t("setup.selectModel"));
@@ -150,58 +213,49 @@ export function SetupWizard() {
       return;
     }
 
-    setLoading(true);
+    setBusy("verify");
     setError(null);
     try {
-      const setupClient = createSetupClient(controlUrl, fetch);
       const modelsToSave = Array.from(selectedModels).map((key) => {
         const model = connectResult.models.find((m) => m.key === key);
         if (!model) throw new Error(t("setup.refreshCatalog"));
         return { key: model.key, id: model.id };
       });
-      const result = await setupClient.saveModels(
+      // The backend refuses a default model that is not executable.
+      const result = await createSetupClient(controlUrl, fetch).saveModels(
         connectResult.providerKey,
         modelsToSave,
         defaultModel,
         profileRevision,
       );
-
-      if (result.runnable_choices.length === 0) {
-        setError(t("setup.noRunnable"));
-        return;
-      }
-
       setProfileRevision(result.revision);
       setSelectedModels(new Set(result.selected_models));
       setDefaultModel(result.default_model);
 
-      // Browse home directory for project selection
-      try {
-        const browse = await setupClient.browseDirectory();
-        setBrowseResult(browse);
-      } catch {
-        // Browsing may fail, proceed anyway
+      // Read readiness back from the same authority the shell gate uses.
+      const ready = verifiedFrom(await createProfileClient(controlUrl, fetch).read());
+      if (!ready) {
+        setError(t("setup.noRunnable"));
+        return;
       }
-
-      setStep("projects");
+      setVerified(ready);
+      setStep("verified");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("setup.saveFailed"));
     } finally {
-      setLoading(false);
+      setBusy(null);
     }
   }, [controlUrl, connectResult, selectedModels, defaultModel, profileRevision, t]);
 
   const handleBrowse = useCallback(async (path: string) => {
     if (!controlUrl) return;
-    setLoading(true);
+    setBusy("project");
     try {
-      const setupClient = createSetupClient(controlUrl, fetch);
-      const result = await setupClient.browseDirectory(path);
-      setBrowseResult(result);
+      setBrowseResult(await createSetupClient(controlUrl, fetch).browseDirectory(path));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("setup.browseFailed"));
     } finally {
-      setLoading(false);
+      setBusy(null);
     }
   }, [controlUrl, t]);
 
@@ -225,71 +279,88 @@ export function SetupWizard() {
       setError(t("setup.selectFolder"));
       return;
     }
-
-    setLoading(true);
+    setBusy("project");
     setError(null);
     try {
       const setupClient = createSetupClient(controlUrl, fetch);
       const imported: Array<{ id: string; name: string; root: string }> = [];
-
       for (const folder of selectedFolders) {
         const commandId = `cmd-setup-project-${Date.now().toString(36)}-${imported.length}`;
         const result = await setupClient.initProject(commandId, folder);
-        imported.push({
-          id: result.project_id,
-          name: result.name,
-          root: result.root,
-        });
+        imported.push({ id: result.project_id, name: result.name, root: result.root });
       }
-
-      setImportedProjects(imported);
-
-      // Set first project as active
-      if (imported.length > 0) {
-        setActiveProject(imported[0].id);
-      }
-
-      // Complete onboarding and enter workspace
-      await completeOnboarding();
-      const projectParam = imported.length > 0 ? `&project=${encodeURIComponent(imported[0].id)}` : "";
-      router.push(`/?scenario=local-ready${projectParam}`);
+      setProjects(imported);
+      setSelectedFolders([]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("setup.importFailed"));
     } finally {
-      setLoading(false);
+      setBusy(null);
     }
-  }, [controlUrl, selectedFolders, completeOnboarding, router, setActiveProject, t]);
+  }, [controlUrl, selectedFolders, t]);
+
+  const enterChat = useCallback(() => {
+    const project = projects[0];
+    router.push(`/?scenario=local-ready${project ? `&project=${encodeURIComponent(project.id)}` : ""}`);
+  }, [projects, router]);
+
+  const progress: Progress = step === "verified" ? projects.length > 0 ? "chat" : "verify" : "connect";
+  const progressIndex = PROGRESS.findIndex((item) => item.id === progress);
+
+  if (!controlUrl || step === "checking") {
+    return (
+      <main className="flex min-h-dvh flex-col items-center justify-center gap-3 bg-background p-6 text-center text-[13px] text-foreground">
+        {!controlUrl ? (
+          <p role="alert" className="text-destructive">{t("setup.noEndpoint")}</p>
+        ) : checkError ? (
+          <>
+            <p role="alert" className="max-w-md break-words text-destructive">{t("setup.checkFailed", { error: checkError })}</p>
+            <Button size="sm" variant="outline" onClick={() => { setCheckError(null); setCheckAttempt((value) => value + 1); }}>{t("common.retry")}</Button>
+          </>
+        ) : (
+          <p role="status" className="text-muted-foreground">{t("setup.checking")}</p>
+        )}
+      </main>
+    );
+  }
+
+  if (step === "welcome") {
+    return (
+      <main className="flex min-h-dvh items-center justify-center bg-background px-4 py-8 text-foreground">
+        <section className="w-full max-w-md space-y-4 rounded-lg border border-border p-6">
+          <h1 className="text-[18px] font-semibold tracking-tight">{t("setup.welcomeTitle")}</h1>
+          <p className="text-[13px] leading-6 text-muted-foreground">{t("setup.welcomeBody")}</p>
+          <Button onClick={() => setStep("connect")}>
+            {t("setup.stepConnect")}
+            <ArrowRight className="size-3.5" aria-hidden="true" />
+          </Button>
+        </section>
+      </main>
+    );
+  }
 
   return (
-    <div className="flex min-h-dvh justify-center bg-background px-4 py-8 text-foreground sm:py-12">
-      <div className="flex w-full max-w-2xl flex-col">
+    <main className="flex min-h-dvh justify-center bg-background px-4 py-8 text-foreground sm:py-12">
+      <div className="flex w-full min-w-0 max-w-xl flex-col">
         <header>
-          <h1 className="text-[18px] font-semibold tracking-tight">{t(STEP_LABELS[step])}</h1>
-
-          {/* Step indicator */}
+          <h1 className="text-[18px] font-semibold tracking-tight">{t(step !== "verified" ? "setup.stepConnect" : connectResult ? "setup.verifiedTitle" : "setup.readyTitle")}</h1>
           <ol className="mt-4 grid grid-cols-3 gap-1" aria-label={t("setup.steps")}>
-            {STEPS.map((s, i) => {
-              const isCurrent = s === step;
-              const isDone = i < currentIndex;
+            {PROGRESS.map((item, index) => {
+              const isCurrent = index === progressIndex;
+              const isDone = index < progressIndex;
               return (
-                <li key={s} className="min-w-0">
-                  <div
-                    className={cn(
-                      "flex w-full items-center gap-1.5 rounded-md border px-2 py-1.5",
-                      isCurrent ? "border-foreground/40 bg-muted" : "border-border",
-                      !isCurrent && !isDone && "opacity-60",
-                    )}
-                  >
-                    <span
-                      className={cn(
-                        "flex size-4 shrink-0 items-center justify-center rounded-full border text-[9px]",
-                        isDone ? "border-emerald-600 bg-emerald-600 text-white" : "border-border text-muted-foreground",
-                      )}
-                      aria-hidden="true"
-                    >
-                      {isDone ? <Check className="size-2.5" /> : i + 1}
+                <li key={item.id} className="min-w-0" aria-current={isCurrent ? "step" : undefined}>
+                  <div className={cn(
+                    "flex w-full items-center gap-1.5 rounded-md border px-2 py-1.5",
+                    isCurrent ? "border-foreground/40 bg-muted" : "border-border",
+                    !isCurrent && !isDone && "opacity-60",
+                  )}>
+                    <span className={cn(
+                      "flex size-4 shrink-0 items-center justify-center rounded-full border text-[9px]",
+                      isDone ? "border-emerald-600 bg-emerald-600 text-white" : "border-border text-muted-foreground",
+                    )} aria-hidden="true">
+                      {isDone ? <Check className="size-2.5" /> : index + 1}
                     </span>
-                    <span className="truncate text-[10px] text-muted-foreground">{t(STEP_LABELS[s])}</span>
+                    <span className="truncate text-[10px] text-muted-foreground">{t(item.label)}</span>
                   </div>
                 </li>
               );
@@ -298,21 +369,19 @@ export function SetupWizard() {
         </header>
 
         <div className="mt-5 flex flex-col gap-3">
+          {repair && step === "connect" && (
+            <p className="rounded-md border border-border p-3 text-[12px] text-muted-foreground">{t("setup.repairNotice")}</p>
+          )}
           {error && (
             <div role="alert" className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden="true" />
-              <p className="text-[12px] text-destructive">{error}</p>
+              <p className="min-w-0 break-words text-[12px] text-destructive">{error}</p>
             </div>
           )}
 
-          <section className="rounded-lg border border-border bg-muted/10 p-4">
-            {step === "provider" && (
-              <ConnectProviderPanel
-                provider={provider}
-                onChange={setProvider}
-                loading={loading}
-                apiKeyInput={apiKeyInput}
-              />
+          <section className="min-w-0 rounded-lg border border-border bg-muted/10 p-4">
+            {step === "connect" && (
+              <ConnectProviderPanel provider={provider} onChange={setProvider} loading={loading} apiKeyInput={apiKeyInput} />
             )}
             {step === "models" && connectResult && (
               <ChooseModelsPanel
@@ -330,55 +399,101 @@ export function SetupWizard() {
                 onSetDefault={setDefaultModel}
               />
             )}
-            {step === "projects" && (
-              <AddProjectsPanel
-                browseResult={browseResult}
-                selectedFolders={selectedFolders}
-                manualPath={manualPath}
-                importedProjects={importedProjects}
-                onBrowse={handleBrowse}
-                onSelectFolder={handleSelectFolder}
-                onManualPathChange={setManualPath}
-                onAddManualPath={handleAddManualPath}
-                loading={loading}
-              />
-            )}
+            {step === "verified" && verified && <VerifiedSummary verified={verified} checkedNow={connectResult !== null} />}
           </section>
+
+          {step === "verified" && (
+            <section className="min-w-0 rounded-lg border border-border bg-muted/10 p-4">
+              {projects.length > 0 ? (
+                <dl className="text-[12px]">
+                  <dt className="text-[11px] text-muted-foreground">{t("setup.project")}</dt>
+                  <dd className="mt-0.5 break-all font-medium">{projects[0].root}</dd>
+                </dl>
+              ) : (
+                <AddProjectsPanel
+                  browseResult={browseResult}
+                  selectedFolders={selectedFolders}
+                  manualPath={manualPath}
+                  onBrowse={handleBrowse}
+                  onSelectFolder={handleSelectFolder}
+                  onManualPathChange={setManualPath}
+                  onAddManualPath={handleAddManualPath}
+                  loading={loading}
+                />
+              )}
+            </section>
+          )}
         </div>
 
-        <footer className="mt-5 flex items-center justify-between gap-2">
-          <span className="text-[11px] text-muted-foreground">
-            {t("setup.progress", { step: currentIndex + 1, total: STEPS.length })}
-          </span>
+        <footer className="mt-5 flex flex-wrap items-center justify-between gap-2">
+          {step === "models" ? (
+            <Button size="sm" variant="ghost" disabled={loading} onClick={() => { setError(null); setStep("connect"); }}>
+              <ArrowLeft className="size-3.5" aria-hidden="true" />{t("setup.editConnection")}
+            </Button>
+          ) : step === "verified" && connectResult ? (
+            <Button size="sm" variant="ghost" disabled={loading} onClick={() => { setError(null); setStep("models"); }}>
+              <ArrowLeft className="size-3.5" aria-hidden="true" />{t("setup.changeModel")}
+            </Button>
+          ) : <span />}
 
-          {step === "provider" && (
+          {step === "connect" && (
             <Button size="sm" onClick={() => void handleConnectProvider()} disabled={loading}>
-              {loading ? <Loader2 className="size-3.5 animate-spin" /> : null}
-              {t("setup.connect")}
-              <ArrowRight className="size-3.5" aria-hidden="true" />
+              {busy === "connect" ? <Loader2 className="size-3.5 animate-spin" /> : null}
+              {t(busy === "connect" ? "setup.connecting" : "setup.connect")}
             </Button>
           )}
           {step === "models" && (
-            <Button size="sm" onClick={() => void handleSaveModels()} disabled={loading}>
-              {loading ? <Loader2 className="size-3.5 animate-spin" /> : null}
-              {t("setup.save")}
-              <ArrowRight className="size-3.5" aria-hidden="true" />
+            <Button size="sm" onClick={() => void handleVerify()} disabled={loading || selectedModels.size === 0}>
+              {busy === "verify" ? <Loader2 className="size-3.5 animate-spin" /> : null}
+              {t(busy === "verify" ? "setup.verifying" : "setup.verify")}
             </Button>
           )}
-          {step === "projects" && (
+          {step === "verified" && projects.length === 0 && (
             <Button size="sm" onClick={() => void handleImportProjects()} disabled={loading || selectedFolders.length === 0}>
-              {loading ? <Loader2 className="size-3.5 animate-spin" /> : null}
-              {t("setup.start")}
+              {busy === "project" ? <Loader2 className="size-3.5 animate-spin" /> : null}
+              {t("setup.addProject")}
+            </Button>
+          )}
+          {step === "verified" && projects.length > 0 && (
+            <Button size="sm" onClick={enterChat} disabled={loading || !verified}>
+              {t("setup.enterChat")}
               <ArrowRight className="size-3.5" aria-hidden="true" />
             </Button>
           )}
         </footer>
       </div>
-    </div>
+    </main>
   );
 }
 
 // -- Step panels -------------------------------------------------------------
+
+/**
+ * `checkedNow` is true only when this session connected the endpoint and listed
+ * its models; a configuration found already runnable claims readiness alone.
+ */
+function VerifiedSummary({ verified, checkedNow }: { verified: Verified; checkedNow: boolean }) {
+  const { t } = useI18n();
+  return (
+    <div className="flex min-w-0 flex-col gap-3">
+      <dl className="grid gap-2 text-[12px]">
+        <div className="min-w-0">
+          <dt className="text-[11px] text-muted-foreground">{t("setup.summaryProvider")}</dt>
+          <dd className="mt-0.5 break-words font-medium">{verified.provider ?? t("common.notReported")}</dd>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-[11px] text-muted-foreground">{t("setup.summaryModel")}</dt>
+          <dd className="mt-0.5 break-all font-medium">{verified.model}</dd>
+        </div>
+        <div>
+          <dt className="text-[11px] text-muted-foreground">{t("setup.summaryRunnable")}</dt>
+          <dd className="mt-0.5 font-medium tabular-nums">{verified.runnable}</dd>
+        </div>
+      </dl>
+      <p className="text-[11px] leading-5 text-muted-foreground">{t(checkedNow ? "setup.verifiedFacts" : "setup.readyFacts")}</p>
+    </div>
+  );
+}
 
 function ConnectProviderPanel({
   provider,
@@ -394,6 +509,7 @@ function ConnectProviderPanel({
   const { t } = useI18n();
   return (
     <div className="flex flex-col gap-4">
+      <p className="text-[12px] text-muted-foreground">{t("setup.connectHint")}</p>
       <div className="flex flex-col gap-1.5">
         <label htmlFor="setup-provider-name" className="text-[12px] font-medium">
           {t("setup.providerName")}
@@ -464,11 +580,11 @@ function ChooseModelsPanel({
 
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-[12px] text-muted-foreground">
-        {t("setup.modelsHint")}
-      </p>
-      <Button size="sm" variant="outline" onClick={onRefresh} disabled={loading}>{t("setup.refreshModels")}</Button>
-      <ul className="divide-y divide-border rounded-md border border-border">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="min-w-0 flex-1 text-[12px] text-muted-foreground">{t("setup.modelsHint")}</p>
+        <Button size="xs" variant="outline" onClick={onRefresh} disabled={loading}>{t("setup.refreshModels")}</Button>
+      </div>
+      <ul className="max-h-[50dvh] divide-y divide-border overflow-y-auto rounded-md border border-border">
         {models.map((model) => {
           const selected = selectedModels.has(model.key);
           const isDefault = defaultModel === model.key;
@@ -483,7 +599,7 @@ function ChooseModelsPanel({
                 aria-label={t("setup.selectNamedModel", { model: model.label })}
               />
               <div className="min-w-0 flex-1">
-                <p className="truncate text-[12px] font-medium">{model.label}</p>
+                <p className="break-all text-[12px] font-medium">{model.label}</p>
               </div>
               {selected && (
                 <Button
@@ -507,7 +623,6 @@ function AddProjectsPanel({
   browseResult,
   selectedFolders,
   manualPath,
-  importedProjects,
   onBrowse,
   onSelectFolder,
   onManualPathChange,
@@ -517,7 +632,6 @@ function AddProjectsPanel({
   browseResult: SetupBrowseResponse | null;
   selectedFolders: string[];
   manualPath: string;
-  importedProjects: Array<{ id: string; name: string; root: string }>;
   onBrowse: (path: string) => void;
   onSelectFolder: (path: string) => void;
   onManualPathChange: (path: string) => void;
@@ -560,7 +674,7 @@ function AddProjectsPanel({
             {selectedFolders.map((folder) => (
               <li key={folder} className="flex items-center gap-2 px-3 py-2">
                 <FolderOpen className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-                <span className="min-w-0 flex-1 truncate text-[12px]">{folder}</span>
+                <span className="min-w-0 flex-1 break-all text-[12px]">{folder}</span>
                 <Button
                   size="xs"
                   variant="ghost"
@@ -591,7 +705,7 @@ function AddProjectsPanel({
               </Button>
             )}
           </div>
-          <p className="truncate text-[11px] text-muted-foreground">{browseResult.current}</p>
+          <p className="break-all text-[11px] text-muted-foreground">{browseResult.current}</p>
           <ul className="max-h-[200px] divide-y divide-border overflow-y-auto rounded-md border border-border">
             {browseResult.entries.map((entry) => {
               const isSelected = selectedFolders.includes(entry.path);
@@ -635,15 +749,6 @@ function AddProjectsPanel({
               </li>
             )}
           </ul>
-        </div>
-      )}
-
-      {/* Imported projects feedback */}
-      {importedProjects.length > 0 && (
-        <div className="rounded-md border border-emerald-500/40 bg-emerald-500/5 p-3">
-          <p className="text-[12px] font-medium text-emerald-700 dark:text-emerald-400">
-            {t("setup.imported", { count: importedProjects.length })}
-          </p>
         </div>
       )}
     </div>
