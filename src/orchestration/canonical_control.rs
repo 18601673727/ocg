@@ -2224,7 +2224,10 @@ impl CanonicalControlService {
                 // Chat's accepted-turn queue predates placement. Its worker
                 // still acquires the existing execution slot before I/O.
                 concurrency: (!is_chat).then_some(provider_concurrency),
-                governor: None,
+                // Placement evaluation must observe the same Governor that
+                // execution-time acquisition enforces, so a recorded upstream
+                // cooldown is visible before a candidate is selected.
+                governor: Some(runtime_handle.governor()),
                 now: crate::clock::Clock::now_unix(&crate::clock::SystemClock),
             },
             existing_job.as_ref(),

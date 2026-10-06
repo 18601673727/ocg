@@ -200,6 +200,23 @@ impl GovernorState {
         }
     }
 
+    /// Ensure a limiter exists so upstream throttling feedback is never lost.
+    ///
+    /// A provider-asserted cooldown (HTTP 429 Retry-After) is a fact about the
+    /// upstream, not local rate policy. When no local rate limit is configured
+    /// for the scope, track the cooldown under a permissive local policy that
+    /// never denies on its own; only the recorded cooldown can deny.
+    fn ensure_rate_limiter_for_feedback(&mut self, scope: &GovernorScope) {
+        if !self.rate_limiters.contains_key(scope) {
+            let config = self.rate_configs.get(scope).copied().unwrap_or(RateConfig {
+                max_requests: u32::MAX,
+                window: Duration::from_secs(60),
+            });
+            self.rate_limiters
+                .insert(scope.clone(), RateLimiterState::new(config));
+        }
+    }
+
     fn ensure_capacity_state(&mut self, scope: &GovernorScope) {
         if !self.capacity_state.contains_key(scope) {
             if let Some(&config) = self.capacity_configs.get(scope) {
@@ -229,7 +246,18 @@ impl Governor {
             .state
             .lock()
             .map_err(|_| invalid("governor lock poisoned"))?;
-        state.rate_configs.insert(scope, config);
+        state.rate_configs.insert(scope.clone(), config);
+        // A limiter created earlier for throttling feedback tracks provider
+        // cooldowns under a permissive default. A later local configuration
+        // must take effect on that same limiter rather than linger unseen.
+        if let Some(limiter) = state.rate_limiters.get_mut(&scope) {
+            let cooldown_until = limiter.cooldown_until;
+            *limiter = RateLimiterState {
+                config,
+                requests: std::mem::take(&mut limiter.requests),
+                cooldown_until,
+            };
+        }
         Ok(())
     }
 
@@ -278,12 +306,16 @@ impl Governor {
     }
 
     /// Record upstream throttling feedback for a scope.
+    ///
+    /// This always records the cooldown, even when no local rate limit is
+    /// configured: dropping provider-asserted throttling would leave Placement
+    /// evaluation and final acquisition blind to a real upstream refusal.
     pub fn record_throttling(&self, scope: GovernorScope, retry_after: Duration) -> Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| invalid("governor lock poisoned"))?;
-        state.ensure_rate_limiter(&scope);
+        state.ensure_rate_limiter_for_feedback(&scope);
         if let Some(rate_limiter) = state.rate_limiters.get_mut(&scope) {
             rate_limiter.set_cooldown(retry_after);
         }
