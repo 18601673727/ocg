@@ -30,7 +30,7 @@ ring = "0.17"
 keyring = { version = "4.2", default-features = false, features = ["v1"] }
 rpassword = "7"
 libc = "0.2"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 sha2 = "0.10"
 # Rust is the single source of truth for the loopback control wire contract;
 # `ts-rs` projects those definitions into the TypeScript PWA.

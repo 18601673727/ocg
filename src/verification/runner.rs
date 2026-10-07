@@ -3,7 +3,7 @@
 use crate::clock::Clock;
 use crate::compiler_feedback as compiler;
 use crate::error::Result;
-use crate::process::CaptureRunner;
+use crate::process::{CaptureRunner, CommandTermination, COMMAND_DEADLINE};
 use crate::verification::config::VerificationConfig;
 use crate::verification::distill::distill;
 use crate::verification::logs::{LogStore, RawLogInput};
@@ -132,6 +132,17 @@ pub fn execute(request: &VerifyRequest<'_>) -> Result<VerificationReport> {
         let stdout = captured.stdout_lossy();
         let stderr = captured.stderr_lossy();
         let mut output = distill(&stdout, &stderr, captured.success);
+        match captured.termination {
+            CommandTermination::Completed => {}
+            CommandTermination::Cancelled => output.notes.push(
+                "the command was cancelled and its process group was terminated; its exit status is not authoritative"
+                    .to_string(),
+            ),
+            CommandTermination::DeadlineExceeded => output.notes.push(format!(
+                "the command exceeded the {} second execution deadline and its process group was terminated; its exit status is not authoritative",
+                COMMAND_DEADLINE.as_secs()
+            )),
+        }
         if captured.truncated() {
             output.truncated = true;
             output.notes.push(

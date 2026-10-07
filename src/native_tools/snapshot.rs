@@ -1,6 +1,6 @@
 use super::{validation, ProjectRoot, ToolError, ToolErrorKind, ToolResult, TOOL_OUTPUT_CAP};
 use crate::orchestration::domain::DomainRepository;
-use crate::process::{CaptureRunner, SystemCaptureRunner};
+use crate::process::{CaptureRunner, CapturedOutput, CommandTermination, SystemCaptureRunner};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
@@ -24,16 +24,27 @@ fn text(value: &str, cap: usize, truncated: &mut bool) -> String {
 
 fn git(root: &ProjectRoot, paths: bool, cancelled: &dyn Fn() -> bool) -> SnapshotResult<Value> {
     let deadline = Instant::now() + Duration::from_secs(3);
-    let run = |args: &[&str], cap| {
+    let run = |args: &[&str], cap: usize| -> SnapshotResult<CapturedOutput> {
         let mut argv = vec![
             "--no-optional-locks".to_string(),
             "-c".into(),
             "core.fsmonitor=false".into(),
         ];
         argv.extend(args.iter().map(|arg| arg.to_string()));
-        SystemCaptureRunner.run_with_cancellation("git", &argv, root.path(), cap, &|| {
-            cancelled() || Instant::now() >= deadline
-        })
+        let output =
+            SystemCaptureRunner.run_with_cancellation("git", &argv, root.path(), cap, &|| {
+                cancelled() || Instant::now() >= deadline
+            })?;
+        if output.termination != CommandTermination::Completed {
+            // A terminated git says nothing about the repository, so it must not
+            // be reported as an unavailable repository.
+            return Err(format!(
+                "git {} was terminated before it finished",
+                args.first().copied().unwrap_or_default()
+            )
+            .into());
+        }
+        Ok(output)
     };
     let prefix = run(&["rev-parse", "--show-prefix"], 4096)?;
     if !prefix.success || prefix.truncated() {

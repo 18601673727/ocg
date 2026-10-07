@@ -18,7 +18,10 @@ use crate::edit;
 use crate::error::{OcgError, Result};
 use crate::orchestration::call_schema;
 use crate::orchestration::domain::{AttemptAuthority, DomainRepository, EffectIntentKind};
-use crate::process::{CaptureRunner, ProcessExit, SystemCaptureRunner};
+use crate::process::{
+    CaptureRunner, CapturedOutput, CommandTermination, ProcessExit, SystemCaptureRunner,
+    COMMAND_DEADLINE,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -629,6 +632,25 @@ fn relative_path(raw: &str) -> std::result::Result<PathBuf, ToolError> {
     Ok(normalized)
 }
 
+/// A command OCG terminated is reported by the bound that stopped it, never as
+/// an ordinary non-zero exit.
+fn terminated_result(program: &str, output: &CapturedOutput) -> Option<ToolResult> {
+    match output.termination {
+        CommandTermination::Completed => None,
+        CommandTermination::Cancelled => Some(ToolResult::failure(ToolError::new(
+            ToolErrorKind::Cancelled,
+            format!("{program} was cancelled and its process group was terminated"),
+        ))),
+        CommandTermination::DeadlineExceeded => Some(ToolResult::failure(ToolError::new(
+            ToolErrorKind::ExecutionFailure,
+            format!(
+                "{program} exceeded the {} second execution deadline and its process group was terminated",
+                COMMAND_DEADLINE.as_secs()
+            ),
+        ))),
+    }
+}
+
 fn bounded_text(bytes: &[u8], cap: usize) -> (String, bool) {
     let truncated = bytes.len() > cap;
     let bytes = &bytes[..bytes.len().min(cap)];
@@ -981,6 +1003,9 @@ impl NativeToolExecutor {
                 "Attempt was cancelled during search",
             ));
         }
+        if let Some(result) = terminated_result("rg", &output) {
+            return result;
+        }
         let no_match = matches!(output.exit, ProcessExit::Code(1));
         let success = output.success || no_match;
         ToolResult {
@@ -1154,6 +1179,9 @@ impl NativeToolExecutor {
                 ToolErrorKind::Cancelled,
                 "Attempt was cancelled during process execution",
             ));
+        }
+        if let Some(result) = terminated_result(program, &output) {
+            return result;
         }
         let stdout = output.stdout_lossy();
         let stderr = output.stderr_lossy();

@@ -8,11 +8,13 @@
 use crate::error::{OcgError, Result};
 use crate::proxy::StaticProxyProvider;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Reads static macOS proxy configuration through `/usr/sbin/scutil --proxy`.
 ///
@@ -305,6 +307,19 @@ impl ProcessExit {
     }
 }
 
+/// Why a captured command stopped. Only [`CommandTermination::Completed`] means
+/// the command ended on its own; the other two mean OCG terminated its process
+/// group, so its exit status is not authoritative.
+///
+/// Termination is group-wide on Unix. On other platforms only the direct child
+/// is stopped, so descendants there are not reaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandTermination {
+    Completed,
+    Cancelled,
+    DeadlineExceeded,
+}
+
 /// One bounded capture of an external command. Bytes are retained as raw
 /// bytes so invalid UTF-8 is preserved lossily by callers instead of being
 /// dropped; `*_truncated` records that a stream exceeded the cap.
@@ -317,6 +332,7 @@ pub struct CapturedOutput {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub duration_ms: u64,
+    pub termination: CommandTermination,
 }
 
 impl CapturedOutput {
@@ -329,6 +345,7 @@ impl CapturedOutput {
             stdout_truncated: false,
             stderr_truncated: false,
             duration_ms: 1,
+            termination: CommandTermination::Completed,
         }
     }
 
@@ -341,6 +358,7 @@ impl CapturedOutput {
             stdout_truncated: false,
             stderr_truncated: false,
             duration_ms: 1,
+            termination: CommandTermination::Completed,
         }
     }
 
@@ -403,6 +421,7 @@ pub trait CaptureRunner: Send + Sync {
                 stdout_truncated: false,
                 stderr_truncated: false,
                 duration_ms: 0,
+                termination: CommandTermination::Cancelled,
             });
         }
         let output = self.run(program, args, cwd, max_bytes)?;
@@ -415,6 +434,7 @@ pub trait CaptureRunner: Send + Sync {
                 stdout_truncated: output.stdout_truncated,
                 stderr_truncated: output.stderr_truncated,
                 duration_ms: output.duration_ms,
+                termination: CommandTermination::Cancelled,
             });
         }
         Ok(output)
@@ -439,6 +459,242 @@ fn process_exit(status: &std::process::ExitStatus) -> ProcessExit {
     ProcessExit::Unknown
 }
 
+/// Longest a captured command may run before OCG terminates its process group.
+/// Cancellation normally arrives first; this ceiling covers paths that have no
+/// cancellation source, so no command can hold its executor indefinitely.
+pub const COMMAND_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// How long OCG waits for a terminated command to be reaped. SIGKILL cannot be
+/// caught, so this only expires when the process is stuck in the kernel.
+const TERMINATION_GRACE: Duration = Duration::from_secs(5);
+
+/// How long OCG waits for a stream's reader to reach EOF once the command has
+/// ended. A reader still blocked after this is held open by a process outside
+/// the command's group.
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Bytes retained from one stream. The reader thread fills it and the parent
+/// takes what it holds, even if the reader is still blocked on the pipe.
+#[derive(Default)]
+struct StreamSink {
+    bytes: Vec<u8>,
+    truncated: bool,
+    finished: bool,
+}
+
+type SharedSink = Arc<Mutex<StreamSink>>;
+
+fn lock_sink(sink: &SharedSink) -> MutexGuard<'_, StreamSink> {
+    sink.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Drain a stream to EOF on its own thread, retaining at most `max` bytes. The
+/// drain never stops early, so a full pipe cannot stall the child.
+fn spawn_drain<R: Read + Send + 'static>(mut reader: R, max: usize) -> SharedSink {
+    let sink = SharedSink::default();
+    let shared = Arc::clone(&sink);
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let mut guard = lock_sink(&shared);
+                    let take = read.min(max.saturating_sub(guard.bytes.len()));
+                    guard.bytes.extend_from_slice(&buffer[..take]);
+                    if take < read {
+                        guard.truncated = true;
+                    }
+                }
+            }
+        }
+        lock_sink(&shared).finished = true;
+    });
+    sink
+}
+
+/// Take what a stream retained. A reader that has not reached EOF within
+/// `READER_GRACE` is abandoned and the stream is reported truncated, because
+/// its output is incomplete. The thread ends by itself when the pipe closes.
+fn collect_sink(sink: SharedSink) -> (Vec<u8>, bool) {
+    let started = Instant::now();
+    loop {
+        let mut guard = lock_sink(&sink);
+        if guard.finished || started.elapsed() >= READER_GRACE {
+            let complete = guard.finished;
+            let truncated = guard.truncated || !complete;
+            return (std::mem::take(&mut guard.bytes), truncated);
+        }
+        drop(guard);
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Send SIGKILL to the command's process group. The child leads that group
+/// because it was spawned with `process_group(0)`, so the group id is the
+/// child's pid. A group that OCG itself belongs to is never signalled.
+#[cfg(unix)]
+fn signal_group(child: &mut Child) -> std::io::Result<()> {
+    use rustix::io::Errno;
+    use rustix::process::{getpgrp, kill_process_group, Pid, Signal};
+    let group = Pid::from_child(child);
+    if group == getpgrp() {
+        return Err(std::io::Error::other("command shares OCG's process group"));
+    }
+    match kill_process_group(group, Signal::KILL) {
+        // A group with no members left is the outcome we wanted.
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_group(child: &mut Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+/// Stop the command and everything it started, then wait, boundedly, until the
+/// command itself has been reaped. A failure to signal the group or to reap the
+/// command is an error, because the tree may still be running.
+fn terminate(child: &mut Child, program: &str) -> Result<ExitStatus> {
+    if let Err(error) = signal_group(child) {
+        // The leader is the one process still reachable; stop it directly too.
+        let _ = child.kill();
+        return Err(OcgError::io(format!("cannot terminate {program}"), error));
+    }
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| OcgError::io(format!("cannot poll {program}"), error))?
+        {
+            return Ok(status);
+        }
+        if started.elapsed() >= TERMINATION_GRACE {
+            return Err(OcgError::io(
+                format!("cannot terminate {program}"),
+                std::io::Error::other("process did not exit after SIGKILL"),
+            ));
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// After a command exits on its own, stop anything it left in its group. Such a
+/// process still holds the output pipes and is part of the command's tree, so
+/// it must not outlive the command.
+#[cfg(unix)]
+fn reap_descendants(child: &mut Child, program: &str) -> Result<()> {
+    signal_group(child).map_err(|error| {
+        OcgError::io(
+            format!("cannot terminate processes left by {program}"),
+            error,
+        )
+    })
+}
+
+/// Windows has no process groups in this module, so only the direct child is
+/// stopped. See the platform limitation on [`CommandTermination`].
+#[cfg(not(unix))]
+fn reap_descendants(_child: &mut Child, _program: &str) -> Result<()> {
+    Ok(())
+}
+
+/// Run one command under OCG's lifecycle: the child leads its own process
+/// group; normal exit, cancellation, and the deadline are the only ways the
+/// call returns; termination always targets the whole group.
+fn run_owned(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    max_bytes: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CapturedOutput> {
+    if cancelled() {
+        return Ok(CapturedOutput {
+            exit: ProcessExit::Unknown,
+            success: false,
+            stdout: Vec::new(),
+            stderr: b"cancelled".to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: 0,
+            termination: CommandTermination::Cancelled,
+        });
+    }
+    let max_bytes = max_bytes.max(1);
+    let start = Instant::now();
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| OcgError::io(format!("cannot run {program}"), error))?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stream| spawn_drain(stream, max_bytes));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stream| spawn_drain(stream, max_bytes));
+
+    let deadline = start + COMMAND_DEADLINE;
+    let mut termination = CommandTermination::Completed;
+    // An exit observed before the fence closes is a normal completion, so
+    // the status is checked first on every poll.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = signal_group(&mut child);
+                return Err(OcgError::io(format!("cannot poll {program}"), error));
+            }
+        }
+        if cancelled() {
+            termination = CommandTermination::Cancelled;
+            break terminate(&mut child, program)?;
+        }
+        if Instant::now() >= deadline {
+            termination = CommandTermination::DeadlineExceeded;
+            break terminate(&mut child, program)?;
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    if termination == CommandTermination::Completed {
+        reap_descendants(&mut child, program)?;
+    }
+    let (stdout_bytes, stdout_truncated) = stdout.map(collect_sink).unwrap_or_default();
+    let (stderr_bytes, stderr_truncated) = stderr.map(collect_sink).unwrap_or_default();
+    let completed = termination == CommandTermination::Completed;
+    Ok(CapturedOutput {
+        exit: if completed {
+            process_exit(&status)
+        } else {
+            ProcessExit::Unknown
+        },
+        success: completed && status.success(),
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        stdout_truncated,
+        stderr_truncated,
+        duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        termination,
+    })
+}
+
 impl CaptureRunner for SystemCaptureRunner {
     fn run(
         &self,
@@ -447,47 +703,7 @@ impl CaptureRunner for SystemCaptureRunner {
         cwd: &Path,
         max_bytes: usize,
     ) -> Result<CapturedOutput> {
-        let max_bytes = max_bytes.max(1);
-        let start = Instant::now();
-        let mut child = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| OcgError::io(format!("cannot run {program}"), error))?;
-
-        // Drain both streams concurrently to EOF, retaining only a bounded
-        // prefix. The child is never killed for being verbose: its own exit
-        // status stays authoritative and truncation is reported separately.
-        // Memory stays bounded; a genuinely non-terminating command is a
-        // documented limitation (there is no timeout).
-        let stdout_handle = child
-            .stdout
-            .take()
-            .map(|stdout| std::thread::spawn(move || read_drain_bounded(stdout, max_bytes)));
-        let (stderr_bytes, stderr_truncated) = match child.stderr.take() {
-            Some(stderr) => read_drain_bounded(stderr, max_bytes),
-            None => (Vec::new(), false),
-        };
-        let (stdout_bytes, stdout_truncated) = match stdout_handle {
-            Some(handle) => handle.join().unwrap_or_default(),
-            None => (Vec::new(), false),
-        };
-        let status = child
-            .wait()
-            .map_err(|error| OcgError::io(format!("cannot wait for {program}"), error))?;
-        let duration_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        Ok(CapturedOutput {
-            exit: process_exit(&status),
-            success: status.success(),
-            stdout: stdout_bytes,
-            stderr: stderr_bytes,
-            stdout_truncated,
-            stderr_truncated,
-            duration_ms,
-        })
+        run_owned(program, args, cwd, max_bytes, &|| false)
     }
 
     fn run_with_cancellation(
@@ -498,80 +714,7 @@ impl CaptureRunner for SystemCaptureRunner {
         max_bytes: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<CapturedOutput> {
-        if cancelled() {
-            return Ok(CapturedOutput {
-                exit: ProcessExit::Unknown,
-                success: false,
-                stdout: Vec::new(),
-                stderr: b"cancelled".to_vec(),
-                stdout_truncated: false,
-                stderr_truncated: false,
-                duration_ms: 0,
-            });
-        }
-        let max_bytes = max_bytes.max(1);
-        let start = Instant::now();
-        let mut child = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| OcgError::io(format!("cannot run {program}"), error))?;
-        let stdout_handle = child
-            .stdout
-            .take()
-            .map(|stdout| thread::spawn(move || read_drain_bounded(stdout, max_bytes)));
-        let stderr_handle = child
-            .stderr
-            .take()
-            .map(|stderr| thread::spawn(move || read_drain_bounded(stderr, max_bytes)));
-        let mut cancelled_child = false;
-        let mut kill_error_reported = false;
-        loop {
-            if cancelled() && !cancelled_child {
-                match child.kill() {
-                    Ok(()) => cancelled_child = true,
-                    Err(error) => {
-                        if !kill_error_reported {
-                            tracing::warn!(%error, program, "cannot kill cancelled child process; retrying until it exits");
-                            kill_error_reported = true;
-                        }
-                    }
-                }
-            }
-            if child
-                .try_wait()
-                .map_err(|error| OcgError::io(format!("cannot poll {program}"), error))?
-                .is_some()
-            {
-                break;
-            }
-            thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let status = child
-            .wait()
-            .map_err(|error| OcgError::io(format!("cannot wait for {program}"), error))?;
-        let (stdout_bytes, stdout_truncated) = stdout_handle
-            .map(|handle| handle.join().unwrap_or_default())
-            .unwrap_or_default();
-        let (stderr_bytes, stderr_truncated) = stderr_handle
-            .map(|handle| handle.join().unwrap_or_default())
-            .unwrap_or_default();
-        Ok(CapturedOutput {
-            exit: if cancelled_child {
-                ProcessExit::Unknown
-            } else {
-                process_exit(&status)
-            },
-            success: !cancelled_child && status.success(),
-            stdout: stdout_bytes,
-            stderr: stderr_bytes,
-            stdout_truncated,
-            stderr_truncated,
-            duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        })
+        run_owned(program, args, cwd, max_bytes, cancelled)
     }
 }
 
