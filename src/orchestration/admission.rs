@@ -277,6 +277,11 @@ fn materialize_reservation(
     )
 }
 
+fn validation_refusal(code: &str, message: String) -> PreparedTarget {
+    let failure = job_failure(code, FailureClass::Validation, &message, false);
+    PreparedTarget::Refused(AdmissionRefusal { message, failure })
+}
+
 fn materialize_choice(
     profile: &Profile,
     choice: ProviderChoice,
@@ -284,43 +289,25 @@ fn materialize_choice(
     pickup: AdmissionPickup,
 ) -> Result<PreparedTarget> {
     let Some(provider) = profile.providers.get(&choice.provider) else {
-        return Ok(PreparedTarget::Refused(AdmissionRefusal {
-            message: format!("provider not found: {}", choice.provider),
-            failure: job_failure(
-                "provider_not_found",
-                FailureClass::Validation,
-                &format!("provider not found: {}", choice.provider),
-                false,
-            ),
-        }));
+        return Ok(validation_refusal(
+            "provider_not_found",
+            format!("provider not found: {}", choice.provider),
+        ));
     };
     let Some(entry) = profile.models.get(&choice.model) else {
-        return Ok(PreparedTarget::Refused(AdmissionRefusal {
-            message: format!("model not found: {}", choice.model),
-            failure: job_failure(
-                "model_not_found",
-                FailureClass::Validation,
-                &format!("model not found: {}", choice.model),
-                false,
-            ),
-        }));
+        return Ok(validation_refusal(
+            "model_not_found",
+            format!("model not found: {}", choice.model),
+        ));
     };
     if entry.provider != choice.provider || entry.id.is_empty() {
-        return Ok(PreparedTarget::Refused(AdmissionRefusal {
-            message: format!(
+        return Ok(validation_refusal(
+            "model_provider_mismatch",
+            format!(
                 "model {} is not runnable for provider {}",
                 choice.model, choice.provider
             ),
-            failure: job_failure(
-                "model_provider_mismatch",
-                FailureClass::Validation,
-                &format!(
-                    "model {} is not runnable for provider {}",
-                    choice.model, choice.provider
-                ),
-                false,
-            ),
-        }));
+        ));
     }
     let Some(endpoint) = provider
         .endpoint
@@ -328,45 +315,27 @@ fn materialize_choice(
         .filter(|endpoint| !endpoint.is_empty())
         .map(str::to_owned)
     else {
-        return Ok(PreparedTarget::Refused(AdmissionRefusal {
-            message: format!("provider {} has no endpoint configured", choice.provider),
-            failure: job_failure(
-                "missing_endpoint",
-                FailureClass::Validation,
-                &format!("provider {} has no endpoint configured", choice.provider),
-                false,
-            ),
-        }));
+        return Ok(validation_refusal(
+            "missing_endpoint",
+            format!("provider {} has no endpoint configured", choice.provider),
+        ));
     };
     if endpoint_has_userinfo(&endpoint) {
-        return Ok(PreparedTarget::Refused(AdmissionRefusal {
-            message: format!(
+        return Ok(validation_refusal(
+            "invalid_endpoint",
+            format!(
                 "provider {} endpoint must not contain userinfo",
                 choice.provider
             ),
-            failure: job_failure(
-                "invalid_endpoint",
-                FailureClass::Validation,
-                &format!(
-                    "provider {} endpoint must not contain userinfo",
-                    choice.provider
-                ),
-                false,
-            ),
-        }));
+        ));
     }
     if let Some(reference) = provider.credential_ref.as_deref() {
         let vault = crate::vault::Vault::user_global()?;
         if vault.get(reference)?.is_none() {
-            return Ok(PreparedTarget::Refused(AdmissionRefusal {
-                message: format!("credential not found: {reference}"),
-                failure: job_failure(
-                    "missing_credential",
-                    FailureClass::Validation,
-                    &format!("credential not found: {reference}"),
-                    false,
-                ),
-            }));
+            return Ok(validation_refusal(
+                "missing_credential",
+                format!("credential not found: {reference}"),
+            ));
         }
     }
     Ok(PreparedTarget::Resolved(ResolvedTarget {

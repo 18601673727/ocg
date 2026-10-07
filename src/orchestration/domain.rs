@@ -1740,13 +1740,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             &[&project_id],
             |row| {
                 let raw: String = row.get(0)?;
-                serde_json::from_str(&raw).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        raw.len(),
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })
+                decode_stored_json(&raw)
             },
         )
     }
@@ -4326,17 +4320,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
     }
 
     pub fn executor(&self, executor_id: &str) -> Result<Option<Executor>> {
-        self.connection
-            .query_row(
-                "SELECT id,attempt_id,kind,state,created_at FROM domain_executors WHERE id=?1",
-                [executor_id],
-                |row| {
-                    serde_rusqlite::from_row::<Executor>(row)
-                        .map_err(crate::error::sqlite_mapping_error)
-                },
-            )
-            .optional()
-            .map_err(sql)
+        read_executor(&self.connection, executor_id)
     }
 
     pub fn executor_for_attempt(&self, attempt_id: &str) -> Result<Option<Executor>> {
@@ -5170,21 +5154,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             .query_row(
                 &format!("SELECT {CALL_COLUMNS} FROM domain_calls c LEFT JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.id=?1"),
                 [call_id],
-                |row| {
-                    Ok(Call {
-                        id: row.get(0)?,
-                        attempt_id: row.get(1)?,
-                        executor_id: row.get(2)?,
-                        generation: u64::try_from(row.get::<_, i64>(3)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
-                        side_effect: row.get(4)?,
-                        state: row.get(5)?,
-                        request: row.get(6)?,
-                        response: row.get(7)?,
-                        created_at: row.get(8)?,
-                        finished_at: row.get(9)?,
-                        effect_kind: row.get::<_, String>(10)?.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    })
-                },
+                call_from_row,
             )
             .map_err(sql)
     }
@@ -5746,6 +5716,16 @@ fn emit_usage_evidence(
 
 const EXECUTOR_COLUMNS: &str = "id,attempt_id,kind,state,created_at";
 
+fn decode_stored_json<T: serde::de::DeserializeOwned>(raw: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            raw.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn call_from_row(row: &Row<'_>) -> rusqlite::Result<Call> {
     Ok(Call {
         id: row.get(0)?,
@@ -5793,13 +5773,7 @@ fn dispatch_intent_from_row(row: &Row<'_>) -> rusqlite::Result<DispatchIntent> {
         reservation_id: row.get(10)?,
         budget_admitted: row.get(11)?,
         pricing_basis: match row.get::<_, Option<String>>(12)? {
-            Some(raw) => Some(serde_json::from_str(&raw).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    raw.len(),
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?),
+            Some(raw) => Some(decode_stored_json(&raw)?),
             None => None,
         },
         provider_key: row.get(13)?,
@@ -7031,14 +7005,7 @@ fn all_job_configurations(connection: &Connection) -> Result<Vec<journal::Stored
         &[],
         |row| {
             let configuration: String = row.get(1)?;
-            let configuration: serde_json::Value =
-                serde_json::from_str(&configuration).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        configuration.len(),
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
+            let configuration: serde_json::Value = decode_stored_json(&configuration)?;
             let revision =
                 u64::try_from(row.get::<_, i64>(2)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
             Ok(journal::StoredJobConfiguration {
@@ -7075,13 +7042,7 @@ fn all_verifications(connection: &Connection) -> Result<Vec<journal::StoredVerif
         &[],
         |row| {
             let report: String = row.get(2)?;
-            let report: serde_json::Value = serde_json::from_str(&report).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    report.len(),
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
+            let report: serde_json::Value = decode_stored_json(&report)?;
             Ok(journal::StoredVerification {
                 call_id: row.get(0)?,
                 passed: row.get(1)?,
@@ -7122,13 +7083,7 @@ fn all_settlements(connection: &Connection) -> Result<Vec<budget::Settlement>> {
         &[],
         |row| {
             let raw: String = row.get(0)?;
-            serde_json::from_str(&raw).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    raw.len(),
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })
+            decode_stored_json(&raw)
         },
     )
 }
@@ -7163,13 +7118,7 @@ fn all_budgets(connection: &Connection) -> Result<Vec<BudgetLedgerRow>> {
         |row| {
             let project_id: String = row.get(0)?;
             let raw: String = row.get(1)?;
-            let ledger = serde_json::from_str::<budget::ProjectBudget>(&raw).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    raw.len(),
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
+            let ledger = decode_stored_json::<budget::ProjectBudget>(&raw)?;
             Ok(BudgetLedgerRow { project_id, ledger })
         },
     )
