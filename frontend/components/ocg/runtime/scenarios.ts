@@ -69,6 +69,32 @@ export function resolveScenario(value: string | undefined | null): ScenarioId {
   return SCENARIO_IDS.includes(value as ScenarioId) ? (value as ScenarioId) : DEFAULT_SCENARIO;
 }
 
+/**
+ * Single authority rule for workspace URLs.
+ *
+ * - canonical runtime: never emit or retain any `scenario=` value. Product
+ *   URLs are `project=`/`session=`/`view=`/`job=` only; fixture state must not
+ *   leak into them.
+ * - mock runtime: preserve the existing fixture scenario behavior unchanged.
+ *   `demo=1` behavior is unchanged.
+ */
+export function scenarioParamForWorkspaceUrl(
+  authority: "canonical" | "mock",
+  scenario: ScenarioId,
+): ScenarioId | null {
+  if (authority === "canonical") return null;
+  return scenario;
+}
+
+/** Strip any `scenario=` state from a canonical URL in place. Mock untouched. */
+export function stripCanonicalScenario(
+  url: URL,
+  authority: "canonical" | "mock",
+): void {
+  if (authority !== "canonical") return;
+  url.searchParams.delete("scenario");
+}
+
 const baseSession: ChatSession = {
   id: "design-pwa-shell",
   title: "OCG PWA shell",

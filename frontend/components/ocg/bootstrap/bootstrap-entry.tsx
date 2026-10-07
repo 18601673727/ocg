@@ -44,7 +44,9 @@ export function BootstrapEntry() {
         // satisfy the same selection/endpoint/credential rules as canonical
         // launch. No fixture scenario and no local re-derivation here.
         const ready = view.runnable_choices.length > 0;
-        const target = ready ? "/?scenario=local-ready" : "/onboarding?scenario=local-first-run";
+        // Canonical product URLs carry only `project=`; fixture `scenario=`
+        // state must not leak into the ready/onboarding entries.
+        const target = ready ? "/" : "/onboarding";
         // The launched Project travels with the entry so the workspace sees the
         // same explicit identity the launcher registered.
         const project = resolveProjectParam(new URLSearchParams(window.location.search).get("project"));

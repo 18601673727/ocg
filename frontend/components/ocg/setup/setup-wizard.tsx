@@ -62,9 +62,10 @@ function entryProject(requested: ProjectId | undefined, registered: ReadonlyArra
   return registered[0]?.id ?? "";
 }
 
-/** The workspace entry URL for the Project setup resolved. */
+/** The workspace entry URL for the Project setup resolved. Canonical product
+ * URLs carry only `project=`; fixture `scenario=` never leaks here. */
 function workspaceHref(projectId: ProjectId): string {
-  return projectId ? withProjectParam("/?scenario=local-ready", projectId) : "/?scenario=local-ready";
+  return projectId ? withProjectParam("/", projectId) : "/";
 }
 
 function verifiedFrom(view: ProfileView): Verified | null {

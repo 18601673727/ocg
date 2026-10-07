@@ -15,6 +15,7 @@ import { selectBootstrapEntry } from "./selectors";
 import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
 import { useI18n } from "../i18n";
+import { resolveProjectParam, withProjectParam } from "../project/domain";
 
 /**
  * Clean root entry gate. The normalized bootstrap state decides whether the
@@ -82,7 +83,11 @@ function CanonicalReadinessGate({ children }: { children: ReactNode }) {
         setState({ status: "ready" });
       } else {
         setState({ status: "setup" });
-        router.replace("/onboarding");
+        // Canonical onboarding URL carries only `project=`; no fixture state.
+        const project = typeof window !== "undefined"
+          ? resolveProjectParam(new URLSearchParams(window.location.search).get("project"))
+          : undefined;
+        router.replace(project ? withProjectParam("/onboarding", project) : "/onboarding");
       }
     }).catch((cause: unknown) => {
       if (!cancelled) setState({ status: "failed", error: cause instanceof Error ? cause.message : t("shell.profileReadFailed") });

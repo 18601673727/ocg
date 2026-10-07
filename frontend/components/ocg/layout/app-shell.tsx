@@ -49,6 +49,17 @@ import {
 import type { JobLaunchResult } from "../runtime/runtime-types";
 import { workspaceViewHref, type WorkspaceView } from "./view-domain";
 import { useI18n } from "../i18n";
+import {
+  canonicalUrlSessionId,
+  findSessionByKey,
+  findSessionByUrlParam,
+  internalIdToUrlParam,
+  urlParamForInternalId,
+} from "../chat/session-identity";
+import {
+  scenarioParamForWorkspaceUrl,
+  stripCanonicalScenario,
+} from "../runtime/scenarios";
 
 export type { WorkspaceView } from "./view-domain";
 
@@ -172,12 +183,15 @@ export function RuntimeWorkspace({
   const [activeSessionId, setActiveSessionId] = useState(() => searchParams.get("session") ?? "");
   const selectedSessions = useRef<Record<string, string>>({});
   const rememberSession = useCallback((id: string) => {
+    // In-memory selection keeps the internal frontend key for snapshot maps;
+    // the URL carries only the canonical `session_id`, never the composite.
     selectedSessions.current[activeProjectId] = id;
     const url = new URL(window.location.href);
-    if (id) url.searchParams.set("session", id);
+    if (id) url.searchParams.set("session", internalIdToUrlParam(id));
     else url.searchParams.delete("session");
+    stripCanonicalScenario(url, runtimeAuthority);
     window.history.replaceState(null, "", `${url.pathname}${url.search}`);
-  }, [activeProjectId]);
+  }, [activeProjectId, runtimeAuthority]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [inspectorMode, setInspectorMode] = useState<InspectorMode>(runtimeAuthority === "canonical" ? "docked" : "collapsed");
@@ -212,14 +226,38 @@ export function RuntimeWorkspace({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const activeSession = snapshot.sessions.find((session) => session.id === activeSessionId) ?? snapshot.sessions[0];
+  // URL authority: an explicit `?session=` is authoritative within the active
+  // Project and never falls back. Absent `session=` keeps the existing
+  // remembered/first-session behavior. `snapshot.sessions` is already the
+  // active Project's projection, so resolution can never cross Projects.
+  const requestedSessionParam = searchParams.get("session");
+  const hasExplicitSessionParam = requestedSessionParam !== null && requestedSessionParam !== "";
+  // Internal selection key stays `session.id` for snapshot maps; the URL holds
+  // only the canonical `session_id`. When explicit, derive strictly from the
+  // URL so an unknown value selects nothing instead of remembered/first.
+  const activeSession = hasExplicitSessionParam
+    ? findSessionByUrlParam(snapshot.sessions, requestedSessionParam)
+    : (activeSessionId ? findSessionByKey(snapshot.sessions, activeSessionId) : undefined) ?? snapshot.sessions[0];
   const activeSessionKey = activeSession?.id;
+  const activeSessionUrlParam = activeSession ? canonicalUrlSessionId(activeSession) : null;
   useEffect(() => {
-    const requestedSessionId = searchParams.get("session");
-    const nextSessionId = requestedSessionId && snapshot.sessions.some((session) => session.id === requestedSessionId)
-      ? requestedSessionId
-      : resolveSelectedSessionId(selectedSessions.current[activeProjectId], snapshot.sessions) ?? "";
-    setActiveSessionId((current) => current === nextSessionId ? current : nextSessionId);
+    const requested = searchParams.get("session");
+    if (requested === null || requested === "") {
+      // ABSENT: existing remembered/first-session fallback is allowed.
+      const nextSessionId = resolveSelectedSessionId(selectedSessions.current[activeProjectId], snapshot.sessions) ?? "";
+      setActiveSessionId((current) => current === nextSessionId ? current : nextSessionId);
+      return;
+    }
+    // PRESENT: resolve only within the active Project, canonical `sessionId`
+    // first then legacy internal `session.id`. Unknown selects nothing and
+    // preserves the explicit URL value (no rewrite elsewhere).
+    const matched = findSessionByUrlParam(snapshot.sessions, requested)?.id;
+    if (matched) {
+      selectedSessions.current[activeProjectId] = matched;
+      setActiveSessionId((current) => current === matched ? current : matched);
+    } else {
+      setActiveSessionId((current) => current === "" ? current : "");
+    }
   }, [activeProjectId, searchParams, snapshot.sessions]);
   const busySessionIds = snapshot.sessions.filter(session => (snapshot.messagesBySession[session.id] ?? []).some(message =>
     message.role === "assistant" && (message.status === "pending" || message.status === "streaming"),
@@ -243,12 +281,57 @@ export function RuntimeWorkspace({
     setLaunchResults(withoutDraft);
   }, [activeProjectId, activeProjectSessionIds, activeSessionKey, client, deleteSession, rememberSession, snapshot.sessions, t]);
   useEffect(() => {
-    if (runtimeAuthority !== "canonical" || historyStatus !== "ready" || !activeSessionKey) return;
+    if (runtimeAuthority !== "canonical" || historyStatus !== "ready" || !activeSessionKey || !activeSessionUrlParam) return;
     // Idempotent: only rewrite the URL when the current selection drifted,
-    // never race the url update coming from a session handler.
-    const current = new URLSearchParams(window.location.search).get("session");
-    if (current !== activeSessionKey) rememberSession(activeSessionKey);
-  }, [activeSessionKey, historyStatus, rememberSession, runtimeAuthority]);
+    // never race the url update coming from a session handler. Canonical URLs
+    // hold the raw `session_id`; a legacy composite value normalizes here.
+    // Unknown explicit values have no active session and return early above,
+    // so this never rewrites an unknown `session=` to another session.
+    const url = new URL(window.location.href);
+    const current = url.searchParams.get("session");
+    const scenarioBefore = url.searchParams.get("scenario");
+    stripCanonicalScenario(url, runtimeAuthority);
+    const scenarioStripped = scenarioBefore !== url.searchParams.get("scenario");
+    if (current !== activeSessionUrlParam || scenarioStripped) rememberSession(activeSessionKey);
+  }, [activeSessionKey, activeSessionUrlParam, historyStatus, rememberSession, runtimeAuthority]);
+  useEffect(() => {
+    // Canonical runtime never retains any `scenario=` state, even with no
+    // active session (e.g. explicit unknown `session=`). Mock untouched.
+    if (runtimeAuthority !== "canonical") return;
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has("scenario")) return;
+    stripCanonicalScenario(url, runtimeAuthority);
+    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+  }, [runtimeAuthority, searchParams]);
+  const autoDraftInFlight = useRef<Record<string, boolean>>({});
+  useEffect(() => {
+    // HA-UX-01: an empty canonical Project lands directly on a usable blank
+    // draft. Reuses `createSession()` local-draft semantics, so no backend
+    // Conversation/Job exists until the first send, and repeated entries reuse
+    // the untouched draft instead of stacking ghosts. Explicit `?session=`
+    // (even unknown) is never auto-rewritten: preserve it and select nothing.
+    if (runtimeAuthority !== "canonical") return;
+    if (historyStatus !== "ready") return;
+    if (!activeProjectId) return;
+    if (snapshot.sessions.length > 0) return;
+    const explicit = searchParams.get("session");
+    if (explicit !== null && explicit !== "") return;
+    if (autoDraftInFlight.current[activeProjectId]) return;
+    autoDraftInFlight.current[activeProjectId] = true;
+    void (async () => {
+      try {
+        const session = await createSession({ workType: "coding", projectId: activeProjectId });
+        registerProjectSession(session.id, activeProjectId);
+        setActiveSessionId(session.id);
+        rememberSession(session.id);
+      } catch {
+        // Leave the empty workspace as the fallback; a retry happens on the
+        // next ready projection.
+      } finally {
+        autoDraftInFlight.current[activeProjectId] = false;
+      }
+    })();
+  }, [runtimeAuthority, historyStatus, activeProjectId, snapshot.sessions.length, searchParams, createSession, registerProjectSession, rememberSession]);
   const isUsage = view === "usage";
   const isLedger = view === "ledger" && runtimeAuthority === "mock";
   const isControlCenter = view === "control-center";
@@ -292,15 +375,28 @@ export function RuntimeWorkspace({
   const withProject = useCallback(
     (path: string, projectId: ProjectId = activeProjectId) => {
       const scoped = projectId ? withProjectParam(path, projectId) : path;
-      return activeSessionKey ? `${scoped}${scoped.includes("?") ? "&" : "?"}session=${encodeURIComponent(activeSessionKey)}` : scoped;
+      // Canonical URLs carry the raw `session_id`, never the composite key.
+      // With no active session (e.g. explicit unknown `?session=`), preserve
+      // the explicit value so view navigations never drop it.
+      let param = activeSessionUrlParam ?? (activeSessionKey ? internalIdToUrlParam(activeSessionKey) : null);
+      if (!param && typeof window !== "undefined") {
+        const explicit = new URLSearchParams(window.location.search).get("session");
+        if (explicit !== null && explicit !== "") param = explicit;
+      }
+      return param ? `${scoped}${scoped.includes("?") ? "&" : "?"}session=${encodeURIComponent(param)}` : scoped;
     },
-    [activeProjectId, activeSessionKey],
+    [activeProjectId, activeSessionKey, activeSessionUrlParam],
   );
 
   /**
    * The one navigation path for every workspace control in the shell. Where a
    * view lives, and whether selecting it again closes it, is decided by the
    * view domain, so the topbar, sidebar and surfaces all agree.
+   *
+   * Canonical product URLs carry only `project=`/`session=`/`view=`/`job=`;
+   * fixture `scenario=` is emitted only for the mock runtime. `sessionId`
+   * arguments are internal frontend keys and are translated to the canonical
+   * `session_id` before touching the URL.
    */
   const navigate = useCallback((target: WorkspaceView, sessionId?: string) => {
     setMobileNavOpen(false);
@@ -309,29 +405,34 @@ export function RuntimeWorkspace({
     if (href !== null) {
       // Update the view without replacing the page and its runtime providers,
       // including when the workspace was entered through a standalone route.
-      const url = new URL(withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`), window.location.origin);
-      if (sessionId) url.searchParams.set("session", sessionId);
+      const scenarioParam = scenarioParamForWorkspaceUrl(runtimeAuthority, snapshot.scenario);
+      const base = scenarioParam ? `${href}&scenario=${encodeURIComponent(scenarioParam)}` : href;
+      const url = new URL(withProject(base), window.location.origin);
+      if (sessionId) url.searchParams.set("session", urlParamForInternalId(snapshot.sessions, sessionId));
       // A Job is selected by jobId; leaving the Job surface clears it.
       if (target !== "job-execution") url.searchParams.delete("job");
       if (new URLSearchParams(window.location.search).get("demo") === "1") url.searchParams.set("demo", "1");
       startTransition(() => window.history.pushState(null, "", url.pathname + url.search));
     }
-  }, [snapshot.scenario, view, withProject]);
+  }, [runtimeAuthority, snapshot.scenario, snapshot.sessions, view, withProject]);
 
   // Selecting a Project-owned Job addresses the Job surface directly. The
   // toggle-back-to-chat resolution of workspaceViewHref is deliberately not used
   // here: re-selecting another Job while already on the Job surface is a Job
-  // change, not a navigation away from it.
+  // change, not a navigation away from it. Canonical Job URLs carry no
+  // fixture `scenario=`; mock navigation keeps its existing scenario.
   const openJob = useCallback((jobId: string) => {
     setMobileNavOpen(false);
     setMobileInspectorOpen(false);
     const href = workspaceViewHref("chat", "job-execution");
     if (!href) return;
-    const url = new URL(withProject(`${href}&scenario=${encodeURIComponent(snapshot.scenario)}`), window.location.origin);
+    const scenarioParam = scenarioParamForWorkspaceUrl(runtimeAuthority, snapshot.scenario);
+    const base = scenarioParam ? `${href}&scenario=${encodeURIComponent(scenarioParam)}` : href;
+    const url = new URL(withProject(base), window.location.origin);
     url.searchParams.set("job", jobId);
     if (new URLSearchParams(window.location.search).get("demo") === "1") url.searchParams.set("demo", "1");
     window.history.pushState(null, "", url.pathname + url.search);
-  }, [snapshot.scenario, withProject]);
+  }, [runtimeAuthority, snapshot.scenario, withProject]);
 
   const handleNewChat = useCallback(async () => {
     const session = await createSession({ workType: "coding", projectId: activeProjectId });
@@ -588,12 +689,14 @@ export function RuntimeWorkspace({
     if (typeof window !== "undefined") {
       const url = new URL(window.location.href);
       url.searchParams.set("project", id);
-      if (nextSessionId) url.searchParams.set("session", nextSessionId);
+      // Canonical URLs hold the raw `session_id`, never the composite key.
+      if (nextSessionId) url.searchParams.set("session", urlParamForInternalId(runtimeSnapshot.sessions, nextSessionId));
       else url.searchParams.delete("session");
       url.searchParams.delete("job");
+      stripCanonicalScenario(url, runtimeAuthority);
       window.history.replaceState(null, "", `${url.pathname}${url.search}`);
     }
-  }, [runtimeSnapshot.sessions, setActiveProject]);
+  }, [runtimeAuthority, runtimeSnapshot.sessions, setActiveProject]);
 
   const messages = activeSession ? snapshot.messagesBySession[activeSession.id] ?? [] : [];
   const execution = activeSession ? snapshot.executionBySession[activeSession.id] ?? null : null;
@@ -726,7 +829,7 @@ export function RuntimeWorkspace({
         {isUsage ? (
           <main aria-label={t("nav.usage")} className="flex min-h-0 flex-1 overflow-hidden">
             <UsageSurface key={activeProjectId} baseUrl={runtimeAuthority === "canonical" ? ocgControlUrl : null} projectId={activeProjectId} onSelectSession={id => {
-              const session = snapshot.sessions.find(item => item.sessionId === id || item.id === id);
+              const session = findSessionByUrlParam(snapshot.sessions, id);
               if (session) selectSession(session.id);
             }} />
           </main>
@@ -817,7 +920,7 @@ export function RuntimeWorkspace({
           </main>
         ) : !activeProjectId ? (
           <main aria-label="No project selected" className="flex min-h-0 flex-1 items-center justify-center">
-            <NoProjectNotice onAddProject={() => router.push("/onboarding?scenario=local-first-run")} />
+            <NoProjectNotice onAddProject={() => router.push("/onboarding")} />
           </main>
         ) : historyStatus !== "ready" ? (
           <main aria-label="Chat history" className="flex min-h-0 flex-1 items-center justify-center p-6">
