@@ -109,7 +109,7 @@ use crate::orchestration::budget::{
     BudgetOrigin, BudgetStatus, Money, Reservation, Settlement, UsageRecord,
 };
 use crate::orchestration::domain::{Attempt, Call, DispatchIntent, Executor, Job, Project};
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1026,7 +1026,7 @@ pub(crate) fn read_after(
     let rows = statement
         .query_map(
             params![to_i64(after)?, to_i64(bound(limit) as u64)?],
-            RawEvent::from_row,
+            |row| serde_rusqlite::from_row(row).map_err(crate::error::sqlite_mapping_error),
         )
         .map_err(sql)?;
     collect(rows)
@@ -1047,7 +1047,7 @@ pub(crate) fn read_for_job(
     let rows = statement
         .query_map(
             params![job_id, to_i64(after)?, to_i64(bound(limit) as u64)?],
-            RawEvent::from_row,
+            |row| serde_rusqlite::from_row(row).map_err(crate::error::sqlite_mapping_error),
         )
         .map_err(sql)?;
     collect(rows)
@@ -1064,6 +1064,7 @@ where
     Ok(events)
 }
 
+#[derive(Deserialize)]
 struct RawEvent {
     seq: i64,
     event_id: String,
@@ -1087,30 +1088,6 @@ struct RawEvent {
 }
 
 impl RawEvent {
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            seq: row.get(0)?,
-            event_id: row.get(1)?,
-            kind: row.get(2)?,
-            entity_type: row.get(3)?,
-            entity_id: row.get(4)?,
-            project_id: row.get(5)?,
-            job_id: row.get(6)?,
-            attempt_id: row.get(7)?,
-            executor_id: row.get(8)?,
-            call_id: row.get(9)?,
-            dispatch_intent_id: row.get(10)?,
-            generation: row.get(11)?,
-            authority_attempt_id: row.get(12)?,
-            authority_generation: row.get(13)?,
-            caused_by_seq: row.get(14)?,
-            causation_key: row.get(15)?,
-            actor: row.get(16)?,
-            payload: row.get(17)?,
-            recorded_at: row.get(18)?,
-        })
-    }
-
     fn into_event(self) -> Result<ExecutionEvent> {
         let kind: EventKind = self
             .kind

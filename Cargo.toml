@@ -46,6 +46,9 @@ strum = { version = "0.27", features = ["derive"] }
 schemars = "1.2"
 jsonschema = { version = "0.58", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
+serde_rusqlite = { version = "0.43.0", default-features = false }
+url = { version = "2.5.8", default-features = false, features = ["std"] }
+ignore = { version = "0.4.33", default-features = false }
 # Incremental architecture dependencies. Keep features narrow until the
 # corresponding runtime, diagnostics, error, parsing, and identifier layers
 # are migrated in later steps.

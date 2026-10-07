@@ -2832,11 +2832,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 "SELECT id,root,created_at FROM domain_projects WHERE root=?1",
                 [root],
                 |row| {
-                    Ok(Project {
-                        id: row.get(0)?,
-                        root: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
+                    serde_rusqlite::from_row::<Project>(row)
+                        .map_err(crate::error::sqlite_mapping_error)
                 },
             )
             .map_err(sql)
@@ -2860,11 +2857,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 "SELECT id,root,created_at FROM domain_projects WHERE root=?1",
                 [&root],
                 |row| {
-                    Ok(Project {
-                        id: row.get(0)?,
-                        root: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
+                    serde_rusqlite::from_row::<Project>(row)
+                        .map_err(crate::error::sqlite_mapping_error)
                 },
             )
             .optional()
@@ -4289,11 +4283,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 "SELECT id,root,created_at FROM domain_projects WHERE id=?1",
                 [&project_id],
                 |row| {
-                    Ok(Project {
-                        id: row.get(0)?,
-                        root: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
+                    serde_rusqlite::from_row::<Project>(row)
+                        .map_err(crate::error::sqlite_mapping_error)
                 },
             )
             .map_err(sql)?;
@@ -4340,13 +4331,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 "SELECT id,attempt_id,kind,state,created_at FROM domain_executors WHERE id=?1",
                 [executor_id],
                 |row| {
-                    Ok(Executor {
-                        id: row.get(0)?,
-                        attempt_id: row.get(1)?,
-                        kind: row.get(2)?,
-                        state: row.get(3)?,
-                        created_at: row.get(4)?,
-                    })
+                    serde_rusqlite::from_row::<Executor>(row)
+                        .map_err(crate::error::sqlite_mapping_error)
                 },
             )
             .optional()
@@ -4359,13 +4345,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 "SELECT id,attempt_id,kind,state,created_at FROM domain_executors WHERE attempt_id=?1 ORDER BY created_at,id LIMIT 1",
                 [attempt_id],
                 |row| {
-                    Ok(Executor {
-                        id: row.get(0)?,
-                        attempt_id: row.get(1)?,
-                        kind: row.get(2)?,
-                        state: row.get(3)?,
-                        created_at: row.get(4)?,
-                    })
+                    serde_rusqlite::from_row::<Executor>(row)
+                        .map_err(crate::error::sqlite_mapping_error)
                 },
             )
             .optional()
@@ -5763,16 +5744,6 @@ fn emit_usage_evidence(
 // journal always records exactly what a reader would observe.
 // -------------------------------------------------------------------------
 
-fn executor_from_row(row: &Row<'_>) -> rusqlite::Result<Executor> {
-    Ok(Executor {
-        id: row.get(0)?,
-        attempt_id: row.get(1)?,
-        kind: row.get(2)?,
-        state: row.get(3)?,
-        created_at: row.get(4)?,
-    })
-}
-
 const EXECUTOR_COLUMNS: &str = "id,attempt_id,kind,state,created_at";
 
 fn call_from_row(row: &Row<'_>) -> rusqlite::Result<Call> {
@@ -6158,7 +6129,7 @@ fn read_executor(connection: &Connection, executor_id: &str) -> Result<Option<Ex
         .query_row(
             &format!("SELECT {EXECUTOR_COLUMNS} FROM domain_executors WHERE id=?1"),
             [executor_id],
-            executor_from_row,
+            |row| serde_rusqlite::from_row(row).map_err(crate::error::sqlite_mapping_error),
         )
         .optional()
         .map_err(sql)
@@ -6855,13 +6826,7 @@ fn all_projects(connection: &Connection) -> Result<Vec<Project>> {
         connection,
         "SELECT id,root,created_at FROM domain_projects ORDER BY created_at,id",
         &[],
-        |row| {
-            Ok(Project {
-                id: row.get(0)?,
-                root: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        },
+        |row| serde_rusqlite::from_row::<Project>(row).map_err(crate::error::sqlite_mapping_error),
     )
 }
 
@@ -6888,7 +6853,7 @@ fn all_executors(connection: &Connection) -> Result<Vec<Executor>> {
         connection,
         &format!("SELECT {EXECUTOR_COLUMNS} FROM domain_executors ORDER BY created_at,id"),
         &[],
-        executor_from_row,
+        |row| serde_rusqlite::from_row(row).map_err(crate::error::sqlite_mapping_error),
     )
 }
 
@@ -6901,7 +6866,7 @@ fn attempt_executors(connection: &Connection, attempt_id: &str) -> Result<Vec<Ex
             "SELECT {EXECUTOR_COLUMNS} FROM domain_executors WHERE attempt_id=?1 ORDER BY created_at,id"
         ),
         &[&attempt_id],
-        executor_from_row,
+        |row| serde_rusqlite::from_row(row).map_err(crate::error::sqlite_mapping_error),
     )
 }
 

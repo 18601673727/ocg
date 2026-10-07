@@ -139,22 +139,18 @@ pub fn github_token_from_env(env: &dyn HttpEnv) -> Option<GithubToken> {
 /// The scheme is checked so a token can never be attached to a cleartext URL,
 /// even if a caller bypasses the transport's HTTPS guard.
 pub fn is_github_api_url(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    if !scheme.eq_ignore_ascii_case("https") {
+    let Some((_, rest)) = url.split_once("://") else {
         return false;
-    }
+    };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     let authority = authority.rsplit('@').next().unwrap_or("");
-    if authority.starts_with('[') {
-        return false;
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (authority, None),
-    };
-    host.eq_ignore_ascii_case("api.github.com") && matches!(port, None | Some("443"))
+    parsed.scheme() == "https"
+        && parsed.host_str() == Some("api.github.com")
+        && (authority.eq_ignore_ascii_case("api.github.com")
+            || authority.eq_ignore_ascii_case("api.github.com:443"))
 }
 
 /// Which GitHub API headers a request should carry. Presence only; the token
@@ -564,47 +560,33 @@ struct ProxyDial {
 
 fn parse_proxy_dial(raw: &str) -> Result<ProxyDial> {
     let raw = raw.trim();
-    let (scheme, rest) = raw
-        .split_once("://")
-        .ok_or_else(|| OcgError::config("proxy endpoint has no scheme"))?;
-    if !scheme.eq_ignore_ascii_case("http") {
+    let parsed = url::Url::parse(raw).map_err(|_| OcgError::config("proxy endpoint is invalid"))?;
+    if parsed.scheme() != "http" {
         return Err(OcgError::config(
             "proxy endpoint uses an unsupported scheme; only http:// proxies tunnel CONNECT",
         ));
     }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        return Err(OcgError::config("proxy endpoint has no authority"));
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| OcgError::config("proxy endpoint has no host"))?
+        .trim_matches(['[', ']'])
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| OcgError::config("proxy endpoint has an invalid port"))?;
+    let authority = raw
+        .split_once("://")
+        .ok_or_else(|| OcgError::config("proxy endpoint has no scheme"))?
+        .1
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() || authority.contains('\\') {
+        return Err(OcgError::config("proxy endpoint has no valid authority"));
     }
-    let (userinfo, hostport) = match authority.rsplit_once('@') {
-        Some((user, host)) => (Some(user), host),
-        None => (None, authority),
-    };
-    if hostport.is_empty() {
-        return Err(OcgError::config("proxy endpoint has no host"));
-    }
-    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
-        let end = inner
-            .find(']')
-            .ok_or_else(|| OcgError::config("proxy endpoint has a malformed IPv6 host"))?;
-        let host = inner[..end].to_string();
-        let port = inner[end + 1..]
-            .strip_prefix(':')
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(80);
-        (host, port)
-    } else if hostport.matches(':').count() == 1 {
-        let (host, port) = hostport.split_once(':').unwrap_or((hostport, ""));
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| OcgError::config("proxy endpoint has an invalid port"))?;
-        (host.to_string(), port)
-    } else {
-        (hostport.to_string(), 80)
-    };
-    if host.is_empty() {
-        return Err(OcgError::config("proxy endpoint has no host"));
-    }
+    let userinfo = authority
+        .rsplit_once('@')
+        .map(|(credentials, _)| credentials);
     let auth = match userinfo {
         Some(credentials) if !credentials.is_empty() => {
             use base64::Engine;

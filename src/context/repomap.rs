@@ -13,7 +13,7 @@ use crate::error::{OcgError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Directory names that are never walked.
 pub const EXCLUDED_DIRS: &[&str] = &[
@@ -126,16 +126,29 @@ pub fn build(root: &Path, config: &ContextConfig, snapshot: &GitSnapshot) -> Res
     }
 
     let mut raw = Vec::new();
-    let truncated = {
-        let mut state = WalkState {
-            out: &mut raw,
-            limit: config.max_repository_files,
-            truncated: false,
-            stopped: false,
-        };
-        walk(&mut state, root);
-        state.truncated
-    };
+    let mut truncated = false;
+    let walker = ignore::WalkBuilder::new(root)
+        .standard_filters(false)
+        .follow_links(false)
+        .sort_by_file_name(Ord::cmp)
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || (entry.file_name() != OCG_DIR
+                    && !(entry.file_type().is_some_and(|kind| kind.is_dir())
+                        && EXCLUDED_DIRS.contains(&entry.file_name().to_string_lossy().as_ref())))
+        })
+        .build();
+    for entry in walker.flatten() {
+        if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if raw.len() >= config.max_repository_files {
+            truncated = true;
+            break;
+        }
+        let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        raw.push((entry.into_path(), size));
+    }
     raw.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut files = Vec::with_capacity(raw.len());
@@ -251,53 +264,6 @@ pub fn relative_path(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-/// Breadth-first-capable walk state. Traversal is deterministic (directories
-/// and files are visited in sorted name order), so stopping at the cap yields
-/// the same file set on every run for the same tree.
-struct WalkState<'a> {
-    out: &'a mut Vec<(PathBuf, u64)>,
-    limit: usize,
-    truncated: bool,
-    stopped: bool,
-}
-
-fn walk(state: &mut WalkState<'_>, dir: &Path) {
-    if state.stopped {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries: Vec<fs::DirEntry> = entries.flatten().collect();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        if state.stopped {
-            return;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == OCG_DIR {
-            continue;
-        }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            if !EXCLUDED_DIRS.contains(&name.as_str()) {
-                walk(state, &entry.path());
-            }
-        } else if file_type.is_file() {
-            if state.out.len() >= state.limit {
-                // One more file exists than the cap allows: stop and be honest.
-                state.truncated = true;
-                state.stopped = true;
-                return;
-            }
-            let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-            state.out.push((entry.path(), size));
-        }
-    }
 }
 
 fn read_head(path: &Path) -> Option<Vec<u8>> {

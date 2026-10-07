@@ -114,3 +114,14 @@ impl OcgError {
 }
 
 pub type Result<T> = std::result::Result<T, OcgError>;
+
+pub(crate) fn sqlite_mapping_error(error: serde_rusqlite::Error) -> rusqlite::Error {
+    match error {
+        serde_rusqlite::Error::Rusqlite(error) => error,
+        error => rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Null,
+            Box::new(error),
+        ),
+    }
+}
