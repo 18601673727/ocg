@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub(crate) mod context_cost;
+mod request_projection;
 #[cfg(test)]
 mod tests;
 
@@ -1990,7 +1991,8 @@ async fn execute_provider_loop(
             }
         }
 
-        let round_response = provider.complete(request).await?;
+        let projected_request = request_projection::project(request);
+        let round_response = provider.complete(&projected_request).await?;
         ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
 
         if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
