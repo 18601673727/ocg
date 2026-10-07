@@ -290,9 +290,17 @@ pub struct JournalPrune {
 }
 
 /// Install the journal and its retention boundary, then reconcile the boundary
-/// with whatever is already durable. Safe to call on every open.
+/// with whatever is already durable. Store bootstrap runs this once per schema
+/// generation.
 pub(crate) fn ensure_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(SCHEMA).map_err(sql)?;
+    reconcile_boundary(connection)
+}
+
+/// Reconcile the retention boundary with the events that are durable now. This
+/// repairs drift caused by rows removed outside this module, so it belongs to
+/// startup recovery rather than to every repository open.
+pub(crate) fn reconcile_boundary(connection: &Connection) -> Result<()> {
     let transaction = begin(connection)?;
     let stored: i64 = transaction
         .query_row(

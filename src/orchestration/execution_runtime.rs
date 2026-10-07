@@ -49,8 +49,9 @@ impl ExecutionRuntime {
         let native_tool_dispatcher = BoundedDispatcher::new(native_tool_capacity)?;
         let cancelled = Arc::new(AtomicBool::new(false));
         // Finish the recovery scan before exposing a handle for new admissions.
-        let recovered = crate::orchestration::domain::DomainRepository::open(project_root)?
-            .recover_provider_dispatches()?;
+        let mut domain = crate::orchestration::domain::DomainRepository::open(project_root)?;
+        domain.recover_startup()?;
+        let recovered = domain.recover_provider_dispatches()?;
 
         let provider_in_flight_limit = Arc::new(std::sync::atomic::AtomicUsize::new(
             provider_in_flight_limit,

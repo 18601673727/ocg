@@ -1563,6 +1563,7 @@ pub fn run_provider_dispatcher(
     // Recover provider dispatches: fence unsafe ones, collect ready ones
     let recovered = {
         let mut domain = DomainRepository::open(project_root)?;
+        domain.recover_startup()?;
         let ready = domain.recover_provider_dispatches()?;
         if !ready.is_empty() {
             eprintln!(

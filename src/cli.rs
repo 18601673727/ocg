@@ -520,6 +520,7 @@ fn native_cache(
 
 fn reconcile_command(root: &Path, _args: &[OsString], pretty: bool) -> Result<i32, Failure> {
     let mut repository = crate::orchestration::domain::DomainRepository::open(root)?;
+    repository.recover_startup()?;
     print_json(&repository.reconcile_dispatches()?, pretty).map(|_| 0)
 }
 

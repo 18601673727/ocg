@@ -303,6 +303,12 @@ where
     Ok((spec, payload))
 }
 
+/// The schema generation recorded by the last completed bootstrap. Stores that
+/// predate the gate report `0`.
+fn schema_generation(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.query_row("PRAGMA user_version", [], |row| row.get(0))
+}
+
 fn ensure_column(
     connection: &Connection,
     table: &str,
@@ -728,6 +734,13 @@ pub struct CanonicalAdmission {
     pub executor: Executor,
 }
 
+/// Schema generation of the canonical domain database, recorded in SQLite's
+/// `user_version`. Ordinary opens read it and skip bootstrap entirely when it
+/// is current. Bump it whenever the bootstrap body gains work that existing
+/// stores must receive. Stores created before this gate report `0`, so their
+/// first open runs the full bootstrap once; every step in it is idempotent.
+const DOMAIN_SCHEMA_VERSION: i64 = 1;
+
 const DOMAIN_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS domain_projects (
     id TEXT PRIMARY KEY,
@@ -983,32 +996,49 @@ impl DomainRepository {
             .ok_or_else(|| invalid("canonical database has no parent directory"))?;
         std::fs::create_dir_all(parent)
             .map_err(|error| OcgError::io("create canonical database directory", error))?;
-        // Schema bootstrap is one serialized step per database across every
-        // process: switching a new database to WAL needs an exclusive lock
-        // SQLite will not wait for, and each `ensure_column` checks then
-        // alters. The connection is opened only once this lock is held, so
-        // every check below reads the schema the previous holder committed.
-        // The holder does only this local SQLite work and takes no other lock;
-        // the kernel releases it if the process dies, and runtime traffic
-        // never takes it.
-        let bootstrap = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path.with_extension("bootstrap.lock"))
-            .map_err(|error| OcgError::io("open canonical database bootstrap lock", error))?;
-        fs2::FileExt::lock_exclusive(&bootstrap)
-            .map_err(|error| OcgError::io("lock canonical database bootstrap", error))?;
         let connection = Connection::open(&path).map_err(|error| open_sql(root, error))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| open_sql(root, error))?;
         connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(|error| open_sql(root, error))?;
-        connection
             .pragma_update(None, "foreign_keys", "ON")
+            .map_err(|error| open_sql(root, error))?;
+        // A current store needs no bootstrap work, so ordinary opens stop at
+        // this unlocked read. Bootstrap is serialized across processes: the
+        // generation is read again under the lock, so only the first process
+        // to find a stale store migrates it and the rest see it current.
+        if schema_generation(&connection).map_err(|error| open_sql(root, error))?
+            < DOMAIN_SCHEMA_VERSION
+        {
+            // Switching a new database to WAL needs an exclusive lock SQLite
+            // will not wait for, and each `ensure_column` checks then alters.
+            // The holder does only this local SQLite work and takes no other
+            // lock; the kernel releases it if the process dies.
+            let bootstrap = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path.with_extension("bootstrap.lock"))
+                .map_err(|error| OcgError::io("open canonical database bootstrap lock", error))?;
+            fs2::FileExt::lock_exclusive(&bootstrap)
+                .map_err(|error| OcgError::io("lock canonical database bootstrap", error))?;
+            if schema_generation(&connection).map_err(|error| open_sql(root, error))?
+                < DOMAIN_SCHEMA_VERSION
+            {
+                Self::bootstrap_schema(root, &connection)?;
+            }
+            drop(bootstrap);
+        }
+        Ok(Self { connection, path })
+    }
+
+    /// Bring a store up to [`DOMAIN_SCHEMA_VERSION`]. Every step is idempotent,
+    /// so a bootstrap interrupted by a crash is simply repeated by the next
+    /// process that finds the store stale. The generation is recorded last.
+    fn bootstrap_schema(root: &Path, connection: &Connection) -> Result<()> {
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
             .map_err(|error| open_sql(root, error))?;
         connection
             .execute_batch(DOMAIN_SCHEMA)
@@ -1017,47 +1047,47 @@ impl DomainRepository {
         // change and its event commit in one transaction. It is evidence, never
         // a decision input: nothing in this file reads it back to choose an
         // execution outcome.
-        journal::ensure_schema(&connection)?;
+        journal::ensure_schema(connection)?;
         ensure_column(
-            &connection,
+            connection,
             "domain_dispatch_intents",
             "reservation_id",
             "TEXT",
         )?;
         ensure_column(
-            &connection,
+            connection,
             "domain_dispatch_intents",
             "budget_admitted",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
-            &connection,
+            connection,
             "domain_dispatch_intents",
             "pricing_basis",
             "TEXT",
         )?;
         ensure_column(
-            &connection,
+            connection,
             "domain_settlements",
             "payload_digest",
             "TEXT NOT NULL DEFAULT ''",
         )?;
         ensure_column(
-            &connection,
+            connection,
             "domain_dispatch_intents",
             "upstream_model_id",
             "TEXT",
         )?;
-        ensure_column(&connection, "domain_jobs", "termination_reason", "TEXT")?;
-        ensure_column(&connection, "domain_jobs", "root_job_id", "TEXT")?;
+        ensure_column(connection, "domain_jobs", "termination_reason", "TEXT")?;
+        ensure_column(connection, "domain_jobs", "root_job_id", "TEXT")?;
         ensure_column(
-            &connection,
+            connection,
             "domain_jobs",
             "depth",
             "INTEGER NOT NULL DEFAULT 0 CHECK(depth >= 0)",
         )?;
         ensure_column(
-            &connection,
+            connection,
             "domain_jobs",
             "waiting_for_children",
             "INTEGER NOT NULL DEFAULT 0 CHECK(waiting_for_children IN (0,1))",
@@ -1069,15 +1099,15 @@ impl DomainRepository {
             )
             .map_err(sql)?;
         ensure_column(
-            &connection,
+            connection,
             "domain_jobs",
             "automatic_admission",
             "INTEGER NOT NULL DEFAULT 0 CHECK(automatic_admission IN (0,1))",
         )?;
-        ensure_column(&connection, "domain_jobs", "admission_selection", "TEXT")?;
-        ensure_column(&connection, "domain_jobs", "placement_evidence", "TEXT")?;
+        ensure_column(connection, "domain_jobs", "admission_selection", "TEXT")?;
+        ensure_column(connection, "domain_jobs", "placement_evidence", "TEXT")?;
         ensure_column(
-            &connection,
+            connection,
             "domain_jobs",
             "final_acquisition_outcome",
             "TEXT",
@@ -1115,15 +1145,15 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
     ON domain_watchdog_actions(job_id,ordinal);",
             )
             .map_err(sql)?;
-        ensure_column(&connection, "domain_job_origins", "spawn_key", "TEXT")?;
+        ensure_column(connection, "domain_job_origins", "spawn_key", "TEXT")?;
         ensure_column(
-            &connection,
+            connection,
             "domain_job_origins",
             "spawn_fingerprint",
             "TEXT",
         )?;
-        ensure_column(&connection, "domain_job_origins", "policy", "TEXT")?;
-        ensure_column(&connection, "domain_job_origins", "call_id", "TEXT")?;
+        ensure_column(connection, "domain_job_origins", "policy", "TEXT")?;
+        ensure_column(connection, "domain_job_origins", "call_id", "TEXT")?;
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS domain_job_spawn_keys ON domain_job_origins(parent_job_id,spawn_key) WHERE spawn_key IS NOT NULL", [],
         ).map_err(sql)?;
@@ -1146,15 +1176,15 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 WHERE EXISTS(SELECT 1 FROM lineage WHERE lineage.job_id=domain_jobs.id);",
             )
             .map_err(sql)?;
-        ensure_column(&connection, "domain_job_bindings", "attempt_id", "TEXT")?;
+        ensure_column(connection, "domain_job_bindings", "attempt_id", "TEXT")?;
         connection.execute(
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
             [],
         ).map_err(sql)?;
-        drop(bootstrap);
-        let repository = Self { connection, path };
-        repository.recover_job_readiness()?;
-        Ok(repository)
+        connection
+            .pragma_update(None, "user_version", DOMAIN_SCHEMA_VERSION)
+            .map_err(|error| open_sql(root, error))?;
+        Ok(())
     }
 
     /// Open the durable store and require a Project identity at this boundary.
@@ -2862,6 +2892,24 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         let root = crate::project::canonicalize(root)
             .to_string_lossy()
             .to_string();
+        // Opens of an established store find the identity it already holds and
+        // skip the write. The conflict-tolerant insert below still settles a
+        // race between two first claims of the same root.
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT id,root,created_at FROM domain_projects WHERE root=?1",
+                [&root],
+                |row| {
+                    serde_rusqlite::from_row::<Project>(row)
+                        .map_err(crate::error::sqlite_mapping_error)
+                },
+            )
+            .optional()
+            .map_err(sql)?;
+        if let Some(project) = existing {
+            return Ok(project);
+        }
         let id = new_id("prj");
         self.connection
             .execute(
@@ -3581,6 +3629,16 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             return Err(invalid("Job does not belong to the requested Project"));
         }
         dependencies_satisfied_in(&self.connection, job_id)
+    }
+
+    /// Crash and startup recovery for this store. Call it once per process
+    /// lifecycle, before the process admits new work: it repairs journal
+    /// boundary drift and re-derives readiness that a crash may have left
+    /// stale. Ordinary opens do not run it, so repository acquisition on a
+    /// runtime hot path stays cheap.
+    pub fn recover_startup(&self) -> Result<()> {
+        journal::reconcile_boundary(&self.connection)?;
+        self.recover_job_readiness()
     }
 
     pub fn recover_job_readiness(&self) -> Result<()> {
