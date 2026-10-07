@@ -5158,13 +5158,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
     }
 
     pub fn attempt(&self, attempt_id: &str) -> Result<Option<Attempt>> {
-        self.connection.query_row(
-            "SELECT id,job_id,generation,state,authoritative,created_at,finished_at FROM domain_attempts WHERE id=?1",
-            [attempt_id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?,row.get::<_,bool>(4)?,row.get::<_,i64>(5)?,row.get::<_,Option<i64>>(6)?)),
-        ).optional().map_err(sql)?.map(|(id,job_id,generation,state,authoritative,created_at,finished_at)| {
-            let state = match state.as_str() { "queued"=>AttemptState::Queued,"running"=>AttemptState::Running,"cancelling"=>AttemptState::Cancelling,"completed"=>AttemptState::Completed,"failed"=>AttemptState::Failed,"cancelled"=>AttemptState::Cancelled,"unknown"=>AttemptState::Unknown,"orphaned"=>AttemptState::Orphaned,_=>return Err(invalid("invalid canonical Attempt state")) };
-            Ok(Attempt { id, job_id, generation: u64::try_from(generation).map_err(|_| invalid("invalid Attempt generation"))?, state, authoritative, created_at, finished_at })
-        }).transpose()
+        read_optional_attempt(&self.connection, attempt_id)
     }
 
     pub fn call(&self, call_id: &str) -> Result<Call> {
@@ -5808,6 +5802,14 @@ fn dispatch_intent_from_row(row: &Row<'_>) -> rusqlite::Result<DispatchIntent> {
 const DISPATCH_INTENT_COLUMNS: &str = "id,call_id,job_id,attempt_id,executor_id,generation,state,\
 effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,provider_key,model,endpoint,credential_ref,failure,created_at,updated_at,upstream_model_id";
 
+/// The one authoritative column list for a canonical Attempt row.
+///
+/// [`attempt_from_row`] decodes by position, so every reader must select
+/// exactly this order. Presence policy is the reader's concern, never the
+/// decoder's.
+const ATTEMPT_COLUMNS: &str =
+    "id,job_id,generation,state,authoritative,created_at,finished_at";
+
 fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
     let state: String = row.get(3)?;
     let state = match state.as_str() {
@@ -6104,15 +6106,22 @@ fn read_job(connection: &Connection, job_id: &str) -> Result<Option<Job>> {
         .map_err(sql)
 }
 
-fn read_attempt(connection: &Connection, attempt_id: &str) -> Result<Attempt> {
+fn read_optional_attempt(connection: &Connection, attempt_id: &str) -> Result<Option<Attempt>> {
     connection
         .query_row(
-            "SELECT id,job_id,generation,state,authoritative,created_at,finished_at FROM domain_attempts WHERE id=?1",
+            &format!("SELECT {ATTEMPT_COLUMNS} FROM domain_attempts WHERE id=?1"),
             [attempt_id],
             attempt_from_row,
         )
         .optional()
-        .map_err(sql)?
+        .map_err(sql)
+}
+
+/// Read the one Attempt a transition is acting on. The row must exist: it was
+/// either just written or fenced inside this transaction, so its absence is an
+/// invariant violation rather than an ordinary lookup miss.
+fn read_attempt(connection: &Connection, attempt_id: &str) -> Result<Attempt> {
+    read_optional_attempt(connection, attempt_id)?
         .ok_or_else(|| invalid("Attempt disappeared while journaling its transition"))
 }
 
@@ -6834,7 +6843,7 @@ fn all_jobs(connection: &Connection) -> Result<Vec<Job>> {
 fn all_attempts(connection: &Connection) -> Result<Vec<Attempt>> {
     query_all(
         connection,
-        "SELECT id,job_id,generation,state,authoritative,created_at,finished_at FROM domain_attempts ORDER BY created_at,id",
+        &format!("SELECT {ATTEMPT_COLUMNS} FROM domain_attempts ORDER BY created_at,id"),
         &[],
         attempt_from_row,
     )
