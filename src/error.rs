@@ -45,6 +45,11 @@ pub enum OcgError {
     /// failure: callers must not retry it as one.
     #[error("storage full ({context}): {message}")]
     StorageFull { context: String, message: String },
+    /// The OS credential store did not answer within the caller's bound,
+    /// usually because it is waiting for a person to answer an approval
+    /// prompt. The lookup keeps running; a later retry observes its outcome.
+    #[error("{0}")]
+    CredentialStorePending(String),
     /// A configuration problem. The message is already user-facing.
     #[error("{0}")]
     Config(String),

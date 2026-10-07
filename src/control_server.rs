@@ -58,6 +58,10 @@ pub const DEFAULT_HEARTBEAT_MS: u64 = 10_000;
 pub const DEFAULT_WRITE_TIMEOUT_MS: u64 = 15_000;
 /// Default per-socket read timeout.
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 10_000;
+/// How long a Profile read waits on the OS credential store, which may be
+/// holding an approval prompt nobody is answering, before it reports
+/// `credential_store_pending` instead.
+const PROFILE_READ_CREDENTIAL_WAIT: Duration = Duration::from_secs(5);
 
 /// Server limits and timings. Every field has a bounded default.
 #[derive(Debug, Clone)]
@@ -637,7 +641,9 @@ fn handle_profile(
         );
     }
     let operation = || -> Result<Value> {
-        let view = || -> Result<Value> {
+        // A read never waits on the OS credential store past a bound; the
+        // mutations keep their existing wait, which follows a committed edit.
+        let view = |wait: Option<Duration>| -> Result<Value> {
             let current = service.current()?;
             // A declared struct, so the generated TypeScript describes the
             // response the PWA actually receives.
@@ -645,12 +651,12 @@ fn handle_profile(
                 api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
                 profile: current.as_ref().map(|(profile, _)| profile.clone()),
                 revision: current.as_ref().map(|(_, revision)| revision.clone()),
-                runnable_choices: service.runnable_choices(),
+                runnable_choices: service.runnable_choices(wait)?,
             })
             .map_err(|error| OcgError::config(error.to_string()))
         };
         match route {
-            Route::ProfileGet => view(),
+            Route::ProfileGet => view(Some(PROFILE_READ_CREDENTIAL_WAIT)),
             Route::ProfileBootstrap => {
                 let body = request
                     .json_body()
@@ -665,7 +671,7 @@ fn handle_profile(
                     }
                     _ => return Err(OcgError::config("choice must be new")),
                 }
-                view()
+                view(None)
             }
             Route::ProfilePut => {
                 let body = request
@@ -682,7 +688,7 @@ fn handle_profile(
                 )
                 .map_err(|error| OcgError::config(format!("invalid edited Profile: {error}")))?;
                 service.replace(expected, &profile)?;
-                view()
+                view(None)
             }
             Route::ProfileCredential => {
                 // The secret goes to the Vault only. The response is the
@@ -698,7 +704,7 @@ fn handle_profile(
                 })?;
                 let vault = crate::vault::Vault::user_global()?;
                 vault.set(&request.name, &request.value)?;
-                view()
+                view(None)
             }
             _ => unreachable!("not a Profile route"),
         }
@@ -706,6 +712,12 @@ fn handle_profile(
     let origin = allowed_cors_origin(request);
     match operation() {
         Ok(value) => write_json_with_origin(stream, 200, &value, origin.as_deref()),
+        Err(OcgError::CredentialStorePending(message)) => write_json_with_origin(
+            stream,
+            503,
+            &ApiError::new(503, "credential_store_pending", message).to_json(),
+            origin.as_deref(),
+        ),
         Err(error) => write_json_with_origin(
             stream,
             400,

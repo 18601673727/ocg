@@ -196,33 +196,55 @@ impl Profile {
     /// is never read out, only its existence is checked. A Vault failure
     /// closes the gate rather than guessing.
     pub fn executable_choices(&self, vault: &crate::vault::Vault) -> Vec<String> {
-        self.models
-            .iter()
-            .filter(|(_, model)| {
-                if model.id.is_empty() {
-                    return false;
+        self.executable_choices_within(vault, None)
+            .unwrap_or_default()
+    }
+
+    /// [`Profile::executable_choices`] with a bound on the credential store.
+    /// The Vault is read at most once per call, so one Profile costs one
+    /// credential-store lookup however many models it declares. Only a
+    /// credential store still pending after `wait` is an error.
+    pub fn executable_choices_within(
+        &self,
+        vault: &crate::vault::Vault,
+        wait: Option<std::time::Duration>,
+    ) -> Result<Vec<String>> {
+        let mut stored: Option<std::collections::BTreeSet<String>> = None;
+        let mut choices = Vec::new();
+        for (key, model) in &self.models {
+            if model.id.is_empty() {
+                continue;
+            }
+            let Some(provider) = self.providers.get(&model.provider) else {
+                continue;
+            };
+            if !endpoint_usable(provider.endpoint.as_deref()) {
+                continue;
+            }
+            // A declared credential must resolve in the Vault; no declared
+            // credential means an unauthenticated endpoint, which is
+            // also executable.
+            let executable = match provider.credential_ref.as_deref() {
+                None => true,
+                Some(reference) if !reference.is_empty() => {
+                    if stored.is_none() {
+                        stored = Some(match vault.credential_names(wait) {
+                            Ok(names) => names,
+                            Err(error @ OcgError::CredentialStorePending(_)) => return Err(error),
+                            Err(_) => std::collections::BTreeSet::new(),
+                        });
+                    }
+                    stored
+                        .as_ref()
+                        .is_some_and(|names| names.contains(reference))
                 }
-                let Some(provider) = self.providers.get(&model.provider) else {
-                    return false;
-                };
-                if !endpoint_usable(provider.endpoint.as_deref()) {
-                    return false;
-                }
-                // A declared credential must resolve in the Vault; no declared
-                // credential means an unauthenticated endpoint, which is
-                // also executable.
-                match provider.credential_ref.as_deref() {
-                    None => true,
-                    Some(reference) if !reference.is_empty() => vault
-                        .get(reference)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|value| !value.is_empty()),
-                    Some(_) => false,
-                }
-            })
-            .map(|(key, _)| key.clone())
-            .collect()
+                Some(_) => false,
+            };
+            if executable {
+                choices.push(key.clone());
+            }
+        }
+        Ok(choices)
     }
 
     pub fn require_runnable(&self) -> Result<()> {
@@ -447,15 +469,17 @@ impl ProfileService {
 
     /// Backend-computed execution readiness: model keys that satisfy the
     /// same selection, endpoint, and credential rules as canonical launch.
-    /// A missing Profile or an unreadable Vault yields no choices.
-    pub fn runnable_choices(&self) -> Vec<String> {
+    /// A missing Profile or an unreadable Vault yields no choices. With
+    /// `wait`, a credential store that has not answered in time is
+    /// [`OcgError::CredentialStorePending`] rather than an indefinite wait.
+    pub fn runnable_choices(&self, wait: Option<std::time::Duration>) -> Result<Vec<String>> {
         let Ok(Some((profile, _))) = self.current() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Ok(vault) = crate::vault::Vault::user_global() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        profile.executable_choices(&vault)
+        profile.executable_choices_within(&vault, wait)
     }
 
     /// Create a new Profile without overwriting an existing one.

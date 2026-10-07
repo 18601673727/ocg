@@ -4,8 +4,10 @@ use crate::error::{OcgError, Result};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 const KEYCHAIN_SERVICE: &str = "ocg.credentials.v1";
 const KEYCHAIN_USER: &str = "vault-key";
@@ -125,6 +127,19 @@ impl Vault {
         Ok(self.read()?.0.get(name).cloned())
     }
 
+    /// Names that hold a non-empty credential, decided by one Vault read. The
+    /// values never leave this function. With `wait`, a credential store that
+    /// has not answered in time is [`OcgError::CredentialStorePending`].
+    pub fn credential_names(&self, wait: Option<Duration>) -> Result<BTreeSet<String>> {
+        Ok(self
+            .read_within(wait)?
+            .0
+            .into_iter()
+            .filter(|(name, value)| validate_name(name).is_ok() && !value.is_empty())
+            .map(|(name, _)| name)
+            .collect())
+    }
+
     /// Return credential values only for the child process environment.
     pub fn child_environment(&self) -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
         self.read()?
@@ -138,6 +153,10 @@ impl Vault {
     }
 
     fn read(&self) -> Result<Credentials> {
+        self.read_within(None)
+    }
+
+    fn read_within(&self, wait: Option<Duration>) -> Result<Credentials> {
         if !self.path.exists() {
             return Ok(Credentials::default());
         }
@@ -148,7 +167,7 @@ impl Vault {
         if envelope.version != 1 || envelope.nonce.len() != NONCE_LEN {
             return Err(OcgError::config("unsupported OCG credential vault format"));
         }
-        let key = encryption_key(false)?;
+        let key = shared_encryption_key(wait)?;
         let cipher = LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, &key)
                 .map_err(|_| OcgError::config("cannot initialize credential encryption"))?,
@@ -210,6 +229,73 @@ impl Vault {
         std::fs::rename(&temp, &self.path)
             .map_err(|error| OcgError::io("cannot install OCG credential vault", error))?;
         Ok(())
+    }
+}
+
+/// The outcome of one in-flight key lookup, shared by every reader that joined it.
+type KeyLookup = Arc<(Mutex<Option<std::result::Result<Vec<u8>, String>>>, Condvar)>;
+
+/// At most one OS credential-store read per process is outstanding. The OS
+/// store can block on an approval prompt for as long as nobody answers it, so
+/// readers join the outstanding lookup instead of each stacking another prompt
+/// and another parked thread behind it.
+static KEY_LOOKUP: Mutex<Option<KeyLookup>> = Mutex::new(None);
+
+/// Read the existing Vault key through the shared lookup. `None` waits for the
+/// outcome; `Some(bound)` stops waiting after `bound` while the lookup runs on.
+fn shared_encryption_key(wait: Option<Duration>) -> Result<Vec<u8>> {
+    let lookup = {
+        let mut slot = KEY_LOOKUP
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some(lookup) => Arc::clone(lookup),
+            None => {
+                let lookup = KeyLookup::default();
+                let worker = Arc::clone(&lookup);
+                std::thread::Builder::new()
+                    .name("ocg-vault-key".to_string())
+                    .spawn(move || {
+                        let outcome = encryption_key(false).map_err(|error| error.to_string());
+                        // Retire the lookup before publishing it, so a later
+                        // reader starts a fresh read rather than reusing this one.
+                        *KEY_LOOKUP
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        let (state, ready) = &*worker;
+                        *state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+                        ready.notify_all();
+                    })
+                    .map_err(|error| OcgError::io("cannot start Vault key lookup", error))?;
+                *slot = Some(Arc::clone(&lookup));
+                lookup
+            }
+        }
+    };
+    let (state, ready) = &*lookup;
+    let state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = match wait {
+        None => ready
+            .wait_while(state, |outcome| outcome.is_none())
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        Some(bound) => {
+            ready
+                .wait_timeout_while(state, bound, |outcome| outcome.is_none())
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0
+        }
+    };
+    match state.as_ref() {
+        Some(outcome) => outcome.clone().map_err(OcgError::config),
+        None => Err(OcgError::CredentialStorePending(
+            "the operating-system credential store has not answered yet; approve the OCG \
+             keychain prompt if one is showing, then retry"
+                .to_string(),
+        )),
     }
 }
 
