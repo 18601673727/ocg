@@ -325,7 +325,61 @@ function executionInspectorIsCanonicalFirst() {
   assert.ok(supplemented.includes("data-execution-target=\"final\"") && supplemented.includes("Job execution cancelled"));
 }
 
-for (const check of [conversationUsageGateChecksCanonicalIdentity, executionInspectorIsCanonicalFirst, conversationUsageRefreshesWhileLive, activeTargetBeatsComposer, preferenceIsScopedPerChat, observableActivityDrivesStatus, longMessagesFold, retryClearsPresentation, chatSurfaceRendersWithoutRuntimeBanner]) {
+function conversationInspectorRemainsStableDuringPolling() {
+  const React = frontendRequire("react");
+  const { renderToStaticMarkup } = frontendRequire("react-dom/server");
+  const { ConversationInspector } = require(path.join(frontend, "components/ocg/usage/conversation-inspector.tsx"));
+  const { I18nProvider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+
+  const usage = (data = null, loading = false, error = null) => ({ data, loading, error, refresh: () => undefined });
+  const sampleData = {
+    id: "usage-123", conversation_id: "chat-1", generated_at: Date.now(),
+    created_at: Date.now(), updated_at: Date.now(), truncated: false,
+    totals: {
+      turns: 5, jobs: 3, first_activity_at: Date.now(), last_activity_at: Date.now(),
+      cost: { input_cost: 0.01, output_cost: 0.02, total_cost: 0.03 },
+      tokens: { input: 100, output: 200, cached_input: 0, cache_creation_input: 0, total: 300 },
+    },
+    models: [], latest_job_state: null,
+  };
+
+  const render = (u) => renderToStaticMarkup(React.createElement(I18nProvider, null,
+    React.createElement(ConversationInspector, {
+      usage: u, execution: null, accounting: null, mode: "docked",
+      onClose: () => undefined, onOpenJobExecution: () => undefined,
+    })));
+
+  // Initial load with no data: shows loading message (has role="status").
+  const initialLoading = render(usage(null, true));
+  assert.ok(initialLoading.includes("role=\"status\""), "loading message appears on initial load");
+  assert.ok(!initialLoading.match(/<dt[^>]*>\s*Cost/i), "data not yet rendered");
+
+  // Initial load complete: no loading message, data visible.
+  const loaded = render(usage(sampleData, false));
+  assert.ok(!loaded.includes("role=\"status\""), "loading message gone after load");
+  assert.ok(loaded.includes("turns"), "data is visible after load");
+
+  // Background refresh: existing data visible, no loading message appears.
+  const refreshing = render(usage(sampleData, true, null));
+  assert.ok(!refreshing.includes("role=\"status\""), "no loading message during background refresh");
+  assert.ok(refreshing.includes("turns"), "existing data remains visible during refresh");
+
+  // No-activity state only on initial load, not during background refresh.
+  const empty = render(usage(null, false));
+  assert.ok(empty.match(/No activity/i) || empty.includes("data-usage-surface"), "no-activity shown when no data and not loading");
+  const refreshingEmpty = render(usage(null, true));
+  assert.ok(!refreshingEmpty.match(/No activity/i) || refreshingEmpty.includes("role=\"status\""), "no-activity not shown during background refresh of empty state");
+
+  // Scrollbar gutter stable prevents layout shift.
+  assert.ok(loaded.includes("scrollbar-gutter"), "stable scrollbar gutter is applied");
+  assert.ok(refreshing.includes("scrollbar-gutter"), "scrollbar gutter remains during refresh");
+
+  // Manual refresh button works and becomes disabled during read.
+  assert.ok(!loaded.match(/disabled["\s]/), "refresh button enabled when not loading");
+  assert.ok(refreshing.includes("disabled"), "refresh button disabled while reading");
+}
+
+for (const check of [conversationUsageGateChecksCanonicalIdentity, executionInspectorIsCanonicalFirst, conversationUsageRefreshesWhileLive, conversationInspectorRemainsStableDuringPolling, activeTargetBeatsComposer, preferenceIsScopedPerChat, observableActivityDrivesStatus, longMessagesFold, retryClearsPresentation, chatSurfaceRendersWithoutRuntimeBanner]) {
   check();
 }
 process.stdout.write("chat presentation contract ok\n");

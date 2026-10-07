@@ -23,6 +23,7 @@ export function ConversationInspector({ usage, execution, accounting, observabil
   const { t, locale } = useI18n();
   const [tab, setTab] = useState<"conversation" | "execution">("conversation");
   const data = usage.data;
+  const initialLoading = usage.loading && data === null;
   return <div className="flex h-full min-w-0 flex-col">
     <nav className="shrink-0 border-b border-border p-2"><SegmentedTabs tabs={[{ id: "conversation", label: t("usage.conversation") }, { id: "execution", label: t("usage.execution") }]} value={tab} onSelect={setTab} ariaLabel={t("usage.inspector")} className="grid-cols-2" panelId="conversation-inspector-panel" /></nav>
     <div id="conversation-inspector-panel" role="tabpanel" aria-label={t(tab === "conversation" ? "usage.conversation" : "usage.execution")} className="flex min-h-0 flex-1 flex-col">
@@ -33,11 +34,11 @@ export function ConversationInspector({ usage, execution, accounting, observabil
           {onModeChange ? <Button variant="ghost" size="icon-xs" onClick={() => onModeChange(mode === "expanded" ? "docked" : "expanded")} aria-label={t(mode === "expanded" ? "execution.dockInspector" : "execution.expandInspector")}>{mode === "expanded" ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}</Button> : null}
           <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("common.close")}><X className="size-4" /></Button>
         </header>
-        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3" data-usage-surface="conversation">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3 [scrollbar-gutter:stable]" data-usage-surface="conversation">
           {tab === "execution" ? <p className="text-[12px] text-muted-foreground">{t("execution.noExecution")}</p> : <>
-            {usage.loading ? <p role="status" className="text-[12px] text-muted-foreground">{t("common.loading")}</p> : null}
+            {initialLoading ? <p role="status" className="text-[12px] text-muted-foreground">{t("common.loading")}</p> : null}
             {usage.error ? <p role="alert" className="text-[12px] text-destructive">{t("usage.failed", { error: usage.error })}</p> : null}
-            {!usage.loading && !usage.error && !data ? <p className="text-[12px] text-muted-foreground">{t("usage.noActivity")}</p> : null}
+            {!initialLoading && !usage.error && !data ? <p className="text-[12px] text-muted-foreground">{t("usage.noActivity")}</p> : null}
             {data ? <>
               <UsageScopeNote scope="conversation" generatedAt={data.generated_at} />
               {data.truncated ? <p className="text-[11px] text-amber-600 dark:text-amber-400">{t("usage.limited")}</p> : null}
