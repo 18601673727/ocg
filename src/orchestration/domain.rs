@@ -2504,6 +2504,17 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
     /// with the DispatchIntent it froze. There is no stored health value to fall
     /// back on, so this cannot disagree with execution history.
     ///
+    /// Every one of those rows is read inside one explicitly DEFERRED
+    /// transaction. That transaction acquires no lock when it is opened: the
+    /// first read establishes the SQLite snapshot, and every subsequent read in
+    /// this projection observes that same snapshot, so a WAL writer stays free
+    /// to commit while the projection is assembled. The result may already be
+    /// stale when the transaction ends, but the Job, Attempt, Call, and
+    /// DispatchIntent reported in one outcome were observed from the same
+    /// committed database snapshot. Reads that fail propagate instead of being
+    /// reported as an absent Call or DispatchIntent, because "none exists" is
+    /// a different claim from "could not be read".
+    ///
     /// The newest probe wins whatever state it is in, so a caller can see that
     /// evidence is being refreshed rather than silently reading a stale verdict.
     /// `json_valid` guards the projection: older CLI Jobs stored their objective
@@ -2519,8 +2530,20 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         if target.provider.is_empty() || target.model.is_empty() {
             return Ok(None);
         }
-        let job_id: Option<String> = self
-            .connection
+        // One DEFERRED transaction, stated explicitly rather than inherited
+        // from the Connection default. DEFERRED acquires no lock when it opens:
+        // the first read below establishes the SQLite snapshot, and every
+        // later read in this projection observes that same snapshot while a WAL
+        // writer is free to commit. As separate autocommit reads, a concurrent
+        // writer could publish a newer Attempt generation between selecting
+        // the id and decoding the row, and this projection would report the
+        // superseded generation as the latest evidence.
+        let snapshot = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            TransactionBehavior::Deferred,
+        )
+        .map_err(sql)?;
+        let job_id: Option<String> = snapshot
             .query_row(
                 "SELECT id FROM domain_jobs WHERE project_id=?1 \
                  AND json_extract(CASE WHEN json_valid(payload) THEN payload ELSE '{}' END,'$.health_probe.provider')=?2 \
@@ -2538,24 +2561,27 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             .optional()
             .map_err(sql)?;
         let Some(job_id) = job_id else {
+            snapshot.commit().map_err(sql)?;
             return Ok(None);
         };
-        let job = read_job(&self.connection, &job_id)?
+        let job = read_job(&snapshot, &job_id)?
             .ok_or_else(|| invalid("health probe Job disappeared"))?;
         let intent: HealthProbeIntent = job
             .spec
             .health_probe
             .clone()
             .ok_or_else(|| invalid("health probe Job lost its declared target"))?;
-        let attempt = self.latest_attempt(&job.id)?;
-        let call = attempt
-            .as_ref()
-            .and_then(|attempt| self.calls_for_attempt(&attempt.id).ok())
-            .and_then(|calls| calls.into_iter().next());
-        let dispatch = call
-            .as_ref()
-            .and_then(|call| self.dispatch_intent(&call.id).ok())
-            .flatten();
+        let attempt = latest_attempt(&snapshot, &job.id)?;
+        let call = match &attempt {
+            Some(attempt) => calls_for_attempt_in(&snapshot, &attempt.id)?
+                .into_iter()
+                .next(),
+            None => None,
+        };
+        let dispatch = match &call {
+            Some(call) => read_dispatch_intent_by_call(&snapshot, &call.id)?,
+            None => None,
+        };
         // Provider latency is measured on the Call when the probe reached
         // dispatch, and on the Attempt when it failed before one existed.
         let (started_at, completed_at) = match &call {
@@ -2568,7 +2594,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 attempt.as_ref().and_then(|attempt| attempt.finished_at),
             ),
         };
-        Ok(Some(HealthProbeOutcome {
+        let outcome = HealthProbeOutcome {
             project_id: job.project_id.clone(),
             intent,
             job_id: job.id.clone(),
@@ -2588,22 +2614,9 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 _ => None,
             },
             failure: job.termination_reason,
-        }))
-    }
-
-    /// The highest-generation Attempt a Job published.
-    fn latest_attempt(&self, job_id: &str) -> Result<Option<Attempt>> {
-        self.connection
-            .query_row(
-                "SELECT id FROM domain_attempts WHERE job_id=?1 ORDER BY generation DESC LIMIT 1",
-                [job_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(sql)?
-            .map(|id| self.attempt(&id))
-            .transpose()
-            .map(|attempt| attempt.flatten())
+        };
+        snapshot.commit().map_err(sql)?;
+        Ok(Some(outcome))
     }
 
     pub fn set_dependency(
@@ -5172,18 +5185,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
     }
 
     pub fn calls_for_attempt(&self, attempt_id: &str) -> Result<Vec<Call>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id FROM domain_calls WHERE attempt_id=?1 ORDER BY created_at,id")
-            .map_err(sql)?;
-        let rows = statement
-            .query_map([attempt_id], |row| row.get::<_, String>(0))
-            .map_err(sql)?;
-        rows.map(|row| {
-            let id = row.map_err(sql)?;
-            self.call(&id)
-        })
-        .collect()
+        calls_for_attempt_in(&self.connection, attempt_id)
     }
 
     pub(crate) fn first_provider_call_input(
@@ -6134,6 +6136,46 @@ fn read_executor(connection: &Connection, executor_id: &str) -> Result<Option<Ex
         )
         .optional()
         .map_err(sql)
+}
+
+/// The Calls one Attempt owns, oldest first by `(created_at, id)`.
+///
+/// Reads through the caller's connection so a caller holding one read snapshot
+/// does not assemble the list and the Call rows from different states.
+fn calls_for_attempt_in(connection: &Connection, attempt_id: &str) -> Result<Vec<Call>> {
+    let mut statement = connection
+        .prepare("SELECT id FROM domain_calls WHERE attempt_id=?1 ORDER BY created_at,id")
+        .map_err(sql)?;
+    let rows = statement
+        .query_map([attempt_id], |row| row.get::<_, String>(0))
+        .map_err(sql)?;
+    rows.map(|row| {
+        let id = row.map_err(sql)?;
+        read_call(connection, &id)?.ok_or_else(|| invalid("Call disappeared while listing"))
+    })
+    .collect()
+}
+
+/// The highest-generation Attempt a Job published.
+///
+/// Selection and decode deliberately read through the caller's connection so a
+/// caller holding one read snapshot sees one generation set. As two autocommit
+/// reads, a newer generation could be published between selecting the id and
+/// decoding the row, and this reader would then report the superseded
+/// generation as the latest one.
+fn latest_attempt(connection: &Connection, job_id: &str) -> Result<Option<Attempt>> {
+    let id: Option<String> = connection
+        .query_row(
+            "SELECT id FROM domain_attempts WHERE job_id=?1 ORDER BY generation DESC LIMIT 1",
+            [job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    match id {
+        Some(id) => read_optional_attempt(connection, &id),
+        None => Ok(None),
+    }
 }
 
 fn read_call(connection: &Connection, call_id: &str) -> Result<Option<Call>> {
