@@ -8,6 +8,7 @@
 mod evidence;
 pub mod openai_projection;
 pub mod projection;
+mod read_many;
 mod snapshot;
 mod validation;
 
@@ -40,6 +41,7 @@ pub enum PermissionClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeToolExecutorBinding {
     FilesystemRead,
+    FilesystemReadMany,
     FilesystemList,
     FilesystemSearch,
     ContextSearch,
@@ -325,6 +327,17 @@ impl NativeToolRegistry {
                 aliases: &["read", "read_file", "view", "cat"],
                 target_field: Some("path"),
                 argument_aliases: &[("file", "path"), ("filePath", "path")],
+            },
+            NativeToolDefinition {
+                name: "filesystem.read_many",
+                description: "Observe 1..16 already-known independent Project-relative files/ranges in one Call. Supply paired 1-based inclusive line_start/line_end, or null for both to read from line 1. Returns ordered per-item outcomes, at most 400 lines and 8192 content bytes each, and 32768 serialized result bytes. Inspect partial/truncated. No edit revision authority or cross-file atomic snapshot.",
+                parameters: json!({"type":"object","additionalProperties":false,"required":["items"],"properties":{"items":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","additionalProperties":false,"required":["path","line_start","line_end"],"properties":{"path":{"type":"string"},"line_start":{"type":["integer","null"],"description":"First line, 1-based; null together with line_end for the first 400 lines."},"line_end":{"type":["integer","null"],"description":"Last line, inclusive; null together with line_start for the first 400 lines."}}}}}}),
+                permission: PermissionClass::ReadOnly,
+                capability: "filesystem",
+                executor: NativeToolExecutorBinding::FilesystemReadMany,
+                aliases: &[],
+                target_field: None,
+                argument_aliases: &[],
             },
             NativeToolDefinition {
                 name: "filesystem.list",
@@ -622,6 +635,28 @@ fn bounded_text(bytes: &[u8], cap: usize) -> (String, bool) {
     (String::from_utf8_lossy(bytes).into_owned(), truncated)
 }
 
+fn read_file_bytes(reader: impl Read, cap: usize) -> std::result::Result<Vec<u8>, ToolError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(cap as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ToolError::new(ToolErrorKind::ExecutionFailure, error.to_string()))?;
+    Ok(bytes)
+}
+
+fn invalid_parameters(definition: &NativeToolDefinition, error: &OcgError) -> ToolResult {
+    let message = error.to_string();
+    if definition.executor == NativeToolExecutorBinding::FilesystemReadMany {
+        // Schema diagnostics can echo input; leave room for JSON escaping in
+        // read_many's smaller result budget even when arguments are rejected.
+        let (message, truncated) = bounded_text(message.as_bytes(), 4096);
+        let mut result = ToolResult::failure(ToolError::new(ToolErrorKind::InvalidInput, message));
+        result.truncated = truncated;
+        return result;
+    }
+    ToolResult::failure(ToolError::new(ToolErrorKind::InvalidInput, message))
+}
+
 pub struct NativeToolExecutor {
     root: ProjectRoot,
     runner: Box<dyn CaptureRunner>,
@@ -691,13 +726,13 @@ impl NativeToolExecutor {
             ));
         }
         if let Err(error) = validate_parameters(&definition.parameters, arguments) {
-            return ToolResult::failure(ToolError::new(
-                ToolErrorKind::InvalidInput,
-                error.to_string(),
-            ));
+            return invalid_parameters(&definition, &error);
         }
         let result = match definition.executor {
             NativeToolExecutorBinding::FilesystemRead => self.read(arguments),
+            NativeToolExecutorBinding::FilesystemReadMany => {
+                read_many::read(&self.root, arguments, cancelled)
+            }
             NativeToolExecutorBinding::FilesystemList => self.list(arguments, cancelled),
             NativeToolExecutorBinding::FilesystemSearch => self.search(arguments, cancelled),
             NativeToolExecutorBinding::ContextSearch => self.context_search(arguments, cancelled),
@@ -774,13 +809,10 @@ impl NativeToolExecutor {
                 error.to_string(),
             ));
         }
-        let mut bytes = Vec::with_capacity(cap.saturating_add(1));
-        if let Err(error) = file.take(cap as u64 + 1).read_to_end(&mut bytes) {
-            return ToolResult::failure(ToolError::new(
-                ToolErrorKind::ExecutionFailure,
-                error.to_string(),
-            ));
-        }
+        let bytes = match read_file_bytes(file, cap.saturating_add(1)) {
+            Ok(bytes) => bytes,
+            Err(error) => return ToolResult::failure(error),
+        };
         let truncated = bytes.len() > cap || start.saturating_add(bytes.len() as u64) < file_len;
         let (content, _) = bounded_text(&bytes, cap);
         let mut metadata = json!({
@@ -1233,10 +1265,7 @@ pub fn execute_canonical_tool_call(
         ))
     } else if let Some(definition) = definition.as_ref() {
         if let Err(error) = validate_parameters(&definition.parameters, &request.arguments) {
-            ToolResult::failure(ToolError::new(
-                ToolErrorKind::InvalidInput,
-                error.to_string(),
-            ))
+            invalid_parameters(definition, &error)
         } else if domain.authority(&authority.attempt_id)?.as_ref() != Some(authority) {
             ToolResult::failure(ToolError::new(
                 ToolErrorKind::Cancelled,

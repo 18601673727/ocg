@@ -25,6 +25,8 @@ const SUPPORTED_KEYWORDS: &[&str] = &[
     "enum",
     "minimum",
     "maximum",
+    "minItems",
+    "maxItems",
 ];
 
 #[derive(Debug, Clone)]

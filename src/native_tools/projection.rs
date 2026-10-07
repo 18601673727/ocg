@@ -35,6 +35,7 @@ impl ToolProjectionProfile {
                 "context.read",
                 "filesystem.list",
                 "filesystem.read",
+                "filesystem.read_many",
                 "filesystem.edit",
                 "filesystem.search",
                 "process.exec",
