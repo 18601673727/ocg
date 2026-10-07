@@ -78,6 +78,25 @@ fn atomic_write(path: &Path, bytes: &[u8], context: &'static str) -> Result<()> 
     result
 }
 
+/// Hold an exclusive OS lock beside one control-state file for a complete
+/// read-modify-write: the read happens under it, so a concurrent process can
+/// never commit over an update it did not see. The kernel releases the lock
+/// when its holder exits, and readers never take it because every commit is
+/// an atomic rename. Holders do only local file work.
+fn lock_control_file(path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| OcgError::io("create control state", e))?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))
+        .map_err(|e| OcgError::io("open control state lock", e))?;
+    fs2::FileExt::lock_exclusive(&lock).map_err(|e| OcgError::io("lock control state", e))?;
+    Ok(lock)
+}
+
 fn chat_conversation_view(
     session_id: String,
     conversation: crate::core_contract::Conversation,
@@ -689,12 +708,20 @@ impl CanonicalControlService {
             profile_path,
             crate::orchestration::state::state_dir(boundary.root()),
         );
+        // Re-checked under the file lock: another process may have adopted
+        // its own legacy state or committed a registration meanwhile.
         if !service.project_file().exists() && legacy.project_file().exists() {
-            service.write_projects(&legacy.read_projects()?)?;
+            let _file = lock_control_file(&service.project_file())?;
+            if !service.project_file().exists() {
+                service.write_projects(&legacy.read_projects()?)?;
+            }
         }
         if !service.config_file().exists() && legacy.config_file().exists() {
-            let (global, defaults, revision) = legacy.read_configuration()?;
-            service.write_configuration(&global, &defaults, revision)?;
+            let _file = lock_control_file(&service.config_file())?;
+            if !service.config_file().exists() {
+                let (global, defaults, revision) = legacy.read_configuration()?;
+                service.write_configuration(&global, &defaults, revision)?;
+            }
         }
         Ok(service)
     }
@@ -876,42 +903,53 @@ impl CanonicalControlService {
         let project_id = DomainRepository::open_existing(&root)?
             .reconcile_project(&root)?
             .id;
-        let mut projects = self.read_projects()?;
-        let record = projects
-            .iter_mut()
+        let previous = self
+            .read_projects()?
+            .into_iter()
             .find(|project| project.project_id == project_id);
-        let project = if let Some(existing) = record {
+        if previous.is_some_and(|existing| existing.root != root.to_string_lossy()) {
             // Same durable identity at a new location: this is a repair of
-            // registry location authority, not a new Project. Identity and
-            // created_at stay; the observed location metadata is replaced.
-            let root_moved = existing.root != root.to_string_lossy();
-            if root_moved {
-                // A live runtime still pinned to the old root is stopped and
-                // joined before the registry may name the new one, so one
-                // project_id can never hold two authoritative roots. A failed
-                // shutdown aborts registration with the registry untouched.
-                if let Some(registry) = &self.runtime_registry {
-                    registry.invalidate(&project_id)?;
-                }
+            // registry location authority, not a new Project. A live runtime
+            // still pinned to the old root is stopped and joined before the
+            // registry may name the new one, so one project_id can never hold
+            // two authoritative roots. A failed shutdown aborts registration
+            // with the registry untouched. This happens before the registry
+            // file lock: joining workers is not bounded local work.
+            if let Some(registry) = &self.runtime_registry {
+                registry.invalidate(&project_id)?;
             }
-            existing.root = root.to_string_lossy().to_string();
-            existing.boundary = boundary_root.to_string_lossy().to_string();
-            existing.marker = boundary.has_marker();
-            existing.updated_at = now;
-            existing.clone()
-        } else {
-            let project = ProjectRecord {
-                project_id,
-                root: root.to_string_lossy().to_string(),
-                boundary: boundary_root.to_string_lossy().to_string(),
-                marker: boundary.has_marker(),
-                created_at: now,
-                updated_at: now,
+        }
+        // The commit merges this one record into the registry as committed
+        // now, keyed by project_id, so concurrent registrations all survive.
+        let project = {
+            let _file = lock_control_file(&self.project_file())?;
+            let mut projects = self.read_projects()?;
+            let record = projects
+                .iter_mut()
+                .find(|project| project.project_id == project_id);
+            let project = if let Some(existing) = record {
+                // Identity and created_at stay; the observed location metadata
+                // is replaced.
+                existing.root = root.to_string_lossy().to_string();
+                existing.boundary = boundary_root.to_string_lossy().to_string();
+                existing.marker = boundary.has_marker();
+                existing.updated_at = now;
+                existing.clone()
+            } else {
+                let project = ProjectRecord {
+                    project_id,
+                    root: root.to_string_lossy().to_string(),
+                    boundary: boundary_root.to_string_lossy().to_string(),
+                    marker: boundary.has_marker(),
+                    created_at: now,
+                    updated_at: now,
+                };
+                projects.push(project.clone());
+                project
             };
-            projects.push(project.clone());
+            self.write_projects(&projects)?;
             project
         };
-        self.write_projects(&projects)?;
         Ok(CanonicalProjectResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             command_id: command_id.to_string(),
@@ -957,15 +995,19 @@ impl CanonicalControlService {
         // One serialization boundary covers the whole read-modify-write: the
         // latest authoritative revision is read, mutated and committed while
         // no other configuration writer can interleave.
-        let _configuration = self
-            .configuration_lock
-            .lock()
-            .map_err(|_| invalid("configuration authority poisoned"))?;
-        let (_old, project_defaults, revision) = self.read_configuration()?;
-        let revision = revision.saturating_add(1);
-        // Global configuration and project defaults are separate scopes: this
-        // never rewrites a project's own defaults.
-        self.write_configuration(&config, &project_defaults, revision)?;
+        let revision = {
+            let _configuration = self
+                .configuration_lock
+                .lock()
+                .map_err(|_| invalid("configuration authority poisoned"))?;
+            let _file = lock_control_file(&self.config_file())?;
+            let (_old, project_defaults, revision) = self.read_configuration()?;
+            let revision = revision.saturating_add(1);
+            // Global configuration and project defaults are separate scopes:
+            // this never rewrites a project's own defaults.
+            self.write_configuration(&config, &project_defaults, revision)?;
+            revision
+        };
         let project = self
             .read_projects()?
             .into_iter()
@@ -1007,6 +1049,7 @@ impl CanonicalControlService {
                 .configuration_lock
                 .lock()
                 .map_err(|_| invalid("configuration authority poisoned"))?;
+            let _file = lock_control_file(&self.config_file())?;
             let (global, mut project_defaults, revision) = self.read_configuration()?;
             let revision = revision.saturating_add(1);
             // Scoped per Project: editing one project's defaults never touches
