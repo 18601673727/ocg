@@ -2,7 +2,7 @@
 
 import { useI18n, type I18nKey } from "../i18n";
 import { useState, useCallback, useEffect, useRef } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, ArrowRight, Check, Loader2, FolderOpen, ChevronRight, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
 import { createHttpCanonicalControlClient } from "../runtime/canonical-client";
 import { createSetupClient } from "./setup-client";
+import { resolveProjectParam, withProjectParam, type ProjectId } from "../project/domain";
 import type { ProfileView, SetupModel, SetupBrowseResponse } from "../contracts";
 
 /**
@@ -47,6 +48,25 @@ interface Verified {
   runnable: number;
 }
 
+/**
+ * The Project setup enters the workspace with.
+ *
+ * An explicit Project is carried through exactly as given, registered or not:
+ * dropping it would let a Project the browser persisted earlier win over the
+ * one OCG was launched with. An unknown explicit Project is forwarded so the
+ * workspace and backend reject or report it, never silently swapped for a
+ * different one. List position is consulted only when no Project was named.
+ */
+function entryProject(requested: ProjectId | undefined, registered: ReadonlyArray<{ id: string }>): ProjectId {
+  if (requested !== undefined) return requested;
+  return registered[0]?.id ?? "";
+}
+
+/** The workspace entry URL for the Project setup resolved. */
+function workspaceHref(projectId: ProjectId): string {
+  return projectId ? withProjectParam("/?scenario=local-ready", projectId) : "/?scenario=local-ready";
+}
+
 function verifiedFrom(view: ProfileView): Verified | null {
   const profile = view.profile;
   if (!profile || view.runnable_choices.length === 0) return null;
@@ -66,7 +86,12 @@ function verifiedFrom(view: ProfileView): Verified | null {
 export function SetupWizard() {
   const { t } = useI18n();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const controlUrl = useOcgControlUrl();
+  // The explicit Project the launcher entered with, if any. It survives setup
+  // and still addresses the workspace once setup is done. Absent stays absent:
+  // setup never invents a Project.
+  const requestedProject = resolveProjectParam(searchParams.get("project"));
 
   const [step, setStep] = useState<SetupStep>("checking");
   const [checkAttempt, setCheckAttempt] = useState(0);
@@ -109,7 +134,9 @@ export function SetupWizard() {
         setProjects(known);
         setCheckError(null);
         if (ready && known.length > 0) {
-          router.replace("/?scenario=local-ready");
+          // An explicit Project outranks list order: a runnable installation
+          // enters the Project it was launched with.
+          router.replace(workspaceHref(entryProject(requestedProject, known)));
           return;
         }
         if (ready) {
@@ -125,7 +152,7 @@ export function SetupWizard() {
       }
     })();
     return () => { cancelled = true; };
-  }, [controlUrl, router, checkAttempt]);
+  }, [controlUrl, requestedProject, router, checkAttempt]);
 
   useEffect(() => {
     if (step !== "verified" || projects.length > 0 || browseResult || !controlUrl) return;
@@ -299,9 +326,8 @@ export function SetupWizard() {
   }, [controlUrl, selectedFolders, t]);
 
   const enterChat = useCallback(() => {
-    const project = projects[0];
-    router.push(`/?scenario=local-ready${project ? `&project=${encodeURIComponent(project.id)}` : ""}`);
-  }, [projects, router]);
+    router.push(workspaceHref(entryProject(requestedProject, projects)));
+  }, [projects, requestedProject, router]);
 
   const progress: Progress = step === "verified" ? projects.length > 0 ? "chat" : "verify" : "connect";
   const progressIndex = PROGRESS.findIndex((item) => item.id === progress);

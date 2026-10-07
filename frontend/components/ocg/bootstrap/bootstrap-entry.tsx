@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { createProfileClient } from "../profile/profile-client";
 import { useOcgControlUrl } from "../profile/control-url";
+import { resolveProjectParam, withProjectParam } from "../project/domain";
 import { useI18n } from "../i18n";
 
 /**
@@ -14,6 +15,12 @@ import { useI18n } from "../i18n";
  * Exactly one readiness semantics exists: the same backend `runnable_choices` the
  * onboarding/profile UI uses. The launcher never decides locally, and no
  * fixture scenario is involved.
+ *
+ * The launcher hands the Project OCG was launched with as an explicit
+ * `project` parameter. It is forwarded verbatim to the workspace entry, which
+ * reads it as the explicit Project of this entry, so a Project the browser
+ * persisted earlier never silently wins over the launched one. No Project is
+ * chosen here: an absent parameter stays absent.
  */
 export function BootstrapEntry() {
   const router = useRouter();
@@ -37,7 +44,11 @@ export function BootstrapEntry() {
         // satisfy the same selection/endpoint/credential rules as canonical
         // launch. No fixture scenario and no local re-derivation here.
         const ready = view.runnable_choices.length > 0;
-        router.replace(ready ? "/?scenario=local-ready" : "/onboarding?scenario=local-first-run");
+        const target = ready ? "/?scenario=local-ready" : "/onboarding?scenario=local-first-run";
+        // The launched Project travels with the entry so the workspace sees the
+        // same explicit identity the launcher registered.
+        const project = resolveProjectParam(new URLSearchParams(window.location.search).get("project"));
+        router.replace(project ? withProjectParam(target, project) : target);
       } catch (cause) {
         if (!cancelled) {
           setError(cause instanceof Error ? cause.message : t("shell.profileReadFailed"));

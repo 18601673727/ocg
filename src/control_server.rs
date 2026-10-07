@@ -143,6 +143,9 @@ pub struct ControlServer {
     /// Only present when canonical control service is available.
     execution_runtimes:
         Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
+    /// The canonical Project identity resolved and registered by this launch.
+    /// `None` when the launch resolved no registered Project boundary.
+    startup_project: Option<String>,
 }
 
 impl ControlServer {
@@ -199,9 +202,17 @@ impl ControlServer {
                 profile_path,
             )?;
         let boundary = crate::project::resolve(root);
-        if boundary.has_marker() {
-            service.register_project("startup-register", boundary.root(), now_unix())?;
-        }
+        // The launch Project is registered here, so its canonical identity is
+        // already known to this process. It is handed to the UI as the
+        // explicit Project of this launch instead of leaving the UI to pick one
+        // from a persisted browser selection or a list ordering.
+        let startup_project = if boundary.has_marker() {
+            let registered =
+                service.register_project("startup-register", boundary.root(), now_unix())?;
+            Some(registered.project.project_id)
+        } else {
+            None
+        };
 
         // Share process transport policy; activate bounded workers lazily per Project.
         let selection = crate::proxy::resolve(
@@ -233,7 +244,15 @@ impl ControlServer {
             active: Arc::new(AtomicUsize::new(0)),
             active_streams: Arc::new(AtomicUsize::new(0)),
             execution_runtimes,
+            startup_project,
         })
+    }
+
+    /// The canonical Project identity this launch registered, when the launch
+    /// resolved a Project boundary. The frontend treats it as the explicit
+    /// Project of the launch; it is never a UI-side guess.
+    pub fn startup_project(&self) -> Option<&str> {
+        self.startup_project.as_deref()
     }
 
     /// The address the server is actually bound to.

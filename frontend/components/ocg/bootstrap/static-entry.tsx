@@ -33,7 +33,7 @@ type RouteEntry = {
  * that one in-memory runtime instance survives a switch between views.
  */
 const ROUTE_ENTRY: Partial<Record<StaticEntryRoute, RouteEntry>> = {
-  onboarding: { scenario: "local-first-run" },
+  onboarding: { scenario: "local-first-run", forwardsProject: true },
   login: { scenario: "remote-unauthenticated" },
   logs: { scenario: "logs-live", view: "logs", forwardsProject: true },
   "resource-ledger": { scenario: "resource-ledger", view: "ledger", forwardsProject: true },

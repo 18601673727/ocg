@@ -30,6 +30,39 @@ fn entry_path() -> &'static str {
     "/bootstrap"
 }
 
+/// The launch URL for this process.
+///
+/// The Project supplied to the launcher is carried as the explicit
+/// `project` parameter of the very first request, so initial workspace entry
+/// honors the Project OCG was launched with instead of a Project the browser
+/// persisted earlier. Identity comes from startup registration; nothing here
+/// infers a Project from order, name, root or recency.
+fn launch_url(base_url: &str, project_id: Option<&str>) -> String {
+    match project_id {
+        Some(project_id) => format!(
+            "{base_url}{}?project={}",
+            entry_path(),
+            encode_query_value(project_id)
+        ),
+        None => format!("{base_url}{}", entry_path()),
+    }
+}
+
+/// Percent-encode a query value. Project identities are opaque
+/// backend-owned strings, so the value is never trusted to be URL-safe.
+fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Bind the loopback server, serve the embedded UI, and wait for termination.
 pub fn run(
     root: &Path,
@@ -51,14 +84,15 @@ pub fn run(
         disable_proxy,
     )?;
     let base_url = control.base_url();
+    let startup_project = control.startup_project().map(str::to_owned);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_server = Arc::clone(&stop);
     let control_thread = std::thread::spawn(move || control.serve(stop_server));
-    let page = entry_path();
     // The UI and control API share this loopback origin. Keeping the control
     // endpoint out of the address bar avoids turning a connection hint into a
-    // query-string token and lets the frontend use same-origin requests.
-    let url = format!("{base_url}{page}");
+    // query-string token and lets the frontend use same-origin requests. The
+    // only query parameter is the explicit Project of this launch.
+    let url = launch_url(&base_url, startup_project.as_deref());
     println!("OCG PWA: {url}");
     if !open_browser(&url) {
         eprintln!("ocg: browser could not be opened here; visit {url}");
