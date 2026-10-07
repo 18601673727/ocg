@@ -243,7 +243,11 @@ export function RuntimeWorkspace({
     setLaunchResults(withoutDraft);
   }, [activeProjectId, activeProjectSessionIds, activeSessionKey, client, deleteSession, rememberSession, snapshot.sessions, t]);
   useEffect(() => {
-    if (runtimeAuthority === "canonical" && historyStatus === "ready" && activeSessionKey) rememberSession(activeSessionKey);
+    if (runtimeAuthority !== "canonical" || historyStatus !== "ready" || !activeSessionKey) return;
+    // Idempotent: only rewrite the URL when the current selection drifted,
+    // never race the url update coming from a session handler.
+    const current = new URLSearchParams(window.location.search).get("session");
+    if (current !== activeSessionKey) rememberSession(activeSessionKey);
   }, [activeSessionKey, historyStatus, rememberSession, runtimeAuthority]);
   const isUsage = view === "usage";
   const isLedger = view === "ledger" && runtimeAuthority === "mock";
@@ -334,22 +338,22 @@ export function RuntimeWorkspace({
     // Register before selecting so the new chat stays in the current project.
     registerProjectSession(session.id);
     setActiveSessionId(session.id);
-    navigate("chat");
     rememberSession(session.id);
+    navigate("chat", session.id);
   }, [activeProjectId, createSession, registerProjectSession, rememberSession, navigate]);
 
   const handleNewProjectChat = useCallback(async () => {
     const session = await createSession({ workType: "coding", projectId: activeProjectId });
     registerProjectSession(session.id, activeProjectId);
     setActiveSessionId(session.id);
-    navigate("chat");
     rememberSession(session.id);
+    navigate("chat", session.id);
   }, [activeProjectId, createSession, registerProjectSession, rememberSession, navigate]);
 
   const selectSession = useCallback((id: string) => {
     setActiveSessionId(id);
-    navigate("chat");
     rememberSession(id);
+    navigate("chat", id);
   }, [navigate, rememberSession]);
 
   // Opens the inspector in Chat. When a Chat session presents the selected Job,

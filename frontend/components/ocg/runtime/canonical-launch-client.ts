@@ -89,6 +89,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly chatJobsBySession = new Map<string, { projectId: string; jobId: string }>();
   private readonly deletedSessions = new Set<string>();
   private readonly deletingSessions = new Set<string>();
+  /** Sessions created locally whose backend Conversation never materialized. */
+  private readonly localDraftSessions = new Set<string>();
   private availabilityProbed = false;
   private reportedStatus: RuntimeStatus | null = null;
   private projectJobRefreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -180,6 +182,19 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   override async createSession(input: CreateSessionInput): Promise<ChatSession> {
     if (!input.projectId) throw new Error("New Chat requires a Project.");
+    // An untouched local draft for the same Project means the user has not
+    // started the conversation yet, so repeated New Chat must reuse it
+    // instead of stacking another frontend-only ghost session.
+    const existing = this.store.getSnapshot().sessions.find((session) =>
+      session.projectId === input.projectId &&
+      this.localDraftSessions.has(session.id) &&
+      (this.store.getSnapshot().messagesBySession[session.id] ?? []).length === 0 &&
+      !this.chatJobsBySession.has(session.id) &&
+      !this.pendingSends.has(session.id) &&
+      !this.chatStreams.has(session.id),
+    );
+    if (existing) return { ...existing };
+
     const sessionId = `chat-${crypto.randomUUID()}`;
     const id = chatSessionKey(input.projectId, sessionId);
     const session: ChatSession = {
@@ -191,6 +206,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       updatedAt: "now",
     };
     this.bindSessionProject(id, input.projectId);
+    this.localDraftSessions.add(id);
     this.emit({ type: "conversation.session-created", session: { ...session } }, { projectId: input.projectId });
     return { ...session };
   }
@@ -235,6 +251,16 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!session) return;
     if (this.pendingSends.has(sessionId) || this.chatStreams.has(sessionId) || this.streamingMessage(sessionId)) {
       throw new Error("Conversation is running. Stop it before deleting.");
+    }
+    // An untouched local draft never materialized a backend Conversation, so
+    // deleting it must not invoke the canonical delete path.
+    if (this.localDraftSessions.has(sessionId)) {
+      this.localDraftSessions.delete(sessionId);
+      this.sessionProjects.delete(sessionId);
+      this.chatJobsBySession.delete(sessionId);
+      this.historyEpochs.delete(sessionId);
+      await super.deleteSession(sessionId);
+      return;
     }
     if (!session.projectId || !session.sessionId || !this.control.deleteChatConversation) {
       throw new Error("This runtime does not support deleting chats.");
@@ -283,6 +309,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const projectId = history.project_id;
     const id = chatSessionKey(projectId, history.conversation.session_id);
     if (this.deletedSessions.has(id)) return;
+    // A Conversation with this ID exists on the backend, so the session is
+    // canonical now — never treat it as a local draft again.
+    this.localDraftSessions.delete(id);
     const session: ChatSession = {
       id, projectId, sessionId: history.conversation.session_id,
       title: history.conversation.title || history.messages.find(message => message.role === "user" && message.content.trim())?.content.trim().slice(0, 80) || history.messages.find(message => message.role === "user" && message.images.length)?.images[0]?.name || "",
@@ -461,6 +490,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     // Only an accepted turn supersedes the previous Attempt on the backend.
     // Keep its EventSource alive until then so failed sends leave it streaming.
     this.chatJobsBySession.set(sessionId, { projectId, jobId: response.job_id });
+    this.localDraftSessions.delete(sessionId);
     this.closeChatStream(sessionId, true);
     this.openChatStream(sessionId, response.job_id, assistantId);
     void this.refreshExecution(sessionId, projectId, response.job_id);
