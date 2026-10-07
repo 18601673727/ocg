@@ -24,6 +24,10 @@ struct Envelope {
 #[derive(Default, Serialize, Deserialize)]
 struct Credentials(BTreeMap<String, String>);
 
+/// The Vault encryption key, read from the OS credential store ahead of a
+/// locked commit so the commit itself never waits on the store.
+pub struct VaultKey(Vec<u8>);
+
 #[derive(Clone, Debug)]
 pub struct Vault {
     path: PathBuf,
@@ -55,24 +59,33 @@ impl Vault {
         if value.is_empty() {
             return Err(OcgError::config("credential value cannot be empty"));
         }
+        let key = self.write_key()?;
         let _lock = self.lock()?;
-        let mut credentials = self.read()?;
+        let mut credentials = self.read_with(&key)?;
         credentials.0.insert(name.to_string(), value.to_string());
-        self.write(&credentials)
+        self.write_with(&key, &credentials)
     }
 
     pub fn remove(&self, name: &str) -> Result<bool> {
         validate_name(name)?;
+        if !self.path.exists() {
+            return Ok(false);
+        }
+        let key = VaultKey(shared_encryption_key(None)?);
         let _lock = self.lock()?;
-        let mut credentials = self.read()?;
+        let mut credentials = self.read_with(&key)?;
         let removed = credentials.0.remove(name).is_some();
         if removed {
-            self.write(&credentials)?;
+            self.write_with(&key, &credentials)?;
         }
         Ok(removed)
     }
 
     fn lock(&self) -> Result<std::fs::File> {
+        self.lock_file("lock", "Vault")
+    }
+
+    fn lock_file(&self, extension: &str, what: &str) -> Result<std::fs::File> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| OcgError::io("cannot create Vault directory", error))?;
@@ -81,37 +94,68 @@ impl Vault {
             .create(true)
             .write(true)
             .truncate(false)
-            .open(self.path.with_extension("lock"))
-            .map_err(|error| OcgError::io("cannot open Vault lock", error))?;
+            .open(self.path.with_extension(extension))
+            .map_err(|error| OcgError::io(format!("cannot open {what} lock"), error))?;
         fs2::FileExt::lock_exclusive(&lock)
-            .map_err(|error| OcgError::io("cannot lock Vault", error))?;
+            .map_err(|error| OcgError::io(format!("cannot lock {what}"), error))?;
         Ok(lock)
     }
 
-    pub fn insert_with<T>(
+    /// The key a Vault write encrypts with, creating it on first use. The OS
+    /// credential store may wait on a person, so call this before taking any
+    /// Profile or Vault lock; the locked commit then never touches the store.
+    pub fn write_key(&self) -> Result<VaultKey> {
+        if let Some(key) = shared_stored_key(None)? {
+            return Ok(VaultKey(key));
+        }
+        // Only a process that found no key at all waits here, and it cannot
+        // write without one; Vault and Profile commits never take this lock.
+        // Creation re-checks under it so concurrent first writers converge on
+        // one key instead of each sealing the Vault with its own.
+        let _creating = self.lock_file("key.lock", "Vault key")?;
+        if let Some(key) = stored_key()? {
+            return Ok(VaultKey(key));
+        }
+        if self.path.exists() {
+            return Err(OcgError::config(
+                "cannot access the operating-system credential store",
+            ));
+        }
+        create_key().map(VaultKey)
+    }
+
+    /// Store a new credential and run `commit` while the Vault stays locked.
+    /// `name` picks the credential name from the names stored right now, so
+    /// two concurrent inserts can never claim the same one. A failed commit
+    /// removes the credential again before the lock is released, so nothing
+    /// else can have observed or referenced it.
+    pub fn insert_with<P, T>(
         &self,
-        name: &str,
+        key: &VaultKey,
         value: &str,
-        commit: impl FnOnce() -> Result<T>,
+        name: impl FnOnce(&BTreeSet<String>) -> Result<(String, P)>,
+        commit: impl FnOnce(P) -> Result<T>,
     ) -> Result<T> {
-        validate_name(name)?;
         if value.is_empty() {
             return Err(OcgError::config("credential value cannot be empty"));
         }
         let _lock = self.lock()?;
-        let mut credentials = self.read()?;
-        if credentials.0.contains_key(name) {
+        let mut credentials = self.read_with(key)?;
+        let stored = credentials.0.keys().cloned().collect();
+        let (name, prepared) = name(&stored)?;
+        validate_name(&name)?;
+        if credentials.0.contains_key(&name) {
             return Err(OcgError::config(
                 "credential name is already in use; reconnect provider",
             ));
         }
-        credentials.0.insert(name.to_string(), value.to_string());
-        self.write(&credentials)?;
-        match commit() {
+        credentials.0.insert(name.clone(), value.to_string());
+        self.write_with(key, &credentials)?;
+        match commit(prepared) {
             Ok(result) => Ok(result),
             Err(error) => {
-                credentials.0.remove(name);
-                self.write(&credentials).map_err(|rollback| {
+                credentials.0.remove(&name);
+                self.write_with(key, &credentials).map_err(|rollback| {
                     OcgError::config(format!(
                         "Provider save failed: {error}; credential rollback failed: {rollback}"
                     ))
@@ -157,6 +201,14 @@ impl Vault {
     }
 
     fn read_within(&self, wait: Option<Duration>) -> Result<Credentials> {
+        self.read_using(|| shared_encryption_key(wait))
+    }
+
+    fn read_with(&self, key: &VaultKey) -> Result<Credentials> {
+        self.read_using(|| Ok(key.0.clone()))
+    }
+
+    fn read_using(&self, key: impl FnOnce() -> Result<Vec<u8>>) -> Result<Credentials> {
         if !self.path.exists() {
             return Ok(Credentials::default());
         }
@@ -167,7 +219,7 @@ impl Vault {
         if envelope.version != 1 || envelope.nonce.len() != NONCE_LEN {
             return Err(OcgError::config("unsupported OCG credential vault format"));
         }
-        let key = shared_encryption_key(wait)?;
+        let key = key()?;
         let cipher = LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, &key)
                 .map_err(|_| OcgError::config("cannot initialize credential encryption"))?,
@@ -189,10 +241,9 @@ impl Vault {
             .map_err(|_| OcgError::config("OCG credential vault contents are invalid"))
     }
 
-    fn write(&self, credentials: &Credentials) -> Result<()> {
-        let key = encryption_key(true)?;
+    fn write_with(&self, key: &VaultKey, credentials: &Credentials) -> Result<()> {
         let cipher = LessSafeKey::new(
-            UnboundKey::new(&AES_256_GCM, &key)
+            UnboundKey::new(&AES_256_GCM, &key.0)
                 .map_err(|_| OcgError::config("cannot initialize credential encryption"))?,
         );
         let rng = SystemRandom::new();
@@ -233,7 +284,10 @@ impl Vault {
 }
 
 /// The outcome of one in-flight key lookup, shared by every reader that joined it.
-type KeyLookup = Arc<(Mutex<Option<std::result::Result<Vec<u8>, String>>>, Condvar)>;
+type KeyLookup = Arc<(
+    Mutex<Option<std::result::Result<Option<Vec<u8>>, String>>>,
+    Condvar,
+)>;
 
 /// At most one OS credential-store read per process is outstanding. The OS
 /// store can block on an approval prompt for as long as nobody answers it, so
@@ -244,6 +298,12 @@ static KEY_LOOKUP: Mutex<Option<KeyLookup>> = Mutex::new(None);
 /// Read the existing Vault key through the shared lookup. `None` waits for the
 /// outcome; `Some(bound)` stops waiting after `bound` while the lookup runs on.
 fn shared_encryption_key(wait: Option<Duration>) -> Result<Vec<u8>> {
+    shared_stored_key(wait)?
+        .ok_or_else(|| OcgError::config("cannot access the operating-system credential store"))
+}
+
+/// [`stored_key`] through the one outstanding lookup of this process.
+fn shared_stored_key(wait: Option<Duration>) -> Result<Option<Vec<u8>>> {
     let lookup = {
         let mut slot = KEY_LOOKUP
             .lock()
@@ -256,7 +316,7 @@ fn shared_encryption_key(wait: Option<Duration>) -> Result<Vec<u8>> {
                 std::thread::Builder::new()
                     .name("ocg-vault-key".to_string())
                     .spawn(move || {
-                        let outcome = encryption_key(false).map_err(|error| error.to_string());
+                        let outcome = stored_key().map_err(|error| error.to_string());
                         // Retire the lookup before publishing it, so a later
                         // reader starts a fresh read rather than reusing this one.
                         *KEY_LOOKUP
@@ -299,7 +359,8 @@ fn shared_encryption_key(wait: Option<Duration>) -> Result<Vec<u8>> {
     }
 }
 
-fn encryption_key(create: bool) -> Result<Vec<u8>> {
+/// The existing Vault key; `None` when the OS credential store has none yet.
+fn stored_key() -> Result<Option<Vec<u8>>> {
     // An explicit key file lets isolated/headless processes avoid the shared
     // OS keychain. A missing or invalid override must never fall back to it.
     if let Some(path) = std::env::var_os("OCG_VAULT_KEY_FILE") {
@@ -332,24 +393,32 @@ fn encryption_key(create: bool) -> Result<Vec<u8>> {
                 "explicit Vault key file must contain 32 bytes",
             ));
         }
-        return Ok(key);
+        return Ok(Some(key));
     }
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)
         .map_err(|_| OcgError::config("cannot access the operating-system credential store"))?;
     match entry.get_password() {
-        Ok(encoded) => decode_key(&encoded),
-        Err(keyring::Error::NoEntry) if create => {
-            let mut key = vec![0; KEY_LEN];
-            SystemRandom::new()
-                .fill(&mut key)
-                .map_err(|_| OcgError::config("cannot generate credential encryption key"))?;
-            entry.set_password(&encode_key(&key)).map_err(|_| OcgError::config("cannot store the credential encryption key in the operating-system credential store"))?;
-            Ok(key)
-        }
+        Ok(encoded) => decode_key(&encoded).map(Some),
+        Err(keyring::Error::NoEntry) => Ok(None),
         Err(_) => Err(OcgError::config(
             "cannot access the operating-system credential store",
         )),
     }
+}
+
+fn create_key() -> Result<Vec<u8>> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER)
+        .map_err(|_| OcgError::config("cannot access the operating-system credential store"))?;
+    let mut key = vec![0; KEY_LEN];
+    SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| OcgError::config("cannot generate credential encryption key"))?;
+    entry.set_password(&encode_key(&key)).map_err(|_| {
+        OcgError::config(
+            "cannot store the credential encryption key in the operating-system credential store",
+        )
+    })?;
+    Ok(key)
 }
 
 fn encode_key(bytes: &[u8]) -> String {

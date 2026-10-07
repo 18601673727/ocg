@@ -503,19 +503,34 @@ impl ProfileService {
         self.replace_locked(expected_sha256, profile)
     }
 
-    pub fn replace_with_credential(
+    /// Store a new credential together with the Profile edit that references
+    /// it. The OS credential store is consulted before any lock is taken; the
+    /// edit is then applied to the Profile re-read under `profile.lock`, so a
+    /// concurrent commit made while this one waited is kept, never replaced
+    /// by a stale copy. `edit` receives the stored credential names and
+    /// returns the name its credential is stored under.
+    pub fn edit_with_credential<T>(
         &self,
-        expected_sha256: &str,
-        profile: &Profile,
         vault: &crate::vault::Vault,
-        reference: &str,
         secret: &str,
-    ) -> Result<String> {
-        profile.validate()?;
+        edit: impl FnOnce(&mut Profile, &std::collections::BTreeSet<String>) -> Result<(String, T)>,
+    ) -> Result<(String, T)> {
+        let key = vault.write_key()?;
+        // Lock order: profile.lock, then the Vault lock inside `insert_with`.
         let _lock = self.lock()?;
-        vault.insert_with(reference, secret, || {
-            self.replace_locked(expected_sha256, profile)
-        })
+        let (mut profile, revision) = self
+            .current()?
+            .ok_or_else(|| OcgError::config("profile must be bootstrapped first"))?;
+        vault.insert_with(
+            &key,
+            secret,
+            move |stored| {
+                let (reference, output) = edit(&mut profile, stored)?;
+                profile.validate()?;
+                Ok((reference, (profile, output)))
+            },
+            |(profile, output)| Ok((self.replace_locked(&revision, &profile)?, output)),
+        )
     }
 
     fn replace_locked(&self, expected_sha256: &str, profile: &Profile) -> Result<String> {

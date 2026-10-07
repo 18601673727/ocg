@@ -772,44 +772,42 @@ fn handle_setup(
                 let http = crate::http::NativeHttp::new()?;
                 let catalog = crate::setup::discover_catalog(&http, &body.endpoint, &body.api_key)?;
 
-                let current = service.current()?;
-                let (mut profile, revision) = current
-                    .as_ref()
-                    .ok_or_else(|| OcgError::config("profile must be bootstrapped first"))?
-                    .clone();
-
-                let existing_keys: Vec<&str> =
-                    profile.providers.keys().map(String::as_str).collect();
+                // Keys are chosen against the Profile and Vault as committed
+                // now, so concurrent connects add distinct providers exactly
+                // as sequential connects would.
                 let vault = crate::vault::Vault::user_global()?;
-                let vault_names = vault.list()?;
-                let existing_refs: Vec<&str> = profile
-                    .providers
-                    .values()
-                    .filter_map(|p| p.credential_ref.as_deref())
-                    .chain(vault_names.iter().map(String::as_str))
-                    .collect();
-
-                let provider_key = crate::setup::normalize_provider_key(name, &existing_keys);
-                let credential_ref = crate::setup::normalize_credential_ref(name, &existing_refs);
-
-                profile.providers.insert(
-                    provider_key.clone(),
-                    crate::profile::Provider {
-                        label: name.to_string(),
-                        endpoint: Some(chat_endpoint),
-                        credential_ref: Some(credential_ref.clone()),
-                        protocol: Some(
-                            crate::provider_protocol::ProviderProtocol::OpenAiCompatible,
-                        ),
-                        catalog: Some(catalog.clone()),
-                    },
-                );
-                let new_revision = service.replace_with_credential(
-                    &revision,
-                    &profile,
+                let (new_revision, provider_key) = service.edit_with_credential(
                     &vault,
-                    &credential_ref,
                     body.api_key.trim(),
+                    |profile, stored| {
+                        let (provider_key, credential_ref) = {
+                            let existing_keys: Vec<&str> =
+                                profile.providers.keys().map(String::as_str).collect();
+                            let existing_refs: Vec<&str> = profile
+                                .providers
+                                .values()
+                                .filter_map(|p| p.credential_ref.as_deref())
+                                .chain(stored.iter().map(String::as_str))
+                                .collect();
+                            (
+                                crate::setup::normalize_provider_key(name, &existing_keys),
+                                crate::setup::normalize_credential_ref(name, &existing_refs),
+                            )
+                        };
+                        profile.providers.insert(
+                            provider_key.clone(),
+                            crate::profile::Provider {
+                                label: name.to_string(),
+                                endpoint: Some(chat_endpoint),
+                                credential_ref: Some(credential_ref.clone()),
+                                protocol: Some(
+                                    crate::provider_protocol::ProviderProtocol::OpenAiCompatible,
+                                ),
+                                catalog: Some(catalog.clone()),
+                            },
+                        );
+                        Ok((credential_ref, provider_key))
+                    },
                 )?;
                 let models = crate::setup::catalog_models(&provider_key, &catalog);
 
