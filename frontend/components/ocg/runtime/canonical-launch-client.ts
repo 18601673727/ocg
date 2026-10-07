@@ -82,6 +82,15 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly pendingSends = new Map<string, Promise<void>>();
   private readonly historyEpochs = new Map<string, number>();
   private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string }>();
+  /**
+   * Where the committed presentation of the streaming message ends, per session.
+   *
+   * A provider round announces its boundary once, before its first HTTP attempt.
+   * Every later HTTP attempt for that same round re-asserts this boundary rather
+   * than taking a new one, which is what drops the failed attempt's provisional
+   * tail instead of the rounds already committed ahead of it.
+   */
+  private readonly roundCommits = new Map<string, { committedContentLength: number; committedImageCount: number }>();
   private readonly sessionProjects = new Map<string, string>();
   private readonly projectHydrations = new Map<string, Promise<void>>();
   private readonly projectJobWatermarks = new Map<string, Map<string, string>>();
@@ -230,6 +239,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.projectJobRefreshProject = null;
     for (const tracked of this.chatStreams.values()) tracked.source.close();
     this.chatStreams.clear();
+    this.roundCommits.clear();
     super.dispose();
   }
 
@@ -664,6 +674,25 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         return;
       }
       if (typeof record["reasoning"] === "string") return;
+      if (record["round_begin"] === true) {
+        const current = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
+        const boundary = {
+          committedContentLength: current?.content.length ?? 0,
+          committedImageCount: current?.images?.length ?? 0,
+        };
+        this.roundCommits.set(sessionId, boundary);
+        this.emit({ type: "conversation.message-round-committed", sessionId, messageId: assistantId, ...boundary });
+        return;
+      }
+      if (record["round_reset"] === true) {
+        const boundary = this.roundCommits.get(sessionId);
+        if (!boundary) return;
+        // Re-asserting the round's own boundary drops exactly the provisional
+        // output of the attempt that was replaced; the replacement attempt then
+        // appends to clean presentation state on the same assistant message.
+        this.emit({ type: "conversation.message-round-committed", sessionId, messageId: assistantId, ...boundary });
+        return;
+      }
       if (record["done"] === true) {
         const after = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
         if (after && after.status === "streaming") {
@@ -718,6 +747,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       // Closing a broken stream must not fail the new turn.
     }
     this.chatStreams.delete(sessionId);
+    this.roundCommits.delete(sessionId);
     if (markCancelled) {
       const current = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === tracked.assistantId);
       if (current && current.status === "streaming") {

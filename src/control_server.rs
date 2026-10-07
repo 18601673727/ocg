@@ -1646,6 +1646,12 @@ fn handle_chat_stream(
                         Stream::ReasoningDelta { delta } => {
                             Some(json!({"reasoning": delta}).to_string())
                         }
+                        // The round boundaries carry no provider content. They are
+                        // ordered like every other buffered event, so a
+                        // reconnecting EventSource replays a reset before the
+                        // replacement deltas that follow it.
+                        Stream::RoundBegan => Some(json!({"round_begin": true}).to_string()),
+                        Stream::RoundReset => Some(json!({"round_reset": true}).to_string()),
                         Stream::ToolCallStart { .. }
                         | Stream::ToolCallArgumentsDelta { .. }
                         | Stream::ToolCallComplete { .. }

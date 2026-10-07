@@ -613,6 +613,32 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
       return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
     }
 
+    case "conversation.message-round-committed": {
+      if (!sessionExists(snapshot, sessionId)) {
+        return { snapshot, diagnostics: [diag("unknown-session", `Round boundary for unknown session "${sessionId ?? ""}".`, { sessionId })] };
+      }
+      const messages = snapshot.messagesBySession[sessionId] ?? [];
+      const index = messages.findIndex((item) => item.id === envelope.payload.messageId);
+      if (index < 0) {
+        return { snapshot, diagnostics: [diag("unknown-entity", `Round boundary for unknown message "${envelope.payload.messageId}".`, { sessionId }, "info")] };
+      }
+      const current = messages[index];
+      if (current.status === "completed" || current.status === "failed" || current.status === "cancelled") {
+        return { snapshot, diagnostics: [diag("unknown-entity", `Round boundary ignored for terminal message "${current.id}" (${current.status}).`, { sessionId }, "info")] };
+      }
+      // Only this round's provisional tail is dropped. The message identity, the
+      // rounds already committed ahead of the boundary, and the turn itself all
+      // survive, so a replacement attempt continues the same assistant message.
+      const content = current.content.slice(0, Math.max(0, envelope.payload.committedContentLength));
+      const images = (current.images ?? []).slice(0, Math.max(0, envelope.payload.committedImageCount));
+      if (content === current.content && images.length === (current.images?.length ?? 0)) {
+        return { snapshot, diagnostics: [] };
+      }
+      const next = [...messages];
+      next[index] = { ...current, content, ...(current.images ? { images } : {}) };
+      return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
+    }
+
     case "conversation.message-completed": {
       if (!sessionExists(snapshot, sessionId)) {
         return { snapshot, diagnostics: [diag("unknown-session", `Message completion for unknown session "${sessionId ?? ""}".`, { sessionId })] };

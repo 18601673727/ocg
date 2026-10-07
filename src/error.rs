@@ -30,6 +30,32 @@ impl SpawnRefusalReason {
     }
 }
 
+/// How a failed HTTP attempt relates to repeating the identical request.
+///
+/// The verdict is taken where the transport's own error type is still
+/// available, from typed variants and [`std::io::ErrorKind`] alone, and then
+/// carried on [`OcgError::Transport`]. It is never re-derived from an error
+/// message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFault {
+    /// The network interrupted the exchange: the same bytes can plausibly be
+    /// accepted on a later attempt.
+    Reconnectable,
+    /// Repeating the identical request cannot change the outcome: a rejected
+    /// or malformed request, a certificate that does not validate, a protocol
+    /// the peer or OCG decoded wrongly, or a local limit.
+    Deterministic,
+}
+
+impl TransportFault {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Reconnectable => "reconnectable",
+            Self::Deterministic => "deterministic",
+        }
+    }
+}
+
 /// A problem the user has to fix: bad configuration, a missing file, invalid
 /// JSON, or a process that could not be launched.
 #[derive(Debug, Error)]
@@ -53,6 +79,13 @@ pub enum OcgError {
     /// A configuration problem. The message is already user-facing.
     #[error("{0}")]
     Config(String),
+    /// A failure raised at the HTTP boundary, carrying the verdict the
+    /// transport's own error type supported at the moment it was made.
+    #[error("{message}")]
+    Transport {
+        fault: TransportFault,
+        message: String,
+    },
     /// An I/O problem with the path it applied to.
     #[error("{context}: {source}")]
     Io {
@@ -72,6 +105,25 @@ impl OcgError {
 
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
+    }
+
+    pub fn transport(fault: TransportFault, message: impl Into<String>) -> Self {
+        Self::Transport {
+            fault,
+            message: message.into(),
+        }
+    }
+
+    /// The verdict this error's transport produced.
+    ///
+    /// Every error that did not come from the HTTP boundary is deterministic by
+    /// definition: a rejected payload, a poisoned decoder or a local failure is
+    /// never repeated.
+    pub fn transport_fault(&self) -> TransportFault {
+        match self {
+            Self::Transport { fault, .. } => *fault,
+            _ => TransportFault::Deterministic,
+        }
     }
 
     pub fn storage_full(context: impl Into<String>, message: impl Into<String>) -> Self {

@@ -63,6 +63,17 @@ export type RuntimeEnvelopePayloads = {
     /** Optional monotonic delta sequence within the turn. */
     deltaSequence?: number;
   };
+  /**
+   * The committed presentation of a streaming assistant message ends here.
+   * Content and images past these lengths are the provisional output of a
+   * provider round that a repeated HTTP attempt replaces, so a replacement can
+   * never be appended onto the partial output of the attempt it replaces.
+   */
+  "conversation.message-round-committed": {
+    messageId: string;
+    committedContentLength: number;
+    committedImageCount: number;
+  };
   "conversation.queue-updated": { queue: import("../types").QueuedChatMessage[]; paused: boolean };
   "conversation.message-completed": { message: ChatMessage };
   "activity.updated": { messageId: string; activity: ToolActivity };
@@ -91,6 +102,7 @@ export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
   "conversation.session-updated",
   "conversation.message-started",
   "conversation.message-delta",
+  "conversation.message-round-committed",
   "conversation.message-completed",
   "activity.updated",
   "observability.updated",
@@ -258,6 +270,16 @@ export function envelopeFromRuntimeEvent(
       return { ...base, type: event.type, payload: { messageId: event.messageId, image: event.image } };
     case "conversation.message-delta":
       return { ...base, type: event.type, payload: { messageId: event.messageId, delta: event.delta } };
+    case "conversation.message-round-committed":
+      return {
+        ...base,
+        type: event.type,
+        payload: {
+          messageId: event.messageId,
+          committedContentLength: event.committedContentLength,
+          committedImageCount: event.committedImageCount,
+        },
+      };
     case "conversation.message-completed":
       return { ...base, type: event.type, payload: { message: event.message } };
     case "activity.updated":
@@ -395,6 +417,14 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
       return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, image: envelope.payload.image };
     case "conversation.message-delta":
       return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, delta: envelope.payload.delta };
+    case "conversation.message-round-committed":
+      return {
+        type: envelope.type,
+        sessionId,
+        messageId: envelope.payload.messageId,
+        committedContentLength: envelope.payload.committedContentLength,
+        committedImageCount: envelope.payload.committedImageCount,
+      };
     case "conversation.message-completed":
       return { type: envelope.type, sessionId, message: envelope.payload.message };
     case "activity.updated":
@@ -500,6 +530,12 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       if (payload.deltaSequence !== undefined && !isNonNegativeInteger(payload.deltaSequence)) {
         return "deltaSequence must be a non-negative integer when present.";
       }
+      return null;
+    }
+    case "conversation.message-round-committed": {
+      if (!isNonEmptyString(payload.messageId)) return "messageId is required.";
+      if (!isNonNegativeInteger(payload.committedContentLength)) return "committedContentLength must be a non-negative integer.";
+      if (!isNonNegativeInteger(payload.committedImageCount)) return "committedImageCount must be a non-negative integer.";
       return null;
     }
     case "activity.updated": {

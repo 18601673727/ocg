@@ -6,7 +6,7 @@
 //! back to the provider.
 
 use crate::call_recovery as recovery;
-use crate::error::{OcgError, Result};
+use crate::error::{OcgError, Result, TransportFault};
 use crate::http::{BoxFuture, HttpTransport};
 use crate::native_tools::projection::{self, ToolProjectionProfile};
 use crate::native_tools::{openai_projection::OpenAiToolProjection, PermissionPolicy, ToolResult};
@@ -28,6 +28,7 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub(crate) mod context_cost;
 #[cfg(test)]
@@ -2650,7 +2651,7 @@ impl ProviderClient for NativeOpenAiCompatibleProvider<'_> {
         // buffered body handed to the parser at the end.
         Box::pin(async move {
             run_streamed_round(
-                StreamedRoundState::new(),
+                StreamedRoundState::new,
                 self.transport,
                 ProviderRequest {
                     endpoint: &self.endpoint,
@@ -2826,7 +2827,7 @@ impl ProviderClient for NativeAnthropicProvider<'_> {
         Box::pin(async move {
             let body = encoded?;
             run_streamed_round(
-                AnthropicRoundState::new(),
+                AnthropicRoundState::new,
                 self.transport,
                 ProviderRequest {
                     endpoint: &self.endpoint,
@@ -2950,6 +2951,9 @@ fn provider_http_failure(
 /// end.
 /// The endpoint, headers and body one protocol put on the wire, plus the
 /// credential that must never appear in a failure message.
+/// Every physical attempt of one logical round is sent from the same frozen
+/// request, so this descriptor is only ever copied, never rebuilt.
+#[derive(Clone, Copy)]
 struct ProviderRequest<'a> {
     endpoint: &'a str,
     headers: &'a [(String, String)],
@@ -2959,24 +2963,204 @@ struct ProviderRequest<'a> {
 }
 
 async fn run_streamed_round<S: ProviderRoundState + 'static>(
-    state: S,
+    round_state: fn() -> S,
     transport: &dyn HttpTransport,
     wire: ProviderRequest<'_>,
     events: Option<flume::Sender<ExecutionEvent>>,
     cancelled: &CallCancellation,
 ) -> Result<ProviderRound> {
     let secret = wire.secret.filter(|secret| !secret.is_empty());
-    run_streamed_round_inner(state, transport, wire, events, cancelled)
-        .await
-        .map_err(|error| {
-            let message = error.to_string();
-            match secret {
-                Some(secret) if message.contains(secret) => {
-                    OcgError::config(message.replace(secret, "<redacted>"))
+    let result = recover_streamed_round(round_state, transport, wire, events, cancelled).await;
+    let Some(secret) = secret else {
+        return result;
+    };
+    result.map_err(|error| {
+        let message = error.to_string();
+        if !message.contains(secret) {
+            return error;
+        }
+        // Redaction rebuilds the error rather than editing it in place, so the
+        // transport verdict travels with the sanitized message instead of being
+        // downgraded to an unclassified configuration failure.
+        OcgError::transport(
+            error.transport_fault(),
+            message.replace(secret, "<redacted>"),
+        )
+    })
+}
+
+/// Physical HTTP attempts allowed for one logical provider round.
+///
+/// The budget belongs to the round, not to the Job. Across all of these
+/// attempts the Job, Attempt, Call, generation and frozen provider tuple are
+/// the same; nothing is re-placed, re-admitted or re-reserved, and native tool
+/// admission still happens only once one attempt has reconstructed a complete
+/// round.
+const MAX_PHYSICAL_ATTEMPTS_PER_ROUND: usize = 5;
+
+/// Bounded exponential backoff waited before the next physical attempt.
+const ROUND_ATTEMPT_BACKOFF: [Duration; 4] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+/// Ceiling for a provider-supplied `Retry-After`, so one header cannot hold a
+/// long Job open for an unbounded cooldown. Cancellation still ends the wait.
+const MAX_ROUND_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Ceiling applied to OCG's own retry schedule.
+///
+/// Production has no ceiling: it waits the schedule exactly as written. The test
+/// build collapses it so a five-attempt budget costs no wall time, and tests
+/// assert the schedule itself through [`ROUND_ATTEMPT_BACKOFF`] rather than by
+/// waiting for it. A cooldown the *provider* asked for is never collapsed, so
+/// cancellation during a provider-requested wait stays observable.
+#[cfg(not(test))]
+const SCHEDULED_BACKOFF_CEILING: Duration = Duration::MAX;
+#[cfg(test)]
+const SCHEDULED_BACKOFF_CEILING: Duration = Duration::from_millis(1);
+
+/// The delay before physical attempt `attempt + 1`.
+///
+/// A reliable `Retry-After` wins when it asks for longer than the schedule; the
+/// schedule always supplies a floor so a missing header is never a free retry.
+fn round_backoff(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    let index = attempt
+        .saturating_sub(1)
+        .min(ROUND_ATTEMPT_BACKOFF.len() - 1);
+    let scheduled = ROUND_ATTEMPT_BACKOFF[index];
+    match retry_after {
+        Some(retry_after) => retry_after
+            .clamp(Duration::ZERO, MAX_ROUND_RETRY_AFTER)
+            .max(scheduled),
+        None => scheduled.min(SCHEDULED_BACKOFF_CEILING),
+    }
+}
+
+/// Which HTTP statuses describe the provider being briefly unable, rather than
+/// the request being wrong.
+///
+/// 408, 429 and the gateway/server failures are what a long coding Job meets
+/// while a provider restarts or sheds load. 400, 401, 403, 404 and every other
+/// status are a verdict on the frozen request itself and end the Call on the
+/// first attempt.
+fn status_repeats_round(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+/// What one physical HTTP attempt produced for the current logical round.
+enum PhysicalAttempt {
+    /// One complete round was reconstructed.
+    Complete(ProviderRound),
+    /// The identical request may be repeated. `provisional` says whether this
+    /// attempt had already produced user-visible output that has to be
+    /// invalidated before a replacement is allowed to speak.
+    Repeatable {
+        error: OcgError,
+        provisional: bool,
+        retry_after: Option<Duration>,
+    },
+    /// The round cannot be repeated; this failure settles the Call.
+    Terminal(OcgError),
+}
+
+fn cancelled_during_streaming() -> OcgError {
+    OcgError::config("provider Call cancelled during streaming")
+}
+
+/// Publish one round boundary to this Call's consumer.
+///
+/// A boundary is a presentation fact rather than provider content, so it carries
+/// nothing the credential redactor has to strip.
+fn announce_round_boundary(events: Option<&flume::Sender<ExecutionEvent>>, event: ChatStreamEvent) {
+    let Some(sender) = events else {
+        return;
+    };
+    if let Err(error) = sender.send(ExecutionEvent::Provider(event)) {
+        tracing::debug!(%error, "provider event receiver disconnected");
+    }
+}
+
+/// Bounded, cancellation-aware recovery for one logical provider round.
+///
+/// A round is one frozen request. It may cost more than one physical HTTP
+/// attempt when the network, a gateway or the provider itself interrupts one:
+/// those failures never reach the Call, the Attempt or the Job, and while the
+/// budget remains the Call stays running and the Attempt stays authoritative.
+async fn recover_streamed_round<S: ProviderRoundState + 'static>(
+    round_state: fn() -> S,
+    transport: &dyn HttpTransport,
+    wire: ProviderRequest<'_>,
+    events: Option<flume::Sender<ExecutionEvent>>,
+    cancelled: &CallCancellation,
+) -> Result<ProviderRound> {
+    // One boundary per logical round, before its first physical attempt:
+    // everything the provider emits after it is this round's provisional
+    // output, which is exactly what a later reset has to be able to drop.
+    announce_round_boundary(events.as_ref(), ChatStreamEvent::RoundBegan);
+
+    let mut attempt = 1usize;
+    loop {
+        // Cancellation is decided before an attempt starts as well as inside
+        // it, so a turn cancelled during the previous cooldown never reopens a
+        // connection.
+        if cancelled.is_cancelled() {
+            return Err(cancelled_during_streaming());
+        }
+        // A fresh decoding state per attempt is what makes a replacement a
+        // reconstruction of the same round rather than a continuation of the
+        // bytes the failed attempt left behind.
+        let outcome = run_streamed_round_inner(
+            round_state(),
+            transport,
+            wire,
+            events.clone(),
+            cancelled,
+        )
+        .await;
+        match outcome {
+            PhysicalAttempt::Complete(round) => return Ok(round),
+            PhysicalAttempt::Terminal(error) => return Err(error),
+            PhysicalAttempt::Repeatable {
+                error,
+                provisional,
+                retry_after,
+            } => {
+                if attempt >= MAX_PHYSICAL_ATTEMPTS_PER_ROUND {
+                    // The budget is spent. The Call, the Attempt and the Job
+                    // settle exactly as they always did, on one redacted
+                    // failure, with no running residue left behind.
+                    return Err(error);
                 }
-                _ => error,
+                // Invalidate only this failed round's provisional output. The
+                // rounds that already completed, and the assistant message
+                // itself, are untouched.
+                if provisional {
+                    announce_round_boundary(events.as_ref(), ChatStreamEvent::RoundReset);
+                }
+                let delay = round_backoff(attempt, retry_after);
+                tracing::debug!(
+                    attempt,
+                    max_attempts = MAX_PHYSICAL_ATTEMPTS_PER_ROUND,
+                    fault = error.transport_fault().code(),
+                    delay_ms = delay.as_millis() as u64,
+                    provisional,
+                    "transient provider round failure; repeating the same logical round"
+                );
+                // The cooldown is raced against cancellation, so a cancelled
+                // turn ends at once instead of waiting out a wait it will not
+                // use.
+                if let ntex::util::Either::Right(()) =
+                    ntex::util::select(ntex::time::sleep(delay), cancelled.cancelled()).await
+                {
+                    return Err(cancelled_during_streaming());
+                }
             }
-        })
+        }
+        attempt += 1;
+    }
 }
 
 fn redact_provider_event(event: &mut ChatStreamEvent, secret: Option<&str>) {
@@ -3013,17 +3197,28 @@ fn redact_provider_event(event: &mut ChatStreamEvent, secret: Option<&str>) {
     }
 }
 
+/// Run exactly one physical HTTP attempt of the current logical round.
+///
+/// Everything protocol-independent lives here: chunk delivery with
+/// backpressure, cancellation racing, the typed verdict on the transport, and
+/// the round boundary around whatever the attempt produced. Nothing here
+/// decides whether the round is repeated; that belongs to
+/// [`recover_streamed_round`], which owns the budget.
 async fn run_streamed_round_inner<S: ProviderRoundState + 'static>(
     state: S,
     transport: &dyn HttpTransport,
     wire: ProviderRequest<'_>,
     events: Option<flume::Sender<ExecutionEvent>>,
     cancelled: &CallCancellation,
-) -> Result<ProviderRound> {
+) -> PhysicalAttempt {
     let state = Arc::new(Mutex::new(state));
+    // Only what the Chat surface accumulates on the assistant message counts as
+    // provisional, so an attempt that never reached the user announces no reset.
+    let provisional = Arc::new(AtomicBool::new(false));
     let callback_state = Arc::clone(&state);
     let callback_events = events.clone();
     let callback_cancelled = cancelled.clone();
+    let callback_provisional = Arc::clone(&provisional);
     let callback_secret = wire.secret.map(str::to_owned);
     let on_chunk: crate::http::ChunkSink = Box::new(move |chunk: &[u8]| -> Result<bool> {
         // Cancellation is checked during consumption; stop reading and let the
@@ -3037,6 +3232,12 @@ async fn run_streamed_round_inner<S: ProviderRoundState + 'static>(
         let (keep_reading, emitted) = guard.consume(chunk)?;
         if let Some(sender) = &callback_events {
             for mut event in emitted {
+                if matches!(
+                    event,
+                    ChatStreamEvent::TextDelta { .. } | ChatStreamEvent::Image { .. }
+                ) {
+                    callback_provisional.store(true, Ordering::SeqCst);
+                }
                 redact_provider_event(&mut event, callback_secret.as_deref());
                 if let Err(error) = sender.send(ExecutionEvent::Provider(event)) {
                     tracing::debug!(%error, "provider event receiver disconnected");
@@ -3063,11 +3264,31 @@ async fn run_streamed_round_inner<S: ProviderRoundState + 'static>(
     )
     .await
     {
-        ntex::util::Either::Left(response) => response?,
+        ntex::util::Either::Left(response) => response,
         ntex::util::Either::Right(()) => {
             // Cancellation owns terminalization; this is not a provider
             // failure and must not be reported as one.
-            return Err(OcgError::config("provider Call cancelled during streaming"));
+            return PhysicalAttempt::Terminal(cancelled_during_streaming());
+        }
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            // The transport decided, from its own typed error, whether the
+            // identical request can be repeated. Anything the Call itself
+            // rejected — a poisoned decoder, a provider frame that does not
+            // decode — arrives here as an unclassified `OcgError` and is
+            // therefore never repeated.
+            let repeat = error.transport_fault() == TransportFault::Reconnectable;
+            return if repeat {
+                PhysicalAttempt::Repeatable {
+                    error,
+                    provisional: provisional.load(Ordering::SeqCst),
+                    retry_after: None,
+                }
+            } else {
+                PhysicalAttempt::Terminal(error)
+            };
         }
     };
 
@@ -3084,22 +3305,46 @@ async fn run_streamed_round_inner<S: ProviderRoundState + 'static>(
         if let Some(secret) = wire.secret {
             excerpt = excerpt.replace(secret, "<redacted>");
         }
-        return Err((wire.on_http_failure)(
+        let error = (wire.on_http_failure)(
             response.status,
             excerpt.as_bytes(),
             response.rate_limit.retry_after,
-        ));
+        );
+        return if status_repeats_round(response.status) {
+            PhysicalAttempt::Repeatable {
+                error,
+                // A non-2xx body is never delivered to the chunk sink, so this
+                // attempt left nothing provisional behind to invalidate.
+                provisional: false,
+                // A delta-seconds `Retry-After` counts only on the throttling
+                // status, exactly as it is reported in the failure message.
+                retry_after: (response.status == 429)
+                    .then_some(response.rate_limit.retry_after)
+                    .flatten()
+                    .map(Duration::from_secs),
+            }
+        } else {
+            PhysicalAttempt::Terminal(error)
+        };
     }
 
     // If cancellation interrupted the stream, this round is not a completion.
     if cancelled.is_cancelled() {
-        return Err(OcgError::config("provider Call cancelled during streaming"));
+        return PhysicalAttempt::Terminal(cancelled_during_streaming());
     }
 
-    let mut state = state
-        .lock()
-        .map_err(|_| OcgError::config("provider stream state poisoned"))?;
-    state.finish()
+    let mut state = match state.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return PhysicalAttempt::Terminal(OcgError::config("provider stream state poisoned"))
+        }
+    };
+    // The transport completed successfully, so anything wrong with what it
+    // carried is the provider's own output, never an interrupted exchange.
+    match state.finish() {
+        Ok(round) => PhysicalAttempt::Complete(round),
+        Err(error) => PhysicalAttempt::Terminal(error),
+    }
 }
 
 fn fail_provider_envelope(

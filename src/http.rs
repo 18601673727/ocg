@@ -10,7 +10,7 @@
 //! requests whose host is exactly `api.github.com`; it never enters a log,
 //! a warning or a serialized artifact.
 
-use crate::error::{OcgError, Result};
+use crate::error::{OcgError, Result, TransportFault};
 use crate::proxy::{proxy_builder_ops, ProxyBuilderOp, ProxyPlan, ProxyScheme};
 use ntex::util::Stream;
 use serde_json::Value;
@@ -1043,6 +1043,97 @@ async fn native_post_json(
     })
 }
 
+use ntex::client::error::ClientError;
+use ntex::client::error::ConnectError as Connect;
+use ntex::http::error::PayloadError;
+
+/// Whether an I/O failure is network weather rather than a verdict.
+///
+/// Only the kind is inspected. `InvalidData` in particular is how a rustls
+/// certificate or hostname validation failure reaches this layer, so it stays
+/// deterministic even though a dropped connection can share its variant path.
+fn reconnectable_io(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+    )
+}
+
+fn classify_io(error: &std::io::Error) -> TransportFault {
+    if reconnectable_io(error.kind()) {
+        TransportFault::Reconnectable
+    } else {
+        TransportFault::Deterministic
+    }
+}
+
+fn classify_connect(error: &Connect) -> TransportFault {
+    match error {
+        Connect::Disconnected(Some(source)) => classify_io(source),
+        Connect::Disconnected(None)
+        | Connect::Resolver(_)
+        | Connect::NoRecords
+        | Connect::Timeout => TransportFault::Reconnectable,
+        // An unresolved host and a missing SSL implementation are local
+        // configuration, not weather.
+        Connect::Unresolved | Connect::SslIsNotSupported => TransportFault::Deterministic,
+    }
+}
+
+fn classify_payload(error: &PayloadError) -> TransportFault {
+    match error {
+        // The peer stopped before the payload was complete, which is the exact
+        // shape of a truncated provider stream.
+        PayloadError::Incomplete(_) => TransportFault::Reconnectable,
+        PayloadError::Io(source) => classify_io(source),
+        // A reset or closed HTTP/2 stream cannot be resumed, but the round that
+        // opened it can be re-requested.
+        PayloadError::Http2Payload(_) => TransportFault::Reconnectable,
+        // Corrupted content coding, a payload over the declared limit, an
+        // unknown length and a decode failure are all reproducible from the
+        // same bytes.
+        PayloadError::EncodingCorrupted
+        | PayloadError::Overflow
+        | PayloadError::UnknownLength
+        | PayloadError::Decode(_) => TransportFault::Deterministic,
+    }
+}
+
+/// Classify a request that failed before or while the response head arrived.
+fn classify_client_error(error: &ClientError) -> TransportFault {
+    match error {
+        ClientError::Connect(source) => classify_connect(source),
+        ClientError::Send(source) => classify_io(source),
+        // A head that stopped mid-parse is a truncated exchange; every other
+        // decode failure is a protocol OCG and the peer disagree about.
+        ClientError::Response(ntex::http::error::DecodeError::Incomplete) => {
+            TransportFault::Reconnectable
+        }
+        // ntex only raises the HTTP/2 variant for connection-level failures, and
+        // `Timeout` for a head that never arrived.
+        ClientError::H2(_) | ClientError::Timeout => TransportFault::Reconnectable,
+        // An unusable URL, a request OCG could not encode, an undecodable head,
+        // an HTTP-level protocol error, a tunnel this client cannot speak and a
+        // body send failure are all decided before the network is relevant.
+        ClientError::Url(_)
+        | ClientError::Request(_)
+        | ClientError::Response(_)
+        | ClientError::Http(_)
+        | ClientError::TunnelNotSupported
+        | ClientError::Error(_) => TransportFault::Deterministic,
+    }
+}
+
 /// Stream a JSON POST response chunk by chunk, delivering each to `on_chunk`.
 ///
 /// This is the only provider execution path: the success body is never
@@ -1080,7 +1171,12 @@ async fn native_post_json_stream(
     let response = request
         .send_body(body.to_vec())
         .await
-        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+        .map_err(|error| {
+            OcgError::transport(
+                classify_client_error(&error),
+                format!("request to {url} failed: {error}"),
+            )
+        })?;
     let status = response.status().as_u16();
     let rate_limit = provider_rate_limit(&response);
     let mut response = Box::pin(response);
@@ -1091,9 +1187,10 @@ async fn native_post_json_stream(
         let mut diagnostic = Vec::new();
         while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
             let chunk = chunk.map_err(|error| {
-                OcgError::config(format!(
-                    "cannot read the error response from {url}: {error}"
-                ))
+                OcgError::transport(
+                    classify_payload(&error),
+                    format!("cannot read the error response from {url}: {error}"),
+                )
             })?;
             if diagnostic.len() + chunk.len() > MAX_PROVIDER_ERROR_BODY {
                 break;
@@ -1113,9 +1210,10 @@ async fn native_post_json_stream(
     let mut total: u64 = 0;
     while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
         let chunk = chunk.map_err(|error| {
-            OcgError::config(format!(
-                "error reading streamed response from {url}: {error}"
-            ))
+            OcgError::transport(
+                classify_payload(&error),
+                format!("error reading streamed response from {url}: {error}"),
+            )
         })?;
         total += chunk.len() as u64;
         if total > MAX_BODY_BYTES {
@@ -1352,7 +1450,12 @@ async fn native_post_json_stream_via_proxy(
     let response = request
         .send_body(body.to_vec())
         .await
-        .map_err(|error| OcgError::config(format!("request to {url} failed: {error}")))?;
+        .map_err(|error| {
+            OcgError::transport(
+                classify_client_error(&error),
+                format!("request to {url} failed: {error}"),
+            )
+        })?;
     let status = response.status().as_u16();
     let rate_limit = provider_rate_limit(&response);
     let mut response = Box::pin(response);
@@ -1361,9 +1464,10 @@ async fn native_post_json_stream_via_proxy(
         let mut diagnostic = Vec::new();
         while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
             let chunk = chunk.map_err(|error| {
-                OcgError::config(format!(
-                    "cannot read the error response from {url}: {error}"
-                ))
+                OcgError::transport(
+                    classify_payload(&error),
+                    format!("cannot read the error response from {url}: {error}"),
+                )
             })?;
             if diagnostic.len() + chunk.len() > MAX_PROVIDER_ERROR_BODY {
                 break;
@@ -1380,9 +1484,10 @@ async fn native_post_json_stream_via_proxy(
     let mut total: u64 = 0;
     while let Some(chunk) = poll_fn(|cx| response.as_mut().poll_next(cx)).await {
         let chunk = chunk.map_err(|error| {
-            OcgError::config(format!(
-                "error reading streamed response from {url}: {error}"
-            ))
+            OcgError::transport(
+                classify_payload(&error),
+                format!("error reading streamed response from {url}: {error}"),
+            )
         })?;
         total += chunk.len() as u64;
         if total > MAX_BODY_BYTES {

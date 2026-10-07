@@ -91,6 +91,16 @@ pub enum ChatStreamEvent {
         model: Option<String>,
         timestamp: Option<String>,
     },
+    /// A logical provider round began. Everything the provider emits between
+    /// this marker and the next one is this round's provisional output, so a
+    /// replaced physical attempt can be dropped without touching the rounds
+    /// that already completed.
+    RoundBegan,
+    /// The provisional output of the current round was invalidated: a
+    /// transient transport failure ended a physical attempt that had already
+    /// produced user-visible output, and a replacement attempt will produce it
+    /// again. Consumers drop back to the last [`ChatStreamEvent::RoundBegan`].
+    RoundReset,
     Finish {
         reason: ChatFinishReason,
         raw_reason: Option<String>,
@@ -171,7 +181,10 @@ impl ChatStreamSummary {
                 self.finish_reason = Some(*reason);
                 self.raw_finish_reason.clone_from(raw_reason);
             }
-            ChatStreamEvent::Metadata { .. } | ChatStreamEvent::Error(_) => {}
+            ChatStreamEvent::Metadata { .. }
+            | ChatStreamEvent::Error(_)
+            | ChatStreamEvent::RoundBegan
+            | ChatStreamEvent::RoundReset => {}
         }
     }
 

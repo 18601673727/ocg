@@ -15,10 +15,88 @@ use tempfile::TempDir;
 
 const WAIT: Duration = Duration::from_secs(5);
 
+/// One scripted response from the provider stub, for one physical HTTP attempt.
+///
+/// The sequence is indexed by physical attempt, not by logical round, so a
+/// fixture can say "fail this way twice, then answer normally" and assert the
+/// exact number of requests the bounded retry produced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StubStep {
+    /// A non-2xx response with a small body.
+    Status(u16),
+    /// A non-2xx response carrying a `Retry-After` cooldown, with its seconds.
+    Throttled(u16, u64),
+    /// A complete SSE stream: these deltas, then `[DONE]`.
+    Stream(&'static [&'static str]),
+    /// An SSE stream that stops mid-flight: these deltas are delivered, then the
+    /// connection is closed without `[DONE]`, which is a premature EOF.
+    TruncatedStream(&'static [&'static str]),
+    /// An SSE stream that stops mid-flight, carrying these already-encoded SSE
+    /// frames verbatim. Needed when the wire shape under test is not an ordinary
+    /// text delta, such as a real OpenAI `tool_calls` fragment.
+    TruncatedFrames(&'static [&'static str]),
+}
+
+/// The scripted attempts for one label, and how many have been served.
+type StubScript = Vec<StubStep>;
+
+fn sse_chunk(content: &str) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]})
+    )
+}
+
+/// One OpenAI-compatible `tool_calls` SSE frame: the call's id and function name
+/// plus an argument fragment, exactly as a real provider streams them.
+fn sse_tool_call(id: &str, name: &str, arguments: &str) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":id,
+            "function":{"name":name,"arguments":arguments}}]},"finish_reason":null}]})
+    )
+}
+
+/// The real tool-call frames a discarded physical attempt streams.
+///
+/// A tool that exists in the Native Tool registry, sent as the two argument
+/// fragments providers actually split it into, which concatenate into complete,
+/// valid arguments `{"path":"."}`. Built once through the same encoder the rest
+/// of the stub uses, then leaked for the process lifetime because a scripted
+/// step holds `&'static [&'static str]`.
+fn discarded_tool_frames() -> &'static [&'static str] {
+    static FRAMES: std::sync::OnceLock<[&'static str; 2]> = std::sync::OnceLock::new();
+    FRAMES
+        .get_or_init(|| {
+            [
+                Box::leak(
+                    sse_tool_call("call-discarded", "filesystem_list", "{\"path\":\"")
+                        .into_boxed_str(),
+                ),
+                Box::leak(
+                    sse_tool_call("call-discarded", "filesystem_list", ".\"}")
+                        .into_boxed_str(),
+                ),
+            ]
+        })
+        .as_slice()
+}
+
+fn sse_final(content: &str) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":"stop"}]})
+    )
+}
+
 struct ProviderStub {
     endpoint: String,
     requests: flume::Receiver<String>,
     closed: flume::Receiver<String>,
+    /// Physical requests served per label, in order. This is the observable the
+    /// bounded retry is asserted against.
+    served: Arc<Mutex<Vec<String>>>,
+    scripts: Arc<Mutex<std::collections::HashMap<String, StubScript>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     handlers: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -31,16 +109,23 @@ impl ProviderStub {
         listener.set_nonblocking(true).expect("nonblocking accept");
         let (requests, received) = flume::unbounded();
         let (closed, closures) = flume::unbounded();
+        let served: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let scripts: Arc<Mutex<std::collections::HashMap<String, StubScript>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let shutdown = stop.clone();
         let handlers = Arc::new(Mutex::new(Vec::new()));
         let connection_handlers = Arc::clone(&handlers);
+        let connection_served = Arc::clone(&served);
+        let connection_scripts = Arc::clone(&scripts);
         let thread = thread::spawn(move || {
             while !shutdown.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let requests = requests.clone();
                         let closed = closed.clone();
+                        let served = Arc::clone(&connection_served);
+                        let scripts = Arc::clone(&connection_scripts);
                         let handler = thread::spawn(move || {
                             let mut stream = stream;
                             stream
@@ -76,6 +161,29 @@ impl ProviderStub {
                                 .expect("user objective")
                                 .to_string();
                             requests.send(label.clone()).expect("request observer");
+                            // The attempt index is decided before the response is
+                            // written, so a scripted sequence is replayed by
+                            // physical attempt and never by wall-clock timing.
+                            let step = {
+                                let mut served = served.lock().expect("served labels");
+                                let attempt = served.iter().filter(|seen| **seen == label).count();
+                                served.push(label.clone());
+                                scripts
+                                    .lock()
+                                    .expect("stub scripts")
+                                    .get(&label)
+                                    .and_then(|script| {
+                                        script
+                                            .get(attempt)
+                                            .or_else(|| script.last())
+                                            .copied()
+                                    })
+                            };
+                            if let Some(step) = step {
+                                serve_step(step, &mut stream);
+                                closed.send(label).expect("closure observer");
+                                return;
+                            }
                             if label == "http500" {
                                 stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfailure").expect("error response");
                             } else if label.starts_with("silent") {
@@ -196,10 +304,37 @@ impl ProviderStub {
             endpoint: format!("http://{address}/v1"),
             requests: received,
             closed: closures,
+            served,
+            scripts,
             stop,
             thread: Some(thread),
             handlers,
         }
+    }
+
+    /// Answer this label's physical attempts from `script`.
+    fn script(&self, label: &str, script: StubScript) {
+        self.scripts
+            .lock()
+            .expect("stub scripts")
+            .insert(label.to_string(), script);
+    }
+
+    /// How many physical requests this label has received so far.
+    fn attempts(&self, label: &str) -> usize {
+        self.served
+            .lock()
+            .expect("served labels")
+            .iter()
+            .filter(|seen| *seen == label)
+            .count()
+    }
+
+    /// How many physical responses the stub has finished writing. A settled round
+    /// has closed every connection it opened, so this matches the attempts a
+    /// completed fixture served.
+    fn closures(&self) -> usize {
+        self.served.lock().expect("served labels").len()
     }
 
     fn request(&self, expected: &str) {
@@ -215,6 +350,94 @@ impl ProviderStub {
             expected
         );
     }
+}
+
+/// Write one scripted response for a single physical attempt.
+fn serve_step(step: StubStep, stream: &mut impl Write) {
+    match step {
+        StubStep::Status(status) => {
+            let reason = match status {
+                401 => "Unauthorized",
+                408 => "Request Timeout",
+                500 => "Internal Server Error",
+                502 => "Bad Gateway",
+                503 => "Service Unavailable",
+                504 => "Gateway Timeout",
+                529 => "Site Overloaded",
+                other => panic!("unscripted status {other}"),
+            };
+            let body = format!("{reason}");
+            write!(
+                stream,
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("error response");
+            stream.flush().expect("flush error response");
+        }
+        StubStep::Throttled(status, seconds) => {
+            let body = "slow down";
+            write!(
+                stream,
+                "HTTP/1.1 {status} Too Many Requests\r\nRetry-After: {seconds}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("throttled response");
+            stream.flush().expect("flush throttled response");
+        }
+        StubStep::Stream(deltas) => {
+            let body = format!("{}data: [DONE]\n\n", stream_body(deltas, true));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("stream head");
+            stream.write_all(body.as_bytes()).expect("stream body");
+            stream.flush().expect("flush body");
+        }
+        StubStep::TruncatedFrames(frames) => {
+            write_truncated_head(stream);
+            let body = frames.concat();
+            write!(stream, "{:x}\r\n{body}\r\n", body.len()).expect("raw chunk");
+            stream.flush().expect("flush raw chunk");
+            let _ = stream.flush();
+        }
+        StubStep::TruncatedStream(deltas) => {
+            // A chunked head with no terminating chunk: the client has delivered
+            // the deltas and then observes a premature EOF.
+            write_truncated_head(stream);
+            let body = stream_body(deltas, false);
+            write!(stream, "{:x}\r\n{body}\r\n", body.len()).expect("truncated chunk");
+            stream.flush().expect("flush truncated chunk");
+            // Closing here is the transport interruption this step models.
+            let _ = stream.flush();
+        }
+    }
+}
+
+/// A chunked SSE head with no terminating chunk: the client has received every
+/// frame the stub sends and then observes a premature EOF when the socket closes.
+fn write_truncated_head(stream: &mut impl Write) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )
+    .expect("truncated stream head");
+}
+
+fn stream_body(deltas: &'static [&'static str], terminal: bool) -> String {
+    deltas
+        .iter()
+        .enumerate()
+        .map(|(index, delta)| {
+            if index + 1 == deltas.len() && terminal {
+                sse_final(delta)
+            } else {
+                sse_chunk(delta)
+            }
+        })
+        .collect()
 }
 
 impl Drop for ProviderStub {
@@ -719,25 +942,334 @@ fn unclaimed_failure_cannot_race_past_an_existing_claim_or_generation_fence() {
     fixture.no_residue();
 }
 
+/// A round that never fails costs exactly one physical HTTP attempt.
 #[test]
-fn streaming_success_and_http_failure_settle_the_attempt() {
+fn streaming_success_uses_one_physical_attempt_and_settles_the_attempt() {
     let upstream = ProviderStub::start();
-    for (label, state) in [("success", "completed"), ("http500", "failed")] {
-        let mut fixture = Fixture::new();
-        let (call, envelope, events) = fixture.admitted(&upstream.endpoint, label, true);
-        let result = fixture.execute(envelope);
-        assert_eq!(result.is_ok(), state == "completed", "{result:?}");
-        upstream.request(label);
-        upstream.closure(label);
-        fixture.terminal(&call, state);
-        if state == "completed" {
-            assert!(events.try_iter().any(|event| matches!(
+    upstream.script("success", vec![StubStep::Stream(&["Real ", "reply"])]);
+    let mut fixture = Fixture::new();
+    let (call, envelope, events) = fixture.admitted(&upstream.endpoint, "success", true);
+
+    fixture.execute(envelope).expect("streamed round");
+
+    assert_eq!(upstream.attempts("success"), 1);
+    assert_eq!(upstream.attempts("success"), upstream.closures());
+    assert!(events.try_iter().any(|event| matches!(
+        event,
+        ExecutionEvent::Provider(ChatStreamEvent::TextDelta { .. })
+    )));
+    fixture.terminal(&call, "completed");
+    fixture.no_residue();
+}
+
+/// HTTP 401 describes the request, not the transport, so the Call settles on the
+/// first attempt and nothing is repeated.
+#[test]
+fn non_retryable_http_status_is_never_repeated() {
+    let upstream = ProviderStub::start();
+    upstream.script("unauthorized", vec![StubStep::Status(401)]);
+    let mut fixture = Fixture::new();
+    let (call, envelope, events) = fixture.admitted(&upstream.endpoint, "unauthorized", true);
+
+    let error = fixture.execute(envelope).expect_err("401 must fail");
+    assert!(error.to_string().contains("401"), "{error}");
+
+    assert_eq!(upstream.attempts("unauthorized"), 1);
+    // The round opened and the Call failed; no provider content was ever
+    // published, and no round was reset because nothing was provisional.
+    let published = events.try_iter().collect::<Vec<_>>();
+    assert_eq!(published.len(), 2, "{published:?}");
+    assert!(matches!(
+        published[0],
+        ExecutionEvent::Provider(ChatStreamEvent::RoundBegan)
+    ));
+    assert!(matches!(&published[1], ExecutionEvent::Failed(_)));
+    fixture.terminal(&call, "failed");
+    fixture.no_residue();
+}
+
+/// A 503 is provider weather: the same logical round is re-requested and its
+/// replacement completes, with the Job, Attempt and Call untouched.
+#[test]
+fn retryable_http_status_repeats_the_same_logical_round() {
+    let upstream = ProviderStub::start();
+    upstream.script(
+        "overloaded",
+        vec![StubStep::Status(503), StubStep::Stream(&["Real ", "reply"])],
+    );
+    let mut fixture = Fixture::new();
+    let (call, envelope, _events) = fixture.admitted(&upstream.endpoint, "overloaded", true);
+
+    fixture.execute(envelope).expect("round recovered");
+
+    assert_eq!(upstream.attempts("overloaded"), 2);
+    // One provider Call: the retry stayed inside the round rather than
+    // admitting a new Call, a new Attempt or a new Job.
+    let calls = fixture
+        .domain
+        .calls_for_attempt(&call.attempt_id)
+        .expect("calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, call.id);
+    let response: Value = serde_json::from_str(
+        calls[0].response.as_deref().expect("provider response"),
+    )
+    .expect("response JSON");
+    assert_eq!(response["content"], "Real reply");
+    assert_eq!(response["rounds"], 1);
+    fixture.terminal(&call, "completed");
+    fixture.no_residue();
+}
+
+/// An exhausted budget settles the Call exactly once, on the final failure.
+#[test]
+fn retryable_http_status_exhausts_the_bounded_round_budget() {
+    let upstream = ProviderStub::start();
+    upstream.script("always-overloaded", vec![StubStep::Status(503)]);
+    let mut fixture = Fixture::new();
+    let (call, envelope, _events) =
+        fixture.admitted(&upstream.endpoint, "always-overloaded", true);
+
+    fixture
+        .execute(envelope)
+        .expect_err("exhausted budget must fail");
+
+    assert_eq!(
+        upstream.attempts("always-overloaded"),
+        MAX_PHYSICAL_ATTEMPTS_PER_ROUND
+    );
+    let calls = fixture
+        .domain
+        .calls_for_attempt(&call.attempt_id)
+        .expect("calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].state, "failed");
+    fixture.terminal(&call, "failed");
+    fixture.no_residue();
+}
+
+/// A premature EOF after partial output resets that round's provisional text and
+/// the replacement starts clean, on the same Call and the same assistant
+/// message.
+#[test]
+fn partial_stream_then_premature_eof_resets_the_round_before_retrying() {
+    let upstream = ProviderStub::start();
+    upstream.script(
+        "truncated",
+        vec![
+            StubStep::TruncatedStream(&["half-written answ"]),
+            StubStep::Stream(&["complete ", "answer"]),
+        ],
+    );
+    let mut fixture = Fixture::new();
+    let (call, envelope, events) = fixture.admitted(&upstream.endpoint, "truncated", true);
+
+    fixture.execute(envelope).expect("round recovered");
+
+    assert_eq!(upstream.attempts("truncated"), 2);
+    let published = events.try_iter().collect::<Vec<_>>();
+    let shapes = published
+        .iter()
+        .map(|event| match event {
+            ExecutionEvent::Provider(ChatStreamEvent::TextDelta { delta }) => {
+                format!("delta:{delta}")
+            }
+            ExecutionEvent::Provider(ChatStreamEvent::RoundBegan) => "round-began".to_string(),
+            ExecutionEvent::Provider(ChatStreamEvent::RoundReset) => "round-reset".to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect::<Vec<_>>();
+    // The failed attempt's provisional text is published, then invalidated, and
+    // the replacement appends from a clean presentation state: the two halves are
+    // never concatenated.
+    assert_eq!(
+        shapes,
+        vec![
+            "round-began",
+            "delta:half-written answ",
+            "round-reset",
+            "delta:complete ",
+            "delta:answer",
+            "Finished",
+        ],
+        "{shapes:?}"
+    );
+    let calls = fixture
+        .domain
+        .calls_for_attempt(&call.attempt_id)
+        .expect("calls");
+    assert_eq!(calls.len(), 1);
+    let response: Value = serde_json::from_str(
+        calls[0].response.as_deref().expect("provider response"),
+    )
+    .expect("response JSON");
+    assert_eq!(response["content"], "complete answer");
+    assert_eq!(response["rounds"], 1);
+    fixture.terminal(&call, "completed");
+    fixture.no_residue();
+}
+
+/// A tool call emitted by a physical attempt that then fails must never become a
+/// durable Call, so a replacement attempt cannot double a native side effect.
+///
+/// The first attempt streams a real OpenAI `tool_calls` fragment — an id, an
+/// existing Native Tool name and complete arguments — and the connection then
+/// dies before the round can complete.
+#[test]
+fn discarded_tool_call_from_a_failed_attempt_is_never_admitted() {
+    let upstream = ProviderStub::start();
+    upstream.script(
+        "truncated-tool",
+        vec![
+            StubStep::TruncatedFrames(discarded_tool_frames()),
+            StubStep::Stream(&["done ", "without ", "tools"]),
+        ],
+    );
+    let mut fixture = Fixture::new();
+    let (call, envelope, events) = fixture.admitted(&upstream.endpoint, "truncated-tool", true);
+
+    fixture.execute(envelope).expect("round recovered");
+
+    // Two physical attempts, both against the same logical round.
+    assert_eq!(upstream.attempts("truncated-tool"), 2);
+
+    let published = events.try_iter().collect::<Vec<_>>();
+    // The discarded attempt really did reach tool-call parsing: its id, name and
+    // argument fragments were decoded and published before the transport died.
+    // Without this the no-native-Call assertion below would be vacuous.
+    let decoded = published
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::Provider(ChatStreamEvent::ToolCallStart { id, name, .. }) => {
+                Some(format!("start:{id}:{name}"))
+            }
+            ExecutionEvent::Provider(ChatStreamEvent::ToolCallArgumentsDelta { id, delta, .. }) => {
+                Some(format!("args:{id}:{delta}"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decoded,
+        vec![
+            "start:call-discarded:filesystem_list",
+            "args:call-discarded:{\"path\":\"",
+            "start:call-discarded:filesystem_list",
+            "args:call-discarded:.\"}",
+        ],
+        "the discarded attempt never reached tool-call parsing: {published:?}"
+    );
+    // The fragments reconstructed a complete, valid argument object for a tool
+    // that really exists, so this attempt would have been dispatched had the
+    // transport not died first.
+    let arguments = decoded
+        .iter()
+        .filter(|event| event.starts_with("args:"))
+        .map(|event| event.trim_start_matches("args:call-discarded:"))
+        .collect::<String>();
+    assert_eq!(arguments, "{\"path\":\".\"}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&arguments).expect("tool arguments"),
+        json!({"path": "."})
+    );
+    // That attempt never completed: no `ToolCallComplete` was ever produced,
+    // because the round was abandoned mid-stream.
+    assert!(
+        !published
+            .iter()
+            .any(|event| matches!(
                 event,
-                ExecutionEvent::Provider(ChatStreamEvent::TextDelta { .. })
-            )));
-        }
-        fixture.no_residue();
-    }
+                ExecutionEvent::Provider(ChatStreamEvent::ToolCallComplete { .. })
+            )),
+        "{published:?}"
+    );
+    // No user-visible text was produced by the discarded attempt, so there was no
+    // provisional presentation to reset; the reset boundary is reserved for
+    // output the user actually saw. What protects the side effect is that the
+    // replacement attempt starts from a fresh decoding state, so the discarded
+    // fragments never become a tool Call.
+    assert!(
+        !published
+            .iter()
+            .any(|event| matches!(
+                event,
+                ExecutionEvent::Provider(ChatStreamEvent::RoundReset)
+            )),
+        "a tool-call-only attempt has no provisional presentation to reset: {published:?}"
+    );
+
+    // The side-effect invariant: only the provider Call exists durably. No
+    // Native Tool Call was admitted, dispatched or completed from attempt #1, and
+    // the dispatcher drained empty.
+    let calls = fixture
+        .domain
+        .calls_for_attempt(&call.attempt_id)
+        .expect("calls");
+    assert_eq!(calls.len(), 1, "a discarded tool call was admitted: {calls:?}");
+    assert_eq!(calls[0].id, call.id);
+    assert_eq!(calls[0].state, "completed");
+    let input: Value = serde_json::from_str(&calls[0].request).expect("Call request");
+    assert_eq!(
+        input["executor_transport"], "provider",
+        "only the provider Call survived"
+    );
+
+    // The replacement attempt's response is the one that settled the round.
+    let response: Value = serde_json::from_str(
+        calls[0].response.as_deref().expect("provider response"),
+    )
+    .expect("response JSON");
+    assert_eq!(response["content"], "done without tools");
+    assert_eq!(response["rounds"], 1);
+    fixture.terminal(&call, "completed");
+    fixture.no_residue();
+}
+
+/// Cancellation interrupts a provider-requested cooldown and no further physical
+/// attempt is issued.
+#[test]
+fn cancellation_during_retry_backoff_stops_immediately_and_owns_settlement() {
+    let upstream = ProviderStub::start();
+    // A provider-asked cooldown is never collapsed by the test seam, so the
+    // cancellation lands while the round is genuinely waiting.
+    upstream.script("throttled", vec![StubStep::Throttled(429, 30)]);
+    let mut fixture = Fixture::new();
+    let (call, envelope, events) = fixture.admitted(&upstream.endpoint, "throttled", true);
+    let cancelled = envelope.cancelled.clone();
+    let handler = fixture.handler.clone();
+
+    let worker = thread::spawn(move || execute_provider_envelope_sync(&handler, envelope));
+    // Wait for the throttling response to land, then cancel while the round is
+    // inside its provider-requested cooldown.
+    upstream.request("throttled");
+    fixture
+        .domain
+        .request_cancel(&call.attempt_id)
+        .expect("request cancel");
+    cancelled.cancel();
+    fixture
+        .domain
+        .confirm_cancel(&call.attempt_id, true)
+        .expect("confirm cancel");
+    let result = worker.join().expect("provider worker");
+
+    assert!(result.is_err(), "a cancelled round never completes");
+    // One physical request only: the cooldown was interrupted, not waited out,
+    // so no second attempt reached the provider.
+    assert_eq!(upstream.attempts("throttled"), 1);
+    let published = events.try_iter().collect::<Vec<_>>();
+    assert!(
+        !published
+            .iter()
+            .any(|event| matches!(event, ExecutionEvent::Finished)),
+        "{published:?}"
+    );
+    // Cancellation, not a provider failure, owns settlement: the throttle never
+    // reached the failure path that would overwrite `cancelled` with `failed`.
+    let settled = fixture.domain.call(&call.id).expect("Call");
+    assert_ne!(settled.state, "failed", "{settled:?}");
+    fixture.terminal(&call, "cancelled");
+    fixture.no_residue();
 }
 
 #[test]
@@ -789,14 +1321,47 @@ fn native_file_read_reports_byte_pagination_for_continuation() {
     assert!(large.to_value().to_string().len() <= crate::native_tools::TOOL_OUTPUT_CAP);
 }
 
+/// A refused connection is typed reconnectable, so the bounded round budget
+/// retries it and then settles the Call as failed with no residue.
 #[test]
-fn connection_refused_terminalizes_without_a_provider_response() {
+fn connection_refused_exhausts_the_bounded_round_budget() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("unused address");
     let endpoint = format!("http://{}/v1", listener.local_addr().expect("address"));
     drop(listener);
     let mut fixture = Fixture::new();
-    let (call, envelope, _events) = fixture.admitted(&endpoint, "refused", true);
-    assert!(fixture.execute(envelope).is_err());
+    let (call, envelope, events) = fixture.admitted(&endpoint, "refused", true);
+    let started = Instant::now();
+
+    let error = fixture.execute(envelope).expect_err("refused must fail");
+
+    // The refusal is observed by the transport seam as reconnectable, so it is
+    // repeated up to the bound rather than terminalizing on the first attempt.
+    assert!(
+        error.transport_fault() == TransportFault::Reconnectable,
+        "{error}"
+    );
+    // The bound is finite, so an unreachable endpoint still settles promptly
+    // instead of retrying forever.
+    assert!(
+        started.elapsed() < MAX_PHYSICAL_ATTEMPTS_PER_ROUND as u32 * 4 * Duration::from_secs(1),
+        "refused round took {:?}",
+        started.elapsed()
+    );
+    // Only the round boundary opened: no response byte ever reached the
+    // decoder, so there was nothing provisional to reset.
+    let published = events.try_iter().collect::<Vec<_>>();
+    assert_eq!(published.len(), 2, "{published:?}");
+    assert!(matches!(
+        published[0],
+        ExecutionEvent::Provider(ChatStreamEvent::RoundBegan)
+    ));
+    assert!(matches!(&published[1], ExecutionEvent::Failed(_)));
+    let calls = fixture
+        .domain
+        .calls_for_attempt(&call.attempt_id)
+        .expect("calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].state, "failed");
     fixture.terminal(&call, "failed");
     fixture.no_residue();
 }
