@@ -652,9 +652,25 @@ impl SmokeHarness {
             let execution = &snapshot["job"];
             let state = string(&execution["job"], "state")?;
             if state == expected {
-                let attempts = array(execution, "attempts")?;
-                let executors = array(execution, "executors")?;
-                let calls = array(execution, "calls")?;
+                // A retried Job keeps its earlier generations as history; the
+                // terminal facts are those of its current generation.
+                let generation = &execution["job"]["generation"];
+                let current = |name| -> Result<Vec<&Value>> {
+                    Ok(array(execution, name)?
+                        .iter()
+                        .filter(|item| item["generation"] == *generation)
+                        .collect())
+                };
+                let attempts = current("attempts")?;
+                let calls = current("calls")?;
+                let executors = array(execution, "executors")?
+                    .iter()
+                    .filter(|executor| {
+                        attempts
+                            .iter()
+                            .any(|attempt| attempt["id"] == executor["attempt_id"])
+                    })
+                    .collect::<Vec<_>>();
                 if attempts.is_empty() || executors.is_empty() || calls.is_empty() {
                     return Err(format!("incomplete terminal execution: {snapshot}").into());
                 }
@@ -679,7 +695,7 @@ impl SmokeHarness {
                         return Err(format!("unsuccessful Call: {call}").into());
                     }
                 }
-                for intent in array(execution, "dispatch_intents")? {
+                for intent in current("dispatch_intents")? {
                     if ["pending", "queued", "running"]
                         .iter()
                         .any(|state| intent["state"] == *state)

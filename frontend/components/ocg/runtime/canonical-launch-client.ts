@@ -62,10 +62,13 @@ import {
 import { selectCanonical } from "./canonical-store";
 import type { JobExecution } from "../execution/domain";
 import { isNonEmptyString, isRecord } from "@/lib/narrow";
+import { retryPresentation } from "../chat/retry";
 
 /** Bounds the snapshot/event refetch loop when the backend keeps demanding a resync. */
 const MAX_REFRESH_ROUNDS = 4;
 const PROJECT_JOB_REFRESH_MS = 2_000;
+/** How often a streaming turn re-reads its Job, so observable activity stays current. */
+const CHAT_EXECUTION_REFRESH_MS = 1_500;
 
 /** Backend-computed readiness for one chat turn, plus the status that reports it. */
 type ChatAvailability = {
@@ -81,7 +84,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private chatCounter = 0;
   private readonly pendingSends = new Map<string, Promise<void>>();
   private readonly historyEpochs = new Map<string, number>();
-  private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string }>();
+  private readonly chatStreams = new Map<string, { source: EventSource; assistantId: string; jobId: string; refresh: ReturnType<typeof setInterval> | null }>();
   /**
    * Where the committed presentation of the streaming message ends, per session.
    *
@@ -237,7 +240,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (this.projectJobRefreshTimer !== null) clearInterval(this.projectJobRefreshTimer);
     this.projectJobRefreshTimer = null;
     this.projectJobRefreshProject = null;
-    for (const tracked of this.chatStreams.values()) tracked.source.close();
+    for (const tracked of this.chatStreams.values()) {
+      tracked.source.close();
+      if (tracked.refresh !== null) clearInterval(tracked.refresh);
+    }
     this.chatStreams.clear();
     this.roundCommits.clear();
     super.dispose();
@@ -330,7 +336,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.bindSessionProject(id, projectId);
     this.emit({ type: "conversation.session-created", session }, { projectId });
     const messages: ChatMessage[] = history.messages.filter((message) => message.state !== "deleted").map((message) => ({
-      id: message.message_id, commandId: message.command_id, role: message.role,
+      id: message.message_id, commandId: message.command_id, jobId: message.job_id ?? undefined, role: message.role,
       images: message.images, content: message.content, failureReason: message.failure_reason ?? undefined, createdAt: chatTimestamp(message.created_at),
       status: message.state === "complete" ? "completed" :
         message.state === "failed" && message.attempt_state === "cancelled" ? "cancelled" :
@@ -364,6 +370,33 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     } catch (cause) {
       this.emit({ type: "error", message: `Chat history refresh failed: ${cause instanceof Error ? cause.message : String(cause)}` });
     }
+  }
+
+  /**
+   * Retry re-executes the message's own Job against its frozen target: same
+   * turn, same assistant Message, a replacement Attempt. It never reads the
+   * composer selection and never sends a new turn.
+   */
+  override async retryMessage(sessionId: string, messageId: string): Promise<void> {
+    const snapshot = this.store.getSnapshot();
+    const session = snapshot.sessions.find((item) => item.id === sessionId);
+    const message = snapshot.messagesBySession[sessionId]?.find((item) => item.id === messageId);
+    if (!session?.projectId || !message || message.role !== "assistant" || !message.jobId) {
+      throw new Error("This canonical Chat message cannot be retried.");
+    }
+
+    const execution = await this.projectCanonicalExecution(session.projectId, message.jobId);
+    if (!execution) throw new Error("Job snapshot is unavailable.");
+    const response = await this.control.retryJob(message.jobId, { expected_generation: execution.generation });
+    if (isCanonicalRejection(response)) throw new Error(response.message);
+    if (response.job_id !== message.jobId) throw new Error("Job operation identity mismatch.");
+
+    this.historyEpochs.set(sessionId, (this.historyEpochs.get(sessionId) ?? 0) + 1);
+    this.chatJobsBySession.set(sessionId, { projectId: session.projectId, jobId: message.jobId });
+    this.closeChatStream(sessionId, true);
+    this.emit({ type: "conversation.message-started", sessionId, message: retryPresentation(message) }, { projectId: session.projectId });
+    this.openChatStream(sessionId, message.jobId, message.id);
+    await this.syncProjectJobs(session.projectId, true);
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
@@ -501,6 +534,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     // Keep its EventSource alive until then so failed sends leave it streaming.
     this.chatJobsBySession.set(sessionId, { projectId, jobId: response.job_id });
     this.localDraftSessions.delete(sessionId);
+    this.emit({ type: "conversation.message-started", sessionId, message: { ...assistant, jobId: response.job_id } }, { projectId });
     this.closeChatStream(sessionId, true);
     this.openChatStream(sessionId, response.job_id, assistantId);
     void this.refreshExecution(sessionId, projectId, response.job_id);
@@ -645,7 +679,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const session = this.store.getSnapshot().sessions.find((item) => item.id === sessionId);
     const url = this.control.chatStreamUrl(session?.sessionId ?? sessionId, jobId);
     const source = new EventSource(url);
-    this.chatStreams.set(sessionId, { source, assistantId, jobId });
+    // Native Tool Calls between provider rounds carry no stream event; the
+    // canonical snapshot is what makes them observable while the turn runs.
+    const projectId = session?.projectId;
+    const refresh = projectId ? setInterval(() => {
+      if (this.chatStreams.get(sessionId)?.source !== source) return;
+      // A missed read is retried on the next tick; the stream stays the authority for the turn.
+      void this.projectCanonicalExecution(projectId, jobId).then((execution) => {
+        if (execution && this.chatStreams.get(sessionId)?.source === source) {
+          this.emit({ type: "job.execution-updated", sessionId, execution, accounting: null }, { projectId });
+        }
+      }, () => undefined);
+    }, CHAT_EXECUTION_REFRESH_MS) : null;
+    if (refresh !== null && typeof refresh === "object" && "unref" in refresh && typeof refresh.unref === "function") refresh.unref();
+    this.chatStreams.set(sessionId, { source, assistantId, jobId, refresh });
     source.onmessage = (event) => {
       let value: unknown = null;
       try {
@@ -746,6 +793,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     } catch {
       // Closing a broken stream must not fail the new turn.
     }
+    if (tracked.refresh !== null) clearInterval(tracked.refresh);
     this.chatStreams.delete(sessionId);
     this.roundCommits.delete(sessionId);
     if (markCancelled) {

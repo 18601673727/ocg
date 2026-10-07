@@ -1204,7 +1204,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             let mut conversation: Conversation = decode_chat_record(&record)?;
             let active: bool = transaction
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM domain_chat_turns t JOIN domain_attempts a ON a.id=t.attempt_id
+                    "SELECT EXISTS(SELECT 1 FROM domain_chat_turns t JOIN domain_attempts a ON a.job_id=t.job_id
                      WHERE t.conversation_id=?1 AND a.state IN ('queued','running','cancelling'))",
                     [conversation.id.as_str()],
                     |row| row.get(0),
@@ -1263,18 +1263,22 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             return Ok(None);
         }
         let messages = read_conversation_messages(&transaction, conversation.id.as_str())?;
+        // A turn's execution state is its Job's current generation. The Job's
+        // authority pointer is cleared once that Attempt settles, and a retried
+        // turn's row still names its first Attempt.
         let mut statement = transaction
             .prepare(
                 "SELECT m.id,t.command_id,t.job_id,a.state,
                  (SELECT i.failure FROM domain_dispatch_intents i
-                  WHERE i.attempt_id=t.attempt_id AND i.failure IS NOT NULL
+                  WHERE i.attempt_id=a.id AND i.failure IS NOT NULL
                     AND i.state IN ('failed','fenced')
                   ORDER BY CASE i.state WHEN 'failed' THEN 0 ELSE 1 END,
                     i.updated_at DESC,i.created_at DESC,i.id DESC LIMIT 1)
                  FROM domain_messages m
              JOIN domain_chat_turns t ON t.attempt_id=m.attempt_id
              JOIN domain_conversations c ON c.id=t.conversation_id
-             JOIN domain_attempts a ON a.id=t.attempt_id
+             JOIN domain_jobs j ON j.id=t.job_id
+             JOIN domain_attempts a ON a.job_id=j.id AND a.generation=j.generation
              WHERE c.project_id=?1 AND c.session_id=?2",
             )
             .map_err(sql)?;
@@ -1494,6 +1498,21 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             });
         transaction.commit().map_err(sql)?;
         Ok((!completed_assistant).then_some(project))
+    }
+
+    /// The Project and session of the Chat turn this Job executes, if any. This
+    /// is durable identity; live transport for the turn may already be gone.
+    pub fn chat_session_for_job(&self, job_id: &str) -> Result<Option<(String, String)>> {
+        self.connection
+            .query_row(
+                "SELECT c.project_id,c.session_id FROM domain_chat_turns t
+                 JOIN domain_conversations c ON c.id=t.conversation_id
+                 WHERE t.job_id=?1",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql)
     }
 
     pub fn accept_chat_turn(&self, attempt_id: &str) -> Result<()> {
@@ -2538,11 +2557,9 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         // writer could publish a newer Attempt generation between selecting
         // the id and decoding the row, and this projection would report the
         // superseded generation as the latest evidence.
-        let snapshot = rusqlite::Transaction::new_unchecked(
-            &self.connection,
-            TransactionBehavior::Deferred,
-        )
-        .map_err(sql)?;
+        let snapshot =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
+                .map_err(sql)?;
         let job_id: Option<String> = snapshot
             .query_row(
                 "SELECT id FROM domain_jobs WHERE project_id=?1 \
@@ -2564,8 +2581,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             snapshot.commit().map_err(sql)?;
             return Ok(None);
         };
-        let job = read_job(&snapshot, &job_id)?
-            .ok_or_else(|| invalid("health probe Job disappeared"))?;
+        let job =
+            read_job(&snapshot, &job_id)?.ok_or_else(|| invalid("health probe Job disappeared"))?;
         let intent: HealthProbeIntent = job
             .spec
             .health_probe
@@ -4292,6 +4309,11 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             .ok_or_else(|| invalid("replacement Executor disappeared"))?;
         let job =
             read_job(&transaction, job_id)?.ok_or_else(|| invalid("replaced Job disappeared"))?;
+        if retry_generation.is_some() {
+            // A retried Chat Job re-enters its own turn in the same commit that
+            // admits the replacement; it never gains a second turn or Message.
+            reactivate_chat_message_in(&transaction, &attempt)?;
+        }
         let root = emit_attempt(&transaction, EventKind::AttemptCreated, &attempt, None)?;
         emit_executor(
             &transaction,
@@ -5809,8 +5831,7 @@ effect_kind,effect_state,request,reservation_id,budget_admitted,pricing_basis,pr
 /// [`attempt_from_row`] decodes by position, so every reader must select
 /// exactly this order. Presence policy is the reader's concern, never the
 /// decoder's.
-const ATTEMPT_COLUMNS: &str =
-    "id,job_id,generation,state,authoritative,created_at,finished_at";
+const ATTEMPT_COLUMNS: &str = "id,job_id,generation,state,authoritative,created_at,finished_at";
 
 fn attempt_from_row(row: &Row<'_>) -> rusqlite::Result<Attempt> {
     let state: String = row.get(3)?;
@@ -7429,16 +7450,12 @@ fn settle_chat_turn(
     attempt_id: &str,
     state: &str,
 ) -> Result<()> {
-    let is_chat: bool = transaction
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM domain_chat_turns WHERE attempt_id=?1)",
-            [attempt_id],
-            |row| row.get(0),
-        )
-        .map_err(sql)?;
-    if !is_chat {
+    // The Attempt is the result authority; its Job names the durable turn whose
+    // Messages it settles. Only the Job's current generation may settle them.
+    let Some(turn) = current_chat_turn_key(transaction, attempt_id)? else {
         return Ok(());
-    }
+    };
+    let turn = turn.as_str();
     if state == "completed" {
         let response: String = transaction.query_row(
             "SELECT response FROM domain_calls WHERE attempt_id=?1 AND state='completed' AND json_extract(request,'$.executor_transport')='provider' ORDER BY created_at DESC,id DESC LIMIT 1",
@@ -7451,7 +7468,7 @@ fn settle_chat_turn(
             .ok_or_else(|| invalid("completed chat Call has no final content"))?;
         update_chat_message(
             transaction,
-            attempt_id,
+            turn,
             "assistant",
             MessageLifecycle::Complete,
             Some(content),
@@ -7459,7 +7476,7 @@ fn settle_chat_turn(
         if let Some(images) = response.get("images").and_then(serde_json::Value::as_array) {
             let (root, project_id, record): (String, String, String) = transaction.query_row(
                 "SELECT p.root,t.project_id,m.record FROM domain_chat_turns t JOIN domain_projects p ON p.id=t.project_id JOIN domain_messages m ON m.attempt_id=t.attempt_id AND m.role='assistant' WHERE t.attempt_id=?1",
-                [attempt_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                [turn], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
             ).map_err(sql)?;
             let mut message: Message = decode_chat_record(&record)?;
             for url in images.iter().take(crate::chat_images::MAX_IMAGES) {
@@ -7476,22 +7493,100 @@ fn settle_chat_turn(
                 .map_err(sql)?;
         }
     } else {
+        update_chat_message(transaction, turn, "user", MessageLifecycle::Failed, None)?;
         update_chat_message(
             transaction,
-            attempt_id,
-            "user",
-            MessageLifecycle::Failed,
-            None,
-        )?;
-        update_chat_message(
-            transaction,
-            attempt_id,
+            turn,
             "assistant",
             MessageLifecycle::Failed,
             None,
         )?;
     }
     Ok(())
+}
+
+/// The Message key of the Chat turn owned by this Attempt's Job, when the
+/// Attempt is that Job's current generation. A replacement Attempt keeps the
+/// original turn: `domain_chat_turns.attempt_id` names the turn, not the
+/// Attempt producing it now.
+fn current_chat_turn_key(connection: &Connection, attempt_id: &str) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT t.attempt_id FROM domain_attempts a
+             JOIN domain_jobs j ON j.id=a.job_id AND j.generation=a.generation
+             JOIN domain_chat_turns t ON t.job_id=j.id
+             WHERE a.id=?1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)
+}
+
+/// Hand an existing Chat turn's assistant Message to a replacement Attempt.
+///
+/// Retry is the only path back from a settled Message, so this deliberately
+/// bypasses [`MessageLifecycle::transition`]: the Message keeps its identity,
+/// drops the previous execution's output and names the new producer.
+fn reactivate_chat_message_in(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt: &Attempt,
+) -> Result<()> {
+    let Some(turn) = current_chat_turn_key(transaction, &attempt.id)? else {
+        return Ok(());
+    };
+    let records: Vec<(String, String)> = query_all(
+        transaction,
+        "SELECT role,record FROM domain_messages WHERE attempt_id=?1",
+        &[&turn],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let mut assistant = None;
+    for (role, record) in records {
+        let message: Message = decode_chat_record(&record)?;
+        if message.state == MessageLifecycle::Deleted {
+            return Err(invalid("deleted Chat turn cannot be retried"));
+        }
+        if role == "assistant" {
+            assistant = Some(message);
+        }
+    }
+    let mut message = assistant.ok_or_else(|| invalid("Chat turn has no assistant Message"))?;
+    let conversation: String = transaction
+        .query_row(
+            "SELECT record FROM domain_conversations WHERE id=?1",
+            [message.conversation_ref.id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if decode_chat_record::<Conversation>(&conversation)?
+        .archived_at
+        .is_some()
+    {
+        return Err(invalid("Conversation has been deleted."));
+    }
+    let attempt_ref = EntityRef {
+        kind: EntityKind::Attempt,
+        id: EntityId::new(attempt.id.strip_prefix("att-").unwrap_or(&attempt.id))?,
+    };
+    message.author = Actor::Attempt {
+        attempt_ref: attempt_ref.clone(),
+    };
+    message.produced_by_attempt_ref = Some(attempt_ref);
+    message.blocks = Vec::new();
+    message.state = MessageLifecycle::Streaming;
+    message.revision = message
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("Message revision overflow"))?;
+    message.updated_at = now().to_string();
+    transaction
+        .execute(
+            "UPDATE domain_messages SET record=?2 WHERE id=?1",
+            params![message.id.as_str(), encode_chat_record(&message)?],
+        )
+        .map_err(sql)?;
+    bump_conversation(transaction, message.conversation_ref.id.as_str())
 }
 
 fn finish_attempt_in(
@@ -8124,5 +8219,167 @@ mod admission_pickup_tests {
             .expect("frozen");
         assert!(matches!(frozen.pickup, AdmissionPickup::Explicit));
         assert_eq!(frozen.exact.expect("exact").effort.as_deref(), Some("low"));
+    }
+}
+
+#[cfg(test)]
+mod chat_retry_tests {
+    use super::*;
+
+    fn assistant(
+        domain: &DomainRepository,
+        project: &str,
+        session: &str,
+    ) -> (Message, ChatMessageOrigin) {
+        let mut history = domain
+            .conversation_history_with_origins(project, session)
+            .expect("history")
+            .expect("conversation");
+        let assistants = history
+            .messages
+            .iter()
+            .filter(|message| matches!(message.author, Actor::Attempt { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 1, "one assistant Message per turn");
+        assert_eq!(history.messages.len(), 2, "no second Chat turn");
+        let message = assistants[0].clone();
+        let origin = history
+            .origins
+            .remove(message.id.as_str())
+            .expect("origin");
+        (message, origin)
+    }
+
+    fn produced_by(message: &Message) -> String {
+        format!(
+            "att-{}",
+            message
+                .produced_by_attempt_ref
+                .as_ref()
+                .expect("producer")
+                .id
+                .as_str()
+        )
+    }
+
+    #[test]
+    fn retry_reuses_the_turn_and_moves_provenance_to_the_replacement() {
+        let directory = tempfile::tempdir().expect("temp");
+        let mut domain = DomainRepository::open(directory.path()).expect("domain");
+        let project = domain.ensure_project(directory.path()).expect("project");
+        let job = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("chat".into()),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("job");
+        domain.set_job_eligible(&job.id).expect("eligible");
+        let first = domain.create_attempt(&job.id).expect("attempt");
+        let request = crate::contracts::JobLaunchRequest {
+            command_id: "command-1".into(),
+            draft_id: "draft-1".into(),
+            project_id: project.id.clone(),
+            session_id: "session-1".into(),
+            objective: "hello".into(),
+            success_criteria: None,
+            constraints: None,
+            hard_budget_micros: 0,
+            resource_commitment: None,
+        };
+        domain
+            .prepare_chat_turn(&request, "hash", &first, "hello")
+            .expect("turn");
+        domain.accept_chat_turn(&first.id).expect("accept");
+        assert_eq!(
+            domain.chat_session_for_job(&job.id).expect("identity"),
+            Some((project.id.clone(), "session-1".to_string()))
+        );
+        domain
+            .fail_attempt(
+                &first.id,
+                &job_failure("test", FailureClass::Unknown, "boom", true),
+            )
+            .expect("fail first");
+        let (failed, origin) = assistant(&domain, &project.id, "session-1");
+        assert_eq!(failed.state, MessageLifecycle::Failed);
+        assert_eq!(origin.attempt_state, "failed");
+        assert_eq!(produced_by(&failed), first.id);
+
+        let generation = domain.job(&job.id).expect("job").expect("job").generation;
+        let retry = domain
+            .retry_job(&job.id, "provider", generation)
+            .expect("retry");
+        assert_eq!(retry.job.id, job.id);
+        assert_eq!(retry.job.generation, generation + 1);
+        assert_eq!(retry.attempt.generation, generation + 1);
+        assert_ne!(retry.attempt.id, first.id);
+
+        let (reactivated, origin) = assistant(&domain, &project.id, "session-1");
+        assert_eq!(reactivated.id, failed.id);
+        assert_eq!(reactivated.state, MessageLifecycle::Streaming);
+        assert!(reactivated.blocks.is_empty());
+        assert!(reactivated.revision > failed.revision);
+        assert_eq!(produced_by(&reactivated), retry.attempt.id);
+        assert!(matches!(
+            &reactivated.author,
+            Actor::Attempt { attempt_ref } if format!("att-{}", attempt_ref.id.as_str()) == retry.attempt.id
+        ));
+        assert_eq!(origin.job_id, job.id);
+        assert_eq!(origin.attempt_state, "queued");
+
+        // The replacement settles the same Message once its authority ends,
+        // even though the Job no longer names an authoritative Attempt.
+        domain
+            .fail_attempt(
+                &retry.attempt.id,
+                &job_failure("test", FailureClass::Unknown, "again", true),
+            )
+            .expect("fail retry");
+        assert!(domain
+            .job(&job.id)
+            .expect("job")
+            .expect("job")
+            .authoritative_attempt_id
+            .is_none());
+        let (settled, origin) = assistant(&domain, &project.id, "session-1");
+        assert_eq!(settled.id, failed.id);
+        assert_eq!(settled.state, MessageLifecycle::Failed);
+        assert_eq!(produced_by(&settled), retry.attempt.id);
+        assert_eq!(origin.attempt_state, "failed");
+        assert_eq!(domain.attempts_for_job(&job.id).expect("attempts").len(), 2);
+    }
+
+    #[test]
+    fn retry_of_a_job_without_a_chat_turn_is_unchanged() {
+        let directory = tempfile::tempdir().expect("temp");
+        let mut domain = DomainRepository::open(directory.path()).expect("domain");
+        let project = domain.ensure_project(directory.path()).expect("project");
+        let job = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("work".into()),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("job");
+        domain.set_job_eligible(&job.id).expect("eligible");
+        let first = domain.create_attempt(&job.id).expect("attempt");
+        domain
+            .fail_attempt(
+                &first.id,
+                &job_failure("test", FailureClass::Unknown, "boom", true),
+            )
+            .expect("fail");
+        assert_eq!(domain.chat_session_for_job(&job.id).expect("identity"), None);
+        let generation = domain.job(&job.id).expect("job").expect("job").generation;
+        let retry = domain
+            .retry_job(&job.id, "worker", generation)
+            .expect("retry");
+        assert_eq!(retry.job.generation, generation + 1);
     }
 }

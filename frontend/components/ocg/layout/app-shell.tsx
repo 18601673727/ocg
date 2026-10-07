@@ -6,7 +6,7 @@ import { cn } from "@/lib/utils";
 import { ChatView } from "../chat/chat-view";
 import { UsageSurface } from "../usage/usage-surface";
 import { ConversationInspector } from "../usage/conversation-inspector";
-import { useConversationUsage, useJobUsage } from "../usage/use-usage";
+import { conversationUsageLive, useConversationUsage, useJobUsage, useLiveUsageRefresh } from "../usage/use-usage";
 import { JobInspector } from "../execution/job-inspector";
 import { JobDraftSurface } from "../job/job-draft-surface";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
@@ -721,7 +721,21 @@ export function RuntimeWorkspace({
   const usageRefreshKey = messages.filter(message => message.role === "assistant" && ["completed", "failed", "cancelled"].includes(message.status)).map(message => `${message.id}:${message.status}`).join("|");
   const usageBaseUrl = runtimeAuthority === "canonical" && view === "chat" ? ocgControlUrl : null;
   const jobUsageBaseUrl = runtimeAuthority === "canonical" && ["chat", "job-execution"].includes(view) ? ocgControlUrl : null;
-  const conversationUsage = useConversationUsage(usageBaseUrl, activeProjectId, activeSession?.sessionId ?? activeSession?.id ?? "", usageRefreshKey, messages.some(message => !message.optimistic));
+  // Conversation Usage becomes queryable once the Chat acquires durable backend
+  // identity: canonical Job/execution or non-optimistic history. An optimistic
+  // assistant with canonical jobId is sufficient — do not wait for reconciliation.
+  const usageAvailable = messages.some(message =>
+    !message.optimistic ||
+    (message.role === "assistant" && message.jobId),
+  );
+  const conversationUsage = useConversationUsage(usageBaseUrl, activeProjectId, activeSession?.sessionId ?? activeSession?.id ?? "", usageRefreshKey, usageAvailable);
+  // Settled turns re-key the read above; a running turn changes usage every
+  // provider round, so it is re-read on a timer until its execution settles.
+  useLiveUsageRefresh(
+    conversationUsage,
+    JSON.stringify([usageBaseUrl, activeProjectId, activeSession?.id ?? ""]),
+    Boolean(usageBaseUrl) && usageAvailable && conversationUsageLive(execution, messages),
+  );
   // Job usage follows the selected Project Job, not the active Chat session.
   const jobUsage = useJobUsage(
     jobUsageBaseUrl,
@@ -946,6 +960,7 @@ export function RuntimeWorkspace({
                 key={`${activeProjectId}:${activeSession.id}`}
                 session={activeSession}
                 messages={messages}
+                execution={execution}
                 runtimeStatus={snapshot.status}
                 onComposerIntent={handleComposerIntent}
                 onCancel={() => cancel(activeSession.id)}

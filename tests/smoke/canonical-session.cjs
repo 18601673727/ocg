@@ -34,20 +34,38 @@ async function main() {
     assert.equal(failed.status, "failed");
     assert.ok(retryContent(messages.map(item => item.id === failed.id ? { ...item, status: "cancelled" } : item), failed.id));
     await assert.rejects(client.retryMessage(session.id, messages.find(item => item.role === "user").id));
+    assert.ok(failed.jobId);
     const streams = [];
     global.EventSource = class {
       static CONNECTING = 0;
       static CLOSED = 2;
-      constructor(url) { streams.push(new URL(url)); }
+      constructor(url) { this.url = new URL(url); streams.push(this); }
       close() {}
     };
+    // Whatever the failed execution left on screen must not survive Retry.
+    client.emit({ type: "conversation.message-started", sessionId: session.id, message: { ...failed, content: "stale output", images: [{ id: "img", name: "old.png", media_type: "image/png", url: "http://127.0.0.1/old.png" }], failureReason: "boom" } }, { projectId });
     await client.retryMessage(session.id, failed.id);
-    await assert.rejects(client.retryMessage(session.id, failed.id));
     assert.equal(streams.length, 1);
+    assert.equal(streams[0].url.searchParams.get("job_id"), failed.jobId);
     const after = client.getSnapshot().messagesBySession[session.id];
-    assert.equal(after.find(item => item.id === failed.id).status, "failed");
-    assert.notEqual(after.at(-1).commandId, failed.commandId);
-    process.stdout.write(JSON.stringify({ job_id: streams[0].searchParams.get("job_id") }));
+    assert.deepEqual(after.map(item => item.id), messages.map(item => item.id), "Retry must not add a turn or Message");
+    const retried = after.find(item => item.id === failed.id);
+    assert.equal(retried.status, "streaming");
+    assert.equal(retried.content, "");
+    assert.equal(retried.images, undefined);
+    assert.equal(retried.failureReason, undefined);
+    assert.equal(retried.jobId, failed.jobId);
+    assert.equal(retried.commandId, failed.commandId);
+    // HA-NET-01 boundaries on the Retry stream start from the cleared Message.
+    const deliver = record => streams[0].onmessage({ data: JSON.stringify(record) });
+    deliver({ round_begin: true });
+    deliver({ delta: "provisional" });
+    deliver({ round_reset: true });
+    deliver({ delta: "replacement" });
+    const streamed = client.getSnapshot().messagesBySession[session.id].find(item => item.id === failed.id);
+    assert.equal(streamed.content, "replacement");
+    assert.equal(streamed.status, "streaming");
+    process.stdout.write(JSON.stringify({ job_id: streams[0].url.searchParams.get("job_id") }));
     return;
   }
   const session = await client.createSession({ projectId, title: "", workType: "coding" });

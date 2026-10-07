@@ -664,6 +664,15 @@ struct ActiveChat {
     started_at: Instant,
 }
 
+/// The live transport a Chat retry installed for its replacement Attempt.
+struct ChatRetryTransport {
+    key: (String, String),
+    sender: flume::Sender<ExecutionEvent>,
+    cancelled: CallCancellation,
+    /// The settled tail this replacement displaced from its session.
+    superseded: Option<ActiveChat>,
+}
+
 impl CanonicalControlService {
     pub fn open(root: &Path) -> Result<Self> {
         let boundary = project::resolve(root);
@@ -1944,6 +1953,31 @@ impl CanonicalControlService {
             return Err(invalid(deferral.message()));
         }
         let snapshot = domain.execution_snapshot()?;
+        // Chat identity is durable: the turn's live transport may already have
+        // been consumed by `finish_chat`, while the turn itself stays retryable.
+        let chat_session = domain.chat_session_for_job(job_id)?;
+        if let Some((_, session_id)) = &chat_session {
+            // Retry re-enters this turn; it never displaces another live turn
+            // of the same Conversation.
+            let other = self
+                .active_chats
+                .lock()
+                .map_err(|_| invalid("active chats poisoned"))?
+                .get(&(job.project_id.clone(), session_id.clone()))
+                .map(|chat| chat.job_id.clone())
+                .filter(|other| other != job_id);
+            if let Some(other) = other {
+                if other.is_empty()
+                    || domain
+                        .job(&other)?
+                        .is_some_and(|other| other.authoritative_attempt_id.is_some())
+                {
+                    return Err(invalid(
+                        "retry rejected: another turn in this Conversation is running",
+                    ));
+                }
+            }
+        }
         let template = snapshot
             .dispatch_intents
             .iter()
@@ -2022,45 +2056,79 @@ impl CanonicalControlService {
                 .map(|executor| executor.kind.as_str())
                 .unwrap_or("worker")
         };
+        // Resolve everything the replacement needs before it is admitted, so a
+        // refusal here leaves the Job exactly as it was.
+        let replay = replay
+            .map(|(request, protocol, provider_config)| -> Result<_> {
+                let runtime = runtime
+                    .clone()
+                    .ok_or_else(|| invalid("retry runtime disappeared"))?;
+                // Retry does not choose a new candidate. It republishes the Call
+                // against the target the previous Attempt already froze.
+                let (profile, _) = self
+                    .profile_service
+                    .current()?
+                    .ok_or_else(|| invalid("profile not configured"))?;
+                let (project, _) = self.project_repository(&job.project_id)?;
+                let resolved = super::admission::ResolvedTarget {
+                    protocol,
+                    config: provider_config,
+                    effort: request
+                        .get("reasoning_effort")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    reservation: super::admission::AdmissionReservation {
+                        choice: super::placement::ProviderChoice {
+                            provider: job.spec.provider.clone().unwrap_or_default(),
+                            model: job.spec.model.clone().unwrap_or_default(),
+                        },
+                        pickup: if job.spec.health_probe.is_some() {
+                            super::admission::AdmissionPickup::Explicit
+                        } else {
+                            super::admission::AdmissionPickup::Automatic
+                        },
+                        exact: job.spec.health_probe.as_ref().map(|intent| {
+                            super::admission::ExactTarget {
+                                provider: intent.provider.clone(),
+                                model: intent.model.clone(),
+                                effort: intent.effort.clone(),
+                            }
+                        }),
+                    },
+                };
+                Ok((request, runtime, profile, project, resolved))
+            })
+            .transpose()?;
+        if chat_session.is_some() && replay.is_none() {
+            return Err(invalid("Chat retry has no frozen provider target"));
+        }
         let (global, _, _) = self.read_configuration()?;
         let budget_config = self.provider_budget_config(&global)?;
+        // The replacement Attempt and the reactivated assistant Message commit
+        // together; the turn and its Message keep their identity.
         let admission = domain.retry_job(job_id, executor_kind, expected_generation)?;
-        if let Some((request, protocol, provider_config)) = replay {
-            // Retry does not choose a new candidate. It republishes the Call
-            // against the target the previous Attempt already froze.
-            let runtime = runtime.ok_or_else(|| invalid("retry runtime disappeared"))?;
-            let (profile, _) = self
-                .profile_service
-                .current()?
-                .ok_or_else(|| invalid("profile not configured"))?;
-            let (project, _) = self.project_repository(&job.project_id)?;
-            let resolved = super::admission::ResolvedTarget {
-                protocol,
-                config: provider_config,
-                effort: request
-                    .get("reasoning_effort")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                reservation: super::admission::AdmissionReservation {
-                    choice: super::placement::ProviderChoice {
-                        provider: job.spec.provider.clone().unwrap_or_default(),
-                        model: job.spec.model.clone().unwrap_or_default(),
-                    },
-                    pickup: if job.spec.health_probe.is_some() {
-                        super::admission::AdmissionPickup::Explicit
-                    } else {
-                        super::admission::AdmissionPickup::Automatic
-                    },
-                    exact: job.spec.health_probe.as_ref().map(|intent| {
-                        super::admission::ExactTarget {
-                            provider: intent.provider.clone(),
-                            model: intent.model.clone(),
-                            effort: intent.effort.clone(),
-                        }
-                    }),
-                },
-            };
-            publish_call(
+        // A Chat replacement executes only through a retained transport: it is
+        // installed and consumed before its Call can be published, and a
+        // replacement that cannot get one never runs.
+        let chat = match chat_session {
+            Some((project_id, session_id)) => {
+                match self.install_chat_retry_transport(
+                    project_id,
+                    session_id,
+                    job_id,
+                    &admission.attempt.id,
+                ) {
+                    Ok(transport) => Some(transport),
+                    Err(error) => {
+                        Self::fail_unpublished_retry(&mut domain, &admission.attempt.id, &error)?;
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
+        if let Some((request, runtime, profile, project, resolved)) = replay {
+            let published = publish_call(
                 &mut AdmissionContext {
                     domain: &mut domain,
                     profile: &profile,
@@ -2086,12 +2154,26 @@ impl CanonicalControlService {
                     } else {
                         PayloadMode::Agent
                     },
-                    event_sender: None,
-                    cancelled: CallCancellation::new(),
+                    event_sender: chat.as_ref().map(|transport| transport.sender.clone()),
+                    cancelled: chat
+                        .as_ref()
+                        .map(|transport| transport.cancelled.clone())
+                        .unwrap_or_default(),
                 },
                 &runtime,
-            )?
-            .map_err(|refusal| invalid(refusal.message))?;
+            )
+            .and_then(|published| published.map_err(|refusal| invalid(refusal.message)));
+            if let Err(error) = published {
+                if let Some(transport) = chat {
+                    self.abandon_chat_retry(&mut domain, &admission.attempt.id, transport, &error)?;
+                }
+                return Err(error);
+            }
+        }
+        if let Some(superseded) = chat.and_then(|transport| transport.superseded) {
+            // The previous tail belongs to a settled generation; its stream
+            // has nothing left to deliver.
+            superseded.cancelled.cancel();
         }
         Ok(CanonicalJobOperationResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -2099,6 +2181,114 @@ impl CanonicalControlService {
             accepted: true,
             snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
         })
+    }
+
+    /// Install the replacement turn's transport for a Chat retry: a fresh
+    /// ActiveChat for the session and a retained consumer of its events.
+    ///
+    /// Nothing is published yet. On failure the session holds exactly the
+    /// tail it had before, and the caller must settle the replacement.
+    fn install_chat_retry_transport(
+        &self,
+        project_id: String,
+        session_id: String,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<ChatRetryTransport> {
+        let (sender, receiver) = flume::unbounded();
+        let cancelled = CallCancellation::new();
+        let buffer = Arc::new(ChatEventBuffer::default());
+        let key = (project_id.clone(), session_id.clone());
+        let superseded = self
+            .active_chats
+            .lock()
+            .map_err(|_| invalid("active chats poisoned"))?
+            .insert(
+                key.clone(),
+                ActiveChat {
+                    project_id,
+                    session_id,
+                    job_id: job_id.to_string(),
+                    attempt_id: attempt_id.to_string(),
+                    cancelled: cancelled.clone(),
+                    sender: sender.clone(),
+                    buffer: buffer.clone(),
+                    started_at: Instant::now(),
+                },
+            );
+        let transport = ChatRetryTransport {
+            key,
+            sender,
+            cancelled,
+            superseded,
+        };
+        if let Err(error) = self.chat_forwarder.register(receiver, buffer) {
+            transport.cancelled.cancel();
+            self.release_chat_retry_transport(attempt_id, transport)?;
+            return Err(error);
+        }
+        Ok(transport)
+    }
+
+    /// Remove a replacement's ActiveChat and give the session back the tail
+    /// it superseded. Dropping the last sender disconnects the forwarder's
+    /// registration, which then drains on its own.
+    fn release_chat_retry_transport(
+        &self,
+        attempt_id: &str,
+        transport: ChatRetryTransport,
+    ) -> Result<()> {
+        let mut chats = self
+            .active_chats
+            .lock()
+            .map_err(|_| invalid("active chats poisoned"))?;
+        if chats
+            .get(&transport.key)
+            .is_some_and(|chat| chat.attempt_id == attempt_id)
+        {
+            chats.remove(&transport.key);
+        }
+        if let Some(superseded) = transport.superseded {
+            chats.entry(transport.key).or_insert(superseded);
+        }
+        Ok(())
+    }
+
+    /// A replacement Attempt whose Call was never published must not stay
+    /// authoritative; failing it settles its Chat Message through the same
+    /// path as any failed Attempt.
+    fn fail_unpublished_retry(
+        domain: &mut DomainRepository,
+        attempt_id: &str,
+        error: &OcgError,
+    ) -> Result<()> {
+        if domain.authority(attempt_id)?.is_some() {
+            domain.fail_attempt(
+                attempt_id,
+                &super::domain::job_failure(
+                    "retry_admission_failed",
+                    FailureClass::Unknown,
+                    &error.to_string(),
+                    true,
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Undo a Chat retry whose Call was never published: the replacement
+    /// Attempt must not stay authoritative without execution, and the session
+    /// returns to the tail it had.
+    fn abandon_chat_retry(
+        &self,
+        domain: &mut DomainRepository,
+        attempt_id: &str,
+        transport: ChatRetryTransport,
+        error: &OcgError,
+    ) -> Result<()> {
+        transport.cancelled.cancel();
+        Self::fail_unpublished_retry(domain, attempt_id, error)?;
+        self.release_chat_retry_transport(attempt_id, transport)
     }
 
     /// The idempotency digest for a Health Probe command.
@@ -3267,9 +3457,22 @@ impl CanonicalControlService {
 
     /// Remove a finished stream entry. Only removes when the job matches so a
     /// newer turn cannot be dropped by a stale tail.
-    pub fn finish_chat(&self, session_id: &str, job_id: &str) {
+    ///
+    /// A retried Job reuses its session and Job identity with a new tail, so
+    /// the consumed tail must also match: a stale stream of the previous
+    /// generation cannot drop its replacement.
+    pub(crate) fn finish_chat(
+        &self,
+        session_id: &str,
+        job_id: &str,
+        buffer: &std::sync::Arc<ChatEventBuffer>,
+    ) {
         if let Ok(mut active) = self.active_chats.lock() {
-            active.retain(|_, entry| entry.session_id != session_id || entry.job_id != job_id);
+            active.retain(|_, entry| {
+                entry.session_id != session_id
+                    || entry.job_id != job_id
+                    || !std::sync::Arc::ptr_eq(&entry.buffer, buffer)
+            });
         }
     }
 
@@ -3358,5 +3561,251 @@ impl CanonicalControlService {
             tracing::debug!(%error, "cancelled Job chat receiver closed");
         }
         Ok(response.accepted)
+    }
+}
+
+#[cfg(test)]
+mod chat_retry_transport_tests {
+    use super::*;
+    use crate::core_contract::{Actor, MessageLifecycle};
+
+    struct Retried {
+        _directory: tempfile::TempDir,
+        service: CanonicalControlService,
+        domain: DomainRepository,
+        project_id: String,
+        job_id: String,
+        first: String,
+        replacement: String,
+    }
+
+    /// A failed Chat turn whose Job was retried in the domain: the replacement
+    /// Attempt is authoritative and its Call has not been published.
+    fn retried() -> Retried {
+        let directory = tempfile::tempdir().expect("temp");
+        let root = directory.path().to_path_buf();
+        let service = CanonicalControlService::new(
+            &root,
+            &root.join("profile.json"),
+            root.join("control.json"),
+        );
+        let mut domain = DomainRepository::open(&root).expect("domain");
+        let project = domain.ensure_project(&root).expect("project");
+        let job = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("chat".into()),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("job");
+        domain.set_job_eligible(&job.id).expect("eligible");
+        let first = domain.create_attempt(&job.id).expect("attempt");
+        let request = crate::contracts::JobLaunchRequest {
+            command_id: "command-1".into(),
+            draft_id: "draft-1".into(),
+            project_id: project.id.clone(),
+            session_id: "session-1".into(),
+            objective: "hello".into(),
+            success_criteria: None,
+            constraints: None,
+            hard_budget_micros: 0,
+            resource_commitment: None,
+        };
+        domain
+            .prepare_chat_turn(&request, "hash", &first, "hello")
+            .expect("turn");
+        domain.accept_chat_turn(&first.id).expect("accept");
+        domain
+            .fail_attempt(
+                &first.id,
+                &super::super::domain::job_failure("test", FailureClass::Unknown, "boom", true),
+            )
+            .expect("fail first");
+        let generation = domain.job(&job.id).expect("job").expect("job").generation;
+        let replacement = domain
+            .retry_job(&job.id, "provider", generation)
+            .expect("retry")
+            .attempt
+            .id;
+        Retried {
+            _directory: directory,
+            service,
+            domain,
+            project_id: project.id,
+            job_id: job.id,
+            first: first.id,
+            replacement,
+        }
+    }
+
+    fn key(retried: &Retried) -> (String, String) {
+        (retried.project_id.clone(), "session-1".to_string())
+    }
+
+    /// The settled tail of the first Attempt, as `finish_chat` had not yet consumed it.
+    fn previous_tail(retried: &Retried) -> Arc<ChatEventBuffer> {
+        let buffer = Arc::new(ChatEventBuffer::default());
+        let (sender, _) = flume::unbounded();
+        retried.service.active_chats.lock().expect("chats").insert(
+            key(retried),
+            ActiveChat {
+                project_id: retried.project_id.clone(),
+                session_id: "session-1".into(),
+                job_id: retried.job_id.clone(),
+                attempt_id: retried.first.clone(),
+                cancelled: CallCancellation::new(),
+                sender,
+                buffer: buffer.clone(),
+                started_at: Instant::now(),
+            },
+        );
+        buffer
+    }
+
+    fn install(retried: &Retried) -> Result<ChatRetryTransport> {
+        retried.service.install_chat_retry_transport(
+            retried.project_id.clone(),
+            "session-1".into(),
+            &retried.job_id,
+            &retried.replacement,
+        )
+    }
+
+    fn assert_replacement_settled(retried: &mut Retried, error: &OcgError) {
+        CanonicalControlService::fail_unpublished_retry(
+            &mut retried.domain,
+            &retried.replacement,
+            error,
+        )
+        .expect("settle");
+        assert_settled(retried);
+    }
+
+    fn assert_settled(retried: &Retried) {
+        assert!(retried
+            .domain
+            .authority(&retried.replacement)
+            .expect("authority")
+            .is_none());
+        let job = retried
+            .domain
+            .job(&retried.job_id)
+            .expect("job")
+            .expect("job");
+        assert!(job.authoritative_attempt_id.is_none());
+        let history = retried
+            .domain
+            .conversation_history(&retried.project_id, "session-1")
+            .expect("history")
+            .expect("conversation")
+            .1;
+        assert_eq!(history.len(), 2);
+        let assistant = history
+            .iter()
+            .find(|message| matches!(message.author, Actor::Attempt { .. }))
+            .expect("assistant");
+        assert_eq!(assistant.state, MessageLifecycle::Failed);
+    }
+
+    fn assert_previous_tail(retried: &Retried, buffer: &Arc<ChatEventBuffer>) {
+        let chats = retried
+            .service
+            .active_chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = chats.get(&key(retried)).expect("previous tail restored");
+        assert_eq!(entry.attempt_id, retried.first);
+        assert!(Arc::ptr_eq(&entry.buffer, buffer));
+    }
+
+    #[test]
+    fn poisoned_active_chats_refuse_the_retry_transport() {
+        let mut retried = retried();
+        let chats = retried.service.active_chats.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = chats.lock().expect("chats");
+            panic!("poison active chats");
+        })
+        .join();
+        let error = install(&retried)
+            .err()
+            .expect("a poisoned registry installs no transport");
+        assert!(retried
+            .service
+            .active_chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        assert_replacement_settled(&mut retried, &error);
+    }
+
+    #[test]
+    fn forwarder_failure_removes_the_replacement_and_restores_the_tail() {
+        let mut retried = retried();
+        let tail = previous_tail(&retried);
+        let (registrations, closed) = flume::unbounded();
+        drop(closed);
+        retried.service.chat_forwarder = Arc::new(ChatForwarder { registrations });
+        let error = install(&retried)
+            .err()
+            .expect("an unconsumed transport is refused");
+        assert_previous_tail(&retried, &tail);
+        assert_replacement_settled(&mut retried, &error);
+    }
+
+    #[test]
+    fn publish_failure_abandons_the_replacement_and_restores_the_tail() {
+        let mut retried = retried();
+        let tail = previous_tail(&retried);
+        let transport = install(&retried).expect("transport");
+        let cancelled = transport.cancelled.clone();
+        let replacement = retried.replacement.clone();
+        retried
+            .service
+            .abandon_chat_retry(
+                &mut retried.domain,
+                &replacement,
+                transport,
+                &invalid("economic admission failed"),
+            )
+            .expect("abandon");
+        assert!(cancelled.is_cancelled());
+        assert_previous_tail(&retried, &tail);
+        assert_settled(&retried);
+    }
+
+    #[test]
+    fn installed_transport_is_consumed_before_publication() {
+        let retried = retried();
+        previous_tail(&retried);
+        let transport = install(&retried).expect("transport");
+        let buffer = {
+            let chats = retried.service.active_chats.lock().expect("chats");
+            let entry = chats.get(&key(&retried)).expect("replacement");
+            assert_eq!(entry.job_id, retried.job_id);
+            assert_eq!(entry.attempt_id, retried.replacement);
+            entry.buffer.clone()
+        };
+        assert_eq!(
+            transport
+                .superseded
+                .as_ref()
+                .map(|tail| tail.attempt_id.as_str()),
+            Some(retried.first.as_str())
+        );
+        // An event sent the moment the provider could start is already retained.
+        transport
+            .sender
+            .send(ExecutionEvent::Finished)
+            .expect("send");
+        let state = buffer.state.lock().expect("buffer");
+        let (state, _) = buffer
+            .cvar
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.terminal)
+            .expect("wait");
+        assert!(state.terminal);
+        assert_eq!(state.events.len(), 1);
     }
 }

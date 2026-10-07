@@ -1726,7 +1726,7 @@ fn handle_chat_stream(
     // A broken socket keeps the retained tail for a retry; only a consumed
     // terminal (or timeout/error sent above) removes the entry.
     if !disconnected {
-        service.finish_chat(&session_id, &job_id);
+        service.finish_chat(&session_id, &job_id, &buffer);
     }
     let _ = stream.flush();
     Ok(())

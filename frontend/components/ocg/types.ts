@@ -78,6 +78,8 @@ export type ChatMessage = {
   images?: import("./contracts").ChatImage[];
   id: string;
   commandId?: string;
+  /** Canonical Job owning this assistant turn, when backed by OCG. */
+  jobId?: string;
   optimistic?: boolean;
   role: MessageRole;
   content: string;

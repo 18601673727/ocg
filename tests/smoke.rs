@@ -12,7 +12,7 @@ use provider::Reply;
 use serde_json::json;
 
 #[test]
-fn failed_chat_retry_creates_a_new_job_and_preserves_history() -> Result<()> {
+fn failed_chat_retry_reexecutes_the_same_job_and_turn() -> Result<()> {
     let mut smoke = SmokeHarness::start(Reply::Text(vec![]))?;
     smoke.configure_provider()?;
     let project = smoke.add_project("retry-project")?;
@@ -21,11 +21,9 @@ fn failed_chat_retry_creates_a_new_job_and_preserves_history() -> Result<()> {
     let original = smoke.send_chat(&project_id, &session_id, "Review this project")?;
     assert!(smoke.consume_chat(&original).is_err());
     smoke.assert_terminal_execution(&original, "failed")?;
-    let messages = smoke.json(
-        "GET",
-        &format!("/api/v1/canonical/chat/messages?project_id={project_id}&session_id={session_id}"),
-        None,
-    )?;
+    let messages_path =
+        format!("/api/v1/canonical/chat/messages?project_id={project_id}&session_id={session_id}");
+    let messages = smoke.json("GET", &messages_path, None)?;
     let failed = array(&messages, "messages")?
         .iter()
         .find(|item| item["role"] == "assistant")
@@ -33,10 +31,53 @@ fn failed_chat_retry_creates_a_new_job_and_preserves_history() -> Result<()> {
     let message_id = string(failed, "message_id")?;
     smoke.provider_reply(Reply::Text(vec!["Review completed".into()]))?;
     let retry = smoke.retry_failed_turn(&original, &message_id)?;
-    assert_ne!(original.job_id, retry.job_id);
+    assert_eq!(original.job_id, retry.job_id);
     assert_eq!(smoke.consume_chat(&retry)?, "Review completed");
-    smoke.assert_terminal_execution(&retry, "completed")?;
-    smoke.assert_terminal_execution(&original, "failed")?;
+    let snapshot = smoke.assert_terminal_execution(&retry, "completed")?;
+    let execution = &snapshot["job"];
+    assert_eq!(execution["job"]["generation"], 2);
+    let attempts = array(execution, "attempts")?;
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0]["id"], attempts[1]["id"]);
+    assert!(attempts
+        .iter()
+        .any(|attempt| attempt["generation"] == 1 && attempt["state"] == "failed"));
+    // The replacement republishes the frozen target: no new Placement.
+    let target = |intent: &serde_json::Value| -> Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&string(intent, "request")?)?;
+        Ok(json!([
+            intent["provider_key"],
+            intent["model"],
+            intent["upstream_model_id"],
+            intent["endpoint"],
+            request["arguments"]["reasoning_effort"],
+        ]))
+    };
+    let provider_intents = array(execution, "dispatch_intents")?
+        .iter()
+        .filter(|intent| !intent["provider_key"].is_null())
+        .collect::<Vec<_>>();
+    let first = provider_intents
+        .iter()
+        .find(|intent| intent["generation"] == 1)
+        .ok_or("original provider intent missing")?;
+    let replacement = provider_intents
+        .iter()
+        .find(|intent| intent["generation"] == 2)
+        .ok_or("replacement provider intent missing")?;
+    assert_eq!(target(first)?, target(replacement)?);
+    let messages = smoke.json("GET", &messages_path, None)?;
+    let messages = array(&messages, "messages")?;
+    assert_eq!(messages.len(), 2, "retry must not add a Chat turn");
+    let assistant = messages
+        .iter()
+        .find(|item| item["role"] == "assistant")
+        .ok_or("assistant missing")?;
+    assert_eq!(assistant["message_id"], message_id.as_str());
+    assert_eq!(assistant["job_id"], original.job_id.as_str());
+    assert_eq!(assistant["state"], "complete");
+    assert_eq!(assistant["content"], "Review completed");
+    assert_eq!(assistant["attempt_state"], "completed");
     smoke.finish()
 }
 
@@ -166,4 +207,22 @@ fn failed_and_retried_chat_usage_preserves_both_provider_calls() -> Result<()> {
         serde_json::Value::Null
     );
     smoke.finish()
+}
+
+#[test]
+fn chat_presentation_contract() -> Result<()> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = std::process::Command::new("node")
+        .current_dir(root)
+        .arg(root.join("tests/smoke/chat-presentation.cjs"))
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "chat presentation contract: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
 }

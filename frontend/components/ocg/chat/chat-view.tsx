@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   Square,
@@ -33,6 +33,10 @@ import { ModelSelector } from "./model-selector";
 import type { ChatModelSelection } from "../contracts";
 import type { QueuedChatMessage } from "../types";
 import { retryInput } from "./retry";
+import { activeExecutionTarget, currentActivity, executionActivity, isExecutionActive, type ActiveExecutionTarget, type ActivityStep, type ExecutionPhase } from "./execution-status";
+import { readModelPreference, writeModelPreference } from "./model-preference";
+import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./message-bounds";
+import type { JobExecution } from "../execution/domain";
 import { parseMarkdownTable, type MarkdownTable } from "./markdown-table";
 import { AttachmentStaging, ImageGallery, useImageAttachments } from "./image-attachments";
 import {
@@ -273,6 +277,65 @@ function ToolBlock({ message }: { message: ChatMessage }) {
 
 /* ---------- message row ---------- */
 
+/**
+ * A long message scrolls inside its own bounded viewport until the reader
+ * expands it. A streaming message keeps its newest output in view until the
+ * reader scrolls up inside it.
+ */
+function BoundedMessage({ streaming, children }: { streaming: boolean; children: React.ReactNode }) {
+  const { t } = useI18n();
+  const viewport = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const following = useRef(true);
+  const lastTop = useRef(0);
+  const [expanded, setExpanded] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
+
+  useEffect(() => {
+    const el = viewport.current;
+    const inner = content.current;
+    if (!el || !inner) return;
+    const observer = new ResizeObserver(() => {
+      if (!expanded && streaming && following.current) {
+        el.scrollTop = el.scrollHeight;
+        lastTop.current = el.scrollTop;
+      }
+      setOverflowing(el.scrollHeight - el.clientHeight > 1);
+    });
+    observer.observe(inner);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [expanded, streaming]);
+
+  const toggle = boundedToggle(overflowing, expanded);
+  return (
+    <>
+      <div
+        ref={viewport}
+        data-message-bounds={expanded ? "expanded" : "bounded"}
+        onScroll={() => {
+          const el = viewport.current;
+          if (!el || expanded) return;
+          following.current = followAfterScroll(following.current, lastTop.current, el);
+          lastTop.current = el.scrollTop;
+        }}
+        className={cn("min-w-0", !expanded && BOUNDED_MESSAGE_CLASS)}
+      >
+        <div ref={content}>{children}</div>
+      </div>
+      {toggle && <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded(value => !value)}
+        className="mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring"
+      >
+        <ChevronDown className={cn("size-3 transition-transform", expanded && "rotate-180")} aria-hidden="true" />
+        {t(toggle === "collapse" ? "chat.collapseMessage" : "chat.expandMessage")}
+      </button>}
+    </>
+  );
+}
+
 function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage; onRetry?: () => void; retryDisabled?: boolean }) {
   const { t } = useI18n();
   const { isCopied, copyToClipboard } = useCopyToClipboard();
@@ -324,8 +387,10 @@ function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage;
              message.status === "cancelled" && "text-muted-foreground italic",
            )}
          >
-           <Markdown content={message.content} />
-           <ImageGallery images={message.images} />
+           <BoundedMessage streaming={message.status === "streaming"}>
+             <Markdown content={message.content} />
+             <ImageGallery images={message.images} />
+           </BoundedMessage>
            {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
              {chatFailureReason(t, message)}
            </p>}
@@ -353,6 +418,9 @@ function Composer({
   queueing,
   selection,
   onSelectionChange,
+  onPreference,
+  active,
+  activity,
   onCancel,
 }: {
   projectId?: string;
@@ -360,6 +428,9 @@ function Composer({
   queueing: boolean;
   selection?: ChatModelSelection;
   onSelectionChange: (selection: ChatModelSelection) => void;
+  onPreference: (selection: ChatModelSelection) => void;
+  active: ActiveExecutionTarget | null;
+  activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
   onCancel?: () => Promise<void>;
   draft: string;
   onDraftChange: (v: string) => void;
@@ -494,7 +565,7 @@ function Composer({
           images.add(Array.from(event.target.files ?? []));
           event.target.value = "";
         }} />
-        <ModelSelector selection={selection} onChange={onSelectionChange} busy={busy || submitting || cancelling} />
+        <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active} activity={activity} />
         <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
           <AttachmentStaging state={images} disabled={submitting || cancelling} />
           <div className="relative">
@@ -635,6 +706,8 @@ function Composer({
 type ChatViewProps = {
   session: ChatSession;
   messages: ChatMessage[];
+  /** The canonical execution of this Chat's latest Job, when one is known. */
+  execution?: JobExecution | null;
   runtimeStatus: RuntimeStatus;
   onComposerIntent: (intent: ComposerIntent) => void | Promise<void>;
   onCancel?: () => Promise<void>;
@@ -654,6 +727,7 @@ const SUGGESTIONS = [
 export function ChatView({
   session,
   messages,
+  execution,
   runtimeStatus,
   onComposerIntent,
   onRetryMessage,
@@ -665,8 +739,18 @@ export function ChatView({
   composerSurfaceKey,
 }: ChatViewProps) {
   const [draft, setDraft] = useState("");
-  const [selection, setSelection] = useState<ChatModelSelection>();
-  const busy = messages.some(message => message.role === "assistant" && (message.status === "streaming" || message.status === "pending"));
+  // ChatView is keyed per Chat, so the saved next-turn preference is read once per Chat.
+  const [selection, setSelection] = useState<ChatModelSelection | undefined>(() => readModelPreference(session.projectId, session.sessionId ?? session.id));
+  const live = messages.findLast(message => message.role === "assistant" && (message.status === "streaming" || message.status === "pending"));
+  // The running turn's own Job is the only source of what is executing.
+  const liveExecution = isExecutionActive(execution) && (!live?.jobId || live.jobId === execution.jobId) ? execution : null;
+  const busy = Boolean(live) || liveExecution !== null;
+  const active = activeExecutionTarget(liveExecution);
+  const activity = useMemo(() => {
+    if (!liveExecution) return undefined;
+    const steps = executionActivity(liveExecution);
+    return { steps, current: currentActivity(liveExecution, steps) };
+  }, [liveExecution]);
   const { t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -781,30 +865,6 @@ export function ChatView({
                 />
               ))}
               {retryError && <p role="alert" className="text-sm text-destructive">{retryError}</p>}
-              {messages.length > 0 && (
-                <div className="flex items-center gap-2 rounded-md border border-dashed border-border bg-muted/20 px-2.5 py-2 text-[12px] text-muted-foreground">
-                  {runtimeStatus.state === "connected" && busy ? (
-                    <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-                  ) : runtimeStatus.state === "connected" ? (
-                    <Check className="size-3.5" aria-hidden="true" />
-                  ) : (
-                    <span className="size-1.5 rounded-full bg-muted-foreground" aria-hidden="true" />
-                  )}
-                  <span>
-                    {runtimeStatus.state === "connected" ? (
-                      <>
-                        <span className="font-medium">{t(busy ? "chat.working" : "chat.ready")}</span>
-                        {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ""}
-                      </>
-                    ) : (
-                      <>
-                        {t("chat.chat")} <span className="font-medium">{t("chat.unavailableState")}</span>
-                        {runtimeStatus.detail ? ` · ${runtimeStatus.detail}` : ` · ${t("chat.configRequired")}`}
-                      </>
-                    )}
-                  </span>
-                </div>
-              )}
               {composerSurface}
             </div>
           )}
@@ -835,6 +895,9 @@ export function ChatView({
         queueing={busy || Boolean(queueState?.queue.length)}
         selection={selection}
         onSelectionChange={setSelection}
+        onPreference={next => writeModelPreference(session.projectId, session.sessionId ?? session.id, next)}
+        active={active}
+        activity={activity}
         onCancel={onCancel}
         draft={draft}
         onDraftChange={setDraft}
