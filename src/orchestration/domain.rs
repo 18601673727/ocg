@@ -983,6 +983,23 @@ impl DomainRepository {
             .ok_or_else(|| invalid("canonical database has no parent directory"))?;
         std::fs::create_dir_all(parent)
             .map_err(|error| OcgError::io("create canonical database directory", error))?;
+        // Schema bootstrap is one serialized step per database across every
+        // process: switching a new database to WAL needs an exclusive lock
+        // SQLite will not wait for, and each `ensure_column` checks then
+        // alters. The connection is opened only once this lock is held, so
+        // every check below reads the schema the previous holder committed.
+        // The holder does only this local SQLite work and takes no other lock;
+        // the kernel releases it if the process dies, and runtime traffic
+        // never takes it.
+        let bootstrap = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("bootstrap.lock"))
+            .map_err(|error| OcgError::io("open canonical database bootstrap lock", error))?;
+        fs2::FileExt::lock_exclusive(&bootstrap)
+            .map_err(|error| OcgError::io("lock canonical database bootstrap", error))?;
         let connection = Connection::open(&path).map_err(|error| open_sql(root, error))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -1134,6 +1151,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
             [],
         ).map_err(sql)?;
+        drop(bootstrap);
         let repository = Self { connection, path };
         repository.recover_job_readiness()?;
         Ok(repository)
