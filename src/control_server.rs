@@ -286,7 +286,7 @@ impl ControlServer {
                 return Ok(());
             }
             match self.listener.accept() {
-                Ok((stream, _peer)) => self.dispatch(stream, &stop),
+                Ok((stream, _peer)) => self.dispatch(stream),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
                 }
@@ -298,7 +298,7 @@ impl ControlServer {
         }
     }
 
-    fn dispatch(&self, mut stream: TcpStream, stop: &Arc<AtomicBool>) {
+    fn dispatch(&self, mut stream: TcpStream) {
         let current = self.active.fetch_add(1, Ordering::SeqCst);
         if current >= self.config.max_clients {
             self.active.fetch_sub(1, Ordering::SeqCst);
@@ -320,7 +320,7 @@ impl ControlServer {
         let canonical = self.canonical.clone();
         let profile = self.profile.clone();
         let config = self.config.clone();
-        let stop = Arc::clone(stop);
+        let bound = self.addr;
         let active_streams = Arc::clone(&self.active_streams);
         let spawned = thread::Builder::new()
             .name("ocg-control-client".to_string())
@@ -330,7 +330,7 @@ impl ControlServer {
                     canonical.as_ref(),
                     &profile,
                     &config,
-                    &stop,
+                    bound,
                     guard,
                     active_streams,
                 );
@@ -465,7 +465,7 @@ fn handle_client(
     canonical: Option<&crate::orchestration::canonical_control::CanonicalControlService>,
     profile: &crate::profile::ProfileService,
     config: &ServerConfig,
-    _stop: &Arc<AtomicBool>,
+    bound: SocketAddr,
     guard: ClientGuard,
     active_streams: Arc<AtomicUsize>,
 ) {
@@ -482,6 +482,13 @@ fn handle_client(
             return;
         }
     };
+
+    // The Host check precedes routing, so no handler (read or mutation) ever
+    // sees a request addressed to a non-local authority.
+    if let Err(error) = check_host(&request, bound.port()) {
+        let _ = write_api_error(&mut stream, &error);
+        return;
+    }
 
     let route = match classify(&request) {
         Ok(route) => route,
@@ -567,6 +574,50 @@ fn handle_client(
             "canonical control needs an initialized Project boundary",
         ),
     );
+}
+
+/// The loopback host names this server answers to. Each is compared as a whole
+/// name, never as a prefix or substring.
+const LOOPBACK_HOST_NAMES: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// Reject any request whose Host is not this server's own loopback authority.
+/// HTTP/1.1 requires a Host header (RFC 7230 section 5.4) and HTTP/1.0 does
+/// not, but a missing Host cannot be checked, so it is refused for both.
+fn check_host(request: &Request, bound_port: u16) -> std::result::Result<(), ApiError> {
+    let Some(host) = request.headers.get("host") else {
+        return Err(ApiError::new(
+            400,
+            "malformed_request",
+            "the Host header is required",
+        ));
+    };
+    if is_local_host(host, bound_port) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            403,
+            "host_refused",
+            "only a loopback Host may use the control server",
+        ))
+    }
+}
+
+/// True when `value` is `<loopback name>` or `<loopback name>:<port>`, where the
+/// port is exactly `bound_port`. A bare name stands for port 80, the default an
+/// HTTP client omits, so it is accepted only when that is the bound port.
+/// Anything after the name other than `:<port>` is refused, so suffixes such as
+/// `localhost.evil.com` or `localhost@evil.com` cannot pass.
+fn is_local_host(value: &str, bound_port: u16) -> bool {
+    let value = value.to_ascii_lowercase();
+    LOOPBACK_HOST_NAMES.iter().any(|name| {
+        let Some(rest) = value.strip_prefix(name) else {
+            return false;
+        };
+        match rest.strip_prefix(':') {
+            Some(port) => port == bound_port.to_string(),
+            None => rest.is_empty() && bound_port == 80,
+        }
+    })
 }
 
 /// The CORS allowlist: only a loopback HTTP origin may call the canonical
@@ -659,7 +710,8 @@ fn handle_profile(
             ),
         );
     }
-    let operation = || -> Result<Value> {
+    // `Ok(None)` means this handler does not own the route.
+    let operation = || -> Result<Option<Value>> {
         // A read never waits on the OS credential store past a bound; the
         // mutations keep their existing wait, which follows a committed edit.
         let view = |wait: Option<Duration>| -> Result<Value> {
@@ -674,7 +726,7 @@ fn handle_profile(
             })
             .map_err(|error| OcgError::config(error.to_string()))
         };
-        match route {
+        let value = match route {
             Route::ProfileGet => view(Some(PROFILE_READ_CREDENTIAL_WAIT)),
             Route::ProfileBootstrap => {
                 let body = request
@@ -725,12 +777,17 @@ fn handle_profile(
                 vault.set(&request.name, &request.value)?;
                 view(None)
             }
-            _ => unreachable!("not a Profile route"),
-        }
+            _ => return Ok(None),
+        }?;
+        Ok(Some(value))
     };
     let origin = allowed_cors_origin(request);
     match operation() {
-        Ok(value) => write_json_with_origin(stream, 200, &value, origin.as_deref()),
+        Ok(Some(value)) => write_json_with_origin(stream, 200, &value, origin.as_deref()),
+        Ok(None) => write_api_error(
+            stream,
+            &ApiError::new(404, "not_found", "no such control route"),
+        ),
         Err(OcgError::CredentialStorePending(message)) => write_json_with_origin(
             stream,
             503,
@@ -765,8 +822,9 @@ fn handle_setup(
         );
     }
 
-    let operation = || -> Result<Value> {
-        match route {
+    // `Ok(None)` means this handler does not own the route.
+    let operation = || -> Result<Option<Value>> {
+        let value = match route {
             Route::SetupProviderConnect => {
                 let body: crate::contracts::SetupConnectRequest = serde_json::from_value(
                     request
@@ -1074,13 +1132,18 @@ fn handle_setup(
                 )
             }
 
-            _ => unreachable!("not a Setup route"),
-        }
+            _ => return Ok(None),
+        }?;
+        Ok(Some(value))
     };
 
     let origin = allowed_cors_origin(request);
     match operation() {
-        Ok(value) => write_json_with_origin(stream, 200, &value, origin.as_deref()),
+        Ok(Some(value)) => write_json_with_origin(stream, 200, &value, origin.as_deref()),
+        Ok(None) => write_api_error(
+            stream,
+            &ApiError::new(404, "not_found", "no such control route"),
+        ),
         Err(error) => write_json_with_origin(
             stream,
             400,
@@ -1137,7 +1200,9 @@ fn handle_canonical(
             .map(str::to_string)
             .ok_or_else(|| OcgError::config("command_id is required"))
     };
-    let operation = || -> Result<Value> {
+    // The operation is the single decision of which canonical routes this
+    // function answers: `Ok(None)` is returned for every route it does not own.
+    let operation = || -> Result<Option<Value>> {
         let now = now_unix();
         // Every canonical answer is built from a declared response struct in
         // `src/contracts.rs`, not an anonymous literal. The generated
@@ -1148,7 +1213,7 @@ fn handle_canonical(
                 serde_json::to_value($value).map_err(|error| OcgError::config(error.to_string()))
             };
         }
-        match route {
+        let value = match route {
             Route::CanonicalProjects => answer!(CanonicalProjectsResponse {
                 api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
                 projects: service.projects()?,
@@ -1326,42 +1391,10 @@ fn handle_canonical(
                 let job = request.query.get("job_id").map(String::as_str);
                 answer!(service.dashboard(&project, job)?)
             }
-            _ => unreachable!("not a canonical route"),
-        }
+            _ => return Ok(None),
+        }?;
+        Ok(Some(value))
     };
-    if !matches!(
-        route,
-        Route::CanonicalProjects
-            | Route::CanonicalProjectImport
-            | Route::CanonicalProjectsGet { .. }
-            | Route::CanonicalConfigurationGet
-            | Route::CanonicalConfigurationPut
-            | Route::CanonicalConfigurationProjectPut { .. }
-            | Route::CanonicalJobConfigGet { .. }
-            | Route::CanonicalJobConfigPut { .. }
-            | Route::CanonicalJobLaunch
-            | Route::HealthProbeLaunch
-            | Route::HealthProbeQuery
-            | Route::CanonicalJobCancel { .. }
-            | Route::CanonicalJobRetry { .. }
-            | Route::CanonicalJobSpawn { .. }
-            | Route::CanonicalSnapshot
-            | Route::CanonicalEvents
-            | Route::CanonicalDashboard
-            | Route::ProjectUsage
-            | Route::ConversationUsage
-            | Route::JobUsage
-            | Route::ChatSend
-            | Route::ChatImageUpload
-            | Route::ChatImageGet { .. }
-            | Route::ChatConversations
-            | Route::ChatConversationDelete
-            | Route::ChatMessages
-            | Route::ChatStream
-            | Route::ChatCancel
-    ) {
-        return None;
-    }
     if matches!(route, Route::ChatImageUpload | Route::ChatImageGet { .. })
         && request.headers.contains_key("origin")
         && allowed_origin.is_none()
@@ -1482,7 +1515,9 @@ fn handle_canonical(
             serde_json::to_value(answer).map_err(|error| OcgError::config(error.to_string())),
         ));
     }
-    Some(respond(stream, operation()))
+    operation()
+        .transpose()
+        .map(|result| respond(stream, result))
 }
 
 /// Stream one live chat turn as SSE from the real provider path.
@@ -2091,83 +2126,12 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         .filter(|segment| !segment.is_empty())
         .collect();
 
-    let allowed = allowed_methods(&segments);
-    if let Some(methods) = allowed {
-        let is_route = matches!(
-            (&request.method[..], segments.as_slice()),
-            ("GET", ["api", "v1", "profile"])
-                | ("POST", ["api", "v1", "profile", "bootstrap"])
-                | ("PUT", ["api", "v1", "profile"])
-                | ("POST", ["api", "v1", "profile", "credentials"])
-                | ("OPTIONS", ["api", "v1", "profile"])
-                | ("OPTIONS", ["api", "v1", "profile", "bootstrap"])
-                | ("OPTIONS", ["api", "v1", "profile", "credentials"])
-                | ("POST", ["api", "v1", "setup", "connect"])
-                | ("POST", ["api", "v1", "setup", "models"])
-                | ("POST", ["api", "v1", "setup", "browse"])
-                | ("POST", ["api", "v1", "setup", "project"])
-                | ("OPTIONS", ["api", "v1", "setup", "connect"])
-                | ("OPTIONS", ["api", "v1", "setup", "models"])
-                | ("OPTIONS", ["api", "v1", "setup", "browse"])
-                | ("OPTIONS", ["api", "v1", "setup", "project"])
-                | ("GET", ["api", "v1", "canonical", "projects"])
-                | ("POST", ["api", "v1", "canonical", "projects", "import"])
-                | ("GET", ["api", "v1", "canonical", "projects", _])
-                | ("GET", ["api", "v1", "canonical", "configuration"])
-                | ("PUT", ["api", "v1", "canonical", "configuration"])
-                | (
-                    "PUT",
-                    ["api", "v1", "canonical", "configuration", "projects", _]
-                )
-                | (
-                    "GET",
-                    ["api", "v1", "canonical", "jobs", _, "configuration"]
-                )
-                | (
-                    "PUT",
-                    ["api", "v1", "canonical", "jobs", _, "configuration"]
-                )
-                | ("GET", ["api", "v1", "canonical", "jobs"])
-                | ("GET", ["api", "v1", "canonical", "jobs", "events"])
-                | ("POST", ["api", "v1", "canonical", "jobs", "launch"])
-                | ("GET", ["api", "v1", "canonical", "jobs", "health-probe"])
-                | ("POST", ["api", "v1", "canonical", "jobs", "health-probe"])
-                | ("POST", ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"])
-                | ("GET", ["api", "v1", "canonical", "dashboard"])
-                | ("POST", ["api", "v1", "canonical", "chat", "images"])
-                | ("GET", ["api", "v1", "canonical", "chat", "images", _, _])
-                | ("POST", ["api", "v1", "canonical", "chat", "send"])
-                | ("GET", ["api", "v1", "canonical", "chat", "stream"])
-                | ("GET", ["api", "v1", "canonical", "chat", "conversations"])
-                | ("DELETE", ["api", "v1", "canonical", "chat", "conversations"])
-                | ("GET", ["api", "v1", "canonical", "chat", "messages"])
-                | ("POST", ["api", "v1", "canonical", "chat", "cancel"])
-                // A browser preflight is answered by the canonical CORS
-                // handler, which is the only place that echoes an origin.
-                | ("OPTIONS", ["api", "v1", "canonical", "projects"])
-                | ("OPTIONS", ["api", "v1", "canonical", "projects", "import"])
-                | ("OPTIONS", ["api", "v1", "canonical", "projects", _])
-                | ("OPTIONS", ["api", "v1", "canonical", "configuration"])
-                | ("OPTIONS", ["api", "v1", "canonical", "configuration", "projects", _])
-                | ("OPTIONS", ["api", "v1", "canonical", "jobs", _, "configuration"])
-                | ("OPTIONS", ["api", "v1", "canonical", "jobs"])
-                | ("OPTIONS", ["api", "v1", "canonical", "jobs", "events"])
-                | ("OPTIONS", ["api", "v1", "canonical", "jobs", "launch"])
-                | ("OPTIONS", ["api", "v1", "canonical", "jobs", "health-probe"])
-                | ("OPTIONS", ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"])
-                | ("OPTIONS", ["api", "v1", "canonical", "dashboard"])
-                | ("GET" | "OPTIONS", ["api", "v1", "canonical", "usage"])
-                | ("GET" | "OPTIONS", ["api", "v1", "canonical", "chat", "usage"])
-                | ("GET" | "OPTIONS", ["api", "v1", "canonical", "jobs", "usage"])
-                | ("OPTIONS", ["api", "v1", "canonical", "chat", "images"])
-                | ("OPTIONS", ["api", "v1", "canonical", "chat", "images", _, _])
-                | ("OPTIONS", ["api", "v1", "canonical", "chat", "send"])
-                | ("OPTIONS", ["api", "v1", "canonical", "chat", "stream"])
-                | ("OPTIONS", ["api", "v1", "canonical", "chat", "conversations"])
-                | ("OPTIONS", ["api", "v1", "canonical", "chat", "messages"])
-                | ("OPTIONS", ["api", "v1", "canonical", "chat", "cancel"])
-        );
-        if !is_route {
+    // The path's method table is the only method policy. OPTIONS is never
+    // refused here: it is the CORS preflight, which every known path answers.
+    if let Some(methods) = allowed_methods(&segments) {
+        if request.method != "OPTIONS"
+            && !methods.split(", ").any(|method| method == request.method)
+        {
             return Err(ApiError::method_not_allowed(methods));
         }
     }
