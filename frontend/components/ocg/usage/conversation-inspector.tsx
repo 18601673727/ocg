@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Maximize2, Minimize2, RefreshCw, X } from "lucide-react";
+import { Maximize2, Minimize2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SegmentedTabs } from "../primitives";
 import { JobInspector } from "../execution/job-inspector";
@@ -30,7 +30,6 @@ export function ConversationInspector({ usage, execution, accounting, observabil
       {tab === "execution" && execution ? <JobInspector execution={execution} accounting={accounting} observability={observability} mode={mode} onModeChange={onModeChange} onClose={onClose} onOpenJobExecution={onOpenJobExecution} /> : <>
         <header className="flex shrink-0 items-center gap-1 border-b border-border px-3 py-2">
           <h2 className="min-w-0 flex-1 text-[12px] font-semibold">{t("usage.inspector")}</h2>
-          <Button variant="ghost" size="icon-xs" disabled={usage.loading} onClick={usage.refresh} aria-label={t("common.refresh")}><RefreshCw className="size-3.5" /></Button>
           {onModeChange ? <Button variant="ghost" size="icon-xs" onClick={() => onModeChange(mode === "expanded" ? "docked" : "expanded")} aria-label={t(mode === "expanded" ? "execution.dockInspector" : "execution.expandInspector")}>{mode === "expanded" ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}</Button> : null}
           <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("common.close")}><X className="size-4" /></Button>
         </header>
