@@ -497,4 +497,125 @@ mod tests {
         assert_eq!(canonical, json!({"path": "test.txt"}));
         assert!(super::super::validate_parameters(&tool.definition.parameters, &canonical).is_ok());
     }
+
+    fn append_line_wire() -> Value {
+        json!({
+            "operation": "appendLine", "file": "README.md", "content": "Acceptance write test.",
+            "expectedRevision": null, "anchor": null, "oldString": null,
+            "old_string": null, "newString": null,
+        })
+    }
+
+    #[test]
+    fn edit_strict_schema_includes_append_line_with_nullable_optional_fields() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_edit").unwrap();
+        let strict = &tool.strict_parameters;
+        assert_eq!(
+            strict["properties"]["operation"]["enum"],
+            json!([
+                "replace",
+                "insertBefore",
+                "insertAfter",
+                "append",
+                "appendLine"
+            ])
+        );
+        let properties = strict["properties"].as_object().unwrap();
+        let required = strict["required"].as_array().unwrap();
+        assert_eq!(required.len(), properties.len());
+        for name in properties.keys() {
+            assert!(required.contains(&json!(name)));
+            assert_eq!(
+                allows_null(&properties[name]),
+                name != "operation" && name != "file"
+            );
+        }
+        assert_eq!(strict["additionalProperties"], false);
+        assert!(tool.function()["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Use appendLine"));
+    }
+
+    #[test]
+    fn append_line_wire_normalizes_to_canonical_edit_arguments() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_edit").unwrap();
+        let wire = append_line_wire();
+        tool.validate_wire_arguments(&wire).unwrap();
+        let canonical = tool.canonical_arguments(&wire);
+        assert_eq!(
+            canonical,
+            json!({
+                "operation": "appendLine", "file": "README.md", "content": "Acceptance write test."
+            })
+        );
+        let call = crate::edit::construct_call(&canonical).unwrap();
+        assert_eq!(call.request.kind, crate::edit::OperationKind::AppendLine);
+        assert_eq!(call.request.target, None);
+        assert_eq!(call.request.expected_revision, None);
+        assert_eq!(call.request.content, "Acceptance write test.");
+        let mut fenced = wire;
+        fenced["expectedRevision"] = json!("a".repeat(64));
+        tool.validate_wire_arguments(&fenced).unwrap();
+        let canonical = tool.canonical_arguments(&fenced);
+        assert_eq!(canonical["expectedRevision"], "a".repeat(64));
+        assert_eq!(
+            crate::edit::construct_call(&canonical)
+                .unwrap()
+                .request
+                .expected_revision,
+            Some("a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn malformed_append_line_arguments_fail_wire_or_canonical_validation() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_edit").unwrap();
+        for (field, value) in [
+            ("content", Value::Null),
+            ("content", json!("line\n")),
+            ("content", json!("line\r")),
+            ("anchor", json!("target")),
+            ("oldString", json!("target")),
+            ("old_string", json!("target")),
+            ("newString", json!("replacement")),
+            (
+                "expectedRevision",
+                json!(format!("sha256:{}", "a".repeat(64))),
+            ),
+        ] {
+            let mut wire = append_line_wire();
+            wire[field] = value;
+            tool.validate_wire_arguments(&wire).unwrap();
+            let error = crate::edit::construct_call(&tool.canonical_arguments(&wire)).unwrap_err();
+            assert_eq!(error.conflict, crate::edit::Conflict::InvalidRequest);
+            assert_eq!(error.kind, Some(crate::edit::OperationKind::AppendLine));
+        }
+        for (field, value) in [("content", json!(123)), ("unknown", json!("value"))] {
+            let mut wire = append_line_wire();
+            wire[field] = value;
+            assert!(tool.validate_wire_arguments(&wire).is_err());
+        }
+        let mut missing = append_line_wire();
+        missing.as_object_mut().unwrap().remove("anchor");
+        assert!(tool.validate_wire_arguments(&missing).is_err());
+    }
+
+    #[test]
+    fn raw_append_and_append_line_remain_distinct_on_strict_wire() {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve("filesystem_edit").unwrap();
+        let mut wire = append_line_wire();
+        wire["content"] = json!("line\r\n");
+        tool.validate_wire_arguments(&wire).unwrap();
+        assert!(crate::edit::construct_call(&tool.canonical_arguments(&wire)).is_err());
+        wire["operation"] = json!("append");
+        tool.validate_wire_arguments(&wire).unwrap();
+        let call = crate::edit::construct_call(&tool.canonical_arguments(&wire)).unwrap();
+        assert_eq!(call.request.kind, crate::edit::OperationKind::Append);
+        assert_eq!(call.request.content, "line\r\n");
+    }
 }

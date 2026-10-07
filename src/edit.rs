@@ -12,6 +12,7 @@ pub enum OperationKind {
     InsertBefore,
     InsertAfter,
     Append,
+    AppendLine,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +94,7 @@ pub fn construct_call(value: &Value) -> Result<CanonicalCall, EditFailure> {
         Some("insertBefore") => OperationKind::InsertBefore,
         Some("insertAfter") => OperationKind::InsertAfter,
         Some("append") => OperationKind::Append,
+        Some("appendLine") => OperationKind::AppendLine,
         Some(_) => return Err(bad(Conflict::UnsupportedOperation)),
         None => return Err(bad(Conflict::InvalidRequest)),
     };
@@ -155,7 +157,7 @@ pub fn construct_call(value: &Value) -> Result<CanonicalCall, EditFailure> {
                 false,
             )
         }
-        OperationKind::Append => {
+        OperationKind::Append | OperationKind::AppendLine => {
             if obj.contains_key("anchor")
                 || obj.contains_key("oldString")
                 || obj.contains_key("old_string")
@@ -166,7 +168,10 @@ pub fn construct_call(value: &Value) -> Result<CanonicalCall, EditFailure> {
             (None, string(obj, "content").ok_or_else(invalid)?, false)
         }
     };
-    if file.is_empty() || target.is_some_and(str::is_empty) {
+    if file.is_empty()
+        || target.is_some_and(str::is_empty)
+        || (kind == OperationKind::AppendLine && content.contains(['\r', '\n']))
+    {
         return Err(invalid());
     }
     Ok(CanonicalCall {
@@ -205,8 +210,10 @@ fn apply_inner(
     const MAX_RETRIES: u8 = 2;
     let kind = call.request.kind;
     let fail = |conflict| EditFailure::new(FailureClass::Execution, conflict, Some(kind));
-    if (kind == OperationKind::Append) != call.request.target.is_none()
+    let appends = matches!(kind, OperationKind::Append | OperationKind::AppendLine);
+    if appends != call.request.target.is_none()
         || call.request.target.as_deref().is_some_and(str::is_empty)
+        || (kind == OperationKind::AppendLine && call.request.content.contains(['\r', '\n']))
         || call
             .request
             .expected_revision
@@ -250,7 +257,7 @@ fn apply_inner(
             .expected_revision
             .as_ref()
             .is_some_and(|expected| expected != &revision);
-        if stale && kind == OperationKind::Append {
+        if stale && appends {
             return Err(EditFailure {
                 revision: Some(revision),
                 retries,
@@ -323,10 +330,18 @@ fn apply_inner(
 
 fn resolve(text: &str, request: &EditRequest) -> Result<(String, bool), Conflict> {
     let Some(target) = request.target.as_deref() else {
-        return if request.kind == OperationKind::Append {
-            Ok((format!("{text}{}", request.content), false))
-        } else {
-            Err(Conflict::InvalidRequest)
+        return match request.kind {
+            OperationKind::Append => Ok((format!("{text}{}", request.content), false)),
+            OperationKind::AppendLine => {
+                let mut next = text.to_owned();
+                if !text.is_empty() && !text.ends_with('\n') {
+                    next.push('\n');
+                }
+                next.push_str(&request.content);
+                next.push('\n');
+                Ok((next, false))
+            }
+            _ => Err(Conflict::InvalidRequest),
         };
     };
     if target.is_empty() {
@@ -349,7 +364,7 @@ fn resolve(text: &str, request: &EditRequest) -> Result<(String, bool), Conflict
     let position = match request.kind {
         OperationKind::Replace | OperationKind::InsertBefore => at,
         OperationKind::InsertAfter => at + needle.len(),
-        OperationKind::Append => return Err(Conflict::InvalidRequest),
+        OperationKind::Append | OperationKind::AppendLine => return Err(Conflict::InvalidRequest),
     };
     let end = if request.kind == OperationKind::Replace {
         at + needle.len()
@@ -361,4 +376,155 @@ fn resolve(text: &str, request: &EditRequest) -> Result<(String, bool), Conflict
     next.push_str(&request.content);
     next.push_str(&text[end..]);
     Ok((next, recovered))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn append_line(initial: &[u8]) -> Vec<u8> {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        fs::write(&path, initial).unwrap();
+        let call = construct_call(&json!({
+            "operation": "appendLine", "file": "README.md", "content": "Acceptance write test."
+        }))
+        .unwrap();
+        let outcome = apply_call(root.path(), call).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(outcome.kind, OperationKind::AppendLine);
+        assert_eq!(outcome.previous_revision, crate::hash::sha256_hex(initial));
+        assert_eq!(outcome.new_revision, crate::hash::sha256_hex(&bytes));
+        assert!(outcome.direct);
+        assert!(!outcome.rebased);
+        assert!(!outcome.mechanically_repaired);
+        assert_eq!(outcome.retries, 0);
+        bytes
+    }
+
+    #[test]
+    fn append_line_to_terminated_file() {
+        assert_eq!(
+            append_line(b"# OCG Human Acceptance\n"),
+            b"# OCG Human Acceptance\nAcceptance write test.\n"
+        );
+    }
+
+    #[test]
+    fn append_line_to_unterminated_file() {
+        assert_eq!(
+            append_line(b"# OCG Human Acceptance"),
+            b"# OCG Human Acceptance\nAcceptance write test.\n"
+        );
+    }
+
+    #[test]
+    fn append_line_to_empty_file() {
+        assert_eq!(append_line(b""), b"Acceptance write test.\n");
+    }
+
+    #[test]
+    fn append_line_preserves_existing_crlf_bytes() {
+        assert_eq!(
+            append_line(b"# OCG Human Acceptance\r\n"),
+            b"# OCG Human Acceptance\r\nAcceptance write test.\n"
+        );
+    }
+
+    #[test]
+    fn append_line_rejects_cr_and_lf_content() {
+        for content in [
+            "\n",
+            "\r",
+            "first\nsecond",
+            "first\rsecond",
+            "first\r\nsecond",
+        ] {
+            let error = construct_call(&json!({
+                "operation": "appendLine", "file": "README.md", "content": content
+            }))
+            .unwrap_err();
+            assert_eq!(error.class, FailureClass::Construction);
+            assert_eq!(error.conflict, Conflict::InvalidRequest);
+            assert_eq!(error.kind, Some(OperationKind::AppendLine));
+        }
+    }
+
+    #[test]
+    fn append_line_stale_revision_leaves_file_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        let initial = b"# OCG Human Acceptance\n";
+        fs::write(&path, initial).unwrap();
+        let call = construct_call(&json!({
+            "operation": "appendLine", "file": "README.md", "content": "Acceptance write test.",
+            "expectedRevision": "0".repeat(64)
+        }))
+        .unwrap();
+        let error = apply_call(root.path(), call).unwrap_err();
+        assert_eq!(error.class, FailureClass::Execution);
+        assert_eq!(error.conflict, Conflict::StaleRevision);
+        assert_eq!(error.revision, Some(crate::hash::sha256_hex(initial)));
+        assert_eq!(fs::read(path).unwrap(), initial);
+    }
+
+    #[test]
+    fn raw_append_preserves_exact_content_without_adding_newlines() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        fs::write(&path, b"original").unwrap();
+        for (content, expected) in [
+            ("suffix", "originalsuffix"),
+            ("\r\nnext\n", "originalsuffix\r\nnext\n"),
+            ("", "originalsuffix\r\nnext\n"),
+        ] {
+            let call = construct_call(&json!({
+                "operation": "append", "file": "README.md", "content": content
+            }))
+            .unwrap();
+            assert_eq!(
+                apply_call(root.path(), call).unwrap().kind,
+                OperationKind::Append
+            );
+            assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn append_line_execution_rejects_invalid_direct_request() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        fs::write(&path, b"original").unwrap();
+        let mut call = construct_call(&json!({
+            "operation": "appendLine", "file": "README.md", "content": "line"
+        }))
+        .unwrap();
+        call.request.content.push('\n');
+        let error = apply_call(root.path(), call).unwrap_err();
+        assert_eq!(error.class, FailureClass::Execution);
+        assert_eq!(error.conflict, Conflict::InvalidRequest);
+        assert_eq!(fs::read(path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn append_line_concurrency_retry_does_not_duplicate_line() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        fs::write(&path, b"original\n").unwrap();
+        let call = construct_call(&json!({
+            "operation": "appendLine", "file": "README.md", "content": "line"
+        }))
+        .unwrap();
+        let outcome = apply_inner(root.path(), call, |retry| {
+            if retry == 0 {
+                fs::write(&path, b"original\nconcurrent\n").unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(outcome.retries, 1);
+        assert!(outcome.rebased);
+        assert!(!outcome.mechanically_repaired);
+        assert_eq!(fs::read(path).unwrap(), b"original\nconcurrent\nline\n");
+    }
 }

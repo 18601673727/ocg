@@ -289,13 +289,35 @@ pub struct NativeToolDefinition {
 
 pub struct NativeToolRegistry;
 
+const FILESYSTEM_EDIT_DESCRIPTION: &str = "Apply a transactional Robust Edit inside the current Project root. Choose fields using the operation rules. Use appendLine to append one logical line; append appends exact bytes. file must be a non-empty Project-relative path to an existing file. expectedRevision is optional: never invent or derive it. Copy the exact metadata.revision from a complete filesystem.read from offset 0, or omit it (strict wire: null). Never use a sha256: prefix. Omit unused fields; on a strict wire that requires every property, send null for omitted fields. Empty strings are supplied values, not omission. Never supply extra fields.";
+
+fn filesystem_edit_operation_contract(kind: edit::OperationKind) -> &'static str {
+    match kind {
+        edit::OperationKind::Append => {
+            "append requires operation, file and content (the exact bytes to append). No newline is added automatically. Use appendLine to append one logical line. Optional: expectedRevision. Must omit anchor, oldString, old_string and newString (send null on the strict wire)."
+        }
+        edit::OperationKind::AppendLine => {
+            "appendLine requires operation, file and content (one logical line containing no CR or LF; may be empty). Preserves existing bytes, adds a separating LF if the non-empty file lacks a final LF, and appends content followed by one LF. Optional: expectedRevision. Must omit anchor, oldString, old_string and newString (send null on the strict wire)."
+        }
+        edit::OperationKind::Replace => {
+            "replace requires operation, file, newString and exactly one of oldString or old_string (a non-empty exact target). Prefer oldString; omit the other alias. Optional: expectedRevision. Must omit anchor and content (send null on the strict wire)."
+        }
+        edit::OperationKind::InsertBefore => {
+            "insertBefore requires operation, file, anchor (a non-empty exact target) and content (the exact bytes to insert before the anchor). Optional: expectedRevision. Must omit oldString, old_string and newString (send null on the strict wire)."
+        }
+        edit::OperationKind::InsertAfter => {
+            "insertAfter requires operation, file, anchor (a non-empty exact target) and content (the exact bytes to insert after the anchor). Optional: expectedRevision. Must omit oldString, old_string and newString (send null on the strict wire)."
+        }
+    }
+}
+
 impl NativeToolRegistry {
     /// The one definition of every built-in tool.
     pub fn definitions() -> Vec<NativeToolDefinition> {
         vec![
             NativeToolDefinition {
                 name: "filesystem.read",
-                description: "Read a bounded UTF-8 file inside the current Project root. offset and limit count bytes, not lines. Each read returns at most 8192 bytes. Omit limit for the default bounded read; use metadata.nextOffset to continue a truncated read.",
+                description: "Read a bounded UTF-8 file inside the current Project root. offset and limit count bytes, not lines. Each read returns at most 8192 bytes. Omit limit for the default bounded read; use metadata.nextOffset to continue a truncated read. A complete read from offset 0 (truncated: false) returns metadata.revision, the bare lowercase SHA-256 of the complete file bytes. Only this metadata.revision is authoritative from this tool for filesystem.edit.expectedRevision; partial reads provide no revision.",
                 parameters: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0,"description":"Zero-based byte offset, not a line number. Default: 0."},"limit":{"type":"integer","minimum":1,"description":"Maximum bytes to read, not lines. Omit to use the default bounded read."}}}),
                 permission: PermissionClass::ReadOnly,
                 capability: "filesystem",
@@ -372,8 +394,26 @@ impl NativeToolRegistry {
             },
             NativeToolDefinition {
                 name: "filesystem.edit",
-                description: "Apply a transactional Robust Edit inside the current Project root.",
-                parameters: json!({"type":"object","additionalProperties":false,"required":["operation","file"],"properties":{"operation":{"type":"string","enum":["replace","insertBefore","insertAfter","append"]},"file":{"type":"string"},"expectedRevision":{"type":"string"},"oldString":{"type":"string"},"old_string":{"type":"string"},"anchor":{"type":"string"},"newString":{"type":"string"},"content":{"type":"string"}}}),
+                description: FILESYSTEM_EDIT_DESCRIPTION,
+                parameters: json!({
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["operation","file"],
+                    "properties":{
+                        "operation":{
+                            "type":"string",
+                            "enum":["replace","insertBefore","insertAfter","append","appendLine"],
+                            "description":([edit::OperationKind::Append, edit::OperationKind::AppendLine, edit::OperationKind::Replace, edit::OperationKind::InsertBefore, edit::OperationKind::InsertAfter].map(filesystem_edit_operation_contract).join(" "))
+                        },
+                        "file":{"type":"string","description":"Non-empty Project-relative path to an existing file."},
+                        "expectedRevision":{"type":"string","description":"Optional: copy exactly metadata.revision from a complete filesystem.read from offset 0 (64 lowercase hexadecimal characters). Otherwise omit (strict wire: null). Never invent or derive a revision; never use a sha256: prefix."},
+                        "oldString":{"type":"string","description":"Non-empty exact target for replace only. Use exactly one of oldString or old_string; omit (strict wire: null) for other operations."},
+                        "old_string":{"type":"string","description":"Legacy alias of oldString for replace only. Prefer oldString and omit this field (strict wire: null). Never supply both aliases."},
+                        "anchor":{"type":"string","description":"Non-empty exact target for insertBefore or insertAfter only. Omit (strict wire: null) for append, appendLine or replace."},
+                        "newString":{"type":"string","description":"Required replacement bytes for replace only; may be empty. Omit (strict wire: null) for other operations."},
+                        "content":{"type":"string","description":"Required for appendLine: one logical line containing no CR or LF; the editor supplies the line boundary and terminating LF. For append, insertBefore or insertAfter: exact bytes, no automatic newline. May be empty. Omit (strict wire: null) for replace."}
+                    }
+                }),
                 permission: PermissionClass::FilesystemWrite,
                 capability: "filesystem",
                 executor: NativeToolExecutorBinding::FilesystemEdit,
@@ -743,15 +783,19 @@ impl NativeToolExecutor {
         }
         let truncated = bytes.len() > cap || start.saturating_add(bytes.len() as u64) < file_len;
         let (content, _) = bounded_text(&bytes, cap);
+        let mut metadata = json!({
+            "remaining": truncated,
+            "offset": start,
+            "nextOffset": start.saturating_add(bytes.len().min(cap) as u64),
+        });
+        if offset == 0 && !truncated {
+            metadata["revision"] = json!(crate::hash::sha256_hex(&bytes));
+        }
         ToolResult {
             success: true,
             output: json!({"path": relative_display(&self.root, &path), "content": content}),
             truncated,
-            metadata: json!({
-                "remaining": truncated,
-                "offset": start,
-                "nextOffset": start.saturating_add(bytes.len().min(cap) as u64),
-            }),
+            metadata,
             error: None,
         }
     }
@@ -978,10 +1022,16 @@ impl NativeToolExecutor {
         let call = match edit::construct_call(arguments) {
             Ok(call) => call,
             Err(error) => {
+                let contract = error
+                    .kind
+                    .map(filesystem_edit_operation_contract)
+                    .unwrap_or(
+                    "operation must be append, appendLine, replace, insertBefore or insertAfter.",
+                );
                 return ToolResult::failure(ToolError::new(
                     ToolErrorKind::InvalidInput,
-                    format!("Robust Edit construction failed: {error:?}"),
-                ))
+                    format!("Invalid filesystem.edit arguments. {contract} {FILESYSTEM_EDIT_DESCRIPTION}"),
+                ));
             }
         };
         if cancelled() {
@@ -994,6 +1044,18 @@ impl NativeToolExecutor {
             Ok(outcome) => ToolResult::success(
                 json!({"file":file,"operation":format!("{:?}", outcome.kind),"previousRevision":outcome.previous_revision,"newRevision":outcome.new_revision,"rebased":outcome.rebased,"retries":outcome.retries,"mechanicallyRepaired":outcome.mechanically_repaired}),
             ),
+            Err(error) if error.conflict == edit::Conflict::StaleRevision => {
+                let mut feedback = ToolError::new(
+                    ToolErrorKind::ExecutionFailure,
+                    "filesystem.edit StaleRevision: the supplied expectedRevision does not match the current file. Do not invent another revision. Read the file completely from offset 0 and copy metadata.revision exactly, or omit expectedRevision (strict wire: null) if the operation and user intent permit editing the current file.",
+                );
+                feedback.metadata = json!({
+                    "conflict": "StaleRevision",
+                    "revision": error.revision,
+                    "retries": error.retries,
+                });
+                ToolResult::failure(feedback)
+            }
             Err(error) => ToolResult::failure(ToolError::new(
                 ToolErrorKind::ExecutionFailure,
                 format!("Robust Edit execution failed: {error:?}"),
@@ -1467,5 +1529,285 @@ impl NativeToolCallHandler {
             domain.fence_dispatch_intent(&call.id, &failure)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openai_projection::OpenAiToolProjection;
+
+    struct NoProcessRunner;
+
+    impl CaptureRunner for NoProcessRunner {
+        fn run(
+            &self,
+            program: &str,
+            _args: &[String],
+            _cwd: &Path,
+            _max_bytes: usize,
+        ) -> Result<crate::process::CapturedOutput> {
+            panic!("filesystem contract must not require process execution: {program}");
+        }
+    }
+
+    fn executor(root: &Path) -> NativeToolExecutor {
+        NativeToolExecutor::with_runner(root, Box::new(NoProcessRunner)).unwrap()
+    }
+
+    fn execute_wire(executor: &NativeToolExecutor, name: &str, wire: &Value) -> ToolResult {
+        let projection = OpenAiToolProjection::from_registry().unwrap();
+        let tool = projection.resolve(name).unwrap();
+        tool.validate_wire_arguments(wire).unwrap();
+        let definition = NativeToolRegistry::get(tool.canonical_name()).unwrap();
+        executor.execute(
+            tool.canonical_name(),
+            &tool.canonical_arguments(wire),
+            definition.permission,
+            PermissionPolicy {
+                process_exec: false,
+                process_capability: false,
+                ..PermissionPolicy::allow_all()
+            },
+            &AtomicBool::new(false),
+        )
+    }
+
+    fn line_wire(expected_revision: Value) -> Value {
+        json!({
+            "operation": "appendLine", "file": "README.md",
+            "content": "Acceptance write test.", "expectedRevision": expected_revision,
+            "anchor": null, "oldString": null, "old_string": null, "newString": null,
+        })
+    }
+
+    fn full_read(executor: &NativeToolExecutor) -> ToolResult {
+        execute_wire(
+            executor,
+            "filesystem_read",
+            &json!({"path": "README.md", "offset": null, "limit": null}),
+        )
+    }
+
+    #[test]
+    fn complete_read_reports_bare_lowercase_sha256_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        let executor = executor(root.path());
+        fs::write(&path, b"# OCG Human Acceptance\n").unwrap();
+        let result = full_read(&executor);
+        assert!(result.success);
+        assert!(!result.truncated);
+        let revision = result.metadata["revision"].as_str().unwrap();
+        assert_eq!(
+            revision,
+            "c7cf76e608b01337e3286196fbf1662ab099969585b65f640c2cfd395406b675"
+        );
+        assert_eq!(revision.len(), 64);
+        assert!(revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(!revision.starts_with("sha256:"));
+        for bytes in [Vec::new(), vec![b'x'; FILE_READ_CONTENT_CAP]] {
+            fs::write(&path, &bytes).unwrap();
+            let result = execute_wire(
+                &executor,
+                "filesystem_read",
+                &json!({"path": "README.md", "offset": 0, "limit": null}),
+            );
+            assert!(result.success);
+            assert!(!result.truncated);
+            assert_eq!(result.metadata["revision"], crate::hash::sha256_hex(&bytes));
+        }
+    }
+
+    #[test]
+    fn complete_read_revision_hashes_raw_bytes_before_utf8_conversion() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"line\r\n\xff\n";
+        fs::write(root.path().join("README.md"), bytes).unwrap();
+        let result = full_read(&executor(root.path()));
+        assert!(result.success);
+        assert!(!result.truncated);
+        assert_eq!(result.metadata["revision"], crate::hash::sha256_hex(bytes));
+        assert_ne!(
+            result.metadata["revision"],
+            crate::hash::sha256_hex(result.output["content"].as_str().unwrap().as_bytes())
+        );
+    }
+
+    #[test]
+    fn partial_and_truncated_reads_do_not_report_full_file_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        fs::write(&path, b"# OCG Human Acceptance\n").unwrap();
+        let executor = executor(root.path());
+        for (offset, limit, truncated) in [
+            (0, json!(5), true),
+            (5, Value::Null, false),
+            (100, Value::Null, false),
+        ] {
+            let result = execute_wire(
+                &executor,
+                "filesystem_read",
+                &json!({"path": "README.md", "offset": offset, "limit": limit}),
+            );
+            assert!(result.success);
+            assert_eq!(result.truncated, truncated);
+            assert!(result.metadata.get("revision").is_none());
+        }
+        fs::write(&path, vec![b'x'; FILE_READ_CONTENT_CAP + 1]).unwrap();
+        let result = full_read(&executor);
+        assert!(result.success);
+        assert!(result.truncated);
+        assert!(result.metadata.get("revision").is_none());
+        fs::write(&path, b"").unwrap();
+        let result = execute_wire(
+            &executor,
+            "filesystem_read",
+            &json!({"path": "README.md", "offset": 1, "limit": null}),
+        );
+        assert!(result.success);
+        assert_eq!(result.metadata["offset"], 0);
+        assert!(result.metadata.get("revision").is_none());
+    }
+
+    #[test]
+    fn human_acceptance_wire_line_append_and_read_preserve_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("README.md"), b"# OCG Human Acceptance\n").unwrap();
+        fs::write(root.path().join("other.txt"), b"untouched\n").unwrap();
+        let executor = executor(root.path());
+        let edit = execute_wire(&executor, "filesystem_edit", &line_wire(Value::Null));
+        assert!(edit.success, "{edit:?}");
+        assert_eq!(edit.output["operation"], "AppendLine");
+        assert_eq!(edit.output["retries"], 0);
+        assert_eq!(edit.output["rebased"], false);
+        assert_eq!(edit.output["mechanicallyRepaired"], false);
+        let read = full_read(&executor);
+        let expected = b"# OCG Human Acceptance\nAcceptance write test.\n";
+        assert!(read.success);
+        assert!(!read.truncated);
+        assert_eq!(
+            read.output["content"].as_str().unwrap().as_bytes(),
+            expected
+        );
+        assert_eq!(fs::read(root.path().join("README.md")).unwrap(), expected);
+        assert_eq!(edit.output["newRevision"], read.metadata["revision"]);
+        assert_eq!(
+            fs::read(root.path().join("other.txt")).unwrap(),
+            b"untouched\n"
+        );
+        let mut user_files: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != ".ocg")
+            .collect();
+        user_files.sort();
+        assert_eq!(user_files, ["README.md", "other.txt"]);
+    }
+
+    #[test]
+    fn complete_read_revision_supports_fenced_line_append() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("README.md"), b"# OCG Human Acceptance\n").unwrap();
+        let executor = executor(root.path());
+        let read = full_read(&executor);
+        assert!(read.success);
+        let revision = read.metadata["revision"].as_str().unwrap();
+        let edit = execute_wire(&executor, "filesystem_edit", &line_wire(json!(revision)));
+        assert!(edit.success, "{edit:?}");
+        assert_eq!(edit.output["previousRevision"], revision);
+        assert_eq!(edit.output["rebased"], false);
+        let verified = full_read(&executor);
+        assert!(verified.success);
+        assert_eq!(
+            verified.output["content"],
+            "# OCG Human Acceptance\nAcceptance write test.\n"
+        );
+        assert_eq!(verified.metadata["revision"], edit.output["newRevision"]);
+    }
+
+    #[test]
+    fn stale_revision_feedback_is_actionable_without_mutating_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("README.md");
+        fs::write(&path, b"# OCG Human Acceptance\n").unwrap();
+        let executor = executor(root.path());
+        let previous = full_read(&executor).metadata["revision"].clone();
+        let current = b"# OCG Human Acceptance\nconcurrent change\n";
+        fs::write(&path, current).unwrap();
+        for revision in [previous, json!("0".repeat(64))] {
+            let result = execute_wire(&executor, "filesystem_edit", &line_wire(revision));
+            assert!(!result.success);
+            let error = result.error.as_ref().unwrap();
+            assert_eq!(error.kind, ToolErrorKind::ExecutionFailure);
+            assert_eq!(error.metadata["conflict"], "StaleRevision");
+            assert_eq!(error.metadata["revision"], crate::hash::sha256_hex(current));
+            assert_eq!(error.metadata["retries"], 0);
+            assert!(error
+                .message
+                .contains("supplied expectedRevision does not match"));
+            assert!(error.message.contains("Do not invent another revision"));
+            assert!(error.message.contains(
+                "Read the file completely from offset 0 and copy metadata.revision exactly"
+            ));
+            assert!(error
+                .message
+                .contains("omit expectedRevision (strict wire: null)"));
+            assert!(!result.tool_message_content().contains("EditFailure {"));
+            assert_eq!(fs::read(&path).unwrap(), current);
+        }
+    }
+
+    #[test]
+    fn invalid_edit_feedback_preserves_operation_specific_guidance() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("README.md"), b"original\n").unwrap();
+        let executor = executor(root.path());
+        for (operation, arguments, guidance) in [
+            (
+                "append",
+                json!({"content": "line", "anchor": "original"}),
+                "Must omit anchor, oldString, old_string and newString",
+            ),
+            (
+                "appendLine",
+                json!({"content": "line\n"}),
+                "one logical line containing no CR or LF",
+            ),
+            (
+                "replace",
+                json!({"oldString": "original", "old_string": "original", "newString": "new"}),
+                "exactly one of oldString or old_string",
+            ),
+            (
+                "insertBefore",
+                json!({"content": "line"}),
+                "anchor (a non-empty exact target)",
+            ),
+            (
+                "insertAfter",
+                json!({"content": "line"}),
+                "anchor (a non-empty exact target)",
+            ),
+        ] {
+            let mut wire = line_wire(Value::Null);
+            wire["operation"] = json!(operation);
+            wire["content"] = Value::Null;
+            for (key, value) in arguments.as_object().unwrap() {
+                wire[key] = value.clone();
+            }
+            let result = execute_wire(&executor, "filesystem_edit", &wire);
+            assert!(!result.success);
+            let error = result.error.unwrap();
+            assert_eq!(error.kind, ToolErrorKind::InvalidInput);
+            assert!(error.message.contains(guidance), "{}", error.message);
+            assert!(error.message.contains("never invent or derive"));
+            assert_eq!(
+                fs::read(root.path().join("README.md")).unwrap(),
+                b"original\n"
+            );
+        }
     }
 }
