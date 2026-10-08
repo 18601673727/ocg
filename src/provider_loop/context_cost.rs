@@ -44,6 +44,7 @@ struct RequestCost {
     canonical: CanonicalCost,
     wire: WireCost,
     reported_usage: ReportedUsage,
+    provider_elapsed_ms: Option<u64>,
     outcome: &'static str,
 }
 
@@ -375,6 +376,7 @@ impl AccountingProvider<'_> {
                                 != ProviderProtocol::Anthropic,
                             ..ReportedUsage::default()
                         },
+                        provider_elapsed_ms: None,
                         outcome: "in_flight",
                     });
                     recorded = true;
@@ -386,13 +388,17 @@ impl AccountingProvider<'_> {
             }
             state.active = recorded;
         }
+        let provider_started = Instant::now();
         let future = self.inner.complete(request);
         Box::pin(async move {
             let result = future.await;
+            let provider_elapsed_ms =
+                provider_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             if recorded {
                 if let Ok(mut state) = self.costs.0.lock() {
                     state.active = false;
                     if let Some(request) = state.data.requests.last_mut() {
+                        request.provider_elapsed_ms = Some(provider_elapsed_ms);
                         match &result {
                             Ok(round) => {
                                 request.reported_usage =
