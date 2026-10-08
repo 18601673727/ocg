@@ -1,12 +1,11 @@
 "use client";
 
 import { useEffect, useId, useState } from "react";
-import { Check, ChevronDown, Circle, LockKeyhole, RefreshCw, SlidersHorizontal, X } from "lucide-react";
+import { ChevronDown, LockKeyhole, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ChatModelSelection, Model, ProfileView } from "../contracts";
 import { useI18n } from "../i18n";
 import type { ActiveExecutionTarget, ActivityStep, ExecutionPhase } from "./execution-status";
-import { currentLabel, stepLabel } from "./activity-labels";
 import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
 
@@ -23,6 +22,7 @@ function efforts(model: Model | undefined, protocol: string | null | undefined):
   return Object.keys(EFFORT_LABELS).filter(effort => supported.has(effort));
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function ModelSelector({ selection, onChange, onPreference, busy, active, activity }: {
   selection?: ChatModelSelection;
   onChange: (selection: ChatModelSelection) => void;
@@ -38,7 +38,6 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
   const baseUrl = useOcgControlUrl();
   const id = useId();
   const [expanded, setExpanded] = useState(false);
-  const [activityOpen, setActivityOpen] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const [result, setResult] = useState<{ baseUrl: string; refresh: number; view?: ProfileView; error?: string } | null>(null);
 
@@ -100,8 +99,6 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
     : busy ? t("chat.executionPending") : model ? model.label || model.id : t("chat.executionSettings");
   const subtitle = active ? [profile?.providers[active.providerKey]?.label || active.providerKey, activeEffort].join(" · ")
     : busy ? null : model ? [profile?.providers[providerKey]?.label || providerKey, availableEfforts.length ? effort ? effortLabel(effort) : t("chat.providerDefault") : t("chat.effortUnsupported")].join(" · ") : null;
-  const steps = activity?.steps.slice(-20) ?? [];
-  const now = busy && activity?.current ? activity.current : null;
   const status = busy ? t("chat.settingsLocked") : !baseUrl ? t("chat.selectorUnavailable")
     : loading ? t("chat.modelsLoading") : error ? t("chat.modelsFailed")
       : !model ? t("chat.noModels") : t("chat.settingsNextTurn");
@@ -140,35 +137,6 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
           <RefreshCw className={cn("size-3.5", loading && "animate-spin")} aria-hidden="true" />
         </button>}
       </div>
-      <div className={cn("mt-1 flex min-w-0 items-center gap-1.5 text-xs", busy ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground", !model && !busy && "sr-only")}>
-        {busy && <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-amber-500" aria-hidden="true" />}
-        <p id={id + "-status"} role="status" className="min-w-0 flex-1 truncate" title={now ? status : undefined}>
-          {now ? currentLabel(t, now) : status}
-        </p>
-        {busy && activity && <button
-          type="button"
-          aria-expanded={activityOpen}
-          aria-controls={id + "-activity"}
-          onClick={() => setActivityOpen(value => !value)}
-          className="flex shrink-0 items-center gap-0.5 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30"
-        >
-          {t("chat.activity")}
-          <ChevronDown className={cn("size-3 transition-transform", activityOpen && "rotate-180")} aria-hidden="true" />
-        </button>}
-      </div>
-      {busy && activity && activityOpen && <ol id={id + "-activity"} aria-label={t("chat.activityHistory")} className="mt-1 max-h-[min(30dvh,14rem)] space-y-0.5 overflow-y-auto overscroll-contain border-l border-border pl-2 text-[11px] text-muted-foreground">
-        {!steps.length && !now && <li>{t("chat.activityEmpty")}</li>}
-        {steps.map(step => <li key={step.id} className={cn("flex min-w-0 items-center gap-1.5", step.status === "running" && "text-foreground", step.status === "failed" && "text-destructive")}>
-          {step.status === "done" ? <Check className="size-3 shrink-0" aria-hidden="true" />
-            : step.status === "failed" ? <X className="size-3 shrink-0" aria-hidden="true" />
-              : <span className="mx-[3px] size-1.5 shrink-0 animate-pulse rounded-full bg-amber-500" aria-hidden="true" />}
-          <span className="truncate">{stepLabel(t, step)}</span>
-        </li>)}
-        {now && <li className="flex min-w-0 items-center gap-1.5">
-          <Circle className="size-3 shrink-0" aria-hidden="true" />
-          <span className="truncate">{typeof now === "string" || now.kind === "provider" ? currentLabel(t, now) : t("chat.activityNext")}</span>
-        </li>}
-      </ol>}
       {expanded && <div id={id + "-panel"} className="mt-2 max-h-[min(25dvh,12rem)] space-y-2 overflow-y-auto overscroll-contain border-t border-border pt-2 [@media(max-height:600px)]:max-h-[18dvh]">
         <fieldset disabled={disabled} aria-describedby={id + "-status"} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-12">
           <legend className="sr-only">{t("chat.executionSettings")}</legend>

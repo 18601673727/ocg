@@ -7,6 +7,7 @@ import {
   ListPlus,
   X,
   Bot,
+  Brain,
   Check,
   ChevronDown,
   Command,
@@ -33,7 +34,7 @@ import { ModelSelector } from "./model-selector";
 import type { ChatModelSelection } from "../contracts";
 import type { QueuedChatMessage } from "../types";
 import { retryInput } from "./retry";
-import { activeExecutionTarget, currentActivity, executionActivity, isExecutionActive, type ActiveExecutionTarget, type ActivityStep, type ExecutionPhase } from "./execution-status";
+import { activeExecutionTarget, currentActivity, executionActivity, executionTarget, isExecutionActive, type ActiveExecutionTarget, type ActivityStep, type ExecutionPhase } from "./execution-status";
 import { readModelPreference, writeModelPreference } from "./model-preference";
 import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./message-bounds";
 import type { JobExecution } from "../execution/domain";
@@ -336,72 +337,105 @@ function BoundedMessage({ streaming, children }: { streaming: boolean; children:
   );
 }
 
-function MessageRow({ message, onRetry, retryDisabled }: { message: ChatMessage; onRetry?: () => void; retryDisabled?: boolean }) {
+function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message: ChatMessage; toolMessages?: ChatMessage[]; onRetry?: () => void; retryDisabled?: boolean }) {
   const { t } = useI18n();
   const { isCopied, copyToClipboard } = useCopyToClipboard();
+  const [reasoningOpen, setReasoningOpen] = useState(false);
+  
   if (message.role === "tool") {
-    return (
-      <div className="flex gap-2.5">
-        <div className="w-6 shrink-0" aria-hidden="true" />
-        <div className="min-w-0 flex-1">
-          <ToolBlock message={message} />
-        </div>
-      </div>
-    );
+    return null; // Tool messages are now rendered within their parent assistant message
   }
   const isUser = message.role === "user";
   return (
-    <div className="flex gap-2.5">
-      <span
-        className={cn(
-          "flex size-6 shrink-0 items-center justify-center rounded-md border",
-          isUser
-            ? "border-border bg-muted text-muted-foreground"
-            : "border-border bg-primary text-primary-foreground",
-        )}
-        aria-hidden="true"
-      >
-        {isUser ? <User className="size-3.5" /> : <Bot className="size-3.5" />}
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="mb-1 flex items-center gap-2">
-          <span className="text-[12px] font-semibold">{isUser ? t("chat.you") : t("chat.assistant")}</span>
-          <span className="text-[11px] text-muted-foreground">{message.createdAt}</span>
-          <button
-            type="button"
-            onClick={() => copyToClipboard(message.content)}
-            disabled={message.content.length === 0}
-            className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
-            aria-label={isUser ? t("chat.copyRawUserMessage") : t("chat.copyRawAssistantMessage")}
-            title={t("chat.copyRawMessage")}
-          >
-            {isCopied ? <Check className="size-3" aria-hidden="true" /> : <Copy className="size-3" aria-hidden="true" />}
-            <span role="status">{isCopied ? t("common.copied") : t("common.copy")}</span>
-          </button>
+    <div className="flex flex-col gap-2.5">
+      <div className="flex gap-2.5">
+        <span
+          className={cn(
+            "flex size-6 shrink-0 items-center justify-center rounded-md border",
+            isUser
+              ? "border-border bg-muted text-muted-foreground"
+              : "border-border bg-primary text-primary-foreground",
+          )}
+          aria-hidden="true"
+        >
+          {isUser ? <User className="size-3.5" /> : <Bot className="size-3.5" />}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="mb-1 flex items-center gap-2">
+            <span className="text-[12px] font-semibold">{isUser ? t("chat.you") : t("chat.assistant")}</span>
+            <span className="text-[11px] text-muted-foreground">{message.createdAt}</span>
+            <button
+              type="button"
+              onClick={() => copyToClipboard(message.content)}
+              disabled={message.content.length === 0}
+              className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+              aria-label={isUser ? t("chat.copyRawUserMessage") : t("chat.copyRawAssistantMessage")}
+              title={t("chat.copyRawMessage")}
+            >
+              {isCopied ? <Check className="size-3" aria-hidden="true" /> : <Copy className="size-3" aria-hidden="true" />}
+              <span role="status">{isCopied ? t("common.copied") : t("common.copy")}</span>
+            </button>
+          </div>
+          {!isUser && message.reasoning && (
+            <Collapsible open={reasoningOpen} onOpenChange={setReasoningOpen}>
+              <div className="mb-2 overflow-hidden rounded-md border border-border bg-muted/20">
+                <CollapsibleTrigger
+                  className="flex w-full items-center gap-2 px-2.5 py-2 text-left"
+                  aria-label={t("chat.toggleThinking")}
+                >
+                  <span className="flex size-6 shrink-0 items-center justify-center rounded border border-border bg-background">
+                    <Brain className="size-3.5 text-muted-foreground" aria-hidden="true" />
+                  </span>
+                  <span className="min-w-0 flex-1 text-[12px] font-medium text-foreground">
+                    {t("chat.thinking")}
+                  </span>
+                  <ChevronDown
+                    className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", !reasoningOpen && "-rotate-90")}
+                    aria-hidden="true"
+                  />
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <div className="border-t border-border bg-background/40 px-2.5 py-2 text-[13px] leading-relaxed text-muted-foreground">
+                    <Markdown content={message.reasoning} />
+                  </div>
+                </CollapsibleContent>
+              </div>
+            </Collapsible>
+          )}
+           <div
+             className={cn(
+               "text-sm text-foreground/90",
+               isUser && "rounded-md border border-border bg-muted/30 px-3 py-2",
+               message.status === "failed" && "text-red-600 dark:text-red-400",
+               message.status === "cancelled" && "text-muted-foreground italic",
+             )}
+           >
+             <BoundedMessage streaming={message.status === "streaming"}>
+               <Markdown content={message.content} />
+               <ImageGallery images={message.images} />
+             </BoundedMessage>
+             {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
+               {chatFailureReason(t, message)}
+             </p>}
+             {onRetry && <Button className="mt-2" size="xs" variant="outline" disabled={retryDisabled} onClick={onRetry}>{t("common.retry")}</Button>}
+             {message.status !== "completed" && message.status !== "pending" && (
+               <span className="mt-1 block text-[11px] text-muted-foreground">
+                 {runtimeStateLabel(t, message.status)}
+               </span>
+             )}
+           </div>
         </div>
-         <div
-           className={cn(
-             "text-sm text-foreground/90",
-             isUser && "rounded-md border border-border bg-muted/30 px-3 py-2",
-             message.status === "failed" && "text-red-600 dark:text-red-400",
-             message.status === "cancelled" && "text-muted-foreground italic",
-           )}
-         >
-           <BoundedMessage streaming={message.status === "streaming"}>
-             <Markdown content={message.content} />
-             <ImageGallery images={message.images} />
-           </BoundedMessage>
-           {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
-             {chatFailureReason(t, message)}
-           </p>}
-           {onRetry && <Button className="mt-2" size="xs" variant="outline" disabled={retryDisabled} onClick={onRetry}>{t("common.retry")}</Button>}
-           {message.status !== "completed" && message.status !== "pending" && (
-             <span className="mt-1 block text-[11px] text-muted-foreground">
-               {runtimeStateLabel(t, message.status)}
-             </span>
-           )}
-         </div>
       </div>
+      {toolMessages && toolMessages.length > 0 && (
+        <div className="flex gap-2.5">
+          <div className="w-6 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 flex-1 space-y-2">
+            {toolMessages.map(toolMsg => (
+              <ToolBlock key={toolMsg.id} message={toolMsg} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -420,6 +454,7 @@ function Composer({
   onSelectionChange,
   onPreference,
   active,
+  historical,
   activity,
   onCancel,
 }: {
@@ -430,6 +465,7 @@ function Composer({
   onSelectionChange: (selection: ChatModelSelection) => void;
   onPreference: (selection: ChatModelSelection) => void;
   active: ActiveExecutionTarget | null;
+  historical: ActiveExecutionTarget | null;
   activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
   onCancel?: () => Promise<void>;
   draft: string;
@@ -565,7 +601,7 @@ function Composer({
           images.add(Array.from(event.target.files ?? []));
           event.target.value = "";
         }} />
-        <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active} activity={activity} />
+        <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active || historical} activity={activity} />
         <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
           <AttachmentStaging state={images} disabled={submitting || cancelling} />
           <div className="relative">
@@ -617,6 +653,22 @@ function Composer({
               onChange={(e) => {
                 setDismissedFor(null);
                 onDraftChange(e.target.value);
+              }}
+              onPaste={(e) => {
+                if (submitting || cancelling) return;
+                const items = e.clipboardData.items;
+                const imageFiles: File[] = [];
+                for (let i = 0; i < items.length; i++) {
+                  const item = items[i];
+                  if (item.type.startsWith("image/")) {
+                    const file = item.getAsFile();
+                    if (file) imageFiles.push(file);
+                  }
+                }
+                if (imageFiles.length > 0) {
+                  e.preventDefault();
+                  images.add(imageFiles);
+                }
               }}
               onKeyDown={(e) => {
                 if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
@@ -746,6 +798,8 @@ export function ChatView({
   const liveExecution = isExecutionActive(execution) && (!live?.jobId || live.jobId === execution.jobId) ? execution : null;
   const busy = Boolean(live) || liveExecution !== null;
   const active = activeExecutionTarget(liveExecution);
+  // For completed Jobs, show historical execution target (not active, so no lock icon)
+  const historical = !active && execution ? executionTarget(execution) : null;
   const activity = useMemo(() => {
     if (!liveExecution) return undefined;
     const steps = executionActivity(liveExecution);
@@ -858,12 +912,25 @@ export function ChatView({
             </div>
           ) : (
             <div ref={contentRef} className="mx-auto flex max-w-3xl flex-col gap-5 px-3 py-5 sm:px-5">
-              {messages.map((m) => (
-                <MessageRow key={m.id} message={m}
-                  onRetry={retryInput(messages, m.id) ? () => void retry(m.id) : undefined}
-                  retryDisabled={retrying || runtimeStatus.state !== "connected"}
-                />
-              ))}
+              {messages.map((m, index) => {
+                if (m.role === "tool") return null; // Skip tool messages, they'll be rendered with their parent
+                // Find tool messages that follow this assistant message
+                const toolMessages: ChatMessage[] = [];
+                if (m.role === "assistant") {
+                  let i = index + 1;
+                  while (i < messages.length && messages[i].role === "tool") {
+                    toolMessages.push(messages[i]);
+                    i++;
+                  }
+                }
+                return (
+                  <MessageRow key={m.id} message={m}
+                    toolMessages={toolMessages.length > 0 ? toolMessages : undefined}
+                    onRetry={retryInput(messages, m.id) ? () => void retry(m.id) : undefined}
+                    retryDisabled={retrying || runtimeStatus.state !== "connected"}
+                  />
+                );
+              })}
               {retryError && <p role="alert" className="text-sm text-destructive">{retryError}</p>}
               {composerSurface}
             </div>
@@ -897,6 +964,7 @@ export function ChatView({
         onSelectionChange={setSelection}
         onPreference={next => writeModelPreference(session.projectId, session.sessionId ?? session.id, next)}
         active={active}
+        historical={historical}
         activity={activity}
         onCancel={onCancel}
         draft={draft}

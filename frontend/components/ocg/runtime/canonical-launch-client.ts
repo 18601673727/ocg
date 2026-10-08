@@ -720,7 +720,12 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         this.emit({ type: "conversation.message-delta", sessionId, messageId: assistantId, delta: record["delta"] as string });
         return;
       }
-      if (typeof record["reasoning"] === "string") return;
+      if (typeof record["reasoning"] === "string") {
+        const current = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
+        if (!current || current.status !== "streaming") return;
+        this.emit({ type: "conversation.message-reasoning-delta", sessionId, messageId: assistantId, delta: record["reasoning"] as string });
+        return;
+      }
       if (record["round_begin"] === true) {
         const current = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
         const boundary = {

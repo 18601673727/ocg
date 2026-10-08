@@ -177,6 +177,8 @@ export const en = {
   "chat.activityProviderFailed": "Provider response failed",
   "chat.expandMessage": "Expand",
   "chat.collapseMessage": "Collapse",
+  "chat.thinking": "Thinking",
+  "chat.toggleThinking": "Toggle thinking content",
 
   "chat.projectMissing": "This conversation is not associated with a project. Select a project and start a new conversation.",
   "chat.streamClosed": "The connection to the conversation stream closed. Refresh to load its latest recorded state.",
@@ -1282,6 +1284,8 @@ export const zh: Dictionary = {
   "chat.activityProviderFailed": "Provider 响应失败",
   "chat.expandMessage": "展开",
   "chat.collapseMessage": "收起",
+  "chat.thinking": "思考过程",
+  "chat.toggleThinking": "切换思考内容显示",
 
   "chat.projectMissing": "此对话未关联项目。请选择项目并新建对话。",
   "chat.streamClosed": "对话流连接已关闭。请刷新以加载最新记录。",

@@ -63,6 +63,10 @@ export type RuntimeEnvelopePayloads = {
     /** Optional monotonic delta sequence within the turn. */
     deltaSequence?: number;
   };
+  "conversation.message-reasoning-delta": {
+    messageId: string;
+    delta: string;
+  };
   /**
    * The committed presentation of a streaming assistant message ends here.
    * Content and images past these lengths are the provisional output of a
@@ -102,6 +106,7 @@ export const RUNTIME_EVENT_TYPES: readonly RuntimeEventType[] = [
   "conversation.session-updated",
   "conversation.message-started",
   "conversation.message-delta",
+  "conversation.message-reasoning-delta",
   "conversation.message-round-committed",
   "conversation.message-completed",
   "activity.updated",
@@ -270,6 +275,8 @@ export function envelopeFromRuntimeEvent(
       return { ...base, type: event.type, payload: { messageId: event.messageId, image: event.image } };
     case "conversation.message-delta":
       return { ...base, type: event.type, payload: { messageId: event.messageId, delta: event.delta } };
+    case "conversation.message-reasoning-delta":
+      return { ...base, type: event.type, payload: { messageId: event.messageId, delta: event.delta } };
     case "conversation.message-round-committed":
       return {
         ...base,
@@ -417,6 +424,8 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
       return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, image: envelope.payload.image };
     case "conversation.message-delta":
       return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, delta: envelope.payload.delta };
+    case "conversation.message-reasoning-delta":
+      return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, delta: envelope.payload.delta };
     case "conversation.message-round-committed":
       return {
         type: envelope.type,
@@ -530,6 +539,11 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       if (payload.deltaSequence !== undefined && !isNonNegativeInteger(payload.deltaSequence)) {
         return "deltaSequence must be a non-negative integer when present.";
       }
+      return null;
+    }
+    case "conversation.message-reasoning-delta": {
+      if (!isNonEmptyString(payload.messageId)) return "messageId is required.";
+      if (typeof payload.delta !== "string") return "delta must be a string.";
       return null;
     }
     case "conversation.message-round-committed": {

@@ -71,12 +71,14 @@ function parseRequest(id: string, request: string): ParsedRequest {
 }
 
 /**
- * The frozen Provider × Model × Effort of the Job's current generation. A
- * retried Job republishes the same target, so an earlier generation is the
+ * The frozen Provider × Model × Effort of a Job's execution target.
+ * For active Jobs, returns the current generation's target.
+ * For terminal Jobs, returns the authoritative generation's target.
+ * A retried Job republishes the same target, so an earlier generation is the
  * truthful answer until the replacement's dispatch is visible.
  */
-export function activeExecutionTarget(execution: JobExecution | null | undefined): ActiveExecutionTarget | null {
-  if (!isExecutionActive(execution)) return null;
+export function executionTarget(execution: JobExecution | null | undefined): ActiveExecutionTarget | null {
+  if (!execution) return null;
   const intents = execution.dispatchIntents
     .filter(intent => intent.providerKey && intent.model)
     .sort((left, right) => right.generation - left.generation || right.createdAt - left.createdAt);
@@ -91,6 +93,16 @@ export function activeExecutionTarget(execution: JobExecution | null | undefined
     upstreamModelId: intent.upstreamModelId,
     effort: request?.provider ? request.effort : null,
   };
+}
+
+/**
+ * The frozen Provider × Model × Effort of the Job's current generation. A
+ * retried Job republishes the same target, so an earlier generation is the
+ * truthful answer until the replacement's dispatch is visible.
+ */
+export function activeExecutionTarget(execution: JobExecution | null | undefined): ActiveExecutionTarget | null {
+  if (!isExecutionActive(execution)) return null;
+  return executionTarget(execution);
 }
 
 function basename(path: unknown): string {

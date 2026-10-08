@@ -83,6 +83,8 @@ export type ChatMessage = {
   optimistic?: boolean;
   role: MessageRole;
   content: string;
+  /** Extended thinking content from models that support reasoning. */
+  reasoning?: string;
   failureReason?: string;
   failureCode?: "project-missing" | "configuration-required" | "stream-closed";
   createdAt: string;
@@ -134,6 +136,7 @@ export type OcgRuntimeEvent =
   | { type: "conversation.session-updated"; session: ChatSession }
   | { type: "conversation.message-started"; sessionId: string; message: ChatMessage }
   | { type: "conversation.message-delta"; sessionId: string; messageId: string; delta: string }
+  | { type: "conversation.message-reasoning-delta"; sessionId: string; messageId: string; delta: string }
   | { type: "conversation.message-round-committed"; sessionId: string; messageId: string; committedContentLength: number; committedImageCount: number }
   | { type: "conversation.message-completed"; sessionId: string; message: ChatMessage }
   | { type: "activity.updated"; sessionId: string; messageId: string; activity: CallActivity }

@@ -613,6 +613,24 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
       return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
     }
 
+    case "conversation.message-reasoning-delta": {
+      if (!sessionExists(snapshot, sessionId)) {
+        return { snapshot, diagnostics: [diag("unknown-session", `Reasoning delta for unknown session "${sessionId ?? ""}".`, { sessionId })] };
+      }
+      const messages = snapshot.messagesBySession[sessionId] ?? [];
+      const index = messages.findIndex((item) => item.id === envelope.payload.messageId);
+      if (index < 0) {
+        return { snapshot, diagnostics: [diag("unknown-entity", `Reasoning delta for unknown message "${envelope.payload.messageId}".`, { sessionId }, "info")] };
+      }
+      const current = messages[index];
+      if (current.status === "cancelled" || current.status === "completed" || current.status === "failed") {
+        return { snapshot, diagnostics: [diag("unknown-entity", `Reasoning delta ignored for terminal message "${current.id}" (${current.status}).`, { sessionId }, "info")] };
+      }
+      const next = [...messages];
+      next[index] = { ...current, reasoning: (current.reasoning ?? "") + envelope.payload.delta };
+      return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
+    }
+
     case "conversation.message-round-committed": {
       if (!sessionExists(snapshot, sessionId)) {
         return { snapshot, diagnostics: [diag("unknown-session", `Round boundary for unknown session "${sessionId ?? ""}".`, { sessionId })] };
