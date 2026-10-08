@@ -455,6 +455,8 @@ pub struct ChatMessageView {
     pub role: ChatMessageRole,
     pub state: MessageLifecycle,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     #[serde(default)]
     pub failure_reason: Option<String>,
     #[serde(default)]

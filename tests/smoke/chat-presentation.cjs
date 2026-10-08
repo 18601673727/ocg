@@ -117,8 +117,48 @@ function longMessagesFold() {
 }
 
 function retryClearsPresentation() {
-  const failed = { id: "m", role: "assistant", commandId: "c", jobId: "job-1", createdAt: "t", content: "old", images: [{ id: "i" }], failureReason: "boom", failureCode: "stream-closed", status: "failed" };
+  const failed = { id: "m", role: "assistant", commandId: "c", jobId: "job-1", createdAt: "t", content: "old", reasoning: "old thought", images: [{ id: "i" }], failureReason: "boom", failureCode: "stream-closed", status: "failed" };
   assert.deepEqual(retryPresentation(failed), { id: "m", role: "assistant", commandId: "c", jobId: "job-1", createdAt: "t", content: "", status: "streaming" });
+}
+
+function reasoningSurvivesHistoryAndRoundReset() {
+  const { applyEnvelopeToSnapshot } = require(path.join(frontend, "components/ocg/runtime/reconciler.ts"));
+  const { RuntimeEnvelopeFactory } = require(path.join(frontend, "components/ocg/runtime/runtime-envelope.ts"));
+  const { emptyRuntimeSnapshot } = require(path.join(frontend, "components/ocg/runtime/runtime-snapshot.ts"));
+  const session = { id: "s", sessionId: "chat-1", projectId: "p", title: "", workType: "coding", updatedAt: "now" };
+  const factory = new RuntimeEnvelopeFactory("reasoning-history", 1);
+  const scope = { projectId: "p", sessionId: "s" };
+  let snapshot = emptyRuntimeSnapshot("normal-chat");
+  const apply = (type, payload) => {
+    const applied = applyEnvelopeToSnapshot(snapshot, factory.envelope(type, payload, scope));
+    assert.deepEqual(applied.diagnostics, []);
+    snapshot = applied.snapshot;
+  };
+  apply("conversation.session-created", { session });
+  apply("conversation.history-loaded", {
+    messages: [{
+      id: "a", role: "assistant", content: "Answer", reasoning: "Think first", createdAt: "t", status: "completed",
+    }],
+  });
+  assert.equal(snapshot.messagesBySession.s[0].reasoning, "Think first");
+  assert.equal(snapshot.messagesBySession.s[0].content, "Answer");
+
+  apply("conversation.message-started", {
+    message: { id: "b", role: "assistant", content: "", reasoning: "kept", createdAt: "t", status: "streaming" },
+  });
+  apply("conversation.message-round-committed", {
+    messageId: "b", committedContentLength: 0, committedImageCount: 0, committedReasoningLength: "kept".length,
+  });
+  apply("conversation.message-reasoning-delta", { messageId: "b", delta: " dropped" });
+  apply("conversation.message-delta", { messageId: "b", delta: "provisional" });
+  apply("conversation.message-round-committed", {
+    messageId: "b", committedContentLength: 0, committedImageCount: 0, committedReasoningLength: "kept".length,
+  });
+  const reset = snapshot.messagesBySession.s.find(message => message.id === "b");
+  assert.equal(reset.reasoning, "kept");
+  assert.equal(reset.content, "");
+  apply("conversation.message-reasoning-delta", { messageId: "b", delta: " more" });
+  assert.equal(snapshot.messagesBySession.s.find(message => message.id === "b").reasoning, "kept more");
 }
 
 function chatSurfaceRendersWithoutRuntimeBanner() {
@@ -379,7 +419,7 @@ function conversationInspectorRemainsStableDuringPolling() {
   assert.ok(refreshing.includes("disabled"), "refresh button disabled while reading");
 }
 
-for (const check of [conversationUsageGateChecksCanonicalIdentity, executionInspectorIsCanonicalFirst, conversationUsageRefreshesWhileLive, conversationInspectorRemainsStableDuringPolling, activeTargetBeatsComposer, preferenceIsScopedPerChat, observableActivityDrivesStatus, longMessagesFold, retryClearsPresentation, chatSurfaceRendersWithoutRuntimeBanner]) {
+for (const check of [conversationUsageGateChecksCanonicalIdentity, executionInspectorIsCanonicalFirst, conversationUsageRefreshesWhileLive, conversationInspectorRemainsStableDuringPolling, activeTargetBeatsComposer, preferenceIsScopedPerChat, observableActivityDrivesStatus, longMessagesFold, retryClearsPresentation, reasoningSurvivesHistoryAndRoundReset, chatSurfaceRendersWithoutRuntimeBanner]) {
   check();
 }
 process.stdout.write("chat presentation contract ok\n");

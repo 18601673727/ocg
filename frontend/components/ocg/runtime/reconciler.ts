@@ -649,11 +649,21 @@ export function applyEnvelopeToSnapshot(snapshot: RuntimeSnapshot, envelope: Any
       // survive, so a replacement attempt continues the same assistant message.
       const content = current.content.slice(0, Math.max(0, envelope.payload.committedContentLength));
       const images = (current.images ?? []).slice(0, Math.max(0, envelope.payload.committedImageCount));
-      if (content === current.content && images.length === (current.images?.length ?? 0)) {
+      const reasoning = (current.reasoning ?? "").slice(0, Math.max(0, envelope.payload.committedReasoningLength));
+      if (
+        content === current.content &&
+        images.length === (current.images?.length ?? 0) &&
+        reasoning === (current.reasoning ?? "")
+      ) {
         return { snapshot, diagnostics: [] };
       }
       const next = [...messages];
-      next[index] = { ...current, content, ...(current.images ? { images } : {}) };
+      next[index] = {
+        ...current,
+        content,
+        ...(current.images ? { images } : {}),
+        ...(current.reasoning !== undefined ? { reasoning } : {}),
+      };
       return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
     }
 

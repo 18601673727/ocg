@@ -16,6 +16,8 @@ pub const MODEL: &str = "mock-model";
 #[derive(Clone)]
 pub enum Reply {
     Text(Vec<String>),
+    /// Reasoning deltas followed by the user-visible answer.
+    Reasoning { reasoning: Vec<String>, text: Vec<String> },
     NativePwd,
 }
 
@@ -168,6 +170,15 @@ fn serve(stream: TcpStream, reply: &Reply, deadline: Instant) -> Result<()> {
             Reply::Text(parts) => parts
                 .iter()
                 .map(|part| chunk(json!({"content": part}), Value::Null))
+                .chain([chunk(json!({}), json!("stop"))])
+                .collect::<Vec<_>>(),
+            Reply::Reasoning { reasoning, text } => reasoning
+                .iter()
+                .map(|part| chunk(json!({"reasoning_content": part}), Value::Null))
+                .chain(
+                    text.iter()
+                        .map(|part| chunk(json!({"content": part}), Value::Null)),
+                )
                 .chain([chunk(json!({}), json!("stop"))])
                 .collect::<Vec<_>>(),
             Reply::NativePwd if has_tool => vec![

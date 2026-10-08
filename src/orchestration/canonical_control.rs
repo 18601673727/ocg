@@ -1384,11 +1384,21 @@ impl CanonicalControlService {
                         .map_err(|error| invalid(error.to_string()))?,
                     content: message
                         .blocks
-                        .into_iter()
+                        .iter()
                         .filter(|block| block.kind == MessageBlockKind::Markdown)
-                        .filter_map(|block| block.content)
+                        .filter_map(|block| block.content.clone())
                         .collect::<Vec<_>>()
                         .join("\n\n"),
+                    reasoning: {
+                        let reasoning = message
+                            .blocks
+                            .iter()
+                            .filter(|block| block.kind == MessageBlockKind::Reasoning)
+                            .filter_map(|block| block.content.as_deref())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        (!reasoning.is_empty()).then_some(reasoning)
+                    },
                     created_at: message.created_at,
                     updated_at: message.updated_at,
                     attempt_state: origin.attempt_state.clone(),

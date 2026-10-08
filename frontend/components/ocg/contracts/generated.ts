@@ -157,7 +157,7 @@ export type ChatImageUploadRequest = { project_id: string, name: string, data_ur
 export type ChatMessageRole = "user" | "assistant";
 
 
-export type ChatMessageView = { message_id: string, command_id: string, role: ChatMessageRole, state: MessageLifecycle, content: string, failure_reason: string | null, images: Array<ChatImage>, job_id: string | null, created_at: string, updated_at: string, attempt_state: string, replay_job_id: string | null, };
+export type ChatMessageView = { message_id: string, command_id: string, role: ChatMessageRole, state: MessageLifecycle, content: string, reasoning?: string | null, failure_reason: string | null, images: Array<ChatImage>, job_id: string | null, created_at: string, updated_at: string, attempt_state: string, replay_job_id: string | null, };
 
 
 export type ChatMessagesResponse = { api_version: CanonicalApiVersion, project_id: string, conversation: ChatConversationView, messages: Array<ChatMessageView>, };
@@ -386,7 +386,7 @@ export type Message = { id: EntityId, project_scope: ProjectScope, conversation_
 export type MessageBlock = { kind: MessageBlockKind, content: string | null, entity_ref: EntityRef | null, artifact_ref: EntityRef | null, changeset_ref: EntityRef | null, projection_kind: string | null, raw: JsonValue | null, };
 
 
-export type MessageBlockKind = "markdown" | "image" | "entity_ref" | "artifact_ref" | "diff_ref" | "status_projection" | "unknown";
+export type MessageBlockKind = "markdown" | "reasoning" | "image" | "entity_ref" | "artifact_ref" | "diff_ref" | "status_projection" | "unknown";
 
 
 export type MessageLifecycle = "pending" | "streaming" | "complete" | "failed" | "deleted";

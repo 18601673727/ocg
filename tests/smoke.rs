@@ -78,6 +78,44 @@ fn failed_chat_retry_reexecutes_the_same_job_and_turn() -> Result<()> {
     assert_eq!(assistant["state"], "complete");
     assert_eq!(assistant["content"], "Review completed");
     assert_eq!(assistant["attempt_state"], "completed");
+    assert!(assistant.get("reasoning").is_none());
+    smoke.finish()
+}
+
+#[test]
+fn chat_reasoning_survives_the_stream_and_history() -> Result<()> {
+    let mut smoke = SmokeHarness::start(Reply::Reasoning {
+        reasoning: vec!["Think ".into(), "first".into()],
+        text: vec!["Answer".into()],
+    })?;
+    smoke.configure_provider()?;
+    let project = smoke.add_project("reasoning-project")?;
+    let project_id = string(&project, "project_id")?;
+    let session_id = smoke.create_untitled_session(&project_id)?;
+    let chat = smoke.send_chat(&project_id, &session_id, "Explain the change")?;
+    assert_eq!(smoke.consume_chat(&chat)?, "Answer");
+    let reasoning = smoke
+        .stream_events()
+        .iter()
+        .filter_map(|event| event.get("reasoning").and_then(|value| value.as_str()))
+        .collect::<String>();
+    assert_eq!(reasoning, "Think first");
+    smoke.assert_terminal_execution(&chat, "completed")?;
+    let messages = smoke.json(
+        "GET",
+        &format!("/api/v1/canonical/chat/messages?project_id={project_id}&session_id={session_id}"),
+        None,
+    )?;
+    let assistant = array(&messages, "messages")?
+        .iter()
+        .find(|item| item["role"] == "assistant")
+        .cloned()
+        .ok_or("assistant missing")?;
+    assert_eq!(assistant["content"], "Answer");
+    assert_eq!(assistant["reasoning"], "Think first");
+    smoke.provider_reply(Reply::Text(vec!["Next".into()]))?;
+    let follow_up = smoke.send_chat(&project_id, &session_id, "Continue")?;
+    assert_eq!(smoke.consume_chat(&follow_up)?, "Next");
     smoke.finish()
 }
 

@@ -93,7 +93,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
    * than taking a new one, which is what drops the failed attempt's provisional
    * tail instead of the rounds already committed ahead of it.
    */
-  private readonly roundCommits = new Map<string, { committedContentLength: number; committedImageCount: number }>();
+  private readonly roundCommits = new Map<string, { committedContentLength: number; committedImageCount: number; committedReasoningLength: number }>();
   private readonly sessionProjects = new Map<string, string>();
   private readonly projectHydrations = new Map<string, Promise<void>>();
   private readonly projectJobWatermarks = new Map<string, Map<string, string>>();
@@ -337,7 +337,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.emit({ type: "conversation.session-created", session }, { projectId });
     const messages: ChatMessage[] = history.messages.filter((message) => message.state !== "deleted").map((message) => ({
       id: message.message_id, commandId: message.command_id, jobId: message.job_id ?? undefined, role: message.role,
-      images: message.images, content: message.content, failureReason: message.failure_reason ?? undefined, createdAt: chatTimestamp(message.created_at),
+      images: message.images, content: message.content, ...(message.reasoning ? { reasoning: message.reasoning } : {}), failureReason: message.failure_reason ?? undefined, createdAt: chatTimestamp(message.created_at),
       status: message.state === "complete" ? "completed" :
         message.state === "failed" && message.attempt_state === "cancelled" ? "cancelled" :
         message.state === "failed" ? "failed" : "pending",
@@ -731,6 +731,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         const boundary = {
           committedContentLength: current?.content.length ?? 0,
           committedImageCount: current?.images?.length ?? 0,
+          committedReasoningLength: current?.reasoning?.length ?? 0,
         };
         this.roundCommits.set(sessionId, boundary);
         this.emit({ type: "conversation.message-round-committed", sessionId, messageId: assistantId, ...boundary });

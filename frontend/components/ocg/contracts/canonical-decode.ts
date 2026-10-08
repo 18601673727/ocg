@@ -149,6 +149,8 @@ const chatMessageView: Decoder<ChatMessageView> = (input, path) => {
   if (!images.ok) return images;
   const content = req(rec.value, "content", string, path);
   if (!content.ok) return content;
+  const reasoning = opt(rec.value, "reasoning", nullable(string), path);
+  if (!reasoning.ok) return reasoning;
   const failure_reason = opt(rec.value, "failure_reason", nullable(string), path);
   if (!failure_reason.ok) return failure_reason;
   const job_id = opt(rec.value, "job_id", nullable(identity), path);
@@ -167,6 +169,7 @@ const chatMessageView: Decoder<ChatMessageView> = (input, path) => {
     role: role.value,
     state: state.value,
     content: content.value,
+    ...(reasoning.value ? { reasoning: reasoning.value } : {}),
     images: images.value ?? [],
     failure_reason: failure_reason.value ?? null,
     job_id: job_id.value ?? null,

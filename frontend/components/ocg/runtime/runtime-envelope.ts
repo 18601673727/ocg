@@ -77,6 +77,7 @@ export type RuntimeEnvelopePayloads = {
     messageId: string;
     committedContentLength: number;
     committedImageCount: number;
+    committedReasoningLength: number;
   };
   "conversation.queue-updated": { queue: import("../types").QueuedChatMessage[]; paused: boolean };
   "conversation.message-completed": { message: ChatMessage };
@@ -285,6 +286,7 @@ export function envelopeFromRuntimeEvent(
           messageId: event.messageId,
           committedContentLength: event.committedContentLength,
           committedImageCount: event.committedImageCount,
+          committedReasoningLength: event.committedReasoningLength,
         },
       };
     case "conversation.message-completed":
@@ -433,6 +435,7 @@ export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
         messageId: envelope.payload.messageId,
         committedContentLength: envelope.payload.committedContentLength,
         committedImageCount: envelope.payload.committedImageCount,
+        committedReasoningLength: envelope.payload.committedReasoningLength,
       };
     case "conversation.message-completed":
       return { type: envelope.type, sessionId, message: envelope.payload.message };
@@ -550,6 +553,7 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
       if (!isNonEmptyString(payload.messageId)) return "messageId is required.";
       if (!isNonNegativeInteger(payload.committedContentLength)) return "committedContentLength must be a non-negative integer.";
       if (!isNonNegativeInteger(payload.committedImageCount)) return "committedImageCount must be a non-negative integer.";
+      if (!isNonNegativeInteger(payload.committedReasoningLength)) return "committedReasoningLength must be a non-negative integer.";
       return null;
     }
     case "activity.updated": {

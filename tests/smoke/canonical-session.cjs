@@ -59,11 +59,14 @@ async function main() {
     // HA-NET-01 boundaries on the Retry stream start from the cleared Message.
     const deliver = record => streams[0].onmessage({ data: JSON.stringify(record) });
     deliver({ round_begin: true });
+    deliver({ reasoning: "old thought" });
     deliver({ delta: "provisional" });
     deliver({ round_reset: true });
+    deliver({ reasoning: "new thought" });
     deliver({ delta: "replacement" });
     const streamed = client.getSnapshot().messagesBySession[session.id].find(item => item.id === failed.id);
     assert.equal(streamed.content, "replacement");
+    assert.equal(streamed.reasoning, "new thought");
     assert.equal(streamed.status, "streaming");
     process.stdout.write(JSON.stringify({ job_id: streams[0].url.searchParams.get("job_id") }));
     return;

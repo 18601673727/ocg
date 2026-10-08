@@ -219,6 +219,8 @@ pub struct CapabilityGrant {
 #[serde(rename_all = "snake_case")]
 pub enum MessageBlockKind {
     Markdown,
+    /// Model thinking, distinct from the user-visible markdown answer.
+    Reasoning,
     Image,
     EntityRef,
     ArtifactRef,

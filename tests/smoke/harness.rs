@@ -632,6 +632,10 @@ impl SmokeHarness {
         result
     }
 
+    pub fn stream_events(&self) -> &[Value] {
+        &self.events
+    }
+
     pub fn assert_terminal_execution(&mut self, chat: &Chat, expected: &str) -> Result<Value> {
         let deadline = self.operation_deadline(self.timeouts.execution);
         loop {

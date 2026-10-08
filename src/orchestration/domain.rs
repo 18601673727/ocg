@@ -1463,13 +1463,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             } else {
                 "assistant"
             };
-            let content = message
-                .blocks
-                .iter()
-                .filter(|block| block.kind == MessageBlockKind::Markdown)
-                .filter_map(|block| block.content.as_deref())
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            let content = chat_block_text(&message, MessageBlockKind::Markdown);
+            let reasoning = chat_block_text(&message, MessageBlockKind::Reasoning);
             let mut parts = vec![serde_json::json!({"type": "text", "text": content})];
             for block in message
                 .blocks
@@ -1495,7 +1490,11 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             } else {
                 serde_json::Value::Array(parts)
             };
-            history.push(serde_json::json!({"role": role, "content": content}));
+            let mut wire = serde_json::json!({"role": role, "content": content});
+            if role == "assistant" && !reasoning.is_empty() {
+                wire["reasoning_content"] = serde_json::Value::String(reasoning);
+            }
+            history.push(wire);
         }
         bump_conversation(&transaction, conversation.id.as_str())?;
         transaction.commit().map_err(sql)?;
@@ -7403,6 +7402,23 @@ fn chat_text_block(content: &str) -> MessageBlock {
     }
 }
 
+fn chat_reasoning_block(content: &str) -> MessageBlock {
+    MessageBlock {
+        kind: MessageBlockKind::Reasoning,
+        ..chat_text_block(content)
+    }
+}
+
+fn chat_block_text(message: &Message, kind: MessageBlockKind) -> String {
+    message
+        .blocks
+        .iter()
+        .filter(|block| block.kind == kind)
+        .filter_map(|block| block.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn chat_image_block(image: &crate::contracts::ChatImage) -> MessageBlock {
     MessageBlock {
         kind: MessageBlockKind::Image,
@@ -7457,6 +7473,17 @@ fn update_chat_message(
     state: MessageLifecycle,
     content: Option<&str>,
 ) -> Result<()> {
+    update_chat_message_with_reasoning(transaction, attempt_id, role, state, content, None)
+}
+
+fn update_chat_message_with_reasoning(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    role: &str,
+    state: MessageLifecycle,
+    content: Option<&str>,
+    reasoning: Option<&str>,
+) -> Result<()> {
     let record: Option<String> = transaction
         .query_row(
             "SELECT record FROM domain_messages WHERE attempt_id=?1 AND role=?2",
@@ -7472,8 +7499,8 @@ fn update_chat_message(
     if message.state == state {
         return Ok(());
     }
-    // An accepted user remains a fact even when its Attempt fails. Assistant
-    // placeholders never retain streaming text or hidden reasoning.
+    // An accepted user remains a fact even when its Attempt fails. A failed or
+    // discarded assistant placeholder keeps neither streaming text nor reasoning.
     if role == "user"
         && state == MessageLifecycle::Failed
         && matches!(
@@ -7486,6 +7513,11 @@ fn update_chat_message(
     message.state = message.state.transition(state)?;
     if let Some(content) = content {
         message.blocks = vec![chat_text_block(content)];
+        if role == "assistant" {
+            if let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) {
+                message.blocks.push(chat_reasoning_block(reasoning));
+            }
+        }
     }
     message.revision = message
         .revision
@@ -7525,12 +7557,14 @@ fn settle_chat_turn(
             .get("content")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| invalid("completed chat Call has no final content"))?;
-        update_chat_message(
+        let reasoning = response.get("reasoning").and_then(serde_json::Value::as_str);
+        update_chat_message_with_reasoning(
             transaction,
             turn,
             "assistant",
             MessageLifecycle::Complete,
             Some(content),
+            reasoning,
         )?;
         if let Some(images) = response.get("images").and_then(serde_json::Value::as_array) {
             let (root, project_id, record): (String, String, String) = transaction.query_row(
@@ -8410,6 +8444,114 @@ mod chat_retry_tests {
         assert_eq!(produced_by(&settled), retry.attempt.id);
         assert_eq!(origin.attempt_state, "failed");
         assert_eq!(domain.attempts_for_job(&job.id).expect("attempts").len(), 2);
+    }
+
+    #[test]
+    fn completed_chat_turn_keeps_reasoning_on_the_message_and_the_next_request() {
+        let directory = tempfile::tempdir().expect("temp");
+        let mut domain = DomainRepository::open(directory.path()).expect("domain");
+        let project = domain.ensure_project(directory.path()).expect("project");
+        let job = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("chat".into()),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("job");
+        domain.set_job_eligible(&job.id).expect("eligible");
+        let request = crate::contracts::JobLaunchRequest {
+            command_id: "command-reasoning".into(),
+            draft_id: "draft-reasoning".into(),
+            project_id: project.id.clone(),
+            session_id: "session-reasoning".into(),
+            objective: "explain".into(),
+            success_criteria: None,
+            constraints: None,
+            hard_budget_micros: 0,
+            resource_commitment: None,
+        };
+        let (dispatched, executor) = domain
+            .dispatch_job(&job.id, "provider")
+            .expect("dispatch");
+        domain
+            .prepare_chat_turn(&request, "hash", &dispatched, "explain")
+            .expect("turn");
+        domain.accept_chat_turn(&dispatched.id).expect("accept");
+        let call = domain
+            .create_call(
+                &dispatched.id,
+                Some(&executor.id),
+                dispatched.generation,
+                false,
+                "{\"executor_transport\":\"provider\"}",
+            )
+            .expect("call");
+        domain
+            .start_call(&call.id, &dispatched.id, dispatched.generation)
+            .expect("start");
+        domain
+            .finish_call(
+                &call.id,
+                &dispatched.id,
+                dispatched.generation,
+                &serde_json::json!({
+                    "content": "Answer",
+                    "reasoning": "Think first",
+                    "images": [],
+                    "rounds": 1
+                })
+                .to_string(),
+            )
+            .expect("finish call");
+        domain.finish_attempt(&dispatched.id, true).expect("finish");
+
+        let (message, _) = assistant(&domain, &project.id, "session-reasoning");
+        assert_eq!(message.state, MessageLifecycle::Complete);
+        let markdown = message
+            .blocks
+            .iter()
+            .find(|block| block.kind == MessageBlockKind::Markdown)
+            .and_then(|block| block.content.as_deref());
+        let reasoning = message
+            .blocks
+            .iter()
+            .find(|block| block.kind == MessageBlockKind::Reasoning)
+            .and_then(|block| block.content.as_deref());
+        assert_eq!(markdown, Some("Answer"));
+        assert_eq!(reasoning, Some("Think first"));
+
+        let next_job = domain
+            .create_job(
+                &project.id,
+                JobSpec {
+                    objective: Some("follow".into()),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("next job");
+        domain.set_job_eligible(&next_job.id).expect("eligible");
+        let next = domain.create_attempt(&next_job.id).expect("next attempt");
+        let history = domain
+            .prepare_chat_turn(
+                &crate::contracts::JobLaunchRequest {
+                    command_id: "command-next".into(),
+                    draft_id: "draft-next".into(),
+                    session_id: "session-reasoning".into(),
+                    objective: "continue".into(),
+                    ..request
+                },
+                "hash-next",
+                &next,
+                "continue",
+            )
+            .expect("next turn");
+        let prior = history
+            .iter()
+            .find(|message| message["role"] == "assistant" && message["content"] == "Answer")
+            .expect("prior assistant");
+        assert_eq!(prior["reasoning_content"], "Think first");
     }
 
     #[test]
