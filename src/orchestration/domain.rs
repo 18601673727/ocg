@@ -4265,13 +4265,14 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         let timestamp = now();
         transaction
             .execute(
-                "UPDATE domain_jobs SET state='eligible',generation=generation+1,authoritative_attempt_id=NULL,automatic_admission=0,admission_selection=NULL,placement_evidence=NULL,termination_reason=NULL,updated_at=?2 WHERE id=?1 AND authoritative_attempt_id=?3",
+                "UPDATE domain_jobs SET state='pending',generation=generation+1,authoritative_attempt_id=NULL,automatic_admission=0,admission_selection=NULL,placement_evidence=NULL,termination_reason=NULL,updated_at=?2 WHERE id=?1 AND authoritative_attempt_id=?3",
                 params![job_id, timestamp, expected_attempt],
             )
             .map_err(sql)?;
         let job =
             read_job(&transaction, job_id)?.ok_or_else(|| invalid("released Job disappeared"))?;
         emit_job(&transaction, EventKind::JobUpdated, &job, None)?;
+        refresh_job_readiness_in(&transaction, job_id, None)?;
         refresh_dependents_in(&transaction, job_id, None)?;
         transaction.commit().map_err(sql)
     }
