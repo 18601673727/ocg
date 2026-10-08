@@ -23,7 +23,7 @@ interface Connected {
  * writing anything, and saving models keeps the current default model. The API
  * key lives only in the uncontrolled input and is cleared after each attempt.
  */
-export function AddSubscriptionPanel() {
+export function AddSubscriptionPanel({ onSaved }: { onSaved?: () => void }) {
   const { t } = useI18n();
   const controlUrl = useOcgControlUrl();
   const apiKeyInput = useRef<HTMLInputElement>(null);
@@ -80,12 +80,13 @@ export function AddSubscriptionPanel() {
       setSelected(new Set());
       setName("");
       setEndpoint("");
+      onSaved?.();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : t("setup.saveFailed"));
     } finally {
       setBusy(null);
     }
-  }, [connected, setupClient, selected, t]);
+  }, [connected, onSaved, setupClient, selected, t]);
 
   function toggle(key: string) {
     setSelected((current) => {

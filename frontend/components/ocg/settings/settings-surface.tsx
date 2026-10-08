@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { ArrowRight, RotateCcw, Settings2, ShieldCheck } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
@@ -153,6 +153,10 @@ export function SettingsSurface({ snapshot }: { snapshot: RuntimeSnapshot }) {
   const sections = selectSettingsSections(state);
   const canonical = snapshot.authority === "canonical";
   const appearanceSection = sections.find((section) => section.id === "appearance");
+  const [providerProfileRefresh, setProviderProfileRefresh] = useState(0);
+  const refreshProviderProfile = useCallback(() => {
+    setProviderProfileRefresh((current) => current + 1);
+  }, []);
 
   return (
     <PageSurface className="mx-auto w-full max-w-5xl pb-[max(2rem,env(safe-area-inset-bottom))]">
@@ -177,8 +181,8 @@ export function SettingsSurface({ snapshot }: { snapshot: RuntimeSnapshot }) {
           <section aria-labelledby="settings-providers">
             <h2 id="settings-providers" tabIndex={-1} className="mb-3 scroll-mt-4 text-base font-semibold">{t("settings.providerModels")}</h2>
             {canonical ? <div className="space-y-4">
-              <AddSubscriptionPanel />
-              <ProviderSyncPanel />
+              <AddSubscriptionPanel onSaved={refreshProviderProfile} />
+              <ProviderSyncPanel profileRefresh={providerProfileRefresh} />
               <div className="rounded-lg border border-border p-4">
                 <p className="text-sm leading-6 text-muted-foreground">{t("settings.providerModelsDesc")}</p>
                 <Button className="mt-3 h-auto min-h-11 max-w-full whitespace-normal rounded-md py-2 tracking-normal normal-case" size="sm" onClick={() => router.push(RECONFIGURE_PATH)}>{t("settings.configure")}<ArrowRight className="size-4" /></Button>

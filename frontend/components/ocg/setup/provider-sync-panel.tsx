@@ -30,7 +30,7 @@ function discoveredLabel(discoveredAt: number | undefined, never: string): strin
  * provider's catalog updates are visible and can be adopted deliberately.
  * Applying changes keeps the current default model.
  */
-export function ProviderSyncPanel() {
+export function ProviderSyncPanel({ profileRefresh = 0 }: { profileRefresh?: number }) {
   const { t } = useI18n();
   const controlUrl = useOcgControlUrl();
   const profileClient = useMemo(() => (controlUrl ? createProfileClient(controlUrl, fetch) : null), [controlUrl]);
@@ -47,7 +47,7 @@ export function ProviderSyncPanel() {
     void profileClient.read().then((next) => { if (active) setView(next); })
       .catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : String(cause)); });
     return () => { active = false; };
-  }, [profileClient]);
+  }, [profileClient, profileRefresh]);
 
   const sync = useCallback(async (providerKey: string) => {
     if (!profileClient || !setupClient || busy) return;
