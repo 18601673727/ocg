@@ -1079,6 +1079,12 @@ impl NativeToolExecutor {
         let call = match edit::construct_call(arguments) {
             Ok(call) => call,
             Err(error) => {
+                if let Some(diagnostic) = error.construction_diagnostic {
+                    return ToolResult::failure(ToolError::new(
+                        ToolErrorKind::InvalidInput,
+                        format!("Invalid filesystem.edit arguments. {diagnostic}"),
+                    ));
+                }
                 let contract = error
                     .kind
                     .map(filesystem_edit_operation_contract)

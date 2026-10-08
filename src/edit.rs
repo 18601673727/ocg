@@ -51,6 +51,7 @@ pub struct EditFailure {
     pub kind: Option<OperationKind>,
     pub retries: u8,
     pub revision: Option<String>,
+    pub construction_diagnostic: Option<String>,
 }
 
 impl EditFailure {
@@ -61,6 +62,7 @@ impl EditFailure {
             kind,
             retries: 0,
             revision: None,
+            construction_diagnostic: None,
         }
     }
 }
@@ -89,14 +91,17 @@ pub fn construct_call(value: &Value) -> Result<CanonicalCall, EditFailure> {
     let obj = value
         .as_object()
         .ok_or_else(|| bad(Conflict::InvalidRequest))?;
-    let kind = match obj.get("operation").and_then(Value::as_str) {
-        Some("replace") => OperationKind::Replace,
-        Some("insertBefore") => OperationKind::InsertBefore,
-        Some("insertAfter") => OperationKind::InsertAfter,
-        Some("append") => OperationKind::Append,
-        Some("appendLine") => OperationKind::AppendLine,
-        Some(_) => return Err(bad(Conflict::UnsupportedOperation)),
-        None => return Err(bad(Conflict::InvalidRequest)),
+    let operation = obj
+        .get("operation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad(Conflict::InvalidRequest))?;
+    let kind = match operation {
+        "replace" => OperationKind::Replace,
+        "insertBefore" => OperationKind::InsertBefore,
+        "insertAfter" => OperationKind::InsertAfter,
+        "append" => OperationKind::Append,
+        "appendLine" => OperationKind::AppendLine,
+        _ => return Err(bad(Conflict::UnsupportedOperation)),
     };
     let invalid = || {
         EditFailure::new(
@@ -104,6 +109,10 @@ pub fn construct_call(value: &Value) -> Result<CanonicalCall, EditFailure> {
             Conflict::InvalidRequest,
             Some(kind),
         )
+    };
+    let diagnostic = |message: String| EditFailure {
+        construction_diagnostic: Some(message),
+        ..invalid()
     };
     let allowed = [
         "operation",
@@ -118,61 +127,92 @@ pub fn construct_call(value: &Value) -> Result<CanonicalCall, EditFailure> {
     if obj.keys().any(|k| !allowed.contains(&k.as_str())) {
         return Err(invalid());
     }
-    let file = string(obj, "file").ok_or_else(invalid)?;
+    let file = required_string(obj, "file", &diagnostic)?;
     let expected_revision = match obj.get("expectedRevision") {
         None => None,
         Some(Value::String(s)) if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
             Some(s.to_ascii_lowercase())
         }
-        _ => return Err(invalid()),
+        Some(Value::String(revision)) if revision == "null" => {
+            return Err(diagnostic(
+                "expectedRevision is the string \"null\", not a valid revision. Omit it (strict wire: JSON null), or copy metadata.revision exactly from a complete filesystem.read from offset 0.".to_string(),
+            ));
+        }
+        _ => {
+            return Err(diagnostic(
+                "expectedRevision must be a 64-character hexadecimal revision copied from metadata.revision of a complete filesystem.read from offset 0. Omit it (strict wire: JSON null) if no revision is supplied; do not invent one.".to_string(),
+            ));
+        }
     };
     let (target, content, repaired) = match kind {
         OperationKind::Replace => {
-            if obj.contains_key("anchor")
-                || obj.contains_key("content")
-                || (obj.contains_key("oldString") && obj.contains_key("old_string"))
-            {
-                return Err(invalid());
+            for field in ["anchor", "content"] {
+                if obj.contains_key(field) {
+                    return Err(diagnostic(format!(
+                        "{field} is not valid for {operation}. Omit {field} (strict wire: JSON null, not the string \"null\")."
+                    )));
+                }
+            }
+            if obj.contains_key("oldString") && obj.contains_key("old_string") {
+                return Err(diagnostic(
+                    "oldString and old_string conflict: replace accepts exactly one of oldString or old_string. Keep one and omit the other (strict wire: JSON null).".to_string(),
+                ));
             }
             let alias = obj.contains_key("old_string");
             (
-                Some(
-                    string(obj, if alias { "old_string" } else { "oldString" })
-                        .ok_or_else(invalid)?,
-                ),
-                string(obj, "newString").ok_or_else(invalid)?,
+                Some(required_string(
+                    obj,
+                    if alias { "old_string" } else { "oldString" },
+                    &diagnostic,
+                )?),
+                required_string(obj, "newString", &diagnostic)?,
                 alias,
             )
         }
         OperationKind::InsertBefore | OperationKind::InsertAfter => {
-            if obj.contains_key("oldString")
-                || obj.contains_key("old_string")
-                || obj.contains_key("newString")
-            {
-                return Err(invalid());
+            for field in ["oldString", "old_string", "newString"] {
+                if obj.contains_key(field) {
+                    return Err(diagnostic(format!(
+                        "{field} is not valid for {operation}. Omit {field} (strict wire: JSON null, not the string \"null\")."
+                    )));
+                }
             }
             (
-                Some(string(obj, "anchor").ok_or_else(invalid)?),
-                string(obj, "content").ok_or_else(invalid)?,
+                Some(required_string(obj, "anchor", &diagnostic)?),
+                required_string(obj, "content", &diagnostic)?,
                 false,
             )
         }
         OperationKind::Append | OperationKind::AppendLine => {
-            if obj.contains_key("anchor")
-                || obj.contains_key("oldString")
-                || obj.contains_key("old_string")
-                || obj.contains_key("newString")
-            {
-                return Err(invalid());
+            for field in ["anchor", "oldString", "old_string", "newString"] {
+                if obj.contains_key(field) {
+                    return Err(diagnostic(format!(
+                        "{field} is not valid for {operation}. Omit {field} (strict wire: JSON null, not the string \"null\")."
+                    )));
+                }
             }
-            (None, string(obj, "content").ok_or_else(invalid)?, false)
+            (None, required_string(obj, "content", &diagnostic)?, false)
         }
     };
-    if file.is_empty()
-        || target.is_some_and(str::is_empty)
-        || (kind == OperationKind::AppendLine && content.contains(['\r', '\n']))
-    {
-        return Err(invalid());
+    if file.is_empty() {
+        return Err(diagnostic(
+            "file is empty. Supply a non-empty Project-relative path to an existing file.".to_string(),
+        ));
+    }
+    if target.is_some_and(str::is_empty) {
+        let field = match kind {
+            OperationKind::Replace if repaired => "old_string",
+            OperationKind::Replace => "oldString",
+            _ => "anchor",
+        };
+        return Err(diagnostic(format!(
+            "{field} is empty. Supply a non-empty exact target for {operation}."
+        )));
+    }
+    if kind == OperationKind::AppendLine && content.contains(['\r', '\n']) {
+        return Err(diagnostic(
+            "content for appendLine must be one logical line containing no CR or LF. Remove line breaks; the editor adds the terminating LF.".to_string(),
+        ));
     }
     Ok(CanonicalCall {
         request: EditRequest {
@@ -186,8 +226,20 @@ pub fn construct_call(value: &Value) -> Result<CanonicalCall, EditFailure> {
     })
 }
 
-fn string<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    obj.get(key).and_then(Value::as_str)
+fn required_string<'a>(
+    obj: &'a Map<String, Value>,
+    field: &str,
+    diagnostic: &impl Fn(String) -> EditFailure,
+) -> Result<&'a str, EditFailure> {
+    match obj.get(field) {
+        None => Err(diagnostic(format!(
+            "{field} is missing. Supply {field} as a string."
+        ))),
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => Err(diagnostic(format!(
+            "{field} must be a string. Supply a string value instead of null or another JSON type."
+        ))),
+    }
 }
 
 /// Return the SHA-256 revision of an existing file. Callers can attach it to
