@@ -100,6 +100,17 @@ export function CanonicalJobOverview({ execution }: { execution: JobExecution })
         </section>
       )}
 
+      <Section title={t("execution.canonical.requested")}>
+        {execution.requestedTarget ? (
+          <dl data-requested-target={execution.jobId}>
+            <Fact label="execution.canonical.provider">{execution.requestedTarget.provider ?? t("common.unknown")}</Fact>
+            <Fact label="execution.canonical.model">{execution.requestedTarget.model ?? t("common.unknown")}</Fact>
+          </dl>
+        ) : (
+          <p className="text-[12px] text-muted-foreground">{t("execution.canonical.requestedUnknown")}</p>
+        )}
+      </Section>
+
       <Section title={t("execution.canonical.target")}>
         {selected ? (
           <dl data-execution-target={selected.kind}>

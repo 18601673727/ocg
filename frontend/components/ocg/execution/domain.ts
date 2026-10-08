@@ -33,6 +33,7 @@ import type {
 } from "../contracts";
 import type { ProjectId } from "../project/domain";
 import { formatTimestamp } from "@/lib/format";
+import { isRecord } from "@/lib/narrow";
 
 /* -------------------------------------------------------------------------- */
 /* Identity                                                                   */
@@ -518,6 +519,36 @@ export function isTerminalJobState(state: CanonicalJobState): boolean {
 }
 
 /**
+ * The Provider and Model the Job specification recorded as requested.
+ *
+ * This is the durable launch intent (`JobSpec.provider` / `JobSpec.model`),
+ * not the Provider a particular Attempt actually ran. A plain-text payload or
+ * a spec that names neither is "not recorded": callers must not invent one
+ * from the composer, the Profile default, or a later Attempt.
+ */
+export type RequestedExecutionTarget = {
+  provider: string | null;
+  model: string | null;
+};
+
+function requestedString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+export function requestedExecutionTarget(payload: string): RequestedExecutionTarget | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const provider = requestedString(parsed.provider);
+  const model = requestedString(parsed.model);
+  return provider === null && model === null ? null : { provider, model };
+}
+
+/**
  * The Attempt that produced a terminal Job's outcome.
  *
  * `domain_attempts` is `UNIQUE(job_id, generation)` and terminalization
@@ -687,6 +718,12 @@ export type JobExecution = {
   waitingForChildren: boolean;
   /** The root's recursion guardrails, when the stored payload carried them. */
   recursiveLimits: RecursiveLimits | undefined;
+  /**
+   * The Provider and Model the Job specification recorded as requested.
+   * `null` when the stored payload named neither — never filled from the
+   * composer, the Profile, or an Attempt's frozen target.
+   */
+  requestedTarget: RequestedExecutionTarget | null;
   /** Watchdog recovery history for this Job, oldest first. */
   recovery: JobRecoveryEvent[];
   canCancel: boolean;
@@ -785,6 +822,7 @@ export function assembleJobExecution(input: {
     state: CanonicalJobState;
     generation: number;
     authoritative_attempt_id: string | null;
+    payload: string;
     created_at: number;
     updated_at: number;
     waiting_for_children?: boolean;
@@ -824,6 +862,7 @@ export function assembleJobExecution(input: {
     descendantSummary: input.job.descendant_summary,
     waitingForChildren: input.job.waiting_for_children ?? false,
     recursiveLimits: input.job.recursive_limits,
+    requestedTarget: requestedExecutionTarget(input.job.payload),
     recovery: recoveryHistoryOf(input.job.id, input.watchdog ?? [], referenceAttemptId),
     canCancel: input.job.can_cancel,
     canRetry: input.job.can_retry,

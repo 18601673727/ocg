@@ -34,7 +34,7 @@ import { ModelSelector } from "./model-selector";
 import type { ChatModelSelection } from "../contracts";
 import type { QueuedChatMessage } from "../types";
 import { retryInput } from "./retry";
-import { activeExecutionTarget, currentActivity, executionActivity, executionTarget, isExecutionActive, type ActiveExecutionTarget, type ActivityStep, type ExecutionPhase } from "./execution-status";
+import { activeExecutionTarget, currentActivity, executionActivity, isExecutionActive, type ActiveExecutionTarget, type ActivityStep, type ExecutionPhase } from "./execution-status";
 import { readModelPreference, writeModelPreference } from "./model-preference";
 import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./message-bounds";
 import type { JobExecution } from "../execution/domain";
@@ -454,7 +454,6 @@ function Composer({
   onSelectionChange,
   onPreference,
   active,
-  historical,
   activity,
   onCancel,
 }: {
@@ -465,7 +464,6 @@ function Composer({
   onSelectionChange: (selection: ChatModelSelection) => void;
   onPreference: (selection: ChatModelSelection) => void;
   active: ActiveExecutionTarget | null;
-  historical: ActiveExecutionTarget | null;
   activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
   onCancel?: () => Promise<void>;
   draft: string;
@@ -485,6 +483,19 @@ function Composer({
   const chatReady = runtimeStatus.state === "connected";
   const actionLock = useRef(false);
   const [submitting, setSubmitting] = useState(false);
+
+  // A drop that misses the composer must not navigate the page to the file.
+  useEffect(() => {
+    const block = (event: DragEvent) => {
+      if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
+    };
+    window.addEventListener("dragover", block);
+    window.addEventListener("drop", block);
+    return () => {
+      window.removeEventListener("dragover", block);
+      window.removeEventListener("drop", block);
+    };
+  }, []);
   const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
@@ -601,7 +612,7 @@ function Composer({
           images.add(Array.from(event.target.files ?? []));
           event.target.value = "";
         }} />
-        <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active || historical} activity={activity} />
+        <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active} activity={activity} />
         <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
           <AttachmentStaging state={images} disabled={submitting || cancelling} />
           <div className="relative">
@@ -656,18 +667,17 @@ function Composer({
               }}
               onPaste={(e) => {
                 if (submitting || cancelling) return;
-                const items = e.clipboardData.items;
-                const imageFiles: File[] = [];
-                for (let i = 0; i < items.length; i++) {
-                  const item = items[i];
-                  if (item.type.startsWith("image/")) {
-                    const file = item.getAsFile();
-                    if (file) imageFiles.push(file);
-                  }
-                }
-                if (imageFiles.length > 0) {
+                const clipboard = e.clipboardData;
+                if (!clipboard) return;
+                // One image can arrive as both an item and a file. Collect once
+                // and let the shared attachment state drop the duplicate.
+                const pasted = [
+                  ...Array.from(clipboard.items).flatMap(item => item.type.startsWith("image/") ? [item.getAsFile()] : []),
+                  ...Array.from(clipboard.files),
+                ].filter((file): file is File => file !== null && file.type.startsWith("image/"));
+                if (pasted.length > 0) {
                   e.preventDefault();
-                  images.add(imageFiles);
+                  images.add(pasted);
                 }
               }}
               onKeyDown={(e) => {
@@ -798,8 +808,6 @@ export function ChatView({
   const liveExecution = isExecutionActive(execution) && (!live?.jobId || live.jobId === execution.jobId) ? execution : null;
   const busy = Boolean(live) || liveExecution !== null;
   const active = activeExecutionTarget(liveExecution);
-  // For completed Jobs, show historical execution target (not active, so no lock icon)
-  const historical = !active && execution ? executionTarget(execution) : null;
   const activity = useMemo(() => {
     if (!liveExecution) return undefined;
     const steps = executionActivity(liveExecution);
@@ -964,7 +972,6 @@ export function ChatView({
         onSelectionChange={setSelection}
         onPreference={next => writeModelPreference(session.projectId, session.sessionId ?? session.id, next)}
         active={active}
-        historical={historical}
         activity={activity}
         onCancel={onCancel}
         draft={draft}

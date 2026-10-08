@@ -23,6 +23,15 @@ type Attachment = {
   error?: string;
 };
 
+/**
+ * Clipboard and some drag sources expose the same image as more than one
+ * File. Name, type and size identify one pending image without reading it;
+ * two distinct images that happen to share all three still both attach.
+ */
+function attachmentKey(file: File): string {
+  return `${file.name}\0${file.type}\0${file.size}\0${file.lastModified}`;
+}
+
 function readImage(file: File, signal: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -83,10 +92,14 @@ export function useImageAttachments(projectId?: string) {
     if (!projectId || !client.uploadChatImage) { setError(t("chat.imageUploadUnavailable")); return; }
     setError(null);
     const added: Attachment[] = [];
+    const seen = new Set(current.current.map(item => attachmentKey(item.file)));
     for (const file of files) {
+      const key = attachmentKey(file);
+      if (seen.has(key)) continue;
       if (!IMAGE_TYPES.has(file.type)) { setError(t("chat.imageTypeError")); continue; }
       if (file.size === 0 || file.size > MAX_IMAGE_BYTES) { setError(t("chat.imageSizeError")); continue; }
       if (current.current.length + added.length >= MAX_IMAGES) { setError(t("chat.imageCountError")); break; }
+      seen.add(key);
       added.push({ id: crypto.randomUUID(), file, preview: URL.createObjectURL(file), status: "uploading" });
     }
     update([...current.current, ...added]);

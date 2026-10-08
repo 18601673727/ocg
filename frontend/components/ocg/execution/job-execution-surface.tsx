@@ -139,7 +139,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
 
       <JobRecoveryPanel execution={execution} />
 
-      <PlacementSection placement={placement} jobFailureShown={execution.terminationReason !== null} jobTerminal={isTerminalJobState(execution.state)} />
+      <PlacementSection placement={placement} requested={execution.requestedTarget} jobFailureShown={execution.terminationReason !== null} jobTerminal={isTerminalJobState(execution.state)} />
 
       <section aria-label={t("execution.usage")} className="rounded-lg border border-border bg-card p-4">
         <SectionTitle>{t("execution.usage")}</SectionTitle>
@@ -299,7 +299,7 @@ function PlacementTargetFacts({ target, t }: { target: PlacementTarget; t: Trans
   );
 }
 
-function PlacementSection({ placement, jobFailureShown, jobTerminal }: { placement: PlacementProjection; jobFailureShown: boolean; jobTerminal: boolean }) {
+function PlacementSection({ placement, requested, jobFailureShown, jobTerminal }: { placement: PlacementProjection; requested: JobExecution["requestedTarget"]; jobFailureShown: boolean; jobTerminal: boolean }) {
   const { t } = useI18n();
   const situation = placementSituation(placement);
   const selected = placement.selected;
@@ -309,6 +309,18 @@ function PlacementSection({ placement, jobFailureShown, jobTerminal }: { placeme
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
         <SectionTitle className="mb-0 min-w-0">{t("placement.title")}</SectionTitle>
         <Pill tone={PLACEMENT_SITUATION_TONE[situation]} dot>{t(PLACEMENT_SITUATION_KEY[situation])}</Pill>
+      </div>
+
+      <div className="mt-3 min-w-0" data-requested-target>
+        <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.requested")}</h4>
+        {requested ? (
+          <div className="mt-1">
+            <p className="break-words text-[13px] font-medium text-foreground">{requested.provider ?? t("common.unknown")}</p>
+            <p className="break-words text-[12px]">{requested.model ?? t("common.unknown")}</p>
+          </div>
+        ) : (
+          <p className="mt-1 text-[12px] text-muted-foreground">{t("placement.requestedUnknown")}</p>
+        )}
       </div>
 
       {selected ? (

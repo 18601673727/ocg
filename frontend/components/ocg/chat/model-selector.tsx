@@ -91,13 +91,12 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
   }, [disabled, selection, modelKey, effort, onChange]);
 
   // While a Job runs, the header reports its frozen target, never the composer.
-  const activeModel = active ? profile?.models[active.model] : undefined;
-  const activeProtocol = active ? profile?.providers[active.providerKey]?.protocol : undefined;
-  const activeEffort = !active ? "" : active.effort ? effortLabel(active.effort)
-    : !activeModel || efforts(activeModel, activeProtocol).length ? t("chat.providerDefault") : t("chat.effortUnsupported");
-  const title = active ? activeModel?.label || activeModel?.id || active.upstreamModelId || active.model
+  // A historical identity the current Profile no longer offers is shown as
+  // recorded. It is never rewritten to a model the Profile still has.
+  const activeEffort = !active ? "" : active.effort ? effortLabel(active.effort) : t("chat.providerDefault");
+  const title = active ? active.model
     : busy ? t("chat.executionPending") : model ? model.label || model.id : t("chat.executionSettings");
-  const subtitle = active ? [profile?.providers[active.providerKey]?.label || active.providerKey, activeEffort].join(" · ")
+  const subtitle = active ? [active.providerKey, activeEffort].filter(Boolean).join(" · ")
     : busy ? null : model ? [profile?.providers[providerKey]?.label || providerKey, availableEfforts.length ? effort ? effortLabel(effort) : t("chat.providerDefault") : t("chat.effortUnsupported")].join(" · ") : null;
   const status = busy ? t("chat.settingsLocked") : !baseUrl ? t("chat.selectorUnavailable")
     : loading ? t("chat.modelsLoading") : error ? t("chat.modelsFailed")

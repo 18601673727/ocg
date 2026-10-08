@@ -71,18 +71,19 @@ function parseRequest(id: string, request: string): ParsedRequest {
 }
 
 /**
- * The frozen Provider × Model × Effort of a Job's execution target.
- * For active Jobs, returns the current generation's target.
- * For terminal Jobs, returns the authoritative generation's target.
- * A retried Job republishes the same target, so an earlier generation is the
- * truthful answer until the replacement's dispatch is visible.
+ * The frozen Provider × Model × Effort of the Job's current generation.
+ * An earlier generation is never substituted: until this generation's
+ * dispatch is visible the target is unknown, not the previous Attempt's.
  */
 export function executionTarget(execution: JobExecution | null | undefined): ActiveExecutionTarget | null {
   if (!execution) return null;
+  // Only this Job's current generation. An earlier Attempt's frozen target is
+  // that Attempt's own identity and must not stand in for a generation that
+  // has not frozen one yet.
   const intents = execution.dispatchIntents
-    .filter(intent => intent.providerKey && intent.model)
-    .sort((left, right) => right.generation - left.generation || right.createdAt - left.createdAt);
-  const intent = intents.find(item => item.generation === execution.generation) ?? intents[0];
+    .filter(intent => intent.generation === execution.generation && intent.providerKey && intent.model)
+    .sort((left, right) => right.createdAt - left.createdAt);
+  const intent = intents[0];
   if (!intent?.providerKey || !intent.model) return null;
   const request = parseRequest(`intent:${intent.dispatchIntentId}`, intent.request);
   return {
@@ -96,9 +97,8 @@ export function executionTarget(execution: JobExecution | null | undefined): Act
 }
 
 /**
- * The frozen Provider × Model × Effort of the Job's current generation. A
- * retried Job republishes the same target, so an earlier generation is the
- * truthful answer until the replacement's dispatch is visible.
+ * The frozen Provider × Model × Effort of a Job that is still executing.
+ * Same rule as `executionTarget`: this generation only, never an earlier one.
  */
 export function activeExecutionTarget(execution: JobExecution | null | undefined): ActiveExecutionTarget | null {
   if (!isExecutionActive(execution)) return null;
