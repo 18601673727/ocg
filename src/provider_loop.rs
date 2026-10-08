@@ -3056,7 +3056,7 @@ fn status_repeats_round(status: u16) -> bool {
 /// What one physical HTTP attempt produced for the current logical round.
 enum PhysicalAttempt {
     /// One complete round was reconstructed.
-    Complete(ProviderRound),
+    Complete(Box<ProviderRound>),
     /// The identical request may be repeated. `provisional` says whether this
     /// attempt had already produced user-visible output that has to be
     /// invalidated before a replacement is allowed to speak.
@@ -3115,16 +3115,11 @@ async fn recover_streamed_round<S: ProviderRoundState + 'static>(
         // A fresh decoding state per attempt is what makes a replacement a
         // reconstruction of the same round rather than a continuation of the
         // bytes the failed attempt left behind.
-        let outcome = run_streamed_round_inner(
-            round_state(),
-            transport,
-            wire,
-            events.clone(),
-            cancelled,
-        )
-        .await;
+        let outcome =
+            run_streamed_round_inner(round_state(), transport, wire, events.clone(), cancelled)
+                .await;
         match outcome {
-            PhysicalAttempt::Complete(round) => return Ok(round),
+            PhysicalAttempt::Complete(round) => return Ok(*round),
             PhysicalAttempt::Terminal(error) => return Err(error),
             PhysicalAttempt::Repeatable {
                 error,
@@ -3345,7 +3340,7 @@ async fn run_streamed_round_inner<S: ProviderRoundState + 'static>(
     // The transport completed successfully, so anything wrong with what it
     // carried is the provider's own output, never an interrupted exchange.
     match state.finish() {
-        Ok(round) => PhysicalAttempt::Complete(round),
+        Ok(round) => PhysicalAttempt::Complete(Box::new(round)),
         Err(error) => PhysicalAttempt::Terminal(error),
     }
 }

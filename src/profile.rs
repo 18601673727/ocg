@@ -451,11 +451,23 @@ impl ProfileService {
         }
         let bytes =
             std::fs::read(&path).map_err(|error| OcgError::io("cannot read OCG Profile", error))?;
-        let data = crate::yaml::read_yaml_object(&path)?;
+        // The revision must describe exactly the bytes used for Placement,
+        // even when another process replaces the Profile during this read.
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| OcgError::config(format!("invalid OCG Profile: {error}")))?;
+        let data = crate::yaml::parse_yaml_object(&path.display().to_string(), text)?;
         Ok(Some((
             Profile::from_ocg_config(&data)?,
             format!("{:x}", Sha256::digest(&bytes)),
         )))
+    }
+
+    pub(crate) fn content_revision(&self) -> Result<Option<String>> {
+        match std::fs::read(self.path()) {
+            Ok(bytes) => Ok(Some(format!("{:x}", Sha256::digest(&bytes)))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(OcgError::io("cannot read OCG Profile revision", error)),
+        }
     }
 
     pub(crate) fn budget_config(&self) -> Result<crate::orchestration::budget::BudgetConfig> {

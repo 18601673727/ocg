@@ -196,7 +196,8 @@ pub fn construct_call(value: &Value) -> Result<CanonicalCall, EditFailure> {
     };
     if file.is_empty() {
         return Err(diagnostic(
-            "file is empty. Supply a non-empty Project-relative path to an existing file.".to_string(),
+            "file is empty. Supply a non-empty Project-relative path to an existing file."
+                .to_string(),
         ));
     }
     if target.is_some_and(str::is_empty) {

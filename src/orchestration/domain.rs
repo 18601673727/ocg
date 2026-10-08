@@ -148,6 +148,7 @@ fn validate_id(value: &str) -> Result<()> {
 /// boundary but remain separately named throughout the domain API.
 pub type JobId = String;
 pub type AttemptId = String;
+pub type LaunchCommandRecord = (String, Option<String>, String, String);
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(default)]
 pub struct JobSpec {
@@ -5321,7 +5322,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         &self,
         command_id: &str,
         project_id: &str,
-    ) -> Result<Option<(String, Option<String>, String, String)>> {
+    ) -> Result<Option<LaunchCommandRecord>> {
         let mut statement = self
             .connection
             .prepare("SELECT request_hash, job_id, outcome, message FROM domain_launch_commands WHERE command_id = ?1 AND project_id = ?2")
@@ -7557,7 +7558,9 @@ fn settle_chat_turn(
             .get("content")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| invalid("completed chat Call has no final content"))?;
-        let reasoning = response.get("reasoning").and_then(serde_json::Value::as_str);
+        let reasoning = response
+            .get("reasoning")
+            .and_then(serde_json::Value::as_str);
         update_chat_message_with_reasoning(
             transaction,
             turn,
@@ -8337,10 +8340,7 @@ mod chat_retry_tests {
         assert_eq!(assistants.len(), 1, "one assistant Message per turn");
         assert_eq!(history.messages.len(), 2, "no second Chat turn");
         let message = assistants[0].clone();
-        let origin = history
-            .origins
-            .remove(message.id.as_str())
-            .expect("origin");
+        let origin = history.origins.remove(message.id.as_str()).expect("origin");
         (message, origin)
     }
 
@@ -8472,9 +8472,7 @@ mod chat_retry_tests {
             hard_budget_micros: 0,
             resource_commitment: None,
         };
-        let (dispatched, executor) = domain
-            .dispatch_job(&job.id, "provider")
-            .expect("dispatch");
+        let (dispatched, executor) = domain.dispatch_job(&job.id, "provider").expect("dispatch");
         domain
             .prepare_chat_turn(&request, "hash", &dispatched, "explain")
             .expect("turn");
@@ -8576,7 +8574,10 @@ mod chat_retry_tests {
                 &job_failure("test", FailureClass::Unknown, "boom", true),
             )
             .expect("fail");
-        assert_eq!(domain.chat_session_for_job(&job.id).expect("identity"), None);
+        assert_eq!(
+            domain.chat_session_for_job(&job.id).expect("identity"),
+            None
+        );
         let generation = domain.job(&job.id).expect("job").expect("job").generation;
         let retry = domain
             .retry_job(&job.id, "worker", generation)

@@ -74,8 +74,7 @@ fn discarded_tool_frames() -> &'static [&'static str] {
                         .into_boxed_str(),
                 ),
                 Box::leak(
-                    sse_tool_call("call-discarded", "filesystem_list", ".\"}")
-                        .into_boxed_str(),
+                    sse_tool_call("call-discarded", "filesystem_list", ".\"}").into_boxed_str(),
                 ),
             ]
         })
@@ -168,16 +167,9 @@ impl ProviderStub {
                                 let mut served = served.lock().expect("served labels");
                                 let attempt = served.iter().filter(|seen| **seen == label).count();
                                 served.push(label.clone());
-                                scripts
-                                    .lock()
-                                    .expect("stub scripts")
-                                    .get(&label)
-                                    .and_then(|script| {
-                                        script
-                                            .get(attempt)
-                                            .or_else(|| script.last())
-                                            .copied()
-                                    })
+                                scripts.lock().expect("stub scripts").get(&label).and_then(
+                                    |script| script.get(attempt).or_else(|| script.last()).copied(),
+                                )
                             };
                             if let Some(step) = step {
                                 serve_step(step, &mut stream);
@@ -366,7 +358,7 @@ fn serve_step(step: StubStep, stream: &mut impl Write) {
                 529 => "Site Overloaded",
                 other => panic!("unscripted status {other}"),
             };
-            let body = format!("{reason}");
+            let body = reason.to_string();
             write!(
                 stream,
                 "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1011,10 +1003,9 @@ fn retryable_http_status_repeats_the_same_logical_round() {
         .expect("calls");
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].id, call.id);
-    let response: Value = serde_json::from_str(
-        calls[0].response.as_deref().expect("provider response"),
-    )
-    .expect("response JSON");
+    let response: Value =
+        serde_json::from_str(calls[0].response.as_deref().expect("provider response"))
+            .expect("response JSON");
     assert_eq!(response["content"], "Real reply");
     assert_eq!(response["rounds"], 1);
     fixture.terminal(&call, "completed");
@@ -1027,8 +1018,7 @@ fn retryable_http_status_exhausts_the_bounded_round_budget() {
     let upstream = ProviderStub::start();
     upstream.script("always-overloaded", vec![StubStep::Status(503)]);
     let mut fixture = Fixture::new();
-    let (call, envelope, _events) =
-        fixture.admitted(&upstream.endpoint, "always-overloaded", true);
+    let (call, envelope, _events) = fixture.admitted(&upstream.endpoint, "always-overloaded", true);
 
     fixture
         .execute(envelope)
@@ -1099,10 +1089,9 @@ fn partial_stream_then_premature_eof_resets_the_round_before_retrying() {
         .calls_for_attempt(&call.attempt_id)
         .expect("calls");
     assert_eq!(calls.len(), 1);
-    let response: Value = serde_json::from_str(
-        calls[0].response.as_deref().expect("provider response"),
-    )
-    .expect("response JSON");
+    let response: Value =
+        serde_json::from_str(calls[0].response.as_deref().expect("provider response"))
+            .expect("response JSON");
     assert_eq!(response["content"], "complete answer");
     assert_eq!(response["rounds"], 1);
     fixture.terminal(&call, "completed");
@@ -1143,9 +1132,9 @@ fn discarded_tool_call_from_a_failed_attempt_is_never_admitted() {
             ExecutionEvent::Provider(ChatStreamEvent::ToolCallStart { id, name, .. }) => {
                 Some(format!("start:{id}:{name}"))
             }
-            ExecutionEvent::Provider(ChatStreamEvent::ToolCallArgumentsDelta { id, delta, .. }) => {
-                Some(format!("args:{id}:{delta}"))
-            }
+            ExecutionEvent::Provider(ChatStreamEvent::ToolCallArgumentsDelta {
+                id, delta, ..
+            }) => Some(format!("args:{id}:{delta}")),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1175,12 +1164,10 @@ fn discarded_tool_call_from_a_failed_attempt_is_never_admitted() {
     // That attempt never completed: no `ToolCallComplete` was ever produced,
     // because the round was abandoned mid-stream.
     assert!(
-        !published
-            .iter()
-            .any(|event| matches!(
-                event,
-                ExecutionEvent::Provider(ChatStreamEvent::ToolCallComplete { .. })
-            )),
+        !published.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::Provider(ChatStreamEvent::ToolCallComplete { .. })
+        )),
         "{published:?}"
     );
     // No user-visible text was produced by the discarded attempt, so there was no
@@ -1191,10 +1178,7 @@ fn discarded_tool_call_from_a_failed_attempt_is_never_admitted() {
     assert!(
         !published
             .iter()
-            .any(|event| matches!(
-                event,
-                ExecutionEvent::Provider(ChatStreamEvent::RoundReset)
-            )),
+            .any(|event| matches!(event, ExecutionEvent::Provider(ChatStreamEvent::RoundReset))),
         "a tool-call-only attempt has no provisional presentation to reset: {published:?}"
     );
 
@@ -1205,7 +1189,11 @@ fn discarded_tool_call_from_a_failed_attempt_is_never_admitted() {
         .domain
         .calls_for_attempt(&call.attempt_id)
         .expect("calls");
-    assert_eq!(calls.len(), 1, "a discarded tool call was admitted: {calls:?}");
+    assert_eq!(
+        calls.len(),
+        1,
+        "a discarded tool call was admitted: {calls:?}"
+    );
     assert_eq!(calls[0].id, call.id);
     assert_eq!(calls[0].state, "completed");
     let input: Value = serde_json::from_str(&calls[0].request).expect("Call request");
@@ -1215,10 +1203,9 @@ fn discarded_tool_call_from_a_failed_attempt_is_never_admitted() {
     );
 
     // The replacement attempt's response is the one that settled the round.
-    let response: Value = serde_json::from_str(
-        calls[0].response.as_deref().expect("provider response"),
-    )
-    .expect("response JSON");
+    let response: Value =
+        serde_json::from_str(calls[0].response.as_deref().expect("provider response"))
+            .expect("response JSON");
     assert_eq!(response["content"], "done without tools");
     assert_eq!(response["rounds"], 1);
     fixture.terminal(&call, "completed");

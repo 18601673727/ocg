@@ -507,6 +507,19 @@ pub struct CanonicalControlService {
     registry_lock: Arc<Mutex<()>>,
     configuration_lock: Arc<Mutex<()>>,
     chat_forwarder: Arc<ChatForwarder>,
+    placement_deferrals: Arc<Mutex<BTreeMap<String, PlacementDeferral>>>,
+}
+
+// Only Profile/spec incompatibility is memoized. Runtime availability is not
+// cached, and restart discards this optimization before authoritative recovery.
+#[derive(Debug)]
+struct PlacementDeferral {
+    root: PathBuf,
+    profile_revision: String,
+    configuration_revision: u64,
+    job_configuration_revision: Option<u64>,
+    generation: u64,
+    spec: JobSpec,
 }
 
 pub(crate) struct JobAdmissionWorker {
@@ -748,6 +761,7 @@ impl CanonicalControlService {
             registry_lock: Arc::new(Mutex::new(())),
             configuration_lock: Arc::new(Mutex::new(())),
             chat_forwarder: ChatForwarder::new(),
+            placement_deferrals: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1719,11 +1733,10 @@ impl CanonicalControlService {
         // Thresholds are re-read every pass so configuration updates take
         // effect without restart; observation refresh is cadence-gated inside
         // the Guard, so most passes are a cached read.
-        let global = self
-            .read_configuration()
-            .map(|(global, _, _)| global)
-            .unwrap_or_default();
+        let (global, _, configuration_revision) = self.read_configuration().unwrap_or_default();
         let mut failure = None;
+        let mut selected_jobs = std::collections::BTreeSet::new();
+        let mut profile_revision = None;
         for project in self.projects()? {
             // Periodic runtime reassessment while OCG is active. Deferred Jobs
             // stay eligible in the substrate, so recovery past the resume
@@ -1771,6 +1784,34 @@ impl CanonicalControlService {
                     }
                 }
                 for job in jobs {
+                    selected_jobs.insert(job.id.clone());
+                    if job.state == super::domain::JobState::Eligible {
+                        let mut deferrals = self
+                            .placement_deferrals
+                            .lock()
+                            .map_err(|_| invalid("placement deferrals poisoned"))?;
+                        if let Some(deferred) = deferrals.get(&job.id) {
+                            let revision = match &profile_revision {
+                                Some(revision) => revision,
+                                None => profile_revision
+                                    .insert(self.profile_service.content_revision()?),
+                            };
+                            if deferred.root == Path::new(&project.root)
+                                && revision.as_ref() == Some(&deferred.profile_revision)
+                                && deferred.configuration_revision == configuration_revision
+                                && deferred.generation == job.generation
+                                && deferred.spec == job.spec
+                                && deferred.job_configuration_revision
+                                    == domain
+                                        .job_configuration(&job.id)?
+                                        .map(|(_, revision)| revision)
+                            {
+                                continue;
+                            }
+                        }
+                        deferrals.remove(&job.id);
+                    }
+
                     let request = crate::contracts::JobLaunchRequest {
                         command_id: format!("auto-{}", job.id),
                         draft_id: job.id.clone(),
@@ -1798,6 +1839,10 @@ impl CanonicalControlService {
                 failure.get_or_insert(error);
             }
         }
+        self.placement_deferrals
+            .lock()
+            .map_err(|_| invalid("placement deferrals poisoned"))?
+            .retain(|job_id, _| selected_jobs.contains(job_id));
         failure.map_or(Ok(()), Err)
     }
 
@@ -2456,7 +2501,7 @@ impl CanonicalControlService {
         }
 
         // Resolve configuration
-        let (global_config, project_configs, _revision) = self.read_configuration()?;
+        let (global_config, project_configs, configuration_revision) = self.read_configuration()?;
         let project_config = project_configs
             .get(&project.project_id)
             .cloned()
@@ -2513,7 +2558,7 @@ impl CanonicalControlService {
         )?;
 
         // Resolve profile from the user-global profile service
-        let (profile, _) = match self.profile_service.current()? {
+        let (profile, profile_revision) = match self.profile_service.current()? {
             Some(p) => p,
             None => {
                 let response = crate::contracts::JobLaunchResponse {
@@ -2628,6 +2673,26 @@ impl CanonicalControlService {
             Err(refusal) => {
                 if let Some(job) = &existing_job {
                     domain.record_admission_failure(&job.id, &refusal.failure)?;
+                    if refusal.profile_incompatible
+                        && job.state == super::domain::JobState::Eligible
+                    {
+                        self.placement_deferrals
+                            .lock()
+                            .map_err(|_| invalid("placement deferrals poisoned"))?
+                            .insert(
+                                job.id.clone(),
+                                PlacementDeferral {
+                                    root: PathBuf::from(&project.root),
+                                    profile_revision,
+                                    configuration_revision,
+                                    job_configuration_revision: domain
+                                        .job_configuration(&job.id)?
+                                        .map(|(_, revision)| revision),
+                                    generation: job.generation,
+                                    spec: job.spec.clone(),
+                                },
+                            );
+                    }
                 }
                 return Ok(crate::contracts::JobLaunchResponse {
                     api_version: CANONICAL_CONTROL_API_VERSION.to_string(),

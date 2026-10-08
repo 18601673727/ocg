@@ -55,8 +55,8 @@ function activeTargetBeatsComposer() {
     jobId: "job-1", generation: 2, providerKey: "nexotokensub", model: "gpt-6.1-sol",
     upstreamModelId: "gpt-6.1-sol", effort: "high",
   });
-  // A replacement generation whose dispatch is not yet visible still reports the frozen target.
-  assert.equal(activeExecutionTarget(execution("running", { generation: 3 })).model, "gpt-6.1-sol");
+  // A replacement generation has no target until its own dispatch is visible.
+  assert.equal(activeExecutionTarget(execution("running", { generation: 3 })), null);
   // No effort in the frozen request is reported as none, not as the composer's.
   assert.equal(activeExecutionTarget(execution("running", { dispatchIntents: [intent(2, "gpt-6.1-sol", null)] })).effort, null);
   for (const state of ["completed", "failed", "cancelled"]) assert.equal(activeExecutionTarget(execution(state)), null);
@@ -178,6 +178,8 @@ function chatSurfaceRendersWithoutRuntimeBanner() {
   const html = render([
     { id: "u", role: "user", content: long, createdAt: "t", status: "completed" },
     { id: "a", role: "assistant", jobId: "job-1", content: "short", createdAt: "t", status: "streaming" },
+    { id: "tool", role: "tool", jobId: "job-1", content: "", createdAt: "t", status: "streaming",
+      tool: { name: "filesystem.edit", status: "running", durationMs: 0, summary: "src/orchestration/domain.rs", detail: "replace" } },
   ], execution("running", { calls: [call(2, "running", tool("filesystem.edit", { file: "src/orchestration/domain.rs" }))] }));
   assert.ok(!html.includes("OCG provider runtime"), "the generic runtime row is gone");
   assert.ok(!html.includes("border-dashed"), "the generic runtime container is gone");

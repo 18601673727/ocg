@@ -17,7 +17,10 @@ pub const MODEL: &str = "mock-model";
 pub enum Reply {
     Text(Vec<String>),
     /// Reasoning deltas followed by the user-visible answer.
-    Reasoning { reasoning: Vec<String>, text: Vec<String> },
+    Reasoning {
+        reasoning: Vec<String>,
+        text: Vec<String>,
+    },
     NativePwd,
 }
 

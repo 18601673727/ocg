@@ -437,9 +437,9 @@ mod tests {
 
         // First two requests should succeed
         let permit1 = gov.acquire(scope.clone()).unwrap();
-        assert!(matches!(permit1, Ok(_)));
+        assert!(permit1.is_ok());
         let permit2 = gov.acquire(scope.clone()).unwrap();
-        assert!(matches!(permit2, Ok(_)));
+        assert!(permit2.is_ok());
 
         // Third request should be rate limited
         let result = gov.acquire(scope.clone()).unwrap();
@@ -467,7 +467,7 @@ mod tests {
 
         // Now should succeed
         let permit3 = gov.acquire(scope.clone()).unwrap();
-        assert!(matches!(permit3, Ok(_)));
+        assert!(permit3.is_ok());
     }
 
     #[test]
@@ -497,6 +497,6 @@ mod tests {
 
         // Should succeed now
         let result = gov.acquire(scope.clone()).unwrap();
-        assert!(matches!(result, Ok(_)));
+        assert!(result.is_ok());
     }
 }

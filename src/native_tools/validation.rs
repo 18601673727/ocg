@@ -872,7 +872,7 @@ fn git_state(
             .split(|byte| *byte == 0)
             .filter(|part| !part.is_empty())
             .collect();
-        for entry in parts.chunks_exact(3) {
+        for entry in parts.as_chunks::<3>().0 {
             if matches!(entry[1], b"filter" | b"diff" | b"working-tree-encoding")
                 && !matches!(entry[2], b"unset" | b"unspecified")
             {

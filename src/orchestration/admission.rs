@@ -127,6 +127,7 @@ pub(crate) struct ResolvedTarget {
 
 /// Why Admission refused to reserve a Job.
 pub(crate) struct AdmissionRefusal {
+    pub profile_incompatible: bool,
     pub failure: Failure,
     pub message: String,
 }
@@ -204,6 +205,7 @@ fn prepare_target(
         };
         if let Some(deferral) = decision.deferral() {
             return Ok(PreparedTarget::Refused(AdmissionRefusal {
+                profile_incompatible: false,
                 message: deferral.message(),
                 failure: deferral.failure(),
             }));
@@ -244,9 +246,10 @@ fn prepare_target(
                         AdmissionPickup::Automatic,
                     )
                 }
-                Err(failure) => Ok(PreparedTarget::Refused(AdmissionRefusal {
-                    message: format!("{}: {}", failure.code, failure.message),
-                    failure,
+                Err(refusal) => Ok(PreparedTarget::Refused(AdmissionRefusal {
+                    profile_incompatible: refusal.profile_incompatible,
+                    message: format!("{}: {}", refusal.failure.code, refusal.failure.message),
+                    failure: refusal.failure,
                 })),
             }
         }
@@ -258,6 +261,7 @@ fn prepare_target(
                 AdmissionPickup::Explicit,
             ),
             Err(failure) => Ok(PreparedTarget::Refused(AdmissionRefusal {
+                profile_incompatible: false,
                 message: failure.message.clone(),
                 failure,
             })),
@@ -279,7 +283,11 @@ fn materialize_reservation(
 
 fn validation_refusal(code: &str, message: String) -> PreparedTarget {
     let failure = job_failure(code, FailureClass::Validation, &message, false);
-    PreparedTarget::Refused(AdmissionRefusal { message, failure })
+    PreparedTarget::Refused(AdmissionRefusal {
+        profile_incompatible: false,
+        message,
+        failure,
+    })
 }
 
 fn materialize_choice(
@@ -525,6 +533,7 @@ pub(crate) fn reserve(
             }))
         }
         Err(error) => Ok(Err(AdmissionRefusal {
+            profile_incompatible: false,
             message: error.to_string(),
             failure: job_failure(
                 "admission_reservation_failed",
@@ -638,6 +647,7 @@ pub(crate) fn publish_call(
                 )?;
             }
             Ok(Err(AdmissionRefusal {
+                profile_incompatible: false,
                 message: format!("economic admission failed: {error}"),
                 failure: job_failure(
                     "economic_admission_failed",

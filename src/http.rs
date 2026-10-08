@@ -1168,15 +1168,12 @@ async fn native_post_json_stream(
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    let response = request
-        .send_body(body.to_vec())
-        .await
-        .map_err(|error| {
-            OcgError::transport(
-                classify_client_error(&error),
-                format!("request to {url} failed: {error}"),
-            )
-        })?;
+    let response = request.send_body(body.to_vec()).await.map_err(|error| {
+        OcgError::transport(
+            classify_client_error(&error),
+            format!("request to {url} failed: {error}"),
+        )
+    })?;
     let status = response.status().as_u16();
     let rate_limit = provider_rate_limit(&response);
     let mut response = Box::pin(response);
@@ -1447,15 +1444,12 @@ async fn native_post_json_stream_via_proxy(
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    let response = request
-        .send_body(body.to_vec())
-        .await
-        .map_err(|error| {
-            OcgError::transport(
-                classify_client_error(&error),
-                format!("request to {url} failed: {error}"),
-            )
-        })?;
+    let response = request.send_body(body.to_vec()).await.map_err(|error| {
+        OcgError::transport(
+            classify_client_error(&error),
+            format!("request to {url} failed: {error}"),
+        )
+    })?;
     let status = response.status().as_u16();
     let rate_limit = provider_rate_limit(&response);
     let mut response = Box::pin(response);

@@ -50,6 +50,11 @@ pub(crate) struct PolicyInput<'a> {
     pub now: i64,
 }
 
+pub(crate) struct PlacementRefusal {
+    pub failure: Failure,
+    pub profile_incompatible: bool,
+}
+
 /// Result of placement candidate selection with evidence.
 pub(crate) struct PlacementResult {
     pub choice: ProviderChoice,
@@ -61,17 +66,20 @@ pub(crate) struct PlacementResult {
 pub(crate) fn choose(
     domain: &DomainRepository,
     input: PolicyInput<'_>,
-) -> Result<std::result::Result<PlacementResult, Failure>> {
-    let vault = crate::vault::Vault::user_global()?;
-    let executable = input.profile.executable_choices(&vault);
+) -> Result<std::result::Result<PlacementResult, PlacementRefusal>> {
+    let mut executable = None;
+    let mut compatible = false;
     let loaded = crate::resources::load(input.root);
     if loaded.corrupt || !loaded.issues.is_empty() {
-        return Ok(Err(job_failure(
-            "placement_health_unknown",
-            FailureClass::Provider,
-            "Resource Registry contains unreadable availability facts",
-            true,
-        )));
+        return Ok(Err(PlacementRefusal {
+            profile_incompatible: false,
+            failure: job_failure(
+                "placement_health_unknown",
+                FailureClass::Provider,
+                "Resource Registry contains unreadable availability facts",
+                true,
+            ),
+        }));
     }
 
     let mut all_evidence = Vec::new();
@@ -80,12 +88,11 @@ pub(crate) fn choose(
     let mut budget_failure = None;
 
     for (key, model) in input.profile.runnable_models() {
-        if !executable.contains(key)
-            || input
-                .spec
-                .provider
-                .as_ref()
-                .is_some_and(|provider| provider != &model.provider)
+        if input
+            .spec
+            .provider
+            .as_ref()
+            .is_some_and(|provider| provider != &model.provider)
             || input
                 .spec
                 .model
@@ -160,6 +167,20 @@ pub(crate) fn choose(
                     detail: "reasoning effort not supported".to_string(),
                 },
             });
+            continue;
+        }
+
+        compatible = true;
+        // Credential readiness can change independently of the Profile. Only
+        // structural rejection can be deferred until the Profile changes.
+        if executable.is_none() {
+            let vault = crate::vault::Vault::user_global()?;
+            executable = Some(input.profile.executable_choices(&vault));
+        }
+        if !executable
+            .as_ref()
+            .is_some_and(|choices| choices.contains(key))
+        {
             continue;
         }
 
@@ -293,26 +314,40 @@ pub(crate) fn choose(
     }
 
     if candidates.is_empty() {
-        return Ok(Err(budget_failure.unwrap_or_else(|| {
-            if unavailable {
-                job_failure("placement_unavailable", FailureClass::Provider,
-                    "All compatible execution resources are known unavailable", true)
-            } else {
-                job_failure("placement_incompatible", FailureClass::Capability,
-                    "No executable configured Provider/Model satisfies the explicit constraints and runtime capabilities", false)
-            }
-        })));
+        return Ok(Err(PlacementRefusal {
+            profile_incompatible: !compatible,
+            failure: budget_failure.unwrap_or_else(|| {
+                if unavailable {
+                    job_failure(
+                        "placement_unavailable",
+                        FailureClass::Provider,
+                        "All compatible execution resources are known unavailable",
+                        true,
+                    )
+                } else {
+                    job_failure(
+                        "placement_incompatible",
+                        FailureClass::Capability,
+                        "No executable configured Provider/Model satisfies the explicit constraints and runtime capabilities",
+                        false,
+                    )
+                }
+            }),
+        }));
     }
 
     // Project capacity check (not per-candidate)
     if let Some(limit) = input.concurrency {
         if !domain.provider_capacity_available(input.project_id, input.job_id, limit)? {
-            return Ok(Err(job_failure(
-                "placement_capacity",
-                FailureClass::Concurrency,
-                "Project provider capacity is reserved by active Attempts",
-                true,
-            )));
+            return Ok(Err(PlacementRefusal {
+                profile_incompatible: false,
+                failure: job_failure(
+                    "placement_capacity",
+                    FailureClass::Concurrency,
+                    "Project provider capacity is reserved by active Attempts",
+                    true,
+                ),
+            }));
         }
     }
 
@@ -337,13 +372,22 @@ pub(crate) fn choose(
         winner_gov,
     )) = candidates.into_iter().next()
     else {
-        return Ok(Err(job_failure(
-            "placement_incompatible",
-            FailureClass::Capability,
-            "No candidate remains",
-            false,
-        )));
+        return Ok(Err(PlacementRefusal {
+            profile_incompatible: false,
+            failure: job_failure(
+                "placement_incompatible",
+                FailureClass::Capability,
+                "No candidate remains",
+                false,
+            ),
+        }));
     };
+
+    all_evidence.retain(|candidate| {
+        executable
+            .as_ref()
+            .is_some_and(|choices| choices.contains(&candidate.model))
+    });
 
     // Record winner as Selected
     all_evidence.push(CandidateEvidence {
