@@ -36,6 +36,12 @@ interface ProviderState {
   endpoint: string;
 }
 
+/** Known OpenAI-compatible services; selecting one only prefills the form. */
+const PROVIDER_PRESETS: readonly { id: string; label: string; endpoint: string }[] = [
+  { id: "opencode-go", label: "OpenCode Go", endpoint: "https://opencode.ai/zen/go/v1" },
+  { id: "command-code", label: "Command Code Plan", endpoint: "https://api.commandcode.ai/provider/v1" },
+];
+
 interface ConnectResult {
   providerKey: string;
   models: SetupModel[];
@@ -537,6 +543,20 @@ function ConnectProviderPanel({
   return (
     <div className="flex flex-col gap-4">
       <p className="text-[12px] text-muted-foreground">{t("setup.connectHint")}</p>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[12px] font-medium">{t("setup.presets")}</span>
+        {PROVIDER_PRESETS.map((preset) => (
+          <button
+            key={preset.id}
+            type="button"
+            className="rounded-md border border-border px-2.5 py-1 text-[12px] hover:bg-muted"
+            onClick={() => onChange({ name: preset.label, endpoint: preset.endpoint })}
+            disabled={loading}
+          >
+            {preset.label}
+          </button>
+        ))}
+      </div>
       <div className="flex flex-col gap-1.5">
         <label htmlFor="setup-provider-name" className="text-[12px] font-medium">
           {t("setup.providerName")}
