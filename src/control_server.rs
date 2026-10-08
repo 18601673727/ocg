@@ -29,7 +29,7 @@ use crate::orchestration::checkpoint::is_safe_id;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -576,10 +576,6 @@ fn handle_client(
     );
 }
 
-/// The loopback host names this server answers to. Each is compared as a whole
-/// name, never as a prefix or substring.
-const LOOPBACK_HOST_NAMES: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
-
 /// Reject any request whose Host is not this server's own loopback authority.
 /// HTTP/1.1 requires a Host header (RFC 7230 section 5.4) and HTTP/1.0 does
 /// not, but a missing Host cannot be checked, so it is refused for both.
@@ -602,22 +598,49 @@ fn check_host(request: &Request, bound_port: u16) -> std::result::Result<(), Api
     }
 }
 
-/// True when `value` is `<loopback name>` or `<loopback name>:<port>`, where the
-/// port is exactly `bound_port`. A bare name stands for port 80, the default an
-/// HTTP client omits, so it is accepted only when that is the bound port.
-/// Anything after the name other than `:<port>` is refused, so suffixes such as
-/// `localhost.evil.com` or `localhost@evil.com` cannot pass.
+/// True when `value` is `<host>` or `<host>:<port>`, where `<host>` is either
+/// the name `localhost` or a numeric loopback IP (any `127.0.0.0/8` IPv4 or
+/// `::1`, bracketed when IPv6), and the port is exactly `bound_port`. A bare
+/// host stands for port 80, the default an HTTP client omits, so it is accepted
+/// only when that is the bound port. The host is split off structurally, so
+/// suffixes such as `localhost.evil.com`, `127.0.0.2.evil.com` or
+/// `localhost@evil.com` cannot pass, and no DNS lookup is ever made.
 fn is_local_host(value: &str, bound_port: u16) -> bool {
     let value = value.to_ascii_lowercase();
-    LOOPBACK_HOST_NAMES.iter().any(|name| {
-        let Some(rest) = value.strip_prefix(name) else {
+    let (host, rest) = if value.starts_with('[') {
+        let Some(end) = value.find(']') else {
             return false;
         };
-        match rest.strip_prefix(':') {
-            Some(port) => port == bound_port.to_string(),
-            None => rest.is_empty() && bound_port == 80,
+        (&value[..=end], &value[end + 1..])
+    } else {
+        match value.find(':') {
+            Some(index) => (&value[..index], &value[index..]),
+            None => (value.as_str(), ""),
         }
-    })
+    };
+    let port = if rest.is_empty() {
+        None
+    } else if let Some(port) = rest.strip_prefix(':') {
+        Some(port)
+    } else {
+        return false;
+    };
+    let host_is_loopback = if let Some(literal) = host.strip_prefix('[') {
+        literal
+            .strip_suffix(']')
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .is_some_and(|addr| addr.is_loopback())
+    } else if host == "localhost" {
+        true
+    } else {
+        host.parse::<Ipv4Addr>()
+            .is_ok_and(|addr| addr.is_loopback())
+    };
+    host_is_loopback
+        && match port {
+            Some(port) => port == bound_port.to_string(),
+            None => bound_port == 80,
+        }
 }
 
 /// The CORS allowlist: only a loopback HTTP origin may call the canonical
