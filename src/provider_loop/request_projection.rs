@@ -89,6 +89,7 @@ fn project_content(call: &Value, message: &Value) -> Option<String> {
         "filesystem.read" | "filesystem_read" => "content",
         "filesystem.list" | "filesystem_list" => "entries",
         "filesystem.search" | "filesystem_search" => "matches",
+        "filesystem.read_many" | "filesystem_read_many" => "items",
         _ => return None,
     };
     // Exempt tools are rejected before even parsing their arbitrary output.
@@ -112,10 +113,11 @@ fn project_content(call: &Value, message: &Value) -> Option<String> {
     }
     let output = result["output"].as_object()?;
     let metadata = result["metadata"].as_object()?;
-    if metadata.get("remaining")?.as_bool()? != result["truncated"].as_bool()? {
+    if field != "items" && metadata.get("remaining")?.as_bool()? != result["truncated"].as_bool()? {
         return None;
     }
     match field {
+        "items" => project_read_many(&mut result, &arguments)?,
         "content" => {
             if !only_keys(output, &["path", "content"])
                 || !only_keys(metadata, &["remaining", "offset", "nextOffset", "revision"])
@@ -195,6 +197,111 @@ fn project_content(call: &Value, message: &Value) -> Option<String> {
         && Value::String(encoded.clone()).to_string().len()
             < Value::String(original.to_owned()).to_string().len())
     .then_some(encoded)
+}
+
+fn project_read_many(result: &mut Value, arguments: &Value) -> Option<()> {
+    let requested = arguments.get("items")?.as_array()?;
+    let output = result["output"].as_object()?;
+    let metadata = result["metadata"].as_object()?;
+    let items = output.get("items")?.as_array()?;
+    if !only_keys(arguments.as_object()?, &["items"])
+        || requested.is_empty()
+        || requested.len() > 16
+        || items.len() != requested.len()
+        || !only_keys(output, &["items", "partial"])
+        || !only_keys(metadata, &["unique_files", "output_cap"])
+        || metadata.get("unique_files")?.as_u64()? > items.len() as u64
+        || metadata.get("output_cap")?.as_u64()? != 32768
+        || output.get("partial")?.as_bool()? != items.iter().any(|item| item["status"] != "ok")
+        || result["truncated"].as_bool()? != items.iter().any(|item| item["truncated"] == true)
+    {
+        return None;
+    }
+    for (request, item) in requested.iter().zip(items) {
+        let request_object = request.as_object()?;
+        let item_object = item.as_object()?;
+        if request_object.len() != 3
+            || !only_keys(request_object, &["path", "line_start", "line_end"])
+            || !valid_path(&request["path"])
+            || !only_keys(
+                item_object,
+                &[
+                    "path",
+                    "line_start",
+                    "line_end",
+                    "status",
+                    "content",
+                    "truncated",
+                    "aggregate_limited",
+                    "error",
+                ],
+            )
+            || ["path", "line_start", "line_end"]
+                .iter()
+                .any(|field| request.get(*field) != item.get(*field))
+            || ["line_start", "line_end"].iter().any(|field| {
+                let value = &request[*field];
+                !value.is_null() && !value.is_i64() && !value.is_u64()
+            })
+        {
+            return None;
+        }
+        let content = item.get("content")?.as_str()?;
+        let truncated = item.get("truncated")?.as_bool()?;
+        let aggregate_limited = item.get("aggregate_limited")?.as_bool()?;
+        match item.get("status")?.as_str()? {
+            "ok" | "truncated" => {
+                let valid_range = match (&request["line_start"], &request["line_end"]) {
+                    (Value::Null, Value::Null) => true,
+                    (start, end) => start
+                        .as_u64()
+                        .zip(end.as_u64())
+                        .is_some_and(|(start, end)| start > 0 && start <= end),
+                };
+                if !valid_range
+                    || item.get("error").is_some()
+                    || truncated != (item["status"] == "truncated")
+                    || (aggregate_limited && !truncated)
+                {
+                    return None;
+                }
+            }
+            "missing" | "error" | "invalid_range" => {
+                let error = item.get("error")?.as_object()?;
+                if truncated
+                    || aggregate_limited
+                    || !content.is_empty()
+                    || error.len() != 3
+                    || !only_keys(error, &["kind", "message", "metadata"])
+                    || serde_json::from_value::<crate::native_tools::ToolErrorKind>(
+                        error.get("kind")?.clone(),
+                    )
+                    .ok()?
+                        == crate::native_tools::ToolErrorKind::Cancelled
+                    || error.get("message")?.as_str()?.is_empty()
+                    || !error.get("metadata")?.is_object()
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let mut omitted = false;
+    for item in result["output"]["items"].as_array_mut()? {
+        let content = item["content"].as_str()?;
+        if !content.is_empty() {
+            let bytes = content.len();
+            item["content"] =
+                json!({"prefix":"","suffix":"","original_bytes":bytes,"omitted_bytes":bytes});
+            omitted = true;
+        }
+    }
+    if !omitted {
+        return None;
+    }
+    result["provider_projection"] = json!({"kind":"filesystem_observation_v1","field":"items","content_omitted":true,"original_items":requested.len(),"omitted_items":0});
+    Some(())
 }
 
 fn only_keys(object: &Map<String, Value>, keys: &[&str]) -> bool {
