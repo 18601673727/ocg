@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import { useTheme } from "../appearance/theme-provider";
 import { ProfilePanel } from "../profile/profile-panel";
 import { AddSubscriptionPanel } from "../setup/add-subscription-panel";
+import { ProviderSyncPanel } from "../setup/provider-sync-panel";
 import type { RuntimeSnapshot } from "../runtime/runtime-types";
 import { useI18n, LanguageSwitcher, type I18nKey } from "../i18n";
 import {
@@ -177,6 +178,7 @@ export function SettingsSurface({ snapshot }: { snapshot: RuntimeSnapshot }) {
             <h2 id="settings-providers" tabIndex={-1} className="mb-3 scroll-mt-4 text-base font-semibold">{t("settings.providerModels")}</h2>
             {canonical ? <div className="space-y-4">
               <AddSubscriptionPanel />
+              <ProviderSyncPanel />
               <div className="rounded-lg border border-border p-4">
                 <p className="text-sm leading-6 text-muted-foreground">{t("settings.providerModelsDesc")}</p>
                 <Button className="mt-3 h-auto min-h-11 max-w-full whitespace-normal rounded-md py-2 tracking-normal normal-case" size="sm" onClick={() => router.push(RECONFIGURE_PATH)}>{t("settings.configure")}<ArrowRight className="size-4" /></Button>

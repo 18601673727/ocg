@@ -964,7 +964,31 @@ fn handle_setup(
                     &secret,
                 )?;
                 let models = crate::setup::catalog_models(&body.provider_key, &catalog);
-                provider.catalog = Some(catalog);
+                provider.catalog = Some(catalog.clone());
+                // Enabled models follow the provider's current label and
+                // metadata, and keep the user's variant while it is still
+                // offered. A model the provider no longer lists stays in place
+                // rather than being removed silently; the UI reports it.
+                for model in profile
+                    .models
+                    .values_mut()
+                    .filter(|model| model.provider == body.provider_key)
+                {
+                    let Some(current) = catalog.models.iter().find(|entry| entry.id == model.id)
+                    else {
+                        continue;
+                    };
+                    model.label = Some(current.label.clone());
+                    model.variants = current.metadata.variants.clone().unwrap_or_default();
+                    model.metadata = Some(current.metadata.clone());
+                    let still_offered = model.variant.as_ref().is_some_and(|variant| {
+                        model.variants.is_empty() || model.variants.contains(variant)
+                    });
+                    if !still_offered {
+                        model.variant = current.metadata.variant.clone();
+                    }
+                }
+                profile.validate()?;
                 let revision = service.replace(&body.revision, &profile)?;
                 Ok(
                     serde_json::to_value(crate::contracts::SetupConnectResponse {
@@ -1039,6 +1063,14 @@ fn handle_setup(
                 }
 
                 // Replace this provider's models wholesale; keep other providers.
+                // A variant the user already chose survives re-saving while
+                // the provider still offers it.
+                let previous_variants: std::collections::BTreeMap<String, String> = profile
+                    .models
+                    .iter()
+                    .filter(|(_, model)| model.provider == provider_key)
+                    .filter_map(|(key, model)| Some((key.clone(), model.variant.clone()?)))
+                    .collect();
                 profile.models.retain(|_, m| m.provider != provider_key);
                 for selection in &body.models {
                     let discovered = catalog
@@ -1048,13 +1080,19 @@ fn handle_setup(
                         .ok_or_else(|| {
                             OcgError::config("selected model is no longer in the catalog")
                         })?;
+                    let variants = discovered.metadata.variants.clone().unwrap_or_default();
+                    let variant = previous_variants
+                        .get(&selection.key)
+                        .filter(|variant| variants.is_empty() || variants.contains(variant))
+                        .cloned()
+                        .or_else(|| discovered.metadata.variant.clone());
                     profile.models.insert(
                         selection.key.clone(),
                         crate::profile::Model {
                             provider: provider_key.clone(),
                             id: selection.id.clone(),
-                            variant: discovered.metadata.variant.clone(),
-                            variants: discovered.metadata.variants.clone().unwrap_or_default(),
+                            variant,
+                            variants,
                             label: Some(discovered.label.clone()),
                             metadata: Some(discovered.metadata.clone()),
                         },
