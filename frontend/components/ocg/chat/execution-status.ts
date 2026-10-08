@@ -179,6 +179,12 @@ export function callKindOf(call: ExecutionCall): "provider" | "native" | null {
   return request === null ? null : request.provider ? "provider" : "native";
 }
 
+/** The canonical native tool name, when the Call request identifies one. */
+export function nativeToolNameOf(call: ExecutionCall): string | null {
+  const request = parseRequest(`call:${call.callId}`, call.request);
+  return request && !request.provider ? request.name : null;
+}
+
 /** The reasoning effort a provider dispatch froze, or `null` when its request carried none. */
 export function frozenEffort(execution: JobExecution, dispatchIntentId: string): string | null {
   const intent = execution.dispatchIntents.find(item => item.dispatchIntentId === dispatchIntentId);

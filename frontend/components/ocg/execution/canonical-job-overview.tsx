@@ -1,12 +1,13 @@
 "use client";
 
-import { Check, Circle, X } from "lucide-react";
+import { useState } from "react";
+import { Check, ChevronDown, Circle, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { formatCount, formatDuration } from "@/lib/format";
 import { JOB_STATE, Pill } from "@/components/ocg/primitives";
 import type { CanonicalJobState } from "../contracts";
 import { runtimeStateLabel, useI18n, type I18nKey } from "../i18n";
-import { callKindOf, currentActivity, executionActivity, frozenEffort } from "../chat/execution-status";
+import { callKindOf, currentActivity, executionActivity, frozenEffort, nativeToolNameOf } from "../chat/execution-status";
 import { currentLabel, stepLabel } from "../chat/activity-labels";
 import { isTerminalJobState, summarizeCalls, type JobExecution } from "./domain";
 import { placementOf } from "./placement";
@@ -40,6 +41,15 @@ function shortId(id: string): string {
   return id.length > 18 ? `${id.slice(0, 12)}…${id.slice(-4)}` : id;
 }
 
+const MAX_FAILURE_REASON_LENGTH = 500;
+
+function boundedReason(reason: string): string {
+  const singleLine = reason.replace(/\s+/g, " ").trim();
+  return singleLine.length > MAX_FAILURE_REASON_LENGTH
+    ? `${singleLine.slice(0, MAX_FAILURE_REASON_LENGTH - 1)}…`
+    : singleLine;
+}
+
 /**
  * How one canonical Job executed, read only from its JobExecution: identity,
  * state, generation, frozen target, Attempts, observable activity, Call
@@ -48,6 +58,7 @@ function shortId(id: string): string {
  */
 export function CanonicalJobOverview({ execution }: { execution: JobExecution }) {
   const { t, locale } = useI18n();
+  const [expandedFailures, setExpandedFailures] = useState<Set<string>>(() => new Set());
   const state = JOB_STATE[execution.state];
   const terminal = isTerminalJobState(execution.state);
   const placement = placementOf(execution);
@@ -133,14 +144,44 @@ export function CanonicalJobOverview({ execution }: { execution: JobExecution })
         )}
         {recent.length ? (
           <ol className="space-y-0.5 text-[11px] text-muted-foreground">
-            {recent.map(step => (
-              <li key={step.id} className={cn("flex min-w-0 items-center gap-1.5", step.status === "running" && "text-foreground", step.status === "failed" && "text-destructive")}>
-                {step.status === "done" ? <Check className="size-3 shrink-0" aria-hidden="true" />
-                  : step.status === "failed" ? <X className="size-3 shrink-0" aria-hidden="true" />
-                    : <Circle className="size-3 shrink-0" aria-hidden="true" />}
-                <span className="truncate">{stepLabel(t, step)}</span>
-              </li>
-            ))}
+            {recent.map(step => {
+              const call = execution.calls.find(item => item.callId === step.id);
+              const expandableFailure = step.status === "failed" && Boolean(call && callKindOf(call) === "native" && call.reason?.trim());
+              const expanded = expandedFailures.has(step.id);
+              const toolName = call ? nativeToolNameOf(call) : null;
+              return (
+                <li key={step.id} className={cn("min-w-0", step.status === "failed" && "text-destructive")}>
+                  <div className={cn("flex min-w-0 items-center gap-1.5", step.status === "running" && "text-foreground")}>
+                    {step.status === "done" ? <Check className="size-3 shrink-0" aria-hidden="true" />
+                      : step.status === "failed" ? <X className="size-3 shrink-0" aria-hidden="true" />
+                        : <Circle className="size-3 shrink-0" aria-hidden="true" />}
+                    {expandableFailure ? (
+                      <button
+                        type="button"
+                        className="flex min-w-0 items-center gap-1.5 text-left hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        aria-expanded={expanded}
+                        aria-controls={`failure-${step.id}`}
+                        onClick={() => setExpandedFailures(current => {
+                          const next = new Set(current);
+                          if (next.has(step.id)) next.delete(step.id); else next.add(step.id);
+                          return next;
+                        })}
+                      >
+                        <ChevronDown className={cn("size-3 shrink-0 transition-transform", expanded && "rotate-180")} aria-hidden="true" />
+                        <span className="truncate">{stepLabel(t, step)}</span>
+                      </button>
+                    ) : <span className="truncate">{stepLabel(t, step)}</span>}
+                  </div>
+                  {expandableFailure && expanded && call && (
+                    <dl id={`failure-${step.id}`} className="ml-7 mt-1 space-y-0.5 border-l border-destructive/30 pl-2 text-[10px] text-muted-foreground">
+                      {toolName && <div><dt className="inline">{t("execution.canonical.tool")}: </dt><dd className="inline font-mono">{toolName}</dd></div>}
+                      <div><dt className="inline">{t("execution.canonical.callId")}: </dt><dd className="inline font-mono" >{call.callId}</dd></div>
+                      <div><dt className="inline">{t("execution.canonical.failureReason")}: </dt><dd className="inline break-words">{boundedReason(call.reason!)}</dd></div>
+                    </dl>
+                  )}
+                </li>
+              );
+            })}
           </ol>
         ) : !now && <p className="text-[12px] text-muted-foreground">{t("execution.canonical.noActivity", { generation: execution.generation })}</p>}
       </Section>
