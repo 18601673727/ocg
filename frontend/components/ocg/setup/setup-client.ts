@@ -36,7 +36,8 @@ function errorMessage(value: unknown, fallback: string): string {
 export interface SetupClient {
   connectProvider(name: string, endpoint: string, apiKey: string): Promise<SetupConnectResponse>;
   refreshModels(providerKey: string, revision: string): Promise<SetupConnectResponse>;
-  saveModels(providerKey: string, models: SetupModelSelection[], defaultModel: string, revision: string): Promise<SetupModelsResponse>;
+  /** An absent `defaultModel` keeps the Profile's current default. */
+  saveModels(providerKey: string, models: SetupModelSelection[], defaultModel: string | undefined, revision: string): Promise<SetupModelsResponse>;
   browseDirectory(path?: string): Promise<SetupBrowseResponse>;
   initProject(commandId: string, root: string): Promise<SetupProjectResponse>;
 }
@@ -71,7 +72,7 @@ export function createSetupClient(baseUrl: string, fetchImpl: typeof fetch): Set
       return post("/api/v1/setup/models", {
         provider_key: providerKey,
         models,
-        default_model: defaultModel,
+        default_model: defaultModel ?? null,
         revision,
       }, decodeSetupModelsResponse);
     },

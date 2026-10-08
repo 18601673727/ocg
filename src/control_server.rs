@@ -1030,10 +1030,12 @@ fn handle_setup(
                         ));
                     }
                 }
-                if !body.models.iter().any(|s| s.key == body.default_model) {
-                    return Err(OcgError::config(
-                        "the default model must be one of the selected models",
-                    ));
+                if let Some(default_model) = &body.default_model {
+                    if !body.models.iter().any(|s| &s.key == default_model) {
+                        return Err(OcgError::config(
+                            "the default model must be one of the selected models",
+                        ));
+                    }
                 }
 
                 // Replace this provider's models wholesale; keep other providers.
@@ -1059,14 +1061,26 @@ fn handle_setup(
                     );
                 }
 
-                profile.default_model = Some(body.default_model.clone());
+                // Without an explicit default, keep the current one if it
+                // survived this provider's model replacement.
+                let default_model = body
+                    .default_model
+                    .clone()
+                    .or_else(|| {
+                        profile
+                            .default_model
+                            .clone()
+                            .filter(|key| profile.models.contains_key(key))
+                    })
+                    .ok_or_else(|| OcgError::config("choose a default model"))?;
+                profile.default_model = Some(default_model.clone());
                 profile.validate()?;
 
                 // Backend readiness is the only authority on whether setup may
                 // continue. Anything less than one runnable choice is reported
                 // as a failure instead of a silent success.
                 let runnable = profile.executable_choices(&crate::vault::Vault::user_global()?);
-                if !runnable.contains(&body.default_model) {
+                if !runnable.contains(&default_model) {
                     return Err(OcgError::config(
                         "selected default model is not executable: check provider configuration",
                     ));
@@ -1077,7 +1091,7 @@ fn handle_setup(
                 Ok(serde_json::to_value(crate::contracts::SetupModelsResponse {
                     api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
                     selected_models: selected.into_iter().cloned().collect(),
-                    default_model: body.default_model.clone(),
+                    default_model,
                     runnable_choices: runnable,
                     revision: new_revision.clone(),
                 })

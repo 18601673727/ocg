@@ -239,6 +239,21 @@ pub fn discover_models_url(
         if models.iter().any(|model: &CatalogModel| model.id == id) {
             continue;
         }
+        // Gateways such as Command Code mix models served only on other
+        // endpoints (for example `/messages`) into one catalog. OCG dispatches
+        // to chat completions, so such a model would fail at dispatch time.
+        // A catalog that declares no endpoints is assumed to be chat-capable.
+        if entry
+            .get("supported_endpoints")
+            .and_then(Value::as_array)
+            .is_some_and(|endpoints| {
+                !endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.as_str() == Some("/chat/completions"))
+            })
+        {
+            continue;
+        }
         models.push(CatalogModel {
             id: id.to_string(),
             label: ["label", "display_name", "name"]

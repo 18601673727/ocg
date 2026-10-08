@@ -10,6 +10,7 @@ import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
 import { createHttpCanonicalControlClient } from "../runtime/canonical-client";
 import { createSetupClient } from "./setup-client";
+import { PROVIDER_PRESETS } from "./provider-presets";
 import { resolveProjectParam, withProjectParam, type ProjectId } from "../project/domain";
 import type { ProfileView, SetupModel, SetupBrowseResponse } from "../contracts";
 
@@ -35,12 +36,6 @@ interface ProviderState {
   name: string;
   endpoint: string;
 }
-
-/** Known OpenAI-compatible services; selecting one only prefills the form. */
-const PROVIDER_PRESETS: readonly { id: string; label: string; endpoint: string }[] = [
-  { id: "opencode-go", label: "OpenCode Go", endpoint: "https://opencode.ai/zen/go/v1" },
-  { id: "command-code", label: "Command Code Plan", endpoint: "https://api.commandcode.ai/provider/v1" },
-];
 
 interface ConnectResult {
   providerKey: string;

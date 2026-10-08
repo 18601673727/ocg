@@ -543,8 +543,11 @@ pub struct SetupModelsRequest {
     pub provider_key: String,
     /// Models to enable, each carrying the OCG key and the upstream provider model id.
     pub models: Vec<SetupModelSelection>,
-    /// Default model key.
-    pub default_model: String,
+    /// Default model key. Absent keeps the Profile's current default, which is
+    /// how an additional subscription is added without changing what new Chats
+    /// use; it is required when the Profile has no usable default yet.
+    #[serde(default)]
+    pub default_model: Option<String>,
     /// Profile revision for optimistic locking.
     pub revision: String,
 }

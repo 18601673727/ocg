@@ -636,9 +636,11 @@ provider_key: string,
  */
 models: Array<SetupModelSelection>,
 /**
- * Default model key.
+ * Default model key. Absent keeps the Profile's current default, which is
+ * how an additional subscription is added without changing what new Chats
+ * use; it is required when the Profile has no usable default yet.
  */
-default_model: string,
+default_model: string | null,
 /**
  * Profile revision for optimistic locking.
  */
