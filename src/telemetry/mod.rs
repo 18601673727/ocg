@@ -22,7 +22,7 @@ pub mod task;
 pub mod tokens;
 
 pub use stats::{Aggregate, TelemetryStats};
-pub use store::{EventLog, TelemetryStore, TELEMETRY_DIR, TELEMETRY_FILE};
+pub use store::{EventLog, TelemetryStore};
 pub use task::{
     ContextMetrics, Event, LogMetrics, OrchestrationMetrics, Outcome, RepoMetrics,
     VerificationMetrics, EVENT_SCHEMA_VERSION, REDACTED,
@@ -107,19 +107,6 @@ impl TelemetryConfig {
         }
         Ok(())
     }
-
-    /// Apply the optional `OCG_TELEMETRY` override. Only an explicit
-    /// on/off value changes the policy; anything else is ignored.
-    pub fn with_env_override(mut self, raw: Option<&str>) -> Self {
-        if let Some(raw) = raw {
-            match raw.trim().to_ascii_lowercase().as_str() {
-                "0" | "false" | "off" | "no" | "disabled" => self.enabled = false,
-                "1" | "true" | "on" | "yes" | "enabled" => self.enabled = true,
-                _ => {}
-            }
-        }
-        self
-    }
 }
 
 /// Append one event, returning human-readable warnings instead of failing the
@@ -170,15 +157,16 @@ pub fn verification_outcome(report: &VerificationReport) -> Outcome {
 
 /// Raw-versus-distilled byte accounting for a report.
 ///
-/// Raw bytes come from the stored raw log files; distilled bytes are the
+/// Raw bytes come from the stored raw logs; distilled bytes are the
 /// deterministic JSON size of the distilled output. No log content is copied.
 pub fn log_metrics(root: &Path, report: &VerificationReport) -> LogMetrics {
     let mut raw_bytes = 0u64;
     let mut distilled_bytes = 0u64;
+    let logs = crate::verification::logs::LogStore::new(root);
     for result in &report.results {
-        if let Some(relative) = &result.raw_log {
-            if let Ok(metadata) = std::fs::metadata(root.join(relative)) {
-                raw_bytes = raw_bytes.saturating_add(metadata.len());
+        if let Some(reference) = &result.raw_log {
+            if let Some(bytes) = logs.size(reference) {
+                raw_bytes = raw_bytes.saturating_add(bytes);
             }
         }
         if let Ok(bytes) = serde_json::to_vec(&result.output) {

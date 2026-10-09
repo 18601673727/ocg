@@ -1,42 +1,65 @@
 use crate::context::{classify, repomap};
 use crate::error::{OcgError, Result};
 use crate::process::{CaptureRunner, ProcessExit};
-use fs2::FileExt;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata};
 use std::io::Read;
 use std::path::{Component, Path};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH};
 
 const MAX_FILES: usize = 20_000;
 pub(crate) const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_TEXT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CHUNKS: usize = 100_000;
 const CHUNK_BYTES: usize = 4096;
-const SCHEMA: &str = "
-PRAGMA auto_vacuum=FULL;
-PRAGMA max_page_count=131072;
-CREATE TABLE IF NOT EXISTS manifest (
- path TEXT PRIMARY KEY, size INTEGER NOT NULL, stamp TEXT NOT NULL,
- revision TEXT NOT NULL, state TEXT NOT NULL, chunk_count INTEGER NOT NULL, indexed_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS chunk_content (
- id INTEGER PRIMARY KEY, path TEXT NOT NULL, content TEXT NOT NULL,
- line_start INTEGER NOT NULL, line_end INTEGER NOT NULL, revision TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS chunk_path ON chunk_content(path);
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(content, content='chunk_content', content_rowid='id');
-CREATE TRIGGER IF NOT EXISTS chunk_insert AFTER INSERT ON chunk_content BEGIN
- INSERT INTO chunks(rowid,content) VALUES(new.id,new.content);
+/// Changed files applied per write transaction, so a refresh holds the
+/// database's writer lock only briefly and other Projects keep executing.
+const FILES_PER_BATCH: usize = 64;
+
+/// The Project context index tables in the OCG database: a manifest of the
+/// Project's files and their chunks under an FTS5 index. Every row belongs to
+/// one Project; the index is derived and rebuilt from the Project's files.
+pub(crate) const SCHEMA: &str = r#"
+CREATE TABLE context_manifest (
+    project_id TEXT NOT NULL REFERENCES domain_projects(id),
+    path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    stamp TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('indexed','binary','excluded','large','capacity')),
+    chunk_count INTEGER NOT NULL,
+    indexed_at INTEGER NOT NULL,
+    PRIMARY KEY(project_id, path)
+) STRICT;
+CREATE TABLE context_chunk_content (
+    id INTEGER PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES domain_projects(id),
+    path TEXT NOT NULL,
+    content TEXT NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end INTEGER NOT NULL,
+    revision TEXT NOT NULL
+) STRICT;
+CREATE INDEX context_chunk_path ON context_chunk_content(project_id, path);
+CREATE VIRTUAL TABLE context_chunks USING fts5(content, content='context_chunk_content', content_rowid='id');
+CREATE TRIGGER context_chunk_insert AFTER INSERT ON context_chunk_content BEGIN
+    INSERT INTO context_chunks(rowid,content) VALUES(new.id,new.content);
 END;
-CREATE TRIGGER IF NOT EXISTS chunk_delete AFTER DELETE ON chunk_content BEGIN
- INSERT INTO chunks(chunks,rowid,content) VALUES('delete',old.id,old.content);
+CREATE TRIGGER context_chunk_delete AFTER DELETE ON context_chunk_content BEGIN
+    INSERT INTO context_chunks(context_chunks,rowid,content) VALUES('delete',old.id,old.content);
 END;
-CREATE TABLE IF NOT EXISTS identity (root TEXT NOT NULL);
-PRAGMA user_version=1;";
+-- Bounded validation evidence, at most 128 recent records per Project.
+CREATE TABLE context_validation_evidence (
+    project_id TEXT NOT NULL REFERENCES domain_projects(id),
+    call_id TEXT NOT NULL,
+    finished INTEGER NOT NULL,
+    body TEXT NOT NULL CHECK(length(body)<=8192),
+    PRIMARY KEY(project_id, call_id)
+) STRICT;
+"#;
 
 #[derive(Debug, thiserror::Error)]
 enum IndexError {
@@ -48,15 +71,6 @@ enum IndexError {
     Ocg(#[from] OcgError),
     #[error("{0}")]
     Boundary(String),
-    #[error("unsupported context index version")]
-    Version,
-}
-
-fn rebuildable(error: &IndexError) -> bool {
-    matches!(error, IndexError::Version)
-        || matches!(error,
-        IndexError::Sql(rusqlite::Error::SqliteFailure(error, _))
-        if matches!(error.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))
 }
 
 type IndexResult<T> = std::result::Result<T, IndexError>;
@@ -85,6 +99,22 @@ struct Entry {
     chunk_count: usize,
 }
 
+/// One change a refresh applies to the stored index.
+enum Change {
+    /// The file is gone from the Project.
+    Delete(String),
+    /// The file's manifest row, and its new content when that changed.
+    Upsert {
+        path: String,
+        size: u64,
+        stamp: String,
+        revision: String,
+        state: String,
+        chunk_count: usize,
+        content: Option<Option<String>>,
+    },
+}
+
 fn active(cancelled: &dyn Fn() -> bool) -> IndexResult<()> {
     if cancelled() {
         return Err(IndexError::Boundary("context search cancelled".into()));
@@ -110,7 +140,19 @@ pub(crate) fn search(
             "context query requires word tokens and limit 1..50",
         ));
     }
-    let result = search_locked(root, prefix, &terms.join(" AND "), limit, runner, cancelled);
+    let result = (|| {
+        let (mut connection, project_id) = open_index(root)?;
+        refresh_and_query(
+            &mut connection,
+            &project_id,
+            root,
+            prefix,
+            &terms.join(" AND "),
+            limit,
+            runner,
+            cancelled,
+        )
+    })();
     result.map_err(|error| OcgError::config(format!("Project context index: {error}")))
 }
 
@@ -118,36 +160,47 @@ fn confined(root: &Path, path: &Path) -> IndexResult<()> {
     if fs::symlink_metadata(path)?.file_type().is_symlink()
         || !path.canonicalize()?.starts_with(root)
     {
-        return Err(IndexError::Boundary(
-            "index state or source escapes Project root".into(),
-        ));
+        return Err(IndexError::Boundary("source escapes Project root".into()));
     }
     Ok(())
 }
 
-fn state_exists(root: &Path, path: &Path) -> IndexResult<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            confined(root, path)?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
+/// The index a search refreshes and queries, and the Project it belongs to.
+///
+/// Unconfined, that is the Project's index in the OCG database. A confined
+/// helper cannot write OCG state at all: it seeds a bounded in-memory index
+/// from the read-only Project snapshot it was given, refreshes that copy and
+/// queries it. Nothing it computes outlives the call.
+fn open_index(root: &Path) -> IndexResult<(Connection, String)> {
+    if crate::remote_execution::native_confined() {
+        let snapshot = std::env::var_os("OCG_NATIVE_DOMAIN_SNAPSHOT").ok_or_else(|| {
+            IndexError::Boundary("confined context search needs a Project snapshot".into())
+        })?;
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(SCHEMA)?;
+        connection.execute(
+            "ATTACH DATABASE ?1 AS seed",
+            [Path::new(&snapshot).to_string_lossy().as_ref()],
+        )?;
+        let project_id: String =
+            connection.query_row("SELECT id FROM seed.domain_projects", [], |row| row.get(0))?;
+        connection.execute_batch(
+            "INSERT INTO main.context_manifest SELECT * FROM seed.context_manifest;
+             INSERT INTO main.context_chunk_content SELECT * FROM seed.context_chunk_content;",
+        )?;
+        connection.execute_batch("DETACH DATABASE seed;")?;
+        return Ok((connection, project_id));
     }
+    let project_id = crate::project_store::ProjectDocuments::for_root(root)?
+        .project_id()
+        .to_string();
+    Ok((crate::database::connect()?, project_id))
 }
 
-fn ensure_directory(root: &Path, path: &Path) -> IndexResult<()> {
-    if !state_exists(root, path)? {
-        match fs::create_dir(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    confined(root, path)
-}
-
-fn search_locked(
+#[allow(clippy::too_many_arguments)]
+fn refresh_and_query(
+    connection: &mut Connection,
+    project_id: &str,
     root: &Path,
     prefix: &Path,
     query: &str,
@@ -156,104 +209,12 @@ fn search_locked(
     cancelled: &dyn Fn() -> bool,
 ) -> IndexResult<Value> {
     let started = Instant::now();
-    let state = root.join(repomap::OCG_DIR);
-    ensure_directory(root, &state)?;
-    let directory = state.join(crate::context::index::INDEX_DIR);
-    ensure_directory(root, &directory)?;
-    let lock_path = directory.join("context-fulltext.lock");
-    state_exists(root, &lock_path)?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)?;
-    loop {
-        active(cancelled)?;
-        match lock.try_lock_exclusive() {
-            Ok(()) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let database = directory.join("context-fulltext.sqlite3");
-    for suffix in ["", "-journal", "-wal", "-shm"] {
-        let path = directory.join(format!("context-fulltext.sqlite3{suffix}"));
-        state_exists(root, &path)?;
-    }
-    let mut rebuilt = !state_exists(root, &database)?;
-    // The lock covers connection lifetime, refresh, query and corruption recovery.
-    // Only this derived database is discarded; canonical state is never opened here.
-    for retry in 0..2 {
-        active(cancelled)?;
-        let outcome = (|| {
-            let mut connection = Connection::open(&database)?;
-            connection.busy_timeout(Duration::from_millis(100))?;
-            let version: i64 =
-                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            if version != 0 && version != 1 {
-                return Err(IndexError::Version);
-            }
-            connection.execute_batch(SCHEMA)?;
-            let stored_root: Option<String> = connection
-                .query_row("SELECT root FROM identity", [], |row| row.get(0))
-                .optional()?;
-            let current_root = root.to_string_lossy();
-            if stored_root.as_deref() != Some(current_root.as_ref()) {
-                connection.execute_batch(
-                    "DELETE FROM manifest; DELETE FROM chunk_content; DELETE FROM identity;",
-                )?;
-                connection.execute("INSERT INTO identity VALUES (?1)", [current_root.as_ref()])?;
-                rebuilt = true;
-            }
-            refresh_and_query(
-                &mut connection,
-                root,
-                prefix,
-                query,
-                limit,
-                runner,
-                cancelled,
-                started,
-                rebuilt,
-            )
-        })();
-        match outcome {
-            Err(ref error) if retry == 0 && rebuildable(error) => {
-                for suffix in ["", "-journal", "-wal", "-shm"] {
-                    let path = directory.join(format!("context-fulltext.sqlite3{suffix}"));
-                    if state_exists(root, &path)? {
-                        fs::remove_file(path)?;
-                    }
-                }
-                rebuilt = true;
-            }
-            other => return other,
-        }
-    }
-    Err(IndexError::Boundary("cannot rebuild context index".into()))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn refresh_and_query(
-    connection: &mut Connection,
-    root: &Path,
-    prefix: &Path,
-    query: &str,
-    limit: usize,
-    runner: &dyn CaptureRunner,
-    cancelled: &dyn Fn() -> bool,
-    started: Instant,
-    rebuilt: bool,
-) -> IndexResult<Value> {
     let paths = discover(root, runner, cancelled)?;
-    let transaction = connection.transaction()?;
     let prior: BTreeMap<String, Entry> = {
-        let mut statement = transaction
-            .prepare("SELECT path,size,stamp,revision,state,chunk_count FROM manifest")?;
-        let rows = statement.query_map([], |row| {
+        let mut statement = connection.prepare(
+            "SELECT path,size,stamp,revision,state,chunk_count FROM context_manifest WHERE project_id=?1",
+        )?;
+        let rows = statement.query_map([project_id], |row| {
             Ok((
                 row.get(0)?,
                 Entry {
@@ -269,19 +230,17 @@ fn refresh_and_query(
     };
     let mut stats = Refresh {
         files_discovered: paths.len(),
-        rebuilt,
+        rebuilt: prior.is_empty(),
         ..Refresh::default()
     };
-    for deleted in prior.keys().filter(|path| !paths.contains(*path)) {
-        active(cancelled)?;
-        transaction.execute("DELETE FROM chunk_content WHERE path=?1", [deleted])?;
-        transaction.execute("DELETE FROM manifest WHERE path=?1", [deleted])?;
-        stats.deleted_files += 1;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| IndexError::Boundary(error.to_string()))?
-        .as_secs();
+    // Everything that reads the Project happens here, with no transaction
+    // open; only the resulting changes are written.
+    let mut changes: Vec<Change> = prior
+        .keys()
+        .filter(|path| !paths.contains(*path))
+        .map(|path| Change::Delete(path.clone()))
+        .collect();
+    stats.deleted_files = changes.len();
     let mut material = String::new();
     let mut total_bytes = 0u64;
     let mut total_chunks = 0usize;
@@ -300,8 +259,7 @@ fn refresh_and_query(
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) | Err(_) => {
                 // A disappearing file or symlink cannot keep a previously searchable entry.
-                transaction.execute("DELETE FROM chunk_content WHERE path=?1", [path])?;
-                transaction.execute("DELETE FROM manifest WHERE path=?1", [path])?;
+                changes.push(Change::Delete(path.clone()));
                 stale = true;
                 continue;
             }
@@ -377,15 +335,20 @@ fn refresh_and_query(
                 old.is_some_and(|old| old.revision == revision && old.state == state);
             if !same_content {
                 stats.changed_files += 1;
-                transaction.execute("DELETE FROM chunk_content WHERE path=?1", [path])?;
                 if let Some(content) = content.as_deref() {
-                    insert_chunks(&transaction, path, content, &revision, cancelled)?;
                     stats.files_reindexed += 1;
                     stats.bytes_indexed += content.len() as u64;
                 }
             }
-            transaction.execute("INSERT INTO manifest VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(path) DO UPDATE SET size=excluded.size,stamp=excluded.stamp,revision=excluded.revision,state=excluded.state,chunk_count=excluded.chunk_count,indexed_at=CASE WHEN manifest.revision=excluded.revision AND manifest.state=excluded.state THEN manifest.indexed_at ELSE excluded.indexed_at END",
-                params![path, metadata.len().min(i64::MAX as u64) as i64, stamp, revision, state, chunk_count as i64, now as i64])?;
+            changes.push(Change::Upsert {
+                path: path.clone(),
+                size: metadata.len(),
+                stamp,
+                revision: revision.clone(),
+                state: state.to_string(),
+                chunk_count,
+                content: (!same_content).then_some(content),
+            });
         } else if let Some(old) = old {
             state = &old.state;
         }
@@ -399,6 +362,14 @@ fn refresh_and_query(
                 .map_err(|error| IndexError::Boundary(error.to_string()))?,
         );
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| IndexError::Boundary(error.to_string()))?
+        .as_secs();
+    for batch in changes.chunks(FILES_PER_BATCH) {
+        active(cancelled)?;
+        apply(connection, project_id, batch, now, cancelled)?;
+    }
     active(cancelled)?;
     let prefix = prefix.to_string_lossy().replace('\\', "/");
     let prefix = if prefix.is_empty() {
@@ -410,8 +381,8 @@ fn refresh_and_query(
     let mut match_bytes = 0;
     let mut truncated = false;
     {
-        let mut statement = transaction.prepare("SELECT c.path,c.line_start,c.line_end,snippet(chunks,0,'','',' … ',48),c.revision FROM chunks JOIN chunk_content c ON c.id=chunks.rowid WHERE chunks MATCH ?1 AND (?2='' OR substr(c.path,1,length(?2))=?2) ORDER BY rank,c.path,c.line_start LIMIT ?3")?;
-        let mut rows = statement.query(params![query, prefix, (limit + 1) as i64])?;
+        let mut statement = connection.prepare("SELECT c.path,c.line_start,c.line_end,snippet(context_chunks,0,'','',' … ',48),c.revision FROM context_chunks JOIN context_chunk_content c ON c.id=context_chunks.rowid WHERE context_chunks MATCH ?1 AND c.project_id=?4 AND (?2='' OR substr(c.path,1,length(?2))=?2) ORDER BY rank,c.path,c.line_start LIMIT ?3")?;
+        let mut rows = statement.query(params![query, prefix, (limit + 1) as i64, project_id])?;
         while let Some(row) = rows.next()? {
             active(cancelled)?;
             let snippet: String = row.get(3)?;
@@ -435,14 +406,69 @@ fn refresh_and_query(
             ));
         }
     }
-    active(cancelled)?;
-    transaction.commit()?;
     stats.total_bytes_indexed = total_bytes;
     stats.elapsed_ms = started.elapsed().as_millis();
     Ok(
         json!({"matches":matches, "index_revision":format!("sha256:{}",crate::hash::sha256_hex(material.as_bytes())),
         "stale":stale, "truncated":truncated, "coverage_limited":stats.limited, "refresh":stats}),
     )
+}
+
+/// Apply one batch of changes in one short write transaction. A file's
+/// manifest row and its chunks change together.
+fn apply(
+    connection: &mut Connection,
+    project_id: &str,
+    batch: &[Change],
+    now: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> IndexResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for change in batch {
+        active(cancelled)?;
+        match change {
+            Change::Delete(path) => {
+                transaction.execute(
+                    "DELETE FROM context_chunk_content WHERE project_id=?1 AND path=?2",
+                    params![project_id, path],
+                )?;
+                transaction.execute(
+                    "DELETE FROM context_manifest WHERE project_id=?1 AND path=?2",
+                    params![project_id, path],
+                )?;
+            }
+            Change::Upsert {
+                path,
+                size,
+                stamp,
+                revision,
+                state,
+                chunk_count,
+                content,
+            } => {
+                if let Some(content) = content {
+                    transaction.execute(
+                        "DELETE FROM context_chunk_content WHERE project_id=?1 AND path=?2",
+                        params![project_id, path],
+                    )?;
+                    if let Some(content) = content.as_deref() {
+                        insert_chunks(
+                            &transaction,
+                            project_id,
+                            path,
+                            content,
+                            revision,
+                            cancelled,
+                        )?;
+                    }
+                }
+                transaction.execute("INSERT INTO context_manifest(project_id,path,size,stamp,revision,state,chunk_count,indexed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(project_id,path) DO UPDATE SET size=excluded.size,stamp=excluded.stamp,revision=excluded.revision,state=excluded.state,chunk_count=excluded.chunk_count,indexed_at=CASE WHEN context_manifest.revision=excluded.revision AND context_manifest.state=excluded.state THEN context_manifest.indexed_at ELSE excluded.indexed_at END",
+                    params![project_id, path, (*size).min(i64::MAX as u64) as i64, stamp, revision, state, *chunk_count as i64, now as i64])?;
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 pub(crate) fn metadata_stamp(metadata: &Metadata) -> String {
@@ -480,67 +506,42 @@ pub(crate) fn status(
 ) -> Result<Value> {
     let read = || -> IndexResult<Value> {
         active(cancelled)?;
-        let directory = root.join(".ocg/index");
-        for path in [root.join(".ocg"), directory.clone()] {
-            if !state_exists(root, &path)? {
-                return Ok(json!({"available":false,"reason":"index_missing"}));
-            }
-        }
-        let database = directory.join("context-fulltext.sqlite3");
-        if !state_exists(root, &database)? {
+        // Status inspects the existing derived manifest. It never creates,
+        // repairs or refreshes an index, and never reads chunk content.
+        let (connection, project_id) = if crate::remote_execution::native_confined() {
+            let Some(snapshot) = std::env::var_os("OCG_NATIVE_DOMAIN_SNAPSHOT") else {
+                return Ok(json!({"available":false,"reason":"index_unavailable"}));
+            };
+            let connection =
+                Connection::open_with_flags(snapshot, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let project_id: Option<String> = connection
+                .query_row("SELECT id FROM domain_projects", [], |row| row.get(0))
+                .optional()?;
+            (connection, project_id)
+        } else {
+            let project_id = crate::project_store::ProjectDocuments::existing(root)?
+                .map(|documents| documents.project_id().to_string());
+            (crate::database::connect()?, project_id)
+        };
+        let Some(project_id) = project_id else {
+            return Ok(json!({"available":false,"reason":"index_missing"}));
+        };
+        let count: i64 = connection.query_row(
+            "SELECT count(*) FROM context_manifest WHERE project_id=?1",
+            [&project_id],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
             return Ok(json!({"available":false,"reason":"index_missing"}));
         }
-        let lock_path = directory.join("context-fulltext.lock");
-        if !state_exists(root, &lock_path)? {
-            return Ok(json!({"available":false,"reason":"index_unavailable"}));
-        }
-        let lock = File::open(lock_path)?;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        loop {
-            active(cancelled)?;
-            match FileExt::try_lock_shared(&lock) {
-                Ok(()) => break,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10))
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        for suffix in ["-journal", "-wal", "-shm"] {
-            state_exists(
-                root,
-                &directory.join(format!("context-fulltext.sqlite3{suffix}")),
-            )?;
-        }
-        // Snapshot inspects the existing derived manifest. It never creates,
-        // repairs or refreshes an index, and never reads chunk content.
-        let connection =
-            Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        connection.busy_timeout(Duration::from_millis(100))?;
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 1 {
-            return Err(IndexError::Version);
-        }
-        let identity: String =
-            connection.query_row("SELECT root FROM identity", [], |row| row.get(0))?;
-        if identity != root.to_string_lossy() {
-            return Ok(json!({"available":false,"reason":"index_identity_changed"}));
-        }
-        connection.prepare("SELECT rowid FROM chunks LIMIT 0")?;
-        connection.prepare("SELECT id FROM chunk_content LIMIT 0")?;
-        let count: i64 =
-            connection.query_row("SELECT count(*) FROM manifest", [], |row| row.get(0))?;
         if !(0..=MAX_FILES as i64).contains(&count) {
             return Err(IndexError::Boundary("manifest exceeds bounds".into()));
         }
         let paths = discover(root, runner, cancelled)?;
         let mut statement = connection.prepare(
-            "SELECT path,size,stamp,revision,state,indexed_at FROM manifest ORDER BY path",
+            "SELECT path,size,stamp,revision,state,indexed_at FROM context_manifest WHERE project_id=?1 ORDER BY path",
         )?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query([&project_id])?;
         let mut material = String::new();
         let mut indexed = 0;
         let mut skipped = 0;
@@ -633,15 +634,17 @@ fn chunks(content: &str) -> Vec<(usize, usize, i64, i64)> {
 
 fn insert_chunks(
     transaction: &rusqlite::Transaction<'_>,
+    project_id: &str,
     path: &str,
     content: &str,
     revision: &str,
     cancelled: &dyn Fn() -> bool,
 ) -> IndexResult<()> {
-    let mut statement = transaction.prepare("INSERT INTO chunk_content(path,content,line_start,line_end,revision) VALUES (?1,?2,?3,?4,?5)")?;
+    let mut statement = transaction.prepare("INSERT INTO context_chunk_content(project_id,path,content,line_start,line_end,revision) VALUES (?1,?2,?3,?4,?5,?6)")?;
     for (start, end, line_start, line_end) in chunks(content) {
         active(cancelled)?;
         statement.execute(params![
+            project_id,
             path,
             &content[start..end],
             line_start,

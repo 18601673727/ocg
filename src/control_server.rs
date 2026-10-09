@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -58,10 +58,6 @@ pub const DEFAULT_HEARTBEAT_MS: u64 = 10_000;
 pub const DEFAULT_WRITE_TIMEOUT_MS: u64 = 15_000;
 /// Default per-socket read timeout.
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 10_000;
-/// How long a Profile read waits on the OS credential store, which may be
-/// holding an approval prompt nobody is answering, before it reports
-/// `credential_store_pending` instead.
-const PROFILE_READ_CREDENTIAL_WAIT: Duration = Duration::from_secs(5);
 
 /// Server limits and timings. Every field has a bounded default.
 #[derive(Debug, Clone)]
@@ -153,40 +149,28 @@ impl ControlServer {
     /// Validate the address and diagnostics, bind the listener, and open the
     /// authoritative service. Only loopback addresses are accepted.
     pub fn bind(addr: &str, root: &Path, config: ServerConfig) -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from);
-        let profile = crate::config::user_config_path(
-            None,
-            std::env::var_os("OCG_USER_CONFIG")
-                .as_deref()
-                .map(Path::new),
-            std::env::var_os("XDG_CONFIG_HOME")
-                .as_deref()
-                .map(Path::new),
-            home.as_deref(),
-        );
-        Self::bind_with_profile(addr, root, &profile, config, false)
+        Self::bind_with_store(
+            addr,
+            root,
+            &crate::core_store::CoreStore::locate()?,
+            config,
+            false,
+        )
     }
 
-    /// Bind using a user-global profile while keeping durable project state at
+    /// Bind over this installation's store while serving the Project at
     /// `root`.
-    pub fn bind_with_profile(
+    pub fn bind_with_store(
         addr: &str,
         root: &Path,
-        profile_path: &Path,
+        store: &crate::core_store::CoreStore,
         config: ServerConfig,
         disable_proxy: bool,
     ) -> Result<Self> {
         let authentication = crate::control_security::Authentication::from_env()?;
         let remote_execution = crate::remote_execution::RemoteExecution::from_env()?;
         if let Some(confinement) = &remote_execution {
-            confinement.accepts_storage(profile_path)?;
-            for name in ["OCG_VAULT_PATH", "OCG_VAULT_KEY_FILE"] {
-                if let Some(path) = std::env::var_os(name) {
-                    confinement.accepts_storage(Path::new(&path))?;
-                }
-            }
+            confinement.accepts_storage(&store.path())?;
             confinement.verify(root)?;
         }
         let requested = parse_loopback_addr(addr)?;
@@ -210,8 +194,7 @@ impl ControlServer {
 
         let service =
             crate::orchestration::canonical_control::CanonicalControlService::open_process(
-                root,
-                profile_path,
+                root, store,
             )?;
         let security = Arc::new(RequestSecurity {
             authentication,
@@ -224,7 +207,7 @@ impl ControlServer {
         // already known to this process. It is handed to the UI as the
         // explicit Project of this launch instead of leaving the UI to pick one
         // from a persisted browser selection or a list ordering.
-        let startup_project = if boundary.has_marker() {
+        let startup_project = if boundary.is_registered() {
             let registered =
                 service.register_project("startup-register", boundary.root(), now_unix())?;
             Some(registered.project.project_id)
@@ -269,7 +252,7 @@ impl ControlServer {
             listener,
             addr: bound,
             canonical,
-            profile: crate::profile::ProfileService::with_workspace(profile_path, root),
+            profile: crate::profile::ProfileService::new(store.clone()),
             config,
             active: Arc::new(AtomicUsize::new(0)),
             active_streams: Arc::new(AtomicUsize::new(0)),
@@ -458,6 +441,9 @@ fn api_error_for(error: &OcgError) -> ApiError {
     match error {
         OcgError::SpawnRefused { reason, message } => {
             ApiError::new(409, reason.code(), message.clone())
+        }
+        OcgError::ConfigurationConflict(message) => {
+            ApiError::new(409, "configuration_conflict", message.clone())
         }
         _ => ApiError::new(400, "invalid_request", error.to_string()),
     }
@@ -1058,7 +1044,7 @@ fn handle_profile(
     let operation = || -> Result<Option<Value>> {
         // A read never waits on the OS credential store past a bound; the
         // mutations keep their existing wait, which follows a committed edit.
-        let view = |wait: Option<Duration>| -> Result<Value> {
+        let view = || -> Result<Value> {
             let current = service.current()?;
             // A declared struct, so the generated TypeScript describes the
             // response the PWA actually receives.
@@ -1066,12 +1052,12 @@ fn handle_profile(
                 api_version: crate::profile::PROVIDER_PROFILE_API_VERSION.to_string(),
                 profile: current.as_ref().map(|(profile, _)| profile.clone()),
                 revision: current.as_ref().map(|(_, revision)| revision.clone()),
-                runnable_choices: service.runnable_choices(wait)?,
+                runnable_choices: service.runnable_choices()?,
             })
             .map_err(|error| OcgError::config(error.to_string()))
         };
         let value = match route {
-            Route::ProfileGet => view(Some(PROFILE_READ_CREDENTIAL_WAIT)),
+            Route::ProfileGet => view(),
             Route::ProfileBootstrap => {
                 let body = request
                     .json_body()
@@ -1086,7 +1072,7 @@ fn handle_profile(
                     }
                     _ => return Err(OcgError::config("choice must be new")),
                 }
-                view(None)
+                view()
             }
             Route::ProfilePut => {
                 let body = request
@@ -1103,7 +1089,7 @@ fn handle_profile(
                 )
                 .map_err(|error| OcgError::config(format!("invalid edited Profile: {error}")))?;
                 service.replace(expected, &profile)?;
-                view(None)
+                view()
             }
             Route::ProfileCredential => {
                 // The secret goes to the Vault only. The response is the
@@ -1117,9 +1103,10 @@ fn handle_profile(
                 .map_err(|error| {
                     OcgError::config(format!("invalid Profile credential: {error}"))
                 })?;
-                let vault = crate::vault::Vault::user_global()?;
-                vault.set(&request.name, &request.value)?;
-                view(None)
+                service
+                    .store()
+                    .set_credential(&request.name, &request.value)?;
+                view()
             }
             _ => return Ok(None),
         }?;
@@ -1132,10 +1119,10 @@ fn handle_profile(
             stream,
             &ApiError::new(404, "not_found", "no such control route"),
         ),
-        Err(OcgError::CredentialStorePending(message)) => write_json_with_origin(
+        Err(OcgError::ConfigurationConflict(message)) => write_json_with_origin(
             stream,
-            503,
-            &ApiError::new(503, "credential_store_pending", message).to_json(),
+            409,
+            &ApiError::new(409, "configuration_conflict", message).to_json(),
             origin.as_deref(),
         ),
         Err(error) => write_json_with_origin(
@@ -1193,14 +1180,11 @@ fn handle_setup(
                 let http = crate::http::NativeHttp::new()?;
                 let catalog = crate::setup::discover_catalog(&http, &body.endpoint, &body.api_key)?;
 
-                // Keys are chosen against the Profile and Vault as committed
-                // now, so concurrent connects add distinct providers exactly
-                // as sequential connects would.
-                let vault = crate::vault::Vault::user_global()?;
-                let (new_revision, provider_key) = service.edit_with_credential(
-                    &vault,
-                    body.api_key.trim(),
-                    |profile, stored| {
+                // Keys are chosen against the Profile and credentials as
+                // committed now; a concurrent connect that commits first
+                // makes this one a revision conflict rather than a lost write.
+                let (new_revision, provider_key) =
+                    service.edit_with_credential(body.api_key.trim(), |profile, stored| {
                         let (provider_key, credential_ref) = {
                             let existing_keys: Vec<&str> =
                                 profile.providers.keys().map(String::as_str).collect();
@@ -1228,8 +1212,7 @@ fn handle_setup(
                             },
                         );
                         Ok((credential_ref, provider_key))
-                    },
-                )?;
+                    })?;
                 let models = crate::setup::catalog_models(&provider_key, &catalog);
 
                 Ok(
@@ -1271,10 +1254,10 @@ fn handle_setup(
                     .endpoint
                     .as_deref()
                     .ok_or_else(|| OcgError::config("provider endpoint is missing"))?;
-                let vault = crate::vault::Vault::user_global()?;
                 let secret = match provider.credential_ref.as_deref() {
-                    Some(reference) => vault
-                        .get(reference)?
+                    Some(reference) => service
+                        .store()
+                        .credential(reference)?
                         .ok_or_else(|| OcgError::config("provider credential is missing"))?,
                     None => String::new(),
                 };
@@ -1438,7 +1421,7 @@ fn handle_setup(
                 // Backend readiness is the only authority on whether setup may
                 // continue. Anything less than one runnable choice is reported
                 // as a failure instead of a silent success.
-                let runnable = profile.executable_choices(&crate::vault::Vault::user_global()?);
+                let runnable = profile.executable_choices(&service.store().credential_names()?);
                 if !runnable.contains(&default_model) {
                     return Err(OcgError::config(
                         "selected default model is not executable: check provider configuration",
@@ -1497,10 +1480,7 @@ fn handle_setup(
                 )
                 .map_err(|error| OcgError::config(format!("invalid setup project: {error}")))?;
 
-                let root = Path::new(&body.root);
-
-                // Initialize the .ocg marker if it doesn't exist
-                let canonical_root = crate::setup::initialize_project_marker(root)?;
+                let canonical_root = crate::setup::project_root(Path::new(&body.root))?;
 
                 let canonical = canonical
                     .ok_or_else(|| OcgError::config("Project registry is not available"))?;
@@ -1655,7 +1635,7 @@ fn handle_canonical(
                         .ok_or_else(|| OcgError::config("configuration is required"))?,
                 )
                 .map_err(|error| OcgError::config(error.to_string()))?;
-                answer!(service.set_global_configuration(&id, config, now)?)
+                answer!(service.set_global_configuration(&id, config, expected_revision(&body)?)?)
             }
             Route::CanonicalConfigurationProjectPut { project } => {
                 let body = body()?;
@@ -1664,7 +1644,12 @@ fn handle_canonical(
                     .get("defaults")
                     .cloned()
                     .ok_or_else(|| OcgError::config("defaults are required"))?;
-                answer!(service.set_project_defaults(&id, project, defaults, now)?)
+                answer!(service.set_project_defaults(
+                    &id,
+                    project,
+                    defaults,
+                    expected_revision(&body)?
+                )?)
             }
             Route::CanonicalJobConfigGet { job } => {
                 let stored = service.job_configuration(job)?;
@@ -2771,6 +2756,14 @@ fn principal(
         },
         None => crate::orchestration::domain::JobPrincipal::operator(),
     }
+}
+
+/// The configuration revision a change was computed from. Required, so a
+/// change can never silently replace one it did not see.
+fn expected_revision(body: &Value) -> Result<u64> {
+    body.get("expected_revision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| OcgError::config("expected_revision is required"))
 }
 
 fn safe_id(value: &str) -> std::result::Result<String, ApiError> {

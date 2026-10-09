@@ -479,24 +479,14 @@ pub fn browse_directory(path: &Path) -> Result<DirectoryListing> {
     })
 }
 
-/// Initialize a project by creating the .ocg marker if it doesn't exist.
-pub fn initialize_project_marker(root: &Path) -> Result<PathBuf> {
+/// The canonical root of a directory about to be registered as a Project.
+/// Registration is the declaration; nothing is written into the directory.
+pub fn project_root(root: &Path) -> Result<PathBuf> {
     let canonical =
         std::fs::canonicalize(root).map_err(|e| OcgError::io("canonicalize project root", e))?;
-
     if !canonical.is_dir() {
         return Err(OcgError::config("project root is not a directory"));
     }
-
-    let marker = canonical.join(crate::project::MARKER);
-
-    if !marker.exists() {
-        std::fs::create_dir_all(&marker).map_err(|e| OcgError::io("create .ocg marker", e))?;
-
-        // Create .gitignore in .ocg
-        crate::install::ensure_gitignore(&canonical)?;
-    }
-
     Ok(canonical)
 }
 

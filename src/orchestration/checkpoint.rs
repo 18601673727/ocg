@@ -2,8 +2,8 @@
 //!
 //! A checkpoint records the structured hand-off between orchestration phases:
 //! the task capsule, a Git state fingerprint, verification state, provenance,
-//! decisions and a creation time. It is stored as JSON under
-//! `.ocg/checkpoints/` and loaded with an explicit schema **and
+//! decisions and a creation time. It is stored as a Project document in the
+//! OCG database and loaded with an explicit schema **and
 //! freshness** check: a stale checkpoint is marked stale and can be ignored,
 //! and a corrupt checkpoint is reported, never allowed to block normal `ocg`.
 
@@ -12,15 +12,15 @@ use crate::context::freshness::{validate, Provenance, ENGINE_VERSION};
 use crate::context::gitdiff::{snapshot_fingerprint, GitSnapshot, GitState};
 use crate::error::{OcgError, Result};
 use crate::process::GitHost;
+use crate::project_store::ProjectDocuments;
 use crate::verification::result::VerificationReport;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The checkpoint schema version.
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
-/// The checkpoint directory under `.ocg/`.
-pub const CHECKPOINTS_DIR: &str = "checkpoints";
+/// The document kind checkpoints are stored under.
+const DOCUMENT_KIND: &str = "checkpoint";
 
 /// The canonical phase sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -137,14 +137,13 @@ impl Checkpoint {
         }
     }
 
-    /// Persist atomically under `.ocg/checkpoints/`.
-    pub fn save(&self, root: &Path) -> Result<PathBuf> {
-        crate::install::ensure_gitignore(root)?;
-        let path = checkpoint_path(root, &self.id)?;
-        let value = serde_json::to_value(self)
+    /// Persist as the Project's checkpoint document; returns its id.
+    pub fn save(&self, root: &Path) -> Result<String> {
+        require_safe_id(&self.id)?;
+        let bytes = serde_json::to_vec(self)
             .map_err(|error| OcgError::config(format!("cannot serialize checkpoint: {error}")))?;
-        crate::install::write_json_atomic(&path, &value)?;
-        Ok(path)
+        ProjectDocuments::for_root(root)?.put(DOCUMENT_KIND, &self.id, &bytes)?;
+        Ok(self.id.clone())
     }
 
     /// Whether the checkpoint's sources or Git identity changed.
@@ -236,27 +235,24 @@ pub fn is_safe_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
 }
 
-/// The directory that stores checkpoints.
-pub fn checkpoints_dir(root: &Path) -> PathBuf {
-    root.join(crate::context::repomap::OCG_DIR)
-        .join(CHECKPOINTS_DIR)
-}
-
-/// The path for one checkpoint id.
-pub fn checkpoint_path(root: &Path, id: &str) -> Result<PathBuf> {
+fn require_safe_id(id: &str) -> Result<()> {
     if !is_safe_id(id) {
         return Err(OcgError::config(format!(
             "unsafe checkpoint id '{id}' (expected lowercase letters, digits and '-')"
         )));
     }
-    Ok(checkpoints_dir(root).join(format!("{id}.json")))
+    Ok(())
 }
 
 /// Load one checkpoint by id with an explicit schema and freshness check.
 pub fn load(root: &Path, id: &str, git: &dyn GitHost) -> Result<LoadedCheckpoint> {
-    let path = checkpoint_path(root, id)?;
-    let text = fs::read_to_string(&path).map_err(|error| OcgError::read(&path, error))?;
-    let checkpoint: Checkpoint = serde_json::from_str(&text)
+    require_safe_id(id)?;
+    let bytes = ProjectDocuments::existing(root)?
+        .map(|documents| documents.get(DOCUMENT_KIND, id))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| OcgError::config(format!("checkpoint {id} does not exist")))?;
+    let checkpoint: Checkpoint = serde_json::from_slice(&bytes)
         .map_err(|error| OcgError::config(format!("checkpoint {id} is not valid JSON: {error}")))?;
     if checkpoint.schema_version != CHECKPOINT_SCHEMA_VERSION {
         return Err(OcgError::config(format!(
@@ -274,36 +270,23 @@ pub fn load(root: &Path, id: &str, git: &dyn GitHost) -> Result<LoadedCheckpoint
 /// List every readable checkpoint, newest first. Corrupt files are counted,
 /// never returned, and never abort the listing.
 pub fn list(root: &Path) -> (Vec<CheckpointSummary>, usize) {
-    let dir = checkpoints_dir(root);
-    let Ok(entries) = fs::read_dir(&dir) else {
+    let Ok(Some(documents)) = ProjectDocuments::existing(root) else {
+        return (Vec::new(), 0);
+    };
+    let Ok(entries) = documents.list(DOCUMENT_KIND) else {
         return (Vec::new(), 0);
     };
     let mut summaries = Vec::new();
     let mut corrupt = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .extension()
-            .map(|extension| extension != "json")
-            .unwrap_or(true)
-        {
-            continue;
-        }
-        let Ok(text) = fs::read_to_string(&path) else {
-            corrupt += 1;
-            continue;
-        };
-        match serde_json::from_str::<Checkpoint>(&text) {
+    for entry in entries {
+        match serde_json::from_slice::<Checkpoint>(&entry.value) {
             Ok(checkpoint) if checkpoint.schema_version == CHECKPOINT_SCHEMA_VERSION => {
                 summaries.push(CheckpointSummary {
                     id: checkpoint.id,
                     phase: checkpoint.phase,
                     task: checkpoint.capsule.task,
                     created_at: checkpoint.created_at,
-                    file: path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
+                    file: entry.key,
                 });
             }
             _ => corrupt += 1,

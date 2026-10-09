@@ -6,7 +6,6 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -291,6 +290,25 @@ impl AccessVerifier {
 #[derive(Debug, Clone)]
 pub(crate) struct OwnershipStore(Arc<Mutex<Connection>>);
 
+/// The remote-access identity tables this component contributes to the OCG
+/// database.
+pub(crate) const SCHEMA: &str = r#"
+CREATE TABLE security_users (
+    id TEXT PRIMARY KEY,
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    UNIQUE(issuer, subject)
+) STRICT;
+CREATE TABLE security_project_owners (
+    project_id TEXT PRIMARY KEY REFERENCES domain_projects(id),
+    user_id TEXT NOT NULL REFERENCES security_users(id)
+) STRICT;
+CREATE TABLE security_revoked_sessions (
+    session_id TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL
+) STRICT;
+"#;
+
 pub(crate) fn user_id(issuer: &str, subject: &str) -> String {
     let mut digest = Sha256::new();
     digest.update((issuer.len() as u64).to_be_bytes());
@@ -300,22 +318,9 @@ pub(crate) fn user_id(issuer: &str, subject: &str) -> String {
 }
 
 impl OwnershipStore {
-    pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| OcgError::io("create security state", error))?;
-        }
-        let connection =
-            Connection::open(path).map_err(|_| OcgError::config("cannot open security state"))?;
-        connection
-            .busy_timeout(Duration::from_secs(5))
-            .map_err(|_| invalid())?;
-        connection.execute_batch("PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT NOT NULL, UNIQUE(issuer, subject));
-            CREATE TABLE IF NOT EXISTS project_owners (project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id));
-            CREATE TABLE IF NOT EXISTS revoked_sessions (session_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);")
-            .map_err(|_| OcgError::config("cannot initialize security state"))?;
-        Ok(Self(Arc::new(Mutex::new(connection))))
+    /// The ownership records in this installation's database.
+    pub fn open() -> Result<Self> {
+        Ok(Self(Arc::new(Mutex::new(crate::database::connect()?))))
     }
 
     pub fn record_user(&self, issuer: &str, subject: &str) -> Result<String> {
@@ -324,7 +329,7 @@ impl OwnershipStore {
             .lock()
             .map_err(|_| invalid())?
             .execute(
-                "INSERT OR IGNORE INTO users (id, issuer, subject) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO security_users (id, issuer, subject) VALUES (?1, ?2, ?3)",
                 params![id, issuer, subject],
             )
             .map_err(|_| invalid())?;
@@ -337,7 +342,7 @@ impl OwnershipStore {
             .lock()
             .map_err(|_| invalid())?
             .query_row(
-                "SELECT user_id FROM project_owners WHERE project_id = ?1",
+                "SELECT user_id FROM security_project_owners WHERE project_id = ?1",
                 [project],
                 |row| row.get(0),
             )
@@ -351,7 +356,7 @@ impl OwnershipStore {
             .lock()
             .map_err(|_| invalid())?
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM revoked_sessions WHERE session_id = ?1)",
+                "SELECT EXISTS(SELECT 1 FROM security_revoked_sessions WHERE session_id = ?1)",
                 [session],
                 |row| row.get(0),
             )
@@ -362,11 +367,14 @@ impl OwnershipStore {
         let mut connection = self.0.lock().map_err(|_| invalid())?;
         let transaction = connection.transaction().map_err(|_| invalid())?;
         transaction
-            .execute("DELETE FROM revoked_sessions WHERE expires_at <= ?1", [now])
+            .execute(
+                "DELETE FROM security_revoked_sessions WHERE expires_at <= ?1",
+                [now],
+            )
             .map_err(|_| invalid())?;
         transaction
             .execute(
-                "INSERT OR IGNORE INTO revoked_sessions VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO security_revoked_sessions VALUES (?1, ?2)",
                 params![identity.session_id, identity.expires_at],
             )
             .map_err(|_| invalid())?;
@@ -384,13 +392,13 @@ impl OwnershipStore {
         let id = user_id(issuer, subject);
         transaction
             .execute(
-                "INSERT OR IGNORE INTO users (id, issuer, subject) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO security_users (id, issuer, subject) VALUES (?1, ?2, ?3)",
                 params![id, issuer, subject],
             )
             .map_err(|_| invalid())?;
         let owner: Option<String> = transaction
             .query_row(
-                "SELECT user_id FROM project_owners WHERE project_id = ?1",
+                "SELECT user_id FROM security_project_owners WHERE project_id = ?1",
                 [project],
                 |row| row.get(0),
             )
@@ -403,7 +411,7 @@ impl OwnershipStore {
         }
         transaction
             .execute(
-                "INSERT OR IGNORE INTO project_owners (project_id, user_id) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO security_project_owners (project_id, user_id) VALUES (?1, ?2)",
                 params![project, id],
             )
             .map_err(|_| invalid())?;

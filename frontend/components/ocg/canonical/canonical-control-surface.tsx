@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { FolderGit2, GitCommitHorizontal, Lock, Save, ShieldCheck, Upload } from "lucide-react";
+import { FolderGit2, GitCommitHorizontal, Lock, Save, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -331,13 +331,6 @@ export function CanonicalControlSurface({
                     <FolderGit2 className="size-3" aria-hidden="true" />
                     <span className="font-medium">{projectLabelFor(project)}</span>
                     <span className="truncate text-muted-foreground">{project.root}</span>
-                    {project.marker ? (
-                      <span className="ml-auto inline-flex items-center gap-1 text-muted-foreground">
-                        <ShieldCheck className="size-3" /> {t("canonical.boundary")}
-                      </span>
-                    ) : (
-                      <span className="ml-auto text-muted-foreground">{t("canonical.explicit")}</span>
-                    )}
                   </button>
                 </li>
               ))}

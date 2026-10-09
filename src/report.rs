@@ -5,7 +5,6 @@ use crate::error::Result;
 use crate::model;
 use crate::observability;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
 
 pub fn routing_text(effective: &Effective) -> Result<String> {
     let mut lines = vec!["Worker router (role -> model):".to_string(), String::new()];
@@ -27,14 +26,6 @@ pub fn routing_text(effective: &Effective) -> Result<String> {
         ));
     }
     Ok(lines.join("\n"))
-}
-
-fn layer_mark(is_applied: bool) -> &'static str {
-    if is_applied {
-        "applied"
-    } else {
-        "not found"
-    }
 }
 
 pub fn status_text(effective: &Effective, level: &str) -> Result<String> {
@@ -70,43 +61,29 @@ pub fn status_text(effective: &Effective, level: &str) -> Result<String> {
         format!("  workers       {workers}"),
         format!("  cwd           {}", effective.cwd.display()),
         String::new(),
-        "Config layers:".to_string(),
+        "Configuration:".to_string(),
+        format!("  database      {}", effective.store.display()),
+        format!("  revision      {}", effective.revision),
+        String::new(),
     ];
-
-    let applied: Vec<&PathBuf> = effective.applied.iter().map(|(_, path)| path).collect();
-    let (name, path) = ("global", &effective.user_path);
-    let marked = applied.contains(&path);
-    lines.push(format!(
-        "  {name:<8} {}  [{}]",
-        path.display(),
-        layer_mark(marked)
-    ));
-
-    lines.push(String::new());
-    lines.extend(
-        effective
-            .diagnostics
-            .iter()
-            .map(|item| format!("  migration: {item}")),
-    );
     lines.push(routing_text(effective)?);
     Ok(lines.join("\n"))
 }
 
-/// `layers` output. `env_trace` is the environment-provided trace path.
-pub fn layers_text(effective: &Effective, env_trace: Option<&Path>) -> String {
-    let home = effective
-        .ocg_home
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "(embedded)".to_string());
-    let mut lines = vec![format!("OCG home: {home}")];
-    let (name, path) = ("global", &effective.user_path);
-    let found = if path.is_file() { "found" } else { "not found" };
-    lines.push(format!("{name:<8} {}  [{found}]", path.display()));
-    let trace = observability::trace_path(effective, env_trace)
+/// `layers` output: the one configuration authority and its active revision.
+pub fn layers_text(effective: &Effective) -> String {
+    let trace = observability::trace_path(effective)
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "(disabled)".to_string());
-    lines.push(format!("{:<8} {trace}", "trace"));
-    lines.join("\n")
+    [
+        "defaults compiled into this binary".to_string(),
+        format!(
+            "{:<8} {}  [revision {}]",
+            "core",
+            effective.store.display(),
+            effective.revision
+        ),
+        format!("{:<8} {trace}", "trace"),
+    ]
+    .join("\n")
 }

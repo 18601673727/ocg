@@ -6,20 +6,20 @@
 //! does not depend on it. Sensitive content never reaches the cache, and a
 //! corrupt, stale or version-mismatched entry is removed and ignored.
 //!
-//! The cache lives at `<project>/.ocg/cache/context/`; `cache clean`
-//! removes that directory only and never touches `.ocg/runtime/`.
+//! Entries are Project documents in the OCG database, at most
+//! [`MAX_ENTRIES`] per Project; `cache clean` removes them and nothing else.
 
 use crate::context::freshness::{validate, SourceFingerprint, ENGINE_VERSION, SCHEMA_VERSION};
 use crate::context::ranking::ContextPlan;
 use crate::error::{OcgError, Result};
+use crate::project_store::ProjectDocuments;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The cache container under `.ocg/`.
-pub const CACHE_DIR: &str = "cache";
-/// The context cache subdirectory.
-pub const CACHE_CONTEXT_DIR: &str = "context";
+/// The document kind cache entries are stored under.
+const DOCUMENT_KIND: &str = "context-cache";
+/// The most entries one Project keeps; the oldest are pruned beyond it.
+pub const MAX_ENTRIES: usize = 256;
 
 /// Everything that distinguishes one cached plan from another. The dependency
 /// fingerprints are stored on the entry (not in the key) so a plan can be
@@ -53,12 +53,9 @@ impl CacheKey {
         }
     }
 
-    fn file_name(&self) -> String {
+    fn document_key(&self) -> String {
         let value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
-        format!(
-            "{}.json",
-            crate::hash::sha256_hex(value.to_string().as_bytes())
-        )
+        crate::hash::sha256_hex(value.to_string().as_bytes())
     }
 }
 
@@ -96,48 +93,47 @@ pub struct CleanReport {
 #[derive(Debug, Clone)]
 pub struct ContextCache {
     root: PathBuf,
-    dir: PathBuf,
 }
 
 impl ContextCache {
     pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
-            dir: root
-                .join(crate::context::repomap::OCG_DIR)
-                .join(CACHE_DIR)
-                .join(CACHE_CONTEXT_DIR),
         }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// Where the entries live, for reports.
+    pub fn dir(&self) -> String {
+        format!("ocg.db:{DOCUMENT_KIND}")
     }
 
     /// Look up a fresh, trusted entry. Corrupt, stale, mismatched or tampered
     /// entries are removed and ignored.
     pub fn get(&self, root: &Path, key: &CacheKey) -> Option<ContextPlan> {
-        let path = self.dir.join(key.file_name());
-        let text = fs::read_to_string(&path).ok()?;
-        let entry: CacheEntry = match serde_json::from_str(&text) {
+        let documents = ProjectDocuments::existing(&self.root).ok()??;
+        let name = key.document_key();
+        let bytes = documents.get(DOCUMENT_KIND, &name).ok()??;
+        let discard = || {
+            let _ = documents.remove(DOCUMENT_KIND, &name);
+        };
+        let entry: CacheEntry = match serde_json::from_slice(&bytes) {
             Ok(entry) => entry,
             Err(_) => {
-                let _ = fs::remove_file(&path);
+                discard();
                 return None;
             }
         };
-        if entry.schema_version != SCHEMA_VERSION || entry.engine_version != ENGINE_VERSION {
-            let _ = fs::remove_file(&path);
-            return None;
-        }
-        if entry.key != *key {
-            let _ = fs::remove_file(&path);
+        if entry.schema_version != SCHEMA_VERSION
+            || entry.engine_version != ENGINE_VERSION
+            || entry.key != *key
+        {
+            discard();
             return None;
         }
         match validate(root, &entry.dependencies) {
             Ok(report) if report.is_fresh() => {}
             _ => {
-                let _ = fs::remove_file(&path);
+                discard();
                 return None;
             }
         }
@@ -145,7 +141,7 @@ impl ContextCache {
         // the current non-sensitive source lines, and no selected path may be
         // sensitive. A poisoned entry is discarded.
         if !trusted(root, &entry.plan) {
-            let _ = fs::remove_file(&path);
+            discard();
             return None;
         }
         let mut plan = entry.plan;
@@ -155,7 +151,8 @@ impl ContextCache {
         Some(plan)
     }
 
-    /// Store a plan, unless it contains sensitive content.
+    /// Store a plan, unless it contains sensitive content. The oldest entries
+    /// beyond [`MAX_ENTRIES`] are pruned.
     pub fn put(
         &self,
         key: &CacheKey,
@@ -166,8 +163,6 @@ impl ContextCache {
         if !plan.cacheable() {
             return Ok(false);
         }
-        // Keep `.ocg/` out of the project's VCS, exactly once.
-        crate::install::ensure_gitignore(&self.root)?;
         let entry = CacheEntry {
             schema_version: SCHEMA_VERSION,
             engine_version: ENGINE_VERSION.to_string(),
@@ -176,21 +171,27 @@ impl ContextCache {
             dependencies: dependencies.to_vec(),
             plan: plan.clone(),
         };
-        let value = serde_json::to_value(&entry).map_err(|error| {
+        let bytes = serde_json::to_vec(&entry).map_err(|error| {
             OcgError::config(format!("cannot serialize the context cache entry: {error}"))
         })?;
-        crate::install::write_json_atomic(&self.dir.join(key.file_name()), &value)?;
+        let documents = ProjectDocuments::for_root(&self.root)?;
+        documents.put(DOCUMENT_KIND, &key.document_key(), &bytes)?;
+        let mut stored = documents.sizes(DOCUMENT_KIND)?;
+        if stored.len() > MAX_ENTRIES {
+            stored.sort_by_key(|(_, _, updated_at)| *updated_at);
+            for (name, _, _) in stored.iter().take(stored.len() - MAX_ENTRIES) {
+                documents.remove(DOCUMENT_KIND, name)?;
+            }
+        }
         Ok(true)
     }
 
-    /// Remove the context cache directory. The index and the managed runtime
-    /// live elsewhere and are never touched.
+    /// Remove every cache entry. The index lives elsewhere and is never
+    /// touched.
     pub fn clean(&self) -> Result<CleanReport> {
         let stats = self.stats();
-        if self.dir.exists() {
-            fs::remove_dir_all(&self.dir).map_err(|error| {
-                OcgError::io(format!("cannot remove {}", self.dir.display()), error)
-            })?;
+        if let Some(documents) = ProjectDocuments::existing(&self.root)? {
+            documents.clear(DOCUMENT_KIND)?;
         }
         Ok(CleanReport {
             dir: stats.dir,
@@ -199,54 +200,44 @@ impl ContextCache {
         })
     }
 
-    /// Count and measure entries. Corrupt files are counted, not trusted.
+    /// Count and measure entries. Corrupt entries are counted, not trusted.
     pub fn stats(&self) -> CacheStats {
         let mut stats = CacheStats {
-            dir: self.dir.to_string_lossy().into_owned(),
+            dir: self.dir(),
             entries: 0,
             bytes: 0,
             corrupt: 0,
             oldest: None,
             newest: None,
         };
-        let Ok(entries) = fs::read_dir(&self.dir) else {
+        let Ok(Some(documents)) = ProjectDocuments::existing(&self.root) else {
             return stats;
         };
-        let mut newest = None;
-        let mut oldest = None;
-        for entry in entries.flatten() {
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            stats.bytes = stats.bytes.saturating_add(metadata.len());
-            let Ok(text) = fs::read_to_string(entry.path()) else {
-                stats.corrupt += 1;
-                continue;
-            };
-            match serde_json::from_str::<CacheEntry>(&text) {
+        let Ok(entries) = documents.list(DOCUMENT_KIND) else {
+            return stats;
+        };
+        for entry in entries {
+            stats.bytes = stats.bytes.saturating_add(entry.value.len() as u64);
+            match serde_json::from_slice::<CacheEntry>(&entry.value) {
                 Ok(parsed)
                     if parsed.schema_version == SCHEMA_VERSION
                         && parsed.engine_version == ENGINE_VERSION =>
                 {
                     stats.entries += 1;
-                    match oldest {
-                        Some(value) if value <= parsed.created_at => {}
-                        _ => oldest = Some(parsed.created_at),
-                    }
-                    match newest {
-                        Some(value) if value >= parsed.created_at => {}
-                        _ => newest = Some(parsed.created_at),
-                    }
+                    stats.oldest = Some(
+                        stats
+                            .oldest
+                            .map_or(parsed.created_at, |oldest| oldest.min(parsed.created_at)),
+                    );
+                    stats.newest = Some(
+                        stats
+                            .newest
+                            .map_or(parsed.created_at, |newest| newest.max(parsed.created_at)),
+                    );
                 }
                 _ => stats.corrupt += 1,
             }
         }
-        stats.oldest = oldest;
-        stats.newest = newest;
         stats
     }
 }
@@ -294,7 +285,7 @@ fn trusted(root: &Path, plan: &ContextPlan) -> bool {
         {
             return false;
         }
-        let Ok(content) = fs::read_to_string(root.join(&slice.path)) else {
+        let Ok(content) = std::fs::read_to_string(root.join(&slice.path)) else {
             return false;
         };
         let lines: Vec<&str> = content.lines().collect();

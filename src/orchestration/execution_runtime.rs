@@ -7,30 +7,63 @@ use crate::orchestration::disk_guard::{DiskGuard, DiskGuardConfig};
 use crate::orchestration::execution_dispatch::BoundedDispatcher;
 use crate::orchestration::governor::Governor;
 use crate::provider_loop::{run_recovered_provider_dispatcher, ProviderHandlerConfig};
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-/// Where a Project's execution ownership lock lives, beside its canonical
-/// store under the canonical Project root.
-const EXECUTION_LOCK: &str = "execution.lock";
-
-/// Exclusive execution and recovery ownership of one Project, held by the OS.
+/// Exclusive execution and recovery ownership of one Project.
 ///
 /// At most one process may admit, execute, cancel or recover work for a
-/// Project. The lock is an open file beside the Project's canonical store,
-/// found from its canonical root, so every process that resolves the same
-/// Project contends for the same lock. The OS releases it when the holder
-/// closes it or exits, so a crashed owner never blocks its successor, and the
-/// file's existence alone grants nothing. Acquisition never waits: a live
-/// owner is refused rather than raced, and nothing is recovered on refusal.
+/// Project. Ownership is a row in the OCG database naming the owning process,
+/// so every process that opens the installation contends for the same fact.
+/// Acquisition never waits: a live owner is refused rather than raced, and
+/// nothing is recovered on refusal.
 ///
-/// The lock only grants permission to act. Canonical SQLite remains the sole
-/// record of Job, Attempt, Call and DispatchIntent state.
+/// Liveness comes from the operating system, not from a lease timer: the
+/// recorded owner is alive while its process exists, so an owner that is
+/// merely paused or suspended never loses ownership to a successor. An owner
+/// recorded with this process's id but another process token is a previous
+/// incarnation and is dead. A dead owner whose process id has since been
+/// reused by an unrelated process is indistinguishable from a live one and
+/// keeps the Project refused: the failure is closed, never a second owner.
+///
+/// Every acquisition advances the Project's ownership generation, the fencing
+/// token a later ownership transfer is checked against. The row only grants
+/// permission to act: canonical domain state remains the sole record of Job,
+/// Attempt, Call and DispatchIntent state.
 pub struct ProjectOwnership {
-    _lock: std::fs::File,
+    project_id: String,
+    generation: i64,
+}
+
+/// This process's identity in ownership records. Distinguishes a process from
+/// an earlier one that had the same process id.
+fn process_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| format!("proc-{}", uuid::Uuid::now_v7()))
+}
+
+#[cfg(unix)]
+fn process_alive(pid: i64) -> bool {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) => true,
+        Err(error) => error != rustix::io::Errno::SRCH,
+    }
+}
+
+/// Without a liveness probe a recorded owner is assumed alive.
+#[cfg(not(unix))]
+fn process_alive(_pid: i64) -> bool {
+    true
 }
 
 impl ProjectOwnership {
@@ -38,56 +71,77 @@ impl ProjectOwnership {
         let root = project_root
             .canonicalize()
             .map_err(|error| OcgError::io("resolve Project root for execution ownership", error))?;
-        let directory = crate::orchestration::state::state_dir(&root);
-        std::fs::create_dir_all(&directory)
-            .map_err(|error| OcgError::io("create Project execution state directory", error))?;
-        let path = directory.join(EXECUTION_LOCK);
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|error| OcgError::io("open Project execution ownership lock", error))?;
-        if let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
-            if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+        let project_id = crate::orchestration::domain::DomainRepository::open(&root)?
+            .project_at_root(&root)?
+            .map(|project| project.id)
+            .ok_or_else(|| OcgError::config("no Project is registered at this root"))?;
+        let mut connection = crate::database::connect()?;
+        let path = crate::database::path()?;
+        let sql = |error| crate::database::sql(&path, error);
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let current: Option<(Option<String>, Option<i64>, i64)> = transaction
+            .query_row(
+                "SELECT owner,pid,generation FROM core_project_owners WHERE project_id=?1",
+                [&project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql)?;
+        let own_pid = i64::from(std::process::id());
+        if let Some((Some(owner), Some(pid), _)) = &current {
+            let previous_incarnation = *pid == own_pid && owner != process_token();
+            if !previous_incarnation && process_alive(*pid) {
                 return Err(OcgError::config(format!(
                     "Project {} is owned by another OCG process for execution and recovery; \
                      stop that process or run this operation through it",
                     root.display()
                 )));
             }
-            return Err(OcgError::io("lock Project execution ownership", error));
         }
-        // The lock binds the file this process opened. If the path now names a
-        // different file, another process may hold a lock on the replacement,
-        // so this one cannot prove it is the only owner.
-        if !names_open_file(&path, &lock)? {
-            return Err(OcgError::config(format!(
-                "Project {} execution ownership lock was replaced while it was being acquired; retry",
-                root.display()
-            )));
-        }
-        Ok(Self { _lock: lock })
+        let generation = current.map_or(0, |(_, _, generation)| generation) + 1;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default();
+        transaction
+            .execute(
+                "INSERT INTO core_project_owners(project_id,owner,pid,generation,acquired_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(project_id) DO UPDATE SET owner=excluded.owner,pid=excluded.pid,generation=excluded.generation,acquired_at=excluded.acquired_at",
+                rusqlite::params![project_id, process_token(), own_pid, generation, now],
+            )
+            .map_err(sql)?;
+        transaction.commit().map_err(sql)?;
+        Ok(Self {
+            project_id,
+            generation,
+        })
+    }
+
+    /// The fencing generation this ownership was acquired at.
+    pub fn generation(&self) -> u64 {
+        self.generation as u64
     }
 }
 
-#[cfg(unix)]
-fn names_open_file(path: &Path, file: &std::fs::File) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let named = std::fs::metadata(path)
-        .map_err(|error| OcgError::io("inspect Project execution ownership lock", error))?;
-    let open = file
-        .metadata()
-        .map_err(|error| OcgError::io("inspect Project execution ownership lock", error))?;
-    Ok(named.dev() == open.dev() && named.ino() == open.ino())
-}
-
-/// Windows does not let an open, locked file be renamed over or deleted, so
-/// the path keeps naming the locked file.
-#[cfg(not(unix))]
-fn names_open_file(_path: &Path, _file: &std::fs::File) -> Result<bool> {
-    Ok(true)
+impl Drop for ProjectOwnership {
+    /// Release only the ownership this value acquired: a successor that took
+    /// over after this process was presumed dead keeps its own.
+    fn drop(&mut self) {
+        let released = crate::database::connect().and_then(|connection| {
+            connection
+                .execute(
+                    "UPDATE core_project_owners SET owner=NULL,pid=NULL WHERE project_id=?1 AND generation=?2 AND owner=?3",
+                    rusqlite::params![self.project_id, self.generation, process_token()],
+                )
+                .map_err(|error| OcgError::config(error.to_string()))
+        });
+        if let Err(error) = released {
+            // The row still names this process, which is about to stop acting;
+            // a successor sees it dead once the process exits.
+            tracing::warn!(%error, project_id = %self.project_id, "Project ownership release failed");
+        }
+    }
 }
 
 /// Long-lived execution runtime that owns provider and native tool dispatchers.
@@ -109,7 +163,7 @@ pub struct ExecutionRuntime {
     /// stopped; shared with every handle.
     owned: Arc<AtomicBool>,
     /// Dropped after `Drop::drop` has joined both workers, which is what
-    /// releases the OS lock only once no worker of this runtime can act.
+    /// releases ownership only once no worker of this runtime can act.
     _ownership: ProjectOwnership,
 }
 

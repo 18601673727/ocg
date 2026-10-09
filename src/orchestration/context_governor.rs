@@ -16,7 +16,7 @@ use crate::error::{OcgError, Result};
 use crate::observation::{ContextUsage, ObservationProvenance, ObservedModelMetadata};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Default warning threshold, expressed as a percentage of a trustworthy model
 /// context limit.
@@ -603,11 +603,13 @@ pub fn decide(
     decision
 }
 
-/// The directory containing context/rollover artifacts.
-/// Persist one bounded context observation atomically. Telemetry is an
-/// artifact, not a second state authority: it contains no transcript and is
-/// never consulted to reconstruct a Job.
-pub fn save_observation(root: &Path, observation: &ContextObservation) -> Result<PathBuf> {
+/// The document kind context observations are stored under.
+const OBSERVATION_KIND: &str = "context-observation";
+
+/// Persist one bounded context observation. Telemetry is an artifact, not a
+/// second state authority: it contains no transcript and is never consulted
+/// to reconstruct a Job. Returns the observation's document key.
+pub fn save_observation(root: &Path, observation: &ContextObservation) -> Result<String> {
     if observation.schema_version != CONTEXT_ARTIFACT_SCHEMA_VERSION {
         return Err(OcgError::config(format!(
             "context observation has unsupported schema_version {}",
@@ -626,53 +628,50 @@ pub fn save_observation(root: &Path, observation: &ContextObservation) -> Result
             "context observation event id is not safe for durable telemetry",
         ));
     }
-    let id = safe_artifact_id(&observation.event_id);
-    crate::install::ensure_gitignore(root)?;
-    let path = telemetry_dir(root).join(format!("{id}.json"));
-    if path.is_file() {
-        let existing = load_observation(root, &observation.event_id)?;
-        if existing.as_ref() != Some(observation) {
+    let key = safe_artifact_id(&observation.event_id);
+    if let Some(existing) = load_observation(root, &observation.event_id)? {
+        if existing != *observation {
             return Err(OcgError::config(
                 "context telemetry event identity is already persisted with a different payload",
             ));
         }
-        return Ok(path);
+        return Ok(key);
     }
-    let value = serde_json::to_value(observation).map_err(|error| {
+    let bytes = serde_json::to_vec(observation).map_err(|error| {
         OcgError::config(format!("cannot serialize context observation: {error}"))
     })?;
-    crate::install::write_json_atomic(&path, &value)?;
-    prune_observations(&telemetry_dir(root), &path);
-    Ok(path)
+    let documents = crate::project_store::ProjectDocuments::for_root(root)?;
+    documents.put(OBSERVATION_KIND, &key, &bytes)?;
+    let mut stored = documents.sizes(OBSERVATION_KIND)?;
+    if stored.len() > MAX_CONTEXT_OBSERVATIONS {
+        stored.sort_by_key(|(_, _, updated_at)| *updated_at);
+        let excess = stored.len() - MAX_CONTEXT_OBSERVATIONS;
+        for (name, _, _) in stored
+            .iter()
+            .filter(|(name, _, _)| *name != key)
+            .take(excess)
+        {
+            documents.remove(OBSERVATION_KIND, name)?;
+        }
+    }
+    Ok(key)
 }
 
 /// Alias with a descriptive persistence verb for callers that treat telemetry
 /// as an append-only observation store.
-pub fn persist_observation(root: &Path, observation: &ContextObservation) -> Result<PathBuf> {
+pub fn persist_observation(root: &Path, observation: &ContextObservation) -> Result<String> {
     save_observation(root, observation)
 }
 
 pub fn load_observation(root: &Path, event_id: &str) -> Result<Option<ContextObservation>> {
-    let hashed_id = safe_artifact_id(event_id);
-    let direct_id =
-        crate::orchestration::checkpoint::is_safe_id(event_id).then(|| event_id.to_string());
-    let candidates = direct_id
-        .into_iter()
-        .map(|id| (id, false))
-        .chain(std::iter::once((hashed_id, true)))
-        .collect::<Vec<_>>();
-    let Some((path_id, hashed_path)) = candidates
-        .into_iter()
-        .find(|(id, _)| telemetry_dir(root).join(format!("{id}.json")).is_file())
-    else {
+    let Some(documents) = crate::project_store::ProjectDocuments::existing(root)? else {
         return Ok(None);
     };
-    let path = telemetry_dir(root).join(format!("{path_id}.json"));
-    if !path.is_file() {
+    let key = safe_artifact_id(event_id);
+    let Some(bytes) = documents.get(OBSERVATION_KIND, &key)? else {
         return Ok(None);
-    }
-    let text = std::fs::read_to_string(&path).map_err(|error| OcgError::read(&path, error))?;
-    let observation: ContextObservation = serde_json::from_str(&text).map_err(|error| {
+    };
+    let observation: ContextObservation = serde_json::from_slice(&bytes).map_err(|error| {
         OcgError::config(format!("context telemetry artifact is corrupt: {error}"))
     })?;
     if observation.schema_version != CONTEXT_ARTIFACT_SCHEMA_VERSION {
@@ -681,72 +680,12 @@ pub fn load_observation(root: &Path, event_id: &str) -> Result<Option<ContextObs
             observation.schema_version
         )));
     }
-    let identity_matches = if hashed_path {
-        safe_artifact_id(&observation.event_id) == path_id
-    } else {
-        observation.event_id == event_id
-    };
-    if observation.event_id.is_empty() || !identity_matches {
+    if observation.event_id != event_id {
         return Err(OcgError::config(
             "context telemetry artifact has a mismatched or empty event id",
         ));
     }
     Ok(Some(observation))
-}
-
-fn prune_observations(directory: &Path, keep: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    let mut files = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                return None;
-            }
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()?;
-            Some((modified, path))
-        })
-        .collect::<Vec<_>>();
-    if files.len() <= MAX_CONTEXT_OBSERVATIONS {
-        return;
-    }
-    files.sort_by_key(|(modified, _)| *modified);
-    let mut remaining = files.len();
-    for (_, path) in files {
-        if remaining <= MAX_CONTEXT_OBSERVATIONS {
-            break;
-        }
-        if path == keep {
-            continue;
-        }
-        if std::fs::remove_file(&path).is_ok() {
-            remaining = remaining.saturating_sub(1);
-        }
-    }
-}
-
-pub fn context_artifacts_dir(root: &Path) -> PathBuf {
-    crate::orchestration::state::state_dir(root).join("context")
-}
-
-/// The directory containing telemetry artifacts.
-pub fn telemetry_dir(root: &Path) -> PathBuf {
-    context_artifacts_dir(root).join("telemetry")
-}
-
-/// The directory containing rollover artifacts.
-pub fn rollover_dir(root: &Path) -> PathBuf {
-    context_artifacts_dir(root).join("rollovers")
-}
-
-/// The directory containing continuation packets.
-pub fn continuation_dir(root: &Path) -> PathBuf {
-    context_artifacts_dir(root).join("continuations")
 }
 
 pub fn safe_artifact_id(id: &str) -> String {

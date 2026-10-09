@@ -338,8 +338,10 @@ fn materialize_choice(
         ));
     }
     if let Some(reference) = provider.credential_ref.as_deref() {
-        let vault = crate::vault::Vault::user_global()?;
-        if vault.get(reference)?.is_none() {
+        if !crate::core_store::CoreStore::locate()?
+            .credential_names()?
+            .contains(reference)
+        {
             return Ok(validation_refusal(
                 "missing_credential",
                 format!("credential not found: {reference}"),
@@ -437,8 +439,10 @@ fn validate_exact(
         )));
     }
     if let Some(reference) = provider.credential_ref.as_deref() {
-        let vault = crate::vault::Vault::user_global()?;
-        if vault.get(reference)?.is_none() {
+        if !crate::core_store::CoreStore::locate()?
+            .credential_names()?
+            .contains(reference)
+        {
             return Ok(Err(super::health_probe::unsupported_target(
                 "health_probe_missing_credential",
                 format!("credential not found: {reference}"),

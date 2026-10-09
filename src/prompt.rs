@@ -7,8 +7,6 @@ use crate::json::value_to_string;
 use crate::model;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::PathBuf;
 
 /// Split optional `---` frontmatter from the prompt body.
 ///
@@ -29,40 +27,16 @@ pub fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, String) {
     (BTreeMap::new(), text.trim().to_string())
 }
 
-fn resolve_prompt_path(raw: &str, effective: &Effective) -> PathBuf {
-    let candidate = crate::config::expand_tilde(raw, effective.home_dir.as_deref());
-    if candidate.is_absolute() {
-        return candidate;
-    }
-    let mut bases: Vec<PathBuf> = vec![effective.cwd.clone()];
-    if let Some(home) = &effective.ocg_home {
-        bases.push(home.join("config"));
-    }
-    for base in bases {
-        let resolved = base.join(&candidate);
-        if resolved.is_file() {
-            return resolved.canonicalize().unwrap_or(resolved);
-        }
-    }
-    effective.cwd.join(&candidate)
-}
-
-fn read_prompt_source_string(raw: &str, effective: &Effective, role: &str) -> Result<String> {
-    if let Some(embedded) = raw.strip_prefix(EMBEDDED_PROMPT_PREFIX) {
-        return embedded_prompt(embedded)
+/// A prompt source string is either the marker of a prompt compiled into
+/// this binary or the prompt text itself. Prompts are configuration, so they
+/// live in the Core database; no prompt is ever read from a file.
+fn read_prompt_source_string(raw: &str, role: &str) -> Result<String> {
+    match raw.strip_prefix(EMBEDDED_PROMPT_PREFIX) {
+        Some(embedded) => embedded_prompt(embedded)
             .map(str::to_string)
-            .ok_or_else(|| {
-                OcgError::config(format!("prompt file for role '{role}' not found: {raw}"))
-            });
+            .ok_or_else(|| OcgError::config(format!("no embedded prompt for role '{role}'"))),
+        None => Ok(raw.to_string()),
     }
-    let path = resolve_prompt_path(raw, effective);
-    if !path.is_file() {
-        return Err(OcgError::config(format!(
-            "prompt file for role '{role}' not found: {}",
-            path.display()
-        )));
-    }
-    fs::read_to_string(&path).map_err(|error| OcgError::read(&path, error))
 }
 
 /// The configured source for a role, if any.
@@ -76,43 +50,21 @@ pub fn prompt_source<'a>(effective: &'a Effective, role: &str) -> Result<&'a Val
 
 /// The unmodified OCG prompt for a role, independent of overrides.
 pub fn default_prompt_text(effective: &Effective, role: &str) -> Result<String> {
-    let raw = effective
+    effective
         .data
         .get("_prompt_defaults")
         .and_then(|defaults| defaults.get(role))
-        .and_then(Value::as_str);
-    match raw {
-        Some(value) => read_prompt_source_string(value, effective, role),
-        None => {
-            if let Some(home) = &effective.ocg_home {
-                let path = home
-                    .join("config")
-                    .join("prompts")
-                    .join(format!("{role}.md"));
-                if path.is_file() {
-                    return fs::read_to_string(&path).map_err(|error| OcgError::read(&path, error));
-                }
-                return Err(OcgError::config(format!(
-                    "prompt file for role '{role}' not found: {}",
-                    path.display()
-                )));
-            }
-            Err(OcgError::config(format!(
-                "no default prompt for role '{role}'"
-            )))
-        }
-    }
+        .and_then(Value::as_str)
+        .ok_or_else(|| OcgError::config(format!("no default prompt for role '{role}'")))
+        .and_then(|raw| read_prompt_source_string(raw, role))
 }
 
 fn read_prompt_source_text(source: &Value, effective: &Effective, role: &str) -> Result<String> {
     match source {
-        Value::String(raw) => read_prompt_source_string(raw, effective, role),
+        Value::String(raw) => read_prompt_source_string(raw, role),
         Value::Object(object) => {
             if let Some(text) = object.get("text") {
                 return Ok(value_to_string(text));
-            }
-            if let Some(path) = object.get("path") {
-                return read_prompt_source_string(&value_to_string(path), effective, role);
             }
             if object.contains_key("append") {
                 return default_prompt_text(effective, role);
@@ -125,14 +77,14 @@ fn read_prompt_source_text(source: &Value, effective: &Effective, role: &str) ->
 
 fn prompt_shape_error(role: &str) -> OcgError {
     OcgError::config(format!(
-        "prompt for role '{role}' must be a path, {{'path': ...}}, {{'text': ...}} or {{'append': [...]}}"
+        "prompt for role '{role}' must be text, {{'text': ...}} or {{'append': [...]}}"
     ))
 }
 
 /// Load a role prompt: frontmatter metadata plus the assembled body.
 ///
-/// Supported source forms: a path string, `{"path": ...}`, `{"text": ...}` or
-/// `{"append": [...]}` (which extends the unmodified OCG prompt).
+/// Supported source forms: text, `{"text": ...}` or `{"append": [...]}`
+/// (which extends the unmodified OCG prompt).
 pub fn read_prompt(
     effective: &Effective,
     role: &str,

@@ -3,9 +3,7 @@ use crate::error::{OcgError, Result};
 use crate::provider_protocol::ProviderProtocol;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use ts_rs::TS;
 
 /// The Profile control API version. Shared with the generated TypeScript, so
@@ -192,24 +190,9 @@ impl Profile {
 
     /// Model keys that can actually execute right now. This is the backend
     /// execution-readiness authority: structural selection, plus a usable
-    /// endpoint, plus a credential that exists in the Vault. The secret value
-    /// is never read out, only its existence is checked. A Vault failure
-    /// closes the gate rather than guessing.
-    pub fn executable_choices(&self, vault: &crate::vault::Vault) -> Vec<String> {
-        self.executable_choices_within(vault, None)
-            .unwrap_or_default()
-    }
-
-    /// [`Profile::executable_choices`] with a bound on the credential store.
-    /// The Vault is read at most once per call, so one Profile costs one
-    /// credential-store lookup however many models it declares. Only a
-    /// credential store still pending after `wait` is an error.
-    pub fn executable_choices_within(
-        &self,
-        vault: &crate::vault::Vault,
-        wait: Option<std::time::Duration>,
-    ) -> Result<Vec<String>> {
-        let mut stored: Option<std::collections::BTreeSet<String>> = None;
+    /// endpoint, plus a credential that is stored. `stored` is the set of
+    /// stored credential names; no credential value is read here.
+    pub fn executable_choices(&self, stored: &std::collections::BTreeSet<String>) -> Vec<String> {
         let mut choices = Vec::new();
         for (key, model) in &self.models {
             if model.id.is_empty() {
@@ -221,30 +204,17 @@ impl Profile {
             if !endpoint_usable(provider.endpoint.as_deref()) {
                 continue;
             }
-            // A declared credential must resolve in the Vault; no declared
-            // credential means an unauthenticated endpoint, which is
-            // also executable.
+            // A declared credential must be stored; no declared credential
+            // means an unauthenticated endpoint, which is also executable.
             let executable = match provider.credential_ref.as_deref() {
                 None => true,
-                Some(reference) if !reference.is_empty() => {
-                    if stored.is_none() {
-                        stored = Some(match vault.credential_names(wait) {
-                            Ok(names) => names,
-                            Err(error @ OcgError::CredentialStorePending(_)) => return Err(error),
-                            Err(_) => std::collections::BTreeSet::new(),
-                        });
-                    }
-                    stored
-                        .as_ref()
-                        .is_some_and(|names| names.contains(reference))
-                }
-                Some(_) => false,
+                Some(reference) => !reference.is_empty() && stored.contains(reference),
             };
             if executable {
                 choices.push(key.clone());
             }
         }
-        Ok(choices)
+        choices
     }
 
     pub fn require_runnable(&self) -> Result<()> {
@@ -376,205 +346,160 @@ pub fn as_ocg_config(profile: &Profile) -> Result<Value> {
     )
 }
 
-/// Reject an existing file: bootstrap and import must not overwrite user edits.
-pub fn persist_new(path: &Path, profile: &Profile) -> Result<()> {
-    let value = as_ocg_config(profile)?;
-    let text = serde_yaml_ng::to_string(&value)
-        .map_err(|error| OcgError::config(format!("cannot serialize Profile: {error}")))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| OcgError::io("cannot create global OCG config directory", error))?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| {
-            OcgError::io(
-                "cannot create OCG Profile (existing files are never overwritten)",
-                error,
-            )
-        })?;
-    use std::io::Write;
-    file.write_all(text.as_bytes())
-        .map_err(|error| OcgError::io("cannot write OCG Profile", error))?;
-    file.sync_all()
-        .map_err(|error| OcgError::io("cannot sync OCG Profile", error))
-}
-
-/// A filesystem-backed view of the user-global OCG Profile.
+/// The user-global OCG Profile, committed in the Core database.
+///
+/// The Profile is the `profile` and `models` sections of the Core
+/// configuration scope. Its revision token is the scope revision it was read
+/// at, and every edit commits only against the revision it was computed from.
 #[derive(Debug, Clone)]
 pub struct ProfileService {
-    config_path: PathBuf,
-    state_dir: PathBuf,
+    store: crate::core_store::CoreStore,
 }
 
 impl ProfileService {
-    pub fn new(config_path: &Path) -> Self {
-        Self::with_workspace(config_path, Path::new("."))
+    pub fn new(store: crate::core_store::CoreStore) -> Self {
+        Self { store }
     }
 
-    pub fn with_workspace(config_path: &Path, workspace: &Path) -> Self {
-        let _ = workspace;
-        Self {
-            config_path: config_path.to_path_buf(),
-            state_dir: config_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("state"),
-        }
+    /// The pre-database constructor the unchanged unit tests still call. The
+    /// paths are not read: the Profile lives in the OCG database.
+    #[cfg(test)]
+    pub fn with_workspace(_config: &std::path::Path, _workspace: &std::path::Path) -> Self {
+        Self::new(crate::core_store::CoreStore)
     }
 
-    fn path(&self) -> PathBuf {
-        self.config_path.clone()
-    }
-
-    fn lock(&self) -> Result<std::fs::File> {
-        let dir = &self.state_dir;
-        std::fs::create_dir_all(dir)
-            .map_err(|error| OcgError::io("cannot create Profile state directory", error))?;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(dir.join("profile.lock"))
-            .map_err(|error| OcgError::io("cannot open Profile lock", error))?;
-        fs2::FileExt::lock_exclusive(&lock)
-            .map_err(|error| OcgError::io("cannot lock Profile", error))?;
-        Ok(lock)
+    pub fn store(&self) -> &crate::core_store::CoreStore {
+        &self.store
     }
 
     pub fn current(&self) -> Result<Option<(Profile, String)>> {
-        let path = self.path();
-        if !path.exists() {
+        let document = self.store.document(crate::core_store::CORE_SCOPE)?;
+        if document.section("profile").is_none() {
             return Ok(None);
         }
-        let bytes =
-            std::fs::read(&path).map_err(|error| OcgError::io("cannot read OCG Profile", error))?;
-        // The revision must describe exactly the bytes used for Placement,
-        // even when another process replaces the Profile during this read.
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|error| OcgError::config(format!("invalid OCG Profile: {error}")))?;
-        let data = crate::yaml::parse_yaml_object(&path.display().to_string(), text)?;
         Ok(Some((
-            Profile::from_ocg_config(&data)?,
-            format!("{:x}", Sha256::digest(&bytes)),
+            Profile::from_ocg_config(&document.to_value())?,
+            document.revision.to_string(),
         )))
     }
 
+    /// The revision of the configuration the Profile was read from, or `None`
+    /// before a Profile exists.
     pub(crate) fn content_revision(&self) -> Result<Option<String>> {
-        match std::fs::read(self.path()) {
-            Ok(bytes) => Ok(Some(format!("{:x}", Sha256::digest(&bytes)))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(OcgError::io("cannot read OCG Profile revision", error)),
-        }
+        let document = self.store.document(crate::core_store::CORE_SCOPE)?;
+        Ok(document
+            .section("profile")
+            .map(|_| document.revision.to_string()))
     }
 
     pub(crate) fn budget_config(&self) -> Result<crate::orchestration::budget::BudgetConfig> {
-        if !self.config_path.exists() {
-            return Ok(crate::orchestration::budget::BudgetConfig::default());
-        }
-        crate::orchestration::budget::BudgetConfig::from_config(&crate::yaml::read_yaml_object(
-            &self.config_path,
-        )?)
+        let document = self.store.document(crate::core_store::CORE_SCOPE)?;
+        crate::orchestration::budget::BudgetConfig::from_config(&document.to_value())
     }
 
     /// Backend-computed execution readiness: model keys that satisfy the
     /// same selection, endpoint, and credential rules as canonical launch.
-    /// A missing Profile or an unreadable Vault yields no choices. With
-    /// `wait`, a credential store that has not answered in time is
-    /// [`OcgError::CredentialStorePending`] rather than an indefinite wait.
-    pub fn runnable_choices(&self, wait: Option<std::time::Duration>) -> Result<Vec<String>> {
-        let Ok(Some((profile, _))) = self.current() else {
+    /// A missing Profile yields no choices.
+    pub fn runnable_choices(&self) -> Result<Vec<String>> {
+        let Some((profile, _)) = self.current()? else {
             return Ok(Vec::new());
         };
-        let Ok(vault) = crate::vault::Vault::user_global() else {
-            return Ok(Vec::new());
-        };
-        profile.executable_choices_within(&vault, wait)
+        Ok(profile.executable_choices(&self.store.credential_names()?))
     }
 
-    /// Create a new Profile without overwriting an existing one.
+    /// Create a new, empty Profile. An existing Profile is never replaced.
     pub fn bootstrap(&self) -> Result<Profile> {
-        let _lock = self.lock()?;
-        if self.path().exists() {
+        let document = self.store.document(crate::core_store::CORE_SCOPE)?;
+        if document.section("profile").is_some() {
             return Err(OcgError::config(
                 "OCG Profile already exists; bootstrap never overwrites it",
             ));
         }
         let profile = Profile::new();
-        persist_new(&self.path(), &profile)?;
+        self.commit(document.revision, &profile, "profile-bootstrap")?;
         Ok(profile)
     }
 
-    /// Explicit editing of the OCG-owned Profile; preserve other OCG YAML
-    /// sections and reject edits based on a stale backend projection.
-    pub fn replace(&self, expected_sha256: &str, profile: &Profile) -> Result<String> {
+    /// Replace the Profile, provided the configuration is still at the
+    /// revision `expected` the edit was computed from.
+    pub fn replace(&self, expected: &str, profile: &Profile) -> Result<String> {
         profile.validate()?;
-        let _lock = self.lock()?;
-        self.replace_locked(expected_sha256, profile)
+        let expected = expected.parse::<u64>().map_err(|_| {
+            OcgError::ConfigurationConflict(
+                "OCG Profile changed since it was read; refresh before editing".to_string(),
+            )
+        })?;
+        self.commit(expected, profile, "profile-edit")
     }
 
     /// Store a new credential together with the Profile edit that references
-    /// it. The OS credential store is consulted before any lock is taken; the
-    /// edit is then applied to the Profile re-read under `profile.lock`, so a
-    /// concurrent commit made while this one waited is kept, never replaced
-    /// by a stale copy. `edit` receives the stored credential names and
-    /// returns the name its credential is stored under.
+    /// it, in one transaction: both commit or neither does. The edit is
+    /// computed from the current Profile and commits only against the
+    /// revision it was computed from. `edit` receives the stored credential
+    /// names and returns the name its credential is stored under.
     pub fn edit_with_credential<T>(
         &self,
-        vault: &crate::vault::Vault,
         secret: &str,
         edit: impl FnOnce(&mut Profile, &std::collections::BTreeSet<String>) -> Result<(String, T)>,
     ) -> Result<(String, T)> {
-        let key = vault.write_key()?;
-        // Lock order: profile.lock, then the Vault lock inside `insert_with`.
-        let _lock = self.lock()?;
+        if secret.is_empty() {
+            return Err(OcgError::config("credential value cannot be empty"));
+        }
         let (mut profile, revision) = self
             .current()?
             .ok_or_else(|| OcgError::config("profile must be bootstrapped first"))?;
-        vault.insert_with(
-            &key,
-            secret,
-            move |stored| {
-                let (reference, output) = edit(&mut profile, stored)?;
-                profile.validate()?;
-                Ok((reference, (profile, output)))
-            },
-            |(profile, output)| Ok((self.replace_locked(&revision, &profile)?, output)),
-        )
+        let stored = self.store.credential_names()?;
+        let (reference, output) = edit(&mut profile, &stored)?;
+        crate::core_store::validate_credential_name(&reference)?;
+        profile.validate()?;
+        let expected = revision.parse::<u64>().map_err(|_| {
+            OcgError::ConfigurationConflict(
+                "OCG Profile changed since it was read; refresh before editing".to_string(),
+            )
+        })?;
+        let revision =
+            self.commit_also(expected, &profile, "profile-credential", |transaction| {
+                crate::core_store::store_credential(transaction, &reference, secret, false)
+            })?;
+        Ok((revision, output))
     }
 
-    fn replace_locked(&self, expected_sha256: &str, profile: &Profile) -> Result<String> {
-        let (.., actual) = self
-            .current()?
-            .ok_or_else(|| OcgError::config("OCG Profile is missing; bootstrap it explicitly"))?;
-        if expected_sha256 != actual {
-            return Err(OcgError::config(
-                "OCG Profile changed since it was read; refresh before editing",
-            ));
-        }
-        let path = self.path();
-        let mut document = crate::yaml::read_yaml_object(&path)?;
-        let profile_data = as_ocg_config(profile)?;
-        let object = document
-            .as_object_mut()
-            .ok_or_else(|| OcgError::config("OCG config must be a mapping"))?;
-        object.insert("profile".into(), profile_data["profile"].clone());
-        object.insert("models".into(), profile_data["models"].clone());
-        let serialized = serde_yaml_ng::to_string(&document)
-            .map_err(|error| OcgError::config(format!("cannot serialize OCG Profile: {error}")))?;
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|error| OcgError::io("cannot stage OCG Profile edit", error))?;
-        use std::io::Write;
-        temp.write_all(serialized.as_bytes())
-            .map_err(|error| OcgError::io("cannot stage OCG Profile edit", error))?;
-        temp.as_file()
-            .sync_all()
-            .map_err(|error| OcgError::io("cannot sync OCG Profile edit", error))?;
-        temp.persist(&path)
-            .map_err(|error| OcgError::io("cannot persist OCG Profile edit", error.error))?;
-        Ok(format!("{:x}", Sha256::digest(serialized.as_bytes())))
+    fn commit(&self, expected: u64, profile: &Profile, purpose: &str) -> Result<String> {
+        self.commit_also(expected, profile, purpose, |_| Ok(()))
+    }
+
+    fn commit_also(
+        &self,
+        expected: u64,
+        profile: &Profile,
+        purpose: &str,
+        also: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    ) -> Result<String> {
+        let sections = as_ocg_config(profile)?;
+        let command_id = format!("{purpose}-{}", uuid::Uuid::now_v7());
+        let store_path = self.store.path();
+        let committed = self
+            .store
+            .commit_with(
+                crate::core_store::ConfigChange {
+                    scope: crate::core_store::CORE_SCOPE,
+                    command_id: &command_id,
+                    principal: "operator",
+                    expected_revision: expected,
+                    sections: vec![
+                        ("profile", Some(sections["profile"].clone())),
+                        ("models", Some(sections["models"].clone())),
+                    ],
+                },
+                |candidate| crate::config::validate_document(candidate, &store_path),
+                also,
+            )
+            .map_err(|error| match error {
+                OcgError::ConfigurationConflict(_) => OcgError::ConfigurationConflict(
+                    "OCG Profile changed since it was read; refresh before editing".to_string(),
+                ),
+                other => other,
+            })?;
+        Ok(committed.revision.to_string())
     }
 }

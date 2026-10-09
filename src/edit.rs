@@ -2,7 +2,7 @@
 //! Callers supply a project root; no orchestration or provider state is required.
 use fs2::FileExt;
 use serde_json::{Map, Value};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
@@ -288,19 +288,11 @@ fn apply_inner(
     if path.canonicalize().map_err(|_| fail(Conflict::IOFailure))? != path {
         return Err(fail(Conflict::UnsafeRepair));
     }
-    // Per-file cooperative lock, placed under the project's ignored state dir.
-    let lock_dir = root.join(".ocg/edit-locks");
-    fs::create_dir_all(&lock_dir).map_err(|_| fail(Conflict::IOFailure))?;
-    let lock_name = crate::hash::sha256_hex(path.to_string_lossy().as_bytes());
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_dir.join(lock_name))
-        .map_err(|_| fail(Conflict::IOFailure))?;
-    lock.lock_exclusive()
-        .map_err(|_| fail(Conflict::IOFailure))?;
+    // Per-file cooperative lock, held on the file being edited itself, so
+    // editing creates nothing but the edit. A commit replaces the file, so a
+    // lock taken on a file that has since been replaced is retried on the
+    // current one: two editors can never both hold the file the path names.
+    let _lock = lock_target(&path).map_err(|_| fail(Conflict::IOFailure))?;
     let mut retries = 0;
     loop {
         let (revision, bytes) = read_revision(&path).map_err(|_| fail(Conflict::IOFailure))?;
@@ -379,6 +371,34 @@ fn apply_inner(
             new_revision: crate::hash::sha256_hex(next.as_bytes()),
         });
     }
+}
+
+/// Lock the file `path` names exclusively, retrying while a concurrent commit
+/// replaces it between opening and locking.
+fn lock_target(path: &Path) -> std::io::Result<fs::File> {
+    loop {
+        let file = fs::File::open(path)?;
+        file.lock_exclusive()?;
+        if same_file(path, &file)? {
+            return Ok(file);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn same_file(path: &Path, file: &fs::File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let named = fs::metadata(path)?;
+    let open = file.metadata()?;
+    Ok(named.dev() == open.dev() && named.ino() == open.ino())
+}
+
+/// Without a portable file identity the path is taken to still name the
+/// locked file; the revision re-read before every commit still detects a
+/// concurrent replacement.
+#[cfg(not(unix))]
+fn same_file(_path: &Path, _file: &fs::File) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 fn resolve(text: &str, request: &EditRequest) -> Result<(String, bool), Conflict> {

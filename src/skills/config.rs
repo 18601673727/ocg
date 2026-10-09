@@ -42,9 +42,6 @@ use serde_json::Value;
 /// The file that carries a skill's metadata and instructions.
 pub const SKILL_FILENAME: &str = "SKILL.md";
 
-/// Directory under `.ocg/` holding project-local skills.
-pub const PROJECT_SKILL_DIR: &str = "skills";
-
 /// Default cap on the catalog, in characters.
 pub const DEFAULT_MAX_CATALOG_CHARS: usize = 8_000;
 
@@ -82,11 +79,8 @@ pub struct SkillsConfig {
     /// Master switch. When false discovery reads nothing and no skill section
     /// is projected.
     pub enabled: bool,
-    /// Discover skills under `<project>/.ocg/skills`.
-    pub project_skills: bool,
-    /// Discover skills under the OCG configuration directory.
-    pub user_skills: bool,
-    /// Extra directories to scan, in addition to the two standard locations.
+    /// Project directories holding skills, relative to the Project root.
+    /// They are the user's own files; OCG keeps no skill directory of its own.
     pub paths: Vec<String>,
     /// Cap on the catalog, in characters.
     pub max_catalog_chars: usize,
@@ -109,8 +103,6 @@ impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            project_skills: true,
-            user_skills: true,
             paths: Vec::new(),
             max_catalog_chars: DEFAULT_MAX_CATALOG_CHARS,
             max_body_chars: DEFAULT_MAX_BODY_CHARS,
@@ -137,11 +129,7 @@ impl SkillsConfig {
                 .as_bool()
                 .ok_or_else(|| invalid_err("enabled must be a boolean"))?;
         }
-        for (key, slot) in [
-            ("projectSkills", &mut config.project_skills),
-            ("userSkills", &mut config.user_skills),
-            ("requireDirectoryName", &mut config.require_directory_name),
-        ] {
+        for (key, slot) in [("requireDirectoryName", &mut config.require_directory_name)] {
             if let Some(value) = object.get(key) {
                 *slot = value
                     .as_bool()

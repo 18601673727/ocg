@@ -19,9 +19,9 @@
 //! - the deterministic release fixture deliberately configures a much tighter
 //!   `4096` / `40%` gate to catch projection regressions.
 //!
-//! `OCG_ORCHESTRATION=0` is an explicit escape hatch that disables the
-//! whole layer for one process. A disabled layer writes no state and makes no
-//! context decision.
+//! `orchestration.enabled=false` in the committed configuration disables the
+//! whole layer. A disabled layer writes no state and makes no context
+//! decision.
 
 use crate::compaction::config::CompactionConfig;
 use crate::error::{OcgError, Result};
@@ -47,9 +47,6 @@ pub const MAX_DEBUG_RETRIES_CEILING: usize = 5;
 pub const MIN_HANDOFF_BYTES: usize = 512;
 /// Hard ceiling accepted for `maxHandoffBytes`.
 pub const MAX_HANDOFF_BYTES_CEILING: usize = 65_536;
-
-/// The environment variable that force-disables orchestration for one process.
-pub const ENV_ENABLED: &str = "OCG_ORCHESTRATION";
 
 /// Parsed, validated orchestration policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,51 +192,9 @@ impl OrchestrationConfig {
         Ok(())
     }
 
-    /// Apply the optional `OCG_ORCHESTRATION` override. Only an
-    /// explicit on/off value changes the policy; anything else is ignored.
-    pub fn with_env_override(mut self, raw: Option<&str>) -> Self {
-        if let Some(enabled) = parse_env_enabled(raw) {
-            self.enabled = enabled;
-        }
-        self
-    }
-
-    /// Apply the environment override to a raw effective config in place.
-    ///
-    /// This is how one process can force orchestration off without editing any
-    /// on-disk configuration. An unrecognised value is ignored.
-    pub fn apply_env_override(data: &mut Value, raw: Option<&str>) {
-        let Some(enabled) = parse_env_enabled(raw) else {
-            return;
-        };
-        if !data.is_object() {
-            *data = serde_json::json!({});
-        }
-        if let Some(object) = data.as_object_mut() {
-            let entry = object
-                .entry("orchestration".to_string())
-                .or_insert_with(|| serde_json::json!({}));
-            if !entry.is_object() {
-                *entry = serde_json::json!({});
-            }
-            if let Some(orchestration) = entry.as_object_mut() {
-                orchestration.insert("enabled".to_string(), Value::Bool(enabled));
-            }
-        }
-    }
-
     /// A stable fingerprint of the policy.
     pub fn fingerprint(&self) -> String {
         let value = serde_json::to_value(self).unwrap_or(Value::Null);
         crate::hash::sha256_hex(value.to_string().as_bytes())
-    }
-}
-
-fn parse_env_enabled(raw: Option<&str>) -> Option<bool> {
-    let raw = raw?;
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "0" | "false" | "off" | "no" | "disabled" => Some(false),
-        "1" | "true" | "on" | "yes" | "enabled" => Some(true),
-        _ => None,
     }
 }

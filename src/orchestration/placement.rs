@@ -174,8 +174,10 @@ pub(crate) fn choose(
         // Credential readiness can change independently of the Profile. Only
         // structural rejection can be deferred until the Profile changes.
         if executable.is_none() {
-            let vault = crate::vault::Vault::user_global()?;
-            executable = Some(input.profile.executable_choices(&vault));
+            executable =
+                Some(input.profile.executable_choices(
+                    &crate::core_store::CoreStore::locate()?.credential_names()?,
+                ));
         }
         if !executable
             .as_ref()

@@ -897,16 +897,16 @@ impl CanonicalProviderCallHandler {
             );
         }
 
-        // Resolve credential from the user-global Vault at execution time,
-        // immediately before the side effect. `None` means no Authorization
-        // header; `Some(ref)` missing from the Vault fails closed. The raw
-        // token is held only in `bearer` and never persisted or logged.
+        // Resolve the credential at execution time, immediately before the
+        // side effect. `None` means no Authorization header; a `Some(ref)`
+        // that is not stored fails closed. The raw token is held only in
+        // `bearer` and never persisted or logged.
         let bearer = match (|| -> Result<Option<String>> {
-            let vault = crate::vault::Vault::user_global()?;
             match &provider_config.credential_ref {
-                Some(credential_ref) => vault.get(credential_ref)?.map(Some).ok_or_else(|| {
-                    OcgError::config("provider credential not found in the user-global Vault")
-                }),
+                Some(credential_ref) => crate::core_store::CoreStore::locate()?
+                    .credential(credential_ref)?
+                    .map(Some)
+                    .ok_or_else(|| OcgError::config("provider credential is not stored")),
                 None => Ok(None),
             }
         })() {

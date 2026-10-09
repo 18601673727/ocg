@@ -64,22 +64,17 @@ fn encode_query_value(value: &str) -> String {
 }
 
 /// Bind the loopback server, serve the embedded UI, and wait for termination.
-pub fn run(
-    root: &Path,
-    profile_path: &Path,
-    _has_profile: bool,
-    disable_proxy: bool,
-) -> Result<()> {
+pub fn run(root: &Path, store: &crate::core_store::CoreStore, disable_proxy: bool) -> Result<()> {
     if !crate::ui_assets::is_packaged() {
         return Err(OcgError::config(format!(
             "the OCG product UI is not embedded; {}",
             crate::ui_assets::build_note()
         )));
     }
-    let control = ControlServer::bind_with_profile(
+    let control = ControlServer::bind_with_store(
         "127.0.0.1:0",
         root,
-        profile_path,
+        store,
         ServerConfig::default(),
         disable_proxy,
     )?;

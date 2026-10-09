@@ -7,7 +7,7 @@
 use crate::clock::Clock;
 use crate::config;
 use crate::context::{ContextConfig, ContextEngine};
-use crate::defaults::{load_defaults, OcgSource};
+use crate::core_store::CoreStore;
 use crate::error::OcgError;
 use crate::observability;
 use crate::orchestration::checkpoint::Phase;
@@ -16,60 +16,17 @@ use crate::report;
 use crate::validate;
 use serde_json::{json, Value};
 use std::ffi::OsString;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Default, Clone)]
-pub struct Env {
-    pub home: Option<PathBuf>,
-    pub user_config: Option<PathBuf>,
-    pub trace: Option<PathBuf>,
-    pub xdg_config_home: Option<PathBuf>,
-    pub home_dir: Option<PathBuf>,
-    pub telemetry: Option<String>,
-    pub orchestration: Option<String>,
-}
-
-impl fmt::Debug for Env {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Env")
-            .field("home", &self.home)
-            .field("user_config", &self.user_config)
-            .field("trace", &self.trace)
-            .field("xdg_config_home", &self.xdg_config_home)
-            .field("home_dir", &self.home_dir)
-            .field("telemetry", &self.telemetry)
-            .field("orchestration", &self.orchestration)
-            .finish()
-    }
-}
-
-impl Env {
-    pub fn from_process() -> Self {
-        Self {
-            home: env_path("OCG_HOME"),
-            user_config: env_path("OCG_USER_CONFIG"),
-            trace: env_path("OCG_TRACE"),
-            xdg_config_home: env_path("XDG_CONFIG_HOME"),
-            home_dir: env_path("HOME").or_else(|| env_path("USERPROFILE")),
-            telemetry: env_string("OCG_TELEMETRY"),
-            orchestration: env_string("OCG_ORCHESTRATION"),
-        }
-    }
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
+/// The user's home directory, used only to expand `~` in generated-file
+/// locations. It is never a source of configuration.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-}
-
-fn env_string(name: &str) -> Option<String> {
-    env_path(name).and_then(|value| value.into_os_string().into_string().ok())
 }
 
 #[derive(Debug)]
@@ -108,7 +65,6 @@ pub struct Cli {
     pub model_choice: Option<String>,
     pub project: Option<PathBuf>,
     pub pretty: bool,
-    pub user_config: Option<PathBuf>,
     pub disable_proxy: bool,
     pub command: Command,
 }
@@ -121,7 +77,6 @@ where
     let mut model_choice = None;
     let mut project = None;
     let mut pretty = false;
-    let mut user_config = None;
     let mut disable_proxy = false;
     let mut command = None;
     let mut rest = Vec::new();
@@ -140,14 +95,6 @@ where
             project = Some(PathBuf::from(value));
         } else if text == "--project" || text == "--cwd" {
             project = Some(PathBuf::from(next_value(&args, &mut index, &text)?));
-        } else if let Some(value) = text.strip_prefix("--user-config=") {
-            user_config = Some(PathBuf::from(value));
-        } else if text == "--user-config" {
-            user_config = Some(PathBuf::from(next_value(
-                &args,
-                &mut index,
-                "--user-config",
-            )?));
         } else if text == "--pretty" {
             pretty = true;
         } else if text == "--disable-proxy" {
@@ -202,7 +149,6 @@ where
         model_choice,
         project,
         pretty,
-        user_config,
         disable_proxy,
         command,
     })
@@ -216,7 +162,7 @@ fn next_value(args: &[OsString], index: &mut usize, name: &str) -> Result<String
 }
 
 fn usage() -> &'static str {
-    "OCG - native project orchestration and control plane\n\nUsage: ocg [--project DIR] [command]\n\nCommands:\n  (none)       open the OCG control surface\n  status       show OCG configuration\n  routing      show configured model routing\n  config       inspect or edit the OCG Profile\n  auth         manage OCG credentials\n  validate     validate configuration\n  context      build repository context\n  verify       run configured verification\n  tools        show capability policy\n  checkpoint   inspect or save checkpoints\n  reconcile    recover durable dispatch intents\n  resources    inspect native resources\n  budget       inspect the Project budget\n  serve        run the OCG control server\n  work         operate canonical Jobs and Calls\n  health       probe or read Health Probe evidence for a Provider/Model/Effort\n  version      report the OCG version\n  doctor       run native diagnostics\n  init         create a global OCG Profile\n  help         show this help\n"
+    "OCG - native project orchestration and control plane\n\nUsage: ocg [--project DIR] [command]\n\nCommands:\n  (none)       open the OCG control surface\n  status       show OCG configuration\n  routing      show configured model routing\n  config       inspect or edit the OCG Profile\n  auth         manage OCG credentials\n  validate     validate configuration\n  context      build repository context\n  verify       run configured verification\n  tools        show capability policy\n  checkpoint   inspect or save checkpoints\n  reconcile    recover durable dispatch intents\n  resources    inspect native resources\n  budget       inspect the Project budget\n  serve        run the OCG control server\n  work         operate canonical Jobs and Calls\n  health       probe or read Health Probe evidence for a Provider/Model/Effort\n  version      report the OCG version\n  doctor       run native diagnostics\n  init         create the OCG Profile in the Core database\n  help         show this help\n"
 }
 
 #[derive(Debug)]
@@ -256,7 +202,7 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         println!("OCG {VERSION}");
         return Ok(0);
     }
-    let env = Env::from_process();
+    let store = CoreStore::locate()?;
     let root = cli.project.clone().unwrap_or(
         std::env::current_dir()
             .map_err(|error| OcgError::io("cannot determine current directory", error))?,
@@ -269,32 +215,10 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     }
     let boundary = project::resolve(&root);
     let project_root = boundary.root().to_path_buf();
-    let (source, home) = match env.home.clone() {
-        Some(path) => (OcgSource::Dir(path.clone()), Some(path)),
-        None => (OcgSource::Embedded, None),
-    };
-    let defaults = load_defaults(&source)?;
-    let user_path = config::user_config_path(
-        cli.user_config.as_deref(),
-        env.user_config.as_deref(),
-        env.xdg_config_home.as_deref(),
-        env.home_dir.as_deref(),
-    );
     if matches!(cli.command, Command::Init) {
-        return init_command(&user_path);
+        return init_command(&store);
     }
-    let mut effective = config::build_effective(
-        defaults.clone(),
-        home.clone(),
-        &project_root,
-        &user_path,
-        &user_path,
-        env.home_dir.clone(),
-    )?;
-    crate::orchestration::OrchestrationConfig::apply_env_override(
-        &mut effective.data,
-        env.orchestration.as_deref(),
-    );
+    let effective = config::load(&store, &project_root, home_dir())?;
     let level = cli
         .model_choice
         .clone()
@@ -305,14 +229,9 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         })
         .unwrap_or_default();
     match cli.command {
-        Command::Launch => crate::pwa::run(
-            &project_root,
-            &user_path,
-            user_path.is_file(),
-            cli.disable_proxy,
-        )
-        .map(|_| 0)
-        .map_err(Into::into),
+        Command::Launch => crate::pwa::run(&project_root, &store, cli.disable_proxy)
+            .map(|_| 0)
+            .map_err(Into::into),
         Command::Status => {
             validate::require_valid(&effective)?;
             println!("{}", report::status_text(&effective, &level)?);
@@ -323,18 +242,16 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
             println!("{}", report::routing_text(&effective)?);
             Ok(0)
         }
-        Command::Config(args) => native_config(&args, &user_path, &project_root, &env),
-        Command::Auth(args) => auth_command(&args),
+        Command::Config(args) => native_config(&args, &store),
+        Command::Auth(args) => auth_command(&args, &store),
         Command::Validate => validate_command(&effective),
         Command::Layers => {
-            println!("{}", report::layers_text(&effective, env.trace.as_deref()));
+            println!("{}", report::layers_text(&effective));
             Ok(0)
         }
         Command::Trace(event) => {
             let event = event.as_deref().unwrap_or("command");
-            if let Some(path) =
-                observability::record_event(&effective, event, &level, env.trace.as_deref())
-            {
+            if let Some(path) = observability::record_event(&effective, event, &level) {
                 println!("{}", path.display());
             }
             Ok(0)
@@ -350,15 +267,11 @@ fn run_inner(args: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         Command::Reconcile(args) => reconcile_command(&project_root, &args, cli.pretty),
         Command::Resources(args) => native_resources(&project_root, &args, cli.pretty),
         Command::Budget(args) => native_budget(&effective, &project_root, &args, cli.pretty),
-        Command::Serve(args) => serve_command(
-            &project_root,
-            &user_path,
-            &args,
-            cli.pretty,
-            cli.disable_proxy,
-        ),
-        Command::Work(args) => work_command(&project_root, &user_path, &args, cli.pretty),
-        Command::Health(args) => health_command(&project_root, &user_path, &args, cli.pretty),
+        Command::Serve(args) => {
+            serve_command(&project_root, &store, &args, cli.pretty, cli.disable_proxy)
+        }
+        Command::Work(args) => work_command(&project_root, &store, &args, cli.pretty),
+        Command::Health(args) => health_command(&project_root, &store, &args, cli.pretty),
         Command::Doctor => doctor_command(&effective, &project_root),
         Command::Help | Command::Version | Command::Init => unreachable!(),
     }
@@ -375,17 +288,14 @@ fn print_json(value: &Value, pretty: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-fn init_command(path: &Path) -> Result<i32, Failure> {
-    if path.exists() {
-        println!("global config already exists: {}", path.display());
+fn init_command(store: &CoreStore) -> Result<i32, Failure> {
+    let service = crate::profile::ProfileService::new(store.clone());
+    if service.current()?.is_some() {
+        println!("OCG Profile already exists in {}", store.path().display());
         return Ok(0);
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| OcgError::io("cannot create config directory", error))?;
-    }
-    crate::profile::persist_new(path, &crate::profile::Profile::new())?;
-    println!("created {}", path.display());
+    service.bootstrap()?;
+    println!("created the OCG Profile in {}", store.path().display());
     Ok(0)
 }
 
@@ -402,25 +312,24 @@ fn validate_command(effective: &config::Effective) -> Result<i32, Failure> {
     }
 }
 
-fn auth_command(args: &[OsString]) -> Result<i32, Failure> {
-    let vault = crate::vault::Vault::user_global()?;
+fn auth_command(args: &[OsString], store: &CoreStore) -> Result<i32, Failure> {
     let words: Vec<String> = args
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     match words.as_slice() {
         [action] if action == "list" => {
-            for name in vault.list()? {
+            for name in store.credential_names()? {
                 println!("{name}");
             }
         }
         [action, name] if action == "set" => {
             let value = rpassword::prompt_password(format!("Credential for {name}: "))
                 .map_err(|_| OcgError::config("cannot read credential input"))?;
-            vault.set(name, &value)?;
+            store.set_credential(name, &value)?;
         }
         [action, name] if action == "remove" => {
-            if vault.remove(name)? {
+            if store.remove_credential(name)? {
                 println!("removed credential {name}");
             }
         }
@@ -528,7 +437,7 @@ fn reconcile_command(root: &Path, _args: &[OsString], pretty: bool) -> Result<i3
 
 fn serve_command(
     root: &Path,
-    profile: &Path,
+    store: &CoreStore,
     args: &[OsString],
     pretty: bool,
     disable_proxy: bool,
@@ -537,10 +446,10 @@ fn serve_command(
         .first()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| "127.0.0.1:0".into());
-    let server = crate::control_server::ControlServer::bind_with_profile(
+    let server = crate::control_server::ControlServer::bind_with_store(
         &address,
         root,
-        profile,
+        store,
         crate::control_server::ServerConfig::default(),
         disable_proxy,
     )?;
@@ -563,43 +472,13 @@ fn serve_command(
     Ok(0)
 }
 
-/// Disk-guard thresholds for low-level `work` operators. Reads the same global
-/// configuration the control plane enforces, checking the process control
-/// state first and the legacy project-adjacent state second (the service's own
-/// adoption order). Any unreadable or absent file falls back to the
-/// conservative built-in reserve, which still measures the real filesystem.
+/// Disk-guard thresholds for low-level `work` operators: the same committed
+/// global configuration the control plane enforces.
 fn cli_disk_guard_config(
-    root: &Path,
-    user_path: &Path,
-) -> crate::orchestration::disk_guard::DiskGuardConfig {
-    let process_control = user_path
-        .canonicalize()
-        .unwrap_or_else(|_| user_path.to_path_buf())
-        .parent()
-        .map(|parent| {
-            parent
-                .join("state")
-                .join("control")
-                .join("configuration.json")
-        });
-    let legacy = Some(crate::orchestration::state::state_dir(root).join("configuration.json"));
-    for candidate in process_control.into_iter().chain(legacy) {
-        let guard = std::fs::read(&candidate)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|value| value.get("global").cloned())
-            .and_then(|global| {
-                serde_json::from_value::<
-                    crate::orchestration::canonical_control::GlobalConfiguration,
-                >(global)
-                .ok()
-            })
-            .and_then(|global| global.storage_guard);
-        if let Some(guard) = guard {
-            return guard;
-        }
-    }
-    crate::orchestration::disk_guard::DiskGuardConfig::default()
+    store: &CoreStore,
+) -> Result<crate::orchestration::disk_guard::DiskGuardConfig, Failure> {
+    let (global, _) = crate::orchestration::canonical_control::global_configuration(store)?;
+    Ok(global.storage_guard.unwrap_or_default())
 }
 
 /// Resolve the execution disk-space guard for a low-level `work` operator.
@@ -608,18 +487,15 @@ fn cli_disk_guard_config(
 /// an operator action never runs on a stale cached observation.
 fn cli_disk_guard(
     root: &Path,
-    user_path: &Path,
+    store: &CoreStore,
 ) -> Result<crate::orchestration::disk_guard::DiskGuard, Failure> {
-    crate::orchestration::disk_guard::DiskGuard::for_root(
-        root,
-        cli_disk_guard_config(root, user_path),
-    )
-    .map_err(Failure::Ocg)
+    crate::orchestration::disk_guard::DiskGuard::for_root(root, cli_disk_guard_config(store)?)
+        .map_err(Failure::Ocg)
 }
 
 fn work_command(
     root: &Path,
-    user_path: &Path,
+    store: &CoreStore,
     args: &[OsString],
     pretty: bool,
 ) -> Result<i32, Failure> {
@@ -690,7 +566,7 @@ fn work_command(
                 .authority_for_binding(&project.id, &binding)?
                 .is_none()
             {
-                let guard = cli_disk_guard(root, user_path)?;
+                let guard = cli_disk_guard(root, store)?;
                 if let Some(deferral) = guard.check_execution_admission().deferral() {
                     return Err(Failure::Ocg(OcgError::config(deferral.message())));
                 }
@@ -721,7 +597,7 @@ fn work_command(
             // the canonical spawn path: an explicit request is not permission
             // to exhaust the host disk. The refusal happens before any lineage
             // write, so the spawn key stays unbound for retry after recovery.
-            let guard = cli_disk_guard(root, user_path)?;
+            let guard = cli_disk_guard(root, store)?;
             if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
                 return Err(Failure::Ocg(OcgError::spawn_refused(
                     crate::error::SpawnRefusalReason::StorageProtection,
@@ -779,7 +655,7 @@ fn work_command(
             // the canonical spawn path. The refusal precedes the lineage
             // transaction, so no origin, dependency or counter residue is
             // left behind.
-            let guard = cli_disk_guard(root, user_path)?;
+            let guard = cli_disk_guard(root, store)?;
             if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
                 return Err(Failure::Ocg(OcgError::spawn_refused(
                     crate::error::SpawnRefusalReason::StorageProtection,
@@ -811,7 +687,7 @@ fn work_command(
             // A dispatch always mints a new Attempt and Executor with fresh
             // journal events. Under disk protection that expansion is
             // deferred; the eligible Job itself is left untouched.
-            let guard = cli_disk_guard(root, user_path)?;
+            let guard = cli_disk_guard(root, store)?;
             if let Some(deferral) = guard.check_execution_admission().deferral() {
                 return Err(Failure::Ocg(OcgError::config(deferral.message())));
             }
@@ -827,7 +703,7 @@ fn work_command(
             // that mints the new Attempt, so the Guard is consulted first: a
             // refusal must leave the existing authoritative execution exactly
             // as it was, never half-fenced with no successor.
-            let guard = cli_disk_guard(root, user_path)?;
+            let guard = cli_disk_guard(root, store)?;
             if let Some(deferral) = guard.check_execution_admission().deferral() {
                 return Err(Failure::Ocg(OcgError::config(deferral.message())));
             }
@@ -872,7 +748,7 @@ fn work_command(
         // Job management claims no execution authority, so it does not take
         // the Project's execution ownership; SQLite serializes its writes.
         "orchestrate" | "attach" => {
-            let guard = cli_disk_guard(root, user_path)?;
+            let guard = cli_disk_guard(root, store)?;
             let deferral = if subcommand == "attach" {
                 guard.check_amplifying_expansion().deferral()
             } else {
@@ -1017,7 +893,7 @@ fn wait_for_terminal_probe(
 /// Neither subcommand schedules anything. A probe runs because it was asked for.
 fn health_command(
     root: &Path,
-    user_path: &Path,
+    store: &CoreStore,
     args: &[OsString],
     pretty: bool,
 ) -> Result<i32, Failure> {
@@ -1099,7 +975,7 @@ fn health_command(
             // makes the probe one-shot: nothing reschedules it.
             let service =
                 crate::orchestration::canonical_control::CanonicalControlService::open_process(
-                    root, user_path,
+                    root, store,
                 )?;
             let selection = crate::proxy::resolve(
                 true,
@@ -1360,8 +1236,8 @@ fn native_checkpoint(
                 decisions,
                 crate::clock::SystemClock.now_unix(),
             );
-            let path = checkpoint.save(root)?;
-            print_json(&json!({"id": checkpoint.id, "path": path}), pretty)?;
+            checkpoint.save(root)?;
+            print_json(&json!({"id": checkpoint.id}), pretty)?;
         }
         Some(other) => {
             return Err(Failure::Usage(format!(
@@ -1430,46 +1306,10 @@ fn doctor_command(effective: &config::Effective, root: &Path) -> Result<i32, Fai
     Ok(if errors.is_empty() { 0 } else { 1 })
 }
 
-fn native_config(
-    args: &[OsString],
-    user_path: &Path,
-    project_root: &Path,
-    env: &Env,
-) -> Result<i32, Failure> {
+fn native_config(args: &[OsString], store: &CoreStore) -> Result<i32, Failure> {
     let request = crate::config_command::parse_request(args)?;
-    let defaults = load_defaults(&OcgSource::Embedded)?;
-    let current = config::build_effective(
-        defaults.clone(),
-        None,
-        project_root,
-        user_path,
-        user_path,
-        env.home_dir.clone(),
-    )?;
-    let context = crate::config_command::Context {
-        defaults,
-        ocg_home: None,
-        project_root: project_root.to_path_buf(),
-        invocation_dir: project_root.to_path_buf(),
-        user_path: user_path.to_path_buf(),
-        project_path: user_path.to_path_buf(),
-        env,
-        level: String::new(),
-        current,
-    };
-    let probe = |_effective: &config::Effective, _level: &str| {};
-    let activate = |_effective: &config::Effective, _level: &str| {};
-    let mut input = std::io::BufReader::new(std::io::stdin());
     let mut output = std::io::stdout();
-    crate::config_command::execute(
-        &request,
-        &context,
-        &probe,
-        &activate,
-        &mut input,
-        &mut output,
-    )
-    .map_err(Failure::Ocg)
+    crate::config_command::execute(&request, store, &mut output).map_err(Failure::Ocg)
 }
 
 #[allow(dead_code)]

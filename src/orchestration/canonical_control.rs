@@ -6,6 +6,7 @@
 //! canonical Job snapshot needed to reconcile a reconnect.
 
 use crate::core_contract::{Failure, FailureClass};
+use crate::core_store::{ConfigChange, ConfigDocument, CoreStore};
 use crate::error::{OcgError, Result};
 use crate::orchestration::admission::{
     publish_call, reserve, AdmissionContext, AdmissionTarget, PayloadMode, PreparedExecution,
@@ -28,8 +29,6 @@ use std::time::{Duration, Instant};
 use ts_rs::TS;
 
 pub const CANONICAL_CONTROL_API_VERSION: &str = "ocg.canonical.v1";
-const PROJECTS_FILE: &str = "projects.json";
-const CONFIG_FILE: &str = "configuration.json";
 /// A terminal chat tail remains replayable for this bounded period after the
 /// provider terminal event is recorded. This is transport retention only, not
 /// durable chat history.
@@ -69,63 +68,6 @@ fn chat_capability_refusal(
 
 fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
-}
-
-static TEMPORARY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A temp path that can never collide with another writer in this process:
-/// the serialization locks already order committed writers, and the unique
-/// suffix removes the fixed-name temp race entirely.
-fn unique_temporary_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "state".to_string());
-    let sequence = TEMPORARY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_file_name(format!("{name}.tmp-{}-{sequence}", std::process::id()))
-}
-
-/// Write a temp file on the same filesystem, flush it, then atomically rename
-/// it over the target. The authoritative file is only replaced by a complete
-/// temp; a failure removes the temp and leaves the previous revision intact.
-fn atomic_write(path: &Path, bytes: &[u8], context: &'static str) -> Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| OcgError::io("create control state", e))?;
-    }
-    let temporary = unique_temporary_path(path);
-    let result = (|| -> Result<()> {
-        let mut file = std::fs::File::create(&temporary).map_err(|e| OcgError::io(context, e))?;
-        file.write_all(bytes)
-            .map_err(|e| OcgError::io(context, e))?;
-        file.sync_all().map_err(|e| OcgError::io(context, e))?;
-        drop(file);
-        std::fs::rename(&temporary, path).map_err(|e| OcgError::io(context, e))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
-}
-
-/// Hold an exclusive OS lock beside one control-state file for a complete
-/// read-modify-write: the read happens under it, so a concurrent process can
-/// never commit over an update it did not see. The kernel releases the lock
-/// when its holder exits, and readers never take it because every commit is
-/// an atomic rename. Holders do only local file work.
-fn lock_control_file(path: &Path) -> Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| OcgError::io("create control state", e))?;
-    }
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path.with_extension("lock"))
-        .map_err(|e| OcgError::io("open control state lock", e))?;
-    fs2::FileExt::lock_exclusive(&lock).map_err(|e| OcgError::io("lock control state", e))?;
-    Ok(lock)
 }
 
 fn chat_conversation_view(
@@ -181,8 +123,6 @@ fn safe_id(value: &str) -> bool {
 pub struct ProjectRecord {
     pub project_id: String,
     pub root: String,
-    pub boundary: String,
-    pub marker: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -253,7 +193,34 @@ fn disk_guard_config(global: &GlobalConfiguration) -> DiskGuardConfig {
 pub struct ProjectConfigurationView {
     pub project: ProjectRecord,
     pub global: GlobalConfiguration,
+    /// The revision of the global configuration; a change must name it.
+    pub global_revision: u64,
     pub project_defaults: ProjectConfiguration,
+    /// The revision of this Project's configuration; a change must name it.
+    pub project_revision: u64,
+}
+
+/// The configuration scope of the control plane's own settings.
+pub const CONTROL_SCOPE: &str = "control";
+/// The section of [`CONTROL_SCOPE`] holding the [`GlobalConfiguration`].
+const GLOBAL_SECTION: &str = "global";
+/// The section of a Project's scope holding its defaults.
+const PROJECT_DEFAULTS_SECTION: &str = "defaults";
+
+fn global_from_document(document: &ConfigDocument) -> Result<GlobalConfiguration> {
+    document
+        .section(GLOBAL_SECTION)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| invalid(format!("invalid global configuration: {error}")))
+        .map(Option::unwrap_or_default)
+}
+
+/// The committed global configuration and the revision of its scope.
+pub(crate) fn global_configuration(store: &CoreStore) -> Result<(GlobalConfiguration, u64)> {
+    let document = store.document(CONTROL_SCOPE)?;
+    Ok((global_from_document(&document)?, document.revision))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -600,7 +567,7 @@ pub struct ChatCancelResponse {
 #[derive(Debug, Clone)]
 pub struct CanonicalControlService {
     initial_root: PathBuf,
-    control_state: PathBuf,
+    store: CoreStore,
     runtime_handle: Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>,
     remote_execution: Option<crate::remote_execution::RemoteExecution>,
     runtime_registry: Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
@@ -609,9 +576,41 @@ pub struct CanonicalControlService {
     active_chats: Arc<Mutex<std::collections::HashMap<(String, String), ActiveChat>>>,
     launch_lock: Arc<Mutex<()>>,
     registry_lock: Arc<Mutex<()>>,
-    configuration_lock: Arc<Mutex<()>>,
+    /// Projects whose automatic admission pass is running in this process.
+    admitting: Arc<Mutex<std::collections::BTreeSet<String>>>,
     chat_forwarder: Arc<ChatForwarder>,
     placement_deferrals: Arc<Mutex<BTreeMap<String, PlacementDeferral>>>,
+}
+
+/// One Project's automatic admission pass in this process; released on drop.
+struct AdmissionGuard {
+    admitting: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    project_id: String,
+}
+
+impl AdmissionGuard {
+    /// `None` when a pass for this Project is already running.
+    fn try_acquire(
+        admitting: &Arc<Mutex<std::collections::BTreeSet<String>>>,
+        project_id: &str,
+    ) -> Result<Option<Self>> {
+        let inserted = admitting
+            .lock()
+            .map_err(|_| invalid("admission registry poisoned"))?
+            .insert(project_id.to_string());
+        Ok(inserted.then(|| Self {
+            admitting: admitting.clone(),
+            project_id: project_id.to_string(),
+        }))
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut admitting) = self.admitting.lock() {
+            admitting.remove(&self.project_id);
+        }
+    }
 }
 
 // Only Profile/spec incompatibility is memoized. Runtime availability is not
@@ -788,83 +787,42 @@ struct ChatRetryTransport {
 }
 
 impl CanonicalControlService {
+    /// The control service for the Project at `root`, over this
+    /// installation's database.
     pub fn open(root: &Path) -> Result<Self> {
         let boundary = project::resolve(root);
-        boundary.require(root)?;
-
-        // Use user-global profile path
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from);
-        let profile_path = crate::config::user_config_path(
-            None,
-            std::env::var_os("OCG_USER_CONFIG")
-                .as_deref()
-                .map(Path::new),
-            std::env::var_os("XDG_CONFIG_HOME")
-                .as_deref()
-                .map(Path::new),
-            home.as_deref(),
-        );
-
-        Ok(Self::new(
-            boundary.root(),
-            &profile_path,
-            crate::orchestration::state::state_dir(boundary.root()),
-        ))
+        Ok(Self::with_store(boundary.root(), CoreStore::locate()?))
     }
 
-    pub fn open_process(root: &Path, profile_path: &Path) -> Result<Self> {
+    /// The control service a long-lived process serves.
+    pub fn open_process(root: &Path, store: &CoreStore) -> Result<Self> {
         let boundary = project::resolve(root);
-        let service = Self::new(
-            boundary.root(),
-            profile_path,
-            project::canonicalize(profile_path)
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("state")
-                .join("control"),
-        );
-        // Adopt the existing control metadata once; Project substrates stay put.
-        let legacy = Self::new(
-            boundary.root(),
-            profile_path,
-            crate::orchestration::state::state_dir(boundary.root()),
-        );
-        // Re-checked under the file lock: another process may have adopted
-        // its own legacy state or committed a registration meanwhile.
-        if !service.project_file().exists() && legacy.project_file().exists() {
-            let _file = lock_control_file(&service.project_file())?;
-            if !service.project_file().exists() {
-                service.write_projects(&legacy.read_projects()?)?;
-            }
-        }
-        if !service.config_file().exists() && legacy.config_file().exists() {
-            let _file = lock_control_file(&service.config_file())?;
-            if !service.config_file().exists() {
-                let (global, defaults, revision) = legacy.read_configuration()?;
-                service.write_configuration(&global, &defaults, revision)?;
-            }
-        }
-        Ok(service)
+        Ok(Self::with_store(boundary.root(), store.clone()))
     }
 
-    fn new(root: &Path, profile_path: &Path, control_state: PathBuf) -> Self {
+    fn with_store(root: &Path, store: CoreStore) -> Self {
         Self {
             initial_root: root.to_path_buf(),
-            control_state,
+            profile_service: crate::profile::ProfileService::new(store.clone()),
+            store,
             runtime_handle: None,
             remote_execution: None,
             runtime_registry: None,
-            profile_service: crate::profile::ProfileService::with_workspace(profile_path, root),
             chat_registrations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             active_chats: Arc::new(Mutex::new(std::collections::HashMap::new())),
             launch_lock: Arc::new(Mutex::new(())),
             registry_lock: Arc::new(Mutex::new(())),
-            configuration_lock: Arc::new(Mutex::new(())),
+            admitting: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             chat_forwarder: ChatForwarder::new(),
             placement_deferrals: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// The pre-database constructor the unchanged unit tests still call. The
+    /// paths are not read: all state lives in the OCG database.
+    #[cfg(test)]
+    fn new(root: &Path, _profile_path: &Path, _control_state: PathBuf) -> Self {
+        Self::with_store(root, CoreStore)
     }
 
     pub(crate) fn with_remote_execution(
@@ -901,7 +859,12 @@ impl CanonicalControlService {
     }
 
     pub(crate) fn security_store(&self) -> Result<crate::control_security::OwnershipStore> {
-        crate::control_security::OwnershipStore::open(&self.control_state.join("security.sqlite"))
+        crate::control_security::OwnershipStore::open()
+    }
+
+    /// This installation's configuration, credentials and Project registry.
+    pub fn store(&self) -> &CoreStore {
+        &self.store
     }
 
     pub(crate) fn chat_project_for(&self, session_id: &str, job_id: &str) -> Option<String> {
@@ -913,105 +876,33 @@ impl CanonicalControlService {
             .map(|chat| chat.project_id.clone())
     }
 
-    fn project_file(&self) -> PathBuf {
-        self.control_state.join(PROJECTS_FILE)
-    }
-
-    fn config_file(&self) -> PathBuf {
-        self.control_state.join(CONFIG_FILE)
-    }
-
     fn read_projects(&self) -> Result<Vec<ProjectRecord>> {
-        let path = self.project_file();
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let bytes = std::fs::read(&path).map_err(|e| OcgError::io("read project registry", e))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| invalid(format!("invalid project registry: {e}")))
+        self.store.projects()
     }
 
-    fn write_projects(&self, projects: &[ProjectRecord]) -> Result<()> {
-        let path = self.project_file();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| OcgError::io("create control state", e))?;
-        }
-        let bytes = serde_json::to_vec_pretty(projects).map_err(|e| invalid(e.to_string()))?;
-        atomic_write(&path, &bytes, "commit project registry")
+    /// The committed global configuration and its revision.
+    fn read_configuration(&self) -> Result<(GlobalConfiguration, u64)> {
+        global_configuration(&self.store)
     }
 
-    fn read_configuration(
-        &self,
-    ) -> Result<(
-        GlobalConfiguration,
-        std::collections::BTreeMap<String, ProjectConfiguration>,
-        u64,
-    )> {
-        let path = self.config_file();
-        if !path.exists() {
-            return Ok((
-                GlobalConfiguration::default(),
-                std::collections::BTreeMap::new(),
-                0,
-            ));
-        }
-        let bytes =
-            std::fs::read(&path).map_err(|e| OcgError::io("read canonical configuration", e))?;
-        #[derive(Deserialize, Default)]
-        struct Stored {
-            #[serde(default)]
-            global: GlobalConfiguration,
-            #[serde(default)]
-            project_defaults: Value,
-            #[serde(default)]
-            revision: u64,
-        }
-        let stored: Stored = serde_json::from_slice(&bytes)
-            .map_err(|e| invalid(format!("invalid canonical configuration: {e}")))?;
-        // Compatibility reader for the first draft: it stored one defaults
-        // object in a list, before Project identity was part of the scope.
-        // Adopt that single entry only for the sole registered Project; if
-        // there are multiple Projects, refuse to guess which one owned it.
-        let project_defaults = if stored.project_defaults.is_array() {
-            let list = stored.project_defaults.as_array().unwrap();
-            let projects = self.read_projects()?;
-            if list.len() != 1 || projects.len() != 1 {
-                return Err(invalid(
-                    "legacy project defaults have ambiguous Project scope",
-                ));
-            }
-            let defaults: ProjectConfiguration = serde_json::from_value(list[0].clone())
-                .map_err(|e| invalid(format!("invalid legacy project defaults: {e}")))?;
-            let mut scoped = std::collections::BTreeMap::new();
-            scoped.insert(projects[0].project_id.clone(), defaults);
-            scoped
-        } else if stored.project_defaults.is_null() {
-            std::collections::BTreeMap::new()
-        } else {
-            serde_json::from_value(stored.project_defaults)
-                .map_err(|e| invalid(format!("invalid scoped project defaults: {e}")))?
-        };
-        Ok((stored.global, project_defaults, stored.revision))
+    /// One Project's committed defaults and the revision of its scope.
+    fn project_defaults(&self, project_id: &str) -> Result<(ProjectConfiguration, u64)> {
+        let document = self.store.document(project_id)?;
+        let defaults = document
+            .section(PROJECT_DEFAULTS_SECTION)
+            .cloned()
+            .map(|defaults| ProjectConfiguration { defaults })
+            .unwrap_or_default();
+        Ok((defaults, document.revision))
     }
 
-    fn write_configuration(
-        &self,
-        global: &GlobalConfiguration,
-        project_defaults: &std::collections::BTreeMap<String, ProjectConfiguration>,
-        revision: u64,
-    ) -> Result<()> {
-        let path = self.config_file();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| OcgError::io("create control state", e))?;
-        }
-        let value =
-            json!({"global":global,"project_defaults":project_defaults,"revision":revision});
-        let bytes = serde_json::to_vec_pretty(&value).map_err(|e| invalid(e.to_string()))?;
-        atomic_write(&path, &bytes, "commit canonical configuration")
-    }
-
-    /// Register/import an existing repository only after nearest-boundary
-    /// resolution and canonical path validation.
+    /// Register an existing directory as a Project, or return the
+    /// registered Project that already contains it.
+    ///
+    /// Registration is the declaration: nothing is written into the
+    /// directory. Identity belongs to the canonical root, so a client can
+    /// never claim an existing identity for another directory, and a moved
+    /// directory registers as a new Project.
     pub fn register_project(
         &self,
         command_id: &str,
@@ -1026,75 +917,24 @@ impl CanonicalControlService {
             .lock()
             .map_err(|_| invalid("Project registry poisoned"))?;
         let boundary: ProjectBoundary = project::resolve(requested_root);
-        boundary.require(requested_root)?;
         let root = project::canonicalize(boundary.root());
         if !root.is_dir() {
             return Err(invalid("project root is not a directory"));
         }
-        let marker = root.join(project::MARKER);
-        let canonical_marker = marker
-            .canonicalize()
-            .map_err(|error| OcgError::io("resolve Project marker", error))?;
-        if !canonical_marker.starts_with(&root)
-            || project::resolve(&canonical_marker).root() != root
-        {
-            return Err(invalid("Project marker must stay inside its boundary"));
+        let installation = crate::database::installation_dir()?;
+        if installation.starts_with(&root) {
+            return Err(invalid(
+                "a Project must not contain the OCG installation directory",
+            ));
         }
-        let boundary_root = project::canonicalize(boundary.root());
-        // The durable Project identity is proven by the new root's own
-        // `.ocg` store, never by a project_id a client may claim. The store is
-        // opened without creating identity so a moved Project is read first:
-        // `open` would mint a second row for the same durable store and that
-        // new row would then look authoritative.
-        let project_id = DomainRepository::open_existing(&root)?
-            .reconcile_project(&root)?
-            .id;
-        let previous = self
-            .read_projects()?
-            .into_iter()
-            .find(|project| project.project_id == project_id);
-        if previous.is_some_and(|existing| existing.root != root.to_string_lossy()) {
-            // Same durable identity at a new location: this is a repair of
-            // registry location authority, not a new Project. A live runtime
-            // still pinned to the old root is stopped and joined before the
-            // registry may name the new one, so one project_id can never hold
-            // two authoritative roots. A failed shutdown aborts registration
-            // with the registry untouched. This happens before the registry
-            // file lock: joining workers is not bounded local work.
-            if let Some(registry) = &self.runtime_registry {
-                registry.invalidate(&project_id)?;
-            }
-        }
-        // The commit merges this one record into the registry as committed
-        // now, keyed by project_id, so concurrent registrations all survive.
-        let project = {
-            let _file = lock_control_file(&self.project_file())?;
-            let mut projects = self.read_projects()?;
-            let record = projects
-                .iter_mut()
-                .find(|project| project.project_id == project_id);
-            let project = if let Some(existing) = record {
-                // Identity and created_at stay; the observed location metadata
-                // is replaced.
-                existing.root = root.to_string_lossy().to_string();
-                existing.boundary = boundary_root.to_string_lossy().to_string();
-                existing.marker = boundary.has_marker();
-                existing.updated_at = now;
-                existing.clone()
-            } else {
-                let project = ProjectRecord {
-                    project_id,
-                    root: root.to_string_lossy().to_string(),
-                    boundary: boundary_root.to_string_lossy().to_string(),
-                    marker: boundary.has_marker(),
-                    created_at: now,
-                    updated_at: now,
-                };
-                projects.push(project.clone());
-                project
-            };
-            self.write_projects(&projects)?;
-            project
+        let repository = DomainRepository::open_existing(&root)?;
+        repository.ensure_project(&root)?;
+        let project = repository.touch_project(&root, now)?;
+        let project = ProjectRecord {
+            project_id: project.id,
+            root: project.root,
+            created_at: project.created_at,
+            updated_at: now,
         };
         Ok(CanonicalProjectResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
@@ -1123,117 +963,126 @@ impl CanonicalControlService {
 
     pub fn configuration(&self, project_id: &str) -> Result<ProjectConfigurationView> {
         let project = self
-            .read_projects()?
-            .into_iter()
-            .find(|project| project.project_id == project_id)
+            .store
+            .project(project_id)?
             .ok_or_else(|| invalid("unknown Project identity"))?;
-        let (global, project_defaults, _) = self.read_configuration()?;
-        let defaults = project_defaults
-            .get(project_id)
-            .cloned()
-            .unwrap_or_default();
+        let (global, global_revision) = self.read_configuration()?;
+        let (project_defaults, project_revision) = self.project_defaults(project_id)?;
         Ok(ProjectConfigurationView {
             project,
             global,
-            project_defaults: defaults,
+            global_revision,
+            project_defaults,
+            project_revision,
         })
     }
 
+    /// Replace the global configuration, provided it is still at
+    /// `expected_revision`.
     pub fn set_global_configuration(
         &self,
         command_id: &str,
         config: GlobalConfiguration,
-        _now: i64,
+        expected_revision: u64,
     ) -> Result<CanonicalConfigurationResponse> {
         if !safe_id(command_id) {
             return Err(invalid("invalid command_id"));
         }
-        if let Some(storage_guard) = config.storage_guard.as_ref() {
-            storage_guard.validate()?;
-        }
-        // One serialization boundary covers the whole read-modify-write: the
-        // latest authoritative revision is read, mutated and committed while
-        // no other configuration writer can interleave.
-        let revision = {
-            let _configuration = self
-                .configuration_lock
-                .lock()
-                .map_err(|_| invalid("configuration authority poisoned"))?;
-            let _file = lock_control_file(&self.config_file())?;
-            let (_old, project_defaults, revision) = self.read_configuration()?;
-            let revision = revision.saturating_add(1);
-            // Global configuration and project defaults are separate scopes:
-            // this never rewrites a project's own defaults.
-            self.write_configuration(&config, &project_defaults, revision)?;
-            revision
-        };
+        let value = serde_json::to_value(&config).map_err(|error| invalid(error.to_string()))?;
+        let committed = self.store.commit(
+            ConfigChange {
+                scope: CONTROL_SCOPE,
+                command_id,
+                principal: "operator",
+                expected_revision,
+                sections: vec![(GLOBAL_SECTION, Some(value))],
+            },
+            |candidate| {
+                let config = global_from_document(candidate)?;
+                if let Some(storage_guard) = config.storage_guard.as_ref() {
+                    storage_guard.validate()?;
+                }
+                Ok(())
+            },
+        )?;
+        let global = global_from_document(&committed.document)?;
         let project = self
             .read_projects()?
             .into_iter()
             .next()
             .ok_or_else(|| invalid("register a Project before configuring OCG"))?;
-        let view = ProjectConfigurationView {
-            project: project.clone(),
-            global: config,
-            project_defaults: ProjectConfiguration::default(),
-        };
+        let (project_defaults, project_revision) = self.project_defaults(&project.project_id)?;
         Ok(CanonicalConfigurationResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             command_id: command_id.to_string(),
             accepted: true,
-            project_id: project.project_id,
-            revision,
-            configuration: view,
+            project_id: project.project_id.clone(),
+            revision: committed.revision,
+            configuration: ProjectConfigurationView {
+                project,
+                global,
+                global_revision: committed.document.revision,
+                project_defaults,
+                project_revision,
+            },
         })
     }
 
+    /// Replace one Project's defaults, provided its scope is still at
+    /// `expected_revision`. Another Project's scope and the global scope are
+    /// never touched.
     pub fn set_project_defaults(
         &self,
         command_id: &str,
         project_id: &str,
         defaults: Value,
-        _now: i64,
+        expected_revision: u64,
     ) -> Result<CanonicalConfigurationResponse> {
         if !safe_id(command_id) || !defaults.is_object() {
             return Err(invalid("invalid project configuration command"));
         }
-        provider_concurrency(&defaults)?;
         let project = self
-            .read_projects()?
-            .into_iter()
-            .find(|project| project.project_id == project_id)
+            .store
+            .project(project_id)?
             .ok_or_else(|| invalid("unknown Project identity"))?;
-        let (global, revision) = {
-            let _configuration = self
-                .configuration_lock
-                .lock()
-                .map_err(|_| invalid("configuration authority poisoned"))?;
-            let _file = lock_control_file(&self.config_file())?;
-            let (global, mut project_defaults, revision) = self.read_configuration()?;
-            let revision = revision.saturating_add(1);
-            // Scoped per Project: editing one project's defaults never touches
-            // another project's persisted defaults or the global scope.
-            project_defaults.insert(
-                project_id.to_string(),
-                ProjectConfiguration {
-                    defaults: defaults.clone(),
-                },
-            );
-            self.write_configuration(&global, &project_defaults, revision)?;
-            (global, revision)
-        };
-        let view = ProjectConfigurationView {
-            project: project.clone(),
-            global,
-            project_defaults: ProjectConfiguration { defaults },
+        let committed = self.store.commit(
+            ConfigChange {
+                scope: project_id,
+                command_id,
+                principal: "operator",
+                expected_revision,
+                sections: vec![(PROJECT_DEFAULTS_SECTION, Some(defaults))],
+            },
+            |candidate| {
+                provider_concurrency(
+                    candidate
+                        .section(PROJECT_DEFAULTS_SECTION)
+                        .unwrap_or(&Value::Null),
+                )
+                .map(|_| ())
+            },
+        )?;
+        let (global, global_revision) = self.read_configuration()?;
+        let project_defaults = ProjectConfiguration {
+            defaults: committed
+                .document
+                .section(PROJECT_DEFAULTS_SECTION)
+                .cloned()
+                .unwrap_or(Value::Null),
         };
         Ok(CanonicalConfigurationResponse {
             api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
             command_id: command_id.to_string(),
             accepted: true,
-            project_id: project.project_id,
-            revision,
-            configuration: view,
+            project_id: project.project_id.clone(),
+            revision: committed.revision,
+            configuration: ProjectConfigurationView {
+                project,
+                global,
+                global_revision,
+                project_defaults,
+                project_revision: committed.document.revision,
+            },
         })
     }
 
@@ -1352,36 +1201,16 @@ impl CanonicalControlService {
                 ))
             }
         };
-        let boundary = project::resolve(&canonical_root);
-        if canonical_root != root || !boundary.has_marker() || boundary.root() != root {
+        if canonical_root != root {
             return Ok(CandidateRepository::Unavailable(
-                "registered Project boundary is no longer valid",
+                "registered Project root is no longer its canonical path",
             ));
         }
-        let marker = root.join(project::MARKER);
-        let canonical_marker = match marker.canonicalize() {
-            Ok(canonical_marker) => canonical_marker,
-            Err(_) => {
-                return Ok(CandidateRepository::Unavailable(
-                    "registered Project boundary is no longer valid",
-                ))
-            }
-        };
-        if !canonical_marker.starts_with(root) || project::resolve(&canonical_marker).root() != root
-        {
-            return Ok(CandidateRepository::Unavailable(
-                "registered Project marker must stay inside its boundary",
-            ));
-        }
-        // Read the identity this store already holds. Opening it never mints a
-        // new Project, so a Job lookup can never create one.
         let repository = DomainRepository::open_existing(root)?;
         if repository.project_at_root(root)?.map(|project| project.id)
             != Some(project.project_id.clone())
         {
-            return Err(invalid(
-                "Project identity does not own this durable boundary",
-            ));
+            return Err(invalid("Project identity is not registered at this root"));
         }
         Ok(CandidateRepository::Ready(repository))
     }
@@ -1394,38 +1223,19 @@ impl CanonicalControlService {
     }
 
     fn repository_for_job(&self, job_id: &str) -> Result<DomainRepository> {
-        let mut owner = None;
-        let mut skipped = 0usize;
-        for project in self.read_projects()? {
-            // Search every registered Project as a candidate owner, but only
-            // skip a candidate whose boundary is gone. A candidate whose store
-            // cannot be opened, read, or proven to own its own identity fails
-            // the lookup here instead of being silently passed over.
-            let repository = match self.candidate_repository(&project)? {
-                CandidateRepository::Ready(repository) => repository,
-                CandidateRepository::Unavailable(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-            let job = repository.job(job_id)?;
-            if job.is_some_and(|job| job.project_id == project.project_id) {
-                if owner.is_some() {
-                    return Err(invalid("ambiguous canonical Job identity"));
-                }
-                owner = Some(repository);
-            }
+        let project_id = DomainRepository::open_existing(&self.initial_root)?
+            .job(job_id)?
+            .map(|job| job.project_id)
+            .ok_or_else(|| invalid("unknown canonical Job"))?;
+        let project = self
+            .projects()?
+            .into_iter()
+            .find(|project| project.project_id == project_id)
+            .ok_or_else(|| invalid("unknown canonical Job"))?;
+        match self.candidate_repository(&project)? {
+            CandidateRepository::Ready(repository) => Ok(repository),
+            CandidateRepository::Unavailable(reason) => Err(invalid(reason)),
         }
-        owner.ok_or_else(|| {
-            if skipped > 0 {
-                invalid(format!(
-                    "unknown canonical Job ({skipped} unavailable Project candidate{} skipped)",
-                    if skipped == 1 { "" } else { "s" }
-                ))
-            } else {
-                invalid("unknown canonical Job")
-            }
-        })
     }
 
     pub fn project_usage(
@@ -1856,14 +1666,8 @@ impl CanonicalControlService {
         root: &Path,
     ) -> Result<crate::orchestration::execution_runtime::ExecutionRuntimeHandle> {
         if let Some(registry) = &self.runtime_registry {
-            let (_, defaults, _) = self.read_configuration()?;
-            let concurrency = provider_concurrency(
-                &defaults
-                    .get(project_id)
-                    .cloned()
-                    .unwrap_or_default()
-                    .defaults,
-            )?;
+            let (defaults, _) = self.project_defaults(project_id)?;
+            let concurrency = provider_concurrency(&defaults.defaults)?;
             return registry.get_or_start(project_id, root, concurrency);
         }
         self.runtime_handle
@@ -1876,7 +1680,7 @@ impl CanonicalControlService {
         let mut failure = None;
         let global = self
             .read_configuration()
-            .map(|(global, _, _)| global)
+            .map(|(global, _)| global)
             .unwrap_or_default();
         // An unreadable Project registry skips this pass's reconciliation, but
         // never the notification of settlements already committed below.
@@ -2063,7 +1867,8 @@ impl CanonicalControlService {
         // Thresholds are re-read every pass so configuration updates take
         // effect without restart; observation refresh is cadence-gated inside
         // the Guard, so most passes are a cached read.
-        let (global, _, configuration_revision) = self.read_configuration().unwrap_or_default();
+        let (global, _) = self.read_configuration().unwrap_or_default();
+        let configuration_revision = self.store.active_revision().unwrap_or_default();
         let mut failure = None;
         let mut selected_jobs = std::collections::BTreeSet::new();
         let mut profile_revision = None;
@@ -2079,20 +1884,16 @@ impl CanonicalControlService {
             }
             let result = (|| -> Result<()> {
                 let (_, mut domain) = self.project_repository(&project.project_id)?;
-                // Serialize the complete Attempt-to-Call handoff across consumers;
-                // SQLite still guards every authoritative claim independently.
-                let lock = std::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(domain.path().with_extension("admission.lock"))
-                    .map_err(|error| OcgError::io("open Job admission lock", error))?;
-                match fs2::FileExt::try_lock_exclusive(&lock) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                    Err(error) => return Err(OcgError::io("lock Job admission", error)),
-                }
+                // Serialize the complete Attempt-to-Call handoff among this
+                // process's consumers of one Project. Other processes are
+                // excluded by Project ownership, taken below before anything
+                // is admitted, and SQLite still guards every authoritative
+                // claim independently. Other Projects are never blocked.
+                let Some(_admitting) =
+                    AdmissionGuard::try_acquire(&self.admitting, &project.project_id)?
+                else {
+                    return Ok(());
+                };
                 let jobs = domain.automatic_admission_jobs(&project.project_id)?;
                 let unpublished = domain.unpublished_admissions(&project.project_id)?;
                 if jobs.is_empty()
@@ -2237,7 +2038,7 @@ impl CanonicalControlService {
                 .find(|project| project.project_id == parent.project_id)
                 .map(|project| project.root)
                 .ok_or_else(|| invalid("unknown Project identity"))?;
-            let (global, _, _) = self.read_configuration()?;
+            let (global, _) = self.read_configuration()?;
             let guard =
                 self.disk_guard_for_project(&parent.project_id, Path::new(&root), &global)?;
             if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
@@ -2285,7 +2086,7 @@ impl CanonicalControlService {
             return Err(invalid("invalid command_id or project_id"));
         }
         let (project, mut domain) = self.project_repository(&request.project_id)?;
-        let (global, _, _) = self.read_configuration()?;
+        let (global, _) = self.read_configuration()?;
         let guard =
             self.disk_guard_for_project(&project.project_id, Path::new(&project.root), &global)?;
         if let Some(deferral) = guard.check_execution_admission().deferral() {
@@ -2329,7 +2130,7 @@ impl CanonicalControlService {
         // same storage gate refuses it before anything is written.
         {
             let (project, _) = self.project_repository(&parent.project_id)?;
-            let (global, _, _) = self.read_configuration()?;
+            let (global, _) = self.read_configuration()?;
             let guard =
                 self.disk_guard_for_project(&parent.project_id, Path::new(&project.root), &global)?;
             if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
@@ -2527,13 +2328,8 @@ impl CanonicalControlService {
             )));
         }
         if let Some(reference) = target.credential_ref.as_deref() {
-            if crate::vault::Vault::user_global()?
-                .get(reference)?
-                .is_none()
-            {
-                return Err(refuse(format!(
-                    "credential {reference} is not in the Vault"
-                )));
+            if !self.store.credential_names()?.contains(reference) {
+                return Err(refuse(format!("credential {reference} is not stored")));
             }
         }
         if let Some(refusal) = chat_capability_refusal(
@@ -2595,7 +2391,7 @@ impl CanonicalControlService {
         // retryable and deferred; no execution is created here.
         let retry_guard = {
             let (project, _) = self.project_repository(&job.project_id)?;
-            let (global, _, _) = self.read_configuration()?;
+            let (global, _) = self.read_configuration()?;
             self.disk_guard_for_project(&job.project_id, Path::new(&project.root), &global)?
         };
         if let Some(deferral) = retry_guard.check_execution_admission().deferral() {
@@ -2752,7 +2548,7 @@ impl CanonicalControlService {
                 Ok((request, runtime, profile, project, resolved))
             })
             .transpose()?;
-        let (global, _, _) = self.read_configuration()?;
+        let (global, _) = self.read_configuration()?;
         let budget_config = self.provider_budget_config(&global)?;
         // The replacement Attempt and the reactivated assistant Message commit
         // together; the turn and its Message keep their identity.
@@ -3096,11 +2892,9 @@ impl CanonicalControlService {
         }
 
         // Resolve configuration
-        let (global_config, project_configs, configuration_revision) = self.read_configuration()?;
-        let project_config = project_configs
-            .get(&project.project_id)
-            .cloned()
-            .unwrap_or_default();
+        let (global_config, _) = self.read_configuration()?;
+        let configuration_revision = self.store.active_revision()?;
+        let (project_config, _) = self.project_defaults(&project.project_id)?;
         let provider_concurrency = provider_concurrency(&project_config.defaults)?;
 
         let runtime = if let Some(registry) = &self.runtime_registry {
@@ -3694,7 +3488,7 @@ impl CanonicalControlService {
         // Probes are Exact diagnostic targets: they fan out durable state
         // without producing user work, so disk safety gates them before the
         // target is even validated.
-        let (probe_global, _, _) = self.read_configuration()?;
+        let (probe_global, _) = self.read_configuration()?;
         let probe_guard = self.disk_guard_for_project(
             &project.project_id,
             Path::new(&project.root),

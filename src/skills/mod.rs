@@ -8,9 +8,11 @@
 //! it and are read on demand rather than loaded with it.
 //!
 //! ```text
-//! <project>/.ocg/skills/<name>/SKILL.md
-//! <config>/skills/<name>/SKILL.md
+//! <project>/<configured skills path>/<name>/SKILL.md
 //! ```
+//!
+//! Skill directories are the user's own Project files, named by the committed
+//! `skills.paths` configuration. OCG keeps no skill directory of its own.
 //!
 //! ## The three kinds of thing, and why they are three
 //!
@@ -61,7 +63,7 @@
 //! Nothing here is wired to a request. A caller assembles a request like this:
 //!
 //! ```text
-//! registry  = skills::discover(project_root, config_home, builtins, &policy)
+//! registry  = skills::discover(project_root, builtins, &policy)
 //! catalog   = skills::render_catalog(&registry, &policy)
 //! active    = skills::resolve(&registry, requests, &policy, tools, capabilities)
 //! bindings  = previous_bindings    // durable, beside the CompactionPoint

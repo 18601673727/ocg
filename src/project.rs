@@ -1,45 +1,36 @@
 //! Deterministic project-boundary resolution.
 //!
-//! A project is *initialized* by the presence of an OCG state directory
-//! (`.ocg/`) in a directory. The project root is the nearest
-//! ancestor of the invocation directory that contains the marker. Every piece
-//! of project-scoped state (context index/cache, orchestration state,
-//! checkpoints, verification logs and local telemetry)
-//! is placed under that resolved root, never under an arbitrary working
-//! directory. Two sibling projects therefore can never share state, and a
-//! parent directory that is not itself a project can never become a boundary
-//! for a child project.
-//!
-//! Resolution is purely local and deterministic: the filesystem is walked
-//! upwards and paths are canonicalized before any comparison. No workspace
-//! database, registry or cache is introduced. There is no global fallback that
-//! could merge unrelated projects.
+//! A Project is a directory registered in the OCG database; registering a root
+//! is what declares it. The boundary of an invocation is the registered
+//! Project whose root is the invocation directory or its nearest ancestor.
+//! OCG never marks a Project on disk: nothing is written into the directory
+//! to declare it, and nothing found in it is taken as a declaration. Paths are
+//! canonicalized before any comparison, so a symlinked spelling resolves to
+//! the same Project, and a parent directory that is not itself registered can
+//! never become the boundary of a child Project.
 
 use crate::error::{OcgError, Result};
 use std::path::{Component, Path, PathBuf};
-
-/// The state directory marker that initializes a project boundary.
-pub const MARKER: &str = ".ocg";
 
 /// The resolved project boundary for one invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectBoundary {
     root: PathBuf,
-    /// A marker was found at `root` or at a nearest ancestor.
-    marker: bool,
+    /// `root` is a registered Project.
+    registered: bool,
     /// The caller named the boundary explicitly (`--project` / `--cwd`).
     explicit: bool,
 }
 
 impl ProjectBoundary {
-    /// The directory that owns all project-scoped state.
+    /// The Project's root directory.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Whether an `.ocg` marker defines this boundary.
-    pub fn has_marker(&self) -> bool {
-        self.marker
+    /// Whether `root` is a registered Project.
+    pub fn is_registered(&self) -> bool {
+        self.registered
     }
 
     /// Whether the caller named this boundary explicitly.
@@ -47,26 +38,21 @@ impl ProjectBoundary {
         self.explicit
     }
 
-    /// Whether project-scoped state may be placed at [`Self::root`]. An
-    /// explicit `--project` declaration always allows it; otherwise a marker
-    /// must have been found by the ancestor walk.
+    /// Whether Project-scoped work may use [`Self::root`]. An explicit
+    /// `--project` declaration always allows it; otherwise the root must be a
+    /// registered Project.
     pub fn allows_project_state(&self) -> bool {
-        self.marker || self.explicit
-    }
-
-    /// The project-local OCG state directory inside the boundary.
-    pub fn config_path(&self) -> PathBuf {
-        self.root.join(MARKER)
+        self.registered || self.explicit
     }
 
     /// Reject an operation that needs a declared boundary when the invocation
-    /// sits outside any initialized project.
+    /// sits outside any registered Project.
     pub fn require(&self, invocation_dir: &Path) -> Result<()> {
         if self.allows_project_state() {
             return Ok(());
         }
         Err(OcgError::config(format!(
-            "this command needs an initialized project: no {MARKER} was found in {} or any parent directory\nrun `mkdir .ocg` in the project root, or pass --project DIR",
+            "this command needs a registered Project: neither {} nor any parent directory is one\nregister the Project from the OCG control surface, or pass --project DIR",
             invocation_dir.display()
         )))
     }
@@ -105,40 +91,41 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
-/// Resolve the nearest ancestor of `start` that contains the marker, or fall
-/// back to the canonical `start` directory with no marker.
+/// Resolve the registered Project containing `start`, or fall back to the
+/// canonical `start` directory, unregistered.
 pub fn resolve(start: &Path) -> ProjectBoundary {
     let start = canonicalize(start);
-    let mut current = start.clone();
-    loop {
-        if current.join(MARKER).is_dir() {
-            return ProjectBoundary {
-                root: current,
-                marker: true,
-                explicit: false,
-            };
-        }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => break,
-        }
-    }
-    ProjectBoundary {
-        root: start,
-        marker: false,
-        explicit: false,
+    let registered = crate::core_store::CoreStore::locate()
+        .and_then(|store| store.project_containing(&start))
+        .ok()
+        .flatten();
+    match registered {
+        Some(project) => ProjectBoundary {
+            root: PathBuf::from(project.root),
+            registered: true,
+            explicit: false,
+        },
+        None => ProjectBoundary {
+            root: start,
+            registered: false,
+            explicit: false,
+        },
     }
 }
 
-/// Use an explicitly named root as the boundary. The directory does not need a
-/// marker: naming it is itself the declaration. The root is still
-/// canonicalized so a symlinked spelling cannot create a second boundary.
+/// Use an explicitly named root as the boundary. Naming it is itself the
+/// declaration. The root is still canonicalized so a symlinked spelling
+/// cannot create a second boundary.
 pub fn explicit(root: &Path) -> ProjectBoundary {
     let root = canonicalize(root);
-    let marker = root.join(MARKER).is_dir();
+    let registered = crate::core_store::CoreStore::locate()
+        .and_then(|store| store.project_containing(&root))
+        .ok()
+        .flatten()
+        .is_some_and(|project| Path::new(&project.root) == root);
     ProjectBoundary {
         root,
-        marker,
+        registered,
         explicit: true,
     }
 }

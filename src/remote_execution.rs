@@ -84,20 +84,6 @@ impl RemoteExecution {
                 "Project is outside the authorized workspace",
             ));
         }
-        let state = root.join(".ocg");
-        if state.canonicalize().ok().as_ref() != Some(&state) || !state.is_dir() {
-            return Err(OcgError::config(
-                "remote Project needs an ordinary .ocg directory",
-            ));
-        }
-        let locks = state.join("edit-locks");
-        std::fs::create_dir_all(&locks)
-            .map_err(|error| OcgError::io("prepare confined edit locks", error))?;
-        if locks.canonicalize().ok().as_ref() != Some(&locks) || !locks.is_dir() {
-            return Err(OcgError::config(
-                "remote edit locks must be an ordinary directory",
-            ));
-        }
         Ok(())
     }
 
@@ -205,12 +191,6 @@ impl RemoteExecution {
             root.to_string_lossy().into_owned(),
             root.to_string_lossy().into_owned(),
             "--ro-bind".into(),
-            root.join(".ocg").to_string_lossy().into_owned(),
-            root.join(".ocg").to_string_lossy().into_owned(),
-            "--bind".into(),
-            root.join(".ocg/edit-locks").to_string_lossy().into_owned(),
-            root.join(".ocg/edit-locks").to_string_lossy().into_owned(),
-            "--ro-bind".into(),
             self.helper.to_string_lossy().into_owned(),
             "/ocg-native-tool".into(),
             "--chdir".into(),
@@ -246,7 +226,13 @@ impl RemoteExecution {
         if input.len() > 256 * 1024 {
             return Err(OcgError::config("confined tool input exceeds limit"));
         }
-        let snapshot = if matches!(name, "context.snapshot" | "context.validation") {
+        // Tools that read the Project's canonical or context state get a
+        // read-only copy of that Project's rows: the helper has no access to
+        // the OCG database itself.
+        let snapshot = if matches!(
+            name,
+            "context.snapshot" | "context.validation" | "context.search"
+        ) {
             let directory = tempfile::tempdir()
                 .map_err(|error| OcgError::io("prepare confined context snapshot", error))?;
             crate::orchestration::domain::DomainRepository::write_read_snapshot(

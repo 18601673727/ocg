@@ -545,7 +545,15 @@ runnable_choices: Array<string>, };
 export type ProjectConfiguration = { defaults: JsonValue, };
 
 
-export type ProjectConfigurationView = { project: ProjectRecord, global: GlobalConfiguration, project_defaults: ProjectConfiguration, };
+export type ProjectConfigurationView = { project: ProjectRecord, global: GlobalConfiguration,
+/**
+ * The revision of the global configuration; a change must name it.
+ */
+global_revision: number, project_defaults: ProjectConfiguration,
+/**
+ * The revision of this Project's configuration; a change must name it.
+ */
+project_revision: number, };
 
 
 export type ProjectOwnershipRequest = { project_id: string, issuer: string, subject: string, };
@@ -558,7 +566,7 @@ export type ProjectOwnershipResponse = { project_id: string, user_id: string, };
  * Backend-owned Project identity. Import is a boundary validation operation,
  * not a general filesystem manager.
  */
-export type ProjectRecord = { project_id: string, root: string, boundary: string, marker: boolean, created_at: number, updated_at: number, };
+export type ProjectRecord = { project_id: string, root: string, created_at: number, updated_at: number, };
 
 
 export type ProjectScope = string;

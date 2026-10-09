@@ -53,79 +53,6 @@ fn is_disk_full(error: &rusqlite::Error) -> bool {
     )
 }
 
-/// Classify an open-time SQLite failure. An exhausted filesystem usually fails
-/// at open — WAL/shared-memory files cannot be created — with `CANTOPEN`
-/// rather than `FULL`. A `CANTOPEN` is therefore confirmed with a writability
-/// probe in the database directory before reclassifying: only an actual
-/// write rejection (`ENOSPC`, read-only mount) becomes storage safety, so
-/// permission or path errors can never masquerade as it.
-fn open_sql(root: &Path, error: rusqlite::Error) -> OcgError {
-    let cant_open = matches!(
-        &error,
-        rusqlite::Error::SqliteFailure(inner, _)
-            if inner.code == rusqlite::ErrorCode::CannotOpen
-    );
-    let mapped = sql(error);
-    if mapped.is_storage_full() || !cant_open {
-        return mapped;
-    }
-    match probe_writable(root) {
-        ProbeOutcome::Unwritable(reason) => OcgError::storage_full(
-            "canonical domain SQLite",
-            format!("{mapped}; host storage rejects writes ({reason})"),
-        ),
-        ProbeOutcome::Writable => mapped,
-    }
-}
-
-enum ProbeOutcome {
-    Writable,
-    Unwritable(&'static str),
-}
-
-/// Try to create, write and remove one tiny file beside the substrate. Only a
-/// write rejection proves exhaustion; anything else (including a probe that
-/// cannot even be attempted cleanly) leaves the original error untouched.
-fn probe_writable(root: &Path) -> ProbeOutcome {
-    use std::io::Write;
-    let directory = crate::orchestration::state::state_dir(root);
-    for attempt in 0..4 {
-        let path = directory.join(format!(
-            ".ocg-open-probe-{}-{attempt}.tmp",
-            std::process::id()
-        ));
-        let created = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path);
-        let mut file = match created {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return classify_probe_error(&error),
-        };
-        let outcome = match file.write_all(&[0]) {
-            Ok(()) => ProbeOutcome::Writable,
-            Err(error) => classify_probe_error(&error),
-        };
-        drop(file);
-        let _ = std::fs::remove_file(&path);
-        return outcome;
-    }
-    ProbeOutcome::Writable
-}
-
-fn classify_probe_error(error: &std::io::Error) -> ProbeOutcome {
-    if error.raw_os_error() == Some(libc::ENOSPC) {
-        return ProbeOutcome::Unwritable("no space left on device");
-    }
-    // `libc` exposes `EROFS` on all supported targets; a read-only mount
-    // cannot take durable state either.
-    if error.raw_os_error() == Some(libc::EROFS) {
-        return ProbeOutcome::Unwritable("filesystem is read-only");
-    }
-    ProbeOutcome::Writable
-}
-
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -302,12 +229,6 @@ where
     let payload = serde_json::to_string(&spec)
         .map_err(|error| invalid(&format!("cannot serialize Job specification: {error}")))?;
     Ok((spec, payload))
-}
-
-/// The schema generation recorded by the last completed initialization. An
-/// uninitialized store reports `0`.
-fn schema_generation(connection: &Connection) -> rusqlite::Result<i64> {
-    connection.query_row("PRAGMA user_version", [], |row| row.get(0))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -800,17 +721,53 @@ pub struct CanonicalAdmission {
     pub executor: Executor,
 }
 
-/// Schema generation of the canonical domain database, recorded in SQLite's
-/// `user_version`. Ordinary opens read it and skip initialization entirely
-/// when it is current. Fresh initialization is the only supported path: a
-/// store written by any other generation is refused rather than migrated.
-const DOMAIN_SCHEMA_VERSION: i64 = 5;
+/// The generation of a confined helper's read-only domain snapshot.
+const SNAPSHOT_GENERATION: i64 = 1;
 
-const DOMAIN_SCHEMA: &str = r#"
+/// Every table a confined helper's Project snapshot carries, with the filter
+/// that selects one Project's rows, `?1` being the Project id: all of the
+/// domain and journal tables, and the context index and validation evidence.
+/// Configuration, credentials and other Projects are never copied.
+const PROJECT_TABLES: &[(&str, &str)] = &[
+    ("domain_projects", "id=?1"),
+    ("domain_jobs", "project_id=?1"),
+    ("domain_attempts", "job_id IN (SELECT id FROM main.domain_jobs WHERE project_id=?1)"),
+    ("domain_executors", "attempt_id IN (SELECT a.id FROM main.domain_attempts a JOIN main.domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1)"),
+    ("domain_calls", "attempt_id IN (SELECT a.id FROM main.domain_attempts a JOIN main.domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1)"),
+    ("domain_dispatch_intents", "job_id IN (SELECT id FROM main.domain_jobs WHERE project_id=?1)"),
+    ("domain_job_bindings", "project_id=?1"),
+    ("domain_job_configs", "job_id IN (SELECT id FROM main.domain_jobs WHERE project_id=?1)"),
+    ("domain_job_dependencies", "project_id=?1"),
+    ("domain_dependency_revisions", "project_id=?1"),
+    ("domain_job_inputs", "job_id IN (SELECT id FROM main.domain_jobs WHERE project_id=?1)"),
+    ("domain_job_origins", "job_id IN (SELECT id FROM main.domain_jobs WHERE project_id=?1)"),
+    ("domain_launch_commands", "project_id=?1"),
+    ("domain_result_evidence", "attempt_id IN (SELECT a.id FROM main.domain_attempts a JOIN main.domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1)"),
+    ("domain_verifications", "call_id IN (SELECT c.id FROM main.domain_calls c JOIN main.domain_attempts a ON a.id=c.attempt_id JOIN main.domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1)"),
+    ("domain_settlements", "project_id=?1"),
+    ("domain_budgets", "project_id=?1"),
+    ("domain_placement_decisions", "job_id IN (SELECT id FROM main.domain_jobs WHERE project_id=?1)"),
+    ("domain_watchdog_actions", "job_id IN (SELECT id FROM main.domain_jobs WHERE project_id=?1)"),
+    ("domain_conversations", "project_id=?1"),
+    ("domain_chat_turns", "project_id=?1"),
+    ("domain_messages", "attempt_id IN (SELECT a.id FROM main.domain_attempts a JOIN main.domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1)"),
+    ("domain_events", "project_id=?1"),
+    ("context_manifest", "project_id=?1"),
+    ("context_chunk_content", "project_id=?1"),
+    ("context_validation_evidence", "project_id=?1"),
+];
+
+/// The canonical execution tables, created in the OCG database together with
+/// every other component's. Every row belongs to one Project, directly by
+/// `project_id` or through the Job, Attempt or Call it describes.
+pub(crate) const SCHEMA: &str = r#"
+-- The Project registry: a Project is the directory registered at `root`.
 CREATE TABLE IF NOT EXISTS domain_projects (
     id TEXT PRIMARY KEY,
     root TEXT NOT NULL UNIQUE,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    -- When registration last confirmed the root.
+    updated_at INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS domain_jobs (
     id TEXT PRIMARY KEY,
@@ -838,12 +795,14 @@ CREATE TABLE IF NOT EXISTS domain_jobs (
     CHECK(scope='none' OR (authoritative_attempt_id IS NULL AND generation=0
         AND (waiting_for_children=1 OR state IN ('completed','failed','cancelled','unknown','orphaned'))))
 ) STRICT;
+-- A caller-chosen binding key names one Job within its Project.
 CREATE TABLE IF NOT EXISTS domain_job_bindings (
-    binding_key TEXT PRIMARY KEY,
+    binding_key TEXT NOT NULL,
     project_id TEXT NOT NULL REFERENCES domain_projects(id),
     job_id TEXT NOT NULL UNIQUE REFERENCES domain_jobs(id),
     attempt_id TEXT,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(project_id, binding_key)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS domain_attempts (
     id TEXT PRIMARY KEY,
@@ -1114,6 +1073,10 @@ impl DependencyProjection {
 pub struct DomainRepository {
     connection: Connection,
     path: PathBuf,
+    /// The canonical root this repository was opened for. Whole-Project reads
+    /// such as [`DomainRepository::execution_snapshot`] are scoped to the
+    /// Project registered at it.
+    root: PathBuf,
 }
 
 pub struct ChatMessageOrigin {
@@ -1152,146 +1115,102 @@ pub struct ChatHistory {
 }
 
 impl DomainRepository {
+    /// Write a read-only copy of one Project's canonical execution state to
+    /// `destination` for a confined helper process.
+    ///
+    /// The copy is a fresh database holding only the domain and journal
+    /// tables, filled with that Project's rows. Configuration, credentials and
+    /// every other Project never leave the OCG database.
     pub(crate) fn write_read_snapshot(root: &Path, destination: &Path) -> Result<()> {
-        let database = crate::orchestration::state::state_dir(root).join("substrate.sqlite3");
-        let connection =
-            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-                .map_err(|error| open_sql(root, error))?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| open_sql(root, error))?;
+        let repository = Self::open_existing(root)?;
+        let project = repository
+            .project_at_root(root)?
+            .ok_or_else(|| invalid("no Project is registered at this root"))?;
+        {
+            let snapshot = Connection::open(destination).map_err(sql)?;
+            let transaction = snapshot.unchecked_transaction().map_err(sql)?;
+            for schema in [SCHEMA, journal::SCHEMA, crate::context::fulltext::SCHEMA] {
+                transaction.execute_batch(schema).map_err(sql)?;
+            }
+            transaction
+                .pragma_update(None, "user_version", SNAPSHOT_GENERATION)
+                .map_err(sql)?;
+            transaction.commit().map_err(sql)?;
+        }
+        let connection = &repository.connection;
         connection
             .execute(
-                "VACUUM main INTO ?1",
+                "ATTACH DATABASE ?1 AS snapshot",
                 [destination.to_string_lossy().as_ref()],
             )
-            .map_err(|error| open_sql(root, error))?;
-        Ok(())
+            .map_err(sql)?;
+        let result = (|| {
+            let transaction = journal::begin(connection)?;
+            transaction
+                .execute_batch("PRAGMA defer_foreign_keys = ON;")
+                .map_err(sql)?;
+            for (table, filter) in PROJECT_TABLES {
+                transaction
+                    .execute(
+                        &format!("INSERT INTO snapshot.{table} SELECT * FROM main.{table} WHERE {filter}"),
+                        [&project.id],
+                    )
+                    .map_err(sql)?;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO snapshot.domain_journal_meta SELECT * FROM main.domain_journal_meta",
+                    [],
+                )
+                .map_err(sql)?;
+            transaction.commit().map_err(sql)
+        })();
+        connection
+            .execute("DETACH DATABASE snapshot", [])
+            .map_err(sql)?;
+        result
     }
 
+    /// Open a snapshot written by [`DomainRepository::write_read_snapshot`],
+    /// or this installation's database when not confined.
     pub(crate) fn open_read_only(root: &Path) -> Result<Self> {
-        let path = std::env::var_os("OCG_NATIVE_DOMAIN_SNAPSHOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                crate::orchestration::state::state_dir(root).join("substrate.sqlite3")
-            });
+        let Some(path) = std::env::var_os("OCG_NATIVE_DOMAIN_SNAPSHOT").map(PathBuf::from) else {
+            return Self::open_existing(root);
+        };
         let connection =
             Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|error| open_sql(root, error))?;
+                .map_err(sql)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| open_sql(root, error))?;
-        if schema_generation(&connection).map_err(|error| open_sql(root, error))?
-            != DOMAIN_SCHEMA_VERSION
-        {
+            .map_err(sql)?;
+        let generation: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(sql)?;
+        if generation != SNAPSHOT_GENERATION {
             return Err(invalid(
-                "canonical store needs migration before confined reads",
+                "confined domain snapshot is not readable by this helper",
             ));
         }
-        Ok(Self { connection, path })
+        Ok(Self {
+            connection,
+            path,
+            root: crate::project::canonicalize(root),
+        })
     }
 
-    /// Open the durable store at a boundary without deciding what Project owns
-    /// it.
+    /// Open the OCG database for the Project at `root` without registering
+    /// one there.
     ///
-    /// Opening a store and creating a Project identity are two separate facts.
-    /// A whole Project — its `.ocg` store included — can move to a new
-    /// directory, and the store it carries already holds the durable Project
-    /// that must survive the move. Creating a Project row here would mint a
-    /// second identity for the same durable store and make that new row look
-    /// like the authoritative one. Callers that only need to read or reconcile
-    /// what a store already holds use this entry point; callers that require a
-    /// Project to exist use [`DomainRepository::open`].
+    /// Opening the database and creating a Project identity are separate
+    /// facts: callers that only read or reconcile what is already registered
+    /// use this entry point; callers that require a Project to exist use
+    /// [`DomainRepository::open`].
     pub fn open_existing(root: &Path) -> Result<Self> {
-        crate::install::ensure_gitignore(root)?;
-        let path = crate::orchestration::state::state_dir(root).join("substrate.sqlite3");
-        let parent = path
-            .parent()
-            .ok_or_else(|| invalid("canonical database has no parent directory"))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|error| OcgError::io("create canonical database directory", error))?;
-        let connection = Connection::open(&path).map_err(|error| open_sql(root, error))?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| open_sql(root, error))?;
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .map_err(|error| open_sql(root, error))?;
-        // A current store needs no initialization, so ordinary opens stop at
-        // this unlocked read. Initialization is serialized across processes:
-        // the generation is read again under the lock, so only the first
-        // process to find an empty store initializes it.
-        if schema_generation(&connection).map_err(|error| open_sql(root, error))?
-            != DOMAIN_SCHEMA_VERSION
-        {
-            // Switching a new database to WAL needs an exclusive lock SQLite
-            // will not wait for. The holder does only this local SQLite work
-            // and takes no other lock; the kernel releases it if the process
-            // dies.
-            let bootstrap = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path.with_extension("bootstrap.lock"))
-                .map_err(|error| OcgError::io("open canonical database bootstrap lock", error))?;
-            fs2::FileExt::lock_exclusive(&bootstrap)
-                .map_err(|error| OcgError::io("lock canonical database bootstrap", error))?;
-            match schema_generation(&connection).map_err(|error| open_sql(root, error))? {
-                DOMAIN_SCHEMA_VERSION => {}
-                0 => Self::bootstrap_schema(root, &connection)?,
-                generation => {
-                    return Err(invalid(&format!(
-                        "canonical store at {} has schema generation {generation}, not {DOMAIN_SCHEMA_VERSION}; it must be reinitialized",
-                        path.display()
-                    )))
-                }
-            }
-            drop(bootstrap);
-        }
-        Ok(Self { connection, path })
-    }
-
-    /// Initialize an empty store at [`DOMAIN_SCHEMA_VERSION`].
-    ///
-    /// The schema and its generation commit in one transaction, so a store
-    /// whose generation is still `0` holds no committed schema at all. A store
-    /// that reports `0` yet already has canonical tables predates the
-    /// generation gate and is refused.
-    fn bootstrap_schema(root: &Path, connection: &Connection) -> Result<()> {
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(|error| open_sql(root, error))?;
-        let transaction = connection
-            .unchecked_transaction()
-            .map_err(|error| open_sql(root, error))?;
-        let existing: bool = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name LIKE 'domain\\_%' ESCAPE '\\')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| open_sql(root, error))?;
-        if existing {
-            return Err(invalid(
-                "canonical store predates schema generations; it must be reinitialized",
-            ));
-        }
-        transaction
-            .execute_batch(DOMAIN_SCHEMA)
-            .map_err(|error| open_sql(root, error))?;
-        // The durable execution event journal shares this database so a state
-        // change and its event commit in one transaction. It is evidence, never
-        // a decision input: nothing in this file reads it back to choose an
-        // execution outcome.
-        journal::ensure_schema(&transaction)?;
-        transaction
-            .pragma_update(None, "user_version", DOMAIN_SCHEMA_VERSION)
-            .map_err(|error| open_sql(root, error))?;
-        transaction
-            .commit()
-            .map_err(|error| open_sql(root, error))?;
-        journal::reconcile_boundary(connection)
+        Ok(Self {
+            connection: crate::database::connect()?,
+            path: crate::database::path()?,
+            root: crate::project::canonicalize(root),
+        })
     }
 
     /// Open the durable store and require a Project identity at this boundary.
@@ -1299,6 +1218,11 @@ impl DomainRepository {
         let repository = Self::open_existing(root)?;
         repository.ensure_project(root)?;
         Ok(repository)
+    }
+
+    /// The Project registered at this repository's root, if any.
+    fn scope(&self) -> Result<Option<String>> {
+        Ok(self.project_at_root(&self.root)?.map(|project| project.id))
     }
 
     pub fn path(&self) -> &Path {
@@ -2028,10 +1952,13 @@ impl DomainRepository {
     // Durable execution event journal (read side)
     // ---------------------------------------------------------------------
 
-    /// The journal head: the cursor of the most recent committed event, or
-    /// [`journal::INITIAL_CURSOR`] when nothing has been journalized.
+    /// This Project's journal head: the cursor of its most recent committed
+    /// event, or [`journal::INITIAL_CURSOR`] when it has none. Cursors are
+    /// positions in the installation-wide stream, so this is also a valid
+    /// resume point for this Project's delta.
     pub fn journal_head(&self) -> Result<u64> {
-        journal::head(&self.connection)
+        let project_id = self.scope()?.unwrap_or_default();
+        journal::project_head(&self.connection, &project_id)
     }
 
     /// The durable retention boundary: head, floor and anchor.
@@ -2044,9 +1971,11 @@ impl DomainRepository {
         Ok(journal::boundary(&self.connection)?.floor_cursor)
     }
 
-    /// Read the committed events strictly after `after`, in cursor order.
+    /// Read this Project's committed events strictly after `after`, in
+    /// cursor order.
     pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<ExecutionEvent>> {
-        journal::read_after(&self.connection, after, limit)
+        let project_id = self.scope()?.unwrap_or_default();
+        journal::read_for_project(&self.connection, &project_id, after, limit)
     }
 
     /// Read one Job's event stream strictly after `after`, in cursor order.
@@ -2059,14 +1988,15 @@ impl DomainRepository {
         journal::read_for_job(&self.connection, job_id, after, limit)
     }
 
-    /// Ask for the complete delta after `cursor`.
+    /// Ask for this Project's complete delta after `cursor`.
     ///
-    /// The outcome is always explicit: the complete delta, an empty delta at
-    /// the head, [`EventDelta::ResyncRequired`] when the cursor fell below the
-    /// retained floor, or [`EventDelta::AheadOfHead`] when the cursor cannot
-    /// name a real position. A partial suffix is never returned.
+    /// The outcome is always explicit: the complete delta, an empty delta when
+    /// the Project has nothing newer, [`EventDelta::ResyncRequired`] when the
+    /// cursor fell below the retained floor, or [`EventDelta::AheadOfHead`]
+    /// when the cursor cannot name a real position.
     pub fn journal_delta(&self, cursor: u64, limit: usize) -> Result<EventDelta> {
-        journal::delta_after(&self.connection, cursor, limit)
+        let project_id = self.scope()?.unwrap_or_default();
+        journal::delta_for_project(&self.connection, &project_id, cursor, limit)
     }
 
     /// The same boundary-checked delta, filtered to one Job.
@@ -2094,6 +2024,9 @@ impl DomainRepository {
     /// and the rows are read together, so a consumer can never pair pre-commit
     /// rows with a post-commit cursor.
     pub fn execution_snapshot(&self) -> Result<ExecutionSnapshot> {
+        // An unregistered root has no Project, and so nothing to show.
+        let project_id = self.scope()?.unwrap_or_default();
+        let project_id = project_id.as_str();
         let transaction = journal::begin_read(&self.connection)?;
         let view: &Connection = &transaction;
         let boundary = journal::boundary(view)?;
@@ -2101,24 +2034,24 @@ impl DomainRepository {
             cursor: boundary.head_cursor,
             floor_cursor: boundary.floor_cursor,
             anchor_digest: boundary.anchor_digest,
-            projects: all_projects(view)?,
-            jobs: all_jobs(view)?,
-            attempts: all_attempts(view)?,
-            executors: all_executors(view)?,
-            calls: all_calls(view)?,
-            dispatch_intents: all_dispatch_intents(view)?,
-            dependencies: all_dependencies(view)?,
-            job_origins: all_job_origins(view)?,
-            job_origin_details: all_job_origin_details(view)?,
-            job_attachments: all_job_attachments(view)?,
-            bindings: all_bindings(view)?,
-            job_configurations: all_job_configurations(view)?,
-            result_evidence: all_result_evidence(view)?,
-            verifications: all_verifications(view)?,
-            reservations: all_reservations(view)?,
-            settlements: all_settlements(view)?,
-            budget_limits: all_budget_limits(view)?,
-            usage_evidence: all_usage_evidence(view)?,
+            projects: all_projects(view, project_id)?,
+            jobs: all_jobs(view, project_id)?,
+            attempts: all_attempts(view, project_id)?,
+            executors: all_executors(view, project_id)?,
+            calls: all_calls(view, project_id)?,
+            dispatch_intents: all_dispatch_intents(view, project_id)?,
+            dependencies: all_dependencies(view, project_id)?,
+            job_origins: all_job_origins(view, project_id)?,
+            job_origin_details: all_job_origin_details(view, project_id)?,
+            job_attachments: all_job_attachments(view, project_id)?,
+            bindings: all_bindings(view, project_id)?,
+            job_configurations: all_job_configurations(view, project_id)?,
+            result_evidence: all_result_evidence(view, project_id)?,
+            verifications: all_verifications(view, project_id)?,
+            reservations: all_reservations(view, project_id)?,
+            settlements: all_settlements(view, project_id)?,
+            budget_limits: all_budget_limits(view, project_id)?,
+            usage_evidence: all_usage_evidence(view, project_id)?,
         };
         transaction.commit().map_err(sql)?;
         Ok(snapshot)
@@ -3336,7 +3269,7 @@ impl DomainRepository {
         let id = new_id("prj");
         self.connection
             .execute(
-                "INSERT INTO domain_projects(id,root,created_at) VALUES(?1,?2,?3) ON CONFLICT(root) DO NOTHING",
+                "INSERT INTO domain_projects(id,root,created_at,updated_at) VALUES(?1,?2,?3,?3) ON CONFLICT(root) DO NOTHING",
                 params![id, root, now()],
             )
             .map_err(sql)?;
@@ -3352,13 +3285,6 @@ impl DomainRepository {
             .map_err(sql)
     }
 
-    /// Resolve the durable Project for a canonical root, adopting the existing
-    /// durable identity when the whole Project store (its `.ocg` directory)
-    /// moved with the directory. Never mints a second identity for the same
-    /// durable store: when no row matches the new root but the store holds
-    /// exactly one Project row, that row's recorded root is repaired in place.
-    /// With zero rows a new Project is created; with several and no root match
-    /// the durable identity is ambiguous and must not be guessed.
     /// Read the durable Project recorded at a canonical root, if any. This
     /// never creates or changes identity.
     pub fn project_at_root(&self, root: &Path) -> Result<Option<Project>> {
@@ -3378,40 +3304,26 @@ impl DomainRepository {
             .map_err(sql)
     }
 
-    /// Resolve the durable Project for a canonical root, adopting the existing
-    /// durable identity when the whole Project store (its `.ocg` directory)
-    /// moved with the directory. Never mints a second identity for the same
-    /// durable store: when no row matches the new root but the store holds
-    /// exactly one Project row, that row's recorded root is repaired in place.
-    /// With zero rows a new Project is created; with several and no root match
-    /// the durable identity is ambiguous and must not be guessed.
-    pub fn reconcile_project(&self, root: &Path) -> Result<Project> {
+    /// Record that registration confirmed the Project at `root` at `now`.
+    pub fn touch_project(&self, root: &Path, now: i64) -> Result<Project> {
         let root = crate::project::canonicalize(root)
             .to_string_lossy()
             .to_string();
-        if let Some(project) = self.project_at_root(Path::new(&root))? {
-            return Ok(project);
-        }
-        let projects = all_projects(&self.connection)?;
-        match projects.len() {
-            0 => self.ensure_project(Path::new(&root)),
-            1 => {
-                self.connection
-                    .execute(
-                        "UPDATE domain_projects SET root=?1 WHERE id=?2",
-                        params![&root, &projects[0].id],
-                    )
-                    .map_err(sql)?;
-                Ok(Project {
-                    id: projects[0].id.clone(),
-                    root,
-                    created_at: projects[0].created_at,
-                })
-            }
-            _ => Err(invalid(
-                "ambiguous durable Project identity at this boundary",
-            )),
-        }
+        self.connection
+            .execute(
+                "UPDATE domain_projects SET updated_at=MAX(updated_at,?2) WHERE root=?1",
+                params![root, now],
+            )
+            .map_err(sql)?;
+        self.project_at_root(Path::new(&root))?
+            .ok_or_else(|| invalid("no Project is registered at this root"))
+    }
+
+    /// The Project registered at a canonical root, registering one when none
+    /// is. Identity belongs to the root: a directory moved elsewhere is a new
+    /// root, and nothing in it carries an identity to adopt.
+    pub fn reconcile_project(&self, root: &Path) -> Result<Project> {
+        self.ensure_project(root)
     }
 
     pub fn create_job<S>(&self, project_id: &str, spec: S) -> Result<Job>
@@ -4016,8 +3928,8 @@ impl DomainRepository {
         }
         let existing: Option<(String, String, Option<String>)> = transaction
             .query_row(
-                "SELECT project_id,job_id,attempt_id FROM domain_job_bindings WHERE binding_key=?1",
-                [binding_key],
+                "SELECT project_id,job_id,attempt_id FROM domain_job_bindings WHERE project_id=?1 AND binding_key=?2",
+                params![project_id, binding_key],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -4112,12 +4024,15 @@ impl DomainRepository {
     }
 
     pub fn recover_job_readiness(&self) -> Result<()> {
+        // Recovery acts for this repository's Project only; other Projects in
+        // the database have their own owners.
+        let project_id = self.scope()?.unwrap_or_default();
         let transaction = self.begin()?;
         // Jobs without dependencies still follow their existing launch path.
         let jobs: Vec<String> = query_all(
             &transaction,
-            "SELECT id FROM domain_jobs j WHERE state IN ('pending','eligible') AND authoritative_attempt_id IS NULL AND EXISTS(SELECT 1 FROM domain_job_dependencies d WHERE d.job_id=j.id) ORDER BY project_id,id",
-            &[],
+            "SELECT id FROM domain_jobs j WHERE project_id=?1 AND state IN ('pending','eligible') AND authoritative_attempt_id IS NULL AND EXISTS(SELECT 1 FROM domain_job_dependencies d WHERE d.job_id=j.id) ORDER BY id",
+            &[&project_id],
             |row| row.get(0),
         )?;
         for job_id in jobs {
@@ -4306,10 +4221,11 @@ impl DomainRepository {
     /// admission work, not a stall, so it is excluded too. The returned facts are
     /// a read; classification and recovery happen outside this query.
     pub(crate) fn watchdog_observations(&self) -> Result<Vec<WatchdogObservation>> {
+        let project_id = self.scope()?.unwrap_or_default();
         let ids: Vec<String> = query_all(
             &self.connection,
-            "SELECT id FROM domain_jobs WHERE state IN ('running','cancelling','unknown','orphaned') OR authoritative_attempt_id IS NOT NULL ORDER BY created_at,id",
-            &[],
+            "SELECT id FROM domain_jobs WHERE project_id=?1 AND (state IN ('running','cancelling','unknown','orphaned') OR authoritative_attempt_id IS NOT NULL) ORDER BY created_at,id",
+            &[&project_id],
             |row| row.get(0),
         )?;
         ids.into_iter()
@@ -5348,11 +5264,12 @@ impl DomainRepository {
     /// recovery. Call and Attempt authority are rechecked by the caller before
     /// handing each row back to the bounded dispatcher.
     pub fn pending_dispatch_intents(&self) -> Result<Vec<DispatchIntent>> {
+        let project_id = self.scope()?.unwrap_or_default();
         let mut statement = self.connection.prepare(&format!(
-            "SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents WHERE state IN ('pending','queued','running') ORDER BY created_at,id"
+            "SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents WHERE state IN ('pending','queued','running') AND job_id IN (SELECT id FROM domain_jobs WHERE project_id=?1) ORDER BY created_at,id"
         )).map_err(sql)?;
         let rows = statement
-            .query_map([], dispatch_intent_from_row)
+            .query_map([&project_id], dispatch_intent_from_row)
             .map_err(sql)?;
         rows.map(|row| row.map_err(sql)).collect()
     }
@@ -7628,38 +7545,40 @@ fn read_verification(
     .transpose()
 }
 
-fn all_projects(connection: &Connection) -> Result<Vec<Project>> {
+fn all_projects(connection: &Connection, project_id: &str) -> Result<Vec<Project>> {
     query_all(
         connection,
-        "SELECT id,root,created_at FROM domain_projects ORDER BY created_at,id",
-        &[],
+        "SELECT id,root,created_at FROM domain_projects WHERE id=?1 ORDER BY created_at,id",
+        &[&project_id],
         |row| serde_rusqlite::from_row::<Project>(row).map_err(crate::error::sqlite_mapping_error),
     )
 }
 
-fn all_jobs(connection: &Connection) -> Result<Vec<Job>> {
+fn all_jobs(connection: &Connection, project_id: &str) -> Result<Vec<Job>> {
     query_all(
         connection,
-        &format!("SELECT {JOB_COLUMNS} FROM domain_jobs ORDER BY created_at,id"),
-        &[],
+        &format!(
+            "SELECT {JOB_COLUMNS} FROM domain_jobs WHERE project_id=?1 ORDER BY created_at,id"
+        ),
+        &[&project_id],
         job_from_row,
     )
 }
 
-fn all_attempts(connection: &Connection) -> Result<Vec<Attempt>> {
+fn all_attempts(connection: &Connection, project_id: &str) -> Result<Vec<Attempt>> {
     query_all(
         connection,
-        &format!("SELECT {ATTEMPT_COLUMNS} FROM domain_attempts ORDER BY created_at,id"),
-        &[],
+        &format!("SELECT {ATTEMPT_COLUMNS} FROM domain_attempts WHERE job_id IN (SELECT id FROM domain_jobs WHERE project_id=?1) ORDER BY created_at,id"),
+        &[&project_id],
         attempt_from_row,
     )
 }
 
-fn all_executors(connection: &Connection) -> Result<Vec<Executor>> {
+fn all_executors(connection: &Connection, project_id: &str) -> Result<Vec<Executor>> {
     query_all(
         connection,
-        &format!("SELECT {EXECUTOR_COLUMNS} FROM domain_executors ORDER BY created_at,id"),
-        &[],
+        &format!("SELECT {EXECUTOR_COLUMNS} FROM domain_executors WHERE attempt_id IN (SELECT a.id FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1) ORDER BY created_at,id"),
+        &[&project_id],
         |row| serde_rusqlite::from_row(row).map_err(crate::error::sqlite_mapping_error),
     )
 }
@@ -7677,13 +7596,13 @@ fn attempt_executors(connection: &Connection, attempt_id: &str) -> Result<Vec<Ex
     )
 }
 
-fn all_calls(connection: &Connection) -> Result<Vec<Call>> {
+fn all_calls(connection: &Connection, project_id: &str) -> Result<Vec<Call>> {
     query_all(
         connection,
         &format!(
-            "SELECT {CALL_COLUMNS} FROM domain_calls c LEFT JOIN domain_dispatch_intents i ON i.call_id=c.id ORDER BY c.created_at,c.id"
+            "SELECT {CALL_COLUMNS} FROM domain_calls c LEFT JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.attempt_id IN (SELECT a.id FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1) ORDER BY c.created_at,c.id"
         ),
-        &[],
+        &[&project_id],
         call_from_row,
     )
 }
@@ -7703,13 +7622,13 @@ fn attempt_calls(connection: &Connection, attempt_id: &str) -> Result<Vec<Call>>
     })
 }
 
-fn all_dispatch_intents(connection: &Connection) -> Result<Vec<DispatchIntent>> {
+fn all_dispatch_intents(connection: &Connection, project_id: &str) -> Result<Vec<DispatchIntent>> {
     query_all(
         connection,
         &format!(
-            "SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents ORDER BY created_at,id"
+            "SELECT {DISPATCH_INTENT_COLUMNS} FROM domain_dispatch_intents WHERE job_id IN (SELECT id FROM domain_jobs WHERE project_id=?1) ORDER BY created_at,id"
         ),
-        &[],
+        &[&project_id],
         dispatch_intent_from_row,
     )
 }
@@ -7729,11 +7648,14 @@ fn attempt_intents(connection: &Connection, attempt_id: &str) -> Result<Vec<Disp
     })
 }
 
-fn all_dependencies(connection: &Connection) -> Result<Vec<journal::DependencyEdge>> {
+fn all_dependencies(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<journal::DependencyEdge>> {
     query_all(
         connection,
-        "SELECT project_id,job_id,prerequisite_job_id FROM domain_job_dependencies ORDER BY project_id,job_id,prerequisite_job_id",
-        &[],
+        "SELECT project_id,job_id,prerequisite_job_id FROM domain_job_dependencies WHERE project_id=?1 ORDER BY project_id,job_id,prerequisite_job_id",
+        &[&project_id],
         |row| {
             Ok(journal::DependencyEdge {
                 project_id: row.get(0)?,
@@ -7793,9 +7715,10 @@ fn request_job_cancel_in(
 
 fn all_job_origin_details(
     connection: &Connection,
+    project_id: &str,
 ) -> Result<std::collections::BTreeMap<JobId, JobOrigin>> {
     query_all(connection,
-        "SELECT job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,call_id,policy FROM domain_job_origins WHERE authority='spawn' ORDER BY job_id", &[], |row| {
+        "SELECT job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,call_id,policy FROM domain_job_origins WHERE authority='spawn' AND job_id IN (SELECT id FROM domain_jobs WHERE project_id=?1) ORDER BY job_id", &[&project_id], |row| {
             let policy = row.get::<_, Option<String>>(7)?.map(|value| serde_json::from_str(&value).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))).transpose()?;
             Ok((row.get(0)?, JobOrigin {
                 parent_job_id: row.get(1)?, attempt_id: row.get(2)?,
@@ -7807,11 +7730,12 @@ fn all_job_origin_details(
 
 fn all_job_attachments(
     connection: &Connection,
+    project_id: &str,
 ) -> Result<std::collections::BTreeMap<JobId, JobAttachment>> {
     query_all(
         connection,
-        "SELECT job_id,parent_job_id,principal_kind,principal_id,command_id,policy,created_at FROM domain_job_origins WHERE authority='attach' ORDER BY job_id",
-        &[],
+        "SELECT job_id,parent_job_id,principal_kind,principal_id,command_id,policy,created_at FROM domain_job_origins WHERE authority='attach' AND job_id IN (SELECT id FROM domain_jobs WHERE project_id=?1) ORDER BY job_id",
+        &[&project_id],
         |row| {
             let kind: String = row.get(2)?;
             let policy: String = row.get(5)?;
@@ -7839,21 +7763,24 @@ fn all_job_attachments(
     .map(|attachments| attachments.into_iter().collect())
 }
 
-fn all_job_origins(connection: &Connection) -> Result<std::collections::BTreeMap<JobId, JobId>> {
+fn all_job_origins(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<std::collections::BTreeMap<JobId, JobId>> {
     query_all(
         connection,
-        "SELECT job_id,parent_job_id FROM domain_job_origins ORDER BY job_id",
-        &[],
+        "SELECT job_id,parent_job_id FROM domain_job_origins WHERE job_id IN (SELECT id FROM domain_jobs WHERE project_id=?1) ORDER BY job_id",
+        &[&project_id],
         |row| Ok((row.get::<_, JobId>(0)?, row.get::<_, JobId>(1)?)),
     )
     .map(|origins| origins.into_iter().collect())
 }
 
-fn all_bindings(connection: &Connection) -> Result<Vec<journal::JobBinding>> {
+fn all_bindings(connection: &Connection, project_id: &str) -> Result<Vec<journal::JobBinding>> {
     query_all(
         connection,
-        "SELECT binding_key,project_id,job_id,attempt_id FROM domain_job_bindings ORDER BY binding_key",
-        &[],
+        "SELECT binding_key,project_id,job_id,attempt_id FROM domain_job_bindings WHERE project_id=?1 ORDER BY binding_key",
+        &[&project_id],
         |row| {
             Ok(journal::JobBinding {
                 binding_key: row.get(0)?,
@@ -7865,11 +7792,14 @@ fn all_bindings(connection: &Connection) -> Result<Vec<journal::JobBinding>> {
     )
 }
 
-fn all_job_configurations(connection: &Connection) -> Result<Vec<journal::StoredJobConfiguration>> {
+fn all_job_configurations(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<journal::StoredJobConfiguration>> {
     query_all(
         connection,
-        "SELECT job_id,configuration,revision FROM domain_job_configs ORDER BY job_id",
-        &[],
+        "SELECT job_id,configuration,revision FROM domain_job_configs WHERE job_id IN (SELECT id FROM domain_jobs WHERE project_id=?1) ORDER BY job_id",
+        &[&project_id],
         |row| {
             let configuration: String = row.get(1)?;
             let configuration: serde_json::Value = decode_stored_json(&configuration)?;
@@ -7884,11 +7814,14 @@ fn all_job_configurations(connection: &Connection) -> Result<Vec<journal::Stored
     )
 }
 
-fn all_result_evidence(connection: &Connection) -> Result<Vec<journal::ResultEvidence>> {
+fn all_result_evidence(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<journal::ResultEvidence>> {
     query_all(
         connection,
-        "SELECT call_id,attempt_id,generation,disposition,created_at FROM domain_result_evidence ORDER BY created_at,call_id,attempt_id,generation",
-        &[],
+        "SELECT call_id,attempt_id,generation,disposition,created_at FROM domain_result_evidence WHERE attempt_id IN (SELECT a.id FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1) ORDER BY created_at,call_id,attempt_id,generation",
+        &[&project_id],
         |row| {
             Ok(journal::ResultEvidence {
                 call_id: row.get(0)?,
@@ -7902,11 +7835,14 @@ fn all_result_evidence(connection: &Connection) -> Result<Vec<journal::ResultEvi
     )
 }
 
-fn all_verifications(connection: &Connection) -> Result<Vec<journal::StoredVerification>> {
+fn all_verifications(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<journal::StoredVerification>> {
     query_all(
         connection,
-        "SELECT call_id,passed,report,created_at FROM domain_verifications ORDER BY created_at,call_id",
-        &[],
+        "SELECT call_id,passed,report,created_at FROM domain_verifications WHERE call_id IN (SELECT c.id FROM domain_calls c JOIN domain_attempts a ON a.id=c.attempt_id JOIN domain_jobs j ON j.id=a.job_id WHERE j.project_id=?1) ORDER BY created_at,call_id",
+        &[&project_id],
         |row| {
             let report: String = row.get(2)?;
             let report: serde_json::Value = decode_stored_json(&report)?;
@@ -7923,9 +7859,12 @@ fn all_verifications(connection: &Connection) -> Result<Vec<journal::StoredVerif
 /// Every live reservation, with the Project that owns the money and the Call it
 /// was taken for. A `Released` or `Settled` entry is retained in the ledger but
 /// is no longer live, so it is not part of the "still holds money" view.
-fn all_reservations(connection: &Connection) -> Result<Vec<journal::ReservationFact>> {
+fn all_reservations(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<journal::ReservationFact>> {
     let mut facts = Vec::new();
-    for row in all_budgets(connection)? {
+    for row in all_budgets(connection, project_id)? {
         for reservation in row.ledger.reservations {
             if reservation.state != budget::ReservationState::Reserved {
                 continue;
@@ -7943,11 +7882,11 @@ fn all_reservations(connection: &Connection) -> Result<Vec<journal::ReservationF
 /// Every accounting fact ever recorded for a Project, in the order it was
 /// applied. This is the durable per-operation record; the bounded in-ledger list
 /// may prune the oldest, this table never does.
-fn all_settlements(connection: &Connection) -> Result<Vec<budget::Settlement>> {
+fn all_settlements(connection: &Connection, project_id: &str) -> Result<Vec<budget::Settlement>> {
     query_all(
         connection,
-        "SELECT settlement FROM domain_settlements ORDER BY created_at,settlement_id",
-        &[],
+        "SELECT settlement FROM domain_settlements WHERE project_id=?1 ORDER BY created_at,settlement_id",
+        &[&project_id],
         |row| {
             let raw: String = row.get(0)?;
             decode_stored_json(&raw)
@@ -7958,8 +7897,11 @@ fn all_settlements(connection: &Connection) -> Result<Vec<budget::Settlement>> {
 /// Usage that was observed but deliberately not booked. It is reconstructed from
 /// the settlements that carry it, so it can never disagree with the accounting
 /// record it came from.
-fn all_usage_evidence(connection: &Connection) -> Result<Vec<journal::UsageEvidence>> {
-    Ok(all_settlements(connection)?
+fn all_usage_evidence(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<journal::UsageEvidence>> {
+    Ok(all_settlements(connection, project_id)?
         .into_iter()
         .filter(|settlement| !settlement.usage_authoritative)
         .filter_map(|settlement| {
@@ -7977,11 +7919,11 @@ fn all_usage_evidence(connection: &Connection) -> Result<Vec<journal::UsageEvide
         .collect())
 }
 
-fn all_budgets(connection: &Connection) -> Result<Vec<BudgetLedgerRow>> {
+fn all_budgets(connection: &Connection, project_id: &str) -> Result<Vec<BudgetLedgerRow>> {
     query_all(
         connection,
-        "SELECT project_id,budget FROM domain_budgets ORDER BY project_id",
-        &[],
+        "SELECT project_id,budget FROM domain_budgets WHERE project_id=?1 ORDER BY project_id",
+        &[&project_id],
         |row| {
             let project_id: String = row.get(0)?;
             let raw: String = row.get(1)?;
@@ -7996,8 +7938,11 @@ struct BudgetLedgerRow {
     ledger: budget::ProjectBudget,
 }
 
-fn all_budget_limits(connection: &Connection) -> Result<Vec<journal::BudgetLimitFact>> {
-    Ok(all_budgets(connection)?
+fn all_budget_limits(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Vec<journal::BudgetLimitFact>> {
+    Ok(all_budgets(connection, project_id)?
         .into_iter()
         .map(|row| journal::BudgetLimitFact {
             project_id: row.project_id,

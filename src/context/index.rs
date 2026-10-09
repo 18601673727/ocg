@@ -13,13 +13,7 @@ use crate::error::{OcgError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
-
-/// Directory (inside `<project>/.ocg/`) holding the inspectable JSON
-/// index. Kept separate from `cache/` so `ocg cache clean` never touches it.
-pub const INDEX_DIR: &str = "index";
-/// The index file name.
-pub const INDEX_FILE: &str = "context-index.json";
+use std::path::Path;
 
 /// One indexed file.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -190,21 +184,18 @@ pub struct IndexReport {
     pub generation_id: String,
 }
 
-/// `<project>/.ocg/index`.
-pub fn index_dir(root: &Path) -> PathBuf {
-    root.join(crate::context::repomap::OCG_DIR).join(INDEX_DIR)
-}
-
-/// `<project>/.ocg/index/context-index.json`.
-pub fn index_path(root: &Path) -> PathBuf {
-    index_dir(root).join(INDEX_FILE)
-}
+/// The document kind and key the index is stored under.
+const DOCUMENT_KIND: &str = "context-index";
+const DOCUMENT_KEY: &str = "index";
 
 /// Load an index, returning `None` for a missing, corrupt or version-mismatched
-/// file. Callers recompute in that case; this is never fatal.
+/// document. Callers recompute in that case; this is never fatal.
 pub fn load(root: &Path) -> Option<ContextIndex> {
-    let text = fs::read_to_string(index_path(root)).ok()?;
-    let index: ContextIndex = serde_json::from_str(&text).ok()?;
+    let bytes = crate::project_store::ProjectDocuments::existing(root)
+        .ok()??
+        .get(DOCUMENT_KIND, DOCUMENT_KEY)
+        .ok()??;
+    let index: ContextIndex = serde_json::from_slice(&bytes).ok()?;
     if index.schema_version != crate::context::freshness::SCHEMA_VERSION {
         return None;
     }
@@ -214,14 +205,12 @@ pub fn load(root: &Path) -> Option<ContextIndex> {
     Some(index)
 }
 
-/// Persist the index atomically, keeping `.ocg/` out of the project
-/// VCS with the same idempotent helper the runtime uses.
+/// Persist the index for the Project at `root`.
 pub fn save(root: &Path, index: &ContextIndex) -> Result<()> {
-    crate::install::ensure_gitignore(root)?;
-    let value = serde_json::to_value(index).map_err(|error| {
+    let bytes = serde_json::to_vec(index).map_err(|error| {
         OcgError::config(format!("cannot serialize the context index: {error}"))
     })?;
-    crate::install::write_json_atomic(&index_path(root), &value)
+    crate::project_store::ProjectDocuments::for_root(root)?.put(DOCUMENT_KIND, DOCUMENT_KEY, &bytes)
 }
 
 /// Compute a fresh index incrementally from `previous`.

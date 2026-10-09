@@ -1,12 +1,11 @@
-//! CLI editing of the same user-global Profile used by the PWA and headless path.
+//! CLI editing of the Profile the PWA and headless path use, committed in the
+//! Core database.
 //! All mutations are explicit and revision-checked.
-use crate::cli::Env;
-use crate::config::Effective;
+use crate::core_store::CoreStore;
 use crate::error::{OcgError, Result};
 use crate::profile::{Model, ProfileService, Provider};
 use std::ffi::OsString;
-use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::io::Write;
 
 #[derive(Debug)]
 pub enum Request {
@@ -26,21 +25,6 @@ pub enum Request {
     RemoveModel(String),
     RemoveProvider(String),
 }
-
-pub struct Context<'a> {
-    pub defaults: serde_json::Value,
-    pub ocg_home: Option<PathBuf>,
-    pub project_root: PathBuf,
-    pub invocation_dir: PathBuf,
-    pub user_path: PathBuf,
-    pub project_path: PathBuf,
-    pub env: &'a Env,
-    pub level: String,
-    pub current: Effective,
-}
-
-pub type ProbeFn<'a> = dyn Fn(&Effective, &str) + 'a;
-pub type ActivateFn<'a> = dyn Fn(&Effective, &str) + 'a;
 
 pub fn parse_request(args: &[OsString]) -> Result<Request> {
     let words: Vec<_> = args
@@ -62,17 +46,10 @@ pub fn parse_request(args: &[OsString]) -> Result<Request> {
     Ok(request)
 }
 
-pub fn execute(
-    request: &Request,
-    ctx: &Context,
-    _probe: &ProbeFn,
-    _activate: &ActivateFn,
-    _input: &mut dyn BufRead,
-    output: &mut dyn Write,
-) -> Result<i32> {
-    let service = ProfileService::with_workspace(&ctx.user_path, &ctx.project_root);
+pub fn execute(request: &Request, store: &CoreStore, output: &mut dyn Write) -> Result<i32> {
+    let service = ProfileService::new(store.clone());
     match request {
-        Request::Help => writeln!(output, "ocg config profile|new\nocg config provider add KEY LABEL|remove KEY\nocg config model add KEY PROVIDER ID [--default]|remove KEY\nConfiguration is stored in the user-global OCG profile.")
+        Request::Help => writeln!(output, "ocg config profile|new\nocg config provider add KEY LABEL|remove KEY\nocg config model add KEY PROVIDER ID [--default]|remove KEY\nThe Profile is stored in the OCG Core database.")
             .map_err(|error| OcgError::io("cannot print config help", error))?,
         Request::New => { service.bootstrap()?; print_current(&service, output)?; }
         Request::Show => print_current(&service, output)?,

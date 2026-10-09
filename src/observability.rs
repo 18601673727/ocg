@@ -6,7 +6,7 @@ use crate::model;
 use serde_json::{Map, Value};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use tracing_subscriber::EnvFilter;
 
@@ -53,7 +53,7 @@ pub fn init_tracing() {
 }
 
 /// Resolve the trace path, or `None` when observability is disabled.
-pub fn trace_path(effective: &Effective, env_trace: Option<&Path>) -> Option<PathBuf> {
+pub fn trace_path(effective: &Effective) -> Option<PathBuf> {
     let config = effective
         .data
         .get("observability")
@@ -64,12 +64,6 @@ pub fn trace_path(effective: &Effective, env_trace: Option<&Path>) -> Option<Pat
         .unwrap_or(false);
     if !enabled {
         return None;
-    }
-    if let Some(path) = env_trace {
-        return Some(crate::config::expand_tilde(
-            &path.to_string_lossy(),
-            effective.home_dir.as_deref(),
-        ));
     }
     if let Some(raw) = config
         .and_then(|config| config.get("path"))
@@ -91,13 +85,8 @@ pub fn trace_path(effective: &Effective, env_trace: Option<&Path>) -> Option<Pat
 
 /// Append one routing event. Errors are swallowed: tracing is best-effort and
 /// must never block a launch.
-pub fn record_event(
-    effective: &Effective,
-    event: &str,
-    level: &str,
-    env_trace: Option<&Path>,
-) -> Option<PathBuf> {
-    let path = trace_path(effective, env_trace)?;
+pub fn record_event(effective: &Effective, event: &str, level: &str) -> Option<PathBuf> {
+    let path = trace_path(effective)?;
     tracing::debug!(event, level, "recording routing event");
     let data = &effective.data;
     crate::profile::Profile::from_ocg_config(data)

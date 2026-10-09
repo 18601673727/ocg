@@ -54,11 +54,7 @@ use std::path::{Path, PathBuf};
 pub enum SkillSource {
     /// Compiled into OCG.
     BuiltIn,
-    /// Under the user configuration directory.
-    UserGlobal,
-    /// Under `<project>/.ocg/skills`.
-    ProjectLocal,
-    /// Under an explicitly configured directory.
+    /// Under a configured Project directory.
     Configured(String),
 }
 
@@ -66,8 +62,6 @@ impl SkillSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             SkillSource::BuiltIn => "builtIn",
-            SkillSource::UserGlobal => "user",
-            SkillSource::ProjectLocal => "project",
             SkillSource::Configured(_) => "configured",
         }
     }

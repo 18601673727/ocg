@@ -514,28 +514,10 @@ fn canonical_block(project_root: &Path) -> CanonicalBlock {
     }
 }
 
-/// The merged configuration, read the same way the CLI reads it.
+/// The effective configuration, read the same way the CLI reads it.
 fn config_data(project_root: &Path) -> Result<Value> {
-    let env = crate::cli::Env::from_process();
-    let (source, home) = match env.home.clone() {
-        Some(path) => (crate::defaults::OcgSource::Dir(path.clone()), Some(path)),
-        None => (crate::defaults::OcgSource::Embedded, None),
-    };
-    let user_path = crate::config::user_config_path(
-        None,
-        env.user_config.as_deref(),
-        env.xdg_config_home.as_deref(),
-        env.home_dir.as_deref(),
-    );
-    let effective = crate::config::build_effective(
-        crate::defaults::load_defaults(&source)?,
-        home,
-        project_root,
-        &user_path,
-        &user_path,
-        env.home_dir,
-    )?;
-    Ok(effective.data)
+    let store = crate::core_store::CoreStore::locate()?;
+    Ok(crate::config::load(&store, project_root, None)?.data)
 }
 
 /// Truncate at a byte ceiling on a character boundary, stating what was cut.

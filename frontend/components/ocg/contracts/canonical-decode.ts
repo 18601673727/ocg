@@ -210,10 +210,6 @@ const projectRecord: Decoder<ProjectRecord> = (input, path) => {
   if (!projectId.ok) return projectId;
   const root = req(rec.value, "root", string, path);
   if (!root.ok) return root;
-  const boundary = req(rec.value, "boundary", string, path);
-  if (!boundary.ok) return boundary;
-  const marker = req(rec.value, "marker", boolean, path);
-  if (!marker.ok) return marker;
   const createdAt = req(rec.value, "created_at", number, path);
   if (!createdAt.ok) return createdAt;
   const updatedAt = req(rec.value, "updated_at", number, path);
@@ -221,8 +217,6 @@ const projectRecord: Decoder<ProjectRecord> = (input, path) => {
   return yes({
     project_id: projectId.value,
     root: root.value,
-    boundary: boundary.value,
-    marker: marker.value,
     created_at: createdAt.value,
     updated_at: updatedAt.value,
   });
@@ -1031,12 +1025,18 @@ const configurationView: Decoder<ProjectConfigurationView> = (input, path) => {
   if (!project.ok) return project;
   const global = req(rec.value, "global", globalConfiguration, path);
   if (!global.ok) return global;
+  const globalRevision = req(rec.value, "global_revision", number, path);
+  if (!globalRevision.ok) return globalRevision;
   const projectDefaults = req(rec.value, "project_defaults", projectConfiguration, path);
   if (!projectDefaults.ok) return projectDefaults;
+  const projectRevision = req(rec.value, "project_revision", number, path);
+  if (!projectRevision.ok) return projectRevision;
   return yes({
     project: project.value,
     global: global.value,
+    global_revision: globalRevision.value,
     project_defaults: projectDefaults.value,
+    project_revision: projectRevision.value,
   });
 };
 

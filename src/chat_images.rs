@@ -1,8 +1,9 @@
 use crate::contracts::{ChatImage, ChatImageUploadRequest};
 use crate::error::{OcgError, Result};
+use crate::project_store::ProjectDocuments;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_IMAGES: usize = 8;
@@ -70,30 +71,11 @@ pub fn provider_image(url: &str) -> Result<ChatImage> {
     })
 }
 
-fn directory(root: &Path) -> Result<PathBuf> {
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|error| OcgError::io("resolve image Project", error))?;
-    let marker = root
-        .join(".ocg")
-        .canonicalize()
-        .map_err(|error| OcgError::io("resolve Project state directory", error))?;
-    if !marker.starts_with(&canonical_root) {
-        return Err(invalid("Project state directory escapes its Project"));
-    }
-    let directory = marker.join("chat-images");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| OcgError::io("create chat image directory", error))?;
-    let canonical = directory
-        .canonicalize()
-        .map_err(|error| OcgError::io("resolve chat image directory", error))?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(invalid("chat image directory escapes its Project"));
-    }
-    Ok(canonical)
-}
+/// The document kind images are stored under. Images are resources a frozen
+/// Job input may reference, so they are kept for the Project's lifetime.
+const IMAGE_KIND: &str = "chat-image";
 
-fn image_path(root: &Path, id: &str) -> Result<PathBuf> {
+fn validate_identity(id: &str) -> Result<()> {
     let generated = id
         .strip_prefix("model-")
         .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -101,41 +83,13 @@ fn image_path(root: &Path, id: &str) -> Result<PathBuf> {
     if !generated && !uploaded {
         return Err(invalid("invalid image identity"));
     }
-    let directory = directory(root)?;
-    let path = directory
-        .join(format!("{id}.json"))
-        .canonicalize()
-        .map_err(|error| OcgError::io("read chat image", error))?;
-    if path.parent() != Some(directory.as_path()) {
-        return Err(invalid("chat image escapes its Project"));
-    }
-    Ok(path)
+    Ok(())
 }
 
 fn store(root: &Path, image: &ChatImage) -> Result<()> {
-    use std::io::Write;
-    let directory = directory(root)?;
-    let target = directory.join(format!("{}.json", image.id));
-    let temporary = directory.join(format!("{}.tmp", uuid::Uuid::now_v7()));
-    let result = (|| -> Result<()> {
-        let bytes = serde_json::to_vec(image).map_err(|error| invalid(&error.to_string()))?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| OcgError::io("create chat image", error))?;
-        file.write_all(&bytes)
-            .map_err(|error| OcgError::io("write chat image", error))?;
-        file.sync_all()
-            .map_err(|error| OcgError::io("flush chat image", error))?;
-        std::fs::rename(&temporary, target)
-            .map_err(|error| OcgError::io("publish chat image", error))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result
+    validate_identity(&image.id)?;
+    let bytes = serde_json::to_vec(image).map_err(|error| invalid(&error.to_string()))?;
+    ProjectDocuments::for_root(root)?.put(IMAGE_KIND, &image.id, &bytes)
 }
 
 pub fn upload(root: &Path, request: &ChatImageUploadRequest) -> Result<ChatImage> {
@@ -157,14 +111,15 @@ pub fn upload(root: &Path, request: &ChatImageUploadRequest) -> Result<ChatImage
 }
 
 fn load(root: &Path, id: &str) -> Result<ChatImage> {
-    let path = image_path(root, id)?;
-    let length = std::fs::metadata(&path)
-        .map_err(|error| OcgError::io("inspect chat image", error))?
-        .len();
-    if length > MAX_UPLOAD_BODY_BYTES as u64 {
+    validate_identity(id)?;
+    let bytes = ProjectDocuments::existing(root)?
+        .map(|documents| documents.get(IMAGE_KIND, id))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| invalid("unknown chat image"))?;
+    if bytes.len() > MAX_UPLOAD_BODY_BYTES {
         return Err(invalid("stored image exceeds size limit"));
     }
-    let bytes = std::fs::read(path).map_err(|error| OcgError::io("read chat image", error))?;
     let image: ChatImage =
         serde_json::from_slice(&bytes).map_err(|error| invalid(&error.to_string()))?;
     if image.id != id {

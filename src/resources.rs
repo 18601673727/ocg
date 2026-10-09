@@ -34,15 +34,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Resource registry schema version.
 pub const RESOURCE_SCHEMA_VERSION: u32 = 1;
-/// Directory under `.ocg/` holding the registry.
-pub const RESOURCE_DIR: &str = "resources";
-/// The single registry document.
-pub const REGISTRY_FILE: &str = "registry.json";
 /// Upper bound on retained resources so the document cannot grow without limit.
 pub const MAX_RESOURCES: usize = 64;
 /// Upper bound on configured uses retained for one resource.
@@ -834,15 +829,13 @@ pub struct LoadedRegistry {
     pub issues: Vec<ResourceIssue>,
 }
 
-/// The registry directory.
-pub fn registry_dir(root: &Path) -> PathBuf {
-    root.join(crate::context::repomap::OCG_DIR)
-        .join(RESOURCE_DIR)
-}
+/// The document kind and key the registry is stored under.
+const REGISTRY_KIND: &str = "resource-registry";
+const REGISTRY_KEY: &str = "registry";
 
-/// The registry document path.
-pub fn registry_path(root: &Path) -> PathBuf {
-    registry_dir(root).join(REGISTRY_FILE)
+/// How the registry document is named in issues.
+fn registry_label() -> PathBuf {
+    PathBuf::from(format!("{REGISTRY_KIND}/{REGISTRY_KEY}"))
 }
 
 fn is_safe_id(value: &str) -> bool {
@@ -862,20 +855,20 @@ fn is_safe_id(value: &str) -> bool {
 /// - A malformed or unsupported document is `Ok(corrupt == true)` so the
 ///   caller can fail closed with the registry's own representation.
 pub(crate) fn load_raw(root: &Path) -> Result<LoadedRegistry> {
-    let path = registry_path(root);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LoadedRegistry {
-                registry: ResourceRegistry::new(0),
-                corrupt: false,
-                exists: false,
-                issues: Vec::new(),
-            })
-        }
-        Err(error) => return Err(OcgError::read(&path, error)),
+    let path = registry_label();
+    let stored = crate::project_store::ProjectDocuments::existing(root)?
+        .map(|documents| documents.get(REGISTRY_KIND, REGISTRY_KEY))
+        .transpose()?
+        .flatten();
+    let Some(bytes) = stored else {
+        return Ok(LoadedRegistry {
+            registry: ResourceRegistry::new(0),
+            corrupt: false,
+            exists: false,
+            issues: Vec::new(),
+        });
     };
-    let value: Value = match serde_json::from_str(&text) {
+    let value: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(error) => {
             return Ok(corrupt(file_issue(
@@ -950,7 +943,7 @@ pub fn load(root: &Path) -> LoadedRegistry {
     match load_raw(root) {
         Ok(loaded) => loaded,
         Err(error) => corrupt(file_issue(
-            &registry_path(root),
+            &registry_label(),
             &format!("resource registry could not be read: {error}"),
         )),
     }
@@ -992,18 +985,15 @@ pub(crate) fn validate_observation(
     Ok(())
 }
 
-/// Persist the registry atomically. Only dynamic observations are written.
-pub fn save(root: &Path, registry: &ResourceRegistry) -> Result<PathBuf> {
-    crate::install::ensure_gitignore(root)?;
-    let path = registry_path(root);
+/// Persist the registry. Only dynamic observations are written.
+pub fn save(root: &Path, registry: &ResourceRegistry) -> Result<()> {
     let document = RegistryDocument {
         schema_version: RESOURCE_SCHEMA_VERSION,
         updated_at: registry.updated_at,
         resources: registry.observations.clone(),
     };
-    let value = serde_json::to_value(&document).map_err(|error| {
+    let bytes = serde_json::to_vec(&document).map_err(|error| {
         OcgError::config(format!("cannot serialize resource registry: {error}"))
     })?;
-    crate::install::write_json_atomic(&path, &value)?;
-    Ok(path)
+    crate::project_store::ProjectDocuments::for_root(root)?.put(REGISTRY_KIND, REGISTRY_KEY, &bytes)
 }

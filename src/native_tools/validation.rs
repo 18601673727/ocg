@@ -1,12 +1,11 @@
 use super::{relative_display, ProjectRoot, ToolError, ToolErrorKind, ToolResult};
 use crate::orchestration::domain::DomainRepository;
 use crate::process::{CaptureRunner, ProcessHost, SystemProcessHost};
-use fs2::FileExt;
 use ring::digest::{Context, SHA256};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1252,10 +1251,10 @@ impl Observation {
             with_store(root, cancelled, |connection, _| {
                 let transaction = connection.transaction()?;
                 transaction.execute(
-                    "INSERT OR REPLACE INTO evidence(call_id,finished,body) VALUES(?1,?2,?3)",
-                    params![call.id, finished, evidence.to_string()],
+                    "INSERT OR REPLACE INTO context_validation_evidence(project_id,call_id,finished,body) VALUES(?1,?2,?3,?4)",
+                    params![job.project_id, call.id, finished, evidence.to_string()],
                 )?;
-                transaction.execute("DELETE FROM evidence WHERE finished < ?1 OR call_id NOT IN (SELECT call_id FROM evidence ORDER BY finished DESC,call_id LIMIT 128)", params![now().saturating_sub(30 * 24 * 60 * 60 * 1000)])?;
+                transaction.execute("DELETE FROM context_validation_evidence WHERE project_id=?2 AND (finished < ?1 OR call_id NOT IN (SELECT call_id FROM context_validation_evidence WHERE project_id=?2 ORDER BY finished DESC,call_id LIMIT 128))", params![now().saturating_sub(30 * 24 * 60 * 60 * 1000), job.project_id])?;
                 transaction.commit()?;
                 Ok(())
             })
@@ -1266,90 +1265,33 @@ impl Observation {
     }
 }
 
+/// Run `action` against the validation evidence store: the OCG database, or
+/// for a confined helper the read-only Project snapshot it was given (an empty
+/// store when there is none). The boolean tells `action` whether the store was
+/// just created empty; evidence never rebuilds, so it is always `false`.
 fn with_store<T>(
-    root: &ProjectRoot,
+    _root: &ProjectRoot,
     cancelled: &dyn Fn() -> bool,
     action: impl FnOnce(&mut Connection, bool) -> VResult<T>,
 ) -> VResult<T> {
-    if crate::remote_execution::native_confined() {
-        active(cancelled)?;
-        let path = if root.path().join(".ocg/index").symlink_metadata().is_ok() {
-            Some(
-                root.resolve_for_create(".ocg/index/validation-evidence.sqlite3")
-                    .map_err(|error| error.message)?,
-            )
-        } else {
-            None
-        };
-        let mut connection = if let Some(path) = path.filter(|path| path.exists()) {
-            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?
-        } else {
-            let connection = Connection::open_in_memory()?;
-            connection.execute_batch("CREATE TABLE evidence(call_id TEXT PRIMARY KEY,finished INTEGER NOT NULL,body TEXT NOT NULL);")?;
-            connection
-        };
-        connection.busy_timeout(Duration::from_millis(100))?;
-        return action(&mut connection, false);
-    }
-    for directory in [".ocg", ".ocg/index"] {
-        let path = root
-            .resolve_for_create(directory)
-            .map_err(|error| error.message)?;
-        if !path.exists() {
-            fs::create_dir(&path)?;
-        }
-        root.resolve_existing(directory)
-            .map_err(|error| error.message)?;
-    }
-    let database = root
-        .resolve_for_create(".ocg/index/validation-evidence.sqlite3")
-        .map_err(|error| error.message)?;
-    let lock_path = root
-        .resolve_for_create(".ocg/index/validation-evidence.lock")
-        .map_err(|error| error.message)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)?;
-    loop {
-        active(cancelled)?;
-        match lock.try_lock_exclusive() {
-            Ok(()) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10))
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let open = || -> rusqlite::Result<Connection> {
-        let connection = Connection::open(&database)?;
-        connection.busy_timeout(Duration::from_millis(100))?;
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if !matches!(version, 0 | 1) {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        connection.execute_batch("PRAGMA auto_vacuum=FULL; PRAGMA max_page_count=512; CREATE TABLE IF NOT EXISTS evidence(call_id TEXT PRIMARY KEY,finished INTEGER NOT NULL,body TEXT NOT NULL CHECK(length(body)<=8192)); PRAGMA user_version=1;")?;
-        let check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-        if check != "ok" {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        Ok(connection)
-    };
-    let (mut connection, rebuilt) = match open() {
-        Ok(connection) => (connection, false),
-        Err(error)
-            if matches!(&error, rusqlite::Error::InvalidQuery)
-                || matches!(&error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)) =>
-        {
-            fs::remove_file(&database)?;
-            (open()?, true)
-        }
-        Err(error) => return Err(error.into()),
-    };
     active(cancelled)?;
-    action(&mut connection, rebuilt)
+    let mut connection = if crate::remote_execution::native_confined() {
+        match std::env::var_os("OCG_NATIVE_DOMAIN_SNAPSHOT") {
+            Some(path) => {
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?
+            }
+            None => {
+                let connection = Connection::open_in_memory()?;
+                connection.execute_batch(crate::context::fulltext::SCHEMA)?;
+                connection
+            }
+        }
+    } else {
+        crate::database::connect()?
+    };
+    connection.busy_timeout(Duration::from_secs(5))?;
+    active(cancelled)?;
+    action(&mut connection, false)
 }
 
 pub(super) fn query_current(
@@ -1382,10 +1324,10 @@ pub(super) fn query_current(
     let query = || -> VResult<ToolResult> {
         let mut observations = BTreeMap::new();
         let (rows, rebuilt) = with_store(root, cancelled, |connection, rebuilt| {
-            let mut statement = connection.prepare("SELECT body FROM evidence WHERE finished>=?1 ORDER BY finished DESC,call_id LIMIT 128")?;
+            let mut statement = connection.prepare("SELECT body FROM context_validation_evidence WHERE project_id=?2 AND finished>=?1 ORDER BY finished DESC,call_id LIMIT 128")?;
             let rows = statement
                 .query_map(
-                    params![now().saturating_sub(30 * 24 * 60 * 60 * 1000)],
+                    params![now().saturating_sub(30 * 24 * 60 * 60 * 1000), project_id],
                     |row| row.get::<_, String>(0),
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -1,4 +1,5 @@
-//! Non-authoritative provider context caches at `.ocg/orchestration/state.json`.
+//! Non-authoritative provider context caches, one document per Project in the
+//! OCG database.
 //! Compiler baselines and compaction summaries may be dropped and recomputed.
 //! They never decide Job/Attempt/Call lifecycle, scheduling, fencing or budgets;
 //! those decisions belong exclusively to the canonical SQLite substrate.
@@ -6,12 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// The storage directory shared by the canonical SQLite substrate and local caches.
-pub const ORCHESTRATION_DIR: &str = "orchestration";
-pub const STATE_FILE: &str = "state.json";
+/// The document kind and key the cache is stored under.
+const DOCUMENT_KIND: &str = "orchestration-state";
+const DOCUMENT_KEY: &str = "state";
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 /// The maximum number of compiler diagnostic baselines retained per project.
 ///
@@ -213,17 +213,6 @@ impl ContextCache {
     }
 }
 
-/// The orchestration state directory.
-pub fn state_dir(root: &Path) -> PathBuf {
-    root.join(crate::context::repomap::OCG_DIR)
-        .join(ORCHESTRATION_DIR)
-}
-
-/// The state file path.
-pub fn state_path(root: &Path) -> PathBuf {
-    state_dir(root).join(STATE_FILE)
-}
-
 /// The result of a load, including corruption accounting for diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedState {
@@ -233,30 +222,39 @@ pub struct LoadedState {
 }
 
 /// Load state, recovering to an empty state on a missing, corrupt or
-/// unsupported file. Never creates state and never fails.
+/// unsupported document. Never creates state and never fails.
 pub fn load(root: &Path) -> LoadedState {
-    let path = state_path(root);
-    if !path.is_file() {
-        return LoadedState {
-            state: ContextCache::default(),
-            corrupt: false,
-            exists: false,
-        };
-    }
-    match fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<ContextCache>(&text) {
-            Ok(state) if state.schema_version == STATE_SCHEMA_VERSION => LoadedState {
-                state,
-                corrupt: false,
-                exists: true,
+    let stored =
+        crate::project_store::ProjectDocuments::existing(root).and_then(
+            |documents| match documents {
+                Some(documents) => documents.get(DOCUMENT_KIND, DOCUMENT_KEY),
+                None => Ok(None),
             },
-            _ => LoadedState {
+        );
+    let bytes = match stored {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return LoadedState {
+                state: ContextCache::default(),
+                corrupt: false,
+                exists: false,
+            }
+        }
+        Err(_) => {
+            return LoadedState {
                 state: ContextCache::default(),
                 corrupt: true,
                 exists: true,
-            },
+            }
+        }
+    };
+    match serde_json::from_slice::<ContextCache>(&bytes) {
+        Ok(state) if state.schema_version == STATE_SCHEMA_VERSION => LoadedState {
+            state,
+            corrupt: false,
+            exists: true,
         },
-        Err(_) => LoadedState {
+        _ => LoadedState {
             state: ContextCache::default(),
             corrupt: true,
             exists: true,
@@ -264,13 +262,10 @@ pub fn load(root: &Path) -> LoadedState {
     }
 }
 
-/// Persist state atomically. Ensures the state tree stays git-ignored.
-pub fn save(root: &Path, state: &ContextCache) -> crate::error::Result<PathBuf> {
-    crate::install::ensure_gitignore(root)?;
-    let path = state_path(root);
-    let value = serde_json::to_value(state).map_err(|error| {
+/// Persist state for the Project at `root`.
+pub fn save(root: &Path, state: &ContextCache) -> crate::error::Result<()> {
+    let bytes = serde_json::to_vec(state).map_err(|error| {
         crate::error::OcgError::config(format!("cannot serialize context cache: {error}"))
     })?;
-    crate::install::write_json_atomic(&path, &value)?;
-    Ok(path)
+    crate::project_store::ProjectDocuments::for_root(root)?.put(DOCUMENT_KIND, DOCUMENT_KEY, &bytes)
 }

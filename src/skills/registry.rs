@@ -4,9 +4,7 @@
 //!
 //! ```text
 //! BuiltIn        registered first, so a project skill can override it
-//! UserGlobal     from the OCG configuration directory
-//! ProjectLocal   from <project>/.ocg/skills
-//! Configured     from explicitly configured directories, in order
+//! Configured     from the configured Project directories, in order
 //! ```
 //!
 //! A later source replaces an earlier one with the same name, and the replaced
@@ -194,18 +192,16 @@ impl SkillRegistry {
     }
 }
 
-/// Build a registry from the filesystem.
+/// Build a registry from the compiled-in skills and the configured Project
+/// skill directories.
 ///
 /// * `project_root` is OCG's existing [`crate::project::ProjectBoundary`] root. It
-///   is used for the project skill directory and as the boundary check; this
-///   module does not re-derive where a project begins.
-/// * `config_home` is the OCG configuration directory, used for user-global
-///   skills. Resolving it is [`crate::config`]'s job.
+///   is the base of the configured paths and the boundary check; this module
+///   does not re-derive where a project begins.
 /// * `builtins` are compiled-in skills, registered first so a project skill can
 ///   override them.
 pub fn discover(
     project_root: Option<&Path>,
-    config_home: Option<&Path>,
     builtins: &[SkillDefinition],
     policy: &SkillsConfig,
 ) -> SkillRegistry {
@@ -218,26 +214,6 @@ pub fn discover(
     }
     registry.builtins_registered = !builtins.is_empty();
 
-    if policy.user_skills {
-        if let Some(home) = config_home {
-            let dir = home.join(config::PROJECT_SKILL_DIR);
-            scan(&dir, SkillSource::UserGlobal, None, policy, &mut registry);
-        }
-    }
-    if policy.project_skills {
-        if let Some(root) = project_root {
-            let dir = root
-                .join(crate::project::MARKER)
-                .join(config::PROJECT_SKILL_DIR);
-            scan(
-                &dir,
-                SkillSource::ProjectLocal,
-                Some(root),
-                policy,
-                &mut registry,
-            );
-        }
-    }
     for relative in &policy.paths {
         // A configured path is relative to the project root. When there is no
         // project there is nothing for it to be relative to, and guessing a base

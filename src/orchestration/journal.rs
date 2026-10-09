@@ -294,8 +294,20 @@ pub struct JournalPrune {
 /// generation.
 /// Create the journal tables. The retention boundary row is established by
 /// [`reconcile_boundary`], which needs a transaction of its own.
-pub(crate) fn ensure_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(SCHEMA).map_err(sql)
+/// Create the empty journal's retention boundary. Runs once, in the
+/// transaction that creates the database.
+pub(crate) fn initialize_boundary(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO domain_journal_meta(id,schema_version,head_seq,floor_seq,anchor_event_id,anchor_digest) VALUES(1,?1,?2,?2,NULL,?3)",
+            params![
+                to_i64(JOURNAL_SCHEMA_VERSION as u64)?,
+                to_i64(INITIAL_CURSOR)?,
+                boundary_digest(INITIAL_CURSOR, INITIAL_CURSOR, None)?
+            ],
+        )
+        .map_err(sql)?;
+    Ok(())
 }
 
 /// Reconcile the retention boundary with the events that are durable now. This
@@ -334,22 +346,10 @@ pub(crate) fn reconcile_boundary(connection: &Connection) -> Result<()> {
         .map_err(sql)?;
     let lowest = to_u64(lowest)?;
     match existing {
-        // No boundary yet: adopt the stream that already exists. This is the
-        // one-time migration from a journal that derived its cursor from
-        // `MAX(seq) + 1`; nothing has been pruned yet, so the floor is 0.
+        // The boundary is created with the database, so its absence is a
+        // damaged journal, never one to adopt.
         None => {
-            let digest = boundary_digest(stored, INITIAL_CURSOR, None)?;
-            transaction
-                .execute(
-                    "INSERT INTO domain_journal_meta(id,schema_version,head_seq,floor_seq,anchor_event_id,anchor_digest) VALUES(1,?1,?2,?3,NULL,?4)",
-                    params![
-                        to_i64(JOURNAL_SCHEMA_VERSION as u64)?,
-                        to_i64(stored)?,
-                        to_i64(INITIAL_CURSOR)?,
-                        digest
-                    ],
-                )
-                .map_err(sql)?;
+            return Err(invalid("execution journal has no retention boundary"));
         }
         Some((head, floor, anchor)) => {
             // The counter only ever moves forward, so an out-of-band deletion of
@@ -766,6 +766,42 @@ pub(crate) fn attempt_scope(
 /// Append one event inside the canonical writer transaction and return its
 /// cursor. The caller must already have made the mutation succeed; if this
 /// fails the whole transaction rolls back, so state and evidence stay atomic.
+/// The Project owning the first of these executions that exists.
+fn owning_project(
+    transaction: &Transaction<'_>,
+    job_id: Option<&str>,
+    attempt_id: Option<&str>,
+    call_id: Option<&str>,
+    dispatch_intent_id: Option<&str>,
+) -> Result<Option<String>> {
+    let lookups = [
+        (job_id, "SELECT project_id FROM domain_jobs WHERE id=?1"),
+        (
+            attempt_id,
+            "SELECT j.project_id FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE a.id=?1",
+        ),
+        (
+            call_id,
+            "SELECT j.project_id FROM domain_calls c JOIN domain_attempts a ON a.id=c.attempt_id JOIN domain_jobs j ON j.id=a.job_id WHERE c.id=?1",
+        ),
+        (
+            dispatch_intent_id,
+            "SELECT j.project_id FROM domain_dispatch_intents i JOIN domain_jobs j ON j.id=i.job_id WHERE i.id=?1",
+        ),
+    ];
+    for (id, query) in lookups {
+        let Some(id) = id else { continue };
+        let project: Option<String> = transaction
+            .query_row(query, [id], |row| row.get(0))
+            .optional()
+            .map_err(sql)?;
+        if project.is_some() {
+            return Ok(project);
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn append(transaction: &Transaction<'_>, draft: EventDraft) -> Result<u64> {
     let EventDraft {
         kind,
@@ -794,6 +830,18 @@ pub(crate) fn append(transaction: &Transaction<'_>, draft: EventDraft) -> Result
             (project_id.or(resolved_project), resolved)
         }
         (None, None) => (project_id, None),
+    };
+    // Every event belongs to the Project of the execution it describes, so a
+    // Project's stream never misses one that did not name it explicitly.
+    let project_id = match project_id {
+        Some(project_id) => Some(project_id),
+        None => owning_project(
+            transaction,
+            job_id.as_deref(),
+            attempt_id.as_deref(),
+            call_id.as_deref(),
+            dispatch_intent_id.as_deref(),
+        )?,
     };
     // The cursor comes from the durable boundary counter, not from
     // `MAX(seq) + 1`. Pruning removes rows, so a row-derived cursor would
@@ -868,16 +916,28 @@ pub(crate) fn append(transaction: &Transaction<'_>, draft: EventDraft) -> Result
 ///
 /// This is the durable counter, not `MAX(seq)`, so it stays correct after
 /// pruning and never regresses when old events are removed.
-pub(crate) fn head(connection: &Connection) -> Result<u64> {
-    Ok(read_boundary(connection)?.head_cursor)
+/// The cursor of one Project's most recent committed event.
+pub(crate) fn project_head(connection: &Connection, project_id: &str) -> Result<u64> {
+    let head: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM domain_events WHERE project_id=?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    to_u64(head)
 }
 
-/// Classify a delta request against the durable boundary.
-///
-/// A consumer is served the complete delta or an explicit outcome. It is never
-/// served a truncated suffix, and "your prefix was pruned" is never dressed up
-/// as a gap.
-pub(crate) fn delta_after(connection: &Connection, after: u64, limit: usize) -> Result<EventDelta> {
+/// The boundary-checked delta for one Project's view of the stream. Cursors
+/// are positions in the installation-wide stream, so other Projects' events
+/// legitimately sit between this Project's; only the global stream can be
+/// checked for holes.
+pub(crate) fn delta_for_project(
+    connection: &Connection,
+    project_id: &str,
+    after: u64,
+    limit: usize,
+) -> Result<EventDelta> {
     let boundary = read_boundary(connection)?;
     if after > boundary.head_cursor {
         return Ok(EventDelta::AheadOfHead {
@@ -885,8 +945,6 @@ pub(crate) fn delta_after(connection: &Connection, after: u64, limit: usize) -> 
             head_cursor: boundary.head_cursor,
         });
     }
-    // The next event this consumer still needs is `after + 1`. If that is below
-    // the retained floor the delta can no longer be produced from the journal.
     if after + 1 < boundary.floor_cursor {
         return Ok(EventDelta::ResyncRequired {
             requested: after,
@@ -894,31 +952,11 @@ pub(crate) fn delta_after(connection: &Connection, after: u64, limit: usize) -> 
             head_cursor: boundary.head_cursor,
         });
     }
-    if after == boundary.head_cursor {
+    let events = read_for_project(connection, project_id, after, limit)?;
+    if events.is_empty() {
         return Ok(EventDelta::Empty {
             head_cursor: boundary.head_cursor,
         });
-    }
-    let events = read_after(connection, after, limit)?;
-    if events.is_empty() {
-        // The consumer is below the head, so events must exist. Their absence
-        // means the retained range lost rows without the floor moving, so the
-        // only correct answer is to resync rather than to claim an empty delta.
-        return Ok(EventDelta::ResyncRequired {
-            requested: after,
-            floor_cursor: boundary.floor_cursor,
-            head_cursor: boundary.head_cursor,
-        });
-    }
-    // The delta is only complete if it starts exactly where the consumer left
-    // off. Anything else is a real hole inside the retained range, so it is
-    // reported rather than served as a partial suffix.
-    let expected = after + 1;
-    if events[0].seq != expected {
-        return Err(invalid(&format!(
-            "execution journal retained range has a hole: expected seq {expected}, found {}",
-            events[0].seq
-        )));
     }
     Ok(EventDelta::Available {
         events,
@@ -1021,20 +1059,21 @@ fn bound(limit: usize) -> usize {
     limit.clamp(1, MAX_EVENT_READ)
 }
 
-/// Read the events strictly after `after`, in cursor order.
-pub(crate) fn read_after(
+/// Read one Project's events strictly after `after`, in cursor order.
+pub(crate) fn read_for_project(
     connection: &Connection,
+    project_id: &str,
     after: u64,
     limit: usize,
 ) -> Result<Vec<ExecutionEvent>> {
     let mut statement = connection
         .prepare(&format!(
-            "{SELECT_COLUMNS} WHERE seq>?1 ORDER BY seq ASC LIMIT ?2"
+            "{SELECT_COLUMNS} WHERE project_id=?1 AND seq>?2 ORDER BY seq ASC LIMIT ?3"
         ))
         .map_err(sql)?;
     let rows = statement
         .query_map(
-            params![to_i64(after)?, to_i64(bound(limit) as u64)?],
+            params![project_id, to_i64(after)?, to_i64(bound(limit) as u64)?],
             |row| serde_rusqlite::from_row(row).map_err(crate::error::sqlite_mapping_error),
         )
         .map_err(sql)?;
