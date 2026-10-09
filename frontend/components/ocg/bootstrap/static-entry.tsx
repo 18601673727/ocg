@@ -8,6 +8,7 @@ import { resolveControlCenterView } from "../control-center/domain";
 import { resolveProjectParam } from "../project/domain";
 import { resolveScenario } from "../runtime/scenarios";
 import type { ScenarioId } from "../runtime/runtime-types";
+import { AccessBoundary } from "../login/access-boundary";
 
 export type StaticEntryRoute =
   | "home"
@@ -47,9 +48,11 @@ const ROUTE_ENTRY: Partial<Record<StaticEntryRoute, RouteEntry>> = {
  */
 export function StaticEntry({ route }: { route: StaticEntryRoute }) {
   return (
-    <Suspense fallback={null}>
-      <StaticEntryContent route={route} />
-    </Suspense>
+    <AccessBoundary>
+      <Suspense fallback={null}>
+        <StaticEntryContent route={route} />
+      </Suspense>
+    </AccessBoundary>
   );
 }
 

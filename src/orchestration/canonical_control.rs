@@ -790,6 +790,19 @@ impl CanonicalControlService {
         &self.initial_root
     }
 
+    pub(crate) fn security_store(&self) -> Result<crate::control_security::OwnershipStore> {
+        crate::control_security::OwnershipStore::open(&self.control_state.join("security.sqlite"))
+    }
+
+    pub(crate) fn chat_project_for(&self, session_id: &str, job_id: &str) -> Option<String> {
+        self.active_chats
+            .lock()
+            .ok()?
+            .values()
+            .find(|chat| chat.session_id == session_id && chat.job_id == job_id)
+            .map(|chat| chat.project_id.clone())
+    }
+
     fn project_file(&self) -> PathBuf {
         self.control_state.join(PROJECTS_FILE)
     }
