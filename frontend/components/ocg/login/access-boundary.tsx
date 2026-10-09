@@ -29,6 +29,9 @@ function RemoteAccess({ children }: { children: ReactNode }) {
     const controller = new AbortController();
     const refresh = async () => {
       try {
+        if (new URL(window.location.href).searchParams.get("__cf_access_message") === "logged_out") {
+          throw new Error("You have signed out. Sign in again to continue.");
+        }
         const response = await fetch("/api/v1/auth/session", { cache: "no-store", signal: controller.signal });
         if (!response.ok || !response.headers.get("content-type")?.includes("application/json")) {
           throw new Error("Your Access session has expired or access was denied. Sign in again to continue.");
@@ -89,7 +92,11 @@ function RemoteAccess({ children }: { children: ReactNode }) {
             : "Checking your Cloudflare Access session…")}
         </p>
         <div className="mt-4 flex gap-3 text-sm">
-          <button className="rounded border px-3 py-2" onClick={() => window.location.reload()}>Refresh access</button>
+          <button className="rounded border px-3 py-2" onClick={() => {
+            const location = new URL(window.location.href);
+            location.searchParams.delete("__cf_access_message");
+            window.location.assign(location.href);
+          }}>Refresh access</button>
           <button className="rounded border px-3 py-2" disabled={signingOut} onClick={() => { void logout(); }}>Sign out</button>
         </div>
       </section>
