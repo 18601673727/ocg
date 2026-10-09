@@ -2197,35 +2197,28 @@ impl CanonicalControlService {
         let job = domain
             .job(job_id)?
             .ok_or_else(|| invalid("unknown canonical Job"))?;
-        let accepted = job.state.can_cancel();
-        // A Core-initiated stop only ever starts a cancellation. It never
-        // re-confirms one an operator already requested, so it cannot attach
-        // its cause to their outcome.
-        if cause.is_some() && job.state != super::domain::JobState::Running {
-            return Ok(CanonicalJobOperationResponse {
-                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                job_id: job.id,
-                accepted: false,
-                snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
-            });
-        }
+        let mut accepted = job.state.can_cancel();
         // Cancellation revokes and settles execution authority, so only the
         // Project's owner performs it, through the runtime that can signal the
         // execution. A Project another process owns is refused before any
         // cancellation is requested.
         let (project, _) = self.project_repository(&job.project_id)?;
         let runtime = self.execution_owner(&job.project_id, Path::new(&project.root))?;
-        for (authority, never_started) in
-            domain.request_job_cancel_cascade(job_id, expected_generation)?
-        {
+        // The cause is recorded with the request, in one transaction; a
+        // Core-initiated stop finds nothing to request once anyone else has.
+        let requested = domain.request_job_cancel_cascade_for(
+            job_id,
+            expected_generation,
+            cause.unwrap_or(super::domain::CancelCause::Operator),
+        )?;
+        if cause.is_some() && requested.is_empty() {
+            accepted = false;
+        }
+        for (authority, never_started) in requested {
             let signalled = runtime
                 .provider_dispatcher()
                 .cancel_attempt(&authority.attempt_id)?;
-            domain.confirm_cancel_with_cause(
-                &authority.attempt_id,
-                signalled || never_started,
-                cause,
-            )?;
+            domain.confirm_cancel(&authority.attempt_id, signalled || never_started)?;
             // The stream reports the committed outcome: an operator's stop
             // stays "chat cancelled", and a Core-initiated stop names its
             // cause and whether the stop was confirmed.

@@ -51,7 +51,7 @@ const APPLICATION_ID: i32 = 0x4F43_4731;
 /// The schema generation, recorded in `user_version`. A database is created at
 /// this generation; one written by any other generation is refused, never
 /// migrated.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// The installation-level tables. Every other component contributes its own
 /// tables through [`schema`].

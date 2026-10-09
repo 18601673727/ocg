@@ -812,6 +812,9 @@ CREATE TABLE IF NOT EXISTS domain_attempts (
     authoritative INTEGER NOT NULL CHECK(authoritative IN (0,1)),
     created_at INTEGER NOT NULL,
     finished_at INTEGER,
+    -- Who initiated the cancellation, recorded in the transaction that first
+    -- requested it and never replaced: a later stop cannot relabel it.
+    cancel_cause TEXT CHECK(cancel_cause IS NULL OR cancel_cause IN ('operator','chat_execution_timeout')),
     UNIQUE(job_id,generation)
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS domain_one_authority_per_job
@@ -5633,7 +5636,12 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let result = request_job_cancel_in(&transaction, job_id, expected_generation)?;
+        let result = request_job_cancel_in(
+            &transaction,
+            job_id,
+            expected_generation,
+            CancelCause::Operator,
+        )?;
         transaction.commit().map_err(sql)?;
         Ok(result)
     }
@@ -5643,6 +5651,22 @@ impl DomainRepository {
         job_id: &str,
         expected_generation: u64,
     ) -> Result<Vec<(AttemptAuthority, bool)>> {
+        self.request_job_cancel_cascade_for(job_id, expected_generation, CancelCause::Operator)
+    }
+
+    /// Request cancellation of a Job and its cascading children, recording
+    /// `cause` on every Attempt this request moves to `cancelling`.
+    ///
+    /// A Core-initiated cause only ever starts a cancellation: when the Job
+    /// is no longer running, because an operator or another cause already
+    /// requested its stop, nothing is requested, inside the same transaction
+    /// that would otherwise record the cause.
+    pub(crate) fn request_job_cancel_cascade_for(
+        &mut self,
+        job_id: &str,
+        expected_generation: u64,
+        cause: CancelCause,
+    ) -> Result<Vec<(AttemptAuthority, bool)>> {
         validate_id(job_id)?;
         let transaction = self
             .connection
@@ -5651,6 +5675,9 @@ impl DomainRepository {
         let root = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
         if root.generation != expected_generation {
             return Err(invalid("cancel rejected: Job generation changed"));
+        }
+        if cause != CancelCause::Operator && root.state != JobState::Running {
+            return Ok(Vec::new());
         }
         let mut authorities = Vec::new();
         let cancelling = root.state.can_cancel()
@@ -5674,7 +5701,9 @@ impl DomainRepository {
             if job.project_id != root.project_id {
                 return Err(invalid("child is not in the parent Project"));
             }
-            if let Some(authority) = request_job_cancel_in(&transaction, &id, job.generation)? {
+            if let Some(authority) =
+                request_job_cancel_in(&transaction, &id, job.generation, cause)?
+            {
                 authorities.push(authority);
             }
             let children: Vec<String> = query_all(&transaction,
@@ -5715,28 +5744,35 @@ impl DomainRepository {
         transaction.commit().map_err(sql)
     }
 
+    /// Confirm a requested cancellation: `stopped` when the execution is
+    /// known to have stopped, otherwise its outcome is unknown. A stop the
+    /// Core initiated names the cause recorded when it was requested.
     pub fn confirm_cancel(&mut self, attempt_id: &str, stopped: bool) -> Result<()> {
-        self.confirm_cancel_with_cause(attempt_id, stopped, None)
-    }
-
-    /// Confirm a requested cancellation, recording the Core's `cause` when it
-    /// initiated the stop. The terminal state is the same either way.
-    pub(crate) fn confirm_cancel_with_cause(
-        &mut self,
-        attempt_id: &str,
-        stopped: bool,
-        cause: Option<CancelCause>,
-    ) -> Result<()> {
         let terminal = if stopped { "cancelled" } else { "unknown" };
-        let mut reason = cancel_reason(terminal, true);
-        if let (Some(reason), Some(cause)) = (reason.as_mut(), cause) {
-            reason.message = format!("{}; {}", cause.summary(), reason.message);
-            reason.details = Some(serde_json::json!({ "cause": cause.code() }));
-        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
+        let cause: Option<String> = transaction
+            .query_row(
+                "SELECT cancel_cause FROM domain_attempts WHERE id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?
+            .flatten();
+        let mut reason = cancel_reason(terminal, true);
+        if let (Some(reason), Some(cause)) = (
+            reason.as_mut(),
+            cause
+                .as_deref()
+                .and_then(CancelCause::parse)
+                .filter(|cause| *cause != CancelCause::Operator),
+        ) {
+            reason.message = format!("{}; {}", cause.summary(), reason.message);
+            reason.details = Some(serde_json::json!({ "cause": cause.code() }));
+        }
         finish_attempt_with_reason_in(&transaction, attempt_id, terminal, true, reason.as_ref())?;
         transaction.commit().map_err(sql)
     }
@@ -5776,14 +5812,15 @@ impl DomainRepository {
     /// recovery re-dispatched. A Chat retry mints a new Attempt and so a new
     /// deadline. A Job already cancelling is left to that cancellation.
     pub(crate) fn chat_execution_deadline_due(&self, cutoff: i64) -> Result<Vec<(String, u64)>> {
+        let project_id = self.scope()?.unwrap_or_default();
         query_all(
             &self.connection,
             "SELECT j.id,j.generation FROM domain_chat_turns t
              JOIN domain_jobs j ON j.id=t.job_id
              JOIN domain_attempts a ON a.id=j.authoritative_attempt_id AND a.generation=j.generation
-             WHERE j.depth=0 AND j.state='running' AND a.state IN ('queued','running') AND a.created_at<=?1
+             WHERE j.project_id=?2 AND j.depth=0 AND j.state='running' AND a.state IN ('queued','running') AND a.created_at<=?1
              ORDER BY a.created_at,j.id",
-            &[&cutoff],
+            &[&cutoff, &project_id],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -7660,6 +7697,7 @@ fn request_job_cancel_in(
     transaction: &rusqlite::Transaction<'_>,
     job_id: &str,
     expected_generation: u64,
+    cause: CancelCause,
 ) -> Result<Option<(AttemptAuthority, bool)>> {
     let job = read_job(transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
     if job.generation != expected_generation {
@@ -7695,6 +7733,12 @@ fn request_job_cancel_in(
                 [attempt_id], |row| row.get::<_, bool>(0),
             ).map_err(sql)?;
     finish_attempt_in(transaction, attempt_id, "cancelling", false)?;
+    transaction
+        .execute(
+            "UPDATE domain_attempts SET cancel_cause=?2 WHERE id=?1 AND cancel_cause IS NULL",
+            params![attempt_id, cause.code()],
+        )
+        .map_err(sql)?;
     let authority = AttemptAuthority {
         attempt_id: attempt.id,
         job_id: job.id,
@@ -8438,6 +8482,8 @@ fn cancel_reason(state: &str, require_cancelling: bool) -> Option<Failure> {
 /// as an operator's cancellation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancelCause {
+    /// An operator or user asked for the stop.
+    Operator,
     /// A Chat turn outlived its execution deadline.
     ChatExecutionTimeout,
 }
@@ -8445,12 +8491,20 @@ pub(crate) enum CancelCause {
 impl CancelCause {
     fn code(self) -> &'static str {
         match self {
+            Self::Operator => "operator",
             Self::ChatExecutionTimeout => "chat_execution_timeout",
         }
     }
 
+    fn parse(code: &str) -> Option<Self> {
+        [Self::Operator, Self::ChatExecutionTimeout]
+            .into_iter()
+            .find(|cause| cause.code() == code)
+    }
+
     pub(crate) fn summary(self) -> &'static str {
         match self {
+            Self::Operator => "cancelled by an operator",
             Self::ChatExecutionTimeout => "Chat execution exceeded its deadline",
         }
     }
