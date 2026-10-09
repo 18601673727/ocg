@@ -2016,15 +2016,24 @@ fn handle_chat_stream(
                 break;
             }
         }
-        if std::time::Instant::now() >= deadline {
+        // A turn whose terminal event is already buffered has settled: an
+        // attach after the deadline replays that outcome rather than
+        // reporting a timeout the canonical state never had.
+        let settled = buffer
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("chat buffer poisoned"))?
+            .terminal;
+        if !settled && std::time::Instant::now() >= deadline {
+            // The timeout must enter the canonical cancellation path so the
+            // Attempt/Call/provider execution is actually revoked. It runs
+            // before the notification, so the history refresh the notification
+            // triggers reads the committed cancellation, and it precedes any
+            // ActiveChat removal so the cancel state is still findable.
+            let _ = service.cancel_chat_turn(&session_id, &job_id);
             let payload = json!({"error": "chat stream timed out"}).to_string();
             let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
             let _ = stream.flush();
-            // The timeout must enter the canonical cancellation path so the
-            // Attempt/Call/provider execution is actually revoked. It runs
-            // even when the frontend socket write above failed, and it precedes
-            // any ActiveChat removal so the cancel state is still findable.
-            let _ = service.cancel_chat_turn(&session_id, &job_id);
             break;
         }
         let (base_index, pending): (
