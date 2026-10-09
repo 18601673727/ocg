@@ -7725,16 +7725,17 @@ fn settle_chat_turn(
     Ok(())
 }
 
-/// The displayable output a failed provider Call recorded for this Attempt,
-/// when the provider delivered anything before failing. Cancelled executions
-/// fence their Calls to `unknown`, so only genuine failures carry evidence.
+/// The displayable output a provider Call recorded for this Attempt when the
+/// Attempt did not complete: a failed Call's evidence, or the answer of a
+/// Call that completed before the Attempt's own settlement failed. Cancelled
+/// executions fence their unfinished Calls to `unknown`, so they carry none.
 fn failed_provider_evidence(
     transaction: &rusqlite::Transaction<'_>,
     attempt_id: &str,
 ) -> Result<Option<(Option<String>, Option<String>)>> {
     let response: Option<String> = transaction
         .query_row(
-            "SELECT response FROM domain_calls WHERE attempt_id=?1 AND state='failed' AND json_extract(request,'$.executor_transport')='provider' ORDER BY created_at DESC,id DESC LIMIT 1",
+            "SELECT response FROM domain_calls WHERE attempt_id=?1 AND state IN ('failed','completed') AND json_extract(request,'$.executor_transport')='provider' ORDER BY created_at DESC,id DESC LIMIT 1",
             [attempt_id],
             |row| row.get(0),
         )
