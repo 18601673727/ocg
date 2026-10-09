@@ -762,7 +762,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           this.emit({ type: "cancelled", sessionId, messageId: assistantId });
         } else {
           const after = this.store.getSnapshot().messagesBySession[sessionId]?.find((item) => item.id === assistantId);
-          this.emit({ type: "conversation.message-completed", sessionId, message: { ...(after ?? { id: assistantId, role: "assistant" as const, createdAt: chatClockLabel() }), content: "", failureReason: message, status: "failed" } });
+          // Received output is not erased to present the failure: what the
+          // provider delivered stays visible, marked failed, until canonical
+          // history replaces it with the failed Message and its evidence.
+          this.emit({ type: "conversation.message-completed", sessionId, message: { ...(after ?? { id: assistantId, role: "assistant" as const, content: "", createdAt: chatClockLabel() }), failureReason: message, status: "failed" } });
         }
         this.closeChatStream(sessionId, false);
         void this.refreshSessionHistory(sessionId);
@@ -783,7 +786,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         this.emit({
           type: "conversation.message-completed",
           sessionId,
-          message: { ...after, content: "", failureCode: "stream-closed", status: "failed" },
+          message: { ...after, failureCode: "stream-closed", status: "failed" },
         });
       }
       this.closeChatStream(sessionId, false);
