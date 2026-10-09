@@ -971,6 +971,25 @@ pub struct ChatMessageOrigin {
     pub failure_reason: Option<String>,
 }
 
+/// Displayable provider output received before its Call failed.
+///
+/// A failure settles the execution; it must not erase what the provider
+/// actually delivered. The evidence rides on the failed Call's record the
+/// same way `context_costs` already does, and the Chat turn's settlement
+/// commits it to the failed assistant Message as ordinary blocks, where the
+/// Failed lifecycle and the recorded failure reason keep it distinct from a
+/// completed answer. Empty means the provider delivered nothing displayable.
+pub struct ProviderFailureEvidence {
+    pub content: String,
+    pub reasoning: String,
+}
+
+impl ProviderFailureEvidence {
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty() && self.reasoning.is_empty()
+    }
+}
+
 pub struct ChatHistory {
     pub conversation: Conversation,
     pub messages: Vec<Message>,
@@ -4984,8 +5003,28 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         generation: u64,
         failure: &str,
     ) -> Result<Call> {
-        self.fail_call_checked(call_id, attempt_id, generation, failure, false, None)?
+        self.fail_call_checked(call_id, attempt_id, generation, failure, false, None, None)?
             .ok_or_else(|| invalid("Call failure rejected: Attempt authority is stale"))
+    }
+
+    /// Persist a terminal provider Call failure together with whatever
+    /// displayable output the provider delivered before failing. The evidence
+    /// rides on the failed Call record the same way `context_costs` already
+    /// does; the Chat turn's settlement reads it back onto the failed
+    /// assistant Message, where the Failed lifecycle keeps it distinct from a
+    /// completed answer.
+    pub fn fail_call_with_evidence(
+        &mut self,
+        call_id: &str,
+        attempt_id: &str,
+        generation: u64,
+        failure: &str,
+        evidence: Option<&ProviderFailureEvidence>,
+    ) -> Result<Call> {
+        self.fail_call_checked(
+            call_id, attempt_id, generation, failure, false, None, evidence,
+        )?
+        .ok_or_else(|| invalid("Call failure rejected: Attempt authority is stale"))
     }
 
     pub fn fail_unclaimed_call(
@@ -4996,7 +5035,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         failure: &str,
     ) -> Result<bool> {
         Ok(self
-            .fail_call_checked(call_id, attempt_id, generation, failure, true, None)?
+            .fail_call_checked(call_id, attempt_id, generation, failure, true, None, None)?
             .is_some())
     }
 
@@ -5020,10 +5059,12 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             failure,
             false,
             Some(response),
+            None,
         )?
         .ok_or_else(|| invalid("native tool failure rejected: Attempt authority is stale"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fail_call_checked(
         &mut self,
         call_id: &str,
@@ -5032,6 +5073,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         failure: &str,
         unclaimed: bool,
         tool_response: Option<&str>,
+        evidence: Option<&ProviderFailureEvidence>,
     ) -> Result<Option<Call>> {
         validate_id(call_id)?;
         validate_id(attempt_id)?;
@@ -5089,18 +5131,28 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             if serde_json::from_str::<serde_json::Value>(&call.request)
                 .is_ok_and(|request| request["executor_transport"] == "provider")
             {
-                if let Some(costs) = call
+                let costs = call
                     .response
                     .as_deref()
                     .and_then(|response| serde_json::from_str::<serde_json::Value>(response).ok())
-                    .and_then(|response| response.get("context_costs").cloned())
-                {
+                    .and_then(|response| response.get("context_costs").cloned());
+                let evidence = evidence.filter(|evidence| !evidence.is_empty());
+                if costs.is_some() || evidence.is_some() {
+                    let mut payload = serde_json::json!({ "failure": failure });
+                    if let Some(costs) = costs {
+                        payload["context_costs"] = costs;
+                    }
+                    if let Some(evidence) = evidence {
+                        if !evidence.content.is_empty() {
+                            payload["content"] = evidence.content.clone().into();
+                        }
+                        if !evidence.reasoning.is_empty() {
+                            payload["reasoning"] = evidence.reasoning.clone().into();
+                        }
+                    }
                     provider_response = Some(
-                        serde_json::to_string(&serde_json::json!({
-                            "failure": failure,
-                            "context_costs": costs,
-                        }))
-                        .map_err(|error| invalid(&error.to_string()))?,
+                        serde_json::to_string(&payload)
+                            .map_err(|error| invalid(&error.to_string()))?,
                     );
                 }
             }
@@ -5263,6 +5315,27 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                 call_from_row,
             )
             .map_err(sql)
+    }
+
+    pub(crate) fn call_with_dispatch_intent(
+        &self,
+        call_id: &str,
+    ) -> Result<(Call, Option<DispatchIntent>)> {
+        // Completion commits both rows atomically; separate autocommit reads
+        // could pair a running Call with its already-completed Intent.
+        let snapshot =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
+                .map_err(sql)?;
+        let call = snapshot
+            .query_row(
+                &format!("SELECT {CALL_COLUMNS} FROM domain_calls c LEFT JOIN domain_dispatch_intents i ON i.call_id=c.id WHERE c.id=?1"),
+                [call_id],
+                call_from_row,
+            )
+            .map_err(sql)?;
+        let intent = read_dispatch_intent_by_call(&snapshot, call_id)?;
+        snapshot.commit().map_err(sql)?;
+        Ok((call, intent))
     }
 
     pub fn calls_for_attempt(&self, attempt_id: &str) -> Result<Vec<Call>> {
@@ -7500,8 +7573,10 @@ fn update_chat_message_with_reasoning(
     if message.state == state {
         return Ok(());
     }
-    // An accepted user remains a fact even when its Attempt fails. A failed or
-    // discarded assistant placeholder keeps neither streaming text nor reasoning.
+    // An accepted user remains a fact even when its Attempt fails. A failed
+    // assistant Message keeps whatever displayable output the provider
+    // delivered before the failure, marked by its Failed lifecycle; a
+    // placeholder that received nothing stays empty.
     if role == "user"
         && state == MessageLifecycle::Failed
         && matches!(
@@ -7590,15 +7665,62 @@ fn settle_chat_turn(
         }
     } else {
         update_chat_message(transaction, turn, "user", MessageLifecycle::Failed, None)?;
-        update_chat_message(
-            transaction,
-            turn,
-            "assistant",
-            MessageLifecycle::Failed,
-            None,
-        )?;
+        match failed_provider_evidence(transaction, attempt_id)? {
+            Some((content, reasoning)) => update_chat_message_with_reasoning(
+                transaction,
+                turn,
+                "assistant",
+                MessageLifecycle::Failed,
+                Some(content.as_deref().unwrap_or("")),
+                reasoning.as_deref(),
+            )?,
+            None => update_chat_message(
+                transaction,
+                turn,
+                "assistant",
+                MessageLifecycle::Failed,
+                None,
+            )?,
+        }
     }
     Ok(())
+}
+
+/// The displayable output a failed provider Call recorded for this Attempt,
+/// when the provider delivered anything before failing. Cancelled executions
+/// fence their Calls to `unknown`, so only genuine failures carry evidence.
+fn failed_provider_evidence(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+) -> Result<Option<(Option<String>, Option<String>)>> {
+    let response: Option<String> = transaction
+        .query_row(
+            "SELECT response FROM domain_calls WHERE attempt_id=?1 AND state='failed' AND json_extract(request,'$.executor_transport')='provider' ORDER BY created_at DESC,id DESC LIMIT 1",
+            [attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some(response) = response else {
+        return Ok(None);
+    };
+    let Ok(response) = serde_json::from_str::<serde_json::Value>(&response) else {
+        return Ok(None);
+    };
+    let content = response
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .filter(|content| !content.is_empty())
+        .map(str::to_owned);
+    let reasoning = response
+        .get("reasoning")
+        .and_then(serde_json::Value::as_str)
+        .filter(|reasoning| !reasoning.is_empty())
+        .map(str::to_owned);
+    if content.is_none() && reasoning.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((content, reasoning)))
 }
 
 /// The Message key of the Chat turn owned by this Attempt's Job, when the

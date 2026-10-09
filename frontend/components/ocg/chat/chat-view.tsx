@@ -340,7 +340,9 @@ function BoundedMessage({ streaming, children }: { streaming: boolean; children:
 function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message: ChatMessage; toolMessages?: ChatMessage[]; onRetry?: () => void; retryDisabled?: boolean }) {
   const { t } = useI18n();
   const { isCopied, copyToClipboard } = useCopyToClipboard();
-  const [reasoningOpen, setReasoningOpen] = useState(false);
+  // Open by default: thinking must be observable as it streams without a
+  // click. The user's explicit toggle still wins for the mounted message.
+  const [reasoningOpen, setReasoningOpen] = useState(true);
   
   if (message.role === "tool") {
     return null; // Tool messages are now rendered within their parent assistant message
