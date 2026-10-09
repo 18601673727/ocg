@@ -1829,7 +1829,13 @@ impl CanonicalControlService {
             .read_configuration()
             .map(|(global, _, _)| global)
             .unwrap_or_default();
-        for project in self.projects()? {
+        // An unreadable Project registry skips this pass's reconciliation, but
+        // never the notification of settlements already committed below.
+        let projects = self.projects().unwrap_or_else(|error| {
+            failure.get_or_insert(error);
+            Vec::new()
+        });
+        for project in projects {
             // Watchdog reconciliation doubles as a bounded disk reassessment
             // point. Fencing itself never consults the Guard — reconciliation
             // is essential settlement — but replacement execution always flows
@@ -1898,7 +1904,20 @@ impl CanonicalControlService {
             };
         for (project_id, job_id, attempt_id, buffer) in live {
             let committed = (|| -> Result<Option<String>> {
-                let (_, domain) = self.project_repository(&project_id)?;
+                // A live tail's turn runs on this process's own runtime, so its
+                // store is reached through that runtime's root rather than the
+                // Project registry, which may be what failed this pass. Attempt
+                // identities are unique, so a store that does not hold this
+                // Attempt yields nothing.
+                let runtime = if let Some(registry) = &self.runtime_registry {
+                    registry.handle(&project_id)?
+                } else {
+                    self.runtime_handle.clone()
+                };
+                let Some(runtime) = runtime else {
+                    return Ok(None);
+                };
+                let domain = DomainRepository::open_existing(runtime.project_root())?;
                 let Some(attempt) = domain.attempt(&attempt_id)? else {
                     return Ok(None);
                 };
