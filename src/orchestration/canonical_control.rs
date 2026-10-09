@@ -2785,20 +2785,11 @@ impl CanonicalControlService {
                     message: format!("{error}; Job was not created"),
                     duplicate: false,
                 };
-                // Another process owns this Project: nothing is written to its
-                // store, not even the command ledger, so the same command sent
-                // to the owner is decided by the owner alone.
-                if crate::orchestration::execution_runtime::owned_elsewhere(&error) {
-                    return Ok(response);
-                }
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "failed",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
+                // Without execution ownership this process has no authority to
+                // record anything about the command, not even a failure in the
+                // command ledger: the outcome is decided by whichever process
+                // can own the Project, and a retry of the same command stays
+                // free to succeed.
                 return Ok(response);
             }
         };
@@ -3268,10 +3259,10 @@ impl CanonicalControlService {
             health_probe: Some(intent.clone()),
             ..JobSpec::default()
         };
-        // Execution ownership is settled before the probe Job exists. A Project
-        // another process owns is refused with nothing written: this process
-        // never had the right to run the tuple, so its refusal is not health
-        // evidence about it.
+        // Execution ownership is settled before the probe Job exists. Without
+        // it this process never had the right to run the tuple, so a failure
+        // to acquire it is refused with nothing written: it is not health
+        // evidence about the tuple.
         let runtime = if let Some(registry) = &self.runtime_registry {
             registry.get_or_start(&project.project_id, Path::new(&project.root), 1)
         } else {
@@ -3283,11 +3274,10 @@ impl CanonicalControlService {
                 .cloned()
                 .ok_or_else(|| invalid("execution runtime is not available for this Project"))
         };
-        if let Err(error) = &runtime {
-            if crate::orchestration::execution_runtime::owned_elsewhere(error) {
-                return Ok(rejected(error.to_string(), None));
-            }
-        }
+        let runtime_handle = match runtime {
+            Ok(handle) => handle,
+            Err(error) => return Ok(rejected(error.to_string(), None)),
+        };
         let job = domain.create_job(&project.project_id, spec.clone())?;
         // A rejected probe is recorded on the Job before any Attempt is
         // claimed. The refusal is the same admission decision every other
@@ -3362,19 +3352,6 @@ impl CanonicalControlService {
                     &response.message,
                 )?;
                 return Ok(response);
-            }
-        };
-        let runtime_handle = match runtime {
-            Ok(handle) => handle,
-            Err(error) => {
-                record(
-                    &mut domain,
-                    &super::health_probe::unsupported_target(
-                        "health_probe_no_runtime",
-                        error.to_string(),
-                    ),
-                )?;
-                return Ok(rejected(error.to_string(), Some(job.id.clone())));
             }
         };
         // The exact target is frozen. Reservation claims the Attempt without

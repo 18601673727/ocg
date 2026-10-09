@@ -17,16 +17,6 @@ use std::thread::JoinHandle;
 /// store under the canonical Project root.
 const EXECUTION_LOCK: &str = "execution.lock";
 
-/// The refusal [`ProjectOwnership::acquire`] reports while another live
-/// process owns the Project.
-const OWNED_ELSEWHERE: &str = "is owned by another OCG process for execution and recovery";
-
-/// Whether `error` is a refusal because another process owns the Project, as
-/// opposed to a failure to execute that this process could record.
-pub(crate) fn owned_elsewhere(error: &OcgError) -> bool {
-    error.to_string().contains(OWNED_ELSEWHERE)
-}
-
 /// Exclusive execution and recovery ownership of one Project, held by the OS.
 ///
 /// At most one process may admit, execute, cancel or recover work for a
@@ -62,7 +52,8 @@ impl ProjectOwnership {
         if let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
             if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
                 return Err(OcgError::config(format!(
-                    "Project {} {OWNED_ELSEWHERE}; stop that process or run this operation through it",
+                    "Project {} is owned by another OCG process for execution and recovery; \
+                     stop that process or run this operation through it",
                     root.display()
                 )));
             }
