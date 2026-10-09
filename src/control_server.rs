@@ -2099,47 +2099,42 @@ fn handle_chat_stream(
                 Live::Started => {}
                 Live::Provider(provider_event) => {
                     use crate::openai_compatible::stream::ChatStreamEvent as Stream;
-                    let (payload, terminal) = match provider_event {
+                    let payload = match provider_event {
                         Stream::Image { url } => {
                             match service.receive_chat_image_for_turn(&session_id, &job_id, &url) {
-                                Ok(image) => (Some(json!({"image": image}).to_string()), false),
-                                // An image that cannot be received locally
-                                // terminates the tail on its error, exactly as
-                                // it always has.
+                                Ok(image) => Some(json!({"image": image}).to_string()),
+                                // An image that cannot be received here is a
+                                // diagnostic, not the turn's verdict: the
+                                // completion settlement receives the final
+                                // images itself, and the `Failed`/`Finished`
+                                // it publishes alone closes the tail.
                                 Err(error) => {
-                                    (Some(json!({"error": error.to_string()}).to_string()), true)
+                                    Some(json!({"provider_error": error.to_string()}).to_string())
                                 }
                             }
                         }
-                        Stream::TextDelta { delta } => {
-                            (Some(json!({"delta": delta}).to_string()), false)
-                        }
+                        Stream::TextDelta { delta } => Some(json!({"delta": delta}).to_string()),
                         Stream::ReasoningDelta { delta } => {
-                            (Some(json!({"reasoning": delta}).to_string()), false)
+                            Some(json!({"reasoning": delta}).to_string())
                         }
                         // The round boundaries carry no provider content. They are
                         // ordered like every other buffered event, so a
                         // reconnecting EventSource replays a reset before the
                         // replacement deltas that follow it.
-                        Stream::RoundBegan => {
-                            (Some(json!({"round_begin": true}).to_string()), false)
-                        }
-                        Stream::RoundReset => {
-                            (Some(json!({"round_reset": true}).to_string()), false)
-                        }
+                        Stream::RoundBegan => Some(json!({"round_begin": true}).to_string()),
+                        Stream::RoundReset => Some(json!({"round_reset": true}).to_string()),
                         Stream::ToolCallStart { .. }
                         | Stream::ToolCallArgumentsDelta { .. }
                         | Stream::ToolCallComplete { .. }
                         | Stream::Metadata { .. }
-                        | Stream::Finish { .. } => (None, false),
+                        | Stream::Finish { .. } => None,
                         // A provider stream error is a diagnostic, not the
                         // turn's verdict: the authoritative `Failed` is
                         // published only after the failure settlement commits,
                         // and it alone closes the tail on an error.
-                        Stream::Error(error) => (
-                            Some(json!({"provider_error": error.to_string()}).to_string()),
-                            false,
-                        ),
+                        Stream::Error(error) => {
+                            Some(json!({"provider_error": error.to_string()}).to_string())
+                        }
                     };
                     if let Some(payload) = payload {
                         if stream
@@ -2152,10 +2147,6 @@ fn handle_chat_stream(
                         }
                         if stream.flush().is_err() {
                             disconnected = true;
-                            finished = true;
-                            break;
-                        }
-                        if terminal {
                             finished = true;
                             break;
                         }
