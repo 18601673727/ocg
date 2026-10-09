@@ -655,11 +655,14 @@ fn authorize_remote(
         | Route::CanonicalJobCancel { job }
         | Route::CanonicalJobRetry { job }
         | Route::CanonicalJobSpawn { job }
+        | Route::CanonicalJobAttach { job }
+        | Route::CanonicalJobClose { job }
             if operator =>
         {
             canonical.and_then(|service| service.project_for_job(job).ok())
         }
         Route::CanonicalJobLaunch
+        | Route::CanonicalOrchestrationCreate
         | Route::ChatSend
         | Route::ChatImageUpload
         | Route::ChatCancel
@@ -1712,6 +1715,19 @@ fn handle_canonical(
                         .map_err(|error| OcgError::config(error.to_string()))?;
                 answer!(service.spawn_job(job, request)?)
             }
+            Route::CanonicalOrchestrationCreate => {
+                let create: crate::contracts::CanonicalOrchestrationRequest =
+                    serde_json::from_value(body()?)
+                        .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.create_orchestration(&principal(request.identity.as_ref()), create)?)
+            }
+            Route::CanonicalJobAttach { job } => {
+                let attach: crate::contracts::CanonicalJobAttachRequest =
+                    serde_json::from_value(body()?)
+                        .map_err(|error| OcgError::config(error.to_string()))?;
+                answer!(service.attach_job(&principal(request.identity.as_ref()), job, attach)?)
+            }
+            Route::CanonicalJobClose { job } => answer!(service.close_job(job)?),
             Route::CanonicalJobCancel { job } | Route::CanonicalJobRetry { job } => {
                 let request: crate::contracts::CanonicalJobOperationRequest =
                     serde_json::from_value(body()?)
@@ -2511,6 +2527,15 @@ enum Route {
     CanonicalJobSpawn {
         job: String,
     },
+    /// Job management: create an orchestration root, attach child work to an
+    /// open one, and close it to further attachment.
+    CanonicalOrchestrationCreate,
+    CanonicalJobAttach {
+        job: String,
+    },
+    CanonicalJobClose {
+        job: String,
+    },
     CanonicalSnapshot,
     CanonicalEvents,
     CanonicalDashboard,
@@ -2598,6 +2623,15 @@ fn classify(request: &Request) -> std::result::Result<Route, ApiError> {
         }
         ("POST", ["api", "v1", "canonical", "jobs", job, "spawn"]) => {
             Ok(Route::CanonicalJobSpawn { job: safe_id(job)? })
+        }
+        ("POST", ["api", "v1", "canonical", "orchestrations"]) => {
+            Ok(Route::CanonicalOrchestrationCreate)
+        }
+        ("POST", ["api", "v1", "canonical", "jobs", job, "attach"]) => {
+            Ok(Route::CanonicalJobAttach { job: safe_id(job)? })
+        }
+        ("POST", ["api", "v1", "canonical", "jobs", job, "close"]) => {
+            Ok(Route::CanonicalJobClose { job: safe_id(job)? })
         }
         ("POST", ["api", "v1", "canonical", "jobs", job, "cancel"]) => {
             Ok(Route::CanonicalJobCancel { job: safe_id(job)? })
@@ -2713,13 +2747,29 @@ fn allowed_methods(segments: &[&str]) -> Option<&'static str> {
         ["api", "v1", "canonical", "projects", "import"] => Some("POST"),
         ["api", "v1", "canonical", "chat", "images", _, _] => Some("GET"),
         ["api", "v1", "canonical", "chat", "images"] => Some("POST"),
-        ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn"] => Some("POST"),
+        ["api", "v1", "canonical", "jobs", _, "cancel" | "retry" | "spawn" | "attach" | "close"]
+        | ["api", "v1", "canonical", "orchestrations"] => Some("POST"),
         ["api", "v1", "canonical", "jobs", "health-probe"] => Some("GET, POST"),
         ["api", "v1", "canonical", "jobs", "launch"]
         | ["api", "v1", "canonical", "chat", "send"]
         | ["api", "v1", "canonical", "chat", "cancel"] => Some("POST"),
         ["api", "v1", "canonical", "projects", _] => Some("GET"),
         _ => None,
+    }
+}
+
+/// The principal a Job-management command acts for. A request without an
+/// authenticated identity reached the loopback surface as the local operator;
+/// an authenticated one was already authorized for the target Project.
+fn principal(
+    identity: Option<&crate::control_security::Identity>,
+) -> crate::orchestration::domain::JobPrincipal {
+    match identity {
+        Some(identity) => crate::orchestration::domain::JobPrincipal {
+            kind: crate::orchestration::domain::PrincipalKind::User,
+            id: identity.user_id.clone(),
+        },
+        None => crate::orchestration::domain::JobPrincipal::operator(),
     }
 }
 

@@ -13,6 +13,7 @@ pub enum SpawnRefusalReason {
     DescendantLimit,
     DependencyCycle,
     StorageProtection,
+    ParentClosed,
 }
 
 impl SpawnRefusalReason {
@@ -26,6 +27,7 @@ impl SpawnRefusalReason {
             Self::DescendantLimit => "spawn_descendant_limit_reached",
             Self::DependencyCycle => "spawn_dependency_cycle",
             Self::StorageProtection => "spawn_storage_protection",
+            Self::ParentClosed => "attach_parent_closed",
         }
     }
 }

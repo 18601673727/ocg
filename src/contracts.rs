@@ -26,12 +26,13 @@ pub use crate::core_contract::{
     MeasurementQuality, Message, MessageBlock, MessageBlockKind, MessageLifecycle, ProjectScope,
 };
 pub use crate::orchestration::canonical_control::{
-    CanonicalConfigurationResponse, CanonicalDashboardResponse, CanonicalJobConfigResponse,
-    CanonicalJobEvent, CanonicalJobOperationRequest, CanonicalJobOperationResponse,
-    CanonicalJobOperations, CanonicalJobRelations, CanonicalJobSnapshot, CanonicalJobSpawnRequest,
-    CanonicalJobSpawnResponse, CanonicalJobSummary, CanonicalProjectResponse, GlobalConfiguration,
-    ProjectConfiguration, ProjectConfigurationView, ProjectRecord, ResourceBudget,
-    CANONICAL_CONTROL_API_VERSION,
+    CanonicalConfigurationResponse, CanonicalDashboardResponse, CanonicalJobAttachRequest,
+    CanonicalJobConfigResponse, CanonicalJobEvent, CanonicalJobManagementResponse,
+    CanonicalJobOperationRequest, CanonicalJobOperationResponse, CanonicalJobOperations,
+    CanonicalJobRelations, CanonicalJobSnapshot, CanonicalJobSpawnRequest,
+    CanonicalJobSpawnResponse, CanonicalJobSummary, CanonicalOrchestrationRequest,
+    CanonicalProjectResponse, GlobalConfiguration, ProjectConfiguration, ProjectConfigurationView,
+    ProjectRecord, ResourceBudget, CANONICAL_CONTROL_API_VERSION,
 };
 /// The authority record. It travels inside a canonical event payload, so the
 /// PWA reads it out of an opaque JSON value and must not be able to drift from
@@ -680,6 +681,9 @@ fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
     CanonicalJobOperations::export_all(cfg)?;
     CanonicalJobSpawnRequest::export_all(cfg)?;
     CanonicalJobSpawnResponse::export_all(cfg)?;
+    CanonicalOrchestrationRequest::export_all(cfg)?;
+    CanonicalJobAttachRequest::export_all(cfg)?;
+    CanonicalJobManagementResponse::export_all(cfg)?;
     CanonicalJobOperationRequest::export_all(cfg)?;
     CanonicalJobOperationResponse::export_all(cfg)?;
     CanonicalJobEvent::export_all(cfg)?;

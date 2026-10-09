@@ -71,6 +71,12 @@ export type CanonicalEventsEnvelope = { api_version: CanonicalApiVersion, projec
 
 
 /**
+ * Attach child work to an open orchestration Job through Job management.
+ */
+export type CanonicalJobAttachRequest = { command_id: string, spec: JobSpec, depends_on: Array<string>, policy: ChildPolicy, };
+
+
+/**
  * `GET /api/v1/canonical/jobs/{job}/configuration`
  */
 export type CanonicalJobConfigEnvelope = { api_version: CanonicalApiVersion, job_id: string,
@@ -94,6 +100,14 @@ export type CanonicalJobEvent = { api_version: CanonicalApiVersion, project_id: 
 sequence: number, event_id: string, kind: string, payload: JsonValue, };
 
 
+export type CanonicalJobManagementResponse = { api_version: CanonicalApiVersion, job_id: string,
+/**
+ * True when the command identity was already recorded and this response
+ * names the Job it created.
+ */
+duplicate: boolean, snapshot: CanonicalJobSnapshot, };
+
+
 export type CanonicalJobOperationRequest = { expected_generation: number, };
 
 
@@ -103,7 +117,21 @@ export type CanonicalJobOperationResponse = { api_version: CanonicalApiVersion, 
 export type CanonicalJobOperations = { can_cancel: boolean, can_retry: boolean, };
 
 
-export type CanonicalJobRelations = { parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, };
+export type CanonicalJobRelations = { parent_job_id: string | null,
+/**
+ * Set when an Executor spawned this Job under its parent Attempt.
+ */
+origin: JobOrigin | null,
+/**
+ * Set when an authorized principal attached this Job to an open
+ * orchestration Job. A child has exactly one of `origin` and
+ * `attachment`.
+ */
+attachment?: JobAttachment | null,
+/**
+ * Set when this Job is an orchestration scope.
+ */
+scope?: JobScope | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, };
 
 
 export type CanonicalJobSnapshot = { api_version: CanonicalApiVersion, project_id: string, job: JsonValue, cursor: number, };
@@ -121,7 +149,27 @@ export type CanonicalJobSummary = { job_id: string, created_at: number, state: s
  * Job, so the declared Provider × Model × Effort target rides with it
  * rather than requiring a second read of every probe.
  */
-health_probe?: HealthProbeIntent | null, parent_job_id: string | null, origin: JobOrigin | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, can_cancel: boolean, can_retry: boolean, };
+health_probe?: HealthProbeIntent | null, parent_job_id: string | null,
+/**
+ * Set when an Executor spawned this Job under its parent Attempt.
+ */
+origin: JobOrigin | null,
+/**
+ * Set when an authorized principal attached this Job to an open
+ * orchestration Job. A child has exactly one of `origin` and
+ * `attachment`.
+ */
+attachment?: JobAttachment | null,
+/**
+ * Set when this Job is an orchestration scope.
+ */
+scope?: JobScope | null, child_job_ids: Array<string>, depends_on: Array<string>, blocks: Array<string>, blocked_by: Array<string>, blocked: boolean, root_job_id: string, depth: number, descendant_job_ids: Array<string>, descendant_summary: { [key in string]: number }, can_cancel: boolean, can_retry: boolean, };
+
+
+/**
+ * Create an orchestration root Job in a Project.
+ */
+export type CanonicalOrchestrationRequest = { command_id: string, project_id: string, spec: JobSpec, };
 
 
 export type CanonicalProjectResponse = { api_version: CanonicalApiVersion, command_id: string, accepted: boolean, project: ProjectRecord, };
@@ -355,6 +403,12 @@ export type HealthProbeTarget = { provider: string, model: string, effort: strin
 
 
 /**
+ * The provenance of a child attached through Job management.
+ */
+export type JobAttachment = { parent_job_id: string, principal: JobPrincipal, command_id: string, policy: ChildPolicy, created_at: number, };
+
+
+/**
  * `POST /api/v1/canonical/jobs/launch`
  */
 export type JobLaunchRequest = { command_id: string, draft_id: string, project_id: string, session_id: string, objective: string, success_criteria: string | null, constraints: string | null, hard_budget_micros: number, resource_commitment: number | null, };
@@ -368,6 +422,25 @@ outcome: string, command_id: string, draft_id: string, project_id: string, sessi
 
 
 export type JobOrigin = { parent_job_id: string, attempt_id: string, generation: number, spawn_key: string | null, spawn_fingerprint: string | null, call_id: string | null, policy: ChildPolicy | null, };
+
+
+/**
+ * The principal the control plane authenticated and authorized for the
+ * target Project. The domain records it; it never confers execution
+ * authority.
+ */
+export type JobPrincipal = { kind: PrincipalKind, id: string, };
+
+
+/**
+ * Whether a Job is an orchestration scope.
+ *
+ * An open scope accepts attached child work and never completes; closing it
+ * is the explicit statement that no further work will be attached, after
+ * which its required children decide its completion. An orchestration scope
+ * is not an execution: it holds no Attempt and no Executor.
+ */
+export type JobScope = "none" | "open" | "closed";
 
 
 export type JobSpec = { provider: string | null, model: string | null, objective: string | null, success_criteria: string | null, constraints: string | null, hard_budget_micros: number | null, resource_commitment: number | null, recursive_limits: RecursiveLimits,
@@ -409,6 +482,12 @@ export type ModelMetadata = { variant: string | null, variants: Array<string> | 
 
 
 export type Origin = "new";
+
+
+/**
+ * Who an authorized Job-management operation acts for.
+ */
+export type PrincipalKind = "operator" | "user" | "job";
 
 
 export type Profile = { origin: Origin, defaultModel?: string | null, providers: { [key in string]: Provider }, models: { [key in string]: Model }, };

@@ -869,6 +869,78 @@ fn work_command(
                 print(json!({"attempt_id": attempt_id, "outcome": outcome, "applied": true}))
             }
         }
+        // Job management claims no execution authority, so it does not take
+        // the Project's execution ownership; SQLite serializes its writes.
+        "orchestrate" | "attach" => {
+            let guard = cli_disk_guard(root, user_path)?;
+            let deferral = if subcommand == "attach" {
+                guard.check_amplifying_expansion().deferral()
+            } else {
+                guard.check_execution_admission().deferral()
+            };
+            if let Some(deferral) = deferral {
+                return Err(Failure::Ocg(OcgError::config(deferral.message())));
+            }
+            let command_id = required("command")?;
+            let spec = crate::orchestration::domain::JobSpec {
+                objective: Some(required("objective")?),
+                ..Default::default()
+            };
+            let mut policy = serde_json::Map::new();
+            for dimension in ["join", "cancellation", "failure"] {
+                if let Some(value) = option(dimension) {
+                    policy.insert(dimension.to_string(), json!(value));
+                }
+            }
+            let policy = serde_json::from_value::<crate::orchestration::domain::ChildPolicy>(
+                Value::Object(policy),
+            )
+            .map_err(|error| OcgError::config(error.to_string()))?;
+            let dependencies = option("depends-on")
+                .map(|raw| {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let parent = option("job");
+            let request_hash = {
+                use sha2::{Digest, Sha256};
+                let content = json!({"command": subcommand, "parent": parent, "spec": spec, "policy": policy, "depends_on": dependencies});
+                format!("{:x}", Sha256::digest(content.to_string().as_bytes()))
+            };
+            // The local CLI acts as this machine's operator.
+            let principal = crate::orchestration::domain::JobPrincipal::operator();
+            let (job, duplicate) = if subcommand == "attach" {
+                let prerequisites = dependencies.iter().map(String::as_str).collect::<Vec<_>>();
+                repository.attach_child(crate::orchestration::domain::AttachChildRequest {
+                    parent_job_id: &required("job")?,
+                    principal: &principal,
+                    command_id: &command_id,
+                    request_hash: &request_hash,
+                    spec,
+                    prerequisite_job_ids: &prerequisites,
+                    policy: &policy,
+                })?
+            } else {
+                repository.create_orchestration_job(
+                    &project.id,
+                    spec,
+                    &principal,
+                    &command_id,
+                    &request_hash,
+                )?
+            };
+            print(
+                json!({"project_id": job.project_id, "job_id": job.id, "duplicate": duplicate, "job": job}),
+            )
+        }
+        "close" => {
+            let job = repository.close_orchestration_job(&required("job")?)?;
+            print(json!({"job_id": job.id, "job": job}))
+        }
         "inspect" => print(repository.inspect_job(&required("job")?)?),
         "ready" => {
             print(json!({"project_id": project.id, "ready": repository.ready_jobs(&project.id)?}))

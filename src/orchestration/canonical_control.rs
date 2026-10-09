@@ -13,7 +13,7 @@ use crate::orchestration::admission::{
 use crate::orchestration::disk_guard::{DiskGuard, DiskGuardConfig, DiskGuardStatus};
 use crate::orchestration::domain::{
     Attempt, AttemptAuthority, Call, ChildPolicy, DispatchIntent, DomainRepository, Executor, Job,
-    JobOrigin, JobSpec,
+    JobAttachment, JobOrigin, JobPrincipal, JobScope, JobSpec,
 };
 use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEvent};
 use crate::orchestration::health_probe::HealthProbeObservation;
@@ -159,6 +159,14 @@ fn initial_user_message(request: &crate::contracts::JobLaunchRequest) -> String 
     message
 }
 
+/// The content digest a Job-management command is recorded with, so a replay
+/// of the same command identity with different content is a conflict.
+fn command_hash(request: &impl Serialize) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(request).map_err(|error| invalid(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 fn safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -288,11 +296,39 @@ pub struct CanonicalJobSnapshot {
     pub cursor: u64,
 }
 
+/// The parentage facts a relations view is built from: every child's parent,
+/// and the provenance of the authority that created it.
+#[derive(Debug, Default)]
+struct ChildOrigins {
+    parents: BTreeMap<String, String>,
+    spawns: BTreeMap<String, JobOrigin>,
+    attachments: BTreeMap<String, JobAttachment>,
+}
+
+impl ChildOrigins {
+    fn take(snapshot: &mut super::journal::ExecutionSnapshot) -> Self {
+        Self {
+            parents: std::mem::take(&mut snapshot.job_origins),
+            spawns: std::mem::take(&mut snapshot.job_origin_details),
+            attachments: std::mem::take(&mut snapshot.job_attachments),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct CanonicalJobRelations {
     pub parent_job_id: Option<String>,
+    /// Set when an Executor spawned this Job under its parent Attempt.
     #[serde(default)]
     pub origin: Option<JobOrigin>,
+    /// Set when an authorized principal attached this Job to an open
+    /// orchestration Job. A child has exactly one of `origin` and
+    /// `attachment`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<JobAttachment>,
+    /// Set when this Job is an orchestration scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<JobScope>,
     pub child_job_ids: Vec<String>,
     pub depends_on: Vec<String>,
     pub blocks: Vec<String>,
@@ -308,9 +344,13 @@ impl CanonicalJobRelations {
     fn from_projection(
         job: &Job,
         projection: &ExecutionProjection,
-        origins: &BTreeMap<String, String>,
-        origin_details: &BTreeMap<String, JobOrigin>,
+        origins: &ChildOrigins,
     ) -> Self {
+        let ChildOrigins {
+            parents: origins,
+            spawns: origin_details,
+            attachments,
+        } = origins;
         let depends_on: Vec<String> = projection
             .dependencies
             .iter()
@@ -355,6 +395,8 @@ impl CanonicalJobRelations {
         Self {
             parent_job_id: origins.get(&job.id).cloned(),
             origin: origin_details.get(&job.id).cloned(),
+            attachment: attachments.get(&job.id).cloned(),
+            scope: (job.scope != JobScope::None).then_some(job.scope),
             child_job_ids: origins
                 .iter()
                 .filter(|(_, parent)| *parent == &job.id)
@@ -443,6 +485,36 @@ pub struct CanonicalJobSpawnResponse {
     #[ts(type = "CanonicalApiVersion")]
     pub api_version: String,
     pub child_job_id: String,
+    pub duplicate: bool,
+    pub snapshot: CanonicalJobSnapshot,
+}
+
+/// Create an orchestration root Job in a Project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct CanonicalOrchestrationRequest {
+    pub command_id: String,
+    pub project_id: String,
+    pub spec: JobSpec,
+}
+
+/// Attach child work to an open orchestration Job through Job management.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+pub struct CanonicalJobAttachRequest {
+    pub command_id: String,
+    pub spec: JobSpec,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub policy: ChildPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct CanonicalJobManagementResponse {
+    #[ts(type = "CanonicalApiVersion")]
+    pub api_version: String,
+    pub job_id: String,
+    /// True when the command identity was already recorded and this response
+    /// names the Job it created.
     pub duplicate: bool,
     pub snapshot: CanonicalJobSnapshot,
 }
@@ -1529,25 +1601,16 @@ impl CanonicalControlService {
     ) -> Result<CanonicalJobSnapshot> {
         let (_, repository) = self.project_repository(project_id)?;
         let mut snapshot = repository.execution_snapshot()?;
-        let origins = std::mem::take(&mut snapshot.job_origins);
-        let origin_details = std::mem::take(&mut snapshot.job_origin_details);
+        let origins = ChildOrigins::take(&mut snapshot);
         let projection = ExecutionProjection::from(snapshot);
-        Self::snapshot_from_projection(
-            project_id,
-            job_id,
-            &projection,
-            &origins,
-            &origin_details,
-            &repository,
-        )
+        Self::snapshot_from_projection(project_id, job_id, &projection, &origins, &repository)
     }
 
     fn snapshot_from_projection(
         project_id: &str,
         job_id: &str,
         projection: &ExecutionProjection,
-        origins: &BTreeMap<String, String>,
-        origin_details: &BTreeMap<String, JobOrigin>,
+        origins: &ChildOrigins,
         repository: &DomainRepository,
     ) -> Result<CanonicalJobSnapshot> {
         let job = projection
@@ -1588,8 +1651,7 @@ impl CanonicalControlService {
             .filter(|intent| intent.job_id == job.id)
             .cloned()
             .collect();
-        let relations =
-            CanonicalJobRelations::from_projection(job, projection, origins, origin_details);
+        let relations = CanonicalJobRelations::from_projection(job, projection, origins);
         let operations = CanonicalJobOperations::for_job(job, relations.blocked);
         let value = json!({
             "job":CanonicalJobView {
@@ -1679,20 +1741,14 @@ impl CanonicalControlService {
     ) -> Result<CanonicalDashboardResponse> {
         let (project, repository) = self.project_repository(project_id)?;
         let mut snapshot = repository.execution_snapshot()?;
-        let origins = std::mem::take(&mut snapshot.job_origins);
-        let origin_details = std::mem::take(&mut snapshot.job_origin_details);
+        let origins = ChildOrigins::take(&mut snapshot);
         let projection = ExecutionProjection::from(snapshot);
         let mut jobs: Vec<CanonicalJobSummary> = projection
             .jobs
             .values()
             .filter(|job| job.project_id == project_id)
             .map(|job| {
-                let relations = CanonicalJobRelations::from_projection(
-                    job,
-                    &projection,
-                    &origins,
-                    &origin_details,
-                );
+                let relations = CanonicalJobRelations::from_projection(job, &projection, &origins);
                 CanonicalJobSummary {
                     job_id: job.id.clone(),
                     created_at: job.created_at,
@@ -1710,14 +1766,7 @@ impl CanonicalControlService {
         });
         let selected_job = job_id
             .map(|id| {
-                Self::snapshot_from_projection(
-                    project_id,
-                    id,
-                    &projection,
-                    &origins,
-                    &origin_details,
-                    &repository,
-                )
+                Self::snapshot_from_projection(project_id, id, &projection, &origins, &repository)
             })
             .transpose()?;
         Ok(CanonicalDashboardResponse {
@@ -2223,6 +2272,107 @@ impl CanonicalControlService {
             snapshot: self.canonical_snapshot(&child.project_id, &child.id)?,
             child_job_id: child.id,
             duplicate,
+        })
+    }
+
+    /// Create an orchestration root Job on behalf of an authorized principal.
+    pub fn create_orchestration(
+        &self,
+        principal: &JobPrincipal,
+        request: CanonicalOrchestrationRequest,
+    ) -> Result<CanonicalJobManagementResponse> {
+        if !safe_id(&request.command_id) || !safe_id(&request.project_id) {
+            return Err(invalid("invalid command_id or project_id"));
+        }
+        let (project, mut domain) = self.project_repository(&request.project_id)?;
+        let (global, _, _) = self.read_configuration()?;
+        let guard =
+            self.disk_guard_for_project(&project.project_id, Path::new(&project.root), &global)?;
+        if let Some(deferral) = guard.check_execution_admission().deferral() {
+            return Err(invalid(deferral.message()));
+        }
+        let canonical_project = domain
+            .project_at_root(Path::new(&project.root))?
+            .ok_or_else(|| invalid("registered Project identity is not durable at this root"))?;
+        let request_hash = command_hash(&("orchestration", &request))?;
+        let (job, duplicate) = domain.create_orchestration_job(
+            &canonical_project.id,
+            request.spec,
+            principal,
+            &request.command_id,
+            &request_hash,
+        )?;
+        Ok(CanonicalJobManagementResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            snapshot: self.canonical_snapshot(&job.project_id, &job.id)?,
+            job_id: job.id,
+            duplicate,
+        })
+    }
+
+    /// Attach child work to an open orchestration Job on behalf of an
+    /// authorized principal. No parent Attempt is involved.
+    pub fn attach_job(
+        &self,
+        principal: &JobPrincipal,
+        parent_job_id: &str,
+        request: CanonicalJobAttachRequest,
+    ) -> Result<CanonicalJobManagementResponse> {
+        if !safe_id(&request.command_id) {
+            return Err(invalid("invalid command_id"));
+        }
+        let mut domain = self.repository_for_job(parent_job_id)?;
+        let parent = domain
+            .job(parent_job_id)?
+            .ok_or_else(|| invalid("unknown parent Job"))?;
+        // Attachment fans durable work out exactly as a spawn does, so the
+        // same storage gate refuses it before anything is written.
+        {
+            let (project, _) = self.project_repository(&parent.project_id)?;
+            let (global, _, _) = self.read_configuration()?;
+            let guard =
+                self.disk_guard_for_project(&parent.project_id, Path::new(&project.root), &global)?;
+            if let Some(deferral) = guard.check_amplifying_expansion().deferral() {
+                return Err(OcgError::spawn_refused(
+                    crate::error::SpawnRefusalReason::StorageProtection,
+                    deferral.message(),
+                ));
+            }
+        }
+        let request_hash = command_hash(&("attach", parent_job_id, &request))?;
+        let prerequisites = request
+            .depends_on
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let (child, duplicate) =
+            domain.attach_child(crate::orchestration::domain::AttachChildRequest {
+                parent_job_id,
+                principal,
+                command_id: &request.command_id,
+                request_hash: &request_hash,
+                spec: request.spec,
+                prerequisite_job_ids: &prerequisites,
+                policy: &request.policy,
+            })?;
+        Ok(CanonicalJobManagementResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            snapshot: self.canonical_snapshot(&child.project_id, &child.id)?,
+            job_id: child.id,
+            duplicate,
+        })
+    }
+
+    /// Close an orchestration Job to further attachment. Its completion then
+    /// follows its required children.
+    pub fn close_job(&self, job_id: &str) -> Result<CanonicalJobOperationResponse> {
+        let mut domain = self.repository_for_job(job_id)?;
+        let job = domain.close_orchestration_job(job_id)?;
+        Ok(CanonicalJobOperationResponse {
+            api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+            accepted: true,
+            snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
+            job_id: job.id,
         })
     }
 

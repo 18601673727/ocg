@@ -1265,6 +1265,8 @@ pub struct ExecutionSnapshot {
     pub job_origins: BTreeMap<String, String>,
     #[serde(default)]
     pub job_origin_details: BTreeMap<String, super::domain::JobOrigin>,
+    #[serde(default)]
+    pub job_attachments: BTreeMap<String, super::domain::JobAttachment>,
     pub bindings: Vec<JobBinding>,
     pub job_configurations: Vec<StoredJobConfiguration>,
     pub result_evidence: Vec<ResultEvidence>,

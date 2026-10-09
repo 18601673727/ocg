@@ -355,6 +355,93 @@ pub struct JobOrigin {
     pub policy: Option<ChildPolicy>,
 }
 
+/// Whether a Job is an orchestration scope.
+///
+/// An open scope accepts attached child work and never completes; closing it
+/// is the explicit statement that no further work will be attached, after
+/// which its required children decide its completion. An orchestration scope
+/// is not an execution: it holds no Attempt and no Executor.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    ts_rs::TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum JobScope {
+    #[default]
+    None,
+    Open,
+    Closed,
+}
+
+/// Who an authorized Job-management operation acts for.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display, EnumString, ts_rs::TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PrincipalKind {
+    /// The local operator of this OCG process.
+    Operator,
+    /// An authenticated user who owns the Project.
+    User,
+    /// A Job acting through Job management rather than through an Executor.
+    Job,
+}
+
+/// The principal the control plane authenticated and authorized for the
+/// target Project. The domain records it; it never confers execution
+/// authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+pub struct JobPrincipal {
+    pub kind: PrincipalKind,
+    pub id: String,
+}
+
+impl JobPrincipal {
+    pub fn operator() -> Self {
+        Self {
+            kind: PrincipalKind::Operator,
+            id: "local".to_string(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_id(&self.id)
+    }
+}
+
+/// The provenance of a child attached through Job management.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+pub struct JobAttachment {
+    pub parent_job_id: JobId,
+    pub principal: JobPrincipal,
+    pub command_id: String,
+    pub policy: ChildPolicy,
+    pub created_at: i64,
+}
+
+pub struct AttachChildRequest<'a> {
+    pub parent_job_id: &'a str,
+    pub principal: &'a JobPrincipal,
+    pub command_id: &'a str,
+    /// The digest of the command's content, so a replay of the same command
+    /// with different content is a conflict rather than a duplicate.
+    pub request_hash: &'a str,
+    pub spec: JobSpec,
+    pub prerequisite_job_ids: &'a [&'a str],
+    pub policy: &'a ChildPolicy,
+}
+
 struct ChildSpawnMetadata<'a> {
     key: &'a str,
     fingerprint: String,
@@ -384,6 +471,8 @@ pub struct Job {
     pub depth: u64,
     #[serde(default)]
     pub waiting_for_children: bool,
+    #[serde(default)]
+    pub scope: JobScope,
     #[serde(rename = "payload", with = "job_spec_payload")]
     pub spec: JobSpec,
     pub created_at: i64,
@@ -715,7 +804,7 @@ pub struct CanonicalAdmission {
 /// `user_version`. Ordinary opens read it and skip initialization entirely
 /// when it is current. Fresh initialization is the only supported path: a
 /// store written by any other generation is refused rather than migrated.
-const DOMAIN_SCHEMA_VERSION: i64 = 4;
+const DOMAIN_SCHEMA_VERSION: i64 = 5;
 
 const DOMAIN_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS domain_projects (
@@ -732,6 +821,11 @@ CREATE TABLE IF NOT EXISTS domain_jobs (
     root_job_id TEXT NOT NULL,
     depth INTEGER NOT NULL DEFAULT 0 CHECK(depth >= 0),
     waiting_for_children INTEGER NOT NULL DEFAULT 0 CHECK(waiting_for_children IN (0,1)),
+    -- Whether this Job is an orchestration scope that authorized principals
+    -- may attach child work to ('open'), one closed to further attachment
+    -- ('closed'), or an ordinary Job ('none'). An orchestration scope never
+    -- executes itself: it waits for its children.
+    scope TEXT NOT NULL DEFAULT 'none' CHECK(scope IN ('none','open','closed')),
     termination_reason TEXT,
     automatic_admission INTEGER NOT NULL DEFAULT 0 CHECK(automatic_admission IN (0,1)),
     admission_selection TEXT,
@@ -740,7 +834,9 @@ CREATE TABLE IF NOT EXISTS domain_jobs (
     payload TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    FOREIGN KEY(authoritative_attempt_id) REFERENCES domain_attempts(id) DEFERRABLE INITIALLY DEFERRED
+    FOREIGN KEY(authoritative_attempt_id) REFERENCES domain_attempts(id) DEFERRABLE INITIALLY DEFERRED,
+    CHECK(scope='none' OR (authoritative_attempt_id IS NULL AND generation=0
+        AND (waiting_for_children=1 OR state IN ('completed','failed','cancelled','unknown','orphaned'))))
 ) STRICT;
 CREATE TABLE IF NOT EXISTS domain_job_bindings (
     binding_key TEXT PRIMARY KEY,
@@ -793,18 +889,35 @@ CREATE TABLE IF NOT EXISTS domain_job_dependencies (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS domain_dependencies_by_prerequisite
     ON domain_job_dependencies(prerequisite_job_id,project_id,job_id);
+-- The one parent of a child Job and the authority that created it. A spawn
+-- is created by an Executor acting under its live parent Attempt; an
+-- attachment is created by an authorized principal through Job management,
+-- with no Attempt behind it. Each authority records only its own provenance.
 CREATE TABLE IF NOT EXISTS domain_job_origins (
     job_id TEXT PRIMARY KEY REFERENCES domain_jobs(id),
     parent_job_id TEXT NOT NULL REFERENCES domain_jobs(id),
-    attempt_id TEXT NOT NULL REFERENCES domain_attempts(id),
-    generation INTEGER NOT NULL,
+    authority TEXT NOT NULL CHECK(authority IN ('spawn','attach')),
+    attempt_id TEXT REFERENCES domain_attempts(id),
+    generation INTEGER CHECK(generation IS NULL OR generation > 0),
     call_id TEXT,
     spawn_key TEXT,
     spawn_fingerprint TEXT,
-    policy TEXT
+    principal_kind TEXT CHECK(principal_kind IS NULL OR principal_kind IN ('operator','user','job')),
+    principal_id TEXT,
+    command_id TEXT,
+    policy TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    CHECK(job_id != parent_job_id),
+    CHECK(authority != 'spawn' OR (attempt_id IS NOT NULL AND generation IS NOT NULL
+        AND principal_kind IS NULL AND principal_id IS NULL AND command_id IS NULL)),
+    CHECK(authority != 'attach' OR (attempt_id IS NULL AND generation IS NULL AND call_id IS NULL
+        AND spawn_key IS NULL AND spawn_fingerprint IS NULL
+        AND principal_kind IS NOT NULL AND principal_id IS NOT NULL AND command_id IS NOT NULL))
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS domain_job_spawn_keys
     ON domain_job_origins(parent_job_id,spawn_key) WHERE spawn_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS domain_job_children
+    ON domain_job_origins(parent_job_id,job_id);
 CREATE TABLE IF NOT EXISTS domain_dispatch_intents (
     id TEXT PRIMARY KEY,
     call_id TEXT NOT NULL UNIQUE REFERENCES domain_calls(id),
@@ -1997,6 +2110,7 @@ impl DomainRepository {
             dependencies: all_dependencies(view)?,
             job_origins: all_job_origins(view)?,
             job_origin_details: all_job_origin_details(view)?,
+            job_attachments: all_job_attachments(view)?,
             bindings: all_bindings(view)?,
             job_configurations: all_job_configurations(view)?,
             result_evidence: all_result_evidence(view)?,
@@ -3326,6 +3440,7 @@ impl DomainRepository {
             root_job_id: id.clone(),
             depth: 0,
             waiting_for_children: false,
+            scope: JobScope::None,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
@@ -3412,7 +3527,7 @@ impl DomainRepository {
     fn create_spawned_job(
         &mut self,
         parent_authority: &AttemptAuthority,
-        mut spec: JobSpec,
+        spec: JobSpec,
         prerequisite_job_ids: &[&str],
         spawn: Option<&ChildSpawnMetadata<'_>>,
     ) -> Result<(Job, bool)> {
@@ -3424,21 +3539,20 @@ impl DomainRepository {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
-        let (project_id, root_job_id, parent_depth, root_payload): (String, String, i64, String) =
-            transaction
+        let parent: Option<String> = transaction
                 .query_row(
-                    "SELECT j.project_id,COALESCE(j.root_job_id,j.id),j.depth,r.payload FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id JOIN domain_jobs r ON r.id=COALESCE(j.root_job_id,j.id) WHERE a.id=?1 AND a.job_id=?2 AND a.generation=?3 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.state IN ('queued','running')",
+                    "SELECT j.id FROM domain_attempts a JOIN domain_jobs j ON j.id=a.job_id WHERE a.id=?1 AND a.job_id=?2 AND a.generation=?3 AND a.authoritative=1 AND j.authoritative_attempt_id=a.id AND a.state IN ('queued','running')",
                     params![parent_authority.attempt_id, parent_authority.job_id, parent_generation],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| row.get(0),
                 )
                 .optional()
-                .map_err(sql)?
-                .ok_or_else(|| {
-                    spawn_refused(
-                        SpawnRefusalReason::ParentAuthorityStale,
-                        "parent Attempt is no longer authoritative",
-                    )
-                })?;
+                .map_err(sql)?;
+        if parent.is_none() {
+            return Err(spawn_refused(
+                SpawnRefusalReason::ParentAuthorityStale,
+                "parent Attempt is no longer authoritative",
+            ));
+        }
         if let Some(spawn) = spawn {
             let existing: Option<(String, Option<String>)> = transaction
                 .query_row(
@@ -3460,8 +3574,6 @@ impl DomainRepository {
                 transaction.commit().map_err(sql)?;
                 return Ok((job, true));
             }
-        }
-        if let Some(spawn) = spawn {
             if let Some(call_id) = spawn.call_id {
                 let valid_call: bool = transaction
                     .query_row(
@@ -3478,118 +3590,17 @@ impl DomainRepository {
                 }
             }
         }
-        let limits = JobSpec::from_payload(&root_payload)?
-            .recursive_limits
-            .validate()?;
-        let child_depth = u64::try_from(parent_depth)
-            .map_err(|_| invalid("invalid parent Job depth"))?
-            .checked_add(1)
-            .ok_or_else(|| spawn_refused(SpawnRefusalReason::DepthLimit, "depth overflow"))?;
-        if child_depth > limits.max_depth {
-            return Err(spawn_refused(
-                SpawnRefusalReason::DepthLimit,
-                "max_depth reached",
-            ));
-        }
-        let child_count: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM domain_job_origins WHERE parent_job_id=?1",
-                [&parent_authority.job_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        if u64::try_from(child_count).map_err(|_| invalid("invalid child count"))?
-            >= limits.max_children_per_job
-        {
-            return Err(spawn_refused(
-                SpawnRefusalReason::ChildLimit,
-                "max_children_per_job reached",
-            ));
-        }
-        let descendant_count: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM domain_jobs WHERE root_job_id=?1 AND id!=?1",
-                [&root_job_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        if u64::try_from(descendant_count).map_err(|_| invalid("invalid descendant count"))?
-            >= limits.max_total_descendants_per_root
-        {
-            return Err(spawn_refused(
-                SpawnRefusalReason::DescendantLimit,
-                "max_total_descendants_per_root reached",
-            ));
-        }
-        spec.recursive_limits = limits;
-        let (_, payload) = stored_job_spec(spec.clone())?;
-        let job_id = new_id("job");
-        let timestamp = now();
+        let job = insert_child_in(
+            &transaction,
+            &parent_authority.job_id,
+            spec,
+            prerequisite_job_ids,
+        )?;
         transaction
             .execute(
-                "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,root_job_id,depth,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?5,?6,?6)",
+                "INSERT INTO domain_job_origins(job_id,parent_job_id,authority,attempt_id,generation,spawn_key,spawn_fingerprint,call_id,policy,created_at) VALUES(?1,?2,'spawn',?3,?4,?5,?6,?7,?8,?9)",
                 params![
-                    job_id,
-                    project_id,
-                    root_job_id,
-                    i64::try_from(child_depth)
-                        .map_err(|_| invalid("child Job depth exceeds SQLite range"))?,
-                    payload,
-                    timestamp
-                ],
-            )
-            .map_err(sql)?;
-        for prerequisite in prerequisite_job_ids {
-            validate_id(prerequisite)?;
-            let same_project: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM domain_jobs WHERE id=?1 AND project_id=?2)",
-                    params![prerequisite, project_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql)?;
-            if !same_project {
-                return Err(invalid("child dependency is not in the parent Project"));
-            }
-            let would_cycle: bool = transaction
-                .query_row(
-                    "WITH RECURSIVE dependents(id) AS (SELECT ?2 UNION SELECT dependencies.prerequisite_job_id FROM domain_job_dependencies dependencies JOIN dependents ON dependencies.job_id=dependents.id WHERE dependencies.project_id=?3) SELECT EXISTS(SELECT 1 FROM dependents WHERE id=?1)",
-                    params![job_id, prerequisite, project_id],
-                    |row| row.get(0),
-                )
-                .map_err(sql)?;
-            if would_cycle {
-                return Err(spawn_refused(
-                    SpawnRefusalReason::DependencyCycle,
-                    "child dependency would create a cycle",
-                ));
-            }
-            transaction
-                .execute(
-                    "INSERT INTO domain_job_dependencies(project_id,job_id,prerequisite_job_id) VALUES(?1,?2,?3)",
-                    params![project_id, job_id, prerequisite],
-                )
-                .map_err(sql)?;
-        }
-        if !prerequisite_job_ids.is_empty() {
-            transaction
-                .execute(
-                    "INSERT INTO domain_dependency_revisions(project_id,revision) VALUES(?1,0) ON CONFLICT(project_id) DO NOTHING",
-                    [&project_id],
-                )
-                .map_err(sql)?;
-            transaction
-                .execute(
-                    "UPDATE domain_dependency_revisions SET revision=revision+1 WHERE project_id=?1",
-                    [&project_id],
-                )
-                .map_err(sql)?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO domain_job_origins(job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,call_id,policy) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    job_id,
+                    job.id,
                     parent_authority.job_id,
                     parent_authority.attempt_id,
                     parent_generation,
@@ -3597,49 +3608,197 @@ impl DomainRepository {
                     spawn.map(|value| value.fingerprint.as_str()),
                     spawn.and_then(|value| value.call_id),
                     serde_json::to_string(spawn.map(|value| value.policy).unwrap_or(&ChildPolicy::default()))
-                        .map_err(|error| invalid(&error.to_string()))?
+                        .map_err(|error| invalid(&error.to_string()))?,
+                    job.created_at
                 ],
             )
             .map_err(sql)?;
-        let job = Job {
-            id: job_id.clone(),
-            project_id: project_id.clone(),
-            state: JobState::Pending,
-            generation: 0,
-            authoritative_attempt_id: None,
-            termination_reason: None,
-            root_job_id,
-            depth: child_depth,
-            waiting_for_children: false,
-            spec,
-            created_at: timestamp,
-            updated_at: timestamp,
-        };
         let root = journal::append(
             &transaction,
             EventDraft::new(EventKind::JobCreated, "job", &job.id, journal::value(&job)?)
-                .project(&project_id)
+                .project(&job.project_id)
                 .job(&job.id)
                 .authority(&parent_authority.attempt_id, parent_authority.generation)
                 .causation_key(&parent_authority.attempt_id),
         )?;
-        for prerequisite in prerequisite_job_ids {
-            emit_dependency(
-                &transaction,
-                EventKind::DependencyAdded,
-                &journal::DependencyEdge {
-                    project_id: project_id.clone(),
-                    job_id: job.id.clone(),
-                    prerequisite_job_id: (*prerequisite).to_string(),
-                },
-                Some(root),
-            )?;
-        }
-        refresh_job_readiness_in(&transaction, &job.id, Some(root))?;
-        let job =
-            read_job(&transaction, &job.id)?.ok_or_else(|| invalid("created Job disappeared"))?;
+        let job = publish_child_in(&transaction, &job, prerequisite_job_ids, root)?;
         transaction.commit().map_err(sql)?;
         Ok((job, false))
+    }
+
+    /// Create an orchestration root: a Job that coordinates child work and
+    /// never executes itself. It starts open, so authorized principals may
+    /// attach children to it until it is explicitly closed.
+    pub fn create_orchestration_job<S>(
+        &mut self,
+        project_id: &str,
+        spec: S,
+        principal: &JobPrincipal,
+        command_id: &str,
+        request_hash: &str,
+    ) -> Result<(Job, bool)>
+    where
+        S: TryInto<JobSpec>,
+        S::Error: std::fmt::Display,
+    {
+        validate_id(project_id)?;
+        validate_id(command_id)?;
+        principal.validate()?;
+        let (spec, payload) = stored_job_spec(spec)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        if let Some(job) = recorded_command_in(&transaction, command_id, project_id, request_hash)?
+        {
+            transaction.commit().map_err(sql)?;
+            return Ok((job, true));
+        }
+        let id = new_id("job");
+        let timestamp = now();
+        transaction
+            .execute(
+                "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,root_job_id,depth,waiting_for_children,scope,payload,created_at,updated_at) VALUES(?1,?2,'eligible',0,NULL,?1,0,1,'open',?3,?4,?4)",
+                params![id, project_id, payload, timestamp],
+            )
+            .map_err(sql)?;
+        record_command_in(&transaction, command_id, project_id, request_hash, &id)?;
+        let job = read_job(&transaction, &id)?.ok_or_else(|| invalid("created Job disappeared"))?;
+        debug_assert_eq!(job.spec, spec);
+        journal::append(
+            &transaction,
+            EventDraft::new(EventKind::JobCreated, "job", &job.id, journal::value(&job)?)
+                .project(project_id)
+                .job(&job.id)
+                .causation_key(command_id),
+        )?;
+        transaction.commit().map_err(sql)?;
+        Ok((job, false))
+    }
+
+    /// Attach a child Job to an open orchestration Job on behalf of an
+    /// authorized principal.
+    ///
+    /// This is Job management, not execution: no Attempt of the parent is
+    /// involved or required, and none is named in the child's provenance. The
+    /// caller has already authorized `principal` for the parent's Project. The
+    /// command identity makes the attachment idempotent: the child, its
+    /// dependencies, its provenance and the command record commit together, so
+    /// a retried or replayed command returns the child it already created.
+    pub fn attach_child(&mut self, request: AttachChildRequest<'_>) -> Result<(Job, bool)> {
+        let AttachChildRequest {
+            parent_job_id,
+            principal,
+            command_id,
+            request_hash,
+            spec,
+            prerequisite_job_ids,
+            policy,
+        } = request;
+        validate_id(parent_job_id)?;
+        validate_id(command_id)?;
+        principal.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let parent =
+            read_job(&transaction, parent_job_id)?.ok_or_else(|| invalid("unknown parent Job"))?;
+        if let Some(job) =
+            recorded_command_in(&transaction, command_id, &parent.project_id, request_hash)?
+        {
+            let attached: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM domain_job_origins WHERE job_id=?1 AND parent_job_id=?2 AND authority='attach')",
+                    params![job.id, parent_job_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql)?;
+            if !attached {
+                return Err(invalid(
+                    "command_id already used with different request content",
+                ));
+            }
+            transaction.commit().map_err(sql)?;
+            return Ok((job, true));
+        }
+        if parent.scope != JobScope::Open
+            || !matches!(parent.state, JobState::Pending | JobState::Eligible)
+            || parent.authoritative_attempt_id.is_some()
+        {
+            return Err(spawn_refused(
+                SpawnRefusalReason::ParentClosed,
+                "parent Job is not an open orchestration Job",
+            ));
+        }
+        let job = insert_child_in(&transaction, parent_job_id, spec, prerequisite_job_ids)?;
+        transaction
+            .execute(
+                "INSERT INTO domain_job_origins(job_id,parent_job_id,authority,principal_kind,principal_id,command_id,policy,created_at) VALUES(?1,?2,'attach',?3,?4,?5,?6,?7)",
+                params![
+                    job.id,
+                    parent_job_id,
+                    principal.kind.to_string(),
+                    principal.id,
+                    command_id,
+                    serde_json::to_string(policy).map_err(|error| invalid(&error.to_string()))?,
+                    job.created_at
+                ],
+            )
+            .map_err(sql)?;
+        record_command_in(
+            &transaction,
+            command_id,
+            &job.project_id,
+            request_hash,
+            &job.id,
+        )?;
+        let root = journal::append(
+            &transaction,
+            EventDraft::new(EventKind::JobCreated, "job", &job.id, journal::value(&job)?)
+                .project(&job.project_id)
+                .job(&job.id)
+                .causation_key(command_id),
+        )?;
+        let job = publish_child_in(&transaction, &job, prerequisite_job_ids, root)?;
+        transaction.commit().map_err(sql)?;
+        Ok((job, false))
+    }
+
+    /// Close an orchestration Job to further attachment.
+    ///
+    /// Closing is what allows it to complete: from here its completion follows
+    /// its required children under their policies, and a closed scope with no
+    /// required child outstanding completes at once. Closing twice is a no-op.
+    pub fn close_orchestration_job(&mut self, job_id: &str) -> Result<Job> {
+        validate_id(job_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        let job = read_job(&transaction, job_id)?.ok_or_else(|| invalid("unknown Job"))?;
+        match job.scope {
+            JobScope::None => return Err(invalid("Job is not an orchestration Job")),
+            JobScope::Closed => {
+                transaction.commit().map_err(sql)?;
+                return Ok(job);
+            }
+            JobScope::Open => {}
+        }
+        transaction
+            .execute(
+                "UPDATE domain_jobs SET scope='closed',updated_at=?2 WHERE id=?1 AND scope='open'",
+                params![job_id, now()],
+            )
+            .map_err(sql)?;
+        let closed =
+            read_job(&transaction, job_id)?.ok_or_else(|| invalid("closed Job disappeared"))?;
+        let root = emit_job(&transaction, EventKind::JobUpdated, &closed, None)?;
+        reconcile_child_join_in(&transaction, job_id, Some(root))?;
+        let job =
+            read_job(&transaction, job_id)?.ok_or_else(|| invalid("closed Job disappeared"))?;
+        transaction.commit().map_err(sql)?;
+        Ok(job)
     }
 
     /// Admit one externally bound execution into the canonical domain.
@@ -3682,6 +3841,7 @@ impl DomainRepository {
                             root_job_id: row.get(21)?,
                             depth: u64::try_from(row.get::<_, i64>(22)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
                             waiting_for_children: row.get(23)?,
+                            scope: JobScope::None,
                             created_at: row.get(6)?, updated_at: row.get(7)?,
                         },
                         Attempt {
@@ -3743,6 +3903,7 @@ impl DomainRepository {
             root_job_id: job_id.clone(),
             depth: 0,
             waiting_for_children: false,
+            scope: JobScope::None,
             spec,
             created_at: timestamp,
             updated_at: timestamp,
@@ -5952,6 +6113,7 @@ impl DomainRepository {
                     root_job_id: job_id.clone(),
                     depth: 0,
                     waiting_for_children: false,
+                    scope: JobScope::None,
                     spec,
                     created_at: timestamp,
                     updated_at: timestamp,
@@ -6617,6 +6779,10 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
         root_job_id: row.get(9)?,
         depth: u64::try_from(row.get::<_, i64>(10)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
         waiting_for_children: row.get(11)?,
+        scope: row
+            .get::<_, String>(12)?
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
         spec: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
@@ -6624,7 +6790,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
 }
 
 const JOB_COLUMNS: &str =
-    "id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at,termination_reason,root_job_id,depth,waiting_for_children";
+    "id,project_id,state,generation,authoritative_attempt_id,payload,created_at,updated_at,termination_reason,root_job_id,depth,waiting_for_children,scope";
 
 fn query_all<T>(
     connection: &Connection,
@@ -7629,7 +7795,7 @@ fn all_job_origin_details(
     connection: &Connection,
 ) -> Result<std::collections::BTreeMap<JobId, JobOrigin>> {
     query_all(connection,
-        "SELECT job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,call_id,policy FROM domain_job_origins ORDER BY job_id", &[], |row| {
+        "SELECT job_id,parent_job_id,attempt_id,generation,spawn_key,spawn_fingerprint,call_id,policy FROM domain_job_origins WHERE authority='spawn' ORDER BY job_id", &[], |row| {
             let policy = row.get::<_, Option<String>>(7)?.map(|value| serde_json::from_str(&value).map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error)))).transpose()?;
             Ok((row.get(0)?, JobOrigin {
                 parent_job_id: row.get(1)?, attempt_id: row.get(2)?,
@@ -7637,6 +7803,40 @@ fn all_job_origin_details(
                 spawn_key: row.get(4)?, spawn_fingerprint: row.get(5)?, call_id: row.get(6)?, policy,
             }))
         }).map(|origins| origins.into_iter().collect())
+}
+
+fn all_job_attachments(
+    connection: &Connection,
+) -> Result<std::collections::BTreeMap<JobId, JobAttachment>> {
+    query_all(
+        connection,
+        "SELECT job_id,parent_job_id,principal_kind,principal_id,command_id,policy,created_at FROM domain_job_origins WHERE authority='attach' ORDER BY job_id",
+        &[],
+        |row| {
+            let kind: String = row.get(2)?;
+            let policy: String = row.get(5)?;
+            Ok((
+                row.get(0)?,
+                JobAttachment {
+                    parent_job_id: row.get(1)?,
+                    principal: JobPrincipal {
+                        kind: kind.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        id: row.get(3)?,
+                    },
+                    command_id: row.get(4)?,
+                    policy: serde_json::from_str(&policy).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    created_at: row.get(6)?,
+                },
+            ))
+        },
+    )
+    .map(|attachments| attachments.into_iter().collect())
 }
 
 fn all_job_origins(connection: &Connection) -> Result<std::collections::BTreeMap<JobId, JobId>> {
@@ -8694,8 +8894,11 @@ fn reconcile_child_join_in(
     caused_by: Option<u64>,
 ) -> Result<()> {
     let parent = read_job(transaction, parent_id)?.ok_or_else(|| invalid("unknown parent Job"))?;
+    // An open orchestration scope may still receive work, so nothing its
+    // current children do can complete it.
     if !parent.waiting_for_children
         || parent.authoritative_attempt_id.is_some()
+        || parent.scope == JobScope::Open
         || !matches!(parent.state, JobState::Pending | JobState::Eligible)
     {
         return Ok(());
@@ -8703,7 +8906,9 @@ fn reconcile_child_join_in(
     let children: Vec<(String, String)> = query_all(transaction,
         "SELECT child.state,COALESCE(json_extract(o.policy,'$.failure'),'observe') FROM domain_job_origins o JOIN domain_jobs child ON child.id=o.job_id WHERE o.parent_job_id=?1 AND json_extract(o.policy,'$.join')='required' ORDER BY child.id",
         &[&parent_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    if children.is_empty() {
+    // An executing Job waits only when it has required children. A closed
+    // orchestration scope with none outstanding has nothing left to wait for.
+    if children.is_empty() && parent.scope != JobScope::Closed {
         return Ok(());
     }
     let mut pending = false;
@@ -8800,6 +9005,220 @@ fn refresh_job_readiness_in(
         params![job_id, state.to_string(), job.updated_at],
     ).map_err(sql)?;
     emit_job(transaction, EventKind::JobUpdated, &job, caused_by)?;
+    Ok(())
+}
+
+/// Insert a child of `parent_job_id`, enforcing the root's recursive limits
+/// and the child's dependencies. The child is not yet journaled; see
+/// [`publish_child_in`].
+fn insert_child_in(
+    transaction: &rusqlite::Transaction<'_>,
+    parent_job_id: &str,
+    mut spec: JobSpec,
+    prerequisite_job_ids: &[&str],
+) -> Result<Job> {
+    let (project_id, root_job_id, parent_depth, root_payload): (String, String, i64, String) =
+        transaction
+            .query_row(
+                "SELECT j.project_id,j.root_job_id,j.depth,r.payload FROM domain_jobs j JOIN domain_jobs r ON r.id=j.root_job_id WHERE j.id=?1",
+                [parent_job_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(sql)?
+            .ok_or_else(|| invalid("unknown parent Job"))?;
+    let limits = JobSpec::from_payload(&root_payload)?
+        .recursive_limits
+        .validate()?;
+    let child_depth = u64::try_from(parent_depth)
+        .map_err(|_| invalid("invalid parent Job depth"))?
+        .checked_add(1)
+        .ok_or_else(|| spawn_refused(SpawnRefusalReason::DepthLimit, "depth overflow"))?;
+    if child_depth > limits.max_depth {
+        return Err(spawn_refused(
+            SpawnRefusalReason::DepthLimit,
+            "max_depth reached",
+        ));
+    }
+    let child_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM domain_job_origins WHERE parent_job_id=?1",
+            [parent_job_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if u64::try_from(child_count).map_err(|_| invalid("invalid child count"))?
+        >= limits.max_children_per_job
+    {
+        return Err(spawn_refused(
+            SpawnRefusalReason::ChildLimit,
+            "max_children_per_job reached",
+        ));
+    }
+    let descendant_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM domain_jobs WHERE root_job_id=?1 AND id!=?1",
+            [&root_job_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    if u64::try_from(descendant_count).map_err(|_| invalid("invalid descendant count"))?
+        >= limits.max_total_descendants_per_root
+    {
+        return Err(spawn_refused(
+            SpawnRefusalReason::DescendantLimit,
+            "max_total_descendants_per_root reached",
+        ));
+    }
+    spec.recursive_limits = limits;
+    let (spec, payload) = stored_job_spec(spec)?;
+    let job_id = new_id("job");
+    let timestamp = now();
+    transaction
+        .execute(
+            "INSERT INTO domain_jobs(id,project_id,state,generation,authoritative_attempt_id,root_job_id,depth,payload,created_at,updated_at) VALUES(?1,?2,'pending',0,NULL,?3,?4,?5,?6,?6)",
+            params![
+                job_id,
+                project_id,
+                root_job_id,
+                i64::try_from(child_depth)
+                    .map_err(|_| invalid("child Job depth exceeds SQLite range"))?,
+                payload,
+                timestamp
+            ],
+        )
+        .map_err(sql)?;
+    for prerequisite in prerequisite_job_ids {
+        validate_id(prerequisite)?;
+        let same_project: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM domain_jobs WHERE id=?1 AND project_id=?2)",
+                params![prerequisite, project_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if !same_project {
+            return Err(invalid("child dependency is not in the parent Project"));
+        }
+        let would_cycle: bool = transaction
+            .query_row(
+                "WITH RECURSIVE dependents(id) AS (SELECT ?2 UNION SELECT dependencies.prerequisite_job_id FROM domain_job_dependencies dependencies JOIN dependents ON dependencies.job_id=dependents.id WHERE dependencies.project_id=?3) SELECT EXISTS(SELECT 1 FROM dependents WHERE id=?1)",
+                params![job_id, prerequisite, project_id],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        if would_cycle {
+            return Err(spawn_refused(
+                SpawnRefusalReason::DependencyCycle,
+                "child dependency would create a cycle",
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO domain_job_dependencies(project_id,job_id,prerequisite_job_id) VALUES(?1,?2,?3)",
+                params![project_id, job_id, prerequisite],
+            )
+            .map_err(sql)?;
+    }
+    if !prerequisite_job_ids.is_empty() {
+        transaction
+            .execute(
+                "INSERT INTO domain_dependency_revisions(project_id,revision) VALUES(?1,0) ON CONFLICT(project_id) DO NOTHING",
+                [&project_id],
+            )
+            .map_err(sql)?;
+        transaction
+            .execute(
+                "UPDATE domain_dependency_revisions SET revision=revision+1 WHERE project_id=?1",
+                [&project_id],
+            )
+            .map_err(sql)?;
+    }
+    Ok(Job {
+        id: job_id,
+        project_id,
+        state: JobState::Pending,
+        generation: 0,
+        authoritative_attempt_id: None,
+        termination_reason: None,
+        root_job_id,
+        depth: child_depth,
+        waiting_for_children: false,
+        scope: JobScope::None,
+        spec,
+        created_at: timestamp,
+        updated_at: timestamp,
+    })
+}
+
+/// Journal a child's dependency edges under its creation event and derive its
+/// readiness. Returns the child as committed.
+fn publish_child_in(
+    transaction: &rusqlite::Transaction<'_>,
+    job: &Job,
+    prerequisite_job_ids: &[&str],
+    root: u64,
+) -> Result<Job> {
+    for prerequisite in prerequisite_job_ids {
+        emit_dependency(
+            transaction,
+            EventKind::DependencyAdded,
+            &journal::DependencyEdge {
+                project_id: job.project_id.clone(),
+                job_id: job.id.clone(),
+                prerequisite_job_id: (*prerequisite).to_string(),
+            },
+            Some(root),
+        )?;
+    }
+    refresh_job_readiness_in(transaction, &job.id, Some(root))?;
+    read_job(transaction, &job.id)?.ok_or_else(|| invalid("created Job disappeared"))
+}
+
+/// The Job a Job-management command already created, if this command
+/// identity was recorded. The same identity with different content is a
+/// conflict, never a duplicate.
+fn recorded_command_in(
+    transaction: &rusqlite::Transaction<'_>,
+    command_id: &str,
+    project_id: &str,
+    request_hash: &str,
+) -> Result<Option<Job>> {
+    let recorded: Option<(String, Option<String>)> = transaction
+        .query_row(
+            "SELECT request_hash,job_id FROM domain_launch_commands WHERE command_id=?1 AND project_id=?2",
+            params![command_id, project_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some((stored_hash, job_id)) = recorded else {
+        return Ok(None);
+    };
+    if stored_hash != request_hash {
+        return Err(invalid(
+            "command_id already used with different request content",
+        ));
+    }
+    let job_id = job_id.ok_or_else(|| invalid("command_id was already used and created no Job"))?;
+    read_job(transaction, &job_id)?
+        .map(Some)
+        .ok_or_else(|| invalid("recorded command Job disappeared"))
+}
+
+fn record_command_in(
+    transaction: &rusqlite::Transaction<'_>,
+    command_id: &str,
+    project_id: &str,
+    request_hash: &str,
+    job_id: &str,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO domain_launch_commands(command_id,project_id,request_hash,outcome,job_id,message,created_at) VALUES(?1,?2,?3,'accepted',?4,?5,?6)",
+            params![command_id, project_id, request_hash, job_id, format!("job created: {job_id}"), now()],
+        )
+        .map_err(sql)?;
     Ok(())
 }
 
