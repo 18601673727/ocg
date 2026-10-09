@@ -268,12 +268,12 @@ fn fence_disappeared(
             attempt_id: attempt_id.to_string(),
         });
     }
-    if domain.chat_session_for_job(&observation.job.id)?.is_some() {
-        // A Chat turn runs again only through Chat retry, which replays its
-        // frozen request with the Conversation's context; Placement would
-        // rebuild it from the objective alone. Its effect may already have
-        // left this process, so the Attempt settles as unknown, not failed,
-        // and the Job waits for that explicit retry.
+    if domain.requires_exact_replay(&observation.job.id)? {
+        // A Job whose frozen input is exact runs again only through an
+        // explicit retry that replays that input; Placement would rebuild it
+        // from the specification alone. Its effect may already have left this
+        // process, so the Attempt settles as unknown, not failed, and the Job
+        // waits for that explicit retry.
         if let Some(call_id) = call_id {
             if let Err(error) =
                 domain.fence_dispatch_intent(call_id, "watchdog_executor_disappeared")
@@ -285,7 +285,7 @@ fn fence_disappeared(
             attempt_id,
             &failure(
                 "watchdog_executor_disappeared",
-                "Provider executor disappeared during this Chat turn; whether its effect completed is unknown. Retry the turn to run it again",
+                "Provider executor disappeared during this Attempt; whether its effect completed is unknown. Retry the Job to run it again",
             ),
         ) {
             Ok(()) => {}

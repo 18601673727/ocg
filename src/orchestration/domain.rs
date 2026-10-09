@@ -740,7 +740,7 @@ pub struct CanonicalAdmission {
 /// is current. Bump it whenever the bootstrap body gains work that existing
 /// stores must receive. Stores created before this gate report `0`, so their
 /// first open runs the full bootstrap once; every step in it is idempotent.
-const DOMAIN_SCHEMA_VERSION: i64 = 2;
+const DOMAIN_SCHEMA_VERSION: i64 = 3;
 
 const DOMAIN_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS domain_projects (
@@ -931,6 +931,30 @@ CREATE TABLE IF NOT EXISTS domain_messages (
     record TEXT NOT NULL,
     UNIQUE(attempt_id,role)
 ) STRICT;
+-- The kernel-authoritative frozen execution input of one Job generation,
+-- committed in the same transaction as the Attempt that owns it. It is
+-- distinct from the user-declared Job specification (`domain_jobs.payload`)
+-- and from the frozen request of a published Call (`domain_dispatch_intents`),
+-- which stays authoritative once it exists. A retry or replacement copies the
+-- input it replays into the new generation, naming the generation it came from.
+CREATE TABLE IF NOT EXISTS domain_job_inputs (
+    job_id TEXT NOT NULL REFERENCES domain_jobs(id),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES domain_attempts(id),
+    version INTEGER NOT NULL CHECK(version > 0),
+    origin TEXT NOT NULL CHECK(origin IN ('admission','retry','replacement')),
+    source_generation INTEGER CHECK(source_generation IS NULL OR (source_generation > 0 AND source_generation < generation)),
+    input TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(job_id,generation),
+    CHECK((origin='admission') = (source_generation IS NULL))
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS domain_job_inputs_immutable_update
+    BEFORE UPDATE ON domain_job_inputs
+    BEGIN SELECT RAISE(ABORT,'frozen Job input is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS domain_job_inputs_immutable_delete
+    BEFORE DELETE ON domain_job_inputs
+    BEGIN SELECT RAISE(ABORT,'frozen Job input is immutable'); END;
 "#;
 
 /// In-memory dependency view. The SQLite revision determines whether it is current.
@@ -1239,9 +1263,6 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             )
             .map_err(sql)?;
         ensure_column(connection, "domain_job_bindings", "attempt_id", "TEXT")?;
-        // The frozen logical request of a Chat turn admitted atomically with
-        // its reservation. Turns admitted before it existed keep NULL.
-        ensure_column(connection, "domain_chat_turns", "launch", "TEXT")?;
         connection.execute(
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
             [],
@@ -1446,57 +1467,56 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         Ok(history)
     }
 
-    /// The frozen logical request of the Chat turn this Job executes, if it was
-    /// admitted with one. Turns admitted before frozen requests existed have none.
-    pub(crate) fn chat_launch_for_job(&self, job_id: &str) -> Result<Option<ChatLaunch>> {
-        let raw: Option<Option<String>> = self
-            .connection
-            .query_row(
-                "SELECT launch FROM domain_chat_turns WHERE job_id=?1",
-                [job_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql)?;
-        raw.flatten()
-            .map(|raw| {
-                serde_json::from_str::<ChatLaunch>(&raw)
-                    .map_err(|error| invalid(&format!("invalid frozen Chat request: {error}")))
-            })
-            .transpose()
-            .and_then(|launch| match launch {
-                Some(launch) if launch.version != CHAT_LAUNCH_VERSION => Err(invalid(&format!(
-                    "unsupported frozen Chat request version {}",
-                    launch.version
-                ))),
-                launch => Ok(launch),
-            })
+    /// The frozen execution input of one Job generation, if that generation
+    /// was committed with one. Generations admitted before inputs were frozen
+    /// have none.
+    pub(crate) fn job_input(
+        &self,
+        job_id: &str,
+        generation: u64,
+    ) -> Result<Option<FrozenJobInput>> {
+        read_job_input(&self.connection, job_id, Some(generation))
     }
 
-    /// The wire messages of a frozen Chat request, with each image reference
+    /// The most recently frozen execution input of a Job, whichever generation
+    /// froze it. Retry replays this input.
+    pub(crate) fn latest_job_input(&self, job_id: &str) -> Result<Option<FrozenJobInput>> {
+        read_job_input(&self.connection, job_id, None)
+    }
+
+    /// The wire messages of a frozen Job input, with each image reference
     /// resolved from the Project's own image store. A reference that no longer
     /// resolves fails rather than being dropped.
-    pub(crate) fn resolve_chat_launch_messages(
+    pub(crate) fn resolve_job_input_messages(
         &self,
         project_id: &str,
-        launch: &ChatLaunch,
+        input: &JobInput,
     ) -> Result<Vec<serde_json::Value>> {
         let transaction = self.begin()?;
-        let history = resolve_chat_history_in(&transaction, project_id, &launch.messages)?;
+        let history = resolve_chat_history_in(&transaction, project_id, &input.messages)?;
         transaction.commit().map_err(sql)?;
         Ok(history)
     }
+
+    /// Whether this Job may only run again through an explicit retry that
+    /// replays its frozen input exactly. The Job's latest frozen input
+    /// decides; a Job with none has nothing that could be re-derived either.
+    pub(crate) fn requires_exact_replay(&self, job_id: &str) -> Result<bool> {
+        Ok(self
+            .latest_job_input(job_id)?
+            .is_none_or(|frozen| frozen.replay != InputReplay::Replaceable))
+    }
 }
 
-/// Version of the [`ChatLaunch`] representation stored on a Chat turn.
-const CHAT_LAUNCH_VERSION: u32 = 1;
+/// Version of the [`JobInput`] representation.
+const JOB_INPUT_VERSION: u32 = 1;
 
-/// The non-secret execution target a Chat turn was admitted against.
+/// The non-secret execution target a Job generation was admitted against.
 ///
 /// The credential is named by its Vault reference only; its value is never
-/// part of the frozen request.
+/// part of the frozen input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ChatLaunchTarget {
+pub(crate) struct ExecutionTarget {
     pub provider_key: String,
     pub model_key: String,
     pub upstream_model_id: String,
@@ -1505,29 +1525,189 @@ pub(crate) struct ChatLaunchTarget {
     pub credential_ref: Option<String>,
 }
 
-/// The frozen logical request of a Chat turn: exactly what was asked, at the
-/// turn boundary, as admission committed it.
-///
-/// `messages` are the wire messages of the original request. Image parts are
-/// stored as references to the Project's image store (`{"type":"ocg_image",
-/// "image": ChatImage}`), never as image bytes, and are resolved when the
-/// request is sent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ChatLaunch {
-    pub version: u32,
-    pub target: ChatLaunchTarget,
-    pub effort: Option<String>,
-    pub messages: Vec<serde_json::Value>,
+/// How a frozen input may be executed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InputReplay {
+    /// Only an explicit retry may run this input again, and only against the
+    /// frozen target. Recovery never re-places or re-derives it.
+    Exact,
+    /// The input is derived from the Job specification alone, so recovery may
+    /// return the Job to admission, where Placement may choose a new target
+    /// and the next generation freezes its own input.
+    Replaceable,
 }
 
-/// What a Chat launch commits in the same transaction as its reservation.
+/// Which provider payload the input is executed as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InputPayload {
+    Agent,
+    Probe,
+}
+
+/// The kernel-authoritative frozen execution input of one Job generation:
+/// exactly what was asked, against which target, as admission committed it.
+///
+/// `messages` are the wire messages of the request, including any historical
+/// context the origin assembled. Image parts are stored as references to the
+/// Project's image store (`{"type":"ocg_image","image": ChatImage}`), never as
+/// image bytes, and are resolved when the request is sent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct JobInput {
+    pub version: u32,
+    pub target: ExecutionTarget,
+    pub effort: Option<String>,
+    pub messages: Vec<serde_json::Value>,
+    pub payload: InputPayload,
+    pub replay: InputReplay,
+}
+
+impl JobInput {
+    /// Whether any message carries an image reference.
+    pub(crate) fn has_images(&self) -> bool {
+        self.messages.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.get("type").and_then(serde_json::Value::as_str) == Some("ocg_image")
+                    })
+                })
+        })
+    }
+}
+
+/// A frozen input and the generation that owns it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FrozenJobInput {
+    pub generation: u64,
+    pub attempt_id: AttemptId,
+    pub replay: InputReplay,
+    /// The decoded input, or why the stored row cannot be replayed.
+    pub input: std::result::Result<JobInput, String>,
+}
+
+/// What an origin supplies so admission can freeze a Job generation's input in
+/// the same transaction as its Attempt.
+pub(crate) struct JobInputDraft<'a> {
+    pub target: ExecutionTarget,
+    pub effort: Option<String>,
+    pub payload: InputPayload,
+    pub replay: InputReplay,
+    pub content: InputContent<'a>,
+}
+
+/// Where the frozen messages come from.
+pub(crate) enum InputContent<'a> {
+    /// The origin already knows the complete request messages.
+    Messages(Vec<serde_json::Value>),
+    /// A Chat turn: the request is the Conversation's history at the turn
+    /// boundary, which only exists once the turn is staged in the same
+    /// transaction.
+    ChatTurn(ChatTurnDraft<'a>),
+}
+
+/// What a Chat launch stages in the same transaction as its reservation.
 pub(crate) struct ChatTurnDraft<'a> {
     pub request: &'a crate::contracts::JobLaunchRequest,
     pub request_hash: &'a str,
     pub content: &'a str,
     pub images: &'a [crate::contracts::ChatImage],
-    pub target: ChatLaunchTarget,
-    pub effort: Option<String>,
+}
+
+fn read_job_input(
+    connection: &Connection,
+    job_id: &str,
+    generation: Option<u64>,
+) -> Result<Option<FrozenJobInput>> {
+    let generation = generation
+        .map(|generation| {
+            i64::try_from(generation).map_err(|_| invalid("Job generation exceeds SQLite range"))
+        })
+        .transpose()?;
+    let row: Option<(i64, String, i64, String)> = connection
+        .query_row(
+            "SELECT generation,attempt_id,version,input FROM domain_job_inputs
+             WHERE job_id=?1 AND (?2 IS NULL OR generation=?2)
+             ORDER BY generation DESC LIMIT 1",
+            params![job_id, generation],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some((generation, attempt_id, version, raw)) = row else {
+        return Ok(None);
+    };
+    let input = serde_json::from_str::<JobInput>(&raw)
+        .map_err(|error| format!("invalid frozen Job input: {error}"))
+        .and_then(|input| {
+            if version != i64::from(JOB_INPUT_VERSION) || input.version != JOB_INPUT_VERSION {
+                Err(format!("unsupported frozen Job input version {version}"))
+            } else {
+                Ok(input)
+            }
+        });
+    Ok(Some(FrozenJobInput {
+        generation: u64::try_from(generation).map_err(|_| invalid("negative Job generation"))?,
+        attempt_id,
+        // An unreadable input is never treated as re-derivable.
+        replay: input
+            .as_ref()
+            .map(|input| input.replay)
+            .unwrap_or(InputReplay::Exact),
+        input,
+    }))
+}
+
+/// Freeze `input` for `attempt` inside the transaction that commits it.
+fn insert_job_input_in(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt: &Attempt,
+    input: &JobInput,
+) -> Result<()> {
+    let raw = serde_json::to_string(input).map_err(|error| invalid(&error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO domain_job_inputs(job_id,generation,attempt_id,version,origin,source_generation,input,created_at) VALUES(?1,?2,?3,?4,'admission',NULL,?5,?6)",
+            params![
+                attempt.job_id,
+                i64::try_from(attempt.generation)
+                    .map_err(|_| invalid("Job generation exceeds SQLite range"))?,
+                attempt.id,
+                input.version,
+                raw,
+                attempt.created_at
+            ],
+        )
+        .map_err(sql)?;
+    Ok(())
+}
+
+/// Carry the Job's latest frozen input into a retry or replacement
+/// generation, unchanged, in the transaction that commits its Attempt.
+fn copy_job_input_in(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt: &Attempt,
+    origin: &str,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO domain_job_inputs(job_id,generation,attempt_id,version,origin,source_generation,input,created_at)
+             SELECT job_id,?2,?3,version,?5,generation,input,?4 FROM domain_job_inputs
+             WHERE job_id=?1 AND generation<?2 ORDER BY generation DESC LIMIT 1",
+            params![
+                attempt.job_id,
+                i64::try_from(attempt.generation)
+                    .map_err(|_| invalid("Job generation exceeds SQLite range"))?,
+                attempt.id,
+                attempt.created_at,
+                origin
+            ],
+        )
+        .map_err(sql)?;
+    Ok(())
 }
 
 /// Stage a Chat turn inside `transaction`: the Conversation, the turn and its
@@ -4345,18 +4525,27 @@ impl DomainRepository {
     /// `placement` is present only when the reservation still required candidate
     /// selection. An exact target passes `None`: the Attempt is still claimed
     /// by this function, but Placement capacity is not reserved for it.
-    /// Reserve a Job for admission. With a Chat `draft`, the turn, its
-    /// Messages and its frozen logical request commit in the same transaction
-    /// as the Attempt, so no Chat Attempt ever exists without its Chat
-    /// identity; the returned history is the first request's messages.
+    /// Reserve a Job for admission. The generation's frozen execution input
+    /// commits in the same transaction as the Attempt, so no admitted Attempt
+    /// exists without what is needed to replay or refuse it; the returned
+    /// messages are the first request's, resolved from that frozen input. A
+    /// Chat turn also stages its Conversation turn and Messages there.
     pub(crate) fn dispatch_job_for_admission(
         &mut self,
         job_id: &str,
         reservation: &super::admission::AdmissionReservation,
         placement: Option<AdmissionPlacement<'_>>,
-        chat: Option<&ChatTurnDraft<'_>>,
-    ) -> Result<(Attempt, Executor, Option<Vec<serde_json::Value>>)> {
-        self.dispatch_job_inner(job_id, "provider", Some(reservation), placement, chat)
+        input: &JobInputDraft<'_>,
+    ) -> Result<(Attempt, Executor, Vec<serde_json::Value>)> {
+        let (attempt, executor, messages) = self.dispatch_job_inner(
+            job_id,
+            "provider",
+            Some(reservation),
+            placement,
+            Some(input),
+        )?;
+        let messages = messages.ok_or_else(|| invalid("admission froze no Job input"))?;
+        Ok((attempt, executor, messages))
     }
 
     fn dispatch_job_inner(
@@ -4365,7 +4554,7 @@ impl DomainRepository {
         executor_kind: &str,
         reservation: Option<&super::admission::AdmissionReservation>,
         placement: Option<AdmissionPlacement<'_>>,
-        chat: Option<&ChatTurnDraft<'_>>,
+        input: Option<&JobInputDraft<'_>>,
     ) -> Result<(Attempt, Executor, Option<Vec<serde_json::Value>>)> {
         validate_id(executor_kind)?;
         let transaction = self
@@ -4434,38 +4623,41 @@ impl DomainRepository {
             &executor,
             Some(root),
         )?;
-        let history = match chat {
+        let history = match input {
             Some(draft) => {
-                let history = prepare_chat_turn_in(
-                    &transaction,
-                    draft.request,
-                    draft.request_hash,
-                    &attempt,
-                    draft.content,
-                    draft.images,
-                )?;
-                let launch = ChatLaunch {
-                    version: CHAT_LAUNCH_VERSION,
+                let messages = match &draft.content {
+                    InputContent::Messages(messages) => messages.clone(),
+                    InputContent::ChatTurn(turn) => prepare_chat_turn_in(
+                        &transaction,
+                        turn.request,
+                        turn.request_hash,
+                        &attempt,
+                        turn.content,
+                        turn.images,
+                    )?,
+                };
+                let frozen = JobInput {
+                    version: JOB_INPUT_VERSION,
                     target: draft.target.clone(),
                     effort: draft.effort.clone(),
-                    messages: history,
+                    messages,
+                    payload: draft.payload,
+                    replay: draft.replay,
                 };
-                transaction
-                    .execute(
-                        "UPDATE domain_chat_turns SET launch=?2 WHERE attempt_id=?1",
-                        params![
-                            attempt.id,
-                            serde_json::to_string(&launch)
-                                .map_err(|error| invalid(&error.to_string()))?
-                        ],
+                insert_job_input_in(&transaction, &attempt, &frozen)?;
+                let project_id: String = transaction
+                    .query_row(
+                        "SELECT project_id FROM domain_jobs WHERE id=?1",
+                        [job_id],
+                        |row| row.get(0),
                     )
                     .map_err(sql)?;
                 // The first request is resolved from the frozen form itself, so
-                // it and any later replay of this turn are one request.
+                // it and any later replay of this generation are one request.
                 Some(resolve_chat_history_in(
                     &transaction,
-                    &draft.request.project_id,
-                    &launch.messages,
+                    &project_id,
+                    &frozen.messages,
                 )?)
             }
             None => None,
@@ -4632,6 +4824,17 @@ impl DomainRepository {
             .ok_or_else(|| invalid("replacement Executor disappeared"))?;
         let job =
             read_job(&transaction, job_id)?.ok_or_else(|| invalid("replaced Job disappeared"))?;
+        // The replacement generation replays the Job's frozen input, so it is
+        // committed with that input or with none at all; it never re-derives one.
+        copy_job_input_in(
+            &transaction,
+            &attempt,
+            if retry_generation.is_some() {
+                "retry"
+            } else {
+                "replacement"
+            },
+        )?;
         if retry_generation.is_some() {
             // A retried Chat Job re-enters its own turn in the same commit that
             // admits the replacement; it never gains a second turn or Message.
@@ -5562,26 +5765,31 @@ impl DomainRepository {
         transaction.commit().map_err(sql)
     }
 
-    /// The Attempt of a Chat turn whose admission was interrupted after the
-    /// turn was persisted but before its provider Call was published.
+    /// Running Jobs whose current provider Attempt was committed but never
+    /// published a Call: admission stopped after the Attempt (and its frozen
+    /// input) existed and before any Call or DispatchIntent did, so nothing
+    /// reached a provider. Each is `(job_id, attempt_id, automatic)`, where
+    /// `automatic` says the admission worker owned the publication window.
     ///
-    /// Only the frozen request on that Call carries the turn's Conversation
-    /// context, so such an Attempt has nothing to resume from. With no Call
-    /// and no DispatchIntent, nothing was sent to a provider.
-    pub(crate) fn unpublished_chat_admission(&self, job_id: &str) -> Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT a.id FROM domain_jobs j
-                 JOIN domain_chat_turns t ON t.job_id=j.id
-                 JOIN domain_attempts a ON a.id=j.authoritative_attempt_id AND a.generation=j.generation
-                 WHERE j.id=?1 AND j.state='running' AND j.automatic_admission=1
-                   AND NOT EXISTS(SELECT 1 FROM domain_calls c WHERE c.attempt_id=a.id)
-                   AND NOT EXISTS(SELECT 1 FROM domain_dispatch_intents i WHERE i.attempt_id=a.id)",
-                [job_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql)
+    /// An explicit origin (launch, retry, probe) publishes under the same
+    /// launch lock the caller of this query holds, so such an Attempt seen
+    /// here is a remnant of an interrupted origin, never one still publishing.
+    pub(crate) fn unpublished_admissions(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(JobId, AttemptId, bool)>> {
+        query_all(
+            &self.connection,
+            "SELECT j.id,a.id,j.automatic_admission=1 FROM domain_jobs j
+             JOIN domain_attempts a ON a.id=j.authoritative_attempt_id AND a.generation=j.generation
+             WHERE j.project_id=?1 AND j.state='running' AND a.state IN ('queued','running')
+               AND EXISTS(SELECT 1 FROM domain_executors e WHERE e.attempt_id=a.id AND e.kind='provider')
+               AND NOT EXISTS(SELECT 1 FROM domain_calls c WHERE c.attempt_id=a.id)
+               AND NOT EXISTS(SELECT 1 FROM domain_dispatch_intents i WHERE i.attempt_id=a.id)
+             ORDER BY j.created_at,j.id",
+            &[&project_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
     }
 
     /// Chat-root Jobs whose current Attempt was created at or before `cutoff`

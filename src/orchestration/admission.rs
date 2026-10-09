@@ -460,14 +460,15 @@ fn endpoint_has_userinfo(endpoint: &str) -> bool {
 /// Reserve an eligible Job: freeze the target and claim its Attempt and Executor.
 ///
 /// This is the transition from "a Job exists" to "this Job has been validly
-/// reserved". Payload construction happens after this returns, because Chat
-/// needs the Attempt identity to persist its turn. [`publish_call`] is the only
-/// way that reserved Attempt becomes a provider Call.
+/// reserved". The generation's execution input is frozen in the same commit
+/// as its Attempt, so every reserved Attempt carries what recovery needs to
+/// replay it exactly or refuse it. [`publish_call`] is the only way that
+/// reserved Attempt becomes a provider Call.
 pub(crate) fn reserve(
     context: &mut AdmissionContext<'_>,
     job: &Job,
     resolved: &ResolvedTarget,
-    chat: Option<&super::domain::ChatTurnDraft<'_>>,
+    input: &super::domain::JobInputDraft<'_>,
 ) -> Result<std::result::Result<ReservedExecution, AdmissionRefusal>> {
     if resolved.reservation.pickup == AdmissionPickup::Explicit
         && resolved.reservation.exact.is_none()
@@ -483,7 +484,7 @@ pub(crate) fn reserve(
             attempt: reserved.attempt,
             executor: reserved.executor,
             existing_call: !calls.is_empty(),
-            chat_history: None,
+            messages: None,
         }));
     }
     let quota = placement::quota(
@@ -505,11 +506,13 @@ pub(crate) fn reserve(
         }),
         (AdmissionPickup::Automatic, None) | (AdmissionPickup::Explicit, _) => None,
     };
-    match context
-        .domain
-        .dispatch_job_for_admission(&job.id, &resolved.reservation, placement, chat)
-    {
-        Ok((attempt, executor, chat_history)) => {
+    match context.domain.dispatch_job_for_admission(
+        &job.id,
+        &resolved.reservation,
+        placement,
+        input,
+    ) {
+        Ok((attempt, executor, messages)) => {
             let mode = match &resolved.reservation.exact {
                 Some(exact) => super::placement_projection::PlacementMode::Exact {
                     provider: exact.provider.clone(),
@@ -532,7 +535,7 @@ pub(crate) fn reserve(
                 attempt,
                 executor,
                 existing_call: false,
-                chat_history,
+                messages: Some(messages),
             }))
         }
         Err(error) => Ok(Err(AdmissionRefusal {
@@ -669,9 +672,10 @@ pub(crate) struct ReservedExecution {
     /// True when this Attempt already owns a Call. The origin must not prepare
     /// another payload; [`publish_call`] resumes the existing one.
     pub existing_call: bool,
-    /// For a Chat reservation, the first request's messages, resolved from the
-    /// frozen request committed with the reservation.
-    pub chat_history: Option<Vec<serde_json::Value>>,
+    /// The first request's messages, resolved from the input frozen with this
+    /// reservation. `None` when an existing reservation was resumed; its
+    /// frozen input is read back by the origin instead.
+    pub messages: Option<Vec<serde_json::Value>>,
 }
 
 pub(crate) struct AdmittedExecution {
@@ -697,6 +701,6 @@ fn resume_reserved(domain: &DomainRepository, job: &Job) -> Result<ReservedExecu
         attempt,
         executor,
         existing_call: false,
-        chat_history: None,
+        messages: None,
     })
 }

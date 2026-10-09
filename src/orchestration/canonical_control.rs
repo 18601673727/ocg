@@ -2045,7 +2045,11 @@ impl CanonicalControlService {
                     Err(error) => return Err(OcgError::io("lock Job admission", error)),
                 }
                 let jobs = domain.automatic_admission_jobs(&project.project_id)?;
-                if jobs.is_empty() && domain.pending_dispatch_intents()?.is_empty() {
+                let unpublished = domain.unpublished_admissions(&project.project_id)?;
+                if jobs.is_empty()
+                    && unpublished.is_empty()
+                    && domain.pending_dispatch_intents()?.is_empty()
+                {
                     return Ok(());
                 }
                 // Admission acts only for a Project this process owns. With
@@ -2053,7 +2057,43 @@ impl CanonicalControlService {
                 // startup recovery; a Project another process owns is refused
                 // here, before any of its Jobs is touched.
                 self.execution_owner(&project.project_id, Path::new(&project.root))?;
+                // Recovery disposition of an Attempt committed without a
+                // published Call is decided by its frozen input alone. Only a
+                // worker-owned reservation whose input is re-derivable resumes,
+                // and it resumes by publishing exactly that input. Everything
+                // else settles as failed: nothing reached a provider, and an
+                // explicit retry replays the frozen input if one exists.
+                let mut interrupted = std::collections::BTreeSet::new();
+                for (job_id, attempt_id, automatic) in unpublished {
+                    let generation = domain
+                        .attempt(&attempt_id)?
+                        .ok_or_else(|| invalid("unpublished Attempt disappeared"))?
+                        .generation;
+                    let resumable = automatic
+                        && domain
+                            .job_input(&job_id, generation)?
+                            .is_some_and(|frozen| {
+                                frozen.input.is_ok()
+                                    && frozen.replay == super::domain::InputReplay::Replaceable
+                            });
+                    if resumable {
+                        continue;
+                    }
+                    domain.fail_attempt(
+                        &attempt_id,
+                        &super::domain::job_failure(
+                            "admission_interrupted",
+                            FailureClass::Internal,
+                            "admission was interrupted before its provider Call was published; nothing was sent to the provider",
+                            true,
+                        ),
+                    )?;
+                    interrupted.insert(job_id);
+                }
                 for job in jobs {
+                    if interrupted.contains(&job.id) {
+                        continue;
+                    }
                     selected_jobs.insert(job.id.clone());
                     if job.state == super::domain::JobState::Eligible {
                         let mut deferrals = self
@@ -2081,27 +2121,6 @@ impl CanonicalControlService {
                         }
                         deferrals.remove(&job.id);
                     }
-                    // A Chat turn whose admission was interrupted before its
-                    // Call was published must not resume as generic work: the
-                    // rebuilt request would carry the objective alone, without
-                    // the Conversation's context. Nothing reached a provider,
-                    // so its Attempt settles as failed and the turn waits for
-                    // the operator, like any other unstarted Chat failure.
-                    if job.state == super::domain::JobState::Running {
-                        if let Some(attempt_id) = domain.unpublished_chat_admission(&job.id)? {
-                            domain.fail_attempt(
-                                &attempt_id,
-                                &super::domain::job_failure(
-                                    "chat_admission_interrupted",
-                                    FailureClass::Internal,
-                                    "Chat admission was interrupted before its provider Call was published; nothing was sent to the provider",
-                                    true,
-                                ),
-                            )?;
-                            continue;
-                        }
-                    }
-
                     let request = crate::contracts::JobLaunchRequest {
                         command_id: format!("auto-{}", job.id),
                         draft_id: job.id.clone(),
@@ -2286,19 +2305,19 @@ impl CanonicalControlService {
         })
     }
 
-    /// The request, protocol and execution target that replay a Chat turn's
-    /// frozen logical request exactly, or a refusal.
+    /// The request, protocol and execution target that replay a Job
+    /// generation's frozen execution input exactly, or a refusal.
     ///
     /// Nothing is substituted: the frozen provider, model, upstream model,
     /// protocol, endpoint and credential reference must all still be what the
     /// Profile configures, the Effort and images must still be supported, and
     /// every image must still resolve. Only the credential value behind the
     /// same Vault reference may have changed.
-    fn frozen_chat_replay(
+    fn frozen_input_replay(
         &self,
         domain: &DomainRepository,
         project_id: &str,
-        launch: &super::domain::ChatLaunch,
+        frozen: &super::domain::FrozenJobInput,
     ) -> Result<(
         Value,
         crate::provider_protocol::ProviderProtocol,
@@ -2306,9 +2325,10 @@ impl CanonicalControlService {
     )> {
         let refuse = |why: String| {
             invalid(format!(
-                "Chat retry refused: {why}; the original request is never replayed against a different target"
+                "replay refused: {why}; the original request is never replayed against a different target"
             ))
         };
+        let launch = frozen.input.as_ref().map_err(|why| refuse(why.clone()))?;
         let target = &launch.target;
         let (profile, _) = self
             .profile_service
@@ -2366,23 +2386,16 @@ impl CanonicalControlService {
                 )));
             }
         }
-        let images = launch.messages.iter().any(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|parts| {
-                    parts
-                        .iter()
-                        .any(|part| part.get("type").and_then(Value::as_str) == Some("ocg_image"))
-                })
-        });
-        if let Some(refusal) =
-            chat_capability_refusal(provider, model, launch.effort.as_deref(), images)
-        {
+        if let Some(refusal) = chat_capability_refusal(
+            provider,
+            model,
+            launch.effort.as_deref(),
+            launch.has_images(),
+        ) {
             return Err(refuse(refusal.to_string()));
         }
         let messages = domain
-            .resolve_chat_launch_messages(project_id, launch)
+            .resolve_job_input_messages(project_id, launch)
             .map_err(|error| refuse(format!("an original image cannot be read ({error})")))?;
         let mut request = json!({
             "model": target.model_key,
@@ -2477,7 +2490,8 @@ impl CanonicalControlService {
             .iter()
             .filter(|intent| intent.job_id == job_id && intent.provider_key.is_some())
             .min_by_key(|intent| (intent.generation, intent.created_at, &intent.id));
-        let runtime = (template.is_some() || chat_session.is_some()).then_some(owner);
+        let frozen = domain.latest_job_input(job_id)?;
+        let runtime = (template.is_some() || frozen.is_some()).then_some(owner);
         let replay = template
             .map(|intent| -> Result<_> {
                 let input: Value = serde_json::from_str(&intent.request)
@@ -2514,31 +2528,36 @@ impl CanonicalControlService {
             .transpose()?;
         // Replay precedence: a provider DispatchIntent's frozen request is what
         // actually ran, so it stays authoritative once it exists. Before any
-        // Call, a Chat turn's frozen logical request is what was asked. A turn
-        // with neither is refused below rather than given an invented request.
+        // Call, the Job's frozen execution input is what was asked. A provider
+        // Job with neither is refused below rather than given an invented
+        // request, whatever origin created it.
         let replay = match replay {
             Some(replay) => Some(replay),
-            None if chat_session.is_some() => domain
-                .chat_launch_for_job(job_id)?
-                .map(|launch| self.frozen_chat_replay(&domain, &job.project_id, &launch))
+            None => frozen
+                .as_ref()
+                .map(|frozen| self.frozen_input_replay(&domain, &job.project_id, frozen))
                 .transpose()?,
-            None => None,
         };
+        let previous_kind = snapshot
+            .executors
+            .iter()
+            .find(|executor| {
+                snapshot.attempts.iter().any(|attempt| {
+                    attempt.id == executor.attempt_id
+                        && attempt.job_id == job_id
+                        && attempt.generation == job.generation
+                })
+            })
+            .map(|executor| executor.kind.as_str());
+        if replay.is_none() && (chat_session.is_some() || previous_kind == Some("provider")) {
+            return Err(invalid(
+                "retry refused: this Job has no frozen execution input to replay; launch it again",
+            ));
+        }
         let executor_kind = if replay.is_some() {
             "provider"
         } else {
-            snapshot
-                .executors
-                .iter()
-                .find(|executor| {
-                    snapshot.attempts.iter().any(|attempt| {
-                        attempt.id == executor.attempt_id
-                            && attempt.job_id == job_id
-                            && attempt.generation == job.generation
-                    })
-                })
-                .map(|executor| executor.kind.as_str())
-                .unwrap_or("worker")
+            previous_kind.unwrap_or("worker")
         };
         // Resolve everything the replacement needs before it is admitted, so a
         // refusal here leaves the Job exactly as it was.
@@ -2583,11 +2602,6 @@ impl CanonicalControlService {
                 Ok((request, runtime, profile, project, resolved))
             })
             .transpose()?;
-        if chat_session.is_some() && replay.is_none() {
-            return Err(invalid(
-                "Chat retry refused: this turn has no frozen request to replay (it was admitted before Chat requests were frozen); send the message again",
-            ));
-        }
         let (global, _, _) = self.read_configuration()?;
         let budget_config = self.provider_budget_config(&global)?;
         // The replacement Attempt and the reactivated assistant Message commit
@@ -2632,7 +2646,7 @@ impl CanonicalControlService {
                     attempt: admission.attempt.clone(),
                     executor: admission.executor.clone(),
                     existing_call: false,
-                    chat_history: None,
+                    messages: None,
                 },
                 PreparedExecution {
                     request,
@@ -3135,8 +3149,10 @@ impl CanonicalControlService {
                 });
             }
         };
-        let provider_key = resolved.reservation.choice.provider.as_str();
-        let model = resolved.reservation.choice.model.as_str();
+        let provider_key = resolved.reservation.choice.provider.clone();
+        let provider_key = provider_key.as_str();
+        let model = resolved.reservation.choice.model.clone();
+        let model = model.as_str();
 
         let provider_entry = profile
             .providers
@@ -3186,27 +3202,42 @@ impl CanonicalControlService {
         } else {
             domain.create_job(&canonical_project.id, job_spec)?
         };
-        // Reservation is the canonical admission transition. Chat and generic
-        // launch both pass through it. A new Chat turn commits its Conversation
-        // turn, Messages and frozen logical request in the same transaction as
-        // its Attempt, so no Chat Attempt can exist without its Chat identity.
+        // Reservation is the canonical admission transition. Every origin
+        // freezes its generation's execution input in the same transaction as
+        // the Attempt. A new Chat turn also stages its Conversation turn and
+        // Messages there, and its input is the Conversation history at that
+        // turn boundary. Any other Job's input is derived from its
+        // specification alone, so recovery may re-place it.
         let user_content = initial_user_message(&request);
-        let chat_draft =
-            (is_chat && existing_job.is_none()).then(|| super::domain::ChatTurnDraft {
-                request: &request,
-                request_hash: &request_hash,
-                content: &user_content,
-                images: &images,
-                target: super::domain::ChatLaunchTarget {
-                    provider_key: resolved.config.provider_key.clone(),
-                    model_key: resolved.config.model.clone(),
-                    upstream_model_id: resolved.config.upstream_model_id.clone(),
-                    protocol: resolved.protocol,
-                    endpoint: resolved.config.endpoint.clone(),
-                    credential_ref: resolved.config.credential_ref.clone(),
-                },
-                effort: effort.map(str::to_string),
-            });
+        let input = super::domain::JobInputDraft {
+            target: super::domain::ExecutionTarget {
+                provider_key: resolved.config.provider_key.clone(),
+                model_key: resolved.config.model.clone(),
+                upstream_model_id: resolved.config.upstream_model_id.clone(),
+                protocol: resolved.protocol,
+                endpoint: resolved.config.endpoint.clone(),
+                credential_ref: resolved.config.credential_ref.clone(),
+            },
+            effort: effort.map(str::to_string),
+            payload: super::domain::InputPayload::Agent,
+            replay: if is_chat {
+                super::domain::InputReplay::Exact
+            } else {
+                super::domain::InputReplay::Replaceable
+            },
+            content: if is_chat && existing_job.is_none() {
+                super::domain::InputContent::ChatTurn(super::domain::ChatTurnDraft {
+                    request: &request,
+                    request_hash: &request_hash,
+                    content: &user_content,
+                    images: &images,
+                })
+            } else {
+                super::domain::InputContent::Messages(vec![
+                    json!({"role": "user", "content": user_content}),
+                ])
+            },
+        };
         let reserved = match reserve(
             &mut AdmissionContext {
                 domain: &mut domain,
@@ -3221,7 +3252,7 @@ impl CanonicalControlService {
             },
             &job,
             &resolved,
-            chat_draft.as_ref(),
+            &input,
         )? {
             Ok(reserved) => reserved,
             Err(refusal) => {
@@ -3247,24 +3278,59 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
-        let messages = if reserved.existing_call {
-            Vec::new()
-        } else if is_chat {
-            reserved
-                .chat_history
-                .clone()
-                .ok_or_else(|| invalid("Chat reservation committed no frozen request"))?
-        } else {
-            vec![json!({"role": "user", "content": user_content})]
+        let mut resolved = resolved;
+        let provider_request = match (&reserved.messages, reserved.existing_call) {
+            // The Call already exists; publication resumes it unchanged.
+            (_, true) => json!({"model": model, "messages": [], "stream": true}),
+            (Some(messages), false) => {
+                let mut request = json!({
+                    "model": model,
+                    "messages": messages,
+                    "stream": true,
+                });
+                if let Some(effort) = effort {
+                    request["reasoning_effort"] = json!(effort);
+                }
+                request
+            }
+            // A resumed reservation publishes exactly the input its generation
+            // froze, against that frozen target. Recovery already refused
+            // every reservation that has no such input.
+            (None, false) => {
+                let frozen = domain
+                    .job_input(&job.id, reserved.attempt.generation)?
+                    .ok_or_else(|| invalid("resumed Attempt has no frozen execution input"))?;
+                let (request, protocol, config) = match self.frozen_input_replay(
+                    &domain,
+                    &job.project_id,
+                    &frozen,
+                ) {
+                    Ok(replay) => replay,
+                    Err(error) => {
+                        // Nothing was sent, and the frozen input can no
+                        // longer run as committed: settle it, never
+                        // substitute a target or a rebuilt request.
+                        domain.fail_attempt(
+                                &reserved.attempt.id,
+                                &super::domain::job_failure(
+                                    "admission_interrupted",
+                                    FailureClass::Internal,
+                                    &format!("admission was interrupted before its provider Call was published; nothing was sent to the provider; {error}"),
+                                    true,
+                                ),
+                            )?;
+                        return Err(error);
+                    }
+                };
+                resolved.protocol = protocol;
+                resolved.config = config;
+                resolved.effort = request
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                request
+            }
         };
-        let mut provider_request = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-        });
-        if let Some(effort) = effort {
-            provider_request["reasoning_effort"] = json!(effort);
-        }
         let chat = self
             .chat_registrations
             .lock()
@@ -3542,7 +3608,26 @@ impl CanonicalControlService {
             },
             &job,
             &resolved,
-            None,
+            &super::domain::JobInputDraft {
+                target: super::domain::ExecutionTarget {
+                    provider_key: resolved.config.provider_key.clone(),
+                    model_key: resolved.config.model.clone(),
+                    upstream_model_id: resolved.config.upstream_model_id.clone(),
+                    protocol: resolved.protocol,
+                    endpoint: resolved.config.endpoint.clone(),
+                    credential_ref: resolved.config.credential_ref.clone(),
+                },
+                effort: intent.effort.clone(),
+                payload: super::domain::InputPayload::Probe,
+                replay: super::domain::InputReplay::Exact,
+                content: super::domain::InputContent::Messages(
+                    super::health_probe::probe_request(&intent.model, intent.effort.as_deref())
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .ok_or_else(|| invalid("probe request has no messages"))?,
+                ),
+            },
         )? {
             Ok(reserved) => reserved,
             Err(refusal) => {
