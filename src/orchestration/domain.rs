@@ -969,6 +969,9 @@ pub struct ChatMessageOrigin {
     pub job_id: String,
     pub attempt_state: String,
     pub failure_reason: Option<String>,
+    /// The termination message when the Core stopped this turn for a
+    /// recorded cause, which an operator's cancellation never carries.
+    pub cause_reason: Option<String>,
 }
 
 /// Displayable provider output received before its Call failed.
@@ -1362,7 +1365,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                   WHERE i.attempt_id=a.id AND i.failure IS NOT NULL
                     AND i.state IN ('failed','fenced')
                   ORDER BY CASE i.state WHEN 'failed' THEN 0 ELSE 1 END,
-                    i.updated_at DESC,i.created_at DESC,i.id DESC LIMIT 1)
+                    i.updated_at DESC,i.created_at DESC,i.id DESC LIMIT 1),
+                 j.termination_reason
                  FROM domain_messages m
              JOIN domain_chat_turns t ON t.attempt_id=m.attempt_id
              JOIN domain_conversations c ON c.id=t.conversation_id
@@ -1380,6 +1384,11 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                         job_id: row.get(2)?,
                         attempt_state: row.get(3)?,
                         failure_reason: row.get(4)?,
+                        cause_reason: row
+                            .get::<_, Option<String>>(5)?
+                            .and_then(|raw| serde_json::from_str::<Failure>(&raw).ok())
+                            .filter(|reason| CancelCause::recorded_in(reason).is_some())
+                            .map(|reason| reason.message),
                     },
                 ))
             })
@@ -5316,8 +5325,55 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
     }
 
     pub fn confirm_cancel(&mut self, attempt_id: &str, stopped: bool) -> Result<()> {
+        self.confirm_cancel_with_cause(attempt_id, stopped, None)
+    }
+
+    /// Confirm a requested cancellation, recording the Core's `cause` when it
+    /// initiated the stop. The terminal state is the same either way.
+    pub(crate) fn confirm_cancel_with_cause(
+        &mut self,
+        attempt_id: &str,
+        stopped: bool,
+        cause: Option<CancelCause>,
+    ) -> Result<()> {
         let terminal = if stopped { "cancelled" } else { "unknown" };
-        self.set_attempt_terminal_or_cancelling(attempt_id, terminal, true)
+        let mut reason = cancel_reason(terminal, true);
+        if let (Some(reason), Some(cause)) = (reason.as_mut(), cause) {
+            reason.message = format!("{}; {}", cause.summary(), reason.message);
+            reason.details = Some(serde_json::json!({ "cause": cause.code() }));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        finish_attempt_with_reason_in(&transaction, attempt_id, terminal, true, reason.as_ref())?;
+        transaction.commit().map_err(sql)
+    }
+
+    /// Chat-root Jobs whose current Attempt was created at or before `cutoff`
+    /// and is still queued or running.
+    ///
+    /// The deadline is anchored on the durable Attempt, not on any transport,
+    /// so it holds with no stream attached and for an Attempt that restart
+    /// recovery re-dispatched. A Chat retry mints a new Attempt and so a new
+    /// deadline. A Job already cancelling is left to that cancellation.
+    pub(crate) fn chat_execution_deadline_due(&self, cutoff: i64) -> Result<Vec<(String, u64)>> {
+        query_all(
+            &self.connection,
+            "SELECT j.id,j.generation FROM domain_chat_turns t
+             JOIN domain_jobs j ON j.id=t.job_id
+             JOIN domain_attempts a ON a.id=j.authoritative_attempt_id AND a.generation=j.generation
+             WHERE j.depth=0 AND j.state='running' AND a.state IN ('queued','running') AND a.created_at<=?1
+             ORDER BY a.created_at,j.id",
+            &[&cutoff],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    u64::try_from(row.get::<_, i64>(1)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                ))
+            },
+        )
     }
 
     pub fn mark_orphaned(&mut self, attempt_id: &str) -> Result<()> {
@@ -7853,7 +7909,18 @@ fn finish_attempt_in(
     state: &str,
     require_cancelling: bool,
 ) -> Result<()> {
-    let reason = match state {
+    finish_attempt_with_reason_in(
+        transaction,
+        attempt_id,
+        state,
+        require_cancelling,
+        cancel_reason(state, require_cancelling).as_ref(),
+    )
+}
+
+/// The termination reason a cancellation lifecycle records for `state`.
+fn cancel_reason(state: &str, require_cancelling: bool) -> Option<Failure> {
+    match state {
         "cancelled" => Some(job_failure(
             "job_cancelled",
             FailureClass::Cancelled,
@@ -7873,14 +7940,39 @@ fn finish_attempt_in(
             true,
         )),
         _ => None,
-    };
-    finish_attempt_with_reason_in(
-        transaction,
-        attempt_id,
-        state,
-        require_cancelling,
-        reason.as_ref(),
-    )
+    }
+}
+
+/// Why the Core itself, rather than an operator, cancelled an execution.
+///
+/// The cause never changes the terminal state, which still records whether
+/// the stop was confirmed (`cancelled`) or not (`unknown`). It rides the
+/// termination reason's details, so a Core-initiated stop is never presented
+/// as an operator's cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelCause {
+    /// A Chat turn outlived its execution deadline.
+    ChatExecutionTimeout,
+}
+
+impl CancelCause {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ChatExecutionTimeout => "chat_execution_timeout",
+        }
+    }
+
+    pub(crate) fn summary(self) -> &'static str {
+        match self {
+            Self::ChatExecutionTimeout => "Chat execution exceeded its deadline",
+        }
+    }
+
+    /// The cause a committed termination reason records, if any.
+    pub(crate) fn recorded_in(reason: &Failure) -> Option<Self> {
+        let code = reason.details.as_ref()?.get("cause")?.as_str()?;
+        (code == Self::ChatExecutionTimeout.code()).then_some(Self::ChatExecutionTimeout)
+    }
 }
 
 pub(crate) fn job_failure(

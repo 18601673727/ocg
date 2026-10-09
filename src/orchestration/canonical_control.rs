@@ -34,7 +34,8 @@ const CONFIG_FILE: &str = "configuration.json";
 /// provider terminal event is recorded. This is transport retention only, not
 /// durable chat history.
 const CHAT_REPLAY_LIFETIME: Duration = Duration::from_secs(300);
-pub(crate) const CHAT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(900);
+/// How long a Chat-root Job's Attempt may execute before the Core cancels it.
+const CHAT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(900);
 
 fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
@@ -673,9 +674,6 @@ struct ActiveChat {
     cancelled: CallCancellation,
     sender: flume::Sender<ExecutionEvent>,
     buffer: std::sync::Arc<ChatEventBuffer>,
-    /// When the turn started. The execution deadline is anchored here,
-    /// so every SSE attach/reconnect of the same turn shares one deadline.
-    started_at: Instant,
 }
 
 /// The live transport a Chat retry installed for its replacement Attempt.
@@ -1431,13 +1429,19 @@ impl CanonicalControlService {
                     state: message.state,
                     // Dispatch failures are already redacted at the provider boundary.
                     // Diagnostics belong to the view, never to Conversation blocks.
+                    // A stop the Core made for a recorded cause names it, even
+                    // when the stop was confirmed, so it never reads as an
+                    // operator's cancellation.
                     failure_reason: if role == ChatMessageRole::Assistant
                         && message.state == MessageLifecycle::Failed
-                        && origin.attempt_state != "cancelled"
                     {
                         origin
-                            .failure_reason
+                            .cause_reason
                             .as_ref()
+                            .or(origin
+                                .failure_reason
+                                .as_ref()
+                                .filter(|_| origin.attempt_state != "cancelled"))
                             .map(|reason| reason.chars().take(1024).collect::<String>())
                     } else {
                         None
@@ -1724,6 +1728,9 @@ impl CanonicalControlService {
                         if let Err(error) = service.reconcile_watchdog() {
                             tracing::error!(%error, "fleet watchdog reconciliation deferred");
                         }
+                        if let Err(error) = service.enforce_chat_execution_deadlines() {
+                            tracing::error!(%error, "chat execution deadline enforcement deferred");
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -1774,6 +1781,40 @@ impl CanonicalControlService {
             if let Err(error) = super::watchdog::reconcile_repository(&mut domain, runtime.as_ref())
             {
                 failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Cancel every Chat-root Job whose current Attempt outlived the Chat
+    /// execution deadline.
+    ///
+    /// The deadline is a Chat policy enforced here, independently of any
+    /// stream: each stop goes through [`Self::cancel_job`]'s lifecycle and
+    /// records the timeout as its cause. A cancellation that is rejected
+    /// (the Job settled or moved on) records and publishes nothing.
+    pub(crate) fn enforce_chat_execution_deadlines(&self) -> Result<()> {
+        let cutoff = crate::clock::Clock::now_unix(&crate::clock::SystemClock)
+            - CHAT_EXECUTION_TIMEOUT.as_secs() as i64;
+        let mut failure = None;
+        for project in self.projects()? {
+            let due = match DomainRepository::open_existing(Path::new(&project.root))
+                .and_then(|domain| domain.chat_execution_deadline_due(cutoff))
+            {
+                Ok(due) => due,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            for (job_id, generation) in due {
+                if let Err(error) = self.cancel_job_for_cause(
+                    &job_id,
+                    generation,
+                    Some(super::domain::CancelCause::ChatExecutionTimeout),
+                ) {
+                    tracing::debug!(%error, job_id, "chat execution deadline cancellation rejected");
+                }
             }
         }
         failure.map_or(Ok(()), Err)
@@ -1976,11 +2017,33 @@ impl CanonicalControlService {
         job_id: &str,
         expected_generation: u64,
     ) -> Result<CanonicalJobOperationResponse> {
+        self.cancel_job_for_cause(job_id, expected_generation, None)
+    }
+
+    /// Cancel through the one canonical cancellation lifecycle, recording the
+    /// Core's `cause` when it, not an operator, initiated the stop.
+    fn cancel_job_for_cause(
+        &self,
+        job_id: &str,
+        expected_generation: u64,
+        cause: Option<super::domain::CancelCause>,
+    ) -> Result<CanonicalJobOperationResponse> {
         let mut domain = self.repository_for_job(job_id)?;
         let job = domain
             .job(job_id)?
             .ok_or_else(|| invalid("unknown canonical Job"))?;
         let accepted = job.state.can_cancel();
+        // A Core-initiated stop only ever starts a cancellation. It never
+        // re-confirms one an operator already requested, so it cannot attach
+        // its cause to their outcome.
+        if cause.is_some() && job.state != super::domain::JobState::Running {
+            return Ok(CanonicalJobOperationResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                job_id: job.id,
+                accepted: false,
+                snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
+            });
+        }
         for (authority, never_started) in
             domain.request_job_cancel_cascade(job_id, expected_generation)?
         {
@@ -2004,17 +2067,28 @@ impl CanonicalControlService {
                     .cancel_attempt(&authority.attempt_id)?,
                 None => false,
             };
-            domain.confirm_cancel(&authority.attempt_id, signalled || never_started)?;
+            domain.confirm_cancel_with_cause(
+                &authority.attempt_id,
+                signalled || never_started,
+                cause,
+            )?;
+            // The stream reports the committed outcome: an operator's stop
+            // stays "chat cancelled", and a Core-initiated stop names its
+            // cause and whether the stop was confirmed.
+            let outcome = match cause {
+                None => "chat cancelled".to_string(),
+                Some(cause) => domain
+                    .job(&authority.job_id)?
+                    .and_then(|job| job.termination_reason)
+                    .map_or_else(|| cause.summary().to_string(), |reason| reason.message),
+            };
             if let Ok(chats) = self.active_chats.lock() {
                 for chat in chats
                     .values()
                     .filter(|chat| chat.attempt_id == authority.attempt_id)
                 {
                     chat.cancelled.cancel();
-                    if let Err(error) = chat
-                        .sender
-                        .send(ExecutionEvent::Failed("chat cancelled".to_string()))
-                    {
+                    if let Err(error) = chat.sender.send(ExecutionEvent::Failed(outcome.clone())) {
                         tracing::debug!(%error, "cancelled Job chat receiver closed");
                     }
                 }
@@ -2322,7 +2396,6 @@ impl CanonicalControlService {
                     cancelled: cancelled.clone(),
                     sender: sender.clone(),
                     buffer: buffer.clone(),
-                    started_at: Instant::now(),
                 },
             );
         let transport = ChatRetryTransport {
@@ -3397,7 +3470,6 @@ impl CanonicalControlService {
                         cancelled: cancelled.clone(),
                         sender: sender.clone(),
                         buffer: buffer.clone(),
-                        started_at: Instant::now(),
                     },
                 );
             })
@@ -3530,15 +3602,14 @@ impl CanonicalControlService {
         }
     }
 
-    /// Clone the retained tail for one SSE attach, together with the turn's
-    /// start time. The entry stays for cancellation until `finish_chat`
-    /// removes it. Late attach replays from index zero; live events follow
-    /// once the prefix is drained.
+    /// Clone the retained tail for one SSE attach. The entry stays for
+    /// cancellation until `finish_chat` removes it. Late attach replays from
+    /// index zero; live events follow once the prefix is drained.
     pub(crate) fn chat_buffer_for(
         &self,
         session_id: &str,
         job_id: &str,
-    ) -> Option<(std::sync::Arc<ChatEventBuffer>, Instant)> {
+    ) -> Option<std::sync::Arc<ChatEventBuffer>> {
         self.reap_expired_chats();
         let mut guard = self.active_chats.lock().ok()?;
         let key = guard
@@ -3557,7 +3628,7 @@ impl CanonicalControlService {
             guard.remove(&key);
             return None;
         }
-        Some((entry.buffer.clone(), entry.started_at))
+        Some(entry.buffer.clone())
     }
 
     /// Opportunistically reap terminal transport buffers. Running chats are
@@ -3607,24 +3678,6 @@ impl CanonicalControlService {
 
     pub fn cancel_chat(&self, session_id: &str) -> Result<bool> {
         self.cancel_chat_in_project(None, session_id)
-    }
-
-    pub(crate) fn cancel_chat_turn(&self, session_id: &str, job_id: &str) -> Result<bool> {
-        let active = {
-            let mut chats = self
-                .active_chats
-                .lock()
-                .map_err(|_| invalid("active chats poisoned"))?;
-            let key = chats
-                .iter()
-                .find(|(_, entry)| entry.session_id == session_id && entry.job_id == job_id)
-                .map(|(key, _)| key.clone());
-            key.and_then(|key| chats.remove(&key))
-        };
-        match active {
-            Some(active) => self.end_active_chat(active),
-            None => Ok(false),
-        }
     }
 
     pub fn cancel_chat_in_project(
@@ -3787,7 +3840,6 @@ mod chat_retry_transport_tests {
                 cancelled: CallCancellation::new(),
                 sender,
                 buffer: buffer.clone(),
-                started_at: Instant::now(),
             },
         );
         buffer

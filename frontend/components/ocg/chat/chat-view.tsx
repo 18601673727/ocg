@@ -419,6 +419,11 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
              {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
                {chatFailureReason(t, message)}
              </p>}
+             {/* A stop the runtime made for a recorded cause, such as the
+                 execution deadline, names that cause; an operator's stop has none. */}
+             {message.status === "cancelled" && message.failureReason && <p className="mt-2 whitespace-pre-wrap break-words text-[12px]">
+               {message.failureReason}
+             </p>}
              {onRetry && <Button className="mt-2" size="xs" variant="outline" disabled={retryDisabled} onClick={onRetry}>{t("common.retry")}</Button>}
              {message.status !== "completed" && message.status !== "pending" && (
                <span className="mt-1 block text-[11px] text-muted-foreground">

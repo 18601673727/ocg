@@ -1945,7 +1945,7 @@ fn handle_chat_stream(
             )
         }
     };
-    let Some((buffer, started_at)) = service.chat_buffer_for(&session_id, &job_id) else {
+    let Some(buffer) = service.chat_buffer_for(&session_id, &job_id) else {
         return write_api_error(
             stream,
             &ApiError::new(404, "unknown_chat", "chat stream unavailable"),
@@ -1964,12 +1964,10 @@ fn handle_chat_stream(
     stream.write_all(head.as_bytes())?;
     stream.flush()?;
 
-    // The execution deadline belongs to the turn, not to this connection:
-    // `started_at` was fixed when the ActiveChat was created, so every
-    // attach and reconnect shares the same deadline and a reconnect can
-    // never extend the execution lifetime.
-    let overall = crate::orchestration::canonical_control::CHAT_EXECUTION_TIMEOUT;
-    let deadline = started_at + overall;
+    // The tail observes the turn; it never decides it. The Chat execution
+    // deadline is enforced by the canonical service whether or not a stream
+    // is attached, and its cancellation publishes the terminal event that
+    // ends this tail like any other.
     let mut last_heartbeat = std::time::Instant::now();
     let heartbeat = Duration::from_secs(10);
     let poll = Duration::from_millis(200);
@@ -2015,26 +2013,6 @@ fn handle_chat_stream(
                 disconnected = true;
                 break;
             }
-        }
-        // A turn whose terminal event is already buffered has settled: an
-        // attach after the deadline replays that outcome rather than
-        // reporting a timeout the canonical state never had.
-        let settled = buffer
-            .state
-            .lock()
-            .map_err(|_| std::io::Error::other("chat buffer poisoned"))?
-            .terminal;
-        if !settled && std::time::Instant::now() >= deadline {
-            // The timeout must enter the canonical cancellation path so the
-            // Attempt/Call/provider execution is actually revoked. It runs
-            // before the notification, so the history refresh the notification
-            // triggers reads the committed cancellation, and it precedes any
-            // ActiveChat removal so the cancel state is still findable.
-            let _ = service.cancel_chat_turn(&session_id, &job_id);
-            let payload = json!({"error": "chat stream timed out"}).to_string();
-            let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
-            let _ = stream.flush();
-            break;
         }
         let (base_index, pending): (
             usize,
