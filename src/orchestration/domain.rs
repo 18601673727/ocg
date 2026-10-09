@@ -1380,18 +1380,26 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             .map_err(sql)?;
         let rows = statement
             .query_map(params![project_id, session_id], |row| {
+                let termination = row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|raw| serde_json::from_str::<Failure>(&raw).ok());
                 Ok((
                     row.get::<_, String>(0)?,
                     ChatMessageOrigin {
                         command_id: row.get(1)?,
                         job_id: row.get(2)?,
                         attempt_state: row.get(3)?,
-                        failure_reason: row.get(4)?,
-                        cause_reason: row
-                            .get::<_, Option<String>>(5)?
-                            .and_then(|raw| serde_json::from_str::<Failure>(&raw).ok())
+                        // The current generation's DispatchIntent failure is the
+                        // most specific evidence. Without one (a failure before
+                        // any Call existed) the Job's committed termination
+                        // reason, which a retry clears, is the evidence.
+                        failure_reason: row
+                            .get::<_, Option<String>>(4)?
+                            .or_else(|| termination.as_ref().map(|reason| reason.message.clone())),
+                        cause_reason: termination
+                            .as_ref()
                             .filter(|reason| CancelCause::recorded_in(reason).is_some())
-                            .map(|reason| reason.message),
+                            .map(|reason| reason.message.clone()),
                     },
                 ))
             })
