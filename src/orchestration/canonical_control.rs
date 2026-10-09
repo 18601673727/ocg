@@ -1778,61 +1778,88 @@ impl CanonicalControlService {
                     handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
                 })
             };
-            match super::watchdog::reconcile_repository(&mut domain, runtime.as_ref()) {
-                Ok(recoveries) => {
-                    for (_, recovery) in recoveries {
-                        if let super::watchdog::WatchdogRecovery::Fenced { attempt_id } = recovery {
-                            self.publish_watchdog_settlement(&domain, &attempt_id);
-                        }
-                    }
-                }
-                Err(error) => {
-                    failure.get_or_insert(error);
-                }
+            if let Err(error) = super::watchdog::reconcile_repository(&mut domain, runtime.as_ref())
+            {
+                failure.get_or_insert(error);
             }
         }
+        // Recovery commits per Job, and a later failure in the same pass
+        // discards the results already committed. Chat tails are therefore
+        // ended from committed state, after every pass, whatever it returned.
+        self.publish_watchdog_settlements();
         failure.map_or(Ok(()), Err)
     }
 
-    /// End the Chat tail of an Attempt that Watchdog settled because its
+    /// End every live Chat tail whose Attempt Watchdog has settled because its
     /// executor disappeared.
     ///
-    /// Only the committed outcome is published: the Attempt must be terminal
-    /// and its Job must record Watchdog's own reason. An Attempt another actor
-    /// settled publishes its own terminal event and is left alone here.
-    fn publish_watchdog_settlement(&self, domain: &DomainRepository, attempt_id: &str) {
-        let committed = (|| -> Result<Option<String>> {
-            let Some(attempt) = domain.attempt(attempt_id)? else {
-                return Ok(None);
+    /// This reads committed state, not the outcome of any one pass, so a
+    /// settlement whose pass later failed is still announced on the next pass.
+    /// A tail is ended only when its own Attempt is terminal, its Job still
+    /// names that generation and holds no authority, and the Job records
+    /// Watchdog's reason. An Attempt another actor settled publishes its own
+    /// terminal event and is left alone. A tail receives at most one terminal:
+    /// one already terminal is skipped, and the forwarder stops at the first.
+    fn publish_watchdog_settlements(&self) {
+        let live: Vec<(String, String, String, std::sync::Arc<ChatEventBuffer>)> =
+            match self.active_chats.lock() {
+                Ok(chats) => chats
+                    .values()
+                    .filter(|chat| !chat.attempt_id.is_empty())
+                    .filter(|chat| chat.buffer.state.lock().is_ok_and(|state| !state.terminal))
+                    .map(|chat| {
+                        (
+                            chat.project_id.clone(),
+                            chat.job_id.clone(),
+                            chat.attempt_id.clone(),
+                            chat.buffer.clone(),
+                        )
+                    })
+                    .collect(),
+                Err(_) => return,
             };
-            if matches!(
-                attempt.state,
-                super::domain::AttemptState::Queued
-                    | super::domain::AttemptState::Running
-                    | super::domain::AttemptState::Cancelling
-            ) {
-                return Ok(None);
-            }
-            Ok(domain
-                .job(attempt.job_id.as_str())?
-                .filter(|job| job.generation == attempt.generation)
-                .and_then(|job| job.termination_reason)
-                .filter(|reason| reason.code == "watchdog_executor_disappeared")
-                .map(|reason| reason.message))
-        })();
-        let message = match committed {
-            Ok(Some(message)) => message,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::debug!(%error, attempt_id, "watchdog settlement could not be read back");
-                return;
-            }
-        };
-        if let Ok(chats) = self.active_chats.lock() {
-            for chat in chats.values().filter(|chat| chat.attempt_id == attempt_id) {
-                chat.cancelled.cancel();
-                if let Err(error) = chat.sender.send(ExecutionEvent::Failed(message.clone())) {
-                    tracing::debug!(%error, "watchdog-settled Job chat receiver closed");
+        for (project_id, job_id, attempt_id, buffer) in live {
+            let committed = (|| -> Result<Option<String>> {
+                let (_, domain) = self.project_repository(&project_id)?;
+                let Some(attempt) = domain.attempt(&attempt_id)? else {
+                    return Ok(None);
+                };
+                if attempt.job_id.as_str() != job_id
+                    || matches!(
+                        attempt.state,
+                        super::domain::AttemptState::Queued
+                            | super::domain::AttemptState::Running
+                            | super::domain::AttemptState::Cancelling
+                    )
+                {
+                    return Ok(None);
+                }
+                Ok(domain
+                    .job(&job_id)?
+                    .filter(|job| {
+                        job.generation == attempt.generation
+                            && job.authoritative_attempt_id.is_none()
+                    })
+                    .and_then(|job| job.termination_reason)
+                    .filter(|reason| reason.code == "watchdog_executor_disappeared")
+                    .map(|reason| reason.message))
+            })();
+            let message = match committed {
+                Ok(Some(message)) => message,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::debug!(%error, attempt_id, "watchdog settlement could not be read back");
+                    continue;
+                }
+            };
+            if let Ok(chats) = self.active_chats.lock() {
+                for chat in chats.values().filter(|chat| {
+                    chat.attempt_id == attempt_id && std::sync::Arc::ptr_eq(&chat.buffer, &buffer)
+                }) {
+                    chat.cancelled.cancel();
+                    if let Err(error) = chat.sender.send(ExecutionEvent::Failed(message.clone())) {
+                        tracing::debug!(%error, "watchdog-settled Job chat receiver closed");
+                    }
                 }
             }
         }
