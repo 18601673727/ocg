@@ -3644,23 +3644,23 @@ fn settle_authoritative_provider_call(
             domain.request_cancel(&envelope.attempt_id)?;
             return domain.confirm_cancel(&envelope.attempt_id, true);
         }
-        if matches!(call.state.as_str(), "created" | "running") {
-            if !fail_provider_envelope(&mut domain, envelope, reason, call_claimed, evidence)? {
-                // A concurrent claimant owns running/completed, but a concurrent
-                // Call failure may still have left this Attempt without an owner.
-                let current = domain.call(&envelope.call_id)?;
-                if current.attempt_id != envelope.attempt_id
-                    || current.generation != envelope.generation
-                    || !matches!(current.state.as_str(), "failed" | "unknown")
-                    || domain
-                        .authority(&envelope.attempt_id)?
-                        .is_none_or(|authority| {
-                            authority.job_id != envelope.job_id
-                                || authority.generation != envelope.generation
-                        })
-                {
-                    return Ok(());
-                }
+        if matches!(call.state.as_str(), "created" | "running")
+            && !fail_provider_envelope(&mut domain, envelope, reason, call_claimed, evidence)?
+        {
+            // A concurrent claimant owns running/completed, but a concurrent
+            // Call failure may still have left this Attempt without an owner.
+            let current = domain.call(&envelope.call_id)?;
+            if current.attempt_id != envelope.attempt_id
+                || current.generation != envelope.generation
+                || !matches!(current.state.as_str(), "failed" | "unknown")
+                || domain
+                    .authority(&envelope.attempt_id)?
+                    .is_none_or(|authority| {
+                        authority.job_id != envelope.job_id
+                            || authority.generation != envelope.generation
+                    })
+            {
+                return Ok(());
             }
         }
         // Persist the failed Attempt evidence before notifying the frontend.
