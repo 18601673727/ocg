@@ -1809,13 +1809,7 @@ fn resolve_chat_history_in(
     project_id: &str,
     history: &[serde_json::Value],
 ) -> Result<Vec<serde_json::Value>> {
-    let root: String = transaction
-        .query_row(
-            "SELECT root FROM domain_projects WHERE id=?1",
-            [project_id],
-            |row| row.get(0),
-        )
-        .map_err(sql)?;
+    let _ = transaction;
     history
         .iter()
         .map(|message| {
@@ -1834,11 +1828,7 @@ fn resolve_chat_history_in(
                             .ok_or_else(|| invalid("image reference has no image"))?,
                     )
                     .map_err(|error| invalid(&error.to_string()))?;
-                    let url = crate::chat_images::upstream_url(
-                        std::path::Path::new(&root),
-                        project_id,
-                        &image,
-                    )?;
+                    let url = crate::chat_images::upstream_url(project_id, &image)?;
                     *part = serde_json::json!({"type": "image_url", "image_url": {"url": url}});
                 }
             }
@@ -8234,16 +8224,18 @@ fn settle_chat_turn(
             Some(content),
             reasoning,
         )?;
+        // The provider loop stored the final images as attachments before
+        // this settlement; the response carries only their references, so
+        // settling never writes outside this transaction.
         if let Some(images) = response.get("images").and_then(serde_json::Value::as_array) {
-            let (root, project_id, record): (String, String, String) = transaction.query_row(
-                "SELECT p.root,t.project_id,m.record FROM domain_chat_turns t JOIN domain_projects p ON p.id=t.project_id JOIN domain_messages m ON m.attempt_id=t.attempt_id AND m.role='assistant' WHERE t.attempt_id=?1",
-                [turn], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            let record: String = transaction.query_row(
+                "SELECT m.record FROM domain_chat_turns t JOIN domain_messages m ON m.attempt_id=t.attempt_id AND m.role='assistant' WHERE t.attempt_id=?1",
+                [turn], |row| row.get(0),
             ).map_err(sql)?;
             let mut message: Message = decode_chat_record(&record)?;
-            for url in images.iter().take(crate::chat_images::MAX_IMAGES) {
-                let url = url.as_str().ok_or_else(|| invalid("invalid final image"))?;
-                let image =
-                    crate::chat_images::received(std::path::Path::new(&root), &project_id, url)?;
+            for image in images.iter().take(crate::chat_images::MAX_IMAGES) {
+                let image: crate::contracts::ChatImage = serde_json::from_value(image.clone())
+                    .map_err(|_| invalid("invalid final image reference"))?;
                 message.blocks.push(chat_image_block(&image));
             }
             transaction

@@ -51,7 +51,7 @@ const APPLICATION_ID: i32 = 0x4F43_4731;
 /// The schema generation, recorded in `user_version`. A database is created at
 /// this generation; one written by any other generation is refused, never
 /// migrated.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// The installation-level tables. Every other component contributes its own
 /// tables through [`schema`].
@@ -281,7 +281,7 @@ fn initialize(path: &Path, location: &Path, connection: &mut Connection) -> Resu
 }
 
 /// Every component's tables, created together in one transaction.
-fn schema() -> [(&'static str, &'static str); 6] {
+fn schema() -> [(&'static str, &'static str); 7] {
     [
         ("Core", crate::core_store::SCHEMA),
         ("domain", crate::orchestration::domain::SCHEMA),
@@ -289,6 +289,7 @@ fn schema() -> [(&'static str, &'static str); 6] {
         ("security", crate::control_security::SCHEMA),
         ("Project document", crate::project_store::SCHEMA),
         ("context index", crate::context::fulltext::SCHEMA),
+        ("attachment", crate::attachments::SCHEMA),
     ]
 }
 

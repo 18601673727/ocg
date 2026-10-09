@@ -3690,13 +3690,13 @@ impl CanonicalControlService {
         &self,
         request: &crate::contracts::ChatImageUploadRequest,
     ) -> Result<crate::contracts::ChatImage> {
-        let (project, _) = self.project_repository(&request.project_id)?;
-        crate::chat_images::upload(Path::new(&project.root), request)
+        self.project_repository(&request.project_id)?;
+        crate::chat_images::upload(request)
     }
 
     pub fn read_chat_image(&self, project_id: &str, image_id: &str) -> Result<(String, Vec<u8>)> {
-        let (project, _) = self.project_repository(project_id)?;
-        crate::chat_images::read(Path::new(&project.root), image_id)
+        self.project_repository(project_id)?;
+        crate::chat_images::read(project_id, image_id)
     }
 
     pub fn receive_chat_image_for_turn(
@@ -3705,24 +3705,24 @@ impl CanonicalControlService {
         job_id: &str,
         url: &str,
     ) -> Result<crate::contracts::ChatImage> {
-        let project_id = self
+        let (project_id, attempt_id) = self
             .active_chats
             .lock()
             .map_err(|_| invalid("active chats poisoned"))?
             .values()
             .find(|chat| chat.session_id == session_id && chat.job_id == job_id)
-            .map(|chat| chat.project_id.clone())
+            .map(|chat| (chat.project_id.clone(), chat.attempt_id.clone()))
             .ok_or_else(|| invalid("unknown chat turn"))?;
-        self.receive_chat_image(&project_id, url)
-    }
-
-    pub fn receive_chat_image(
-        &self,
-        project_id: &str,
-        url: &str,
-    ) -> Result<crate::contracts::ChatImage> {
-        let (project, _) = self.project_repository(project_id)?;
-        crate::chat_images::received(Path::new(&project.root), project_id, url)
+        self.project_repository(&project_id)?;
+        crate::chat_images::received(
+            &project_id,
+            crate::attachments::Producer {
+                job_id,
+                attempt_id: Some(&attempt_id),
+                call_id: None,
+            },
+            url,
+        )
     }
 
     pub fn launch_chat_with_images(
@@ -3732,9 +3732,8 @@ impl CanonicalControlService {
         image_ids: &[String],
         _now: i64,
     ) -> Result<crate::contracts::JobLaunchResponse> {
-        let (project, _) = self.project_repository(&request.project_id)?;
-        let images =
-            crate::chat_images::selected(Path::new(&project.root), &request.project_id, image_ids)?;
+        self.project_repository(&request.project_id)?;
+        let images = crate::chat_images::selected(&request.project_id, image_ids)?;
         let _launch = self
             .launch_lock
             .lock()
@@ -3833,6 +3832,9 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
+        // The images this turn's frozen input references now belong to its
+        // Job, unless an earlier Job's input already referenced them.
+        crate::attachments::adopt(&request.project_id, image_ids, &job_id)?;
         // Resolve the Attempt that launch_job created for this Job. There is
         // exactly one Attempt right after launch.
         let attempt_id = {

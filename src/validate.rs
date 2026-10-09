@@ -22,6 +22,19 @@ pub fn validate(effective: &Effective) -> Vec<String> {
     errors.extend(crate::orchestration::OrchestrationConfig::validate(data));
     errors.extend(crate::orchestration::budget::BudgetConfig::validate(data));
 
+    match data
+        .get("storage")
+        .and_then(|storage| storage.get("attachments"))
+        .and_then(|attachments| attachments.get("path"))
+    {
+        Some(Value::String(path)) => {
+            if let Err(error) = crate::attachments::validate_root(path) {
+                errors.push(error.to_string());
+            }
+        }
+        _ => errors.push(format!("{} must be a string", crate::attachments::ROOT_KEY)),
+    }
+
     // An installation with no Profile yet is valid; one that has a Profile
     // must have a valid one.
     if data.get("profile").is_some() {

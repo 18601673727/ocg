@@ -93,6 +93,7 @@ pub fn load_defaults() -> Result<Value> {
         "capabilities": default_capabilities(),
         "telemetry": default_telemetry(),
         "orchestration": default_orchestration(),
+        "storage": {"attachments": {"path": crate::attachments::DEFAULT_ROOT}},
     }))
 }
 

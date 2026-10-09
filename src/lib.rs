@@ -21,6 +21,7 @@
 //! OCG does not depend on any external agent runtime to work.
 
 pub mod anthropic;
+pub mod attachments;
 pub mod call_recovery;
 pub mod capabilities;
 pub(crate) mod chat_images;

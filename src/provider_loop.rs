@@ -1177,10 +1177,32 @@ impl CanonicalProviderCallHandler {
         };
         let settlement = (|| -> Result<()> {
             let mut domain = DomainRepository::open(&config.project_root)?;
+            // Final images are stored as attachments of this Call before the
+            // completion commits, which then records only their references.
+            let project_id = domain
+                .job(&envelope.job_id)?
+                .map(|job| job.project_id)
+                .ok_or_else(|| OcgError::config("provider Call's Job disappeared"))?;
+            let images = response
+                .images
+                .iter()
+                .take(crate::chat_images::MAX_IMAGES)
+                .map(|url| {
+                    crate::chat_images::received(
+                        &project_id,
+                        crate::attachments::Producer {
+                            job_id: &envelope.job_id,
+                            attempt_id: Some(&envelope.attempt_id),
+                            call_id: Some(&envelope.call_id),
+                        },
+                        url,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
             let serialized = serde_json::to_string(&json!({
                 "content": response.content,
                 "reasoning": response.reasoning,
-                "images": response.images,
+                "images": images,
                 "rounds": response.rounds,
                 "context_costs": costs.snapshot()
             }))

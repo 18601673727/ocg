@@ -202,6 +202,11 @@ impl ControlServer {
             remote_execution: remote_execution.clone(),
             bound,
         });
+        // Publications abandoned by an earlier process are removed before
+        // anything new is stored; a failure only postpones that cleanup.
+        if let Err(error) = crate::attachments::expire_staged_now() {
+            tracing::warn!(%error, "abandoned attachment cleanup failed");
+        }
         let boundary = crate::project::resolve(root);
         // The launch Project is registered here, so its canonical identity is
         // already known to this process. It is handed to the UI as the
