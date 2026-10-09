@@ -3499,12 +3499,6 @@ fn fail_provider_envelope(
     )? {
         return Ok(false);
     }
-    if let Err(error) = envelope
-        .events
-        .send(crate::orchestration::execution_dispatch::ExecutionEvent::Failed(reason.to_string()))
-    {
-        tracing::debug!(error = %error, "provider failure receiver closed");
-    }
     Ok(true)
 }
 
@@ -3645,12 +3639,16 @@ fn settle_authoritative_provider_call(
                     return Ok(());
                 }
             }
-        } else if let Err(error) = envelope.events.send(
+        }
+        // Persist the failed Attempt evidence before notifying the frontend.
+        // This ensures refreshSessionHistory reads the committed failure state.
+        domain.fail_attempt(&envelope.attempt_id, &failure)?;
+        if let Err(error) = envelope.events.send(
             crate::orchestration::execution_dispatch::ExecutionEvent::Failed(reason.to_string()),
         ) {
             tracing::debug!(error = %error, "provider failure receiver closed");
         }
-        domain.fail_attempt(&envelope.attempt_id, &failure)
+        Ok(())
     })() {
         // A storage-full settlement failure is reported as storage safety, not
         // as a provider failure: retrying it as provider work cannot help, and
