@@ -1748,6 +1748,51 @@ impl CanonicalControlService {
     /// The pass only opens stores that already exist and only signals a runtime
     /// that admission has already started. It never starts a provider worker
     /// merely to ask whether one owns a Call.
+    /// This process's runtime for a Project, only while it owns the Project's
+    /// execution. It never acquires ownership, so a background pass acts only
+    /// on Projects this process already owns and leaves another process's
+    /// live Attempts untouched.
+    fn owned_runtime(
+        &self,
+        project_id: &str,
+        root: &Path,
+    ) -> Result<Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>> {
+        let handle = if let Some(registry) = &self.runtime_registry {
+            registry.handle(project_id)?
+        } else {
+            self.runtime_handle
+                .clone()
+                .filter(|handle| handle.project_root() == root)
+        };
+        Ok(handle.filter(|handle| handle.owns_execution()))
+    }
+
+    /// This process's runtime for a Project, acquiring the Project's execution
+    /// ownership if no runtime holds it yet. Starting a runtime runs startup
+    /// recovery once ownership is held; another live owner is refused with
+    /// nothing recovered. Every explicit execution operation goes through here.
+    fn execution_owner(
+        &self,
+        project_id: &str,
+        root: &Path,
+    ) -> Result<crate::orchestration::execution_runtime::ExecutionRuntimeHandle> {
+        if let Some(registry) = &self.runtime_registry {
+            let (_, defaults, _) = self.read_configuration()?;
+            let concurrency = provider_concurrency(
+                &defaults
+                    .get(project_id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .defaults,
+            )?;
+            return registry.get_or_start(project_id, root, concurrency);
+        }
+        self.runtime_handle
+            .clone()
+            .filter(|handle| handle.project_root() == root && handle.owns_execution())
+            .ok_or_else(|| invalid("execution runtime is not available for this Project"))
+    }
+
     pub(crate) fn reconcile_watchdog(&self) -> Result<()> {
         let mut failure = None;
         let global = self
@@ -1764,6 +1809,17 @@ impl CanonicalControlService {
             {
                 guard.refresh_if_stale();
             }
+            // Watchdog classifies an Attempt whose token this process cannot
+            // see as disappeared. That is only true for a Project this process
+            // owns: another owner's live Attempts are invisible here, not lost.
+            let runtime = match self.owned_runtime(&project.project_id, Path::new(&project.root)) {
+                Ok(Some(runtime)) => runtime,
+                Ok(None) => continue,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
             let mut domain = match DomainRepository::open_existing(Path::new(&project.root)) {
                 Ok(domain) => domain,
                 Err(error) => {
@@ -1771,15 +1827,7 @@ impl CanonicalControlService {
                     continue;
                 }
             };
-            let runtime = if let Some(registry) = &self.runtime_registry {
-                registry.handle(&project.project_id)?
-            } else {
-                self.runtime_handle.clone().filter(|handle| {
-                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
-                })
-            };
-            if let Err(error) = super::watchdog::reconcile_repository(&mut domain, runtime.as_ref())
-            {
+            if let Err(error) = super::watchdog::reconcile_repository(&mut domain, Some(&runtime)) {
                 failure.get_or_insert(error);
             }
         }
@@ -1877,6 +1925,16 @@ impl CanonicalControlService {
             - CHAT_EXECUTION_TIMEOUT.as_secs() as i64;
         let mut failure = None;
         for project in self.projects()? {
+            // Only the owning process enforces the deadline; its runtime is the
+            // one that can signal the execution it cancels.
+            match self.owned_runtime(&project.project_id, Path::new(&project.root)) {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            }
             let due = match DomainRepository::open_existing(Path::new(&project.root))
                 .and_then(|domain| domain.chat_execution_deadline_due(cutoff))
             {
@@ -1938,25 +1996,14 @@ impl CanonicalControlService {
                     Err(error) => return Err(OcgError::io("lock Job admission", error)),
                 }
                 let jobs = domain.automatic_admission_jobs(&project.project_id)?;
-                if !domain.pending_dispatch_intents()?.is_empty() {
-                    if let Some(registry) = &self.runtime_registry {
-                        if registry.handle(&project.project_id)?.is_none() {
-                            let (_, defaults, _) = self.read_configuration()?;
-                            let concurrency = provider_concurrency(
-                                &defaults
-                                    .get(&project.project_id)
-                                    .cloned()
-                                    .unwrap_or_default()
-                                    .defaults,
-                            )?;
-                            registry.get_or_start(
-                                &project.project_id,
-                                Path::new(&project.root),
-                                concurrency,
-                            )?;
-                        }
-                    }
+                if jobs.is_empty() && domain.pending_dispatch_intents()?.is_empty() {
+                    return Ok(());
                 }
+                // Admission acts only for a Project this process owns. With
+                // work waiting it takes that ownership, which first runs
+                // startup recovery; a Project another process owns is refused
+                // here, before any of its Jobs is touched.
+                self.execution_owner(&project.project_id, Path::new(&project.root))?;
                 for job in jobs {
                     selected_jobs.insert(job.id.clone());
                     if job.state == super::domain::JobState::Eligible {
@@ -2143,29 +2190,18 @@ impl CanonicalControlService {
                 snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
             });
         }
+        // Cancellation revokes and settles execution authority, so only the
+        // Project's owner performs it, through the runtime that can signal the
+        // execution. A Project another process owns is refused before any
+        // cancellation is requested.
+        let (project, _) = self.project_repository(&job.project_id)?;
+        let runtime = self.execution_owner(&job.project_id, Path::new(&project.root))?;
         for (authority, never_started) in
             domain.request_job_cancel_cascade(job_id, expected_generation)?
         {
-            let runtime = if let Some(registry) = &self.runtime_registry {
-                registry.handle(&job.project_id)?
-            } else {
-                match &self.runtime_handle {
-                    Some(handle)
-                        if domain
-                            .project_at_root(handle.project_root())?
-                            .is_some_and(|project| project.id == job.project_id) =>
-                    {
-                        Some(handle.clone())
-                    }
-                    _ => None,
-                }
-            };
-            let signalled = match runtime {
-                Some(runtime) => runtime
-                    .provider_dispatcher()
-                    .cancel_attempt(&authority.attempt_id)?,
-                None => false,
-            };
+            let signalled = runtime
+                .provider_dispatcher()
+                .cancel_attempt(&authority.attempt_id)?;
             domain.confirm_cancel_with_cause(
                 &authority.attempt_id,
                 signalled || never_started,
@@ -2234,6 +2270,14 @@ impl CanonicalControlService {
         if let Some(deferral) = retry_guard.check_execution_admission().deferral() {
             return Err(invalid(deferral.message()));
         }
+        // A retry mints a replacement Attempt, so only the Project's owner may
+        // perform it. Taking ownership before the replacement is read or
+        // written runs startup recovery first when this process did not yet
+        // own the Project.
+        let owner = {
+            let (project, _) = self.project_repository(&job.project_id)?;
+            self.execution_owner(&job.project_id, Path::new(&project.root))?
+        };
         let snapshot = domain.execution_snapshot()?;
         // Chat identity is durable: the turn's live transport may already have
         // been consumed by `finish_chat`, while the turn itself stays retryable.
@@ -2265,29 +2309,7 @@ impl CanonicalControlService {
             .iter()
             .filter(|intent| intent.job_id == job_id && intent.provider_key.is_some())
             .min_by_key(|intent| (intent.generation, intent.created_at, &intent.id));
-        let runtime = if template.is_some() {
-            let (project, _) = self.project_repository(&job.project_id)?;
-            let (_, defaults, _) = self.read_configuration()?;
-            let concurrency = provider_concurrency(
-                &defaults
-                    .get(&job.project_id)
-                    .cloned()
-                    .unwrap_or_default()
-                    .defaults,
-            )?;
-            Some(if let Some(registry) = &self.runtime_registry {
-                registry.get_or_start(&job.project_id, Path::new(&project.root), concurrency)?
-            } else {
-                self.runtime_handle
-                    .clone()
-                    .filter(|handle| {
-                        handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
-                    })
-                    .ok_or_else(|| invalid("execution runtime is not available for this Project"))?
-            })
-        } else {
-            None
-        };
+        let runtime = template.is_some().then_some(owner);
         let replay = template
             .map(|intent| -> Result<_> {
                 let input: Value = serde_json::from_str(&intent.request)
@@ -2744,7 +2766,7 @@ impl CanonicalControlService {
             self.runtime_handle
                 .as_ref()
                 .filter(|handle| {
-                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
+                    handle.project_root() == Path::new(&project.root) && handle.owns_execution()
                 })
                 .cloned()
                 .ok_or_else(|| invalid("execution runtime is not available for this Project"))
@@ -2763,6 +2785,12 @@ impl CanonicalControlService {
                     message: format!("{error}; Job was not created"),
                     duplicate: false,
                 };
+                // Another process owns this Project: nothing is written to its
+                // store, not even the command ledger, so the same command sent
+                // to the owner is decided by the owner alone.
+                if crate::orchestration::execution_runtime::owned_elsewhere(&error) {
+                    return Ok(response);
+                }
                 domain.record_launch_command(
                     &request.command_id,
                     &request.project_id,
@@ -3240,6 +3268,26 @@ impl CanonicalControlService {
             health_probe: Some(intent.clone()),
             ..JobSpec::default()
         };
+        // Execution ownership is settled before the probe Job exists. A Project
+        // another process owns is refused with nothing written: this process
+        // never had the right to run the tuple, so its refusal is not health
+        // evidence about it.
+        let runtime = if let Some(registry) = &self.runtime_registry {
+            registry.get_or_start(&project.project_id, Path::new(&project.root), 1)
+        } else {
+            self.runtime_handle
+                .as_ref()
+                .filter(|handle| {
+                    handle.project_root() == Path::new(&project.root) && handle.owns_execution()
+                })
+                .cloned()
+                .ok_or_else(|| invalid("execution runtime is not available for this Project"))
+        };
+        if let Err(error) = &runtime {
+            if crate::orchestration::execution_runtime::owned_elsewhere(error) {
+                return Ok(rejected(error.to_string(), None));
+            }
+        }
         let job = domain.create_job(&project.project_id, spec.clone())?;
         // A rejected probe is recorded on the Job before any Attempt is
         // claimed. The refusal is the same admission decision every other
@@ -3315,17 +3363,6 @@ impl CanonicalControlService {
                 )?;
                 return Ok(response);
             }
-        };
-        let runtime = if let Some(registry) = &self.runtime_registry {
-            registry.get_or_start(&project.project_id, Path::new(&project.root), 1)
-        } else {
-            self.runtime_handle
-                .as_ref()
-                .filter(|handle| {
-                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
-                })
-                .cloned()
-                .ok_or_else(|| invalid("execution runtime is not available for this Project"))
         };
         let runtime_handle = match runtime {
             Ok(handle) => handle,
