@@ -5365,6 +5365,28 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         transaction.commit().map_err(sql)
     }
 
+    /// The Attempt of a Chat turn whose admission was interrupted after the
+    /// turn was persisted but before its provider Call was published.
+    ///
+    /// Only the frozen request on that Call carries the turn's Conversation
+    /// context, so such an Attempt has nothing to resume from. With no Call
+    /// and no DispatchIntent, nothing was sent to a provider.
+    pub(crate) fn unpublished_chat_admission(&self, job_id: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT a.id FROM domain_jobs j
+                 JOIN domain_chat_turns t ON t.job_id=j.id
+                 JOIN domain_attempts a ON a.id=j.authoritative_attempt_id AND a.generation=j.generation
+                 WHERE j.id=?1 AND j.state='running' AND j.automatic_admission=1
+                   AND NOT EXISTS(SELECT 1 FROM domain_calls c WHERE c.attempt_id=a.id)
+                   AND NOT EXISTS(SELECT 1 FROM domain_dispatch_intents i WHERE i.attempt_id=a.id)",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)
+    }
+
     /// Chat-root Jobs whose current Attempt was created at or before `cutoff`
     /// and is still queued or running.
     ///

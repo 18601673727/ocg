@@ -1922,7 +1922,7 @@ impl CanonicalControlService {
                 guard.refresh_if_stale();
             }
             let result = (|| -> Result<()> {
-                let (_, domain) = self.project_repository(&project.project_id)?;
+                let (_, mut domain) = self.project_repository(&project.project_id)?;
                 // Serialize the complete Attempt-to-Call handoff across consumers;
                 // SQLite still guards every authoritative claim independently.
                 let lock = std::fs::OpenOptions::new()
@@ -1984,6 +1984,26 @@ impl CanonicalControlService {
                             }
                         }
                         deferrals.remove(&job.id);
+                    }
+                    // A Chat turn whose admission was interrupted before its
+                    // Call was published must not resume as generic work: the
+                    // rebuilt request would carry the objective alone, without
+                    // the Conversation's context. Nothing reached a provider,
+                    // so its Attempt settles as failed and the turn waits for
+                    // the operator, like any other unstarted Chat failure.
+                    if job.state == super::domain::JobState::Running {
+                        if let Some(attempt_id) = domain.unpublished_chat_admission(&job.id)? {
+                            domain.fail_attempt(
+                                &attempt_id,
+                                &super::domain::job_failure(
+                                    "chat_admission_interrupted",
+                                    FailureClass::Internal,
+                                    "Chat admission was interrupted before its provider Call was published; nothing was sent to the provider",
+                                    true,
+                                ),
+                            )?;
+                            continue;
+                        }
                     }
 
                     let request = crate::contracts::JobLaunchRequest {
