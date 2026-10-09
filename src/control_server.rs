@@ -179,6 +179,16 @@ impl ControlServer {
         disable_proxy: bool,
     ) -> Result<Self> {
         let authentication = crate::control_security::Authentication::from_env()?;
+        let remote_execution = crate::remote_execution::RemoteExecution::from_env()?;
+        if let Some(confinement) = &remote_execution {
+            confinement.accepts_storage(profile_path)?;
+            for name in ["OCG_VAULT_PATH", "OCG_VAULT_KEY_FILE"] {
+                if let Some(path) = std::env::var_os(name) {
+                    confinement.accepts_storage(Path::new(&path))?;
+                }
+            }
+            confinement.verify(root)?;
+        }
         let requested = parse_loopback_addr(addr)?;
         config.validate()?;
         let listener = TcpListener::bind(requested).map_err(|error| {
@@ -206,6 +216,7 @@ impl ControlServer {
         let security = Arc::new(RequestSecurity {
             authentication,
             ownership: service.security_store()?,
+            remote_execution: remote_execution.clone(),
             bound,
         });
         let boundary = crate::project::resolve(root);
@@ -239,14 +250,20 @@ impl ControlServer {
                 16,
             ),
         );
-        let (canonical, execution_runtimes) = if security.authentication.is_remote() {
-            (Some(service), None)
+        let service = if let Some(confinement) = remote_execution {
+            service.with_remote_execution(confinement)
         } else {
-            (
-                Some(service.with_runtime_registry(registry.clone())),
-                Some(registry),
-            )
+            service
         };
+        let (canonical, execution_runtimes) =
+            if security.authentication.is_remote() && security.remote_execution.is_none() {
+                (Some(service), None)
+            } else {
+                (
+                    Some(service.with_runtime_registry(registry.clone())),
+                    Some(registry),
+                )
+            };
 
         Ok(Self {
             listener,
@@ -284,7 +301,9 @@ impl ControlServer {
 
     /// Run the accept loop until `stop` is set.
     pub fn serve(self, stop: Arc<AtomicBool>) -> Result<()> {
-        let _job_admission = if self.security.authentication.is_remote() {
+        let _job_admission = if self.security.authentication.is_remote()
+            && self.security.remote_execution.is_none()
+        {
             None
         } else {
             self.canonical
@@ -472,6 +491,7 @@ struct Request {
 struct RequestSecurity {
     authentication: crate::control_security::Authentication,
     ownership: crate::control_security::OwnershipStore,
+    remote_execution: Option<crate::remote_execution::RemoteExecution>,
     bound: SocketAddr,
 }
 
@@ -497,7 +517,12 @@ fn handle_security(
                     .identity
                     .as_ref()
                     .map(|identity| identity.expires_at),
-                remote_execution: false,
+                remote_execution: request.identity.as_ref().is_some_and(|identity| {
+                    security
+                        .remote_execution
+                        .as_ref()
+                        .is_some_and(|confinement| confinement.operator_id == identity.user_id)
+                }),
             };
             match serde_json::to_value(session) {
                 Ok(value) => {
@@ -597,6 +622,7 @@ fn handle_security(
 
 fn authorize_remote(
     canonical: Option<&crate::orchestration::canonical_control::CanonicalControlService>,
+    security: &RequestSecurity,
     route: &Route,
     request: &Request,
 ) -> std::result::Result<(), ApiError> {
@@ -609,7 +635,11 @@ fn authorize_remote(
     ) {
         return Ok(());
     }
-    if request.method != "GET" {
+    let operator = security
+        .remote_execution
+        .as_ref()
+        .is_some_and(|confinement| confinement.operator_id == identity.user_id);
+    if request.method != "GET" && !operator {
         return Err(ApiError::new(
             403,
             "remote_execution_blocked",
@@ -617,6 +647,31 @@ fn authorize_remote(
         ));
     }
     let project = match route {
+        Route::ProfileGet if operator => return Ok(()),
+        Route::CanonicalProjectsGet { project } if operator => Some(project.clone()),
+        Route::CanonicalConfigurationGet if operator => request.query.get("project_id").cloned(),
+        Route::CanonicalJobConfigGet { job }
+        | Route::CanonicalJobConfigPut { job }
+        | Route::CanonicalJobCancel { job }
+        | Route::CanonicalJobRetry { job }
+        | Route::CanonicalJobSpawn { job }
+            if operator =>
+        {
+            canonical.and_then(|service| service.project_for_job(job).ok())
+        }
+        Route::CanonicalJobLaunch
+        | Route::ChatSend
+        | Route::ChatImageUpload
+        | Route::ChatCancel
+            if operator =>
+        {
+            request
+                .json_body()?
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+        Route::ChatConversationDelete if operator => request.query.get("project_id").cloned(),
         Route::ChatImageGet { project, .. } => Some(project.clone()),
         Route::ChatStream => canonical.and_then(|service| {
             service.chat_project_for(
@@ -709,10 +764,22 @@ fn handle_client(
         }
         request.approved_origin = Some(origin.clone());
     }
+    let access_return_navigation = request.method == "GET"
+        && request.path == "/"
+        && security.authentication.is_remote()
+        && request
+            .headers
+            .get("sec-fetch-mode")
+            .is_some_and(|mode| mode == "navigate")
+        && request
+            .headers
+            .get("sec-fetch-dest")
+            .is_some_and(|destination| destination == "document");
     if request
         .headers
         .get("sec-fetch-site")
         .is_some_and(|site| site == "cross-site")
+        && !access_return_navigation
     {
         let _ = write_api_error(
             &mut stream,
@@ -751,7 +818,7 @@ fn handle_client(
         }
     };
 
-    if let Err(error) = authorize_remote(canonical, &route, &request) {
+    if let Err(error) = authorize_remote(canonical, security, &route, &request) {
         let _ = write_api_error(&mut stream, &error);
         return;
     }

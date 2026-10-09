@@ -6,7 +6,7 @@
  * same loopback guard as the profile client.
  */
 
-import { isLoopbackControlUrl } from "../profile/profile-client";
+import { isTrustedControlUrl } from "../profile/profile-client";
 import {
   decodeSetupConnectResponse,
   decodeSetupModelsResponse,
@@ -43,8 +43,8 @@ export interface SetupClient {
 }
 
 export function createSetupClient(baseUrl: string, fetchImpl: typeof fetch): SetupClient {
-  if (!isLoopbackControlUrl(baseUrl)) {
-    throw new Error("OCG setup endpoint must be an HTTP loopback URL");
+  if (!isTrustedControlUrl(baseUrl)) {
+    throw new Error("OCG setup endpoint must be loopback or the current HTTPS origin");
   }
   const base = baseUrl.replace(/\/$/, "");
 

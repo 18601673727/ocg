@@ -750,6 +750,25 @@ impl NativeToolExecutor {
         if let Err(error) = validate_parameters(&definition.parameters, arguments) {
             return invalid_parameters(&definition, &error);
         }
+        if std::env::var("OCG_AUTH_MODE").as_deref() == Ok("cloudflare-access") {
+            return match crate::remote_execution::RemoteExecution::from_env()
+                .and_then(|policy| {
+                    policy.ok_or_else(|| OcgError::config("remote execution is disabled"))
+                })
+                .and_then(|confinement| {
+                    confinement.execute(self.root.path(), name, arguments, policy, cancelled)
+                }) {
+                Ok(result) => result,
+                Err(error) => ToolResult::failure(ToolError::new(
+                    if cancelled() {
+                        ToolErrorKind::Cancelled
+                    } else {
+                        ToolErrorKind::Unavailable
+                    },
+                    error.to_string(),
+                )),
+            };
+        }
         let result = match definition.executor {
             NativeToolExecutorBinding::FilesystemRead => self.read(arguments),
             NativeToolExecutorBinding::FilesystemReadMany => {
@@ -1304,12 +1323,17 @@ pub fn execute_canonical_tool_call(
             domain.start_call(&call.id, &authority.attempt_id, authority.generation)?;
             match NativeToolExecutor::new(project_root) {
                 Ok(executor) => {
-                    observation = validation::Observation::begin(
-                        &executor.root,
-                        &request.name,
-                        &request.arguments,
-                        &|| cancelled.load(Ordering::SeqCst),
-                    );
+                    observation =
+                        if std::env::var("OCG_AUTH_MODE").as_deref() == Ok("cloudflare-access") {
+                            None
+                        } else {
+                            validation::Observation::begin(
+                                &executor.root,
+                                &request.name,
+                                &request.arguments,
+                                &|| cancelled.load(Ordering::SeqCst),
+                            )
+                        };
                     executor.execute(
                         &request.name,
                         &request.arguments,
@@ -1478,8 +1502,11 @@ impl NativeToolCallHandler {
         domain.start_call(&envelope.call_id, &envelope.attempt_id, envelope.generation)?;
         *claimed = true;
         drop(domain);
-        let observation =
-            validation::Observation::begin(&executor.root, name, &arguments, &cancelled);
+        let observation = if std::env::var("OCG_AUTH_MODE").as_deref() == Ok("cloudflare-access") {
+            None
+        } else {
+            validation::Observation::begin(&executor.root, name, &arguments, &cancelled)
+        };
         let result = executor.execute_cancellable(
             name,
             &arguments,

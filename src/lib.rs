@@ -62,6 +62,7 @@ pub mod provider_protocol;
 pub mod proxy;
 pub mod pwa;
 pub mod release;
+pub mod remote_execution;
 pub mod report;
 pub mod resources;
 pub mod self_update;

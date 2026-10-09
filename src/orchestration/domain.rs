@@ -978,6 +978,45 @@ pub struct ChatHistory {
 }
 
 impl DomainRepository {
+    pub(crate) fn write_read_snapshot(root: &Path, destination: &Path) -> Result<()> {
+        let database = crate::orchestration::state::state_dir(root).join("substrate.sqlite3");
+        let connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(|error| open_sql(root, error))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| open_sql(root, error))?;
+        connection
+            .execute(
+                "VACUUM main INTO ?1",
+                [destination.to_string_lossy().as_ref()],
+            )
+            .map_err(|error| open_sql(root, error))?;
+        Ok(())
+    }
+
+    pub(crate) fn open_read_only(root: &Path) -> Result<Self> {
+        let path = std::env::var_os("OCG_NATIVE_DOMAIN_SNAPSHOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                crate::orchestration::state::state_dir(root).join("substrate.sqlite3")
+            });
+        let connection =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| open_sql(root, error))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| open_sql(root, error))?;
+        if schema_generation(&connection).map_err(|error| open_sql(root, error))?
+            != DOMAIN_SCHEMA_VERSION
+        {
+            return Err(invalid(
+                "canonical store needs migration before confined reads",
+            ));
+        }
+        Ok(Self { connection, path })
+    }
+
     /// Open the durable store at a boundary without deciding what Project owns
     /// it.
     ///

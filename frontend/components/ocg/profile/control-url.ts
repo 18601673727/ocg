@@ -1,13 +1,17 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
-import { isLoopbackControlUrl } from "./profile-client";
+import { isLoopbackControlUrl, isTrustedControlUrl } from "./profile-client";
 
 /** One invocation-scoped connection hint; never a source of Profile truth. */
 export function useOcgControlUrl(): string | null {
   const url = useSyncExternalStore(
     (listener) => { window.addEventListener("popstate", listener); return () => window.removeEventListener("popstate", listener); },
     () => {
+      const origin = window.location.origin;
+      if (!isLoopbackControlUrl(origin)) {
+        return isTrustedControlUrl(origin) ? origin : null;
+      }
       // Demo must be explicit; a scenario never overrides a real endpoint.
       if (!process.env.NEXT_PUBLIC_OCG_CONTROL_URL && new URLSearchParams(window.location.search).get("demo") === "1") return null;
       const selected = process.env.NEXT_PUBLIC_OCG_CONTROL_URL ?? window.location.origin;

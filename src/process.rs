@@ -8,7 +8,7 @@
 use crate::error::{OcgError, Result};
 use crate::proxy::StaticProxyProvider;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -612,6 +612,17 @@ fn run_owned(
     max_bytes: usize,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<CapturedOutput> {
+    run_owned_input(program, args, cwd, max_bytes, cancelled, None)
+}
+
+pub(crate) fn run_owned_input(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    max_bytes: usize,
+    cancelled: &dyn Fn() -> bool,
+    input: Option<&[u8]>,
+) -> Result<CapturedOutput> {
     if cancelled() {
         return Ok(CapturedOutput {
             exit: ProcessExit::Unknown,
@@ -630,9 +641,16 @@ fn run_owned(
     command
         .args(args)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if input.is_some() {
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -649,6 +667,22 @@ fn run_owned(
         .stderr
         .take()
         .map(|stream| spawn_drain(stream, max_bytes));
+
+    if let Some(input) = input {
+        let written = child
+            .stdin
+            .take()
+            .ok_or_else(|| OcgError::config("missing tool input pipe"))
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(input)
+                    .map_err(|error| OcgError::io("write confined tool input", error))
+            });
+        if let Err(error) = written {
+            terminate(&mut child, program)?;
+            return Err(error);
+        }
+    }
 
     let deadline = start + COMMAND_DEADLINE;
     let mut termination = CommandTermination::Completed;

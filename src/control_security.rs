@@ -291,7 +291,7 @@ impl AccessVerifier {
 #[derive(Debug, Clone)]
 pub(crate) struct OwnershipStore(Arc<Mutex<Connection>>);
 
-fn user_id(issuer: &str, subject: &str) -> String {
+pub(crate) fn user_id(issuer: &str, subject: &str) -> String {
     let mut digest = Sha256::new();
     digest.update((issuer.len() as u64).to_be_bytes());
     digest.update(issuer.as_bytes());

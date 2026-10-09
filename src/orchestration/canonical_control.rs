@@ -499,6 +499,7 @@ pub struct CanonicalControlService {
     initial_root: PathBuf,
     control_state: PathBuf,
     runtime_handle: Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>,
+    remote_execution: Option<crate::remote_execution::RemoteExecution>,
     runtime_registry: Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
     profile_service: crate::profile::ProfileService,
     chat_registrations: Arc<Mutex<std::collections::HashMap<String, ChatRegistration>>>,
@@ -753,6 +754,7 @@ impl CanonicalControlService {
             initial_root: root.to_path_buf(),
             control_state,
             runtime_handle: None,
+            remote_execution: None,
             runtime_registry: None,
             profile_service: crate::profile::ProfileService::with_workspace(profile_path, root),
             chat_registrations: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -763,6 +765,14 @@ impl CanonicalControlService {
             chat_forwarder: ChatForwarder::new(),
             placement_deferrals: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub(crate) fn with_remote_execution(
+        mut self,
+        confinement: crate::remote_execution::RemoteExecution,
+    ) -> Self {
+        self.remote_execution = Some(confinement);
+        self
     }
 
     pub fn with_runtime_handle(
@@ -995,7 +1005,20 @@ impl CanonicalControlService {
     }
 
     pub fn projects(&self) -> Result<Vec<ProjectRecord>> {
-        self.read_projects()
+        let mut projects = self.read_projects()?;
+        if let Some(confinement) = &self.remote_execution {
+            let ownership = self.security_store()?;
+            let mut allowed = Vec::new();
+            for project in projects {
+                if ownership.owns(&confinement.operator_id, &project.project_id)?
+                    && confinement.accepts_root(Path::new(&project.root)).is_ok()
+                {
+                    allowed.push(project);
+                }
+            }
+            projects = allowed;
+        }
+        Ok(projects)
     }
 
     pub fn configuration(&self, project_id: &str) -> Result<ProjectConfigurationView> {
@@ -1205,6 +1228,17 @@ impl CanonicalControlService {
     /// owner", because that would report corruption as an unknown Job.
     fn candidate_repository(&self, project: &ProjectRecord) -> Result<CandidateRepository> {
         let root = Path::new(&project.root);
+        if let Some(confinement) = &self.remote_execution {
+            if !self
+                .security_store()?
+                .owns(&confinement.operator_id, &project.project_id)?
+            {
+                return Ok(CandidateRepository::Unavailable(
+                    "Project is not owned by the remote operator",
+                ));
+            }
+            confinement.accepts_root(root)?;
+        }
         if !root.is_dir() {
             return Ok(CandidateRepository::Unavailable(
                 "registered Project root is unavailable",
@@ -1250,6 +1284,13 @@ impl CanonicalControlService {
             ));
         }
         Ok(CandidateRepository::Ready(repository))
+    }
+
+    pub(crate) fn project_for_job(&self, job_id: &str) -> Result<String> {
+        self.repository_for_job(job_id)?
+            .job(job_id)?
+            .map(|job| job.project_id)
+            .ok_or_else(|| invalid("unknown canonical Job"))
     }
 
     fn repository_for_job(&self, job_id: &str) -> Result<DomainRepository> {
