@@ -37,6 +37,36 @@ const CHAT_REPLAY_LIFETIME: Duration = Duration::from_secs(300);
 /// How long a Chat-root Job's Attempt may execute before the Core cancels it.
 const CHAT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(900);
 
+/// Why a Chat request with these inputs cannot run on this model, if it
+/// cannot. Launch and the replay of a frozen Chat request apply the same rule.
+fn chat_capability_refusal(
+    provider: &crate::profile::Provider,
+    model: &crate::profile::Model,
+    effort: Option<&str>,
+    images: bool,
+) -> Option<&'static str> {
+    if images
+        && model.metadata.as_ref().is_some_and(|metadata| {
+            metadata.images == Some(false)
+                || (metadata.images.is_none() && metadata.multimodal == Some(false))
+        })
+    {
+        return Some("selected model does not support image input");
+    }
+    if let Some(effort) = effort {
+        if !super::placement::supports_effort(model, effort)
+            || !provider.wire_protocol().is_openai_chat_completions()
+            || !matches!(
+                effort,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            )
+        {
+            return Some("selected reasoning effort is unsupported for this model/protocol");
+        }
+    }
+    None
+}
+
 fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
 }
@@ -2237,6 +2267,125 @@ impl CanonicalControlService {
         })
     }
 
+    /// The request, protocol and execution target that replay a Chat turn's
+    /// frozen logical request exactly, or a refusal.
+    ///
+    /// Nothing is substituted: the frozen provider, model, upstream model,
+    /// protocol, endpoint and credential reference must all still be what the
+    /// Profile configures, the Effort and images must still be supported, and
+    /// every image must still resolve. Only the credential value behind the
+    /// same Vault reference may have changed.
+    fn frozen_chat_replay(
+        &self,
+        domain: &DomainRepository,
+        project_id: &str,
+        launch: &super::domain::ChatLaunch,
+    ) -> Result<(
+        Value,
+        crate::provider_protocol::ProviderProtocol,
+        crate::orchestration::execution_dispatch::ProviderExecutionConfig,
+    )> {
+        let refuse = |why: String| {
+            invalid(format!(
+                "Chat retry refused: {why}; the original request is never replayed against a different target"
+            ))
+        };
+        let target = &launch.target;
+        let (profile, _) = self
+            .profile_service
+            .current()?
+            .ok_or_else(|| invalid("profile not configured"))?;
+        let provider = profile.providers.get(&target.provider_key).ok_or_else(|| {
+            refuse(format!(
+                "provider {} is no longer configured",
+                target.provider_key
+            ))
+        })?;
+        let model = profile
+            .models
+            .get(&target.model_key)
+            .filter(|model| model.provider == target.provider_key)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "model {} is no longer configured for provider {}",
+                    target.model_key, target.provider_key
+                ))
+            })?;
+        if model.id != target.upstream_model_id {
+            return Err(refuse(format!(
+                "model {} now names upstream model {} instead of {}",
+                target.model_key, model.id, target.upstream_model_id
+            )));
+        }
+        if provider.wire_protocol() != target.protocol {
+            return Err(refuse(format!(
+                "provider {} now speaks {} instead of {}",
+                target.provider_key,
+                provider.wire_protocol(),
+                target.protocol
+            )));
+        }
+        if provider.endpoint.as_deref() != Some(target.endpoint.as_str()) {
+            return Err(refuse(format!(
+                "the endpoint of provider {} changed",
+                target.provider_key
+            )));
+        }
+        if provider.credential_ref != target.credential_ref {
+            return Err(refuse(format!(
+                "the credential reference of provider {} changed",
+                target.provider_key
+            )));
+        }
+        if let Some(reference) = target.credential_ref.as_deref() {
+            if crate::vault::Vault::user_global()?
+                .get(reference)?
+                .is_none()
+            {
+                return Err(refuse(format!(
+                    "credential {reference} is not in the Vault"
+                )));
+            }
+        }
+        let images = launch.messages.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("ocg_image"))
+                })
+        });
+        if let Some(refusal) =
+            chat_capability_refusal(provider, model, launch.effort.as_deref(), images)
+        {
+            return Err(refuse(refusal.to_string()));
+        }
+        let messages = domain
+            .resolve_chat_launch_messages(project_id, launch)
+            .map_err(|error| refuse(format!("an original image cannot be read ({error})")))?;
+        let mut request = json!({
+            "model": target.model_key,
+            "messages": messages,
+            "stream": true,
+        });
+        if let Some(effort) = &launch.effort {
+            request["reasoning_effort"] = json!(effort);
+        }
+        Ok((
+            request,
+            target.protocol,
+            crate::orchestration::execution_dispatch::ProviderExecutionConfig {
+                provider_key: target.provider_key.clone(),
+                model: target.model_key.clone(),
+                upstream_model_id: target.upstream_model_id.clone(),
+                endpoint: target.endpoint.clone(),
+                credential_ref: target.credential_ref.clone(),
+            },
+        ))
+    }
+
     pub fn retry_job(
         &self,
         job_id: &str,
@@ -2309,7 +2458,7 @@ impl CanonicalControlService {
             .iter()
             .filter(|intent| intent.job_id == job_id && intent.provider_key.is_some())
             .min_by_key(|intent| (intent.generation, intent.created_at, &intent.id));
-        let runtime = template.is_some().then_some(owner);
+        let runtime = (template.is_some() || chat_session.is_some()).then_some(owner);
         let replay = template
             .map(|intent| -> Result<_> {
                 let input: Value = serde_json::from_str(&intent.request)
@@ -2344,6 +2493,18 @@ impl CanonicalControlService {
                 Ok((request, protocol, config))
             })
             .transpose()?;
+        // Replay precedence: a provider DispatchIntent's frozen request is what
+        // actually ran, so it stays authoritative once it exists. Before any
+        // Call, a Chat turn's frozen logical request is what was asked. A turn
+        // with neither is refused below rather than given an invented request.
+        let replay = match replay {
+            Some(replay) => Some(replay),
+            None if chat_session.is_some() => domain
+                .chat_launch_for_job(job_id)?
+                .map(|launch| self.frozen_chat_replay(&domain, &job.project_id, &launch))
+                .transpose()?,
+            None => None,
+        };
         let executor_kind = if replay.is_some() {
             "provider"
         } else {
@@ -2404,7 +2565,9 @@ impl CanonicalControlService {
             })
             .transpose()?;
         if chat_session.is_some() && replay.is_none() {
-            return Err(invalid("Chat retry has no frozen provider target"));
+            return Err(invalid(
+                "Chat retry refused: this turn has no frozen request to replay (it was admitted before Chat requests were frozen); send the message again",
+            ));
         }
         let (global, _, _) = self.read_configuration()?;
         let budget_config = self.provider_budget_config(&global)?;
@@ -2450,6 +2613,7 @@ impl CanonicalControlService {
                     attempt: admission.attempt.clone(),
                     executor: admission.executor.clone(),
                     existing_call: false,
+                    chat_history: None,
                 },
                 PreparedExecution {
                     request,
@@ -2960,39 +3124,17 @@ impl CanonicalControlService {
             .get(provider_key)
             .ok_or_else(|| invalid("resolved provider disappeared"))?;
 
-        if !images.is_empty()
-            && profile
-                .models
-                .get(model)
-                .and_then(|entry| entry.metadata.as_ref())
-                .is_some_and(|metadata| {
-                    metadata.images == Some(false)
-                        || (metadata.images.is_none() && metadata.multimodal == Some(false))
-                })
-        {
-            return Err(invalid("selected model does not support image input"));
-        }
-
         let effort = selection
             .as_ref()
             .and_then(|selection| selection.effort.as_deref());
-        if let Some(effort) = effort {
-            let entry = profile
-                .models
-                .get(model)
-                .ok_or_else(|| invalid("selected model missing"))?;
-            let supported = super::placement::supports_effort(entry, effort);
-            if !supported
-                || !provider_entry.wire_protocol().is_openai_chat_completions()
-                || !matches!(
-                    effort,
-                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
-                )
+        if let Some(entry) = profile.models.get(model) {
+            if let Some(refusal) =
+                chat_capability_refusal(provider_entry, entry, effort, !images.is_empty())
             {
-                return Err(invalid(
-                    "selected reasoning effort is unsupported for this model/protocol",
-                ));
+                return Err(invalid(refusal));
             }
+        } else if effort.is_some() {
+            return Err(invalid("selected model missing"));
         }
 
         // Create the Job, then hand it to canonical admission. The Job spec is
@@ -3026,7 +3168,26 @@ impl CanonicalControlService {
             domain.create_job(&canonical_project.id, job_spec)?
         };
         // Reservation is the canonical admission transition. Chat and generic
-        // launch both pass through it; only the payload built afterwards differs.
+        // launch both pass through it. A new Chat turn commits its Conversation
+        // turn, Messages and frozen logical request in the same transaction as
+        // its Attempt, so no Chat Attempt can exist without its Chat identity.
+        let user_content = initial_user_message(&request);
+        let chat_draft =
+            (is_chat && existing_job.is_none()).then(|| super::domain::ChatTurnDraft {
+                request: &request,
+                request_hash: &request_hash,
+                content: &user_content,
+                images: &images,
+                target: super::domain::ChatLaunchTarget {
+                    provider_key: resolved.config.provider_key.clone(),
+                    model_key: resolved.config.model.clone(),
+                    upstream_model_id: resolved.config.upstream_model_id.clone(),
+                    protocol: resolved.protocol,
+                    endpoint: resolved.config.endpoint.clone(),
+                    credential_ref: resolved.config.credential_ref.clone(),
+                },
+                effort: effort.map(str::to_string),
+            });
         let reserved = match reserve(
             &mut AdmissionContext {
                 domain: &mut domain,
@@ -3041,6 +3202,7 @@ impl CanonicalControlService {
             },
             &job,
             &resolved,
+            chat_draft.as_ref(),
         )? {
             Ok(reserved) => reserved,
             Err(refusal) => {
@@ -3066,23 +3228,13 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
-        let user_content = initial_user_message(&request);
         let messages = if reserved.existing_call {
             Vec::new()
         } else if is_chat {
-            match domain.prepare_chat_turn_with_images(
-                &request,
-                &request_hash,
-                &reserved.attempt,
-                &user_content,
-                &images,
-            ) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    domain.finish_attempt(&reserved.attempt.id, false)?;
-                    return Err(error);
-                }
-            }
+            reserved
+                .chat_history
+                .clone()
+                .ok_or_else(|| invalid("Chat reservation committed no frozen request"))?
         } else {
             vec![json!({"role": "user", "content": user_content})]
         };
@@ -3371,6 +3523,7 @@ impl CanonicalControlService {
             },
             &job,
             &resolved,
+            None,
         )? {
             Ok(reserved) => reserved,
             Err(refusal) => {
