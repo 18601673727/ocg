@@ -268,6 +268,34 @@ fn fence_disappeared(
             attempt_id: attempt_id.to_string(),
         });
     }
+    if domain.chat_session_for_job(&observation.job.id)?.is_some() {
+        // A Chat turn runs again only through Chat retry, which replays its
+        // frozen request with the Conversation's context; Placement would
+        // rebuild it from the objective alone. Its effect may already have
+        // left this process, so the Attempt settles as unknown, not failed,
+        // and the Job waits for that explicit retry.
+        if let Some(call_id) = call_id {
+            if let Err(error) =
+                domain.fence_dispatch_intent(call_id, "watchdog_executor_disappeared")
+            {
+                tracing::debug!(%error, call_id, "watchdog fence found the Call already settled");
+            }
+        }
+        match domain.settle_attempt_unknown(
+            attempt_id,
+            &failure(
+                "watchdog_executor_disappeared",
+                "Provider executor disappeared during this Chat turn; whether its effect completed is unknown. Retry the turn to run it again",
+            ),
+        ) {
+            Ok(()) => {}
+            Err(error) if authority_moved(&error) => {}
+            Err(error) => return Err(error),
+        }
+        return Ok(WatchdogRecovery::Fenced {
+            attempt_id: attempt_id.to_string(),
+        });
+    }
     // Candidate work may be placed again, but only by admission. Fencing this
     // generation and clearing the authority pointer returns the Job to
     // eligibility. The admission worker is the only component that runs
@@ -286,7 +314,9 @@ fn fence_disappeared(
 
 fn authority_moved(error: &OcgError) -> bool {
     let message = error.to_string();
-    message.contains("authority changed") || message.contains("already terminal")
+    message.contains("authority changed")
+        || message.contains("already terminal")
+        || message.contains("no longer authoritative")
 }
 
 fn failure(code: &str, message: &str) -> Failure {

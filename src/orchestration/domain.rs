@@ -5324,6 +5324,21 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         transaction.commit().map_err(sql)
     }
 
+    /// Settle a still-authoritative Attempt whose external effect may or may
+    /// not have happened as `unknown`, recording why.
+    pub(crate) fn settle_attempt_unknown(
+        &mut self,
+        attempt_id: &str,
+        failure: &Failure,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        finish_attempt_with_reason_in(&transaction, attempt_id, "unknown", false, Some(failure))?;
+        transaction.commit().map_err(sql)
+    }
+
     pub fn confirm_cancel(&mut self, attempt_id: &str, stopped: bool) -> Result<()> {
         self.confirm_cancel_with_cause(attempt_id, stopped, None)
     }

@@ -1778,12 +1778,64 @@ impl CanonicalControlService {
                     handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
                 })
             };
-            if let Err(error) = super::watchdog::reconcile_repository(&mut domain, runtime.as_ref())
-            {
-                failure.get_or_insert(error);
+            match super::watchdog::reconcile_repository(&mut domain, runtime.as_ref()) {
+                Ok(recoveries) => {
+                    for (_, recovery) in recoveries {
+                        if let super::watchdog::WatchdogRecovery::Fenced { attempt_id } = recovery {
+                            self.publish_watchdog_settlement(&domain, &attempt_id);
+                        }
+                    }
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
             }
         }
         failure.map_or(Ok(()), Err)
+    }
+
+    /// End the Chat tail of an Attempt that Watchdog settled because its
+    /// executor disappeared.
+    ///
+    /// Only the committed outcome is published: the Attempt must be terminal
+    /// and its Job must record Watchdog's own reason. An Attempt another actor
+    /// settled publishes its own terminal event and is left alone here.
+    fn publish_watchdog_settlement(&self, domain: &DomainRepository, attempt_id: &str) {
+        let committed = (|| -> Result<Option<String>> {
+            let Some(attempt) = domain.attempt(attempt_id)? else {
+                return Ok(None);
+            };
+            if matches!(
+                attempt.state,
+                super::domain::AttemptState::Queued
+                    | super::domain::AttemptState::Running
+                    | super::domain::AttemptState::Cancelling
+            ) {
+                return Ok(None);
+            }
+            Ok(domain
+                .job(attempt.job_id.as_str())?
+                .filter(|job| job.generation == attempt.generation)
+                .and_then(|job| job.termination_reason)
+                .filter(|reason| reason.code == "watchdog_executor_disappeared")
+                .map(|reason| reason.message))
+        })();
+        let message = match committed {
+            Ok(Some(message)) => message,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(%error, attempt_id, "watchdog settlement could not be read back");
+                return;
+            }
+        };
+        if let Ok(chats) = self.active_chats.lock() {
+            for chat in chats.values().filter(|chat| chat.attempt_id == attempt_id) {
+                chat.cancelled.cancel();
+                if let Err(error) = chat.sender.send(ExecutionEvent::Failed(message.clone())) {
+                    tracing::debug!(%error, "watchdog-settled Job chat receiver closed");
+                }
+            }
+        }
     }
 
     /// Cancel every Chat-root Job whose current Attempt outlived the Chat
