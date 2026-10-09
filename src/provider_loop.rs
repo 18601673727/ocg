@@ -1761,7 +1761,9 @@ async fn run_provider_worker_async(
         {
             ntex::util::Either::Left(result) => log_provider_task_result(result),
             ntex::util::Either::Right(envelope) => match envelope? {
-                Some(envelope) => tasks.push(spawn_provider_task(&handler, envelope)),
+                Some((envelope, lease)) => {
+                    tasks.push(spawn_provider_task(&handler, envelope, lease))
+                }
                 None => closed = true,
             },
         }
@@ -1788,11 +1790,17 @@ async fn next_provider_completion(tasks: &mut Vec<ProviderTask>) -> Result<()> {
 fn spawn_provider_task(
     handler: &CanonicalProviderCallHandler,
     envelope: ExecutionEnvelope,
+    lease: crate::orchestration::execution_dispatch::ExecutionLease,
 ) -> ProviderTask {
     let handler = handler.clone();
     let cancelled = envelope.cancelled.clone();
     ProviderTask {
-        handle: ntex::rt::spawn(async move { execute_provider_envelope(&handler, envelope).await }),
+        // The task holds the Attempt's lease for as long as it runs; a task
+        // that returns, fails or panics releases it.
+        handle: ntex::rt::spawn(async move {
+            let _lease = lease;
+            execute_provider_envelope(&handler, envelope).await
+        }),
         cancelled,
     }
 }
@@ -1855,7 +1863,7 @@ fn run_native_tool_scheduler(
         }
 
         let envelope = if read_only_tasks.is_empty() {
-            dispatcher.recv()?
+            dispatcher.recv_leased()?
         } else {
             match dispatcher.recv_timeout(std::time::Duration::from_millis(10))? {
                 Some(envelope) => Some(envelope),
@@ -1877,22 +1885,25 @@ fn run_native_tool_scheduler(
                 }
             }
         };
-        let Some(envelope) = envelope else {
+        let Some((envelope, lease)) = envelope else {
             while !read_only_tasks.is_empty() {
                 finish_native_tool_task(&mut read_only_tasks)?;
             }
             return Ok(());
         };
 
+        // Each task holds its Attempt's lease until it finishes or unwinds.
         if is_read_only_native_tool(&envelope)? {
             let handler = handler.clone();
             read_only_tasks.push(std::thread::spawn(move || {
+                let _lease = lease;
                 process_native_tool_item(&handler, envelope)
             }));
         } else {
             while !read_only_tasks.is_empty() {
                 finish_native_tool_task(&mut read_only_tasks)?;
             }
+            let _lease = lease;
             process_native_tool_item(handler, envelope)?;
         }
     }
