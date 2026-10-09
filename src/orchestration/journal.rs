@@ -292,9 +292,10 @@ pub struct JournalPrune {
 /// Install the journal and its retention boundary, then reconcile the boundary
 /// with whatever is already durable. Store bootstrap runs this once per schema
 /// generation.
+/// Create the journal tables. The retention boundary row is established by
+/// [`reconcile_boundary`], which needs a transaction of its own.
 pub(crate) fn ensure_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(SCHEMA).map_err(sql)?;
-    reconcile_boundary(connection)
+    connection.execute_batch(SCHEMA).map_err(sql)
 }
 
 /// Reconcile the retention boundary with the events that are durable now. This

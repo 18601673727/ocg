@@ -304,34 +304,10 @@ where
     Ok((spec, payload))
 }
 
-/// The schema generation recorded by the last completed bootstrap. Stores that
-/// predate the gate report `0`.
+/// The schema generation recorded by the last completed initialization. An
+/// uninitialized store reports `0`.
 fn schema_generation(connection: &Connection) -> rusqlite::Result<i64> {
     connection.query_row("PRAGMA user_version", [], |row| row.get(0))
-}
-
-fn ensure_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<()> {
-    let exists: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
-            params![table, column],
-            |row| row.get(0),
-        )
-        .map_err(sql)?;
-    if !exists {
-        connection
-            .execute(
-                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
-                [],
-            )
-            .map_err(sql)?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -736,11 +712,10 @@ pub struct CanonicalAdmission {
 }
 
 /// Schema generation of the canonical domain database, recorded in SQLite's
-/// `user_version`. Ordinary opens read it and skip bootstrap entirely when it
-/// is current. Bump it whenever the bootstrap body gains work that existing
-/// stores must receive. Stores created before this gate report `0`, so their
-/// first open runs the full bootstrap once; every step in it is idempotent.
-const DOMAIN_SCHEMA_VERSION: i64 = 3;
+/// `user_version`. Ordinary opens read it and skip initialization entirely
+/// when it is current. Fresh initialization is the only supported path: a
+/// store written by any other generation is refused rather than migrated.
+const DOMAIN_SCHEMA_VERSION: i64 = 4;
 
 const DOMAIN_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS domain_projects (
@@ -754,9 +729,14 @@ CREATE TABLE IF NOT EXISTS domain_jobs (
     state TEXT NOT NULL CHECK(state IN ('pending','eligible','running','cancelling','completed','failed','cancelled','unknown','orphaned')),
     generation INTEGER NOT NULL CHECK(generation >= 0),
     authoritative_attempt_id TEXT,
-    root_job_id TEXT,
+    root_job_id TEXT NOT NULL,
     depth INTEGER NOT NULL DEFAULT 0 CHECK(depth >= 0),
     waiting_for_children INTEGER NOT NULL DEFAULT 0 CHECK(waiting_for_children IN (0,1)),
+    termination_reason TEXT,
+    automatic_admission INTEGER NOT NULL DEFAULT 0 CHECK(automatic_admission IN (0,1)),
+    admission_selection TEXT,
+    placement_evidence TEXT,
+    final_acquisition_outcome TEXT,
     payload TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -766,6 +746,7 @@ CREATE TABLE IF NOT EXISTS domain_job_bindings (
     binding_key TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES domain_projects(id),
     job_id TEXT NOT NULL UNIQUE REFERENCES domain_jobs(id),
+    attempt_id TEXT,
     created_at INTEGER NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS domain_attempts (
@@ -817,8 +798,13 @@ CREATE TABLE IF NOT EXISTS domain_job_origins (
     parent_job_id TEXT NOT NULL REFERENCES domain_jobs(id),
     attempt_id TEXT NOT NULL REFERENCES domain_attempts(id),
     generation INTEGER NOT NULL,
-    call_id TEXT
+    call_id TEXT,
+    spawn_key TEXT,
+    spawn_fingerprint TEXT,
+    policy TEXT
 ) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS domain_job_spawn_keys
+    ON domain_job_origins(parent_job_id,spawn_key) WHERE spawn_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS domain_dispatch_intents (
     id TEXT PRIMARY KEY,
     call_id TEXT NOT NULL UNIQUE REFERENCES domain_calls(id),
@@ -865,7 +851,7 @@ CREATE TABLE IF NOT EXISTS domain_settlements (
     usage_authoritative INTEGER NOT NULL CHECK(usage_authoritative IN (0,1)),
     -- The content digest of the settlement payload, so a re-delivery of the same
     -- identity with different content is a conflict rather than a duplicate.
-    payload_digest TEXT NOT NULL DEFAULT '',
+    payload_digest TEXT NOT NULL,
     settlement TEXT NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
@@ -955,6 +941,35 @@ CREATE TRIGGER IF NOT EXISTS domain_job_inputs_immutable_update
 CREATE TRIGGER IF NOT EXISTS domain_job_inputs_immutable_delete
     BEFORE DELETE ON domain_job_inputs
     BEGIN SELECT RAISE(ABORT,'frozen Job input is immutable'); END;
+-- Staged candidate evidence is adopted by the Attempt that consumes it. The
+-- history itself is append-only and keyed by Attempt, so a later replacement
+-- cannot overwrite an earlier decision.
+CREATE TABLE IF NOT EXISTS domain_placement_decisions (
+    job_id TEXT NOT NULL REFERENCES domain_jobs(id),
+    attempt_id TEXT REFERENCES domain_attempts(id),
+    generation INTEGER,
+    decision TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    ordinal INTEGER PRIMARY KEY AUTOINCREMENT
+) STRICT;
+CREATE INDEX IF NOT EXISTS domain_placement_by_job
+    ON domain_placement_decisions(job_id,ordinal);
+CREATE TABLE IF NOT EXISTS domain_watchdog_actions (
+    job_id TEXT NOT NULL REFERENCES domain_jobs(id),
+    attempt_id TEXT,
+    generation INTEGER,
+    call_id TEXT,
+    executor_id TEXT,
+    classification TEXT NOT NULL,
+    action TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    replacement_attempt_id TEXT,
+    created_at INTEGER NOT NULL,
+    ordinal INTEGER PRIMARY KEY AUTOINCREMENT
+) STRICT;
+CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
+    ON domain_watchdog_actions(job_id,ordinal);
 "#;
 
 /// In-memory dependency view. The SQLite revision determines whether it is current.
@@ -1089,17 +1104,17 @@ impl DomainRepository {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| open_sql(root, error))?;
-        // A current store needs no bootstrap work, so ordinary opens stop at
-        // this unlocked read. Bootstrap is serialized across processes: the
-        // generation is read again under the lock, so only the first process
-        // to find a stale store migrates it and the rest see it current.
+        // A current store needs no initialization, so ordinary opens stop at
+        // this unlocked read. Initialization is serialized across processes:
+        // the generation is read again under the lock, so only the first
+        // process to find an empty store initializes it.
         if schema_generation(&connection).map_err(|error| open_sql(root, error))?
-            < DOMAIN_SCHEMA_VERSION
+            != DOMAIN_SCHEMA_VERSION
         {
             // Switching a new database to WAL needs an exclusive lock SQLite
-            // will not wait for, and each `ensure_column` checks then alters.
-            // The holder does only this local SQLite work and takes no other
-            // lock; the kernel releases it if the process dies.
+            // will not wait for. The holder does only this local SQLite work
+            // and takes no other lock; the kernel releases it if the process
+            // dies.
             let bootstrap = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -1109,168 +1124,61 @@ impl DomainRepository {
                 .map_err(|error| OcgError::io("open canonical database bootstrap lock", error))?;
             fs2::FileExt::lock_exclusive(&bootstrap)
                 .map_err(|error| OcgError::io("lock canonical database bootstrap", error))?;
-            if schema_generation(&connection).map_err(|error| open_sql(root, error))?
-                < DOMAIN_SCHEMA_VERSION
-            {
-                Self::bootstrap_schema(root, &connection)?;
+            match schema_generation(&connection).map_err(|error| open_sql(root, error))? {
+                DOMAIN_SCHEMA_VERSION => {}
+                0 => Self::bootstrap_schema(root, &connection)?,
+                generation => {
+                    return Err(invalid(&format!(
+                        "canonical store at {} has schema generation {generation}, not {DOMAIN_SCHEMA_VERSION}; it must be reinitialized",
+                        path.display()
+                    )))
+                }
             }
             drop(bootstrap);
         }
         Ok(Self { connection, path })
     }
 
-    /// Bring a store up to [`DOMAIN_SCHEMA_VERSION`]. Every step is idempotent,
-    /// so a bootstrap interrupted by a crash is simply repeated by the next
-    /// process that finds the store stale. The generation is recorded last.
+    /// Initialize an empty store at [`DOMAIN_SCHEMA_VERSION`].
+    ///
+    /// The schema and its generation commit in one transaction, so a store
+    /// whose generation is still `0` holds no committed schema at all. A store
+    /// that reports `0` yet already has canonical tables predates the
+    /// generation gate and is refused.
     fn bootstrap_schema(root: &Path, connection: &Connection) -> Result<()> {
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(|error| open_sql(root, error))?;
-        connection
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| open_sql(root, error))?;
+        let existing: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name LIKE 'domain\\_%' ESCAPE '\\')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| open_sql(root, error))?;
+        if existing {
+            return Err(invalid(
+                "canonical store predates schema generations; it must be reinitialized",
+            ));
+        }
+        transaction
             .execute_batch(DOMAIN_SCHEMA)
             .map_err(|error| open_sql(root, error))?;
         // The durable execution event journal shares this database so a state
         // change and its event commit in one transaction. It is evidence, never
         // a decision input: nothing in this file reads it back to choose an
         // execution outcome.
-        journal::ensure_schema(connection)?;
-        ensure_column(
-            connection,
-            "domain_dispatch_intents",
-            "reservation_id",
-            "TEXT",
-        )?;
-        ensure_column(
-            connection,
-            "domain_dispatch_intents",
-            "budget_admitted",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(
-            connection,
-            "domain_dispatch_intents",
-            "pricing_basis",
-            "TEXT",
-        )?;
-        ensure_column(
-            connection,
-            "domain_settlements",
-            "payload_digest",
-            "TEXT NOT NULL DEFAULT ''",
-        )?;
-        ensure_column(
-            connection,
-            "domain_dispatch_intents",
-            "upstream_model_id",
-            "TEXT",
-        )?;
-        ensure_column(connection, "domain_jobs", "termination_reason", "TEXT")?;
-        ensure_column(connection, "domain_jobs", "root_job_id", "TEXT")?;
-        ensure_column(
-            connection,
-            "domain_jobs",
-            "depth",
-            "INTEGER NOT NULL DEFAULT 0 CHECK(depth >= 0)",
-        )?;
-        ensure_column(
-            connection,
-            "domain_jobs",
-            "waiting_for_children",
-            "INTEGER NOT NULL DEFAULT 0 CHECK(waiting_for_children IN (0,1))",
-        )?;
-        connection
-            .execute(
-                "UPDATE domain_jobs SET root_job_id=id WHERE root_job_id IS NULL",
-                [],
-            )
-            .map_err(sql)?;
-        ensure_column(
-            connection,
-            "domain_jobs",
-            "automatic_admission",
-            "INTEGER NOT NULL DEFAULT 0 CHECK(automatic_admission IN (0,1))",
-        )?;
-        ensure_column(connection, "domain_jobs", "admission_selection", "TEXT")?;
-        ensure_column(connection, "domain_jobs", "placement_evidence", "TEXT")?;
-        ensure_column(
-            connection,
-            "domain_jobs",
-            "final_acquisition_outcome",
-            "TEXT",
-        )?;
-        // Staged candidate evidence is adopted by the Attempt that consumes it.
-        // The history itself is append-only and keyed by Attempt, so a later
-        // replacement cannot overwrite an earlier decision.
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS domain_placement_decisions (
-    job_id TEXT NOT NULL REFERENCES domain_jobs(id),
-    attempt_id TEXT REFERENCES domain_attempts(id),
-    generation INTEGER,
-    decision TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    ordinal INTEGER PRIMARY KEY AUTOINCREMENT
-) STRICT;
-CREATE INDEX IF NOT EXISTS domain_placement_by_job
-    ON domain_placement_decisions(job_id,ordinal);
-CREATE TABLE IF NOT EXISTS domain_watchdog_actions (
-    job_id TEXT NOT NULL REFERENCES domain_jobs(id),
-    attempt_id TEXT,
-    generation INTEGER,
-    call_id TEXT,
-    executor_id TEXT,
-    classification TEXT NOT NULL,
-    action TEXT NOT NULL,
-    evidence TEXT NOT NULL,
-    outcome TEXT NOT NULL,
-    replacement_attempt_id TEXT,
-    created_at INTEGER NOT NULL,
-    ordinal INTEGER PRIMARY KEY AUTOINCREMENT
-) STRICT;
-CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
-    ON domain_watchdog_actions(job_id,ordinal);",
-            )
-            .map_err(sql)?;
-        ensure_column(connection, "domain_job_origins", "spawn_key", "TEXT")?;
-        ensure_column(
-            connection,
-            "domain_job_origins",
-            "spawn_fingerprint",
-            "TEXT",
-        )?;
-        ensure_column(connection, "domain_job_origins", "policy", "TEXT")?;
-        ensure_column(connection, "domain_job_origins", "call_id", "TEXT")?;
-        connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS domain_job_spawn_keys ON domain_job_origins(parent_job_id,spawn_key) WHERE spawn_key IS NOT NULL", [],
-        ).map_err(sql)?;
-        connection
-            .execute_batch(
-                "WITH RECURSIVE lineage(job_id,root_job_id,depth) AS (
-                    SELECT j.id,j.id,0
-                    FROM domain_jobs j
-                    WHERE NOT EXISTS(
-                        SELECT 1 FROM domain_job_origins o WHERE o.job_id=j.id
-                    )
-                    UNION ALL
-                    SELECT o.job_id,lineage.root_job_id,lineage.depth+1
-                    FROM domain_job_origins o
-                    JOIN lineage ON lineage.job_id=o.parent_job_id
-                )
-                UPDATE domain_jobs
-                SET root_job_id=(SELECT lineage.root_job_id FROM lineage WHERE lineage.job_id=domain_jobs.id),
-                    depth=(SELECT lineage.depth FROM lineage WHERE lineage.job_id=domain_jobs.id)
-                WHERE EXISTS(SELECT 1 FROM lineage WHERE lineage.job_id=domain_jobs.id);",
-            )
-            .map_err(sql)?;
-        ensure_column(connection, "domain_job_bindings", "attempt_id", "TEXT")?;
-        connection.execute(
-            "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
-            [],
-        ).map_err(sql)?;
-        connection
+        journal::ensure_schema(&transaction)?;
+        transaction
             .pragma_update(None, "user_version", DOMAIN_SCHEMA_VERSION)
             .map_err(|error| open_sql(root, error))?;
-        Ok(())
+        transaction
+            .commit()
+            .map_err(|error| open_sql(root, error))?;
+        journal::reconcile_boundary(connection)
     }
 
     /// Open the durable store and require a Project identity at this boundary.
