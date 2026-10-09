@@ -19,6 +19,17 @@ export function isLoopbackControlUrl(raw: string): boolean {
   }
 }
 
+export function isTrustedControlUrl(raw: string): boolean {
+  if (isLoopbackControlUrl(raw)) return true;
+  if (typeof window === "undefined") return false;
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" && url.origin === window.location.origin && !url.username && !url.password && url.pathname === "/" && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
 /** The message a failed control request should surface. */
 function errorMessage(body: unknown, fallback: string): string {
   if (body && typeof body === "object" && "error" in body) {
@@ -32,7 +43,7 @@ function errorMessage(body: unknown, fallback: string): string {
 }
 
 export function createProfileClient(baseUrl: string, fetchImpl: typeof fetch) {
-  if (!isLoopbackControlUrl(baseUrl)) throw new Error("OCG control endpoint must be an HTTP loopback URL");
+  if (!isTrustedControlUrl(baseUrl)) throw new Error("OCG control endpoint must be loopback or the current HTTPS origin");
   async function request(path: string, init?: RequestInit): Promise<ProfileView> {
     const response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}${path}`, {
       ...init,

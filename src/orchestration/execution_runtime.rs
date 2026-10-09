@@ -13,7 +13,88 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+/// Where a Project's execution ownership lock lives, beside its canonical
+/// store under the canonical Project root.
+const EXECUTION_LOCK: &str = "execution.lock";
+
+/// Exclusive execution and recovery ownership of one Project, held by the OS.
+///
+/// At most one process may admit, execute, cancel or recover work for a
+/// Project. The lock is an open file beside the Project's canonical store,
+/// found from its canonical root, so every process that resolves the same
+/// Project contends for the same lock. The OS releases it when the holder
+/// closes it or exits, so a crashed owner never blocks its successor, and the
+/// file's existence alone grants nothing. Acquisition never waits: a live
+/// owner is refused rather than raced, and nothing is recovered on refusal.
+///
+/// The lock only grants permission to act. Canonical SQLite remains the sole
+/// record of Job, Attempt, Call and DispatchIntent state.
+pub struct ProjectOwnership {
+    _lock: std::fs::File,
+}
+
+impl ProjectOwnership {
+    pub fn acquire(project_root: &Path) -> Result<Self> {
+        let root = project_root
+            .canonicalize()
+            .map_err(|error| OcgError::io("resolve Project root for execution ownership", error))?;
+        let directory = crate::orchestration::state::state_dir(&root);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| OcgError::io("create Project execution state directory", error))?;
+        let path = directory.join(EXECUTION_LOCK);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| OcgError::io("open Project execution ownership lock", error))?;
+        if let Err(error) = fs2::FileExt::try_lock_exclusive(&lock) {
+            if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+                return Err(OcgError::config(format!(
+                    "Project {} is owned by another OCG process for execution and recovery; \
+                     stop that process or run this operation through it",
+                    root.display()
+                )));
+            }
+            return Err(OcgError::io("lock Project execution ownership", error));
+        }
+        // The lock binds the file this process opened. If the path now names a
+        // different file, another process may hold a lock on the replacement,
+        // so this one cannot prove it is the only owner.
+        if !names_open_file(&path, &lock)? {
+            return Err(OcgError::config(format!(
+                "Project {} execution ownership lock was replaced while it was being acquired; retry",
+                root.display()
+            )));
+        }
+        Ok(Self { _lock: lock })
+    }
+}
+
+#[cfg(unix)]
+fn names_open_file(path: &Path, file: &std::fs::File) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let named = std::fs::metadata(path)
+        .map_err(|error| OcgError::io("inspect Project execution ownership lock", error))?;
+    let open = file
+        .metadata()
+        .map_err(|error| OcgError::io("inspect Project execution ownership lock", error))?;
+    Ok(named.dev() == open.dev() && named.ino() == open.ino())
+}
+
+/// Windows does not let an open, locked file be renamed over or deleted, so
+/// the path keeps naming the locked file.
+#[cfg(not(unix))]
+fn names_open_file(_path: &Path, _file: &std::fs::File) -> Result<bool> {
+    Ok(true)
+}
+
 /// Long-lived execution runtime that owns provider and native tool dispatchers.
+///
+/// A runtime is the only holder of its Project's [`ProjectOwnership`]: it is
+/// acquired before startup recovery and released only after both workers have
+/// stopped and joined.
 pub struct ExecutionRuntime {
     project_root: PathBuf,
     provider_dispatcher: BoundedDispatcher,
@@ -24,6 +105,12 @@ pub struct ExecutionRuntime {
     disk_guard: DiskGuard,
     provider_thread: Option<JoinHandle<Result<()>>>,
     native_tool_thread: Option<JoinHandle<Result<()>>>,
+    /// True while this runtime holds its Project's ownership and has not been
+    /// stopped; shared with every handle.
+    owned: Arc<AtomicBool>,
+    /// Dropped after `Drop::drop` has joined both workers, which is what
+    /// releases the OS lock only once no worker of this runtime can act.
+    _ownership: ProjectOwnership,
 }
 
 impl ExecutionRuntime {
@@ -45,6 +132,10 @@ impl ExecutionRuntime {
             .canonicalize()
             .map_err(|error| OcgError::io("resolve execution Project root", error))?;
         let project_root = canonical_root.as_path();
+        // Ownership precedes startup recovery: recovery treats every live
+        // Attempt it finds as abandoned, which is only true when no other
+        // process owns this Project. A refusal returns before anything runs.
+        let ownership = ProjectOwnership::acquire(project_root)?;
         let provider_dispatcher = BoundedDispatcher::new(provider_capacity)?;
         let native_tool_dispatcher = BoundedDispatcher::new(native_tool_capacity)?;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -125,6 +216,8 @@ impl ExecutionRuntime {
             disk_guard,
             provider_thread: Some(provider_thread),
             native_tool_thread: Some(native_tool_thread),
+            owned: Arc::new(AtomicBool::new(true)),
+            _ownership: ownership,
         })
     }
 
@@ -197,6 +290,8 @@ impl Drop for ExecutionRuntime {
         if let Some(thread) = self.native_tool_thread.take() {
             let _ = thread.join();
         }
+        // Both workers are joined; the ownership field is released right after.
+        self.owned.store(false, Ordering::SeqCst);
     }
 }
 
@@ -206,6 +301,7 @@ pub struct ExecutionRuntimeHandle {
     project_root: PathBuf,
     provider_dispatcher: BoundedDispatcher,
     cancelled: Arc<AtomicBool>,
+    owned: Arc<AtomicBool>,
     governor: Governor,
     disk_guard: DiskGuard,
 }
@@ -216,6 +312,7 @@ impl ExecutionRuntimeHandle {
             project_root: runtime.project_root.clone(),
             provider_dispatcher: runtime.provider_dispatcher.clone(),
             cancelled: runtime.cancelled.clone(),
+            owned: runtime.owned.clone(),
             governor: runtime.governor.clone(),
             disk_guard: runtime.disk_guard.clone(),
         }
@@ -240,6 +337,12 @@ impl ExecutionRuntimeHandle {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Whether this handle's runtime still holds its Project's execution
+    /// ownership and has not been stopped. Only then may it act for the Project.
+    pub fn owns_execution(&self) -> bool {
+        self.owned.load(Ordering::SeqCst) && !self.is_cancelled()
     }
 }
 

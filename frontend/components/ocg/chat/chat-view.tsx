@@ -340,7 +340,9 @@ function BoundedMessage({ streaming, children }: { streaming: boolean; children:
 function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message: ChatMessage; toolMessages?: ChatMessage[]; onRetry?: () => void; retryDisabled?: boolean }) {
   const { t } = useI18n();
   const { isCopied, copyToClipboard } = useCopyToClipboard();
-  const [reasoningOpen, setReasoningOpen] = useState(false);
+  // Open by default: thinking must be observable as it streams without a
+  // click. The user's explicit toggle still wins for the mounted message.
+  const [reasoningOpen, setReasoningOpen] = useState(true);
   
   if (message.role === "tool") {
     return null; // Tool messages are now rendered within their parent assistant message
@@ -416,6 +418,11 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
              </BoundedMessage>
              {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
                {chatFailureReason(t, message)}
+             </p>}
+             {/* A stop the runtime made for a recorded cause, such as the
+                 execution deadline, names that cause; an operator's stop has none. */}
+             {message.status === "cancelled" && message.failureReason && <p className="mt-2 whitespace-pre-wrap break-words text-[12px]">
+               {message.failureReason}
              </p>}
              {onRetry && <Button className="mt-2" size="xs" variant="outline" disabled={retryDisabled} onClick={onRetry}>{t("common.retry")}</Button>}
              {message.status !== "completed" && message.status !== "pending" && (

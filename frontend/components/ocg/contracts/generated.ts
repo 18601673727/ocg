@@ -41,6 +41,12 @@ export type ApiErrorBody = { code: string, message: string, };
 export type ApiErrorEnvelope = { error: ApiErrorBody, };
 
 
+export type AuthenticationMode = "local" | "cloudflare-access";
+
+
+export type AuthenticationSession = { mode: AuthenticationMode, user_id: string | null, expires_at: number | null, remote_execution: boolean, };
+
+
 /**
  * The `configuration` envelope shared by the three configuration read routes.
  */
@@ -461,6 +467,12 @@ export type ProjectConfiguration = { defaults: JsonValue, };
 
 
 export type ProjectConfigurationView = { project: ProjectRecord, global: GlobalConfiguration, project_defaults: ProjectConfiguration, };
+
+
+export type ProjectOwnershipRequest = { project_id: string, issuer: string, subject: string, };
+
+
+export type ProjectOwnershipResponse = { project_id: string, user_id: string, };
 
 
 /**

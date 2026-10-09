@@ -599,6 +599,9 @@ pub struct NativeOpenAiCompatibleProvider<'a> {
     upstream_model_id: String,
     cancelled: CallCancellation,
     events: Option<flume::Sender<crate::orchestration::execution_dispatch::ExecutionEvent>>,
+    /// Whether the current turn's assistant rounds carry their
+    /// `reasoning_content` back on the wire.
+    replays_turn_reasoning: bool,
 }
 
 impl<'a> NativeOpenAiCompatibleProvider<'a> {
@@ -617,6 +620,7 @@ impl<'a> NativeOpenAiCompatibleProvider<'a> {
             upstream_model_id: upstream_model_id.into(),
             cancelled,
             events,
+            replays_turn_reasoning: true,
         }
     }
 }
@@ -1034,6 +1038,28 @@ impl CanonicalProviderCallHandler {
             Some(decorated) => decorated,
             None => &transport,
         };
+        // Tap the provider event stream: when an execution fails after the
+        // provider already delivered displayable output, that output is
+        // canonical evidence of what was received, and the failure settlement
+        // preserves it on the failed Call rather than erasing it. The tap
+        // mirrors the Chat reconciler's round semantics exactly — a new round
+        // or a physical retry invalidates only the round's partial output.
+        let (tap_tx, tap_rx) = flume::unbounded();
+        let received_stream = Arc::new(Mutex::new(ReceivedProviderStream::default()));
+        let tap = {
+            let forward = envelope.events.clone();
+            let received_stream = Arc::clone(&received_stream);
+            ntex::rt::spawn(async move {
+                while let Ok(event) = tap_rx.recv_async().await {
+                    if let ExecutionEvent::Provider(stream_event) = &event {
+                        if let Ok(mut received) = received_stream.lock() {
+                            received.observe(stream_event);
+                        }
+                    }
+                    let _ = forward.send(event);
+                }
+            })
+        };
         let provider = context_cost::AccountingProvider {
             inner: provider_client(
                 ProviderBinding::of(protocol),
@@ -1041,7 +1067,7 @@ impl CanonicalProviderCallHandler {
                 provider_config,
                 bearer,
                 envelope.cancelled.clone(),
-                Some(envelope.events.clone()),
+                Some(tap_tx),
             ),
             costs: costs.clone(),
             protocol,
@@ -1051,7 +1077,8 @@ impl CanonicalProviderCallHandler {
             envelope: &envelope,
             projection: &tool_projection,
         };
-        let response = match execute_provider_loop(
+        let mut received = ProviderReceivedOutput::default();
+        let result = execute_provider_loop(
             &provider,
             &config.project_root,
             &envelope,
@@ -1069,9 +1096,23 @@ impl CanonicalProviderCallHandler {
                 .as_ref()
                 .zip(probe_outcome.as_ref())
                 .map(|(intent, _)| intent),
+            &mut received,
         )
-        .await
-        {
+        .await;
+        // Settle only after the event tap drained: both the failure evidence
+        // and the event order its receiver observes must be final. Dropping
+        // the provider releases the last tap sender, so the tap task observes
+        // every queued event before it terminates; its JoinHandle resolving is
+        // the happens-before point that makes this merge complete.
+        drop(provider);
+        let _ = tap.await;
+        if received.include_stream_partials {
+            if let Ok(partial) = received_stream.lock() {
+                received.content = partial.content.clone();
+                received.reasoning = format!("{}{}", received.reasoning, partial.reasoning);
+            }
+        }
+        let response = match result {
             Ok(response) => response,
             Err(error) => {
                 // A reliable upstream 429 is rate governance, not a stall and
@@ -1102,7 +1143,14 @@ impl CanonicalProviderCallHandler {
                 // completion. This worker still holds the Attempt authority it
                 // validated above, so the failure settles the whole execution
                 // rather than only the Call. A probe settles the same way, with
-                // the class the provider's own answer implies.
+                // the class the provider's own answer implies. Whatever
+                // displayable output arrived before the failure is preserved
+                // as evidence, never promoted to a completion.
+                let evidence = (!received.content.is_empty() || !received.reasoning.is_empty())
+                    .then(|| crate::orchestration::domain::ProviderFailureEvidence {
+                        content: std::mem::take(&mut received.content),
+                        reasoning: std::mem::take(&mut received.reasoning),
+                    });
                 match (&probe, &probe_outcome) {
                     (Some(_), Some(decorated)) => settle_authoritative_provider_call(
                         &config.project_root,
@@ -1113,12 +1161,14 @@ impl CanonicalProviderCallHandler {
                             &error.to_string(),
                         ),
                         true,
+                        None,
                     ),
-                    _ => fail_authoritative_provider_call(
+                    _ => fail_authoritative_provider_call_with_evidence(
                         &config.project_root,
                         &envelope,
                         &error.to_string(),
                         true,
+                        evidence.as_ref(),
                     ),
                 }
                 costs.persist(&config.project_root, &envelope);
@@ -1145,6 +1195,13 @@ impl CanonicalProviderCallHandler {
             Ok(())
         })();
         if let Err(error) = settlement {
+            // The provider's answer arrived but could not be settled: it stays
+            // observable as failed-attempt evidence rather than disappearing
+            // with the settlement failure.
+            let evidence = crate::orchestration::domain::ProviderFailureEvidence {
+                content: response.content.clone(),
+                reasoning: response.reasoning.clone(),
+            };
             // An actual disk-full terminal write is storage safety, never a
             // provider failure: the Attempt carries `storage_full` so recovery
             // waits on disk rather than retrying the provider.
@@ -1154,13 +1211,15 @@ impl CanonicalProviderCallHandler {
                     &envelope,
                     crate::orchestration::domain::storage_full_failure(&error.to_string()),
                     true,
+                    Some(&evidence),
                 );
             } else {
-                fail_authoritative_provider_call(
+                fail_authoritative_provider_call_with_evidence(
                     &config.project_root,
                     &envelope,
                     &error.to_string(),
                     true,
+                    Some(&evidence),
                 );
             }
             costs.persist(&config.project_root, &envelope);
@@ -1899,6 +1958,53 @@ struct PendingNativeToolCall {
     durable_call_id: String,
 }
 
+/// The in-flight provider round's displayable output, captured from the same
+/// canonical events the Chat surface consumes. Round boundaries mirror the
+/// Chat reconciler exactly: a new logical round or a physical retry
+/// invalidates the round's partial output, never the rounds that already
+/// completed. The loop merges this only when a round never completed;
+/// completed rounds are already accounted in its own accumulator.
+#[derive(Default)]
+struct ReceivedProviderStream {
+    content: String,
+    reasoning: String,
+}
+
+impl ReceivedProviderStream {
+    fn observe(&mut self, event: &ChatStreamEvent) {
+        match event {
+            ChatStreamEvent::TextDelta { delta } => self.content.push_str(delta),
+            ChatStreamEvent::ReasoningDelta { delta } => self.reasoning.push_str(delta),
+            ChatStreamEvent::RoundBegan | ChatStreamEvent::RoundReset => {
+                self.content.clear();
+                self.reasoning.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Displayable provider output the loop accounted before a failure: completed
+/// rounds' accumulated reasoning, plus whatever the failed round itself
+/// delivered. Success paths ignore it; the failure path preserves it on the
+/// Call record so settlement can keep it on the failed assistant Message.
+///
+/// The loop accounts every completed round here as soon as the round
+/// returns, so any later exit — a tool round, an activity check, round
+/// exhaustion — carries it without a handler of its own.
+#[derive(Default)]
+struct ProviderReceivedOutput {
+    /// The latest completed round's text.
+    content: String,
+    /// Every completed round's reasoning, in order.
+    reasoning: String,
+    /// The failing round never completed, so its partial output exists only in
+    /// the event tap. The worker merges it after the tap drained, when every
+    /// queued delta has been observed; reading the tap earlier could miss
+    /// events the provider already delivered.
+    include_stream_partials: bool,
+}
+
 /// Drive the provider rounds for one Call.
 ///
 /// A Health Probe supplies `probe`. It shares every pre-execution invariant and
@@ -1906,6 +2012,7 @@ struct PendingNativeToolCall {
 /// — context assembly, native-tool dispatch, compaction — because a probe asks
 /// whether the frozen tuple executes, not what the model can do. It sends one
 /// round of the frozen request and returns.
+#[allow(clippy::too_many_arguments)]
 async fn execute_provider_loop(
     provider: &dyn ProviderClient,
     project_root: &Path,
@@ -1914,6 +2021,7 @@ async fn execute_provider_loop(
     binding: ProviderBinding,
     admission: ProviderAdmission<'_>,
     probe: Option<&crate::orchestration::health_probe::HealthProbeIntent>,
+    received: &mut ProviderReceivedOutput,
 ) -> Result<ProviderFinalResponse> {
     let ProviderAdmission {
         authority,
@@ -1993,18 +2101,37 @@ async fn execute_provider_loop(
         }
 
         let projected_request = request_projection::project(request);
-        let round_response = provider.complete(&projected_request).await?;
+        let mut round_response = match provider.complete(&projected_request).await {
+            Ok(round_response) => round_response,
+            Err(error) => {
+                // A round that never completed leaves its partial output only
+                // in the event tap; the rounds that completed are already
+                // accounted in `received`. The tap task may still hold queued
+                // deltas it has not observed yet, so the tap is merged by the
+                // worker only after it drained — never here.
+                received.include_stream_partials = true;
+                return Err(error);
+            }
+        };
+        // The round completed, so its output is received from here on: every
+        // later exit, including the tool round below, keeps it as evidence. A
+        // retry inside `complete` never reaches this point with output it
+        // invalidated.
+        received
+            .reasoning
+            .push_str(&round_response.summary.reasoning);
+        received.content = std::mem::take(&mut round_response.summary.text);
         ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
 
         if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
+            // A truncated answer is received output too: keep it as evidence.
             return Err(OcgError::config("provider exceeded token limit"));
         }
         if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
             || round_response.summary.tool_calls.is_empty()
         {
-            if round_response.summary.text.trim().is_empty()
-                && round_response.summary.images.is_empty()
-            {
+            if received.content.trim().is_empty() && round_response.summary.images.is_empty() {
+                received.content.clear();
                 return Err(OcgError::config(
                     "provider returned no user-visible assistant content",
                 ));
@@ -2020,8 +2147,8 @@ async fn execute_provider_loop(
             .await?;
             return Ok(ProviderFinalResponse {
                 images: round_response.summary.images,
-                content: round_response.summary.text,
-                reasoning: round_response.summary.reasoning,
+                content: std::mem::take(&mut received.content),
+                reasoning: std::mem::take(&mut received.reasoning),
                 rounds: round + 1,
             });
         }
@@ -2529,7 +2656,7 @@ fn wait_for_call_completion(
     for _ in 0..600 {
         ensure_provider_active(project_root, envelope, shutdown)?;
         let domain = DomainRepository::open(project_root)?;
-        let call = domain.call(call_id)?;
+        let (call, intent) = domain.call_with_dispatch_intent(call_id)?;
         match call.state.as_str() {
             "completed" => {
                 let response = call.response.ok_or_else(|| {
@@ -2543,7 +2670,7 @@ fn wait_for_call_completion(
                     .response
                     .ok_or_else(|| OcgError::config("failed native tool Call has no result"))?;
                 ToolResult::validate_response(&response, false)?;
-                let intent = domain.dispatch_intent(call_id)?.ok_or_else(|| {
+                let intent = intent.ok_or_else(|| {
                     OcgError::config("failed native tool Call has no dispatch intent")
                 })?;
                 if intent.state != "failed" || intent.effect_state != EffectIntentState::Settled {
@@ -2562,7 +2689,7 @@ fn wait_for_call_completion(
                 if dispatcher.is_closed()? {
                     return Err(OcgError::config("native tool worker is unavailable"));
                 }
-                if domain.dispatch_intent(call_id)?.is_none_or(|intent| {
+                if intent.is_none_or(|intent| {
                     !matches!(intent.state.as_str(), "pending" | "queued" | "running")
                 }) {
                     return Err(OcgError::config(
@@ -2626,6 +2753,28 @@ impl ProviderClient for NativeOpenAiCompatibleProvider<'_> {
     fn complete(&self, request: &Value) -> BoxFuture<'_, Result<ProviderRound>> {
         // The frozen upstream model id is authoritative on the wire.
         let mut body = request.clone();
+        // Canonical reasoning remains in history; this is only its wire
+        // projection. Earlier turns never replay it. Within the current turn
+        // — the assistant tool-call rounds after the last user message — an
+        // OpenAI-compatible endpoint receives back the `reasoning_content` it
+        // emitted itself, as thinking models with tool calls require. Native
+        // OpenAI never emits the extension, so it never receives it.
+        if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+            let current_turn = messages
+                .iter()
+                .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .map_or(0, |last_user| last_user + 1);
+            for (index, message) in messages.iter_mut().enumerate() {
+                let replay = self.replays_turn_reasoning
+                    && index >= current_turn
+                    && message.get("role").and_then(Value::as_str) == Some("assistant");
+                if !replay {
+                    if let Some(object) = message.as_object_mut() {
+                        object.remove("reasoning_content");
+                    }
+                }
+            }
+        }
         if let Some(object) = body.as_object_mut() {
             object.insert(
                 "model".to_string(),
@@ -2887,14 +3036,17 @@ fn provider_client<'a>(
             events,
         )),
         ProviderProtocol::OpenAi | ProviderProtocol::OpenAiCompatible => {
-            Box::new(NativeOpenAiCompatibleProvider::new(
+            let mut provider = NativeOpenAiCompatibleProvider::new(
                 transport,
                 config.endpoint.clone(),
                 credential,
                 config.upstream_model_id.clone(),
                 cancelled,
                 events,
-            ))
+            );
+            provider.replays_turn_reasoning =
+                binding.protocol == ProviderProtocol::OpenAiCompatible;
+            Box::new(provider)
         }
     }
 }
@@ -3232,7 +3384,9 @@ async fn run_streamed_round_inner<S: ProviderRoundState + 'static>(
             for mut event in emitted {
                 if matches!(
                     event,
-                    ChatStreamEvent::TextDelta { .. } | ChatStreamEvent::Image { .. }
+                    ChatStreamEvent::TextDelta { .. }
+                        | ChatStreamEvent::ReasoningDelta { .. }
+                        | ChatStreamEvent::Image { .. }
                 ) {
                     callback_provisional.store(true, Ordering::SeqCst);
                 }
@@ -3350,13 +3504,15 @@ fn fail_provider_envelope(
     envelope: &ExecutionEnvelope,
     reason: &str,
     call_claimed: bool,
+    evidence: Option<&crate::orchestration::domain::ProviderFailureEvidence>,
 ) -> Result<bool> {
     if call_claimed {
-        domain.fail_call(
+        domain.fail_call_with_evidence(
             &envelope.call_id,
             &envelope.attempt_id,
             envelope.generation,
             reason,
+            evidence,
         )?;
     } else if !domain.fail_unclaimed_call(
         &envelope.call_id,
@@ -3365,12 +3521,6 @@ fn fail_provider_envelope(
         reason,
     )? {
         return Ok(false);
-    }
-    if let Err(error) = envelope
-        .events
-        .send(crate::orchestration::execution_dispatch::ExecutionEvent::Failed(reason.to_string()))
-    {
-        tracing::debug!(error = %error, "provider failure receiver closed");
     }
     Ok(true)
 }
@@ -3407,6 +3557,32 @@ fn fail_authoritative_provider_call(
             true,
         ),
         call_claimed,
+        None,
+    );
+}
+
+/// Settle a provider execution that failed after the provider delivered
+/// displayable output: the output rides the failed Call record as evidence,
+/// never a completion, so the Chat turn's settlement can keep it on the
+/// failed assistant Message instead of erasing it.
+fn fail_authoritative_provider_call_with_evidence(
+    project_root: &Path,
+    envelope: &ExecutionEnvelope,
+    reason: &str,
+    call_claimed: bool,
+    evidence: Option<&crate::orchestration::domain::ProviderFailureEvidence>,
+) {
+    fail_authoritative_provider_call_with_failure(
+        project_root,
+        envelope,
+        crate::orchestration::domain::job_failure(
+            "provider_execution_failed",
+            crate::core_contract::FailureClass::Provider,
+            reason,
+            true,
+        ),
+        call_claimed,
+        evidence,
     );
 }
 
@@ -3421,8 +3597,9 @@ fn fail_authoritative_provider_call_with_failure(
     envelope: &ExecutionEnvelope,
     failure: crate::core_contract::Failure,
     call_claimed: bool,
+    evidence: Option<&crate::orchestration::domain::ProviderFailureEvidence>,
 ) {
-    settle_authoritative_provider_call(project_root, envelope, failure, call_claimed);
+    settle_authoritative_provider_call(project_root, envelope, failure, call_claimed, evidence);
 }
 
 /// Settle a provider execution that failed while this worker still held its
@@ -3439,6 +3616,7 @@ fn settle_authoritative_provider_call(
     envelope: &ExecutionEnvelope,
     failure: crate::core_contract::Failure,
     call_claimed: bool,
+    evidence: Option<&crate::orchestration::domain::ProviderFailureEvidence>,
 ) {
     let reason = failure.message.as_str();
     if let Err(error) = (|| -> Result<()> {
@@ -3466,30 +3644,34 @@ fn settle_authoritative_provider_call(
             domain.request_cancel(&envelope.attempt_id)?;
             return domain.confirm_cancel(&envelope.attempt_id, true);
         }
-        if matches!(call.state.as_str(), "created" | "running") {
-            if !fail_provider_envelope(&mut domain, envelope, reason, call_claimed)? {
-                // A concurrent claimant owns running/completed, but a concurrent
-                // Call failure may still have left this Attempt without an owner.
-                let current = domain.call(&envelope.call_id)?;
-                if current.attempt_id != envelope.attempt_id
-                    || current.generation != envelope.generation
-                    || !matches!(current.state.as_str(), "failed" | "unknown")
-                    || domain
-                        .authority(&envelope.attempt_id)?
-                        .is_none_or(|authority| {
-                            authority.job_id != envelope.job_id
-                                || authority.generation != envelope.generation
-                        })
-                {
-                    return Ok(());
-                }
+        if matches!(call.state.as_str(), "created" | "running")
+            && !fail_provider_envelope(&mut domain, envelope, reason, call_claimed, evidence)?
+        {
+            // A concurrent claimant owns running/completed, but a concurrent
+            // Call failure may still have left this Attempt without an owner.
+            let current = domain.call(&envelope.call_id)?;
+            if current.attempt_id != envelope.attempt_id
+                || current.generation != envelope.generation
+                || !matches!(current.state.as_str(), "failed" | "unknown")
+                || domain
+                    .authority(&envelope.attempt_id)?
+                    .is_none_or(|authority| {
+                        authority.job_id != envelope.job_id
+                            || authority.generation != envelope.generation
+                    })
+            {
+                return Ok(());
             }
-        } else if let Err(error) = envelope.events.send(
+        }
+        // Persist the failed Attempt evidence before notifying the frontend.
+        // This ensures refreshSessionHistory reads the committed failure state.
+        domain.fail_attempt(&envelope.attempt_id, &failure)?;
+        if let Err(error) = envelope.events.send(
             crate::orchestration::execution_dispatch::ExecutionEvent::Failed(reason.to_string()),
         ) {
             tracing::debug!(error = %error, "provider failure receiver closed");
         }
-        domain.fail_attempt(&envelope.attempt_id, &failure)
+        Ok(())
     })() {
         // A storage-full settlement failure is reported as storage safety, not
         // as a provider failure: retrying it as provider work cannot help, and
@@ -3498,6 +3680,19 @@ fn settle_authoritative_provider_call(
             tracing::error!(error = %error, call_id = %envelope.call_id, "local storage is full; provider Attempt settlement could not be persisted");
         } else {
             tracing::error!(error = %error, call_id = %envelope.call_id, "provider Attempt failure could not be settled");
+        }
+        // No settled `Failed` can be published, yet the turn's tail must still
+        // end: report the provider failure together with the fact that it was
+        // not recorded, so the receiver never mistakes it for a committed
+        // verdict. Cancellation publishes its own terminal event.
+        if !envelope.cancelled.is_cancelled() {
+            if let Err(error) = envelope.events.send(
+                crate::orchestration::execution_dispatch::ExecutionEvent::Failed(format!(
+                    "{reason} (this failure could not be recorded: {error})"
+                )),
+            ) {
+                tracing::debug!(error = %error, "provider failure receiver closed");
+            }
         }
     }
 }

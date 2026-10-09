@@ -146,6 +146,7 @@ pub struct ControlServer {
     /// The canonical Project identity resolved and registered by this launch.
     /// `None` when the launch resolved no registered Project boundary.
     startup_project: Option<String>,
+    security: Arc<RequestSecurity>,
 }
 
 impl ControlServer {
@@ -177,6 +178,17 @@ impl ControlServer {
         config: ServerConfig,
         disable_proxy: bool,
     ) -> Result<Self> {
+        let authentication = crate::control_security::Authentication::from_env()?;
+        let remote_execution = crate::remote_execution::RemoteExecution::from_env()?;
+        if let Some(confinement) = &remote_execution {
+            confinement.accepts_storage(profile_path)?;
+            for name in ["OCG_VAULT_PATH", "OCG_VAULT_KEY_FILE"] {
+                if let Some(path) = std::env::var_os(name) {
+                    confinement.accepts_storage(Path::new(&path))?;
+                }
+            }
+            confinement.verify(root)?;
+        }
         let requested = parse_loopback_addr(addr)?;
         config.validate()?;
         let listener = TcpListener::bind(requested).map_err(|error| {
@@ -201,6 +213,12 @@ impl ControlServer {
                 root,
                 profile_path,
             )?;
+        let security = Arc::new(RequestSecurity {
+            authentication,
+            ownership: service.security_store()?,
+            remote_execution: remote_execution.clone(),
+            bound,
+        });
         let boundary = crate::project::resolve(root);
         // The launch Project is registered here, so its canonical identity is
         // already known to this process. It is handed to the UI as the
@@ -232,8 +250,20 @@ impl ControlServer {
                 16,
             ),
         );
-        let canonical = Some(service.with_runtime_registry(registry.clone()));
-        let execution_runtimes = Some(registry);
+        let service = if let Some(confinement) = remote_execution {
+            service.with_remote_execution(confinement)
+        } else {
+            service
+        };
+        let (canonical, execution_runtimes) =
+            if security.authentication.is_remote() && security.remote_execution.is_none() {
+                (Some(service), None)
+            } else {
+                (
+                    Some(service.with_runtime_registry(registry.clone())),
+                    Some(registry),
+                )
+            };
 
         Ok(Self {
             listener,
@@ -245,6 +275,7 @@ impl ControlServer {
             active_streams: Arc::new(AtomicUsize::new(0)),
             execution_runtimes,
             startup_project,
+            security,
         })
     }
 
@@ -270,11 +301,16 @@ impl ControlServer {
 
     /// Run the accept loop until `stop` is set.
     pub fn serve(self, stop: Arc<AtomicBool>) -> Result<()> {
-        let _job_admission = self
-            .canonical
-            .as_ref()
-            .map(|service| service.start_job_admission_worker())
-            .transpose()?;
+        let _job_admission = if self.security.authentication.is_remote()
+            && self.security.remote_execution.is_none()
+        {
+            None
+        } else {
+            self.canonical
+                .as_ref()
+                .map(|service| service.start_job_admission_worker())
+                .transpose()?
+        };
         self.listener.set_nonblocking(true).map_err(|error| {
             OcgError::io(
                 "cannot put the control server listener in nonblocking mode",
@@ -320,7 +356,7 @@ impl ControlServer {
         let canonical = self.canonical.clone();
         let profile = self.profile.clone();
         let config = self.config.clone();
-        let bound = self.addr;
+        let security = self.security.clone();
         let active_streams = Arc::clone(&self.active_streams);
         let spawned = thread::Builder::new()
             .name("ocg-control-client".to_string())
@@ -330,7 +366,7 @@ impl ControlServer {
                     canonical.as_ref(),
                     &profile,
                     &config,
-                    bound,
+                    &security,
                     guard,
                     active_streams,
                 );
@@ -441,13 +477,241 @@ fn bounded(message: String) -> String {
 }
 
 /// One parsed HTTP request. Only the fields this server uses are retained.
-#[derive(Debug)]
 struct Request {
     method: String,
     path: String,
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    approved_origin: Option<String>,
+    identity: Option<crate::control_security::Identity>,
+    ownership: Option<crate::control_security::OwnershipStore>,
+}
+
+struct RequestSecurity {
+    authentication: crate::control_security::Authentication,
+    ownership: crate::control_security::OwnershipStore,
+    remote_execution: Option<crate::remote_execution::RemoteExecution>,
+    bound: SocketAddr,
+}
+
+fn handle_security(
+    stream: &mut TcpStream,
+    canonical: Option<&crate::orchestration::canonical_control::CanonicalControlService>,
+    security: &RequestSecurity,
+    request: &Request,
+) -> bool {
+    let result = match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/api/v1/auth/session") => {
+            let session = crate::contracts::AuthenticationSession {
+                mode: if request.identity.is_some() {
+                    crate::contracts::AuthenticationMode::CloudflareAccess
+                } else {
+                    crate::contracts::AuthenticationMode::Local
+                },
+                user_id: request
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.user_id.clone()),
+                expires_at: request
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.expires_at),
+                remote_execution: request.identity.as_ref().is_some_and(|identity| {
+                    security
+                        .remote_execution
+                        .as_ref()
+                        .is_some_and(|confinement| confinement.operator_id == identity.user_id)
+                }),
+            };
+            match serde_json::to_value(session) {
+                Ok(value) => {
+                    write_json_with_origin(stream, 200, &value, request.approved_origin.as_deref())
+                }
+                Err(_) => write_api_error(
+                    stream,
+                    &ApiError::new(500, "internal", "cannot encode authentication session"),
+                ),
+            }
+        }
+        ("POST", "/api/v1/auth/logout") => {
+            if let Some(identity) = &request.identity {
+                match security.ownership.revoke(identity, now_unix()) {
+                    Ok(()) => write_response(
+                        stream,
+                        303,
+                        "application/json",
+                        b"{}",
+                        &[("Location", "/cdn-cgi/access/logout".to_string())],
+                    ),
+                    Err(_) => write_api_error(
+                        stream,
+                        &ApiError::new(503, "security_unavailable", "cannot revoke session"),
+                    ),
+                }
+            } else {
+                write_json_with_origin(
+                    stream,
+                    200,
+                    &json!({"mode": "local"}),
+                    request.approved_origin.as_deref(),
+                )
+            }
+        }
+        ("POST", "/api/v1/auth/ownership") if !security.authentication.is_remote() => {
+            let migrate = || -> std::result::Result<Value, ApiError> {
+                let body = request.json_body()?;
+                let migration: crate::contracts::ProjectOwnershipRequest =
+                    serde_json::from_value(body).map_err(|_| {
+                        ApiError::new(
+                            400,
+                            "invalid_request",
+                            "explicit project_id, issuer and subject are required",
+                        )
+                    })?;
+                let project = migration.project_id.as_str();
+                let issuer = migration.issuer.as_str();
+                let subject = migration.subject.as_str();
+                let registered = canonical
+                    .ok_or_else(|| {
+                        ApiError::new(503, "security_unavailable", "Project registry unavailable")
+                    })?
+                    .projects()
+                    .map_err(|_| {
+                        ApiError::new(503, "security_unavailable", "Project registry unavailable")
+                    })?;
+                if !registered.iter().any(|record| record.project_id == project) {
+                    return Err(ApiError::new(
+                        404,
+                        "project_unavailable",
+                        "Project unavailable",
+                    ));
+                }
+                let user = security
+                    .ownership
+                    .assign_legacy(project, issuer, subject)
+                    .map_err(|error| ApiError::new(409, "migration_refused", error.to_string()))?;
+                serde_json::to_value(crate::contracts::ProjectOwnershipResponse {
+                    project_id: project.to_string(),
+                    user_id: user,
+                })
+                .map_err(|_| ApiError::new(500, "internal", "cannot encode migration result"))
+            };
+            match migrate() {
+                Ok(value) => {
+                    write_json_with_origin(stream, 200, &value, request.approved_origin.as_deref())
+                }
+                Err(error) => write_api_error(stream, &error),
+            }
+        }
+        (_, path) if path.starts_with("/api/v1/auth/") => write_api_error(
+            stream,
+            &ApiError::new(
+                403,
+                "operation_refused",
+                "authentication operation unavailable",
+            ),
+        ),
+        _ => return false,
+    };
+    if let Err(error) = result {
+        tracing::debug!(%error, "security response connection closed");
+    }
+    true
+}
+
+fn authorize_remote(
+    canonical: Option<&crate::orchestration::canonical_control::CanonicalControlService>,
+    security: &RequestSecurity,
+    route: &Route,
+    request: &Request,
+) -> std::result::Result<(), ApiError> {
+    let Some(identity) = &request.identity else {
+        return Ok(());
+    };
+    if matches!(
+        route,
+        Route::Product { .. } | Route::CanonicalProjects | Route::CanonicalPreflight
+    ) {
+        return Ok(());
+    }
+    let operator = security
+        .remote_execution
+        .as_ref()
+        .is_some_and(|confinement| confinement.operator_id == identity.user_id);
+    if request.method != "GET" && !operator {
+        return Err(ApiError::new(
+            403,
+            "remote_execution_blocked",
+            "remote mutations require isolated executors and filesystem roots",
+        ));
+    }
+    let project = match route {
+        Route::ProfileGet if operator => return Ok(()),
+        Route::CanonicalProjectsGet { project } if operator => Some(project.clone()),
+        Route::CanonicalConfigurationGet if operator => request.query.get("project_id").cloned(),
+        Route::CanonicalJobConfigGet { job }
+        | Route::CanonicalJobConfigPut { job }
+        | Route::CanonicalJobCancel { job }
+        | Route::CanonicalJobRetry { job }
+        | Route::CanonicalJobSpawn { job }
+            if operator =>
+        {
+            canonical.and_then(|service| service.project_for_job(job).ok())
+        }
+        Route::CanonicalJobLaunch
+        | Route::ChatSend
+        | Route::ChatImageUpload
+        | Route::ChatCancel
+            if operator =>
+        {
+            request
+                .json_body()?
+                .get("project_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+        Route::ChatConversationDelete if operator => request.query.get("project_id").cloned(),
+        Route::ChatImageGet { project, .. } => Some(project.clone()),
+        Route::ChatStream => canonical.and_then(|service| {
+            service.chat_project_for(
+                request.query.get("session_id")?,
+                request.query.get("job_id")?,
+            )
+        }),
+        Route::CanonicalSnapshot
+        | Route::CanonicalEvents
+        | Route::CanonicalDashboard
+        | Route::ProjectUsage
+        | Route::ConversationUsage
+        | Route::JobUsage
+        | Route::ChatConversations
+        | Route::ChatMessages => request.query.get("project_id").cloned(),
+        // Profile, Vault, configuration, setup and global probes are process
+        // authority. A Project owner must never acquire that authority.
+        _ => {
+            return Err(ApiError::new(
+                403,
+                "operator_required",
+                "this operation requires a local operator",
+            ))
+        }
+    };
+    let allowed = project.as_deref().is_some_and(|project| {
+        request
+            .ownership
+            .as_ref()
+            .is_some_and(|ownership| ownership.owns(&identity.user_id, project).unwrap_or(false))
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            403,
+            "resource_denied",
+            "resource unavailable to this user",
+        ))
+    }
 }
 
 impl Request {
@@ -465,7 +729,7 @@ fn handle_client(
     canonical: Option<&crate::orchestration::canonical_control::CanonicalControlService>,
     profile: &crate::profile::ProfileService,
     config: &ServerConfig,
-    bound: SocketAddr,
+    security: &RequestSecurity,
     guard: ClientGuard,
     active_streams: Arc<AtomicUsize>,
 ) {
@@ -475,7 +739,7 @@ fn handle_client(
     let _ = stream.set_write_timeout(Some(config.write_timeout));
     let _ = stream.set_nodelay(true);
 
-    let request = match read_request(&mut stream) {
+    let mut request = match read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => {
             let _ = write_api_error(&mut stream, &error);
@@ -485,8 +749,64 @@ fn handle_client(
 
     // The Host check precedes routing, so no handler (read or mutation) ever
     // sees a request addressed to a non-local authority.
-    if let Err(error) = check_host(&request, bound.port()) {
+    if let Err(error) = check_host(&request, security.bound.port()) {
         let _ = write_api_error(&mut stream, &error);
+        return;
+    }
+
+    if let Some(origin) = request.headers.get("origin") {
+        if !security.authentication.accepts_origin(origin) {
+            let _ = write_api_error(
+                &mut stream,
+                &ApiError::new(403, "origin_refused", "browser origin is not trusted"),
+            );
+            return;
+        }
+        request.approved_origin = Some(origin.clone());
+    }
+    let access_return_navigation = request.method == "GET"
+        && request.path == "/"
+        && security.authentication.is_remote()
+        && request
+            .headers
+            .get("sec-fetch-mode")
+            .is_some_and(|mode| mode == "navigate")
+        && request
+            .headers
+            .get("sec-fetch-dest")
+            .is_some_and(|destination| destination == "document");
+    if request
+        .headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site == "cross-site")
+        && !access_return_navigation
+    {
+        let _ = write_api_error(
+            &mut stream,
+            &ApiError::new(403, "origin_refused", "cross-site requests are refused"),
+        );
+        return;
+    }
+    request.identity = match security.authentication.authenticate(
+        &request.headers,
+        &security.ownership,
+        now_unix(),
+    ) {
+        Ok(identity) => identity,
+        Err(_) => {
+            let _ = write_api_error(
+                &mut stream,
+                &ApiError::new(
+                    401,
+                    "authentication_required",
+                    "a valid Access session is required",
+                ),
+            );
+            return;
+        }
+    };
+    request.ownership = Some(security.ownership.clone());
+    if handle_security(&mut stream, canonical, security, &request) {
         return;
     }
 
@@ -497,6 +817,11 @@ fn handle_client(
             return;
         }
     };
+
+    if let Err(error) = authorize_remote(canonical, security, &route, &request) {
+        let _ = write_api_error(&mut stream, &error);
+        return;
+    }
 
     // The request head is parsed on this per-connection thread, never on the
     // accept loop. Only an actual GET stream switches lanes; OPTIONS and all
@@ -647,14 +972,7 @@ fn is_local_host(value: &str, bound_port: u16) -> bool {
 /// control surface. Credentials are never allowed, so an allowlist of concrete
 /// origins (never `*`) is both correct and required.
 fn allowed_cors_origin(request: &Request) -> Option<String> {
-    let origin = request.headers.get("origin")?;
-    let rest = origin.strip_prefix("http://")?;
-    let host = rest.split(':').next().unwrap_or_default();
-    if host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1" {
-        Some(origin.clone())
-    } else {
-        None
-    }
+    request.approved_origin.clone()
 }
 
 fn cors_headers(origin: Option<&str>, methods: &str) -> Vec<(&'static str, String)> {
@@ -1291,7 +1609,19 @@ fn handle_canonical(
         let value = match route {
             Route::CanonicalProjects => answer!(CanonicalProjectsResponse {
                 api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
-                projects: service.projects()?,
+                projects: service
+                    .projects()?
+                    .into_iter()
+                    .filter(|project| {
+                        request.identity.as_ref().is_none_or(|identity| {
+                            request.ownership.as_ref().is_some_and(|ownership| {
+                                ownership
+                                    .owns(&identity.user_id, &project.project_id)
+                                    .unwrap_or(false)
+                            })
+                        })
+                    })
+                    .collect(),
             }),
             Route::CanonicalProjectImport => {
                 let body = body()?;
@@ -1487,10 +1817,7 @@ fn handle_canonical(
         return Some(match service.read_chat_image(project, image) {
             Ok((media_type, bytes)) => {
                 let mut headers = vec![
-                    (
-                        "Cache-Control",
-                        "private, max-age=31536000, immutable".to_string(),
-                    ),
+                    ("Cache-Control", "private, no-store".to_string()),
                     ("X-Content-Type-Options", "nosniff".to_string()),
                 ];
                 if let Some(origin) = allowed_origin.as_ref() {
@@ -1618,7 +1945,7 @@ fn handle_chat_stream(
             )
         }
     };
-    let Some((buffer, started_at)) = service.chat_buffer_for(&session_id, &job_id) else {
+    let Some(buffer) = service.chat_buffer_for(&session_id, &job_id) else {
         return write_api_error(
             stream,
             &ApiError::new(404, "unknown_chat", "chat stream unavailable"),
@@ -1637,12 +1964,10 @@ fn handle_chat_stream(
     stream.write_all(head.as_bytes())?;
     stream.flush()?;
 
-    // The execution deadline belongs to the turn, not to this connection:
-    // `started_at` was fixed when the ActiveChat was created, so every
-    // attach and reconnect shares the same deadline and a reconnect can
-    // never extend the execution lifetime.
-    let overall = crate::orchestration::canonical_control::CHAT_EXECUTION_TIMEOUT;
-    let deadline = started_at + overall;
+    // The tail observes the turn; it never decides it. The Chat execution
+    // deadline is enforced by the canonical service whether or not a stream
+    // is attached, and its cancellation publishes the terminal event that
+    // ends this tail like any other.
     let mut last_heartbeat = std::time::Instant::now();
     let heartbeat = Duration::from_secs(10);
     let poll = Duration::from_millis(200);
@@ -1670,16 +1995,24 @@ fn handle_chat_stream(
     let mut finished = false;
     let mut disconnected = false;
     while !finished {
-        if std::time::Instant::now() >= deadline {
-            let payload = json!({"error": "chat stream timed out"}).to_string();
-            let _ = stream.write_all(format!("data: {payload}\n\n").as_bytes());
-            let _ = stream.flush();
-            // The timeout must enter the canonical cancellation path so the
-            // Attempt/Call/provider execution is actually revoked. It runs
-            // even when the frontend socket write above failed, and it precedes
-            // any ActiveChat removal so the cancel state is still findable.
-            let _ = service.cancel_chat_turn(&session_id, &job_id);
-            break;
+        if let Some(identity) = &request.identity {
+            let authorized = request.ownership.as_ref().is_some_and(|ownership| {
+                identity.expires_at > now_unix()
+                    && ownership
+                        .revoked(&identity.session_id)
+                        .is_ok_and(|revoked| !revoked)
+                    && service
+                        .chat_project_for(&session_id, &job_id)
+                        .is_some_and(|project| {
+                            ownership.owns(&identity.user_id, &project).unwrap_or(false)
+                        })
+            });
+            if !authorized {
+                stream.write_all(b"event: authentication_required\ndata: {}\n\n")?;
+                stream.flush()?;
+                disconnected = true;
+                break;
+            }
         }
         let (base_index, pending): (
             usize,
@@ -1745,13 +2078,19 @@ fn handle_chat_stream(
                 Live::Provider(provider_event) => {
                     use crate::openai_compatible::stream::ChatStreamEvent as Stream;
                     let payload = match provider_event {
-                        Stream::Image { url } => Some(
+                        Stream::Image { url } => {
                             match service.receive_chat_image_for_turn(&session_id, &job_id, &url) {
-                                Ok(image) => json!({"image": image}),
-                                Err(error) => json!({"error": error.to_string()}),
+                                Ok(image) => Some(json!({"image": image}).to_string()),
+                                // An image that cannot be received here is a
+                                // diagnostic, not the turn's verdict: the
+                                // completion settlement receives the final
+                                // images itself, and the `Failed`/`Finished`
+                                // it publishes alone closes the tail.
+                                Err(error) => {
+                                    Some(json!({"provider_error": error.to_string()}).to_string())
+                                }
                             }
-                            .to_string(),
-                        ),
+                        }
                         Stream::TextDelta { delta } => Some(json!({"delta": delta}).to_string()),
                         Stream::ReasoningDelta { delta } => {
                             Some(json!({"reasoning": delta}).to_string())
@@ -1767,8 +2106,12 @@ fn handle_chat_stream(
                         | Stream::ToolCallComplete { .. }
                         | Stream::Metadata { .. }
                         | Stream::Finish { .. } => None,
+                        // A provider stream error is a diagnostic, not the
+                        // turn's verdict: the authoritative `Failed` is
+                        // published only after the failure settlement commits,
+                        // and it alone closes the tail on an error.
                         Stream::Error(error) => {
-                            Some(json!({"error": error.to_string()}).to_string())
+                            Some(json!({"provider_error": error.to_string()}).to_string())
                         }
                     };
                     if let Some(payload) = payload {
@@ -1782,11 +2125,6 @@ fn handle_chat_stream(
                         }
                         if stream.flush().is_err() {
                             disconnected = true;
-                            finished = true;
-                            break;
-                        }
-                        // A provider transport error terminates the tail.
-                        if payload.contains("\"error\"") {
                             finished = true;
                             break;
                         }
@@ -2071,6 +2409,9 @@ fn read_request(stream: &mut TcpStream) -> std::result::Result<Request, ApiError
         query,
         headers,
         body,
+        approved_origin: None,
+        identity: None,
+        ownership: None,
     })
 }
 
@@ -2403,6 +2744,8 @@ fn now_unix() -> i64 {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        303 => "See Other",
+        401 => "Unauthorized",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",

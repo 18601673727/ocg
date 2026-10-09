@@ -34,7 +34,38 @@ const CONFIG_FILE: &str = "configuration.json";
 /// provider terminal event is recorded. This is transport retention only, not
 /// durable chat history.
 const CHAT_REPLAY_LIFETIME: Duration = Duration::from_secs(300);
-pub(crate) const CHAT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(900);
+/// How long a Chat-root Job's Attempt may execute before the Core cancels it.
+const CHAT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// Why a Chat request with these inputs cannot run on this model, if it
+/// cannot. Launch and the replay of a frozen Chat request apply the same rule.
+fn chat_capability_refusal(
+    provider: &crate::profile::Provider,
+    model: &crate::profile::Model,
+    effort: Option<&str>,
+    images: bool,
+) -> Option<&'static str> {
+    if images
+        && model.metadata.as_ref().is_some_and(|metadata| {
+            metadata.images == Some(false)
+                || (metadata.images.is_none() && metadata.multimodal == Some(false))
+        })
+    {
+        return Some("selected model does not support image input");
+    }
+    if let Some(effort) = effort {
+        if !super::placement::supports_effort(model, effort)
+            || !provider.wire_protocol().is_openai_chat_completions()
+            || !matches!(
+                effort,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            )
+        {
+            return Some("selected reasoning effort is unsupported for this model/protocol");
+        }
+    }
+    None
+}
 
 fn invalid(message: impl Into<String>) -> OcgError {
     OcgError::config(message.into())
@@ -499,6 +530,7 @@ pub struct CanonicalControlService {
     initial_root: PathBuf,
     control_state: PathBuf,
     runtime_handle: Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>,
+    remote_execution: Option<crate::remote_execution::RemoteExecution>,
     runtime_registry: Option<Arc<crate::orchestration::execution_runtime::ProjectRuntimeRegistry>>,
     profile_service: crate::profile::ProfileService,
     chat_registrations: Arc<Mutex<std::collections::HashMap<String, ChatRegistration>>>,
@@ -672,9 +704,6 @@ struct ActiveChat {
     cancelled: CallCancellation,
     sender: flume::Sender<ExecutionEvent>,
     buffer: std::sync::Arc<ChatEventBuffer>,
-    /// When the turn started. The execution deadline is anchored here,
-    /// so every SSE attach/reconnect of the same turn shares one deadline.
-    started_at: Instant,
 }
 
 /// The live transport a Chat retry installed for its replacement Attempt.
@@ -753,6 +782,7 @@ impl CanonicalControlService {
             initial_root: root.to_path_buf(),
             control_state,
             runtime_handle: None,
+            remote_execution: None,
             runtime_registry: None,
             profile_service: crate::profile::ProfileService::with_workspace(profile_path, root),
             chat_registrations: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -763,6 +793,14 @@ impl CanonicalControlService {
             chat_forwarder: ChatForwarder::new(),
             placement_deferrals: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub(crate) fn with_remote_execution(
+        mut self,
+        confinement: crate::remote_execution::RemoteExecution,
+    ) -> Self {
+        self.remote_execution = Some(confinement);
+        self
     }
 
     pub fn with_runtime_handle(
@@ -788,6 +826,19 @@ impl CanonicalControlService {
 
     pub fn root(&self) -> &Path {
         &self.initial_root
+    }
+
+    pub(crate) fn security_store(&self) -> Result<crate::control_security::OwnershipStore> {
+        crate::control_security::OwnershipStore::open(&self.control_state.join("security.sqlite"))
+    }
+
+    pub(crate) fn chat_project_for(&self, session_id: &str, job_id: &str) -> Option<String> {
+        self.active_chats
+            .lock()
+            .ok()?
+            .values()
+            .find(|chat| chat.session_id == session_id && chat.job_id == job_id)
+            .map(|chat| chat.project_id.clone())
     }
 
     fn project_file(&self) -> PathBuf {
@@ -982,7 +1033,20 @@ impl CanonicalControlService {
     }
 
     pub fn projects(&self) -> Result<Vec<ProjectRecord>> {
-        self.read_projects()
+        let mut projects = self.read_projects()?;
+        if let Some(confinement) = &self.remote_execution {
+            let ownership = self.security_store()?;
+            let mut allowed = Vec::new();
+            for project in projects {
+                if ownership.owns(&confinement.operator_id, &project.project_id)?
+                    && confinement.accepts_root(Path::new(&project.root)).is_ok()
+                {
+                    allowed.push(project);
+                }
+            }
+            projects = allowed;
+        }
+        Ok(projects)
     }
 
     pub fn configuration(&self, project_id: &str) -> Result<ProjectConfigurationView> {
@@ -1192,6 +1256,17 @@ impl CanonicalControlService {
     /// owner", because that would report corruption as an unknown Job.
     fn candidate_repository(&self, project: &ProjectRecord) -> Result<CandidateRepository> {
         let root = Path::new(&project.root);
+        if let Some(confinement) = &self.remote_execution {
+            if !self
+                .security_store()?
+                .owns(&confinement.operator_id, &project.project_id)?
+            {
+                return Ok(CandidateRepository::Unavailable(
+                    "Project is not owned by the remote operator",
+                ));
+            }
+            confinement.accepts_root(root)?;
+        }
         if !root.is_dir() {
             return Ok(CandidateRepository::Unavailable(
                 "registered Project root is unavailable",
@@ -1237,6 +1312,13 @@ impl CanonicalControlService {
             ));
         }
         Ok(CandidateRepository::Ready(repository))
+    }
+
+    pub(crate) fn project_for_job(&self, job_id: &str) -> Result<String> {
+        self.repository_for_job(job_id)?
+            .job(job_id)?
+            .map(|job| job.project_id)
+            .ok_or_else(|| invalid("unknown canonical Job"))
     }
 
     fn repository_for_job(&self, job_id: &str) -> Result<DomainRepository> {
@@ -1377,13 +1459,19 @@ impl CanonicalControlService {
                     state: message.state,
                     // Dispatch failures are already redacted at the provider boundary.
                     // Diagnostics belong to the view, never to Conversation blocks.
+                    // A stop the Core made for a recorded cause names it, even
+                    // when the stop was confirmed, so it never reads as an
+                    // operator's cancellation.
                     failure_reason: if role == ChatMessageRole::Assistant
                         && message.state == MessageLifecycle::Failed
-                        && origin.attempt_state != "cancelled"
                     {
                         origin
-                            .failure_reason
+                            .cause_reason
                             .as_ref()
+                            .or(origin
+                                .failure_reason
+                                .as_ref()
+                                .filter(|_| origin.attempt_state != "cancelled"))
                             .map(|reason| reason.chars().take(1024).collect::<String>())
                     } else {
                         None
@@ -1670,6 +1758,9 @@ impl CanonicalControlService {
                         if let Err(error) = service.reconcile_watchdog() {
                             tracing::error!(%error, "fleet watchdog reconciliation deferred");
                         }
+                        if let Err(error) = service.enforce_chat_execution_deadlines() {
+                            tracing::error!(%error, "chat execution deadline enforcement deferred");
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -1687,13 +1778,64 @@ impl CanonicalControlService {
     /// The pass only opens stores that already exist and only signals a runtime
     /// that admission has already started. It never starts a provider worker
     /// merely to ask whether one owns a Call.
+    /// This process's runtime for a Project, only while it owns the Project's
+    /// execution. It never acquires ownership, so a background pass acts only
+    /// on Projects this process already owns and leaves another process's
+    /// live Attempts untouched.
+    fn owned_runtime(
+        &self,
+        project_id: &str,
+        root: &Path,
+    ) -> Result<Option<crate::orchestration::execution_runtime::ExecutionRuntimeHandle>> {
+        let handle = if let Some(registry) = &self.runtime_registry {
+            registry.handle(project_id)?
+        } else {
+            self.runtime_handle
+                .clone()
+                .filter(|handle| handle.project_root() == root)
+        };
+        Ok(handle.filter(|handle| handle.owns_execution()))
+    }
+
+    /// This process's runtime for a Project, acquiring the Project's execution
+    /// ownership if no runtime holds it yet. Starting a runtime runs startup
+    /// recovery once ownership is held; another live owner is refused with
+    /// nothing recovered. Every explicit execution operation goes through here.
+    fn execution_owner(
+        &self,
+        project_id: &str,
+        root: &Path,
+    ) -> Result<crate::orchestration::execution_runtime::ExecutionRuntimeHandle> {
+        if let Some(registry) = &self.runtime_registry {
+            let (_, defaults, _) = self.read_configuration()?;
+            let concurrency = provider_concurrency(
+                &defaults
+                    .get(project_id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .defaults,
+            )?;
+            return registry.get_or_start(project_id, root, concurrency);
+        }
+        self.runtime_handle
+            .clone()
+            .filter(|handle| handle.project_root() == root && handle.owns_execution())
+            .ok_or_else(|| invalid("execution runtime is not available for this Project"))
+    }
+
     pub(crate) fn reconcile_watchdog(&self) -> Result<()> {
         let mut failure = None;
         let global = self
             .read_configuration()
             .map(|(global, _, _)| global)
             .unwrap_or_default();
-        for project in self.projects()? {
+        // An unreadable Project registry skips this pass's reconciliation, but
+        // never the notification of settlements already committed below.
+        let projects = self.projects().unwrap_or_else(|error| {
+            failure.get_or_insert(error);
+            Vec::new()
+        });
+        for project in projects {
             // Watchdog reconciliation doubles as a bounded disk reassessment
             // point. Fencing itself never consults the Guard — reconciliation
             // is essential settlement — but replacement execution always flows
@@ -1703,6 +1845,17 @@ impl CanonicalControlService {
             {
                 guard.refresh_if_stale();
             }
+            // Watchdog classifies an Attempt whose token this process cannot
+            // see as disappeared. That is only true for a Project this process
+            // owns: another owner's live Attempts are invisible here, not lost.
+            let runtime = match self.owned_runtime(&project.project_id, Path::new(&project.root)) {
+                Ok(Some(runtime)) => runtime,
+                Ok(None) => continue,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
             let mut domain = match DomainRepository::open_existing(Path::new(&project.root)) {
                 Ok(domain) => domain,
                 Err(error) => {
@@ -1710,16 +1863,144 @@ impl CanonicalControlService {
                     continue;
                 }
             };
-            let runtime = if let Some(registry) = &self.runtime_registry {
-                registry.handle(&project.project_id)?
-            } else {
-                self.runtime_handle.clone().filter(|handle| {
-                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
-                })
-            };
-            if let Err(error) = super::watchdog::reconcile_repository(&mut domain, runtime.as_ref())
-            {
+            if let Err(error) = super::watchdog::reconcile_repository(&mut domain, Some(&runtime)) {
                 failure.get_or_insert(error);
+            }
+        }
+        // Recovery commits per Job, and a later failure in the same pass
+        // discards the results already committed. Chat tails are therefore
+        // ended from committed state, after every pass, whatever it returned.
+        self.publish_watchdog_settlements();
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// End every live Chat tail whose Attempt Watchdog has settled because its
+    /// executor disappeared.
+    ///
+    /// This reads committed state, not the outcome of any one pass, so a
+    /// settlement whose pass later failed is still announced on the next pass.
+    /// A tail is ended only when its own Attempt is terminal, its Job still
+    /// names that generation and holds no authority, and the Job records
+    /// Watchdog's reason. An Attempt another actor settled publishes its own
+    /// terminal event and is left alone. A tail receives at most one terminal:
+    /// one already terminal is skipped, and the forwarder stops at the first.
+    fn publish_watchdog_settlements(&self) {
+        let live: Vec<(String, String, String, std::sync::Arc<ChatEventBuffer>)> =
+            match self.active_chats.lock() {
+                Ok(chats) => chats
+                    .values()
+                    .filter(|chat| !chat.attempt_id.is_empty())
+                    .filter(|chat| chat.buffer.state.lock().is_ok_and(|state| !state.terminal))
+                    .map(|chat| {
+                        (
+                            chat.project_id.clone(),
+                            chat.job_id.clone(),
+                            chat.attempt_id.clone(),
+                            chat.buffer.clone(),
+                        )
+                    })
+                    .collect(),
+                Err(_) => return,
+            };
+        for (project_id, job_id, attempt_id, buffer) in live {
+            let committed = (|| -> Result<Option<String>> {
+                // A live tail's turn runs on this process's own runtime, so its
+                // store is reached through that runtime's root rather than the
+                // Project registry, which may be what failed this pass. Attempt
+                // identities are unique, so a store that does not hold this
+                // Attempt yields nothing.
+                let runtime = if let Some(registry) = &self.runtime_registry {
+                    registry.handle(&project_id)?
+                } else {
+                    self.runtime_handle.clone()
+                };
+                let Some(runtime) = runtime else {
+                    return Ok(None);
+                };
+                let domain = DomainRepository::open_existing(runtime.project_root())?;
+                let Some(attempt) = domain.attempt(&attempt_id)? else {
+                    return Ok(None);
+                };
+                if attempt.job_id.as_str() != job_id
+                    || matches!(
+                        attempt.state,
+                        super::domain::AttemptState::Queued
+                            | super::domain::AttemptState::Running
+                            | super::domain::AttemptState::Cancelling
+                    )
+                {
+                    return Ok(None);
+                }
+                Ok(domain
+                    .job(&job_id)?
+                    .filter(|job| {
+                        job.generation == attempt.generation
+                            && job.authoritative_attempt_id.is_none()
+                    })
+                    .and_then(|job| job.termination_reason)
+                    .filter(|reason| reason.code == "watchdog_executor_disappeared")
+                    .map(|reason| reason.message))
+            })();
+            let message = match committed {
+                Ok(Some(message)) => message,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::debug!(%error, attempt_id, "watchdog settlement could not be read back");
+                    continue;
+                }
+            };
+            if let Ok(chats) = self.active_chats.lock() {
+                for chat in chats.values().filter(|chat| {
+                    chat.attempt_id == attempt_id && std::sync::Arc::ptr_eq(&chat.buffer, &buffer)
+                }) {
+                    chat.cancelled.cancel();
+                    if let Err(error) = chat.sender.send(ExecutionEvent::Failed(message.clone())) {
+                        tracing::debug!(%error, "watchdog-settled Job chat receiver closed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cancel every Chat-root Job whose current Attempt outlived the Chat
+    /// execution deadline.
+    ///
+    /// The deadline is a Chat policy enforced here, independently of any
+    /// stream: each stop goes through [`Self::cancel_job`]'s lifecycle and
+    /// records the timeout as its cause. A cancellation that is rejected
+    /// (the Job settled or moved on) records and publishes nothing.
+    pub(crate) fn enforce_chat_execution_deadlines(&self) -> Result<()> {
+        let cutoff = crate::clock::Clock::now_unix(&crate::clock::SystemClock)
+            - CHAT_EXECUTION_TIMEOUT.as_secs() as i64;
+        let mut failure = None;
+        for project in self.projects()? {
+            // Only the owning process enforces the deadline; its runtime is the
+            // one that can signal the execution it cancels.
+            match self.owned_runtime(&project.project_id, Path::new(&project.root)) {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            }
+            let due = match DomainRepository::open_existing(Path::new(&project.root))
+                .and_then(|domain| domain.chat_execution_deadline_due(cutoff))
+            {
+                Ok(due) => due,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
+            for (job_id, generation) in due {
+                if let Err(error) = self.cancel_job_for_cause(
+                    &job_id,
+                    generation,
+                    Some(super::domain::CancelCause::ChatExecutionTimeout),
+                ) {
+                    tracing::debug!(%error, job_id, "chat execution deadline cancellation rejected");
+                }
             }
         }
         failure.map_or(Ok(()), Err)
@@ -1748,7 +2029,7 @@ impl CanonicalControlService {
                 guard.refresh_if_stale();
             }
             let result = (|| -> Result<()> {
-                let (_, domain) = self.project_repository(&project.project_id)?;
+                let (_, mut domain) = self.project_repository(&project.project_id)?;
                 // Serialize the complete Attempt-to-Call handoff across consumers;
                 // SQLite still guards every authoritative claim independently.
                 let lock = std::fs::OpenOptions::new()
@@ -1764,25 +2045,14 @@ impl CanonicalControlService {
                     Err(error) => return Err(OcgError::io("lock Job admission", error)),
                 }
                 let jobs = domain.automatic_admission_jobs(&project.project_id)?;
-                if !domain.pending_dispatch_intents()?.is_empty() {
-                    if let Some(registry) = &self.runtime_registry {
-                        if registry.handle(&project.project_id)?.is_none() {
-                            let (_, defaults, _) = self.read_configuration()?;
-                            let concurrency = provider_concurrency(
-                                &defaults
-                                    .get(&project.project_id)
-                                    .cloned()
-                                    .unwrap_or_default()
-                                    .defaults,
-                            )?;
-                            registry.get_or_start(
-                                &project.project_id,
-                                Path::new(&project.root),
-                                concurrency,
-                            )?;
-                        }
-                    }
+                if jobs.is_empty() && domain.pending_dispatch_intents()?.is_empty() {
+                    return Ok(());
                 }
+                // Admission acts only for a Project this process owns. With
+                // work waiting it takes that ownership, which first runs
+                // startup recovery; a Project another process owns is refused
+                // here, before any of its Jobs is touched.
+                self.execution_owner(&project.project_id, Path::new(&project.root))?;
                 for job in jobs {
                     selected_jobs.insert(job.id.clone());
                     if job.state == super::domain::JobState::Eligible {
@@ -1810,6 +2080,26 @@ impl CanonicalControlService {
                             }
                         }
                         deferrals.remove(&job.id);
+                    }
+                    // A Chat turn whose admission was interrupted before its
+                    // Call was published must not resume as generic work: the
+                    // rebuilt request would carry the objective alone, without
+                    // the Conversation's context. Nothing reached a provider,
+                    // so its Attempt settles as failed and the turn waits for
+                    // the operator, like any other unstarted Chat failure.
+                    if job.state == super::domain::JobState::Running {
+                        if let Some(attempt_id) = domain.unpublished_chat_admission(&job.id)? {
+                            domain.fail_attempt(
+                                &attempt_id,
+                                &super::domain::job_failure(
+                                    "chat_admission_interrupted",
+                                    FailureClass::Internal,
+                                    "Chat admission was interrupted before its provider Call was published; nothing was sent to the provider",
+                                    true,
+                                ),
+                            )?;
+                            continue;
+                        }
                     }
 
                     let request = crate::contracts::JobLaunchRequest {
@@ -1922,45 +2212,67 @@ impl CanonicalControlService {
         job_id: &str,
         expected_generation: u64,
     ) -> Result<CanonicalJobOperationResponse> {
+        self.cancel_job_for_cause(job_id, expected_generation, None)
+    }
+
+    /// Cancel through the one canonical cancellation lifecycle, recording the
+    /// Core's `cause` when it, not an operator, initiated the stop.
+    fn cancel_job_for_cause(
+        &self,
+        job_id: &str,
+        expected_generation: u64,
+        cause: Option<super::domain::CancelCause>,
+    ) -> Result<CanonicalJobOperationResponse> {
         let mut domain = self.repository_for_job(job_id)?;
         let job = domain
             .job(job_id)?
             .ok_or_else(|| invalid("unknown canonical Job"))?;
         let accepted = job.state.can_cancel();
+        // A Core-initiated stop only ever starts a cancellation. It never
+        // re-confirms one an operator already requested, so it cannot attach
+        // its cause to their outcome.
+        if cause.is_some() && job.state != super::domain::JobState::Running {
+            return Ok(CanonicalJobOperationResponse {
+                api_version: CANONICAL_CONTROL_API_VERSION.to_string(),
+                job_id: job.id,
+                accepted: false,
+                snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
+            });
+        }
+        // Cancellation revokes and settles execution authority, so only the
+        // Project's owner performs it, through the runtime that can signal the
+        // execution. A Project another process owns is refused before any
+        // cancellation is requested.
+        let (project, _) = self.project_repository(&job.project_id)?;
+        let runtime = self.execution_owner(&job.project_id, Path::new(&project.root))?;
         for (authority, never_started) in
             domain.request_job_cancel_cascade(job_id, expected_generation)?
         {
-            let runtime = if let Some(registry) = &self.runtime_registry {
-                registry.handle(&job.project_id)?
-            } else {
-                match &self.runtime_handle {
-                    Some(handle)
-                        if domain
-                            .project_at_root(handle.project_root())?
-                            .is_some_and(|project| project.id == job.project_id) =>
-                    {
-                        Some(handle.clone())
-                    }
-                    _ => None,
-                }
+            let signalled = runtime
+                .provider_dispatcher()
+                .cancel_attempt(&authority.attempt_id)?;
+            domain.confirm_cancel_with_cause(
+                &authority.attempt_id,
+                signalled || never_started,
+                cause,
+            )?;
+            // The stream reports the committed outcome: an operator's stop
+            // stays "chat cancelled", and a Core-initiated stop names its
+            // cause and whether the stop was confirmed.
+            let outcome = match cause {
+                None => "chat cancelled".to_string(),
+                Some(cause) => domain
+                    .job(&authority.job_id)?
+                    .and_then(|job| job.termination_reason)
+                    .map_or_else(|| cause.summary().to_string(), |reason| reason.message),
             };
-            let signalled = match runtime {
-                Some(runtime) => runtime
-                    .provider_dispatcher()
-                    .cancel_attempt(&authority.attempt_id)?,
-                None => false,
-            };
-            domain.confirm_cancel(&authority.attempt_id, signalled || never_started)?;
             if let Ok(chats) = self.active_chats.lock() {
                 for chat in chats
                     .values()
                     .filter(|chat| chat.attempt_id == authority.attempt_id)
                 {
                     chat.cancelled.cancel();
-                    if let Err(error) = chat
-                        .sender
-                        .send(ExecutionEvent::Failed("chat cancelled".to_string()))
-                    {
+                    if let Err(error) = chat.sender.send(ExecutionEvent::Failed(outcome.clone())) {
                         tracing::debug!(%error, "cancelled Job chat receiver closed");
                     }
                 }
@@ -1972,6 +2284,125 @@ impl CanonicalControlService {
             accepted,
             snapshot: self.canonical_snapshot(&job.project_id, job_id)?,
         })
+    }
+
+    /// The request, protocol and execution target that replay a Chat turn's
+    /// frozen logical request exactly, or a refusal.
+    ///
+    /// Nothing is substituted: the frozen provider, model, upstream model,
+    /// protocol, endpoint and credential reference must all still be what the
+    /// Profile configures, the Effort and images must still be supported, and
+    /// every image must still resolve. Only the credential value behind the
+    /// same Vault reference may have changed.
+    fn frozen_chat_replay(
+        &self,
+        domain: &DomainRepository,
+        project_id: &str,
+        launch: &super::domain::ChatLaunch,
+    ) -> Result<(
+        Value,
+        crate::provider_protocol::ProviderProtocol,
+        crate::orchestration::execution_dispatch::ProviderExecutionConfig,
+    )> {
+        let refuse = |why: String| {
+            invalid(format!(
+                "Chat retry refused: {why}; the original request is never replayed against a different target"
+            ))
+        };
+        let target = &launch.target;
+        let (profile, _) = self
+            .profile_service
+            .current()?
+            .ok_or_else(|| invalid("profile not configured"))?;
+        let provider = profile.providers.get(&target.provider_key).ok_or_else(|| {
+            refuse(format!(
+                "provider {} is no longer configured",
+                target.provider_key
+            ))
+        })?;
+        let model = profile
+            .models
+            .get(&target.model_key)
+            .filter(|model| model.provider == target.provider_key)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "model {} is no longer configured for provider {}",
+                    target.model_key, target.provider_key
+                ))
+            })?;
+        if model.id != target.upstream_model_id {
+            return Err(refuse(format!(
+                "model {} now names upstream model {} instead of {}",
+                target.model_key, model.id, target.upstream_model_id
+            )));
+        }
+        if provider.wire_protocol() != target.protocol {
+            return Err(refuse(format!(
+                "provider {} now speaks {} instead of {}",
+                target.provider_key,
+                provider.wire_protocol(),
+                target.protocol
+            )));
+        }
+        if provider.endpoint.as_deref() != Some(target.endpoint.as_str()) {
+            return Err(refuse(format!(
+                "the endpoint of provider {} changed",
+                target.provider_key
+            )));
+        }
+        if provider.credential_ref != target.credential_ref {
+            return Err(refuse(format!(
+                "the credential reference of provider {} changed",
+                target.provider_key
+            )));
+        }
+        if let Some(reference) = target.credential_ref.as_deref() {
+            if crate::vault::Vault::user_global()?
+                .get(reference)?
+                .is_none()
+            {
+                return Err(refuse(format!(
+                    "credential {reference} is not in the Vault"
+                )));
+            }
+        }
+        let images = launch.messages.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("ocg_image"))
+                })
+        });
+        if let Some(refusal) =
+            chat_capability_refusal(provider, model, launch.effort.as_deref(), images)
+        {
+            return Err(refuse(refusal.to_string()));
+        }
+        let messages = domain
+            .resolve_chat_launch_messages(project_id, launch)
+            .map_err(|error| refuse(format!("an original image cannot be read ({error})")))?;
+        let mut request = json!({
+            "model": target.model_key,
+            "messages": messages,
+            "stream": true,
+        });
+        if let Some(effort) = &launch.effort {
+            request["reasoning_effort"] = json!(effort);
+        }
+        Ok((
+            request,
+            target.protocol,
+            crate::orchestration::execution_dispatch::ProviderExecutionConfig {
+                provider_key: target.provider_key.clone(),
+                model: target.model_key.clone(),
+                upstream_model_id: target.upstream_model_id.clone(),
+                endpoint: target.endpoint.clone(),
+                credential_ref: target.credential_ref.clone(),
+            },
+        ))
     }
 
     pub fn retry_job(
@@ -2007,6 +2438,14 @@ impl CanonicalControlService {
         if let Some(deferral) = retry_guard.check_execution_admission().deferral() {
             return Err(invalid(deferral.message()));
         }
+        // A retry mints a replacement Attempt, so only the Project's owner may
+        // perform it. Taking ownership before the replacement is read or
+        // written runs startup recovery first when this process did not yet
+        // own the Project.
+        let owner = {
+            let (project, _) = self.project_repository(&job.project_id)?;
+            self.execution_owner(&job.project_id, Path::new(&project.root))?
+        };
         let snapshot = domain.execution_snapshot()?;
         // Chat identity is durable: the turn's live transport may already have
         // been consumed by `finish_chat`, while the turn itself stays retryable.
@@ -2038,29 +2477,7 @@ impl CanonicalControlService {
             .iter()
             .filter(|intent| intent.job_id == job_id && intent.provider_key.is_some())
             .min_by_key(|intent| (intent.generation, intent.created_at, &intent.id));
-        let runtime = if template.is_some() {
-            let (project, _) = self.project_repository(&job.project_id)?;
-            let (_, defaults, _) = self.read_configuration()?;
-            let concurrency = provider_concurrency(
-                &defaults
-                    .get(&job.project_id)
-                    .cloned()
-                    .unwrap_or_default()
-                    .defaults,
-            )?;
-            Some(if let Some(registry) = &self.runtime_registry {
-                registry.get_or_start(&job.project_id, Path::new(&project.root), concurrency)?
-            } else {
-                self.runtime_handle
-                    .clone()
-                    .filter(|handle| {
-                        handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
-                    })
-                    .ok_or_else(|| invalid("execution runtime is not available for this Project"))?
-            })
-        } else {
-            None
-        };
+        let runtime = (template.is_some() || chat_session.is_some()).then_some(owner);
         let replay = template
             .map(|intent| -> Result<_> {
                 let input: Value = serde_json::from_str(&intent.request)
@@ -2095,6 +2512,18 @@ impl CanonicalControlService {
                 Ok((request, protocol, config))
             })
             .transpose()?;
+        // Replay precedence: a provider DispatchIntent's frozen request is what
+        // actually ran, so it stays authoritative once it exists. Before any
+        // Call, a Chat turn's frozen logical request is what was asked. A turn
+        // with neither is refused below rather than given an invented request.
+        let replay = match replay {
+            Some(replay) => Some(replay),
+            None if chat_session.is_some() => domain
+                .chat_launch_for_job(job_id)?
+                .map(|launch| self.frozen_chat_replay(&domain, &job.project_id, &launch))
+                .transpose()?,
+            None => None,
+        };
         let executor_kind = if replay.is_some() {
             "provider"
         } else {
@@ -2155,7 +2584,9 @@ impl CanonicalControlService {
             })
             .transpose()?;
         if chat_session.is_some() && replay.is_none() {
-            return Err(invalid("Chat retry has no frozen provider target"));
+            return Err(invalid(
+                "Chat retry refused: this turn has no frozen request to replay (it was admitted before Chat requests were frozen); send the message again",
+            ));
         }
         let (global, _, _) = self.read_configuration()?;
         let budget_config = self.provider_budget_config(&global)?;
@@ -2201,6 +2632,7 @@ impl CanonicalControlService {
                     attempt: admission.attempt.clone(),
                     executor: admission.executor.clone(),
                     existing_call: false,
+                    chat_history: None,
                 },
                 PreparedExecution {
                     request,
@@ -2268,7 +2700,6 @@ impl CanonicalControlService {
                     cancelled: cancelled.clone(),
                     sender: sender.clone(),
                     buffer: buffer.clone(),
-                    started_at: Instant::now(),
                 },
             );
         let transport = ChatRetryTransport {
@@ -2518,7 +2949,7 @@ impl CanonicalControlService {
             self.runtime_handle
                 .as_ref()
                 .filter(|handle| {
-                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
+                    handle.project_root() == Path::new(&project.root) && handle.owns_execution()
                 })
                 .cloned()
                 .ok_or_else(|| invalid("execution runtime is not available for this Project"))
@@ -2537,14 +2968,11 @@ impl CanonicalControlService {
                     message: format!("{error}; Job was not created"),
                     duplicate: false,
                 };
-                domain.record_launch_command(
-                    &request.command_id,
-                    &request.project_id,
-                    &request_hash,
-                    "failed",
-                    existing_job.as_ref().map(|job| job.id.as_str()),
-                    &response.message,
-                )?;
+                // Without execution ownership this process has no authority to
+                // record anything about the command, not even a failure in the
+                // command ledger: the outcome is decided by whichever process
+                // can own the Project, and a retry of the same command stays
+                // free to succeed.
                 return Ok(response);
             }
         };
@@ -2715,39 +3143,17 @@ impl CanonicalControlService {
             .get(provider_key)
             .ok_or_else(|| invalid("resolved provider disappeared"))?;
 
-        if !images.is_empty()
-            && profile
-                .models
-                .get(model)
-                .and_then(|entry| entry.metadata.as_ref())
-                .is_some_and(|metadata| {
-                    metadata.images == Some(false)
-                        || (metadata.images.is_none() && metadata.multimodal == Some(false))
-                })
-        {
-            return Err(invalid("selected model does not support image input"));
-        }
-
         let effort = selection
             .as_ref()
             .and_then(|selection| selection.effort.as_deref());
-        if let Some(effort) = effort {
-            let entry = profile
-                .models
-                .get(model)
-                .ok_or_else(|| invalid("selected model missing"))?;
-            let supported = super::placement::supports_effort(entry, effort);
-            if !supported
-                || !provider_entry.wire_protocol().is_openai_chat_completions()
-                || !matches!(
-                    effort,
-                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
-                )
+        if let Some(entry) = profile.models.get(model) {
+            if let Some(refusal) =
+                chat_capability_refusal(provider_entry, entry, effort, !images.is_empty())
             {
-                return Err(invalid(
-                    "selected reasoning effort is unsupported for this model/protocol",
-                ));
+                return Err(invalid(refusal));
             }
+        } else if effort.is_some() {
+            return Err(invalid("selected model missing"));
         }
 
         // Create the Job, then hand it to canonical admission. The Job spec is
@@ -2781,7 +3187,26 @@ impl CanonicalControlService {
             domain.create_job(&canonical_project.id, job_spec)?
         };
         // Reservation is the canonical admission transition. Chat and generic
-        // launch both pass through it; only the payload built afterwards differs.
+        // launch both pass through it. A new Chat turn commits its Conversation
+        // turn, Messages and frozen logical request in the same transaction as
+        // its Attempt, so no Chat Attempt can exist without its Chat identity.
+        let user_content = initial_user_message(&request);
+        let chat_draft =
+            (is_chat && existing_job.is_none()).then(|| super::domain::ChatTurnDraft {
+                request: &request,
+                request_hash: &request_hash,
+                content: &user_content,
+                images: &images,
+                target: super::domain::ChatLaunchTarget {
+                    provider_key: resolved.config.provider_key.clone(),
+                    model_key: resolved.config.model.clone(),
+                    upstream_model_id: resolved.config.upstream_model_id.clone(),
+                    protocol: resolved.protocol,
+                    endpoint: resolved.config.endpoint.clone(),
+                    credential_ref: resolved.config.credential_ref.clone(),
+                },
+                effort: effort.map(str::to_string),
+            });
         let reserved = match reserve(
             &mut AdmissionContext {
                 domain: &mut domain,
@@ -2796,6 +3221,7 @@ impl CanonicalControlService {
             },
             &job,
             &resolved,
+            chat_draft.as_ref(),
         )? {
             Ok(reserved) => reserved,
             Err(refusal) => {
@@ -2821,23 +3247,13 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
-        let user_content = initial_user_message(&request);
         let messages = if reserved.existing_call {
             Vec::new()
         } else if is_chat {
-            match domain.prepare_chat_turn_with_images(
-                &request,
-                &request_hash,
-                &reserved.attempt,
-                &user_content,
-                &images,
-            ) {
-                Ok(messages) => messages,
-                Err(error) => {
-                    domain.finish_attempt(&reserved.attempt.id, false)?;
-                    return Err(error);
-                }
-            }
+            reserved
+                .chat_history
+                .clone()
+                .ok_or_else(|| invalid("Chat reservation committed no frozen request"))?
         } else {
             vec![json!({"role": "user", "content": user_content})]
         };
@@ -3014,6 +3430,25 @@ impl CanonicalControlService {
             health_probe: Some(intent.clone()),
             ..JobSpec::default()
         };
+        // Execution ownership is settled before the probe Job exists. Without
+        // it this process never had the right to run the tuple, so a failure
+        // to acquire it is refused with nothing written: it is not health
+        // evidence about the tuple.
+        let runtime = if let Some(registry) = &self.runtime_registry {
+            registry.get_or_start(&project.project_id, Path::new(&project.root), 1)
+        } else {
+            self.runtime_handle
+                .as_ref()
+                .filter(|handle| {
+                    handle.project_root() == Path::new(&project.root) && handle.owns_execution()
+                })
+                .cloned()
+                .ok_or_else(|| invalid("execution runtime is not available for this Project"))
+        };
+        let runtime_handle = match runtime {
+            Ok(handle) => handle,
+            Err(error) => return Ok(rejected(error.to_string(), None)),
+        };
         let job = domain.create_job(&project.project_id, spec.clone())?;
         // A rejected probe is recorded on the Job before any Attempt is
         // claimed. The refusal is the same admission decision every other
@@ -3090,30 +3525,6 @@ impl CanonicalControlService {
                 return Ok(response);
             }
         };
-        let runtime = if let Some(registry) = &self.runtime_registry {
-            registry.get_or_start(&project.project_id, Path::new(&project.root), 1)
-        } else {
-            self.runtime_handle
-                .as_ref()
-                .filter(|handle| {
-                    handle.project_root() == Path::new(&project.root) && !handle.is_cancelled()
-                })
-                .cloned()
-                .ok_or_else(|| invalid("execution runtime is not available for this Project"))
-        };
-        let runtime_handle = match runtime {
-            Ok(handle) => handle,
-            Err(error) => {
-                record(
-                    &mut domain,
-                    &super::health_probe::unsupported_target(
-                        "health_probe_no_runtime",
-                        error.to_string(),
-                    ),
-                )?;
-                return Ok(rejected(error.to_string(), Some(job.id.clone())));
-            }
-        };
         // The exact target is frozen. Reservation claims the Attempt without
         // asking Placement to choose, and the probe payload is built only after
         // that reservation exists.
@@ -3131,6 +3542,7 @@ impl CanonicalControlService {
             },
             &job,
             &resolved,
+            None,
         )? {
             Ok(reserved) => reserved,
             Err(refusal) => {
@@ -3343,7 +3755,6 @@ impl CanonicalControlService {
                         cancelled: cancelled.clone(),
                         sender: sender.clone(),
                         buffer: buffer.clone(),
-                        started_at: Instant::now(),
                     },
                 );
             })
@@ -3476,15 +3887,14 @@ impl CanonicalControlService {
         }
     }
 
-    /// Clone the retained tail for one SSE attach, together with the turn's
-    /// start time. The entry stays for cancellation until `finish_chat`
-    /// removes it. Late attach replays from index zero; live events follow
-    /// once the prefix is drained.
+    /// Clone the retained tail for one SSE attach. The entry stays for
+    /// cancellation until `finish_chat` removes it. Late attach replays from
+    /// index zero; live events follow once the prefix is drained.
     pub(crate) fn chat_buffer_for(
         &self,
         session_id: &str,
         job_id: &str,
-    ) -> Option<(std::sync::Arc<ChatEventBuffer>, Instant)> {
+    ) -> Option<std::sync::Arc<ChatEventBuffer>> {
         self.reap_expired_chats();
         let mut guard = self.active_chats.lock().ok()?;
         let key = guard
@@ -3503,7 +3913,7 @@ impl CanonicalControlService {
             guard.remove(&key);
             return None;
         }
-        Some((entry.buffer.clone(), entry.started_at))
+        Some(entry.buffer.clone())
     }
 
     /// Opportunistically reap terminal transport buffers. Running chats are
@@ -3553,24 +3963,6 @@ impl CanonicalControlService {
 
     pub fn cancel_chat(&self, session_id: &str) -> Result<bool> {
         self.cancel_chat_in_project(None, session_id)
-    }
-
-    pub(crate) fn cancel_chat_turn(&self, session_id: &str, job_id: &str) -> Result<bool> {
-        let active = {
-            let mut chats = self
-                .active_chats
-                .lock()
-                .map_err(|_| invalid("active chats poisoned"))?;
-            let key = chats
-                .iter()
-                .find(|(_, entry)| entry.session_id == session_id && entry.job_id == job_id)
-                .map(|(key, _)| key.clone());
-            key.and_then(|key| chats.remove(&key))
-        };
-        match active {
-            Some(active) => self.end_active_chat(active),
-            None => Ok(false),
-        }
     }
 
     pub fn cancel_chat_in_project(
@@ -3733,7 +4125,6 @@ mod chat_retry_transport_tests {
                 cancelled: CallCancellation::new(),
                 sender,
                 buffer: buffer.clone(),
-                started_at: Instant::now(),
             },
         );
         buffer
