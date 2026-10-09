@@ -279,24 +279,36 @@ impl RemoteExecution {
                 ],
             );
         }
-        let output = crate::process::run_owned_input(
+        // From here the helper may have started and acted. A failure it does
+        // not report as a tool result leaves the tool's effect unknown, which
+        // is what it is reported as: never a failure that proves no effect.
+        let indeterminate = |message: &str| {
+            Ok(ToolResult::failure(crate::native_tools::ToolError::new(
+                crate::native_tools::ToolErrorKind::Indeterminate,
+                message,
+            )))
+        };
+        let output = match crate::process::run_owned_input(
             "/usr/bin/bwrap",
             &arguments,
             root,
             crate::native_tools::TOOL_OUTPUT_CAP,
             cancelled,
             Some(&input),
-        )?;
+        ) {
+            Ok(output) => output,
+            Err(error) => return indeterminate(&format!("confined helper failed: {error}")),
+        };
         if cancelled() || output.termination != crate::process::CommandTermination::Completed {
-            return Err(OcgError::config(
-                "confined tool cancelled or exceeded deadline",
-            ));
+            return indeterminate("confined tool cancelled or exceeded deadline");
         }
         if !output.success || output.truncated() {
-            return Err(OcgError::config("confined native tool helper failed"));
+            return indeterminate("confined native tool helper failed");
         }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|_| OcgError::config("invalid confined tool result"))
+        match serde_json::from_slice(&output.stdout) {
+            Ok(result) => Ok(result),
+            Err(_) => indeterminate("invalid confined tool result"),
+        }
     }
 
     pub fn verify(&self, root: &Path) -> Result<()> {

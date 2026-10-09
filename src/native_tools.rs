@@ -55,6 +55,13 @@ pub enum NativeToolExecutorBinding {
     ProcessExec,
 }
 
+impl NativeToolExecutorBinding {
+    /// Whether running the tool can change anything outside OCG.
+    pub fn has_effects(self) -> bool {
+        matches!(self, Self::FilesystemEdit | Self::ProcessExec)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PermissionPolicy {
     pub read_only: bool,
@@ -128,6 +135,10 @@ pub enum ToolErrorKind {
     ExecutionFailure,
     Cancelled,
     OutputLimit,
+    /// The tool may have taken effect, but its outcome could not be
+    /// established: an execution host failed after the tool started. Never a
+    /// validated failure, and never safe to repeat.
+    Indeterminate,
 }
 
 impl ToolErrorKind {
@@ -140,6 +151,7 @@ impl ToolErrorKind {
             Self::ExecutionFailure => "execution_failure",
             Self::Cancelled => "cancelled",
             Self::OutputLimit => "output_limit",
+            Self::Indeterminate => "indeterminate",
         }
     }
 }
@@ -152,7 +164,7 @@ pub struct ToolError {
 }
 
 impl ToolError {
-    fn new(kind: ToolErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: ToolErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -189,7 +201,7 @@ impl ToolResult {
         }
     }
 
-    fn failure(error: ToolError) -> Self {
+    pub(crate) fn failure(error: ToolError) -> Self {
         Self {
             success: false,
             output: Value::Null,
@@ -758,6 +770,18 @@ impl NativeToolExecutor {
                 .and_then(|confinement| {
                     confinement.execute(self.root.path(), name, arguments, policy, cancelled)
                 }) {
+                // A tool that cannot change anything cannot leave an unknown
+                // effect behind, so its helper failure is plain unavailability.
+                Ok(result)
+                    if !definition.executor.has_effects()
+                        && result
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.kind == ToolErrorKind::Indeterminate) =>
+                {
+                    let message = result.error.map(|error| error.message).unwrap_or_default();
+                    ToolResult::failure(ToolError::new(ToolErrorKind::Unavailable, message))
+                }
                 Ok(result) => result,
                 Err(error) => ToolResult::failure(ToolError::new(
                     if cancelled() {
@@ -1522,6 +1546,19 @@ impl NativeToolCallHandler {
                 .is_some_and(|error| error.kind == ToolErrorKind::Cancelled)
         {
             return Err(OcgError::config("native tool execution cancelled"));
+        }
+        // An outcome nobody could establish is not a tool result: the claimed
+        // Call is settled as unknown, never as a failure that proves no
+        // effect, and is never executed again.
+        if let Some(error) = result
+            .error
+            .as_ref()
+            .filter(|error| error.kind == ToolErrorKind::Indeterminate)
+        {
+            return Err(OcgError::config(format!(
+                "native tool outcome is unknown: {}",
+                error.message
+            )));
         }
         let serialized = result.to_value().to_string();
         ToolResult::validate_response(&serialized, result.success)?;
