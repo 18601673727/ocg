@@ -2100,6 +2100,7 @@ async fn execute_provider_loop(
                 // accumulated in `reasoning`. The tap task may still hold
                 // queued deltas it has not observed yet, so the tap is merged
                 // by the worker only after it drained — never here.
+                received.reasoning = reasoning.clone();
                 received.include_stream_partials = true;
                 return Err(error);
             }
@@ -2107,9 +2108,9 @@ async fn execute_provider_loop(
         ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
 
         reasoning.push_str(&round_response.summary.reasoning);
-        received.reasoning = reasoning.clone();
         if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
             // A truncated answer is received output too: keep it as evidence.
+            received.reasoning = reasoning.clone();
             received.content = round_response.summary.text.clone();
             return Err(OcgError::config("provider exceeded token limit"));
         }
@@ -2119,12 +2120,14 @@ async fn execute_provider_loop(
             if round_response.summary.text.trim().is_empty()
                 && round_response.summary.images.is_empty()
             {
+                received.reasoning = reasoning.clone();
                 return Err(OcgError::config(
                     "provider returned no user-visible assistant content",
                 ));
             }
             // The final answer is received output from here on: a native tool
             // failure below must not erase it either.
+            received.reasoning = reasoning.clone();
             received.content = round_response.summary.text.clone();
             wait_for_native_tool_calls(
                 project_root,
