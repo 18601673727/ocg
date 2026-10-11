@@ -229,6 +229,76 @@ fn restart_settles_a_turn_without_its_chat_registry_and_retry_replays_frozen_inp
     smoke.finish()
 }
 
+/// The provider dispatch of a Job's single generation.
+fn provider_intent(execution: &Value) -> Result<Value> {
+    let intents = array(execution, "dispatch_intents")?
+        .iter()
+        .filter(|intent| !intent["provider_key"].is_null())
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(intents.len(), 1, "{execution}");
+    Ok(intents[0].clone())
+}
+
+#[test]
+fn restart_runs_an_admitted_unstarted_dispatch_once_from_its_durable_request() -> Result<()> {
+    let (mut smoke, project_id, first_session) = session("unstarted-project")?;
+    let second_session = smoke.create_untitled_session(&project_id)?;
+    smoke.provider_reply(Reply::Hang)?;
+    let started = smoke.send_chat(&project_id, &first_session, "Wait for the provider")?;
+    smoke.wait_until("the provider request", |smoke| {
+        Ok(smoke.provider_completions() == 1)
+    })?;
+    // The Project's single provider slot is held by the started turn, so a
+    // turn from another session is admitted and waits without starting.
+    let queued = smoke.send_chat(&project_id, &second_session, "Wait for the slot")?;
+    smoke.wait_until("the waiting turn's admitted dispatch", |smoke| {
+        let execution = smoke.execution(&queued)?;
+        Ok(provider_intent(&execution)?["budget_admitted"] == true)
+    })?;
+    let before = provider_intent(&smoke.execution(&queued)?)?;
+    assert_eq!(before["effect_state"], "not_started", "{before}");
+    assert_eq!(smoke.provider_completions(), 1);
+
+    smoke.provider_reply(Reply::Text(vec!["Resumed".into()]))?;
+    smoke.crash_and_restart()?;
+
+    // The started effect is uncertain and is never replayed.
+    let execution = wait_for_job_state(&mut smoke, &started, "unknown")?;
+    assert_stopped(&execution, "unknown")?;
+    // The unstarted one runs once, from the request and target it was
+    // admitted with, and settles without the old Chat registry.
+    let execution = wait_for_job_state(&mut smoke, &queued, "completed")?;
+    assert!(
+        execution["job"]["authoritative_attempt_id"].is_null(),
+        "{execution}"
+    );
+    let attempts = array(&execution, "attempts")?;
+    assert_eq!(attempts.len(), 1, "{execution}");
+    assert_eq!(attempts[0]["state"], "completed", "{execution}");
+    let after = provider_intent(&execution)?;
+    for field in [
+        "call_id",
+        "request",
+        "provider_key",
+        "model",
+        "upstream_model_id",
+        "endpoint",
+        "credential_ref",
+    ] {
+        assert_eq!(after[field], before[field], "{field}: {execution}");
+    }
+    assert_eq!(after["effect_state"], "settled", "{execution}");
+    let calls = array(&execution, "calls")?;
+    assert_eq!(calls.len(), 1, "{execution}");
+    assert_eq!(calls[0]["state"], "completed", "{execution}");
+    let message = assistant(&mut smoke, &queued)?;
+    assert_eq!(message["state"], "complete", "{message}");
+    assert_eq!(message["content"], "Resumed", "{message}");
+    assert_eq!(smoke.provider_completions(), 2, "each effect ran once");
+    smoke.finish()
+}
+
 #[test]
 fn reconnect_after_the_terminal_replays_the_tail_without_executing_again() -> Result<()> {
     let (mut smoke, project_id, session_id) = session("reconnect-project")?;
