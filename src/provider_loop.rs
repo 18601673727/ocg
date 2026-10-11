@@ -599,6 +599,9 @@ pub struct NativeOpenAiCompatibleProvider<'a> {
     upstream_model_id: String,
     cancelled: CallCancellation,
     events: Option<flume::Sender<crate::orchestration::execution_dispatch::ExecutionEvent>>,
+    /// Whether the current turn's assistant rounds carry their
+    /// `reasoning_content` back on the wire.
+    replays_turn_reasoning: bool,
 }
 
 impl<'a> NativeOpenAiCompatibleProvider<'a> {
@@ -617,6 +620,7 @@ impl<'a> NativeOpenAiCompatibleProvider<'a> {
             upstream_model_id: upstream_model_id.into(),
             cancelled,
             events,
+            replays_turn_reasoning: true,
         }
     }
 }
@@ -1984,9 +1988,15 @@ impl ReceivedProviderStream {
 /// rounds' accumulated reasoning, plus whatever the failed round itself
 /// delivered. Success paths ignore it; the failure path preserves it on the
 /// Call record so settlement can keep it on the failed assistant Message.
+///
+/// The loop accounts every completed round here as soon as the round
+/// returns, so any later exit — a tool round, an activity check, round
+/// exhaustion — carries it without a handler of its own.
 #[derive(Default)]
 struct ProviderReceivedOutput {
+    /// The latest completed round's text.
     content: String,
+    /// Every completed round's reasoning, in order.
     reasoning: String,
     /// The failing round never completed, so its partial output exists only in
     /// the event tap. The worker merges it after the tap drained, when every
@@ -2050,7 +2060,6 @@ async fn execute_provider_loop(
         .map(|config| config.upstream_model_id.clone())
         .unwrap_or_default();
     let mut pending_read_only = Vec::new();
-    let mut reasoning = String::new();
 
     let visible_names = request
         .get("tools")
@@ -2092,43 +2101,41 @@ async fn execute_provider_loop(
         }
 
         let projected_request = request_projection::project(request);
-        let round_response = match provider.complete(&projected_request).await {
+        let mut round_response = match provider.complete(&projected_request).await {
             Ok(round_response) => round_response,
             Err(error) => {
                 // A round that never completed leaves its partial output only
                 // in the event tap; the rounds that completed are already
-                // accumulated in `reasoning`. The tap task may still hold
-                // queued deltas it has not observed yet, so the tap is merged
-                // by the worker only after it drained — never here.
-                received.reasoning = reasoning.clone();
+                // accounted in `received`. The tap task may still hold queued
+                // deltas it has not observed yet, so the tap is merged by the
+                // worker only after it drained — never here.
                 received.include_stream_partials = true;
                 return Err(error);
             }
         };
+        // The round completed, so its output is received from here on: every
+        // later exit, including the tool round below, keeps it as evidence. A
+        // retry inside `complete` never reaches this point with output it
+        // invalidated.
+        received
+            .reasoning
+            .push_str(&round_response.summary.reasoning);
+        received.content = std::mem::take(&mut round_response.summary.text);
         ensure_provider_active(project_root, envelope, shutdown.as_ref())?;
 
-        reasoning.push_str(&round_response.summary.reasoning);
         if round_response.summary.finish_reason == Some(ChatFinishReason::Length) {
             // A truncated answer is received output too: keep it as evidence.
-            received.reasoning = reasoning.clone();
-            received.content = round_response.summary.text.clone();
             return Err(OcgError::config("provider exceeded token limit"));
         }
         if round_response.summary.finish_reason == Some(ChatFinishReason::Stop)
             || round_response.summary.tool_calls.is_empty()
         {
-            if round_response.summary.text.trim().is_empty()
-                && round_response.summary.images.is_empty()
-            {
-                received.reasoning = reasoning.clone();
+            if received.content.trim().is_empty() && round_response.summary.images.is_empty() {
+                received.content.clear();
                 return Err(OcgError::config(
                     "provider returned no user-visible assistant content",
                 ));
             }
-            // The final answer is received output from here on: a native tool
-            // failure below must not erase it either.
-            received.reasoning = reasoning.clone();
-            received.content = round_response.summary.text.clone();
             wait_for_native_tool_calls(
                 project_root,
                 envelope,
@@ -2140,8 +2147,8 @@ async fn execute_provider_loop(
             .await?;
             return Ok(ProviderFinalResponse {
                 images: round_response.summary.images,
-                content: round_response.summary.text,
-                reasoning,
+                content: std::mem::take(&mut received.content),
+                reasoning: std::mem::take(&mut received.reasoning),
                 rounds: round + 1,
             });
         }
@@ -2746,12 +2753,25 @@ impl ProviderClient for NativeOpenAiCompatibleProvider<'_> {
     fn complete(&self, request: &Value) -> BoxFuture<'_, Result<ProviderRound>> {
         // The frozen upstream model id is authoritative on the wire.
         let mut body = request.clone();
-        // Canonical reasoning remains in history, but neither Chat Completions
-        // protocol declares support for replaying this provider extension.
+        // Canonical reasoning remains in history; this is only its wire
+        // projection. Earlier turns never replay it. Within the current turn
+        // — the assistant tool-call rounds after the last user message — an
+        // OpenAI-compatible endpoint receives back the `reasoning_content` it
+        // emitted itself, as thinking models with tool calls require. Native
+        // OpenAI never emits the extension, so it never receives it.
         if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-            for message in messages {
-                if let Some(object) = message.as_object_mut() {
-                    object.remove("reasoning_content");
+            let current_turn = messages
+                .iter()
+                .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .map_or(0, |last_user| last_user + 1);
+            for (index, message) in messages.iter_mut().enumerate() {
+                let replay = self.replays_turn_reasoning
+                    && index >= current_turn
+                    && message.get("role").and_then(Value::as_str) == Some("assistant");
+                if !replay {
+                    if let Some(object) = message.as_object_mut() {
+                        object.remove("reasoning_content");
+                    }
                 }
             }
         }
@@ -3016,14 +3036,17 @@ fn provider_client<'a>(
             events,
         )),
         ProviderProtocol::OpenAi | ProviderProtocol::OpenAiCompatible => {
-            Box::new(NativeOpenAiCompatibleProvider::new(
+            let mut provider = NativeOpenAiCompatibleProvider::new(
                 transport,
                 config.endpoint.clone(),
                 credential,
                 config.upstream_model_id.clone(),
                 cancelled,
                 events,
-            ))
+            );
+            provider.replays_turn_reasoning =
+                binding.protocol == ProviderProtocol::OpenAiCompatible;
+            Box::new(provider)
         }
     }
 }
@@ -3657,6 +3680,19 @@ fn settle_authoritative_provider_call(
             tracing::error!(error = %error, call_id = %envelope.call_id, "local storage is full; provider Attempt settlement could not be persisted");
         } else {
             tracing::error!(error = %error, call_id = %envelope.call_id, "provider Attempt failure could not be settled");
+        }
+        // No settled `Failed` can be published, yet the turn's tail must still
+        // end: report the provider failure together with the fact that it was
+        // not recorded, so the receiver never mistakes it for a committed
+        // verdict. Cancellation publishes its own terminal event.
+        if !envelope.cancelled.is_cancelled() {
+            if let Err(error) = envelope.events.send(
+                crate::orchestration::execution_dispatch::ExecutionEvent::Failed(format!(
+                    "{reason} (this failure could not be recorded: {error})"
+                )),
+            ) {
+                tracing::debug!(error = %error, "provider failure receiver closed");
+            }
         }
     }
 }
