@@ -1,0 +1,1865 @@
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
+use std::thread::JoinHandle;
+use std::time::Instant;
+
+use redb::Database;
+
+use crate::data_directory::DataDirectory;
+use crate::disk_protection::{
+    self, DiskProtectionStatus, FilesystemConfig, FilesystemConfigError, ProtectedArea,
+    ProtectionCell, ProtectionLock, ProtectionReason, ProtectionWatch, RecoveryError,
+    RecoveryReport, ReopenFailure, SharedRequest, SpaceMeasurement, SpaceShortage,
+};
+use crate::persistence::{
+    self, AppendedOutput, AppendedStep, ExecutorId, JobFinalization, JobId, JobInputDraft,
+    JobInputId, JobOutputRecord, JobRecord, JobStepId, NewExecutor, NewJob, NewJobOutput,
+    NewJobStep, OperationId, OperationKind, OperationMarker, StepFacts, StepSettlement,
+    Timestamp, Violation,
+};
+use crate::storage::{self, BatchError, BatchFailure, MarkerSubjects, OpenError};
+use crate::system_policy::{self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError};
+pub use crate::storage::{StorageError, StorageErrorKind};
+
+pub const COMMAND_QUEUE_CAPACITY: usize = 256;
+/// Reads run on this many dedicated threads, separate from the write worker.
+pub const READ_WORKERS: usize = 2;
+pub const READ_QUEUE_CAPACITY: usize = 64;
+/// At most one space check and one recovery are pending at a time; later
+/// requests join them.
+const CONTROL_QUEUE_CAPACITY: usize = 2;
+/// The space a command's transaction is allowed beyond twice its
+/// variable-length payload. This is an allowance, not a prediction of redb
+/// file growth, which depends on page reuse, B-tree splits and region
+/// allocation; real I/O errors are still handled after a passing check.
+const TRANSACTION_ALLOWANCE_BYTES: u64 = 1024 * 1024;
+
+/// Command errors fall into three groups, so a caller always knows whether
+/// its change can have been applied (see [`DatabaseError::command_outcome`]):
+///
+/// - not accepted: [`QueueFull`](Self::QueueFull),
+///   [`ShuttingDown`](Self::ShuttingDown),
+///   [`DiskProtected`](Self::DiskProtected);
+/// - accepted and known not to be committed: [`Rejected`](Self::Rejected),
+///   [`RolledBack`](Self::RolledBack), [`NeverExecuted`](Self::NeverExecuted),
+///   [`RefusedByDiskProtection`](Self::RefusedByDiskProtection),
+///   [`InsufficientSpace`](Self::InsufficientSpace);
+/// - accepted with an unknown outcome: [`OutcomeUnknown`](Self::OutcomeUnknown).
+///   A commit error is not a rollback. Do not retry the command; recover
+///   storage with [`DatabaseHandle::recover_storage`], which reconciles it,
+///   or call [`DatabaseHandle::reconcile_operation`] after reopening.
+///
+/// Read errors are separate and say nothing about any command.
+#[derive(Debug, thiserror::Error)]
+pub enum DatabaseError {
+    #[error("invalid startup policy: {0}")]
+    StartupPolicy(#[source] SystemPolicyError),
+    #[error("the control queue is full; the space check was not accepted")]
+    ControlQueueFull,
+    #[error("database command queue is full ({COMMAND_QUEUE_CAPACITY} pending commands); the command was not accepted")]
+    QueueFull,
+    #[error("the database is shutting down; the command was not accepted")]
+    ShuttingDown,
+    #[error("disk protection is active; the command was not accepted: {0}")]
+    DiskProtected(ProtectionLock),
+    /// Returned by [`DatabaseWorker::shutdown`] when storage had failed and
+    /// was not recovered.
+    #[error("the database stopped after a storage failure that was not recovered: {0}")]
+    StorageUnavailable(StorageError),
+    #[error("the command was refused and nothing was committed: {0}")]
+    Rejected(Violation),
+    #[error("storage failed before the commit; nothing was committed: {0}")]
+    RolledBack(StorageError),
+    #[error("{operation} was accepted but the worker stopped before executing it; nothing was committed")]
+    NeverExecuted { operation: OperationId },
+    #[error("{operation} was accepted but disk protection activated before it could run; nothing was committed: {lock}")]
+    RefusedByDiskProtection { operation: OperationId, lock: ProtectionLock },
+    /// Space is above the lock threshold, but this command's allowance would
+    /// take it below; only this command is refused, without locking.
+    #[error(
+        "{operation} was refused before it ran and nothing was committed: {} has {} bytes available, \
+         and the command's {} byte allowance would leave less than {}",
+        shortage.path.display(), shortage.available_bytes, shortage.expected_write_bytes, shortage.threshold_bytes
+    )]
+    InsufficientSpace { operation: OperationId, shortage: SpaceShortage },
+    #[error("the outcome of {operation} is unknown: {cause}")]
+    OutcomeUnknown { operation: OperationId, cause: UnknownCause },
+    #[error("{0} was not issued by this database")]
+    UnknownOperation(OperationId),
+    #[error("database read queue is full ({READ_QUEUE_CAPACITY} pending reads); the read was not started")]
+    ReadQueueFull,
+    #[error("the database is shutting down or closed; the read was not performed")]
+    ReadsClosed,
+    #[error("the database stopped after a storage failure and must be reopened; the read was not performed: {0}")]
+    ReadsStorageFailed(StorageError),
+    #[error("the read worker stopped without answering the read")]
+    ReadInterrupted,
+    /// Every read worker has exited unexpectedly. Reads stay refused until
+    /// the database is shut down and started again; commands are unaffected.
+    #[error("no database read worker is running; the read was not performed")]
+    ReadPoolStopped,
+    #[error("failed to read from the database: {0}")]
+    Read(StorageError),
+    #[error("failed to start the database worker: {0}")]
+    Startup(#[source] std::io::Error),
+    #[error("invalid filesystem configuration: {0}")]
+    Configuration(FilesystemConfigError),
+    /// A protected filesystem is below the configured lock threshold or its
+    /// space could not be measured; the database was not opened.
+    #[error("startup refused by disk protection: {}", describe_reasons(.0))]
+    InsufficientStartupSpace(Vec<ProtectionReason>),
+    #[error("failed to open the database: {0}")]
+    Open(StorageError),
+    #[error("{0} is not an OCG database")]
+    ForeignDatabase(PathBuf),
+    #[error("the database uses storage format {found}; this build supports only format {supported}")]
+    UnsupportedFormat { found: u32, supported: u32 },
+    #[error("database worker panicked")]
+    WorkerPanicked,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UnknownCause {
+    /// The commit failed; its changes may already be durable.
+    #[error("the commit failed: {0}")]
+    Commit(StorageError),
+    /// The worker stopped while executing the command, without answering it.
+    #[error("the database worker stopped while executing the command")]
+    WorkerStopped,
+}
+
+/// Whether a failed command's change can have been applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandOutcome {
+    NotAccepted,
+    NotCommitted,
+    Unknown,
+}
+
+impl DatabaseError {
+    /// The commit classification of a command error; `None` for errors that
+    /// are not command results.
+    pub fn command_outcome(&self) -> Option<CommandOutcome> {
+        match self {
+            Self::QueueFull | Self::ShuttingDown | Self::DiskProtected(_) => Some(CommandOutcome::NotAccepted),
+            Self::Rejected(_)
+            | Self::RolledBack(_)
+            | Self::NeverExecuted { .. }
+            | Self::RefusedByDiskProtection { .. }
+            | Self::InsufficientSpace { .. } => Some(CommandOutcome::NotCommitted),
+            Self::OutcomeUnknown { .. } => Some(CommandOutcome::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// What a stored operation marker says about a command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperationStatus {
+    Committed(OperationMarker),
+    /// Issued by an earlier opening and has no marker: it did not commit,
+    /// and the handle that ran it is gone, so it never will.
+    NotCommitted,
+    /// Issued by this opening and not committed so far.
+    NotCommittedYet,
+}
+
+fn describe_reasons(reasons: &[ProtectionReason]) -> String {
+    reasons.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+}
+
+fn operation_status(marker: Option<OperationMarker>, operation: OperationId, epoch: u64) -> OperationStatus {
+    match marker {
+        Some(marker) => OperationStatus::Committed(marker),
+        None if operation.epoch() < epoch => OperationStatus::NotCommitted,
+        None => OperationStatus::NotCommittedYet,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DatabaseStatus {
+    Open,
+    /// Disk protection refuses commands; [`DatabaseHandle::disk_protection`]
+    /// says why. Reads continue unless storage failed, in which case the
+    /// database is released until [`DatabaseHandle::recover_storage`]
+    /// reopens it.
+    Protected,
+    ShuttingDown,
+    /// The write worker panicked; admission is closed and the database released.
+    WorkerStopped,
+    Closed,
+}
+
+type Reply<T> = flume::Sender<Result<T, DatabaseError>>;
+
+enum Message {
+    Run(Envelope),
+    Shutdown,
+}
+
+/// Write-worker requests that are not commands. They have their own queue,
+/// so a full command queue never delays them, and the worker takes them
+/// before its next command.
+enum Control {
+    FilesystemFailure {
+        reason: ProtectionReason,
+        reply: flume::Sender<bool>,
+    },
+    CheckSpace,
+    Recover,
+    ReadPolicy(flume::Sender<Result<SystemPolicy, PolicyOperationError>>),
+    SavePolicy {
+        expected: SystemPolicy,
+        candidate: SystemPolicy,
+        started: Arc<AtomicBool>,
+        reply: flume::Sender<Result<PolicySaveResult, PolicyOperationError>>,
+    },
+}
+
+impl Control {
+    fn refuse_policy(self, stopped: bool) {
+        let error = if stopped {
+            PolicyOperationError::WorkerStopped
+        } else {
+            PolicyOperationError::ShuttingDown
+        };
+        match self {
+            Self::ReadPolicy(reply) => {
+                reply.send(Err(error)).ok();
+            }
+            Self::SavePolicy { reply, .. } => {
+                reply.send(Err(error)).ok();
+            }
+            Self::CheckSpace | Self::Recover => {}
+            Self::FilesystemFailure { reply, .. } => {
+                reply.send(false).ok();
+            }
+        }
+    }
+}
+
+/// An admitted command with its execution mark, which the worker sets before
+/// the command touches storage. The submitter keeps the other reference, so
+/// when the reply is lost it can tell a command that never began from one
+/// that began.
+struct Envelope {
+    operation: OperationId,
+    started: Arc<AtomicBool>,
+    command: Command,
+}
+
+enum Command {
+    BeginCoreLogCleanup {
+        owner: JobId,
+        executor: ExecutorId,
+        facts: StepFacts,
+        reply: Reply<crate::log_cleanup::CleanupRecords>,
+    },
+    SaveJobInput {
+        existing: Option<JobInputId>,
+        draft: JobInputDraft,
+        reply: Reply<JobInputId>,
+    },
+    CreateJobWithInput {
+        job: NewJob,
+        input: JobInputId,
+        reply: Reply<JobId>,
+    },
+    AssignJobExecutor {
+        job: JobId,
+        executor: ExecutorId,
+        reply: Reply<()>,
+    },
+    AppendJobStep {
+        job: JobId,
+        step: NewJobStep,
+        reply: Reply<AppendedStep>,
+    },
+    StartJobStep {
+        step: JobStepId,
+        executed_by: Option<ExecutorId>,
+        reply: Reply<()>,
+    },
+    SettleJobStep {
+        step: JobStepId,
+        settlement: StepSettlement,
+        facts: StepFacts,
+        reply: Reply<()>,
+    },
+    AppendJobOutput {
+        job: JobId,
+        output: NewJobOutput,
+        reply: Reply<AppendedOutput>,
+    },
+    FinalizeJob {
+        job: JobId,
+        finalization: JobFinalization,
+        reply: Reply<Option<AppendedOutput>>,
+    },
+    CreateExecutor {
+        executor: NewExecutor,
+        reply: Reply<ExecutorId>,
+    },
+}
+
+impl Command {
+    /// Runs the command as one batch and answers it. Returns the storage
+    /// failure that must release this opening of the database, if any. A
+    /// dropped reply receiver means the caller stopped waiting; the batch has
+    /// ended either way.
+    fn execute(self, database: &Database, operation: OperationId) -> Option<StorageFailure> {
+        use OperationKind as Kind;
+        match self {
+            Self::BeginCoreLogCleanup { owner, executor, facts, reply } => run(database, operation, Kind::BeginCoreLogCleanup, reply, |batch| {
+                persistence::begin_core_log_cleanup(batch, owner, executor, facts)
+            }),
+            Self::SaveJobInput { existing, draft, reply } => run(database, operation, Kind::SaveJobInput, reply, |batch| {
+                persistence::save_job_input(batch, existing, draft)
+            }),
+            Self::CreateJobWithInput { job, input, reply } => run(database, operation, Kind::CreateJobWithInput, reply, |batch| {
+                persistence::create_job_with_input(batch, job, input)
+            }),
+            Self::AssignJobExecutor { job, executor, reply } => run(database, operation, Kind::AssignJobExecutor, reply, |batch| {
+                persistence::assign_job_executor(batch, job, executor)
+            }),
+            Self::AppendJobStep { job, step, reply } => run(database, operation, Kind::AppendJobStep, reply, |batch| {
+                persistence::append_job_step(batch, job, step)
+            }),
+            Self::StartJobStep { step, executed_by, reply } => run(database, operation, Kind::StartJobStep, reply, |batch| {
+                persistence::start_job_step(batch, step, executed_by)
+            }),
+            Self::SettleJobStep { step, settlement, facts, reply } => run(database, operation, Kind::SettleJobStep, reply, |batch| {
+                persistence::settle_job_step(batch, step, settlement, facts)
+            }),
+            Self::AppendJobOutput { job, output, reply } => run(database, operation, Kind::AppendJobOutput, reply, |batch| {
+                persistence::append_job_output(batch, job, output)
+            }),
+            Self::FinalizeJob { job, finalization, reply } => run(database, operation, Kind::FinalizeJob, reply, |batch| {
+                persistence::finalize_job(batch, job, finalization)
+            }),
+            Self::CreateExecutor { executor, reply } => run(database, operation, Kind::CreateExecutor, reply, |batch| {
+                persistence::create_executor(batch, executor)
+            }),
+        }
+    }
+
+    /// The space this command's transaction is allowed to need: twice its
+    /// variable-length payload plus [`TRANSACTION_ALLOWANCE_BYTES`]. Saturates
+    /// rather than wraps, so an absurd payload fails the space check.
+    fn expected_write_bytes(&self) -> u64 {
+        let payload = match self {
+            Self::BeginCoreLogCleanup { facts, .. } => fact_bytes(facts).saturating_add(256),
+            Self::SaveJobInput { draft, .. } => text_bytes(&draft.submission_id).saturating_add(text_bytes(&draft.objective)),
+            Self::CreateJobWithInput { job, .. } => text_bytes(&job.name),
+            Self::AssignJobExecutor { .. } | Self::StartJobStep { .. } => 0,
+            Self::AppendJobStep { step, .. } => byte_count(step.operation.len())
+                .saturating_add(text_bytes(&step.protocol_call_id))
+                .saturating_add(fact_bytes(&step.facts)),
+            Self::SettleJobStep { facts, .. } => fact_bytes(facts),
+            Self::AppendJobOutput { output, .. } => text_bytes(&output.summary).saturating_add(text_bytes(&output.code)),
+            Self::FinalizeJob { finalization, .. } => match finalization {
+                JobFinalization::Completed(result) | JobFinalization::Failed(result) | JobFinalization::Cancelled(result) => {
+                    text_bytes(&result.summary).saturating_add(text_bytes(&result.code))
+                }
+                JobFinalization::Unknown => 0,
+            },
+            Self::CreateExecutor { executor, .. } => byte_count(executor.name.len()),
+        };
+        payload.saturating_mul(2).saturating_add(TRANSACTION_ALLOWANCE_BYTES)
+    }
+
+    /// Answers a command that will never run, so its caller is not left
+    /// waiting and knows nothing was applied.
+    fn refuse(self, error: impl Fn() -> DatabaseError) {
+        match self {
+            Self::BeginCoreLogCleanup { reply, .. } => refuse(reply, error),
+            Self::SaveJobInput { reply, .. } => refuse(reply, error),
+            Self::CreateJobWithInput { reply, .. } => refuse(reply, error),
+            Self::AssignJobExecutor { reply, .. } => refuse(reply, error),
+            Self::AppendJobStep { reply, .. } => refuse(reply, error),
+            Self::StartJobStep { reply, .. } => refuse(reply, error),
+            Self::SettleJobStep { reply, .. } => refuse(reply, error),
+            Self::AppendJobOutput { reply, .. } => refuse(reply, error),
+            Self::FinalizeJob { reply, .. } => refuse(reply, error),
+            Self::CreateExecutor { reply, .. } => refuse(reply, error),
+        }
+    }
+}
+
+fn refuse<T>(reply: Reply<T>, error: impl Fn() -> DatabaseError) {
+    reply.send(Err(error())).ok();
+}
+
+fn byte_count(length: usize) -> u64 {
+    u64::try_from(length).unwrap_or(u64::MAX)
+}
+
+fn text_bytes(text: &Option<String>) -> u64 {
+    text.as_ref().map_or(0, |text| byte_count(text.len()))
+}
+
+fn fact_bytes(facts: &StepFacts) -> u64 {
+    let json_bytes = |map: &Option<serde_json::Map<String, serde_json::Value>>| {
+        map.as_ref()
+            .map_or(0, |map| serde_json::to_string(map).map_or(u64::MAX, |json| byte_count(json.len())))
+    };
+    [
+        text_bytes(&facts.code),
+        text_bytes(&facts.message),
+        text_bytes(&facts.stdout),
+        text_bytes(&facts.stderr),
+        text_bytes(&facts.external_task_id),
+        text_bytes(&facts.external_session_id),
+        json_bytes(&facts.structured_result),
+        json_bytes(&facts.diagnostic_details),
+    ]
+    .into_iter()
+    .fold(0, u64::saturating_add)
+}
+
+/// A storage failure that ends this opening of the database.
+struct StorageFailure {
+    error: StorageError,
+    /// The command's commit failed, so whether it committed is unknown.
+    outcome_unknown: bool,
+}
+
+fn run<T>(
+    database: &Database,
+    operation: OperationId,
+    kind: OperationKind,
+    reply: Reply<T>,
+    body: impl FnOnce(&mut storage::Batch) -> Result<(T, MarkerSubjects), BatchError>,
+) -> Option<StorageFailure> {
+    let outcome = storage::run_batch(database, operation, kind, body);
+    let result = outcome.result.map_err(|failure| match failure {
+        BatchFailure::Rejected(violation) => DatabaseError::Rejected(violation),
+        BatchFailure::NotCommitted(error) => DatabaseError::RolledBack(error),
+        BatchFailure::OutcomeUnknown(error) => DatabaseError::OutcomeUnknown {
+            operation,
+            cause: UnknownCause::Commit(error),
+        },
+    });
+    let outcome_unknown = matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+    reply.send(result).ok();
+    outcome.storage_failure.map(|error| StorageFailure { error, outcome_unknown })
+}
+
+/// A read, boxed with its reply channel. It receives the opened database
+/// while a read worker holds it open, or the reason reads are refused.
+type ReadJob = Box<dyn FnOnce(Result<&Opened, DatabaseError>) + Send>;
+
+/// The database with the epoch of the opening that produced it, so a read
+/// always judges markers against the epoch of the data it saw.
+struct Opened {
+    database: Database,
+    epoch: u64,
+}
+
+enum ReadMessage {
+    Run(ReadJob),
+    Stop,
+}
+
+#[derive(Clone)]
+enum Admission {
+    Open,
+    /// Disk protection refuses commands. Reads continue unless the lock
+    /// names a storage failure, which released the database.
+    Protected(ProtectionLock),
+    ShuttingDown,
+    WorkerStopped,
+}
+
+struct Shared {
+    active_policy: SystemPolicy,
+    log_directory: PathBuf,
+    log_files: Arc<crate::logger::LogFiles>,
+    cleanup_worker: Arc<AtomicBool>,
+    /// Admission is checked and the command or read enqueued under the read
+    /// lock, so once admission is closed under the write lock, every accepted
+    /// command and read is already in its queue.
+    admission: RwLock<Admission>,
+    /// Read workers and the write worker hold the read lock while they use
+    /// the database; releasing it takes the write lock, so it waits for them.
+    database: RwLock<Option<Opened>>,
+    /// The current opening's epoch. Only recovery changes it, by reopening
+    /// while admission is closed, so identifiers allocated under the
+    /// admission read lock never mix openings.
+    epoch: AtomicU64,
+    next_operation: AtomicU64,
+    /// Set while the database is released, so status checks never wait on
+    /// the database lock behind a pending release.
+    released: AtomicBool,
+    /// Read workers whose thread has not yet exited.
+    live_readers: AtomicUsize,
+    /// Set by the last exiting read worker. Reads are enqueued under its read
+    /// lock and the queue is drained under its write lock, so once it is set
+    /// no read can be left in the queue unanswered.
+    reads_stopped: RwLock<bool>,
+    protection: Arc<ProtectionCell>,
+    /// `None` answers a check that the stopping worker will never run.
+    space_check: SharedRequest<Option<DiskProtectionStatus>>,
+    recovery: SharedRequest<Result<RecoveryReport, RecoveryError>>,
+}
+
+impl Shared {
+    fn admission(&self) -> Admission {
+        self.admission.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    fn read_refusal(&self) -> DatabaseError {
+        match self.admission() {
+            Admission::Protected(lock) => match lock.storage_failure() {
+                Some(error) => DatabaseError::ReadsStorageFailed(error.clone()),
+                None => DatabaseError::ReadsClosed,
+            },
+            _ => DatabaseError::ReadsClosed,
+        }
+    }
+
+    fn release_database(&self) {
+        let database = self.database.write().unwrap_or_else(PoisonError::into_inner).take();
+        drop(database);
+        self.released.store(true, Ordering::SeqCst);
+    }
+}
+
+/// If the write worker unwinds, closes admission, answers every queued
+/// command as never executed, releases the database and ends pending space
+/// checks, recoveries and watches, so no caller is left waiting and the file
+/// can be reopened. A queued message outlives the
+/// worker's receiver while handles still hold senders, so it must be drained
+/// here. The command that was executing is answered by its own submitter's
+/// execution mark.
+struct ReleaseOnPanic {
+    shared: Arc<Shared>,
+    receiver: flume::Receiver<Message>,
+    control: flume::Receiver<Control>,
+}
+
+impl Drop for ReleaseOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            {
+                let mut admission = self.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+                *admission = Admission::WorkerStopped;
+            }
+            for message in self.receiver.drain() {
+                if let Message::Run(envelope) = message {
+                    let operation = envelope.operation;
+                    envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
+                }
+            }
+            self.shared.space_check.abandon();
+            self.shared.recovery.abandon();
+            for control in self.control.drain() {
+                control.refuse_policy(true);
+            }
+            self.shared.release_database();
+            self.shared.protection.close();
+        }
+    }
+}
+
+/// Moves into each read worker's closure, so it runs however the worker
+/// ends: a normal stop, a panic, or a closure dropped because its thread
+/// never spawned. The last one to go stops read admission and answers every
+/// queued read. A worker panic says nothing about storage, so command
+/// admission and status are left alone, and no worker is respawned.
+struct ReadWorkerExit {
+    shared: Arc<Shared>,
+    receiver: flume::Receiver<ReadMessage>,
+}
+
+impl Drop for ReadWorkerExit {
+    fn drop(&mut self) {
+        if self.shared.live_readers.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        let mut stopped = self.shared.reads_stopped.write().unwrap_or_else(PoisonError::into_inner);
+        *stopped = true;
+        for message in self.receiver.drain() {
+            if let ReadMessage::Run(read) = message {
+                read(Err(DatabaseError::ReadPoolStopped));
+            }
+        }
+    }
+}
+
+/// Owns the process's single embedded database. Commands are executed one at
+/// a time on a dedicated write thread, in admission order, each in its own
+/// write transaction. Reads run on [`READ_WORKERS`] dedicated read threads.
+pub struct DatabaseWorker {
+    handle: DatabaseHandle,
+    thread: JoinHandle<Result<(), DatabaseError>>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+/// A cloneable endpoint for the database worker.
+///
+/// Submissions never wait for queue space: when [`COMMAND_QUEUE_CAPACITY`]
+/// commands are already pending, they fail with [`DatabaseError::QueueFull`],
+/// and when [`READ_QUEUE_CAPACITY`] reads are pending, reads fail with
+/// [`DatabaseError::ReadQueueFull`]; nothing is retried automatically.
+/// Waiting for a result never blocks the caller's thread and needs no
+/// particular async runtime: every redb access and decode happens on a
+/// database thread.
+#[derive(Clone)]
+pub struct DatabaseHandle {
+    sender: flume::Sender<Message>,
+    read_sender: flume::Sender<ReadMessage>,
+    control_sender: flume::Sender<Control>,
+    shared: Arc<Shared>,
+}
+
+impl DatabaseWorker {
+    /// Starts with the default [`FilesystemConfig`].
+    pub fn start(data_directory: &DataDirectory) -> Result<Self, DatabaseError> {
+        Self::start_with_config(data_directory, FilesystemConfig::default())
+    }
+
+    /// Opens the database, checks its storage format, allocates this
+    /// opening's operation epoch and checks every protected filesystem
+    /// before returning, so a returned worker is ready to accept commands and
+    /// reads, or already refuses commands under disk protection.
+    pub fn start_with_config(data_directory: &DataDirectory, config: FilesystemConfig) -> Result<Self, DatabaseError> {
+        config.validate().map_err(DatabaseError::Configuration)?;
+        Self::start_with_policy(
+            data_directory,
+            SystemPolicy {
+                filesystem_config: config,
+                ..SystemPolicy::default()
+            },
+        )
+    }
+
+    pub fn start_with_policy(
+        data_directory: &DataDirectory,
+        policy: SystemPolicy,
+    ) -> Result<Self, DatabaseError> {
+        policy
+            .validate(&SystemPolicy::path(data_directory))
+            .map_err(DatabaseError::StartupPolicy)?;
+        let config = policy.filesystem_config;
+        let log_directory = data_directory.logs_path().to_path_buf();
+        let directory = data_directory.database_path().to_path_buf();
+        let paths = disk_protection::protected_paths(data_directory);
+        let (sender, receiver) = flume::bounded(COMMAND_QUEUE_CAPACITY);
+        let (control_sender, control) = flume::bounded(CONTROL_QUEUE_CAPACITY);
+        let (ready_sender, ready_receiver) = flume::bounded(1);
+        let thread = std::thread::Builder::new()
+            .name("ocg-database".to_string())
+            .spawn(move || {
+                // Every protected filesystem must meet the configured lock
+                // threshold before the database file is opened or its epoch
+                // is written.
+                let shortfalls = space_shortfalls(&paths, config.disk_lock_threshold_bytes);
+                if !shortfalls.is_empty() {
+                    ready_sender.send(Err(DatabaseError::InsufficientStartupSpace(shortfalls))).ok();
+                    return Ok(());
+                }
+                let (database, epoch) = match storage::open(&directory) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        ready_sender.send(Err(open_error(error, &directory))).ok();
+                        return Ok(());
+                    }
+                };
+                let shared = Arc::new(Shared {
+                    active_policy: policy,
+                    log_directory,
+                    log_files: Arc::new(crate::logger::LogFiles::default()),
+                    cleanup_worker: Arc::new(AtomicBool::new(false)),
+                    admission: RwLock::new(Admission::Open),
+                    database: RwLock::new(Some(Opened { database, epoch })),
+                    epoch: AtomicU64::new(epoch),
+                    next_operation: AtomicU64::new(1),
+                    released: AtomicBool::new(false),
+                    live_readers: AtomicUsize::new(0),
+                    reads_stopped: RwLock::new(false),
+                    protection: ProtectionCell::new(),
+                    space_check: SharedRequest::new(),
+                    recovery: SharedRequest::new(),
+                });
+                let _release = ReleaseOnPanic {
+                    shared: shared.clone(),
+                    receiver: receiver.clone(),
+                    control: control.clone(),
+                };
+                let mut worker = WriteWorker {
+                    shared: shared.clone(),
+                    receiver,
+                    control,
+                    directory,
+                    paths,
+                    config,
+                    next_check: None,
+                    uncertain: Vec::new(),
+                    storage_failure: None,
+                    shutdown_requested: false,
+                };
+                worker.check_all_paths();
+                if ready_sender.send(Ok(shared)).is_ok() {
+                    worker.serve();
+                }
+                worker.exit()
+            })
+            .map_err(DatabaseError::Startup)?;
+
+        let shared = match ready_receiver.recv() {
+            Ok(Ok(shared)) => shared,
+            Ok(Err(error)) => {
+                join(thread)?;
+                return Err(error);
+            }
+            Err(flume::RecvError::Disconnected) => {
+                join(thread)?;
+                return Err(DatabaseError::WorkerPanicked);
+            }
+        };
+        let (read_sender, read_receiver) = flume::bounded(READ_QUEUE_CAPACITY);
+        let mut worker = Self {
+            handle: DatabaseHandle { sender, read_sender, control_sender, shared },
+            thread,
+            readers: Vec::with_capacity(READ_WORKERS),
+        };
+        for index in 0..READ_WORKERS {
+            let shared = worker.handle.shared.clone();
+            shared.live_readers.fetch_add(1, Ordering::SeqCst);
+            let exit = ReadWorkerExit { shared, receiver: read_receiver.clone() };
+            match std::thread::Builder::new()
+                .name(format!("ocg-database-read-{index}"))
+                .spawn(move || serve_reads(&exit.shared, &exit.receiver))
+            {
+                Ok(reader) => worker.readers.push(reader),
+                Err(error) => {
+                    worker.shutdown().ok();
+                    return Err(DatabaseError::Startup(error));
+                }
+            }
+        }
+        Ok(worker)
+    }
+
+    pub fn handle(&self) -> DatabaseHandle {
+        self.handle.clone()
+    }
+
+    /// Closes admission, lets the worker finish every command accepted before
+    /// that point, releases the database once executing reads have returned,
+    /// answers every queued read, and waits for all database threads to exit.
+    /// When this returns, the database file is closed and may be reopened
+    /// immediately.
+    ///
+    /// Commands refused by disk protection meanwhile stay refused, and a
+    /// pending space check or recovery is answered as shutting down.
+    ///
+    /// Returns [`DatabaseError::StorageUnavailable`] when storage had failed
+    /// and was not recovered, or [`DatabaseError::WorkerPanicked`] when the
+    /// worker panicked; resources are released all the same.
+    ///
+    /// Blocks the calling thread; call it from the process's lifecycle code,
+    /// not from inside an async task.
+    pub fn shutdown(self) -> Result<(), DatabaseError> {
+        {
+            let mut admission = self.handle.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+            if matches!(*admission, Admission::Open | Admission::Protected(_)) {
+                *admission = Admission::ShuttingDown;
+            }
+        }
+        // The marker queues behind every accepted command, waiting for space
+        // if needed. If the worker is already gone, joining reports why.
+        self.handle.sender.send(Message::Shutdown).ok();
+        let written = join(self.thread);
+        // The database is released by now, so reads still queued ahead of the
+        // stop markers are answered with the refusal.
+        for _ in &self.readers {
+            self.handle.read_sender.send(ReadMessage::Stop).ok();
+        }
+        let mut readers_ok = true;
+        for reader in self.readers {
+            readers_ok &= reader.join().is_ok();
+        }
+        written?;
+        if readers_ok { Ok(()) } else { Err(DatabaseError::WorkerPanicked) }
+    }
+}
+
+fn open_error(error: OpenError, directory: &std::path::Path) -> DatabaseError {
+    match error {
+        OpenError::Storage(error) => DatabaseError::Open(error),
+        OpenError::ForeignFile => DatabaseError::ForeignDatabase(storage::database_file(directory)),
+        OpenError::UnsupportedFormat { found } => DatabaseError::UnsupportedFormat {
+            found,
+            supported: storage::FORMAT_VERSION,
+        },
+    }
+}
+
+fn join(thread: JoinHandle<Result<(), DatabaseError>>) -> Result<(), DatabaseError> {
+    thread.join().map_err(|_| DatabaseError::WorkerPanicked)?
+}
+
+/// Every protected filesystem that is below `threshold_bytes` or cannot be
+/// measured.
+fn space_shortfalls(paths: &[(ProtectedArea, PathBuf)], threshold_bytes: u64) -> Vec<ProtectionReason> {
+    paths
+        .iter()
+        .filter_map(|(area, path)| disk_protection::check_space(*area, path, 0, threshold_bytes).err())
+        .collect()
+}
+
+fn reopen_failure(error: OpenError, directory: &std::path::Path) -> ReopenFailure {
+    match error {
+        OpenError::Storage(error) => ReopenFailure::Storage(error),
+        OpenError::ForeignFile => ReopenFailure::ForeignDatabase(storage::database_file(directory)),
+        OpenError::UnsupportedFormat { found } => ReopenFailure::UnsupportedFormat {
+            found,
+            supported: storage::FORMAT_VERSION,
+        },
+    }
+}
+
+/// The write thread. It alone executes commands, measures space, changes
+/// the protection lock, and releases or reopens the database, so every
+/// protection transition happens between commands, never inside one.
+struct WriteWorker {
+    shared: Arc<Shared>,
+    receiver: flume::Receiver<Message>,
+    control: flume::Receiver<Control>,
+    /// The database directory, which is also the path checked before each
+    /// command.
+    directory: PathBuf,
+    paths: [(ProtectedArea, PathBuf); 3],
+    config: FilesystemConfig,
+    /// `None` when the interval does not fit in an `Instant`.
+    next_check: Option<Instant>,
+    /// Operations whose commit failed with an unknown outcome; the next
+    /// successful recovery reconciles them.
+    uncertain: Vec<OperationId>,
+    /// Set from a storage failure until a reopen replaces the failed handle.
+    storage_failure: Option<StorageError>,
+    shutdown_requested: bool,
+}
+
+enum Event {
+    Control(Result<Control, flume::RecvError>),
+    Message(Result<Message, flume::RecvError>),
+    CheckDue,
+}
+
+impl WriteWorker {
+    /// Runs control requests, due checks and commands until shutdown. A due
+    /// check runs before the next command, so steady traffic cannot
+    /// postpone it by more than one command.
+    fn serve(&mut self) {
+        while !self.shutdown_requested {
+            if self.next_check.is_some_and(|due| Instant::now() >= due) {
+                self.check_all_paths();
+                continue;
+            }
+            if let Ok(control) = self.control.try_recv() {
+                self.handle(control);
+                continue;
+            }
+            let selector = flume::Selector::new()
+                .recv(&self.control, Event::Control)
+                .recv(&self.receiver, Event::Message);
+            let event = match self.next_check {
+                Some(due) => selector.wait_deadline(due).unwrap_or(Event::CheckDue),
+                None => selector.wait(),
+            };
+            match event {
+                Event::Control(Ok(control)) => self.handle(control),
+                Event::Message(Ok(Message::Run(envelope))) => self.execute(envelope),
+                Event::CheckDue => {}
+                // Without senders, no handle and therefore no caller remains.
+                Event::Message(Ok(Message::Shutdown)) | Event::Message(Err(_)) | Event::Control(Err(_)) => return,
+            }
+        }
+    }
+
+    fn handle(&mut self, control: Control) {
+        match control {
+            Control::FilesystemFailure { reason, reply } => {
+                let active = matches!(
+                    self.shared.admission(),
+                    Admission::Open | Admission::Protected(_)
+                );
+                if active {
+                    self.activate(vec![reason]);
+                }
+                reply.send(active).ok();
+            }
+            Control::CheckSpace => {
+                self.check_all_paths();
+                self.shared.space_check.complete(Some(self.shared.protection.status()));
+            }
+            Control::Recover => {
+                let result = self.recover();
+                self.shared.recovery.complete(result);
+            }
+            Control::ReadPolicy(reply) => {
+                let result = match self.shared.admission() {
+                    Admission::ShuttingDown => Err(PolicyOperationError::ShuttingDown),
+                    Admission::WorkerStopped => Err(PolicyOperationError::WorkerStopped),
+                    Admission::Open | Admission::Protected(_) => {
+                        SystemPolicy::read_saved(&self.policy_path())
+                            .map_err(PolicyOperationError::Read)
+                    }
+                };
+                reply.send(result).ok();
+            }
+            Control::SavePolicy {
+                expected,
+                candidate,
+                started,
+                reply,
+            } => {
+                let result = self.save_policy(expected, candidate, &started);
+                reply.send(result).ok();
+            }
+        }
+    }
+
+    fn policy_path(&self) -> PathBuf {
+        self.directory.join(system_policy::SYSTEM_POLICY_FILE_NAME)
+    }
+
+    fn policy_save_admission(&self) -> Result<(), PolicyOperationError> {
+        match self.shared.admission() {
+            Admission::Open => Ok(()),
+            Admission::Protected(lock) => Err(PolicyOperationError::DiskProtected(lock)),
+            Admission::ShuttingDown => Err(PolicyOperationError::ShuttingDown),
+            Admission::WorkerStopped => Err(PolicyOperationError::WorkerStopped),
+        }
+    }
+
+    fn save_policy(
+        &mut self,
+        expected: SystemPolicy,
+        candidate: SystemPolicy,
+        started: &AtomicBool,
+    ) -> Result<PolicySaveResult, PolicyOperationError> {
+        self.policy_save_admission()?;
+        let path = self.policy_path();
+        let current = SystemPolicy::read_saved(&path).map_err(PolicyOperationError::NotSaved)?;
+        if current != expected {
+            return Err(PolicyOperationError::Conflict {
+                expected,
+                actual: current,
+            });
+        }
+        candidate
+            .validate(&path)
+            .map_err(PolicyOperationError::NotSaved)?;
+        self.policy_save_admission()?;
+        if current == candidate {
+            return Ok(PolicySaveResult::Unchanged);
+        }
+        let result = self.replace_policy(&path, candidate, started);
+        if let Err(
+            PolicyOperationError::NotSaved(SystemPolicyError::Io { source, .. })
+            | PolicyOperationError::OutcomeUncertain(SystemPolicyError::Io { source, .. }),
+        ) = &result
+        {
+            if source.kind() == std::io::ErrorKind::StorageFull {
+                self.activate(vec![ProtectionReason::FilesystemWriteFailed {
+                    area: ProtectedArea::Database,
+                    path,
+                    kind: source.kind(),
+                    os_error: source.raw_os_error(),
+                    detail: source.to_string(),
+                }]);
+            }
+        }
+        result
+    }
+
+    fn replace_policy(
+        &mut self,
+        path: &std::path::Path,
+        candidate: SystemPolicy,
+        started: &AtomicBool,
+    ) -> Result<PolicySaveResult, PolicyOperationError> {
+        let fail = |operation: String, source| {
+            PolicyOperationError::NotSaved(system_policy::io_error(path, operation, source))
+        };
+        let directory_file = system_policy::open_directory(&self.directory).map_err(|source| {
+            fail(
+                "open policy directory for durable replacement".into(),
+                source,
+            )
+        })?;
+        let mut bytes = serde_json::to_vec_pretty(&candidate).map_err(|source| {
+            PolicyOperationError::NotSaved(SystemPolicyError::Json {
+                path: path.to_path_buf(),
+                source,
+            })
+        })?;
+        bytes.push(b'\n');
+        let expected_write_bytes =
+            byte_count(bytes.len()).saturating_add(TRANSACTION_ALLOWANCE_BYTES);
+        match disk_protection::check_space(
+            ProtectedArea::Database,
+            &self.directory,
+            expected_write_bytes,
+            self.config.disk_lock_threshold_bytes,
+        ) {
+            Ok(_) => {}
+            Err(ProtectionReason::InsufficientSpace(shortage))
+                if shortage.available_bytes >= shortage.threshold_bytes =>
+            {
+                return Err(PolicyOperationError::InsufficientSpace(shortage));
+            }
+            Err(reason) => {
+                return Err(PolicyOperationError::DiskProtected(
+                    self.activate(vec![reason]),
+                ));
+            }
+        }
+        self.policy_save_admission()?;
+        static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+        let temporary = self.directory.join(format!(
+            ".system_policy-edit-{}-{}.tmp",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|source| {
+                fail(
+                    format!("create temporary file {}", temporary.display()),
+                    source,
+                )
+            })?;
+        let result = (|| {
+            file.write_all(&bytes)
+                .and_then(|()| file.flush())
+                .and_then(|()| file.sync_all())
+                .map_err(|source| {
+                    fail(
+                        format!("write and persist temporary file {}", temporary.display()),
+                        source,
+                    )
+                })?;
+            self.policy_save_admission()?;
+            started.store(true, Ordering::SeqCst);
+            std::fs::rename(&temporary, path).map_err(|source| {
+                fail(
+                    format!("replace policy from {}", temporary.display()),
+                    source,
+                )
+            })?;
+            directory_file.sync_all().map_err(|source| {
+                PolicyOperationError::OutcomeUncertain(system_policy::io_error(
+                    path,
+                    "confirm replacement directory durability",
+                    source,
+                ))
+            })?;
+            Ok(PolicySaveResult::SavedForRestart)
+        })();
+        drop(file);
+        if result.is_err() {
+            if let Err(source) = std::fs::remove_file(&temporary) {
+                if source.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "{}",
+                        system_policy::io_error(
+                            path,
+                            format!("clean up temporary file {}", temporary.display()),
+                            source
+                        )
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// Checks the database filesystem for the command's allowance and runs
+    /// it. Space already below the lock threshold, or a failed measurement,
+    /// locks; an allowance that alone would cross the threshold refuses only
+    /// this command. Either way the command is refused before it starts.
+    fn execute(&mut self, envelope: Envelope) {
+        let operation = envelope.operation;
+        // Activation drains the queue, so no command should arrive while
+        // locked; refusing here keeps that true even if one did.
+        if let Some(lock) = self.shared.protection.status().lock {
+            envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+            return;
+        }
+        let expected_write_bytes = envelope.command.expected_write_bytes();
+        match disk_protection::check_space(
+            ProtectedArea::Database,
+            &self.directory,
+            expected_write_bytes,
+            self.config.disk_lock_threshold_bytes,
+        ) {
+            Ok(_) => {}
+            Err(ProtectionReason::InsufficientSpace(shortage)) if shortage.available_bytes >= shortage.threshold_bytes => {
+                envelope.command.refuse(|| DatabaseError::InsufficientSpace { operation, shortage: shortage.clone() });
+                return;
+            }
+            Err(reason) => {
+                let lock = self.activate(vec![reason]);
+                envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+                return;
+            }
+        }
+        let failure = {
+            let guard = self.shared.database.read().unwrap_or_else(PoisonError::into_inner);
+            let Some(opened) = guard.as_ref() else {
+                envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
+                return;
+            };
+            envelope.started.store(true, Ordering::SeqCst);
+            envelope.command.execute(&opened.database, operation)
+        };
+        if let Some(failure) = failure {
+            if failure.outcome_unknown {
+                self.uncertain.push(operation);
+            }
+            self.storage_failure = Some(failure.error.clone());
+            self.activate(vec![ProtectionReason::StorageUnavailable(failure.error)]);
+        }
+    }
+
+    /// Closes command admission, refuses every queued command, and releases
+    /// the database when storage failed. Runs between commands, so the one
+    /// that was executing has already answered with its own result.
+    fn activate(&mut self, reasons: Vec<ProtectionReason>) -> ProtectionLock {
+        let storage_failed = reasons
+            .iter()
+            .any(|reason| matches!(reason, ProtectionReason::StorageUnavailable(_)));
+        let lock = {
+            let mut admission = self.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+            let lock = self.shared.protection.lock(reasons);
+            if matches!(*admission, Admission::Open | Admission::Protected(_)) {
+                *admission = Admission::Protected(lock.clone());
+            }
+            lock
+        };
+        for message in self.receiver.drain() {
+            match message {
+                Message::Run(envelope) => {
+                    let operation = envelope.operation;
+                    envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+                }
+                Message::Shutdown => self.shutdown_requested = true,
+            }
+        }
+        if storage_failed {
+            self.shared.release_database();
+        }
+        lock
+    }
+
+    /// Checks every protected filesystem against the lock threshold and
+    /// locks when any is short or cannot be measured.
+    fn check_all_paths(&mut self) {
+        let reasons = space_shortfalls(&self.paths, self.config.disk_lock_threshold_bytes);
+        if !reasons.is_empty() {
+            self.activate(reasons);
+        }
+        self.shared.protection.update(|status| {
+            status.completed_checks += 1;
+            status.last_checked_at = Some(Timestamp::now());
+        });
+        self.next_check = Instant::now().checked_add(self.config.check_interval());
+    }
+
+    /// Runs one recovery attempt for every caller that joined it. The lock
+    /// stays unless every step succeeds.
+    fn recover(&mut self) -> Result<RecoveryReport, RecoveryError> {
+        match self.shared.admission() {
+            Admission::Open => return Ok(RecoveryReport::default()),
+            Admission::Protected(_) => {}
+            Admission::ShuttingDown => return Err(RecoveryError::ShuttingDown),
+            Admission::WorkerStopped => return Err(RecoveryError::WorkerStopped),
+        }
+        self.shared.protection.update(|status| {
+            status.recovering = true;
+            status.recovery_attempts += 1;
+        });
+        let result = self.attempt_recovery().and_then(|report| {
+            let mut admission = self.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+            // Shutdown began during the attempt; it keeps the lock.
+            if !matches!(*admission, Admission::Protected(_)) {
+                return Err(RecoveryError::ShuttingDown);
+            }
+            *admission = Admission::Open;
+            self.shared.protection.update(|status| {
+                status.lock = None;
+                status.recovering = false;
+            });
+            Ok(report)
+        });
+        if result.is_err() {
+            self.shared.protection.update(|status| status.recovering = false);
+        }
+        result
+    }
+
+    fn attempt_recovery(&mut self) -> Result<RecoveryReport, RecoveryError> {
+        let threshold = self.config.disk_resume_threshold_bytes;
+        let mut available = Vec::with_capacity(self.paths.len());
+        let mut shortages = Vec::new();
+        for (area, path) in &self.paths {
+            match disk_protection::check_space(*area, path, 0, threshold) {
+                Ok(available_bytes) => available.push(SpaceMeasurement {
+                    area: *area,
+                    path: path.clone(),
+                    available_bytes,
+                }),
+                Err(reason) => shortages.push(reason),
+            }
+        }
+        if !shortages.is_empty() {
+            return Err(RecoveryError::Space(shortages));
+        }
+        let released = self.shared.database.read().unwrap_or_else(PoisonError::into_inner).is_none();
+        let reopened_epoch = if self.storage_failure.is_some() || released {
+            Some(self.reopen()?)
+        } else {
+            None
+        };
+        let reconciled = self.reconcile_uncertain()?;
+        self.uncertain.clear();
+        Ok(RecoveryReport { reopened_epoch, reconciled, available })
+    }
+
+    /// Releases the failed handle completely, waiting for executing reads,
+    /// then opens the database again under a new epoch. Admission is closed,
+    /// so no identifier is allocated while the epoch changes.
+    fn reopen(&mut self) -> Result<u64, RecoveryError> {
+        self.shared.release_database();
+        let (database, epoch) = storage::open(&self.directory)
+            .map_err(|error| RecoveryError::Reopen(reopen_failure(error, &self.directory)))?;
+        *self.shared.database.write().unwrap_or_else(PoisonError::into_inner) = Some(Opened { database, epoch });
+        self.shared.epoch.store(epoch, Ordering::SeqCst);
+        self.shared.next_operation.store(1, Ordering::SeqCst);
+        self.shared.released.store(false, Ordering::SeqCst);
+        self.storage_failure = None;
+        Ok(epoch)
+    }
+
+    /// Reads the marker of every operation whose outcome was unknown. A
+    /// failed read is a storage failure, so the handle is released again.
+    fn reconcile_uncertain(&mut self) -> Result<Vec<(OperationId, OperationStatus)>, RecoveryError> {
+        let reconciled = {
+            let guard = self.shared.database.read().unwrap_or_else(PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(opened) => self
+                    .uncertain
+                    .iter()
+                    .map(|&operation| {
+                        storage::read_marker(&opened.database, operation)
+                            .map(|marker| (operation, operation_status(marker, operation, opened.epoch)))
+                            .map_err(|error| (operation, error))
+                    })
+                    .collect::<Result<Vec<_>, _>>(),
+                None if self.uncertain.is_empty() => Ok(Vec::new()),
+                None => {
+                    return Err(RecoveryError::Reopen(ReopenFailure::Storage(StorageError {
+                        kind: StorageErrorKind::Closed,
+                        os_error: None,
+                        detail: "the database is not open".to_string(),
+                    })));
+                }
+            }
+        };
+        reconciled.map_err(|(operation, error)| {
+            self.storage_failure = Some(error.clone());
+            self.activate(vec![ProtectionReason::StorageUnavailable(error.clone())]);
+            RecoveryError::Reconcile { operation, error }
+        })
+    }
+
+    /// Closes admission for good, releases the database, and answers every
+    /// queued command and pending request, so no caller is left waiting.
+    fn exit(self) -> Result<(), DatabaseError> {
+        {
+            let mut admission = self.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+            *admission = Admission::ShuttingDown;
+        }
+        self.shared.release_database();
+        // Admission closed before the shutdown marker was queued, so this
+        // finds nothing unless every handle was dropped without a shutdown.
+        for message in self.receiver.drain() {
+            if let Message::Run(envelope) = message {
+                let operation = envelope.operation;
+                envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
+            }
+        }
+        self.shared.space_check.complete(None);
+        self.shared.recovery.complete(Err(RecoveryError::ShuttingDown));
+        for control in self.control.drain() {
+            control.refuse_policy(false);
+        }
+        self.shared.protection.close();
+        match self.storage_failure {
+            None => Ok(()),
+            Some(error) => Err(DatabaseError::StorageUnavailable(error)),
+        }
+    }
+}
+
+/// Runs reads until stopped, holding the database open for each one.
+fn serve_reads(shared: &Shared, receiver: &flume::Receiver<ReadMessage>) {
+    while let Ok(ReadMessage::Run(read)) = receiver.recv() {
+        let guard = shared.database.read().unwrap_or_else(PoisonError::into_inner);
+        match guard.as_ref() {
+            Some(opened) => read(Ok(opened)),
+            None => read(Err(shared.read_refusal())),
+        }
+    }
+}
+
+impl DatabaseHandle {
+    pub(crate) fn log_files(&self) -> Arc<crate::logger::LogFiles> {
+        self.shared.log_files.clone()
+    }
+
+    pub(crate) fn cleanup_worker(&self) -> Arc<AtomicBool> {
+        self.shared.cleanup_worker.clone()
+    }
+
+    pub(crate) async fn begin_core_log_cleanup(
+        &self,
+        owner: JobId,
+        executor: ExecutorId,
+        facts: StepFacts,
+    ) -> Result<crate::log_cleanup::CleanupRecords, DatabaseError> {
+        self.submit(|reply| Command::BeginCoreLogCleanup { owner, executor, facts, reply }).await
+    }
+
+    pub(crate) fn log_directory(&self) -> &std::path::Path {
+        &self.shared.log_directory
+    }
+
+    pub(crate) fn logging_protection_state(&self) -> (bool, u64) {
+        self.shared.protection.logging_state()
+    }
+
+    pub(crate) fn activate_filesystem_protection(&self, reason: ProtectionReason) -> bool {
+        let (reply, response) = flume::bounded(1);
+        if self
+            .control_sender
+            .send(Control::FilesystemFailure { reason, reply })
+            .is_err()
+        {
+            return false;
+        }
+        response.recv().unwrap_or(false)
+    }
+
+    pub fn active_system_policy(&self) -> SystemPolicy {
+        self.shared.active_policy
+    }
+
+    pub async fn read_saved_system_policy(&self) -> Result<SystemPolicy, PolicyOperationError> {
+        let (reply, response) = flume::bounded(1);
+        self.request_policy(Control::ReadPolicy(reply), false)?;
+        response
+            .recv_async()
+            .await
+            .unwrap_or(Err(PolicyOperationError::WorkerStopped))
+    }
+
+    pub async fn save_system_policy(
+        &self,
+        candidate: SystemPolicy,
+        expected_previous: SystemPolicy,
+    ) -> Result<PolicySaveResult, PolicyOperationError> {
+        let (reply, response) = flume::bounded(1);
+        let started = Arc::new(AtomicBool::new(false));
+        self.request_policy(
+            Control::SavePolicy {
+                expected: expected_previous,
+                candidate,
+                started: started.clone(),
+                reply,
+            },
+            true,
+        )?;
+        response.recv_async().await.unwrap_or_else(|_| {
+            Err(if started.load(Ordering::SeqCst) {
+                PolicyOperationError::SaveInterrupted
+            } else {
+                PolicyOperationError::WorkerStopped
+            })
+        })
+    }
+
+    fn request_policy(&self, control: Control, saving: bool) -> Result<(), PolicyOperationError> {
+        let admission = self
+            .shared
+            .admission
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match &*admission {
+            Admission::Open => {}
+            Admission::Protected(lock) if saving => {
+                return Err(PolicyOperationError::DiskProtected(lock.clone()));
+            }
+            Admission::Protected(_) => {}
+            Admission::ShuttingDown => return Err(PolicyOperationError::ShuttingDown),
+            Admission::WorkerStopped => return Err(PolicyOperationError::WorkerStopped),
+        }
+        self.control_sender
+            .try_send(control)
+            .map_err(|error| match error {
+                flume::TrySendError::Full(_) => PolicyOperationError::QueueFull,
+                flume::TrySendError::Disconnected(_) => PolicyOperationError::WorkerStopped,
+            })
+    }
+
+    async fn submit<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, DatabaseError> {
+        let (reply, response) = flume::bounded(1);
+        let started = Arc::new(AtomicBool::new(false));
+        let operation = {
+            let admission = self.shared.admission.read().unwrap_or_else(PoisonError::into_inner);
+            match &*admission {
+                Admission::Open => {}
+                Admission::Protected(lock) => return Err(DatabaseError::DiskProtected(lock.clone())),
+                Admission::ShuttingDown | Admission::WorkerStopped => return Err(DatabaseError::ShuttingDown),
+            }
+            let epoch = self.shared.epoch.load(Ordering::SeqCst);
+            let operation = OperationId::new(epoch, self.shared.next_operation.fetch_add(1, Ordering::Relaxed));
+            let envelope = Envelope { operation, started: started.clone(), command: command(reply) };
+            self.sender.try_send(Message::Run(envelope)).map_err(|error| match error {
+                flume::TrySendError::Full(_) => DatabaseError::QueueFull,
+                flume::TrySendError::Disconnected(_) => DatabaseError::ShuttingDown,
+            })?;
+            operation
+        };
+        // Every command that reaches the worker is answered, so a closed
+        // reply channel means the worker stopped. Its execution mark tells
+        // whether the command began; worker termination alone says nothing
+        // about a begun command's commit.
+        response.recv_async().await.map_err(|_| {
+            if started.load(Ordering::SeqCst) {
+                DatabaseError::OutcomeUnknown { operation, cause: UnknownCause::WorkerStopped }
+            } else {
+                DatabaseError::NeverExecuted { operation }
+            }
+        })?
+    }
+
+    async fn read<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Database) -> Result<T, StorageError> + Send + 'static,
+    ) -> Result<T, DatabaseError> {
+        self.read_opened(move |opened| read(&opened.database)).await
+    }
+
+    /// Reads stay available under disk protection unless storage failed.
+    async fn read_opened<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Opened) -> Result<T, StorageError> + Send + 'static,
+    ) -> Result<T, DatabaseError> {
+        let (reply, response) = flume::bounded(1);
+        {
+            let admission = self.shared.admission.read().unwrap_or_else(PoisonError::into_inner);
+            match &*admission {
+                Admission::Open => {}
+                Admission::Protected(lock) => {
+                    if let Some(error) = lock.storage_failure() {
+                        return Err(DatabaseError::ReadsStorageFailed(error.clone()));
+                    }
+                }
+                Admission::ShuttingDown | Admission::WorkerStopped => return Err(DatabaseError::ReadsClosed),
+            }
+            let stopped = self.shared.reads_stopped.read().unwrap_or_else(PoisonError::into_inner);
+            if *stopped {
+                return Err(DatabaseError::ReadPoolStopped);
+            }
+            let job: ReadJob = Box::new(move |opened| {
+                let result = opened.and_then(|opened| read(opened).map_err(DatabaseError::Read));
+                reply.send(result).ok();
+            });
+            self.read_sender.try_send(ReadMessage::Run(job)).map_err(|error| match error {
+                flume::TrySendError::Full(_) => DatabaseError::ReadQueueFull,
+                flume::TrySendError::Disconnected(_) => DatabaseError::ReadPoolStopped,
+            })?;
+        }
+        response.recv_async().await.map_err(|_| DatabaseError::ReadInterrupted)?
+    }
+
+    pub fn status(&self) -> DatabaseStatus {
+        match self.shared.admission() {
+            Admission::Open => DatabaseStatus::Open,
+            Admission::Protected(_) => DatabaseStatus::Protected,
+            Admission::WorkerStopped => DatabaseStatus::WorkerStopped,
+            Admission::ShuttingDown => {
+                if self.shared.released.load(Ordering::SeqCst) {
+                    DatabaseStatus::Closed
+                } else {
+                    DatabaseStatus::ShuttingDown
+                }
+            }
+        }
+    }
+
+    /// The operation epoch of the current opening. A recovery that reopens
+    /// the database moves it forward.
+    pub fn epoch(&self) -> u64 {
+        self.shared.epoch.load(Ordering::SeqCst)
+    }
+
+    /// The current disk protection status. Never waits for storage.
+    pub fn disk_protection(&self) -> DiskProtectionStatus {
+        self.shared.protection.status()
+    }
+
+    /// Notifies of every later disk protection change until the database
+    /// worker stops.
+    pub fn watch_disk_protection(&self) -> ProtectionWatch {
+        self.shared.protection.watch()
+    }
+
+    /// Checks every protected filesystem now, on the write worker, and
+    /// returns the status after the check. Concurrent requests share one
+    /// check.
+    pub async fn check_disk_space(&self) -> Result<DiskProtectionStatus, DatabaseError> {
+        let response = self
+            .shared
+            .space_check
+            .join(|| self.request(Control::CheckSpace).map_err(|error| match error {
+                RecoveryError::ControlQueueFull => DatabaseError::ControlQueueFull,
+                _ => DatabaseError::ShuttingDown,
+            }))?;
+        match response.recv_async().await {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => Err(DatabaseError::ShuttingDown),
+            Err(_) => Err(DatabaseError::WorkerPanicked),
+        }
+    }
+
+    /// Clears disk protection once every protected filesystem has the resume
+    /// threshold available, a failed database has been released and
+    /// reopened, and every operation whose outcome was unknown has been
+    /// reconciled against its marker. Otherwise the lock stays and the
+    /// failed step is returned. Concurrent requests share one attempt.
+    ///
+    /// Commands refused while locked are not replayed, operations with an
+    /// unknown outcome are not retried, and no Job is resumed.
+    pub async fn recover_storage(&self) -> Result<RecoveryReport, RecoveryError> {
+        let response = self.shared.recovery.join(|| self.request(Control::Recover))?;
+        response.recv_async().await.unwrap_or(Err(RecoveryError::WorkerStopped))
+    }
+
+    /// Queues a control request unless the worker is stopping or stopped.
+    /// Callers hold the request's lock, and the worker closes admission
+    /// before answering pending requests on exit, so none is left unanswered.
+    fn request(&self, control: Control) -> Result<(), RecoveryError> {
+        let admission = self.shared.admission.read().unwrap_or_else(PoisonError::into_inner);
+        match &*admission {
+            Admission::Open | Admission::Protected(_) => {}
+            Admission::ShuttingDown => return Err(RecoveryError::ShuttingDown),
+            Admission::WorkerStopped => return Err(RecoveryError::WorkerStopped),
+        }
+        self.control_sender.try_send(control).map_err(|error| match error {
+            flume::TrySendError::Full(_) => RecoveryError::ControlQueueFull,
+            flume::TrySendError::Disconnected(_) => RecoveryError::WorkerStopped,
+        })
+    }
+
+    pub async fn job(&self, job: JobId) -> Result<Option<JobRecord>, DatabaseError> {
+        self.read(move |database| storage::read_job(database, job)).await
+    }
+
+    /// Newest Jobs first, strictly before `before` when given; at most
+    /// 1,000 per call.
+    pub async fn jobs(&self, before: Option<JobId>, limit: usize) -> Result<Vec<JobRecord>, DatabaseError> {
+        self.read(move |database| storage::read_jobs(database, before, limit)).await
+    }
+
+    /// A Job's outputs in seq order, strictly after `after_seq` when given;
+    /// at most 1,000 per call.
+    pub async fn job_outputs(&self, job: JobId, after_seq: Option<i64>, limit: usize) -> Result<Vec<JobOutputRecord>, DatabaseError> {
+        self.read(move |database| storage::read_outputs(database, job, after_seq, limit)).await
+    }
+
+    pub async fn latest_output(&self, job: JobId) -> Result<Option<JobOutputRecord>, DatabaseError> {
+        self.read(move |database| storage::read_latest_output(database, job)).await
+    }
+
+    /// Operation markers in identifier order, strictly after `after` when
+    /// given; at most 1,000 per call.
+    pub async fn operation_markers(&self, after: Option<OperationId>, limit: usize) -> Result<Vec<OperationMarker>, DatabaseError> {
+        self.read(move |database| storage::read_markers(database, after, limit)).await
+    }
+
+    /// Resolves a command reported as [`DatabaseError::OutcomeUnknown`]. Call
+    /// it after reopening: for an operation of an earlier opening, a missing
+    /// marker proves the command did not commit.
+    pub async fn reconcile_operation(&self, operation: OperationId) -> Result<OperationStatus, DatabaseError> {
+        if operation.epoch() > self.epoch() {
+            return Err(DatabaseError::UnknownOperation(operation));
+        }
+        self.read_opened(move |opened| {
+            storage::read_marker(&opened.database, operation)
+                .map(|marker| operation_status(marker, operation, opened.epoch))
+        })
+        .await
+    }
+
+    pub async fn save_job_input(&self, existing: Option<JobInputId>, draft: JobInputDraft) -> Result<JobInputId, DatabaseError> {
+        self.submit(|reply| Command::SaveJobInput { existing, draft, reply }).await
+    }
+
+    pub async fn create_job_with_input(&self, job: NewJob, input: JobInputId) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateJobWithInput { job, input, reply }).await
+    }
+
+    pub async fn assign_job_executor(&self, job: JobId, executor: ExecutorId) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::AssignJobExecutor { job, executor, reply }).await
+    }
+
+    pub async fn append_job_step(&self, job: JobId, step: NewJobStep) -> Result<AppendedStep, DatabaseError> {
+        self.submit(|reply| Command::AppendJobStep { job, step, reply }).await
+    }
+
+    pub async fn start_job_step(&self, step: JobStepId, executed_by: Option<ExecutorId>) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::StartJobStep { step, executed_by, reply }).await
+    }
+
+    pub async fn settle_job_step(&self, step: JobStepId, settlement: StepSettlement, facts: StepFacts) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::SettleJobStep { step, settlement, facts, reply }).await
+    }
+
+    pub async fn append_job_output(&self, job: JobId, output: NewJobOutput) -> Result<AppendedOutput, DatabaseError> {
+        self.submit(|reply| Command::AppendJobOutput { job, output, reply }).await
+    }
+
+    pub async fn finalize_job(&self, job: JobId, finalization: JobFinalization) -> Result<Option<AppendedOutput>, DatabaseError> {
+        self.submit(|reply| Command::FinalizeJob { job, finalization, reply }).await
+    }
+
+    pub async fn create_executor(&self, executor: NewExecutor) -> Result<ExecutorId, DatabaseError> {
+        self.submit(|reply| Command::CreateExecutor { executor, reply }).await
+    }
+}
+
+#[cfg(test)]
+mod read_pool_tests {
+    //! Read-pool failure and shutdown. Faults are injected by submitting
+    //! test-only read closures that block on a channel and then panic, which
+    //! makes a read worker exit; every wait is bounded.
+
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    const WAIT: Duration = Duration::from_secs(10);
+    const QUEUED: usize = 5;
+
+    type PendingRead<'a, T> = Pin<Box<dyn Future<Output = Result<T, DatabaseError>> + 'a>>;
+
+    struct Unpark(std::thread::Thread);
+
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Option<F::Output> {
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        match future.poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(value) => Some(value),
+            Poll::Pending => None,
+        }
+    }
+
+    /// Drives a future on this thread, failing the test if it does not resolve in time.
+    fn wait<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(value) = poll_once(future.as_mut()) {
+                return value;
+            }
+            let now = Instant::now();
+            assert!(now < deadline, "a caller did not resolve within {WAIT:?}");
+            std::thread::park_timeout(deadline - now);
+        }
+    }
+
+    struct TestRoot(PathBuf);
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn data_directory(name: &str) -> (TestRoot, DataDirectory) {
+        let root = std::env::temp_dir().join(format!("ocg-read-pool-{}-{name}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let directory = DataDirectory::bootstrap(root.clone().into_os_string()).expect("bootstrap data directory");
+        (TestRoot(root), directory)
+    }
+
+    /// Occupies every read worker with a read that reports it has started,
+    /// waits for release and then panics, so the worker exits.
+    struct HeldWorkers {
+        release: flume::Sender<()>,
+    }
+
+    fn hold_every_read_worker<'a>(
+        handle: &'a DatabaseHandle,
+    ) -> (HeldWorkers, Vec<PendingRead<'a, ()>>) {
+        let (entered_sender, entered) = flume::unbounded();
+        let (release, released) = flume::unbounded::<()>();
+        let mut reads: Vec<PendingRead<'a, ()>> = Vec::new();
+        for _ in 0..READ_WORKERS {
+            let (entered_sender, released) = (entered_sender.clone(), released.clone());
+            let mut read: PendingRead<'a, ()> = Box::pin(handle.read(move |_| {
+                entered_sender.send(()).expect("test observer");
+                released.recv_timeout(WAIT).expect("test release");
+                panic!("test: read worker exits unexpectedly");
+            }));
+            assert!(poll_once(read.as_mut()).is_none(), "a held read must be admitted, not answered");
+            reads.push(read);
+        }
+        for _ in 0..READ_WORKERS {
+            entered.recv_timeout(WAIT).expect("every read worker picked up a held read");
+        }
+        (HeldWorkers { release }, reads)
+    }
+
+    impl HeldWorkers {
+        fn release(&self) {
+            for _ in 0..READ_WORKERS {
+                self.release.send(()).expect("held reads are waiting");
+            }
+        }
+    }
+
+    fn queue_reads(handle: &DatabaseHandle) -> Vec<PendingRead<'_, Vec<JobRecord>>> {
+        (0..QUEUED)
+            .map(|_| {
+                let mut read: PendingRead<'_, Vec<JobRecord>> = Box::pin(handle.jobs(None, 1));
+                assert!(poll_once(read.as_mut()).is_none(), "a queued read must be admitted, not answered");
+                read
+            })
+            .collect()
+    }
+
+    fn pool_stopped(result: &Result<impl std::fmt::Debug, DatabaseError>) -> bool {
+        matches!(result, Err(DatabaseError::ReadPoolStopped))
+    }
+
+    fn reopen_and_read(directory: &DataDirectory) {
+        let worker = DatabaseWorker::start(directory).expect("immediate reopen");
+        let handle = worker.handle();
+        assert!(wait(handle.jobs(None, 1)).is_ok(), "reads work after reopening");
+        worker.shutdown().expect("clean shutdown after reopening");
+    }
+
+    #[test]
+    fn both_read_workers_exiting_resolve_every_queued_read() {
+        let (_root, directory) = data_directory("queued");
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let handle = worker.handle();
+        let (held, executing) = hold_every_read_worker(&handle);
+        let queued = queue_reads(&handle);
+
+        held.release();
+        for read in executing {
+            assert!(matches!(wait(read), Err(DatabaseError::ReadInterrupted)), "an executing read stays ReadInterrupted");
+        }
+        for read in queued {
+            let result = wait(read);
+            assert!(pool_stopped(&result), "a queued read is answered explicitly, got {result:?}");
+        }
+
+        assert!(matches!(worker.shutdown(), Err(DatabaseError::WorkerPanicked)));
+        reopen_and_read(&directory);
+    }
+
+    #[test]
+    fn new_reads_are_refused_once_the_pool_has_stopped() {
+        let (_root, directory) = data_directory("refused");
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let handle = worker.handle();
+        let (held, executing) = hold_every_read_worker(&handle);
+        held.release();
+        for read in executing {
+            assert!(matches!(wait(read), Err(DatabaseError::ReadInterrupted)));
+        }
+        // A caller sees ReadInterrupted while its worker is still unwinding;
+        // the pool stops when the last worker's exit has run. A read issued
+        // in between is admitted and then answered by that exit.
+        let deadline = Instant::now() + WAIT;
+        while !*handle.shared.reads_stopped.read().unwrap() {
+            assert!(Instant::now() < deadline, "the read pool did not stop in time");
+            let result = wait(handle.jobs(None, 1));
+            assert!(pool_stopped(&result), "a read during pool exit is answered explicitly, got {result:?}");
+        }
+
+        for _ in 0..3 {
+            let mut read = Box::pin(handle.job(JobId::new(1)));
+            let result = poll_once(read.as_mut()).expect("a read is refused at admission once the pool has stopped");
+            assert!(pool_stopped(&result), "got {result:?}");
+        }
+        // A read-worker panic is not a storage failure: commands still run.
+        assert_eq!(handle.status(), DatabaseStatus::Open);
+        assert!(wait(handle.save_job_input(None, JobInputDraft::default())).is_ok());
+
+        assert!(matches!(worker.shutdown(), Err(DatabaseError::WorkerPanicked)));
+        reopen_and_read(&directory);
+    }
+
+    #[test]
+    fn read_pool_failure_racing_shutdown_resolves_every_caller() {
+        let (_root, directory) = data_directory("shutdown");
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let handle = worker.handle();
+        let (held, executing) = hold_every_read_worker(&handle);
+        let queued = queue_reads(&handle);
+
+        // Shutdown closes admission, then waits for the executing reads,
+        // which hold the database open.
+        let (finished_sender, finished) = flume::bounded(1);
+        let shutdown = std::thread::spawn(move || finished_sender.send(worker.shutdown()).ok());
+        let deadline = Instant::now() + WAIT;
+        while handle.status() == DatabaseStatus::Open {
+            assert!(Instant::now() < deadline, "shutdown did not close admission in time");
+            std::thread::yield_now();
+        }
+        assert!(finished.try_recv().is_err(), "shutdown cannot finish while reads hold the database");
+        assert!(matches!(wait(handle.jobs(None, 1)), Err(DatabaseError::ReadsClosed)));
+        assert!(matches!(wait(handle.save_job_input(None, JobInputDraft::default())), Err(DatabaseError::ShuttingDown)));
+
+        held.release();
+        for read in executing {
+            assert!(matches!(wait(read), Err(DatabaseError::ReadInterrupted)));
+        }
+        for read in queued {
+            let result = wait(read);
+            assert!(
+                pool_stopped(&result) || matches!(result, Err(DatabaseError::ReadsClosed)),
+                "a queued read is answered explicitly, got {result:?}"
+            );
+        }
+        let result = finished.recv_timeout(WAIT).expect("shutdown finished");
+        assert!(matches!(result, Err(DatabaseError::WorkerPanicked)), "got {result:?}");
+        shutdown.join().unwrap();
+        reopen_and_read(&directory);
+    }
+}

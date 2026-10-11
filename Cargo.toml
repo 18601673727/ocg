@@ -1,14 +1,10 @@
 [package]
 name = "ocg"
-version = "0.4.3"
-edition = "2021"
+version = "0.5.0"
+edition = "2024"
 rust-version = "1.98"
-description = "Project-agnostic orchestration Core and PWA control plane"
 license = "MIT"
-readme = "README.md"
-repository = "https://github.com/18601673727/ocg"
-keywords = ["orchestration", "ai", "agents", "pwa"]
-categories = ["command-line-utilities"]
+publish = false
 
 [[bin]]
 name = "ocg"
@@ -16,49 +12,15 @@ path = "src/main.rs"
 
 [lib]
 name = "ocg"
-path = "src/lib.rs"
+path = "src/ocg.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-serde_json_canonicalizer = "0.3.2"
-base64 = "0.22"
-semver = "1"
-directories = "6"
-tempfile = "3"
-ring = "0.17"
-keyring = { version = "4.2", default-features = false, features = ["v1"] }
-rpassword = "7"
-libc = "0.2"
-rustix = { version = "1", features = ["fs", "process"] }
-sha2 = "0.10"
-# Rust is the single source of truth for the loopback control wire contract;
-# `ts-rs` projects those definitions into the TypeScript PWA.
-ts-rs = { version = "12.0.1", features = ["serde-json-impl"] }
-serde_yaml_ng = "0.10.0"
-fs2 = "0.4"
-petgraph = "0.8"
-ntex = { version = "3.12", default-features = false, features = ["rustls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1.0"
+redb = { version = "=4.3.0", default-features = false, features = ["std"] }
+petgraph = { version = "=0.8.3", default-features = false, features = ["std"] }
 flume = "0.11"
-strum = { version = "0.27", features = ["derive"] }
-schemars = "1.2"
-jsonschema = { version = "0.58", default-features = false }
-rusqlite = { version = "0.40", features = ["bundled"] }
-serde_rusqlite = { version = "0.43.0", default-features = false }
-url = { version = "2.5.8", default-features = false, features = ["std"] }
-ignore = { version = "0.4.33", default-features = false }
-# Incremental architecture dependencies. Keep features narrow until the
-# corresponding runtime, diagnostics, error, parsing, and identifier layers
-# are migrated in later steps.
-ctrlc = "3.4"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-serde_path_to_error = "0.1"
-uuid = { version = "1", features = ["serde", "v7"] }
-
-[profile.release]
-lto = true
-strip = true
+log = { version = "=0.4.34", default-features = false, features = ["std"] }
+time = { version = "=0.3.55", default-features = false, features = ["std"] }
