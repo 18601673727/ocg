@@ -37,10 +37,10 @@ pub const MAX_PROVIDER_ERROR_BODY: usize = 4096;
 /// The client library's 5s default aborts a request GitHub is queueing or
 /// throttling, which surfaces as an opaque transport error rather than as the
 /// rate-limit condition the caller can actually act on.
-const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
+const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Reasoning providers can queue a round longer than ordinary HTTP requests.
-const PROVIDER_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 6 } else { 120 });
+const PROVIDER_RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Time allowed to read a whole body once the head has arrived.
 ///
