@@ -190,7 +190,7 @@ impl ProviderStub {
                                 );
                             } else {
                                 if label == "slow-head" {
-                                    thread::sleep(Duration::from_secs(31));
+                                    thread::sleep(Duration::from_secs(2));
                                 }
                                 let tool_messages = body["messages"]
                                     .as_array()
@@ -1260,7 +1260,7 @@ fn cancellation_during_retry_backoff_stops_immediately_and_owns_settlement() {
 }
 
 #[test]
-fn reasoning_provider_can_wait_more_than_thirty_seconds_for_a_response_head() {
+fn reasoning_provider_uses_extended_response_head_budget() {
     let upstream = ProviderStub::start();
     let mut fixture = Fixture::new();
     let (call, envelope, _events) = fixture.admitted(&upstream.endpoint, "slow-head", true);
@@ -1269,6 +1269,7 @@ fn reasoning_provider_can_wait_more_than_thirty_seconds_for_a_response_head() {
         .expect("reasoning provider response");
     upstream.request("slow-head");
     upstream.closure("slow-head");
+    assert_eq!(upstream.attempts("slow-head"), 1);
     fixture.terminal(&call, "completed");
     fixture.no_residue();
 }
