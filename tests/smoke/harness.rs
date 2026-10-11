@@ -174,6 +174,7 @@ pub struct Chat {
 
 pub struct SmokeHarness {
     workspace: Option<TempDir>,
+    executable: PathBuf,
     process: Option<Process>,
     provider: ProviderFixture,
     address: Option<SocketAddr>,
@@ -193,9 +194,12 @@ impl SmokeHarness {
         let timeouts = Timeouts::default();
         let deadline = Instant::now() + timeouts.scenario;
         let workspace = tempfile::Builder::new().prefix("ocg-smoke-").tempdir()?;
+        let executable = workspace.path().join("ocg");
+        fs::copy(env!("CARGO_BIN_EXE_ocg"), &executable)?;
         let provider = ProviderFixture::start(reply, timeouts, deadline)?;
         let mut smoke = Self {
             workspace: Some(workspace),
+            executable,
             process: None,
             provider,
             address: None,
@@ -246,9 +250,16 @@ impl SmokeHarness {
             .join(relative)
     }
 
+    pub fn database_path(&self) -> PathBuf {
+        self.executable
+            .parent()
+            .expect("executable has an installation directory")
+            .join("ocg.db")
+    }
+
     fn command(&self) -> Command {
         // Cargo resolves this for integration tests, including custom target dirs.
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ocg"));
+        let mut command = Command::new(&self.executable);
         command
             .env_clear()
             .current_dir(self.path("root"))
@@ -745,16 +756,16 @@ impl SmokeHarness {
         Ok(job)
     }
 
-    pub fn control_file(&self, name: &str) -> Result<Value> {
-        Ok(serde_json::from_slice(&fs::read(
-            self.path(&format!("config/state/control/{name}.json")),
-        )?)?)
-    }
-
     pub fn assert_no_temp_files(&self) -> Result<()> {
-        for entry in fs::read_dir(self.path("config/state/control"))? {
+        let database = self.database_path();
+        let directory = database
+            .parent()
+            .ok_or("database has no parent directory")?;
+        for entry in fs::read_dir(directory)? {
             let entry = entry?;
-            if entry.file_name().to_string_lossy().contains(".tmp-") {
+            if entry.file_name().to_string_lossy().contains(".tmp-")
+                || entry.file_name().to_string_lossy().ends_with(".tmp")
+            {
                 return Err(format!("leftover atomic-write file: {:?}", entry.path()).into());
             }
         }

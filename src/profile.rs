@@ -4,6 +4,8 @@ use crate::provider_protocol::ProviderProtocol;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::path::PathBuf;
 use ts_rs::TS;
 
 /// The Profile control API version. Shared with the generated TypeScript, so
@@ -354,18 +356,27 @@ pub fn as_ocg_config(profile: &Profile) -> Result<Value> {
 #[derive(Debug, Clone)]
 pub struct ProfileService {
     store: crate::core_store::CoreStore,
+    #[cfg(test)]
+    legacy_config: Option<PathBuf>,
 }
 
 impl ProfileService {
     pub fn new(store: crate::core_store::CoreStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            #[cfg(test)]
+            legacy_config: None,
+        }
     }
 
-    /// The pre-database constructor the unchanged unit tests still call. The
-    /// paths are not read: the Profile lives in the OCG database.
+    /// The pre-database constructor retained for unit tests that provide an
+    /// isolated filesystem-backed Profile fixture.
     #[cfg(test)]
-    pub fn with_workspace(_config: &std::path::Path, _workspace: &std::path::Path) -> Self {
-        Self::new(crate::core_store::CoreStore)
+    pub fn with_workspace(config: &std::path::Path, _workspace: &std::path::Path) -> Self {
+        Self {
+            store: crate::core_store::CoreStore,
+            legacy_config: Some(config.to_path_buf()),
+        }
     }
 
     pub fn store(&self) -> &crate::core_store::CoreStore {
@@ -373,6 +384,20 @@ impl ProfileService {
     }
 
     pub fn current(&self) -> Result<Option<(Profile, String)>> {
+        #[cfg(test)]
+        if let Some(path) = &self.legacy_config {
+            if !path.exists() {
+                return Ok(None);
+            }
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| OcgError::io("cannot read test Profile", error))?;
+            let value: Value = serde_yaml_ng::from_str(&text)
+                .map_err(|error| OcgError::config(format!("invalid test Profile: {error}")))?;
+            return Ok(Some((
+                Profile::from_ocg_config(&value)?,
+                "test".to_string(),
+            )));
+        }
         let document = self.store.document(crate::core_store::CORE_SCOPE)?;
         if document.section("profile").is_none() {
             return Ok(None);

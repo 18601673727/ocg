@@ -19,25 +19,28 @@ fn domain() -> (TempDir, DomainRepository) {
 
 /// Admit one externally bound execution. Every admission in a test shares the
 /// same canonical Project because the repository root is stable.
-fn admitted(repository: &mut DomainRepository, binding: &str) -> CanonicalAdmission {
-    let project = repository
-        .ensure_project(repository.path().parent().expect("state parent"))
-        .expect("ensure project");
+fn admitted(
+    repository: &mut DomainRepository,
+    root: &std::path::Path,
+    binding: &str,
+) -> CanonicalAdmission {
+    let project = repository.ensure_project(root).expect("ensure project");
     repository
         .admit_job(project, binding, "{\"tool\":\"value\"}", "compio")
         .expect("admit canonical job")
 }
 
-fn project_of(repository: &DomainRepository) -> ocg::orchestration::domain::Project {
-    repository
-        .ensure_project(repository.path().parent().expect("state parent"))
-        .expect("ensure project")
+fn project_of(
+    repository: &DomainRepository,
+    root: &std::path::Path,
+) -> ocg::orchestration::domain::Project {
+    repository.ensure_project(root).expect("ensure project")
 }
 
 #[test]
 fn attempt_identity_and_frozen_configuration_are_immutable() {
-    let (_root, mut repository) = domain();
-    let project = project_of(&repository);
+    let (root, mut repository) = domain();
+    let project = project_of(&repository, root.path());
     let job = repository
         .create_job(&project.id, "objective")
         .expect("create Job");
@@ -84,8 +87,8 @@ fn attempt_identity_and_frozen_configuration_are_immutable() {
 
 #[test]
 fn attempt_ownership_is_authoritative() {
-    let (_root, mut repository) = domain();
-    let admission = admitted(&mut repository, "session-attempt");
+    let (root, mut repository) = domain();
+    let admission = admitted(&mut repository, root.path(), "session-attempt");
     let authority = repository
         .authority_for_binding(&admission.project.id, "session-attempt")
         .expect("read authority")
@@ -99,9 +102,9 @@ fn attempt_ownership_is_authoritative() {
 
 #[test]
 fn call_ownership_rejects_an_executor_from_another_attempt() {
-    let (_root, mut repository) = domain();
-    let first = admitted(&mut repository, "session-call-1");
-    let second = admitted(&mut repository, "session-call-2");
+    let (root, mut repository) = domain();
+    let first = admitted(&mut repository, root.path(), "session-call-1");
+    let second = admitted(&mut repository, root.path(), "session-call-2");
     let error = repository.create_call(
         &first.attempt.id,
         Some(&second.executor.id),
@@ -129,8 +132,8 @@ fn call_ownership_rejects_an_executor_from_another_attempt() {
 
 #[test]
 fn late_result_is_fenced_after_attempt_replacement() {
-    let (_root, mut repository) = domain();
-    let admission = admitted(&mut repository, "session-late");
+    let (root, mut repository) = domain();
+    let admission = admitted(&mut repository, root.path(), "session-late");
     let call = repository
         .create_call(
             &admission.attempt.id,
@@ -187,8 +190,8 @@ fn late_result_is_fenced_after_attempt_replacement() {
 
 #[test]
 fn replacement_always_publishes_a_new_attempt_identity() {
-    let (_root, mut repository) = domain();
-    let admission = admitted(&mut repository, "session-replacement");
+    let (root, mut repository) = domain();
+    let admission = admitted(&mut repository, root.path(), "session-replacement");
     let replacement = repository
         .replace_attempt_checked(&admission.job.id, "worker", Some(&admission.attempt.id))
         .expect("replace Attempt");
@@ -213,8 +216,8 @@ fn replacement_always_publishes_a_new_attempt_identity() {
 
 #[test]
 fn dependency_revision_is_monotonic() {
-    let (_root, mut repository) = domain();
-    let project = project_of(&repository);
+    let (root, mut repository) = domain();
+    let project = project_of(&repository, root.path());
     let prerequisite = repository
         .create_job(&project.id, "prerequisite")
         .expect("create prerequisite");
@@ -235,8 +238,8 @@ fn dependency_revision_is_monotonic() {
 
 #[test]
 fn dependency_dag_rejects_cycles() {
-    let (_root, mut repository) = domain();
-    let project = project_of(&repository);
+    let (root, mut repository) = domain();
+    let project = project_of(&repository, root.path());
     let first = repository
         .create_job(&project.id, "first")
         .expect("first job");
@@ -253,8 +256,8 @@ fn dependency_dag_rejects_cycles() {
 
 #[test]
 fn unsatisfied_dependency_is_not_runnable() {
-    let (_root, mut repository) = domain();
-    let project = project_of(&repository);
+    let (root, mut repository) = domain();
+    let project = project_of(&repository, root.path());
     let prerequisite = repository
         .create_job(&project.id, "prerequisite")
         .expect("create prerequisite");
@@ -285,8 +288,8 @@ fn unsatisfied_dependency_is_not_runnable() {
 
 #[test]
 fn terminal_attempt_cannot_roll_back() {
-    let (_root, mut repository) = domain();
-    let admission = admitted(&mut repository, "session-terminal");
+    let (root, mut repository) = domain();
+    let admission = admitted(&mut repository, root.path(), "session-terminal");
     repository
         .finish_attempt(&admission.attempt.id, true)
         .expect("complete Attempt");
@@ -313,8 +316,8 @@ fn terminal_attempt_cannot_roll_back() {
 
 #[test]
 fn cancellation_revokes_side_effect_authority() {
-    let (_root, mut repository) = domain();
-    let admission = admitted(&mut repository, "session-cancel");
+    let (root, mut repository) = domain();
+    let admission = admitted(&mut repository, root.path(), "session-cancel");
     let call = repository
         .create_call(
             &admission.attempt.id,
@@ -372,7 +375,7 @@ fn cancellation_revokes_side_effect_authority() {
 #[test]
 fn canonical_state_is_not_changed_by_projection_reads() {
     let (root, mut repository) = domain();
-    let project = project_of(&repository);
+    let project = project_of(&repository, root.path());
     let prerequisite = repository
         .create_job(&project.id, "prerequisite")
         .expect("prerequisite");
