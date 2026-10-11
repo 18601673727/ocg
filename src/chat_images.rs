@@ -119,6 +119,11 @@ pub fn upload(request: &ChatImageUploadRequest) -> Result<ChatImage> {
 
 /// An image the model returned. A data URL is stored as an attachment of the
 /// Call that produced it; a remote URL is passed through unstored.
+///
+/// The publication is keyed by the producing execution as well as the
+/// content, so the same image from another Job, Attempt or Call is its own
+/// attachment with its own provenance, while the image a Call streamed and
+/// the same image settled with that Call remain one.
 pub fn received(
     project_id: &str,
     producer: crate::attachments::Producer<'_>,
@@ -131,7 +136,13 @@ pub fn received(
     let name = format!("generated-image.{}", extension_for(media_type));
     let attachment = crate::attachments::publish(crate::attachments::NewAttachment {
         project_id,
-        operation_key: &format!("model-image:{:x}", Sha256::digest(url.as_bytes())),
+        operation_key: &format!(
+            "model-image:{}:{}:{}:{:x}",
+            producer.job_id,
+            producer.attempt_id.unwrap_or("-"),
+            producer.call_id.unwrap_or("-"),
+            Sha256::digest(url.as_bytes())
+        ),
         original_name: &name,
         media_type: Some(media_type),
         bytes: &bytes,
@@ -209,4 +220,122 @@ pub fn upstream_url(project_id: &str, image: &ChatImage) -> Result<String> {
         return Ok(image.url.clone());
     }
     Err(invalid("image does not belong to this Project"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attachments::Producer;
+    use crate::orchestration::domain::{DomainRepository, JobSpec};
+
+    const IMAGE: &[u8] = b"\x89PNG\r\n\x1a\nprovenance";
+
+    fn image_url() -> String {
+        data_url("image/png", IMAGE)
+    }
+
+    fn job(domain: &DomainRepository, project_id: &str) -> String {
+        domain
+            .create_job(
+                project_id,
+                JobSpec {
+                    objective: Some("image".into()),
+                    ..JobSpec::default()
+                },
+            )
+            .expect("job")
+            .id
+    }
+
+    fn attachment(project_id: &str, id: &str) -> crate::attachments::Attachment {
+        crate::attachments::get(project_id, id).expect("attachment")
+    }
+
+    #[test]
+    fn identical_images_from_different_calls_keep_their_own_calls() {
+        let directory = tempfile::tempdir().expect("temp");
+        let mut domain = DomainRepository::open(directory.path()).expect("domain");
+        let project = domain.ensure_project(directory.path()).expect("project");
+        let job_id = job(&domain, &project.id);
+        domain.set_job_eligible(&job_id).expect("eligible");
+        let (attempt, executor) = domain.dispatch_job(&job_id, "provider").expect("dispatch");
+        let mut call = || {
+            domain
+                .create_call(
+                    &attempt.id,
+                    Some(&executor.id),
+                    attempt.generation,
+                    false,
+                    "{\"executor_transport\":\"provider\"}",
+                )
+                .expect("call")
+                .id
+        };
+        let first_call = call();
+        let second_call = call();
+        let publish = |call_id: &str| {
+            received(
+                &project.id,
+                Producer {
+                    job_id: &job_id,
+                    attempt_id: Some(&attempt.id),
+                    call_id: Some(call_id),
+                },
+                &image_url(),
+            )
+            .expect("image")
+        };
+
+        let streamed = publish(&first_call);
+        let settled = publish(&first_call);
+        let second = publish(&second_call);
+
+        assert_eq!(
+            streamed.id, settled.id,
+            "one Call's image is one attachment"
+        );
+        assert_ne!(settled.id, second.id);
+        assert_eq!(
+            attachment(&project.id, &settled.id).call_id.as_deref(),
+            Some(first_call.as_str())
+        );
+        assert_eq!(
+            attachment(&project.id, &second.id).call_id.as_deref(),
+            Some(second_call.as_str())
+        );
+    }
+
+    #[test]
+    fn identical_images_from_different_jobs_keep_their_own_producers() {
+        let directory = tempfile::tempdir().expect("temp");
+        let domain = DomainRepository::open(directory.path()).expect("domain");
+        let project = domain.ensure_project(directory.path()).expect("project");
+        let first_job = job(&domain, &project.id);
+        let second_job = job(&domain, &project.id);
+        let publish = |job_id: &str| {
+            received(
+                &project.id,
+                Producer {
+                    job_id,
+                    attempt_id: None,
+                    call_id: None,
+                },
+                &image_url(),
+            )
+            .expect("image")
+        };
+
+        let first = publish(&first_job);
+        let second = publish(&second_job);
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            attachment(&project.id, &first.id).job_id.as_deref(),
+            Some(first_job.as_str())
+        );
+        assert_eq!(
+            attachment(&project.id, &second.id).job_id.as_deref(),
+            Some(second_job.as_str())
+        );
+    }
 }

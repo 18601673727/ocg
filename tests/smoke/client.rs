@@ -185,6 +185,56 @@ impl Response {
         }
         consume_sse(&mut self.reader, events)
     }
+
+    /// Drop the connection with a reset rather than an orderly close, so the
+    /// server's next write to it fails at once.
+    pub fn abort(self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: the descriptor is owned by this live socket, and the
+            // option value is a correctly sized `linger`.
+            let result = unsafe {
+                libc::setsockopt(
+                    self.reader.get_ref().stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&linger as *const libc::linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The next SSE event and its `id:`, or `None` when the stream closes.
+    pub fn next_sse_event(&mut self) -> Result<Option<(Option<u64>, Value)>> {
+        let mut id = None;
+        let mut data = Vec::new();
+        loop {
+            let Some(line) = line(&mut self.reader, BODY_LIMIT)? else {
+                return Ok(None);
+            };
+            if line.is_empty() {
+                if data.is_empty() {
+                    continue;
+                }
+                return Ok(Some((id, serde_json::from_str(&data.join("\n"))?)));
+            }
+            if let Some(value) = line.strip_prefix("id:") {
+                id = Some(value.trim().parse()?);
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data.push(value.strip_prefix(' ').unwrap_or(value).to_owned());
+            }
+        }
+    }
 }
 
 fn consume_sse(reader: &mut impl BufRead, events: &mut Vec<Value>) -> Result<String> {

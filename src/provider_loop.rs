@@ -1048,6 +1048,7 @@ impl CanonicalProviderCallHandler {
         let received_stream = Arc::new(Mutex::new(ReceivedProviderStream::default()));
         let tap = {
             let forward = envelope.events.clone();
+            let call_id = envelope.call_id.clone();
             let received_stream = Arc::clone(&received_stream);
             ntex::rt::spawn(async move {
                 while let Ok(event) = tap_rx.recv_async().await {
@@ -1056,6 +1057,16 @@ impl CanonicalProviderCallHandler {
                             received.observe(stream_event);
                         }
                     }
+                    // A streamed image is consumed as this Call's output.
+                    let event = match event {
+                        ExecutionEvent::Provider(ChatStreamEvent::Image { url }) => {
+                            ExecutionEvent::CallImage {
+                                call_id: call_id.clone(),
+                                url,
+                            }
+                        }
+                        event => event,
+                    };
                     let _ = forward.send(event);
                 }
             })

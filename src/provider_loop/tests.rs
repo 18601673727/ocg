@@ -1095,6 +1095,48 @@ fn partial_stream_then_premature_eof_resets_the_round_before_retrying() {
     fixture.no_residue();
 }
 
+/// A streamed image reaches the consumer tagged with the Call that produced
+/// it, so it can be stored as that Call's output.
+#[test]
+fn streamed_image_is_published_with_its_call() {
+    const URL: &str = "https://images.example.invalid/streamed.png";
+    static FRAME: std::sync::OnceLock<[&'static str; 1]> = std::sync::OnceLock::new();
+    let frames = FRAME.get_or_init(|| {
+        [Box::leak(
+            format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":{"images":[{"type":"image_url","image_url":{"url":URL}}]},"finish_reason":null}]})
+            )
+            .into_boxed_str(),
+        )]
+    });
+    let upstream = ProviderStub::start();
+    upstream.script(
+        "image",
+        vec![
+            StubStep::TruncatedFrames(frames),
+            StubStep::Stream(&["done"]),
+        ],
+    );
+    let mut fixture = Fixture::new();
+    let (call, envelope, events) = fixture.admitted(&upstream.endpoint, "image", true);
+
+    fixture.execute(envelope).expect("round recovered");
+
+    let published = events.try_iter().collect::<Vec<_>>();
+    assert!(
+        published.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::CallImage { call_id, url } if *call_id == call.id && url == URL
+        )),
+        "{published:?}"
+    );
+    assert!(!published.iter().any(|event| matches!(
+        event,
+        ExecutionEvent::Provider(ChatStreamEvent::Image { .. })
+    )));
+}
+
 /// A tool call emitted by a physical attempt that then fails must never become a
 /// durable Call, so a replacement attempt cannot double a native side effect.
 ///

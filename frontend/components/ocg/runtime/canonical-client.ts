@@ -114,14 +114,18 @@ export interface CanonicalControlClient {
   listProjects(): Promise<ProjectRecord[]>;
   importProject(commandId: string, root: string): Promise<CanonicalResult<CanonicalProjectAck>>;
   readConfiguration(projectId: string): Promise<CanonicalResult<ProjectConfigurationView>>;
+  /** `expectedRevision` is the `global_revision` the change was computed from. */
   writeGlobalConfiguration(
     commandId: string,
     configuration: GlobalConfiguration,
+    expectedRevision: number,
   ): Promise<CanonicalResult<CanonicalConfigurationAck>>;
+  /** `expectedRevision` is the `project_revision` the change was computed from. */
   writeProjectDefaults(
     commandId: string,
     projectId: string,
     defaults: JsonValue,
+    expectedRevision: number,
   ): Promise<CanonicalResult<CanonicalConfigurationAck>>;
   writeJobConfiguration(
     commandId: string,
@@ -338,21 +342,21 @@ export function createHttpCanonicalControlClient(
       }
     },
 
-    async writeGlobalConfiguration(commandId, configuration) {
+    async writeGlobalConfiguration(commandId, configuration, expectedRevision) {
       const { status, value, text } = await send(
         "PUT",
         "/api/v1/canonical/configuration",
-        { command_id: commandId, configuration },
+        { command_id: commandId, configuration, expected_revision: expectedRevision },
       );
       if (status !== 200) return rejection(commandId, status, text);
       return acknowledgeConfiguration(commandId, value);
     },
 
-    async writeProjectDefaults(commandId, projectId, defaults) {
+    async writeProjectDefaults(commandId, projectId, defaults, expectedRevision) {
       const { status, value, text } = await send(
         "PUT",
         `/api/v1/canonical/configuration/projects/${encodeURIComponent(projectId)}`,
-        { command_id: commandId, defaults },
+        { command_id: commandId, defaults, expected_revision: expectedRevision },
       );
       if (status !== 200) return rejection(commandId, status, text);
       return acknowledgeConfiguration(commandId, value);

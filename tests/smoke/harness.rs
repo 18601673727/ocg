@@ -479,6 +479,91 @@ impl SmokeHarness {
         self.provider.set_reply(reply)
     }
 
+    /// How many chat completion requests reached the provider.
+    pub fn provider_completions(&self) -> usize {
+        self.provider.completions()
+    }
+
+    /// Kill OCG without a graceful shutdown, then start it again on the same
+    /// installation. Nothing held only in the old process survives.
+    pub fn crash_and_restart(&mut self) -> Result<()> {
+        self.phase = "crash".into();
+        if let Some(mut process) = self.process.take() {
+            process.graceful = false;
+            process.stop()?;
+        }
+        self.address = None;
+        self.phase = "restart".into();
+        let mut command = self.command();
+        command.args(["--disable-proxy", "serve", "127.0.0.1:0"]);
+        let name = format!("ocg-{}", self.id());
+        self.process = Some(Process::spawn(
+            &mut command,
+            &self.path(""),
+            &name,
+            self.timeouts,
+        )?);
+        self.wait_ready()
+    }
+
+    /// Poll until `done` holds, within the execution timeout.
+    pub fn wait_until(
+        &mut self,
+        what: &str,
+        mut done: impl FnMut(&mut Self) -> Result<bool>,
+    ) -> Result<()> {
+        let deadline = self.operation_deadline(self.timeouts.execution);
+        loop {
+            if done(self)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("timed out waiting for {what}").into());
+            }
+            thread::sleep(self.timeouts.poll.min(remaining(deadline)?));
+        }
+    }
+
+    /// The canonical execution of a Chat's Job.
+    pub fn execution(&mut self, chat: &Chat) -> Result<Value> {
+        let snapshot = self.json(
+            "GET",
+            &format!(
+                "/api/v1/canonical/jobs?project_id={}&job_id={}",
+                chat.project_id, chat.job_id
+            ),
+            None,
+        )?;
+        self.snapshot = snapshot.clone();
+        Ok(snapshot["job"].clone())
+    }
+
+    /// Open a Chat's stream, resuming after `last_event_id` when given.
+    pub fn open_chat_stream(
+        &mut self,
+        chat: &Chat,
+        last_event_id: Option<u64>,
+    ) -> Result<Response> {
+        self.phase = format!("SSE {chat:?} after {last_event_id:?}");
+        self.alive()?;
+        let resume = last_event_id.map(|id| id.to_string());
+        let mut headers = vec![("Accept", "text/event-stream")];
+        if let Some(resume) = &resume {
+            headers.push(("Last-Event-ID", resume.as_str()));
+        }
+        Response::open(
+            self.address.ok_or("no OCG address")?,
+            "GET",
+            &format!(
+                "/api/v1/canonical/chat/stream?session_id={}&job_id={}",
+                chat.session_id, chat.job_id
+            ),
+            &headers,
+            None,
+            self.operation_deadline(self.timeouts.execution),
+        )
+    }
+
     pub fn import_project(&mut self, root: &Path) -> Result<Value> {
         let command = self.id();
         let response = self.json(

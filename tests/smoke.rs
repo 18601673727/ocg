@@ -1,3 +1,5 @@
+#[path = "smoke/acceptance.rs"]
+mod acceptance;
 #[path = "smoke/client.rs"]
 mod client;
 #[path = "smoke/hardening.rs"]

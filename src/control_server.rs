@@ -2081,22 +2081,39 @@ fn handle_chat_stream(
             use crate::orchestration::execution_dispatch::ExecutionEvent as Live;
             match event {
                 Live::Started => {}
+                Live::CallImage { call_id, url } => {
+                    let payload = match service.receive_chat_image_for_turn(
+                        &session_id,
+                        &job_id,
+                        &call_id,
+                        &url,
+                    ) {
+                        Ok(image) => json!({"image": image}).to_string(),
+                        // An image that cannot be received here is a
+                        // diagnostic, not the turn's verdict: the completion
+                        // settlement receives the final images itself.
+                        Err(error) => json!({"provider_error": error.to_string()}).to_string(),
+                    };
+                    if stream
+                        .write_all(format!("id: {seq}\ndata: {payload}\n\n").as_bytes())
+                        .is_err()
+                    {
+                        disconnected = true;
+                        finished = true;
+                        break;
+                    }
+                    if stream.flush().is_err() {
+                        disconnected = true;
+                        finished = true;
+                        break;
+                    }
+                }
                 Live::Provider(provider_event) => {
                     use crate::openai_compatible::stream::ChatStreamEvent as Stream;
                     let payload = match provider_event {
-                        Stream::Image { url } => {
-                            match service.receive_chat_image_for_turn(&session_id, &job_id, &url) {
-                                Ok(image) => Some(json!({"image": image}).to_string()),
-                                // An image that cannot be received here is a
-                                // diagnostic, not the turn's verdict: the
-                                // completion settlement receives the final
-                                // images itself, and the `Failed`/`Finished`
-                                // it publishes alone closes the tail.
-                                Err(error) => {
-                                    Some(json!({"provider_error": error.to_string()}).to_string())
-                                }
-                            }
-                        }
+                        // Images are relayed as `CallImage`, tagged with
+                        // their Call; an untagged one has no producer.
+                        Stream::Image { .. } => None,
                         Stream::TextDelta { delta } => Some(json!({"delta": delta}).to_string()),
                         Stream::ReasoningDelta { delta } => {
                             Some(json!({"reasoning": delta}).to_string())

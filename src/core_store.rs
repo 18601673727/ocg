@@ -180,8 +180,11 @@ impl CoreStore {
 
     /// The committed configuration of one scope.
     pub fn document(&self, scope: &str) -> Result<ConfigDocument> {
-        let connection = self.connect()?;
-        read_document(&connection, scope).map_err(|error| sql(&self.path(), error))
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| sql(&self.path(), error))?;
+        read_document(&transaction, scope).map_err(|error| sql(&self.path(), error))
     }
 
     /// Commit one validated change atomically.
@@ -506,13 +509,18 @@ pub fn validate_credential_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_document(connection: &Connection, scope: &str) -> rusqlite::Result<ConfigDocument> {
-    let revision: i64 = connection.query_row(
+/// One scope's configuration. The revision and the sections are read inside
+/// one transaction, so they come from the same snapshot: a commit between the
+/// two reads can never pair an old revision with new content.
+fn read_document(transaction: &Transaction<'_>, scope: &str) -> rusqlite::Result<ConfigDocument> {
+    let revision: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(revision),0) FROM core_config_revisions WHERE scope=?1",
         [scope],
         |row| row.get(0),
     )?;
-    let mut statement = connection.prepare(
+    #[cfg(test)]
+    tests::between_reads();
+    let mut statement = transaction.prepare(
         "SELECT section,value FROM core_config_sections WHERE scope=?1 ORDER BY section",
     )?;
     let rows = statement.query_map([scope], |row| {
@@ -568,4 +576,68 @@ fn now() -> i64 {
 
 fn sql(path: &Path, error: rusqlite::Error) -> OcgError {
     crate::database::sql(path, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change<'a>(
+        scope: &'a str,
+        command_id: &'a str,
+        expected: u64,
+        value: i64,
+    ) -> ConfigChange<'a> {
+        ConfigChange {
+            scope,
+            command_id,
+            principal: "test",
+            expected_revision: expected,
+            sections: vec![("value", Some(Value::from(value)))],
+        }
+    }
+
+    thread_local! {
+        static BETWEEN_READS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// Run the action a test placed between a document's revision and
+    /// section reads, once.
+    pub(super) fn between_reads() {
+        if let Some(action) = BETWEEN_READS.with(|slot| slot.borrow_mut().take()) {
+            action();
+        }
+    }
+
+    #[test]
+    fn a_document_never_pairs_a_revision_with_another_revisions_content() {
+        let store = CoreStore::locate().expect("store");
+        let scope = format!("snapshot-{}", uuid::Uuid::now_v7());
+        let first = store
+            .commit(change(&scope, "first", 0, 1), |_| Ok(()))
+            .expect("first");
+        let writer = store.clone();
+        let concurrent = scope.clone();
+        BETWEEN_READS.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Another connection commits after the revision was read.
+                writer
+                    .commit(change(&concurrent, "second", first.revision, 2), |_| Ok(()))
+                    .expect("second");
+            }))
+        });
+
+        let document = store.document(&scope).expect("document");
+
+        assert!(
+            BETWEEN_READS.with(|slot| slot.borrow().is_none()),
+            "commit ran"
+        );
+        assert_eq!(document.revision, first.revision);
+        assert_eq!(document.section("value"), Some(&Value::from(1)));
+        let current = store.document(&scope).expect("current");
+        assert!(current.revision > first.revision);
+        assert_eq!(current.section("value"), Some(&Value::from(2)));
+    }
 }

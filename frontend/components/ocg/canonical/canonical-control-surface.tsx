@@ -222,8 +222,11 @@ export function CanonicalControlSurface({
         setError(t("canonical.error.needProjectGlobal"));
         return;
       }
-      const commandId = globalConfigurationCommandId(configurationRevision(configuration) + 1);
-      const result = await client.writeGlobalConfiguration(commandId, toGlobalConfiguration(draft));
+      // A command is named by the revision it was computed from, so a retry of
+      // the same edit replays it and an edit of a newer revision is distinct.
+      const expectedRevision = configuration?.global_revision ?? 0;
+      const commandId = globalConfigurationCommandId(expectedRevision);
+      const result = await client.writeGlobalConfiguration(commandId, toGlobalConfiguration(draft), expectedRevision);
       setAck(isCanonicalRejection(result) ? t("canonical.rejected", { id: result.commandId, message: result.message }) : t("canonical.accepted", { id: result.commandId }));
       if (isCanonicalRejection(result)) return;
       setConfiguration(result.configuration);
@@ -245,10 +248,18 @@ export function CanonicalControlSurface({
         setError(t("canonical.error.needProjectDefaults"));
         return;
       }
+      // The draft was computed from the loaded configuration; it must be this
+      // Project's, or its defaults would be written to another Project.
+      if (configuration?.project.project_id !== project.project_id) {
+        setError(t("canonical.error.projectDefaultsNotLoaded"));
+        return;
+      }
+      const expectedRevision = configuration.project_revision;
       const result = await client.writeProjectDefaults(
-        projectDefaultsCommandId(project.project_id, configurationRevision(configuration) + 1),
+        projectDefaultsCommandId(project.project_id, expectedRevision),
         project.project_id,
         { profile: draft.profile, routing: draft.routing, hard_budget: draft.hardBudget },
+        expectedRevision,
       );
       setAck(isCanonicalRejection(result) ? t("canonical.rejected", { id: result.commandId, message: result.message }) : t("canonical.accepted", { id: result.commandId }));
       if (!isCanonicalRejection(result)) {
@@ -468,10 +479,4 @@ export function CanonicalControlSurface({
       </div>
     </div>
   );
-}
-
-function configurationRevision(view: CanonicalConfigurationView | null): number {
-  if (!view) return 0;
-  const budget = view.global.resource_budget;
-  return budget ? Math.trunc(budget.hard_limit) : 0;
 }

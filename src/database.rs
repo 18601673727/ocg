@@ -101,16 +101,21 @@ pub fn path() -> Result<PathBuf> {
 /// Every caller opens its own connection, so threads and processes share the
 /// database through SQLite's locking alone.
 pub fn connect() -> Result<Connection> {
-    let path = path()?;
-    let location = installation_dir()?;
-    let existed = path.exists();
-    let mut connection =
-        Connection::open(&path).map_err(|error| open_sql(&location, &path, error))?;
-    configure(&path, &connection)?;
-    if !existed {
-        restrict_permissions(&path)?;
-    }
-    let current: Option<String> = if generation(&connection, &path)? == SCHEMA_VERSION {
+    open(&path()?, &installation_dir()?)
+}
+
+/// Open the database at `path` for the installation in `location`.
+fn open(path: &Path, location: &Path) -> Result<Connection> {
+    let mut connection = Connection::open(path).map_err(|error| open_sql(location, path, error))?;
+    configure(path, &connection)?;
+    // Another program's database is refused before OCG changes anything about
+    // it, its journal mode and permissions included.
+    refuse_foreign(path, &connection)?;
+    // The database holds plaintext credentials. Whether OCG created the file
+    // or found it (an empty placeholder, a copied installation), it is made
+    // owner-only before anything is written to it.
+    restrict_permissions(path)?;
+    let current: Option<String> = if generation(&connection, path)? == SCHEMA_VERSION {
         connection
             .query_row(
                 "SELECT location FROM ocg_installation WHERE id=1",
@@ -118,12 +123,12 @@ pub fn connect() -> Result<Connection> {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|error| sql(&path, error))?
+            .map_err(|error| sql(path, error))?
     } else {
         None
     };
     if current.as_deref() != Some(location.to_string_lossy().as_ref()) {
-        initialize(&path, &location, &mut connection)?;
+        initialize(path, location, &mut connection)?;
     }
     Ok(connection)
 }
@@ -142,6 +147,35 @@ fn configure(path: &Path, connection: &Connection) -> Result<()> {
             .map_err(|error| sql(path, error))?;
     }
     Ok(())
+}
+
+/// Refuse a database that is not OCG's: one with tables but without OCG's
+/// `application_id`. [`initialize`] decides again under its exclusive lock.
+fn refuse_foreign(path: &Path, connection: &Connection) -> Result<()> {
+    let application_id: i32 = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .map_err(|error| sql(path, error))?;
+    if application_id == APPLICATION_ID {
+        return Ok(());
+    }
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| sql(path, error))?;
+    if tables > 0 {
+        return Err(foreign(path));
+    }
+    Ok(())
+}
+
+fn foreign(path: &Path) -> OcgError {
+    OcgError::config(format!(
+        "{} is not an OCG database; OCG will not modify it. Move it away to let OCG create its database here.",
+        path.display()
+    ))
 }
 
 fn generation(connection: &Connection, path: &Path) -> Result<i64> {
@@ -205,10 +239,7 @@ fn initialize(path: &Path, location: &Path, connection: &mut Connection) -> Resu
         }
     }
     if application_id != APPLICATION_ID && !tables.is_empty() {
-        return Err(OcgError::config(format!(
-            "{} is not an OCG database; OCG will not modify it. Move it away to let OCG create its database here.",
-            path.display()
-        )));
+        return Err(foreign(path));
     }
     if application_id == APPLICATION_ID && generation != SCHEMA_VERSION && generation != 0 {
         let recorded: Option<String> = if tables.contains(&"ocg_installation") {
@@ -383,11 +414,32 @@ fn classify_probe_error(error: &std::io::Error) -> ProbeOutcome {
     ProbeOutcome::Writable
 }
 
+/// Make the database and any WAL or shared-memory file beside it owner-only.
+/// SQLite creates those files with the database's permissions, so ones
+/// created later follow.
 #[cfg(unix)]
 fn restrict_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| OcgError::io("restrict OCG database permissions", error))
+    let mut files = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        files.push(PathBuf::from(name));
+    }
+    for (index, file) in files.iter().enumerate() {
+        let mode = match std::fs::metadata(file) {
+            Ok(metadata) => metadata.permissions().mode(),
+            Err(error) if index > 0 && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(OcgError::io("inspect OCG database permissions", error));
+            }
+        };
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| OcgError::io("restrict OCG database permissions", error))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -409,4 +461,66 @@ pub(crate) fn sql(path: &Path, error: rusqlite::Error) -> OcgError {
         }
     }
     OcgError::config(format!("OCG database {}: {error}", path.display()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_foreign_database_is_refused_unchanged() {
+        let directory = tempfile::tempdir().expect("temp");
+        let path = directory.path().join(DATABASE_FILE);
+        {
+            let foreign = Connection::open(&path).expect("foreign");
+            foreign
+                .execute_batch("CREATE TABLE notes(body TEXT); INSERT INTO notes VALUES('kept');")
+                .expect("foreign content");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+        let before = std::fs::read(&path).expect("bytes");
+
+        let error = open(&path, directory.path()).expect_err("refused");
+
+        assert!(error.to_string().contains("not an OCG database"), "{error}");
+        assert_eq!(std::fs::read(&path).expect("bytes"), before);
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn a_found_world_readable_database_is_made_owner_only() {
+        let directory = tempfile::tempdir().expect("temp");
+        let path = directory.path().join(DATABASE_FILE);
+        std::fs::File::create(&path).expect("empty database");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+
+        let connection = open(&path, directory.path()).expect("open");
+        connection
+            .query_row(
+                "SELECT location FROM ocg_installation WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("initialized");
+
+        for file in ["", "-wal", "-shm"] {
+            let file = PathBuf::from(format!("{}{file}", path.display()));
+            if let Ok(metadata) = std::fs::metadata(&file) {
+                assert_eq!(
+                    metadata.permissions().mode() & 0o777,
+                    0o600,
+                    "{} is owner-only",
+                    file.display()
+                );
+            }
+        }
+    }
 }

@@ -3696,6 +3696,7 @@ impl CanonicalControlService {
         &self,
         session_id: &str,
         job_id: &str,
+        call_id: &str,
         url: &str,
     ) -> Result<crate::contracts::ChatImage> {
         let (project_id, attempt_id) = self
@@ -3712,7 +3713,7 @@ impl CanonicalControlService {
             crate::attachments::Producer {
                 job_id,
                 attempt_id: Some(&attempt_id),
-                call_id: None,
+                call_id: Some(call_id),
             },
             url,
         )

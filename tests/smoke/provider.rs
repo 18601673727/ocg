@@ -1,6 +1,6 @@
 use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -22,6 +22,13 @@ pub enum Reply {
         text: Vec<String>,
     },
     NativePwd,
+    /// One delta, then the response stays open until OCG closes it.
+    Hang,
+    /// One delta, then these once `released` is set.
+    Gated {
+        released: Arc<AtomicBool>,
+        rest: Vec<String>,
+    },
 }
 
 pub struct ProviderFixture {
@@ -30,6 +37,7 @@ pub struct ProviderFixture {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     diagnostics: Arc<Mutex<Vec<String>>>,
+    completions: Arc<AtomicUsize>,
 }
 
 impl ProviderFixture {
@@ -43,6 +51,8 @@ impl ProviderFixture {
         let worker_stop = Arc::clone(&stop);
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
         let worker_diagnostics = Arc::clone(&diagnostics);
+        let completions = Arc::new(AtomicUsize::new(0));
+        let worker_completions = Arc::clone(&completions);
         let worker = thread::Builder::new()
             .name("smoke-provider".into())
             .spawn(move || {
@@ -56,11 +66,16 @@ impl ProviderFixture {
                                     break;
                                 }
                             };
-                            if let Err(error) = serve(
-                                stream,
-                                &reply,
-                                (Instant::now() + timeouts.http).min(deadline),
-                            ) {
+                            // A hanging reply lasts until OCG closes it, never
+                            // past the scenario.
+                            let expires = if matches!(reply, Reply::Hang | Reply::Gated { .. }) {
+                                deadline
+                            } else {
+                                (Instant::now() + timeouts.http).min(deadline)
+                            };
+                            if let Err(error) =
+                                serve(stream, &reply, expires, &worker_completions, timeouts)
+                            {
                                 match worker_diagnostics.lock() {
                                     Ok(mut diagnostics) if diagnostics.len() < 64 => {
                                         diagnostics.push(error.to_string())
@@ -86,7 +101,13 @@ impl ProviderFixture {
             stop,
             worker: Some(worker),
             diagnostics,
+            completions,
         })
+    }
+
+    /// How many chat completion requests the provider has received.
+    pub fn completions(&self) -> usize {
+        self.completions.load(Ordering::SeqCst)
     }
 
     pub fn set_reply(&mut self, reply: Reply) -> Result<()> {
@@ -127,7 +148,15 @@ fn chunk(delta: Value, finish: Value) -> Value {
     })
 }
 
-fn serve(stream: TcpStream, reply: &Reply, deadline: Instant) -> Result<()> {
+fn serve(
+    stream: TcpStream,
+    reply: &Reply,
+    deadline: Instant,
+    completions: &AtomicUsize,
+    timeouts: Timeouts,
+) -> Result<()> {
+    // Some platforms hand an accepted socket the listener's non-blocking mode.
+    stream.set_nonblocking(false)?;
     let mut reader = BufReader::new(DeadlineSocket::new(stream, deadline));
     let request = line(&mut reader, 8192)?.ok_or("provider request closed")?;
     let mut length = 0;
@@ -166,6 +195,14 @@ fn serve(stream: TcpStream, reply: &Reply, deadline: Instant) -> Result<()> {
         if body["model"] != MODEL || body["stream"] != true {
             return Err(format!("unexpected provider request: {body}").into());
         }
+        completions.fetch_add(1, Ordering::SeqCst);
+        match reply {
+            Reply::Hang => return hang(reader.into_inner(), timeouts),
+            Reply::Gated { released, rest } => {
+                return gated(reader.into_inner(), released, rest, timeouts)
+            }
+            _ => {}
+        }
         let has_tool = body["messages"]
             .as_array()
             .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
@@ -191,6 +228,9 @@ fn serve(stream: TcpStream, reply: &Reply, deadline: Instant) -> Result<()> {
                 ),
                 chunk(json!({}), json!("stop")),
             ],
+            Reply::Hang | Reply::Gated { .. } => {
+                unreachable!("an open-ended reply is served on its own")
+            }
             Reply::NativePwd => vec![
                 chunk(
                     json!({"role": "assistant", "tool_calls": [{
@@ -217,6 +257,67 @@ fn serve(stream: TcpStream, reply: &Reply, deadline: Instant) -> Result<()> {
     for bytes in payload.as_bytes().chunks(7) {
         socket.write_all(bytes)?;
     }
+    socket.flush()?;
+    Ok(())
+}
+
+fn write_chunk(socket: &mut DeadlineSocket, data: &str) -> std::io::Result<()> {
+    socket.write_all(format!("{:x}\r\n{data}\r\n", data.len()).as_bytes())?;
+    socket.flush()
+}
+
+/// Begin a streamed reply with one delta.
+fn open_reply(socket: &mut DeadlineSocket) -> std::io::Result<()> {
+    socket.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    )?;
+    write_chunk(
+        socket,
+        &format!(
+            "data: {}\n\n",
+            chunk(json!({"content": "partial "}), Value::Null)
+        ),
+    )
+}
+
+/// Start a streamed reply and keep it open until OCG closes the connection,
+/// which a write then reports.
+fn hang(mut socket: DeadlineSocket, timeouts: Timeouts) -> Result<()> {
+    open_reply(&mut socket)?;
+    loop {
+        thread::sleep(timeouts.poll);
+        if write_chunk(&mut socket, ": waiting\n\n").is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// Start a streamed reply, then finish it once the test releases it.
+fn gated(
+    mut socket: DeadlineSocket,
+    released: &AtomicBool,
+    rest: &[String],
+    timeouts: Timeouts,
+) -> Result<()> {
+    open_reply(&mut socket)?;
+    while !released.load(Ordering::SeqCst) {
+        thread::sleep(timeouts.poll);
+        write_chunk(&mut socket, ": waiting\n\n")?;
+    }
+    for part in rest {
+        write_chunk(
+            &mut socket,
+            &format!("data: {}\n\n", chunk(json!({"content": part}), Value::Null)),
+        )?;
+    }
+    write_chunk(
+        &mut socket,
+        &format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            chunk(json!({}), json!("stop"))
+        ),
+    )?;
+    socket.write_all(b"0\r\n\r\n")?;
     socket.flush()?;
     Ok(())
 }

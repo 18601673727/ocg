@@ -130,6 +130,12 @@ pub struct ProviderExecutionConfig {
 pub enum ExecutionEvent {
     Started,
     Provider(crate::openai_compatible::stream::ChatStreamEvent),
+    /// An image a provider streamed, with the Call that produced it, so it is
+    /// stored as that Call's output.
+    CallImage {
+        call_id: String,
+        url: String,
+    },
     Failed(String),
     Finished,
 }

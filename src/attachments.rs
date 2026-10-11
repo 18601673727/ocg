@@ -253,15 +253,28 @@ pub fn publish(new: NewAttachment<'_>) -> Result<Attachment> {
         }
     };
     write_file(&location, &id, new.bytes)?;
+    finish(&connection, &id, &location)
+}
+
+/// Make a written publication available. Its row may have been expired while
+/// the bytes were written; the file written for it is then removed, so no
+/// file outlives the row that names it.
+fn finish(connection: &Connection, id: &str, location: &Path) -> Result<Attachment> {
     connection
         .execute(
             "UPDATE attachments SET state='available' WHERE id=?1 AND state='staged'",
-            [&id],
+            [id],
         )
         .map_err(sql)?;
-    let attachment = by_id(&connection, &id)?
-        .ok_or_else(|| OcgError::config("published attachment disappeared"))?;
-    verified(attachment)
+    match by_id(connection, id)? {
+        Some(attachment) => verified(attachment),
+        None => {
+            remove_if_present(location)?;
+            Err(OcgError::config(
+                "attachment publication expired before it completed",
+            ))
+        }
+    }
 }
 
 /// One available attachment of a Project.
@@ -347,18 +360,44 @@ fn expire_staged(connection: &mut Connection) -> Result<usize> {
             .map_err(sql)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql)?
     };
+    let mut removed = 0;
     for (id, location) in &expired {
-        let location = Path::new(location);
-        remove_if_present(&temporary_path(location, id))?;
-        remove_if_present(location)?;
-        connection
-            .execute(
-                "DELETE FROM attachments WHERE id=?1 AND state='staged'",
-                [id],
-            )
-            .map_err(sql)?;
+        if expire_one(connection, id, Path::new(location))? {
+            removed += 1;
+        }
     }
-    Ok(expired.len())
+    Ok(removed)
+}
+
+/// Remove one abandoned publication, provided it is still `staged`. The check,
+/// the file removal and the row deletion hold the write lock together, so a
+/// publisher cannot make the row available in between: either it finished
+/// first and its file is kept, or it finds the row gone and removes its own
+/// file. Files go before the row, so an interruption leaves a row that names
+/// them for the next cleanup.
+fn expire_one(connection: &mut Connection, id: &str, location: &Path) -> Result<bool> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql)?;
+    let staged = transaction
+        .query_row(
+            "SELECT 1 FROM attachments WHERE id=?1 AND state='staged'",
+            [id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(sql)?
+        .is_some();
+    if !staged {
+        return Ok(false);
+    }
+    remove_if_present(&temporary_path(location, id))?;
+    remove_if_present(location)?;
+    transaction
+        .execute("DELETE FROM attachments WHERE id=?1", [id])
+        .map_err(sql)?;
+    transaction.commit().map_err(sql)?;
+    Ok(true)
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -513,4 +552,61 @@ fn now() -> i64 {
 
 fn sql(error: rusqlite::Error) -> OcgError {
     crate::database::sql(&crate::database::path().unwrap_or_default(), error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::domain::DomainRepository;
+
+    /// A `staged` row abandoned long ago, its file written at `location`.
+    fn abandoned(directory: &Path) -> (Connection, String, PathBuf) {
+        let domain = DomainRepository::open(directory).expect("domain");
+        let project = domain.ensure_project(directory).expect("project");
+        let connection = crate::database::connect().expect("database");
+        let id = format!("att-{}", uuid::Uuid::now_v7());
+        let location = directory.join("png").join(format!("{id}.png"));
+        connection
+            .execute(
+                "INSERT INTO attachments(id,project_id,operation_key,original_name,extension,size,sha256,location,state,created_at) VALUES(?1,?2,?1,'image.png','png',5,'sha',?3,'staged',0)",
+                params![id, project.id, location.to_string_lossy()],
+            )
+            .expect("staged row");
+        write_file(&location, &id, b"bytes").expect("file");
+        (connection, id, location)
+    }
+
+    #[test]
+    fn cleanup_keeps_a_publication_that_became_available_after_selection() {
+        let directory = tempfile::tempdir().expect("temp");
+        let (mut connection, id, location) = abandoned(directory.path());
+        // The publisher completes after cleanup selected the row as staged.
+        connection
+            .execute(
+                "UPDATE attachments SET state='available' WHERE id=?1 AND state='staged'",
+                [&id],
+            )
+            .expect("publish");
+
+        assert!(!expire_one(&mut connection, &id, &location).expect("expire"));
+        assert!(location.exists(), "the published file is kept");
+        let state: String = connection
+            .query_row("SELECT state FROM attachments WHERE id=?1", [&id], |row| {
+                row.get(0)
+            })
+            .expect("row");
+        assert_eq!(state, "available");
+    }
+
+    #[test]
+    fn publisher_removes_its_file_when_its_row_was_expired() {
+        let directory = tempfile::tempdir().expect("temp");
+        let (mut connection, id, location) = abandoned(directory.path());
+        assert!(expire_one(&mut connection, &id, &location).expect("expire"));
+        // The publisher renames its bytes into place after cleanup ran.
+        write_file(&location, &id, b"bytes").expect("late file");
+
+        assert!(finish(&connection, &id, &location).is_err());
+        assert!(!location.exists(), "no file outlives its row");
+    }
 }
