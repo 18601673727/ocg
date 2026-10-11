@@ -486,3 +486,22 @@ impl Drop for ProjectRuntimeRegistry {
         let _ = self.shutdown();
     }
 }
+
+#[cfg(test)]
+impl ExecutionRuntimeHandle {
+    /// A handle over an isolated dispatcher, so a test controls which work is
+    /// queued and which execution actors hold leases.
+    pub(crate) fn for_dispatcher(
+        project_root: &Path,
+        provider_dispatcher: BoundedDispatcher,
+    ) -> Result<Self> {
+        Ok(Self {
+            project_root: project_root.to_path_buf(),
+            provider_dispatcher,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            owned: Arc::new(AtomicBool::new(true)),
+            governor: Governor::new(),
+            disk_guard: DiskGuard::for_root(project_root, DiskGuardConfig::default())?,
+        })
+    }
+}

@@ -578,3 +578,74 @@ impl BoundedDispatcher {
         self.capacity
     }
 }
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn envelope(attempt_id: &str) -> ExecutionEnvelope {
+        let (events, _) = flume::unbounded();
+        ExecutionEnvelope {
+            call_id: format!("call-{attempt_id}"),
+            job_id: format!("job-{attempt_id}"),
+            attempt_id: attempt_id.to_string(),
+            executor_id: None,
+            generation: 1,
+            payload: "{}".into(),
+            dispatch_id: None,
+            events,
+            provider_config: None,
+            cancelled: CallCancellation::new(),
+        }
+    }
+
+    #[test]
+    fn queued_work_and_live_lease_own_the_attempt_until_the_actor_returns() {
+        let dispatcher = BoundedDispatcher::new(2).expect("dispatcher");
+        dispatcher.send(envelope("attempt-a")).expect("queue");
+        assert!(dispatcher.owns_attempt("attempt-a").expect("owned"));
+
+        let (_, lease) = dispatcher
+            .recv_leased()
+            .expect("receive")
+            .expect("envelope");
+        assert!(dispatcher.is_empty().expect("empty"));
+        assert!(dispatcher
+            .owns_attempt("attempt-a")
+            .expect("owned while leased"));
+
+        drop(lease);
+        assert!(!dispatcher.owns_attempt("attempt-a").expect("released"));
+    }
+
+    #[test]
+    fn retained_cancellation_token_does_not_keep_an_attempt_owned() {
+        let dispatcher = BoundedDispatcher::new(2).expect("dispatcher");
+        let work = envelope("attempt-b");
+        // A Chat observer keeps its clone of the token after the actor is gone.
+        let observer_token = work.cancelled.clone();
+        dispatcher.send(work).expect("queue");
+        let (_, lease) = dispatcher
+            .recv_leased()
+            .expect("receive")
+            .expect("envelope");
+        drop(lease);
+
+        assert!(!observer_token.is_cancelled());
+        assert!(!dispatcher.owns_attempt("attempt-b").expect("not owned"));
+    }
+
+    #[test]
+    fn an_actor_that_unwinds_releases_its_lease() {
+        let dispatcher = BoundedDispatcher::new(2).expect("dispatcher");
+        dispatcher.send(envelope("attempt-c")).expect("queue");
+        let actor = dispatcher.clone();
+        let panicked = std::thread::spawn(move || {
+            let (_, _lease) = actor.recv_leased().expect("receive").expect("envelope");
+            panic!("executor failed while holding its Attempt");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(!dispatcher.owns_attempt("attempt-c").expect("released"));
+    }
+}

@@ -1933,3 +1933,140 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use crate::orchestration::domain::EffectIntentState;
+    use crate::orchestration::execution_dispatch::{CallCancellation, ExecutionEnvelope};
+
+    /// A native Call admitted to a fresh Attempt, with its envelope as the
+    /// dispatcher would deliver it.
+    struct Settlement {
+        root: tempfile::TempDir,
+        handler: NativeToolCallHandler,
+        envelope: ExecutionEnvelope,
+    }
+
+    impl Settlement {
+        fn new(name: &str, arguments: Value) -> Self {
+            let root = tempfile::tempdir().expect("Project");
+            let mut domain = DomainRepository::open(root.path()).expect("domain");
+            let project = domain.ensure_project(root.path()).expect("Project");
+            let job = domain
+                .create_job(&project.id, &json!({"objective": name}).to_string())
+                .expect("Job");
+            let (attempt, executor) = domain.dispatch_job(&job.id, "native").expect("Attempt");
+            let payload = json!({
+                "kind": "native_tool",
+                "tool_call_id": format!("tool-{name}"),
+                "name": name,
+                "arguments": arguments,
+            })
+            .to_string();
+            let call = domain
+                .create_call_with_effect(
+                    &attempt.id,
+                    Some(&executor.id),
+                    attempt.generation,
+                    EffectIntentKind::Idempotent,
+                    &payload,
+                )
+                .expect("Call");
+            domain
+                .mark_dispatch_queued(&call.id)
+                .expect("queued intent");
+            let (events, _) = flume::unbounded();
+            let envelope = ExecutionEnvelope {
+                call_id: call.id,
+                job_id: job.id,
+                attempt_id: attempt.id,
+                executor_id: Some(executor.id),
+                generation: attempt.generation,
+                payload,
+                dispatch_id: None,
+                events,
+                provider_config: None,
+                cancelled: CallCancellation::new(),
+            };
+            let handler = NativeToolCallHandler::new(
+                root.path().to_path_buf(),
+                PermissionPolicy::allow_all(),
+                Arc::new(AtomicBool::new(false)),
+            );
+            Self {
+                root,
+                handler,
+                envelope,
+            }
+        }
+
+        fn domain(&self) -> DomainRepository {
+            DomainRepository::open(self.root.path()).expect("domain")
+        }
+
+        fn call(&self) -> crate::orchestration::domain::Call {
+            self.domain().call(&self.envelope.call_id).expect("Call")
+        }
+
+        fn intent(&self) -> crate::orchestration::domain::DispatchIntent {
+            self.domain()
+                .dispatch_intent(&self.envelope.call_id)
+                .expect("intent read")
+                .expect("dispatch intent")
+        }
+    }
+
+    #[test]
+    fn confirmed_tool_failure_settles_the_call_as_failed() {
+        let settlement = Settlement::new("filesystem.read", json!({"path": "missing.txt"}));
+
+        let output = settlement
+            .handler
+            .execute_validated_sync(settlement.envelope.clone())
+            .expect("confirmed failure is a settled result");
+
+        assert_eq!(output["result"]["success"], false);
+        let call = settlement.call();
+        assert_eq!(call.state, "failed");
+        let intent = settlement.intent();
+        assert_eq!(intent.state, "failed");
+        assert_ne!(intent.effect_state, EffectIntentState::Unknown);
+    }
+
+    #[test]
+    fn uncertain_effect_fences_the_claimed_call_and_is_never_executed_again() {
+        let settlement = Settlement::new("filesystem.read", json!({"path": "notes.txt"}));
+        let claimed = settlement
+            .domain()
+            .claim_call(
+                &settlement.envelope.call_id,
+                &settlement.envelope.attempt_id,
+                settlement.envelope.generation,
+            )
+            .expect("claim");
+        assert!(claimed);
+        let failure = "native tool outcome is unknown: confined native tool helper failed";
+
+        settlement
+            .handler
+            .terminalize_error(&settlement.envelope, failure, true)
+            .expect("settle unknown outcome");
+
+        let call = settlement.call();
+        assert_eq!(call.state, "unknown");
+        assert_eq!(call.response.as_deref(), Some(failure));
+        let intent = settlement.intent();
+        assert_eq!(intent.state, "fenced");
+        assert_eq!(intent.effect_state, EffectIntentState::Unknown);
+        assert_eq!(intent.failure.as_deref(), Some(failure));
+
+        // A redelivery of the same envelope must not execute the tool again.
+        assert!(settlement
+            .handler
+            .execute_validated_sync(settlement.envelope.clone())
+            .is_err());
+        assert_eq!(settlement.call().state, "unknown");
+        assert_eq!(settlement.intent().state, "fenced");
+    }
+}
