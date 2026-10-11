@@ -1654,3 +1654,138 @@ fn chat_queue_supersede_cancel_and_empty_final_keep_one_consumer_progressing() {
     assert_no_residue(&domain);
     runtime.shutdown().expect("shutdown");
 }
+
+#[test]
+fn unrecoverable_unpublished_reservation_settles_on_restart_without_sending() {
+    use crate::orchestration::admission::{AdmissionPickup, AdmissionReservation};
+    use crate::orchestration::domain::{
+        AttemptState, ExecutionTarget, InputContent, InputPayload, InputReplay, JobInputDraft,
+        JobSpec,
+    };
+    use crate::orchestration::placement::ProviderChoice;
+
+    let upstream = ProviderStub::start();
+    let root = tempfile::tempdir().expect("project");
+    std::fs::create_dir(root.path().join(".ocg")).expect("marker");
+    let profile_path = root.path().join("profile.yaml");
+    let write_profile = |model: &str| {
+        let config = json!({"profile":{"origin":"new","defaultModel":model},"models":{"providers":{"local":{"placeholder":false,"label":"local","endpoint":upstream.endpoint}},"models":{model:{"placeholder":false,"provider":"local","id":"example"}}}});
+        std::fs::write(
+            &profile_path,
+            serde_yaml_ng::to_string(&config).expect("profile YAML"),
+        )
+        .expect("profile");
+    };
+    write_profile("local/example");
+    let service = || {
+        CanonicalControlService::open(root.path())
+            .expect("control")
+            .with_profile_service(crate::profile::ProfileService::with_workspace(
+                &profile_path,
+                root.path(),
+            ))
+    };
+    let mut domain = DomainRepository::open(root.path()).expect("domain");
+    let project = domain.ensure_project(root.path()).expect("Project");
+    service()
+        .register_project("register", root.path(), 0)
+        .expect("register Project");
+
+    // The crashed process committed an ordinary Job's Attempt together with
+    // its frozen Replaceable input, and stopped before publishing a Call.
+    let job = domain
+        .create_job(
+            &project.id,
+            JobSpec {
+                objective: Some("ordinary".into()),
+                ..JobSpec::default()
+            },
+        )
+        .expect("Job");
+    domain.set_job_eligible(&job.id).expect("eligible");
+    assert!(domain.mark_automatic_admission(&job.id).expect("mark"));
+    let (attempt, _, _) = domain
+        .dispatch_job_for_admission(
+            &job.id,
+            &AdmissionReservation {
+                choice: ProviderChoice {
+                    provider: "local".into(),
+                    model: "local/example".into(),
+                },
+                pickup: AdmissionPickup::Automatic,
+                exact: None,
+            },
+            None,
+            &JobInputDraft {
+                target: ExecutionTarget {
+                    provider_key: "local".into(),
+                    model_key: "local/example".into(),
+                    upstream_model_id: "example".into(),
+                    protocol: crate::provider_protocol::ProviderProtocol::default(),
+                    endpoint: upstream.endpoint.clone(),
+                    credential_ref: None,
+                },
+                effort: None,
+                payload: InputPayload::Agent,
+                replay: InputReplay::Replaceable,
+                content: InputContent::Messages(vec![json!({"role":"user","content":"ordinary"})]),
+            },
+        )
+        .expect("reserve");
+    let frozen = domain
+        .job_input(&job.id, attempt.generation)
+        .expect("input")
+        .expect("frozen");
+    assert_eq!(frozen.replay, InputReplay::Replaceable);
+    drop(domain);
+
+    // Before recovery the reserved Model leaves the Profile; another one,
+    // served by the same endpoint, takes its place.
+    write_profile("local/other");
+
+    let runtime = ExecutionRuntime::start(
+        root.path(),
+        8,
+        8,
+        1,
+        Arc::new(NativeHttp::new().expect("HTTP")),
+        PermissionPolicy::allow_all(),
+    )
+    .expect("execution runtime");
+    let service = service().with_runtime_handle(ExecutionRuntimeHandle::new(&runtime));
+    for _ in 0..2 {
+        let _ = service.admit_eligible_jobs();
+        service.reconcile_watchdog().expect("watchdog");
+    }
+
+    let domain = DomainRepository::open(root.path()).expect("domain");
+    let job = domain.job(&job.id).expect("Job").expect("exists");
+    assert_eq!(job.state, JobState::Failed, "{job:?}");
+    assert!(job.authoritative_attempt_id.is_none(), "{job:?}");
+    let reason = job.termination_reason.expect("termination reason");
+    assert_eq!(reason.code, "admission_interrupted", "{reason:?}");
+    assert!(
+        reason.message.contains("nothing was sent to the provider")
+            && reason.message.contains("model not found: local/example"),
+        "{reason:?}"
+    );
+    let attempts = domain.attempts_for_job(&job.id).expect("Attempts");
+    assert_eq!(attempts.len(), 1, "no target was substituted");
+    assert_eq!(attempts[0].state, AttemptState::Failed);
+    assert!(!attempts[0].authoritative);
+    assert!(domain.authority(&attempt.id).expect("authority").is_none());
+    assert!(domain
+        .calls_for_attempt(&attempt.id)
+        .expect("Calls")
+        .is_empty());
+    assert_eq!(
+        domain
+            .job_input(&job.id, attempt.generation)
+            .expect("input")
+            .expect("frozen input is kept"),
+        frozen
+    );
+    assert!(upstream.requests.is_empty(), "nothing reached a provider");
+    assert_no_residue(&domain);
+    runtime.shutdown().expect("shutdown");
+}

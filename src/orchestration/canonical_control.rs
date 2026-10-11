@@ -172,6 +172,17 @@ pub struct ProjectConfiguration {
     pub defaults: Value,
 }
 
+/// Why an Attempt whose admission stopped before its provider Call was
+/// published settled as failed: it can no longer be published as committed.
+fn unpublished_admission_failure(why: &str) -> Failure {
+    super::domain::job_failure(
+        "admission_interrupted",
+        FailureClass::Internal,
+        &format!("admission was interrupted before its provider Call was published; nothing was sent to the provider; {why}"),
+        true,
+    )
+}
+
 fn provider_concurrency(defaults: &Value) -> Result<usize> {
     match defaults.get("provider_concurrency") {
         None => Ok(1),
@@ -3051,6 +3062,25 @@ impl CanonicalControlService {
             Ok(resolved) => resolved,
             Err(refusal) => {
                 if let Some(job) = &existing_job {
+                    // A resumed reservation is refused only when its committed
+                    // target can no longer run. Nothing was published for it,
+                    // so it settles now instead of being refused on every pass.
+                    if let Some(attempt_id) = job
+                        .authoritative_attempt_id
+                        .as_deref()
+                        .filter(|_| job.state == super::domain::JobState::Running)
+                    {
+                        if domain
+                            .unpublished_admissions(&project.project_id)?
+                            .iter()
+                            .any(|(_, unpublished, _)| unpublished == attempt_id)
+                        {
+                            domain.fail_attempt(
+                                attempt_id,
+                                &unpublished_admission_failure(&refusal.message),
+                            )?;
+                        }
+                    }
                     domain.record_admission_failure(&job.id, &refusal.failure)?;
                     if refusal.profile_incompatible
                         && job.state == super::domain::JobState::Eligible
@@ -3237,28 +3267,20 @@ impl CanonicalControlService {
                 let frozen = domain
                     .job_input(&job.id, reserved.attempt.generation)?
                     .ok_or_else(|| invalid("resumed Attempt has no frozen execution input"))?;
-                let (request, protocol, config) = match self.frozen_input_replay(
-                    &domain,
-                    &job.project_id,
-                    &frozen,
-                ) {
-                    Ok(replay) => replay,
-                    Err(error) => {
-                        // Nothing was sent, and the frozen input can no
-                        // longer run as committed: settle it, never
-                        // substitute a target or a rebuilt request.
-                        domain.fail_attempt(
+                let (request, protocol, config) =
+                    match self.frozen_input_replay(&domain, &job.project_id, &frozen) {
+                        Ok(replay) => replay,
+                        Err(error) => {
+                            // Nothing was sent, and the frozen input can no
+                            // longer run as committed: settle it, never
+                            // substitute a target or a rebuilt request.
+                            domain.fail_attempt(
                                 &reserved.attempt.id,
-                                &super::domain::job_failure(
-                                    "admission_interrupted",
-                                    FailureClass::Internal,
-                                    &format!("admission was interrupted before its provider Call was published; nothing was sent to the provider; {error}"),
-                                    true,
-                                ),
+                                &unpublished_admission_failure(&error.to_string()),
                             )?;
-                        return Err(error);
-                    }
-                };
+                            return Err(error);
+                        }
+                    };
                 resolved.protocol = protocol;
                 resolved.config = config;
                 resolved.effort = request
