@@ -12,6 +12,8 @@ pub(crate) struct RemoteExecution {
     workspace: PathBuf,
     helper: PathBuf,
     runtime: Option<PathBuf>,
+    /// The confinement program that launches the helper.
+    program: PathBuf,
 }
 
 fn required(name: &str) -> Result<String> {
@@ -67,6 +69,7 @@ impl RemoteExecution {
             workspace,
             helper,
             runtime,
+            program: PathBuf::from("/usr/bin/bwrap"),
         }))
     }
 
@@ -265,6 +268,11 @@ impl RemoteExecution {
                 ],
             );
         }
+        // A confinement program that is absent was never launched, so no
+        // helper ran and the failure is definite.
+        if !self.program.is_file() {
+            return Err(OcgError::config("confinement program is unavailable"));
+        }
         // From here the helper may have started and acted. A failure it does
         // not report as a tool result leaves the tool's effect unknown, which
         // is what it is reported as: never a failure that proves no effect.
@@ -275,7 +283,7 @@ impl RemoteExecution {
             )))
         };
         let output = match crate::process::run_owned_input(
-            "/usr/bin/bwrap",
+            &self.program.to_string_lossy(),
             &arguments,
             root,
             crate::native_tools::TOOL_OUTPUT_CAP,
@@ -402,4 +410,141 @@ pub fn run_native_tool_helper() -> Result<()> {
     std::io::stdout()
         .write_all(&output)
         .map_err(|error| OcgError::io("write tool result", error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_tools::{PermissionPolicy, ToolError, ToolErrorKind, ToolResult};
+    use serde_json::json;
+
+    struct Helper {
+        _dir: tempfile::TempDir,
+        workspace: PathBuf,
+        root: PathBuf,
+    }
+
+    impl Helper {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("workspace");
+            let workspace = dir.path().canonicalize().expect("canonical workspace");
+            let root = workspace.join("project");
+            std::fs::create_dir_all(root.join(".ocg")).expect("Project state");
+            Self {
+                _dir: dir,
+                workspace,
+                root,
+            }
+        }
+
+        /// A stand-in for the confinement program: it consumes the tool input
+        /// it is given, then runs `script`.
+        fn execution(&self, script: &str) -> RemoteExecution {
+            let program = self._dir.path().join("stub-bwrap");
+            std::fs::write(&program, format!("#!/bin/sh\ncat > /dev/null\n{script}\n"))
+                .expect("stub program");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+                    .expect("executable stub");
+            }
+            self.with_program(program)
+        }
+
+        fn with_program(&self, program: PathBuf) -> RemoteExecution {
+            RemoteExecution {
+                operator_id: "operator".into(),
+                workspace: self.workspace.clone(),
+                helper: self.workspace.join("ocg-native-tool"),
+                runtime: None,
+                program,
+            }
+        }
+
+        fn run(&self, remote: &RemoteExecution) -> Result<ToolResult> {
+            remote.execute(
+                &self.root,
+                "filesystem.read",
+                &json!({"path": "notes.txt"}),
+                PermissionPolicy::allow_all(),
+                &|| false,
+            )
+        }
+    }
+
+    fn reported(result: &ToolResult) -> String {
+        serde_json::to_string(result).expect("tool result JSON")
+    }
+
+    #[test]
+    fn helper_that_exits_after_starting_leaves_its_effect_unknown() {
+        let helper = Helper::new();
+        let remote = helper.execution("exit 7");
+
+        let result = helper.run(&remote).expect("settled outcome");
+
+        assert!(!result.success);
+        let error = result.error.expect("unknown outcome");
+        assert_eq!(error.kind, ToolErrorKind::Indeterminate);
+        assert_eq!(error.message, "confined native tool helper failed");
+    }
+
+    #[test]
+    fn helper_output_that_is_not_a_tool_result_leaves_its_effect_unknown() {
+        let helper = Helper::new();
+        let remote = helper.execution("printf 'not a result'");
+
+        let error = helper
+            .run(&remote)
+            .expect("settled outcome")
+            .error
+            .expect("unknown outcome");
+
+        assert_eq!(error.kind, ToolErrorKind::Indeterminate);
+        assert_eq!(error.message, "invalid confined tool result");
+    }
+
+    #[test]
+    fn helper_reported_failure_is_a_confirmed_definite_failure() {
+        let helper = Helper::new();
+        let failure = ToolResult::failure(ToolError::new(
+            ToolErrorKind::ExecutionFailure,
+            "file is missing",
+        ));
+        let remote = helper.execution(&format!("printf '%s' '{}'", reported(&failure)));
+
+        let result = helper.run(&remote).expect("reported outcome");
+
+        assert!(!result.success);
+        let error = result.error.expect("confirmed failure");
+        assert_eq!(error.kind, ToolErrorKind::ExecutionFailure);
+        assert_eq!(error.message, "file is missing");
+    }
+
+    #[test]
+    fn helper_reported_success_is_a_confirmed_success() {
+        let helper = Helper::new();
+        let success = ToolResult::success(json!({"content": "hello"}));
+        let remote = helper.execution(&format!("printf '%s' '{}'", reported(&success)));
+
+        let result = helper.run(&remote).expect("reported outcome");
+
+        assert!(result.success);
+        assert_eq!(result.output["content"], "hello");
+    }
+
+    #[test]
+    fn helper_that_never_launches_is_not_reported_as_an_unknown_effect() {
+        let helper = Helper::new();
+        let remote = helper.with_program(helper._dir.path().join("missing-bwrap"));
+
+        // Nothing ran, so the outcome is definite: an Err, or a failure that is
+        // not Indeterminate.
+        if let Ok(result) = helper.run(&remote) {
+            assert!(!matches!(
+                result.error.map(|error| error.kind),
+                Some(ToolErrorKind::Indeterminate)
+            ));
+        }
+    }
 }
