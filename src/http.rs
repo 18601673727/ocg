@@ -483,6 +483,28 @@ impl NativeHttp {
         Self::with_policy(&ProxyPlan::default(), None)
     }
 
+    pub(crate) fn get_security_document(&self, url: &str) -> Result<Vec<u8>> {
+        if !url.starts_with("https://") || self.proxy_endpoint_for(url)?.is_some() {
+            return Err(OcgError::config("security documents require direct HTTPS"));
+        }
+        let runtime = ntex::rt::System::new("ocg-security-http", ntex::rt::DefaultRuntime);
+        let url = url.to_string();
+        let response = runtime.block_on(async move {
+            native_get_limited(
+                &url,
+                None,
+                256 * 1024,
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            )
+            .await
+        })?;
+        if !response.is_success() {
+            return Err(OcgError::config("security document unavailable"));
+        }
+        Ok(response.body)
+    }
+
     /// A client that uses exactly the resolved proxy plan and GitHub token.
     pub fn with_policy(proxy: &ProxyPlan, token: Option<GithubToken>) -> Result<Self> {
         let ops = proxy_builder_ops(proxy);
@@ -938,6 +960,23 @@ impl HttpTransport for NativeHttp {
 impl RateLimit {}
 
 async fn native_get(url: &str, token: Option<&GithubToken>) -> Result<HttpResponse> {
+    native_get_limited(
+        url,
+        token,
+        MAX_BODY_BYTES,
+        RESPONSE_HEAD_TIMEOUT,
+        RESPONSE_BODY_TIMEOUT,
+    )
+    .await
+}
+
+async fn native_get_limited(
+    url: &str,
+    token: Option<&GithubToken>,
+    max_bytes: u64,
+    head_timeout: Duration,
+    body_timeout: Duration,
+) -> Result<HttpResponse> {
     // `Client::new()` would inherit the library's payload limits, and
     // `response.body()` reads through the buffered payload reader that enforces
     // them: at the defaults a body is capped at 256 KiB and 10s, so every
@@ -945,9 +984,9 @@ async fn native_get(url: &str, token: Option<&GithubToken>) -> Result<HttpRespon
     // envelope is therefore declared here, where it is enforced, rather than
     // only compared after the fact.
     let client = ntex::client::ClientBuilder::new()
-        .response_timeout(RESPONSE_HEAD_TIMEOUT)
-        .response_payload_limit(MAX_BODY_BYTES as usize)
-        .response_payload_timeout(ntex::time::Millis::from(RESPONSE_BODY_TIMEOUT))
+        .response_timeout(head_timeout)
+        .response_payload_limit(max_bytes as usize)
+        .response_payload_timeout(ntex::time::Millis::from(body_timeout))
         .build(ntex::SharedCfg::default())
         .await
         .map_err(|error| {
@@ -981,14 +1020,14 @@ async fn native_get(url: &str, token: Option<&GithubToken>) -> Result<HttpRespon
     );
     let body = response.body().await.map_err(|error| {
         OcgError::config(format!(
-            "cannot read the response body from {url} (limit {MAX_BODY_BYTES} bytes): {error}"
+            "cannot read the response body from {url} (limit {max_bytes} bytes): {error}"
         ))
     })?;
     // The payload reader rejects an oversized body before this point; kept as a
     // cheap second gate so `MAX_BODY_BYTES` stays the single declared envelope.
-    if body.len() as u64 > MAX_BODY_BYTES {
+    if body.len() as u64 > max_bytes {
         return Err(OcgError::config(format!(
-            "response from {url} exceeded the {MAX_BODY_BYTES} byte limit"
+            "response from {url} exceeded the {max_bytes} byte limit"
         )));
     }
     Ok(HttpResponse {

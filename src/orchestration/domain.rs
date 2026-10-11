@@ -740,7 +740,7 @@ pub struct CanonicalAdmission {
 /// is current. Bump it whenever the bootstrap body gains work that existing
 /// stores must receive. Stores created before this gate report `0`, so their
 /// first open runs the full bootstrap once; every step in it is idempotent.
-const DOMAIN_SCHEMA_VERSION: i64 = 1;
+const DOMAIN_SCHEMA_VERSION: i64 = 2;
 
 const DOMAIN_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS domain_projects (
@@ -969,6 +969,9 @@ pub struct ChatMessageOrigin {
     pub job_id: String,
     pub attempt_state: String,
     pub failure_reason: Option<String>,
+    /// The termination message when the Core stopped this turn for a
+    /// recorded cause, which an operator's cancellation never carries.
+    pub cause_reason: Option<String>,
 }
 
 /// Displayable provider output received before its Call failed.
@@ -997,6 +1000,45 @@ pub struct ChatHistory {
 }
 
 impl DomainRepository {
+    pub(crate) fn write_read_snapshot(root: &Path, destination: &Path) -> Result<()> {
+        let database = crate::orchestration::state::state_dir(root).join("substrate.sqlite3");
+        let connection =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(|error| open_sql(root, error))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| open_sql(root, error))?;
+        connection
+            .execute(
+                "VACUUM main INTO ?1",
+                [destination.to_string_lossy().as_ref()],
+            )
+            .map_err(|error| open_sql(root, error))?;
+        Ok(())
+    }
+
+    pub(crate) fn open_read_only(root: &Path) -> Result<Self> {
+        let path = std::env::var_os("OCG_NATIVE_DOMAIN_SNAPSHOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                crate::orchestration::state::state_dir(root).join("substrate.sqlite3")
+            });
+        let connection =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| open_sql(root, error))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| open_sql(root, error))?;
+        if schema_generation(&connection).map_err(|error| open_sql(root, error))?
+            != DOMAIN_SCHEMA_VERSION
+        {
+            return Err(invalid(
+                "canonical store needs migration before confined reads",
+            ));
+        }
+        Ok(Self { connection, path })
+    }
+
     /// Open the durable store at a boundary without deciding what Project owns
     /// it.
     ///
@@ -1197,6 +1239,9 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             )
             .map_err(sql)?;
         ensure_column(connection, "domain_job_bindings", "attempt_id", "TEXT")?;
+        // The frozen logical request of a Chat turn admitted atomically with
+        // its reservation. Turns admitted before it existed keep NULL.
+        ensure_column(connection, "domain_chat_turns", "launch", "TEXT")?;
         connection.execute(
             "UPDATE domain_job_bindings SET attempt_id=(SELECT a.id FROM domain_attempts a WHERE a.job_id=domain_job_bindings.job_id ORDER BY a.generation DESC LIMIT 1) WHERE attempt_id IS NULL",
             [],
@@ -1323,7 +1368,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                   WHERE i.attempt_id=a.id AND i.failure IS NOT NULL
                     AND i.state IN ('failed','fenced')
                   ORDER BY CASE i.state WHEN 'failed' THEN 0 ELSE 1 END,
-                    i.updated_at DESC,i.created_at DESC,i.id DESC LIMIT 1)
+                    i.updated_at DESC,i.created_at DESC,i.id DESC LIMIT 1),
+                 j.termination_reason
                  FROM domain_messages m
              JOIN domain_chat_turns t ON t.attempt_id=m.attempt_id
              JOIN domain_conversations c ON c.id=t.conversation_id
@@ -1334,13 +1380,26 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             .map_err(sql)?;
         let rows = statement
             .query_map(params![project_id, session_id], |row| {
+                let termination = row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|raw| serde_json::from_str::<Failure>(&raw).ok());
                 Ok((
                     row.get::<_, String>(0)?,
                     ChatMessageOrigin {
                         command_id: row.get(1)?,
                         job_id: row.get(2)?,
                         attempt_state: row.get(3)?,
-                        failure_reason: row.get(4)?,
+                        // The current generation's DispatchIntent failure is the
+                        // most specific evidence. Without one (a failure before
+                        // any Call existed) the Job's committed termination
+                        // reason, which a retry clears, is the evidence.
+                        failure_reason: row
+                            .get::<_, Option<String>>(4)?
+                            .or_else(|| termination.as_ref().map(|reason| reason.message.clone())),
+                        cause_reason: termination
+                            .as_ref()
+                            .filter(|reason| CancelCause::recorded_in(reason).is_some())
+                            .map(|reason| reason.message.clone()),
                     },
                 ))
             })
@@ -1373,8 +1432,117 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         content: &str,
         images: &[crate::contracts::ChatImage],
     ) -> Result<Vec<serde_json::Value>> {
-        validate_id(&request.session_id)?;
         let transaction = self.begin()?;
+        let history = prepare_chat_turn_in(
+            &transaction,
+            request,
+            request_hash,
+            attempt,
+            content,
+            images,
+        )?;
+        let history = resolve_chat_history_in(&transaction, &request.project_id, &history)?;
+        transaction.commit().map_err(sql)?;
+        Ok(history)
+    }
+
+    /// The frozen logical request of the Chat turn this Job executes, if it was
+    /// admitted with one. Turns admitted before frozen requests existed have none.
+    pub(crate) fn chat_launch_for_job(&self, job_id: &str) -> Result<Option<ChatLaunch>> {
+        let raw: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT launch FROM domain_chat_turns WHERE job_id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        raw.flatten()
+            .map(|raw| {
+                serde_json::from_str::<ChatLaunch>(&raw)
+                    .map_err(|error| invalid(&format!("invalid frozen Chat request: {error}")))
+            })
+            .transpose()
+            .and_then(|launch| match launch {
+                Some(launch) if launch.version != CHAT_LAUNCH_VERSION => Err(invalid(&format!(
+                    "unsupported frozen Chat request version {}",
+                    launch.version
+                ))),
+                launch => Ok(launch),
+            })
+    }
+
+    /// The wire messages of a frozen Chat request, with each image reference
+    /// resolved from the Project's own image store. A reference that no longer
+    /// resolves fails rather than being dropped.
+    pub(crate) fn resolve_chat_launch_messages(
+        &self,
+        project_id: &str,
+        launch: &ChatLaunch,
+    ) -> Result<Vec<serde_json::Value>> {
+        let transaction = self.begin()?;
+        let history = resolve_chat_history_in(&transaction, project_id, &launch.messages)?;
+        transaction.commit().map_err(sql)?;
+        Ok(history)
+    }
+}
+
+/// Version of the [`ChatLaunch`] representation stored on a Chat turn.
+const CHAT_LAUNCH_VERSION: u32 = 1;
+
+/// The non-secret execution target a Chat turn was admitted against.
+///
+/// The credential is named by its Vault reference only; its value is never
+/// part of the frozen request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChatLaunchTarget {
+    pub provider_key: String,
+    pub model_key: String,
+    pub upstream_model_id: String,
+    pub protocol: crate::provider_protocol::ProviderProtocol,
+    pub endpoint: String,
+    pub credential_ref: Option<String>,
+}
+
+/// The frozen logical request of a Chat turn: exactly what was asked, at the
+/// turn boundary, as admission committed it.
+///
+/// `messages` are the wire messages of the original request. Image parts are
+/// stored as references to the Project's image store (`{"type":"ocg_image",
+/// "image": ChatImage}`), never as image bytes, and are resolved when the
+/// request is sent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ChatLaunch {
+    pub version: u32,
+    pub target: ChatLaunchTarget,
+    pub effort: Option<String>,
+    pub messages: Vec<serde_json::Value>,
+}
+
+/// What a Chat launch commits in the same transaction as its reservation.
+pub(crate) struct ChatTurnDraft<'a> {
+    pub request: &'a crate::contracts::JobLaunchRequest,
+    pub request_hash: &'a str,
+    pub content: &'a str,
+    pub images: &'a [crate::contracts::ChatImage],
+    pub target: ChatLaunchTarget,
+    pub effort: Option<String>,
+}
+
+/// Stage a Chat turn inside `transaction`: the Conversation, the turn and its
+/// user and assistant Messages. Returns the request history at this turn
+/// boundary with image parts as references.
+fn prepare_chat_turn_in(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &crate::contracts::JobLaunchRequest,
+    request_hash: &str,
+    attempt: &Attempt,
+    content: &str,
+    images: &[crate::contracts::ChatImage],
+) -> Result<Vec<serde_json::Value>> {
+    {
+        validate_id(&request.session_id)?;
         let owns_project: bool = transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM domain_jobs WHERE id=?1 AND project_id=?2)",
@@ -1466,15 +1634,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         }
         // Only complete canonical messages enter history. The current staged
         // user is included explicitly, before the immutable Call is admitted.
-        let root: String = transaction
-            .query_row(
-                "SELECT root FROM domain_projects WHERE id=?1",
-                [&request.project_id],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
         let mut history = Vec::new();
-        for message in read_conversation_messages(&transaction, conversation.id.as_str())? {
+        for message in read_conversation_messages(transaction, conversation.id.as_str())? {
             if message.state != MessageLifecycle::Complete && message.id != user.id {
                 continue;
             }
@@ -1498,12 +1659,7 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
                         .ok_or_else(|| invalid("image block has no image"))?,
                 )
                 .map_err(|error| invalid(&error.to_string()))?;
-                let url = crate::chat_images::upstream_url(
-                    std::path::Path::new(&root),
-                    &request.project_id,
-                    &image,
-                )?;
-                parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+                parts.push(serde_json::json!({"type": "ocg_image", "image": image}));
             }
             let content = if parts.len() == 1 {
                 serde_json::Value::String(content)
@@ -1516,11 +1672,57 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             }
             history.push(wire);
         }
-        bump_conversation(&transaction, conversation.id.as_str())?;
-        transaction.commit().map_err(sql)?;
+        bump_conversation(transaction, conversation.id.as_str())?;
         Ok(history)
     }
+}
 
+/// Resolve the image references in frozen-form request history to the wire
+/// form the provider receives. A reference that does not resolve fails.
+fn resolve_chat_history_in(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    history: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>> {
+    let root: String = transaction
+        .query_row(
+            "SELECT root FROM domain_projects WHERE id=?1",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    history
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            if let Some(parts) = message
+                .get_mut("content")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for part in parts.iter_mut() {
+                    if part.get("type").and_then(serde_json::Value::as_str) != Some("ocg_image") {
+                        continue;
+                    }
+                    let image: crate::contracts::ChatImage = serde_json::from_value(
+                        part.get("image")
+                            .cloned()
+                            .ok_or_else(|| invalid("image reference has no image"))?,
+                    )
+                    .map_err(|error| invalid(&error.to_string()))?;
+                    let url = crate::chat_images::upstream_url(
+                        std::path::Path::new(&root),
+                        project_id,
+                        &image,
+                    )?;
+                    *part = serde_json::json!({"type": "image_url", "image_url": {"url": url}});
+                }
+            }
+            Ok(message)
+        })
+        .collect()
+}
+
+impl DomainRepository {
     pub(crate) fn first_chat_project(&self, attempt_id: &str) -> Result<Option<Project>> {
         let transaction = self.begin()?;
         // A replacement Attempt may own the original turn's Job. Later user
@@ -4080,7 +4282,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         job_id: &str,
         executor_kind: &str,
     ) -> Result<(Attempt, Executor)> {
-        self.dispatch_job_inner(job_id, executor_kind, None, None)
+        self.dispatch_job_inner(job_id, executor_kind, None, None, None)
+            .map(|(attempt, executor, _)| (attempt, executor))
     }
 
     /// Record the final Governor acquisition for the Attempt that attempted it.
@@ -4142,13 +4345,18 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
     /// `placement` is present only when the reservation still required candidate
     /// selection. An exact target passes `None`: the Attempt is still claimed
     /// by this function, but Placement capacity is not reserved for it.
+    /// Reserve a Job for admission. With a Chat `draft`, the turn, its
+    /// Messages and its frozen logical request commit in the same transaction
+    /// as the Attempt, so no Chat Attempt ever exists without its Chat
+    /// identity; the returned history is the first request's messages.
     pub(crate) fn dispatch_job_for_admission(
         &mut self,
         job_id: &str,
         reservation: &super::admission::AdmissionReservation,
         placement: Option<AdmissionPlacement<'_>>,
-    ) -> Result<(Attempt, Executor)> {
-        self.dispatch_job_inner(job_id, "provider", Some(reservation), placement)
+        chat: Option<&ChatTurnDraft<'_>>,
+    ) -> Result<(Attempt, Executor, Option<Vec<serde_json::Value>>)> {
+        self.dispatch_job_inner(job_id, "provider", Some(reservation), placement, chat)
     }
 
     fn dispatch_job_inner(
@@ -4157,7 +4365,8 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         executor_kind: &str,
         reservation: Option<&super::admission::AdmissionReservation>,
         placement: Option<AdmissionPlacement<'_>>,
-    ) -> Result<(Attempt, Executor)> {
+        chat: Option<&ChatTurnDraft<'_>>,
+    ) -> Result<(Attempt, Executor, Option<Vec<serde_json::Value>>)> {
         validate_id(executor_kind)?;
         let transaction = self
             .connection
@@ -4225,8 +4434,44 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
             &executor,
             Some(root),
         )?;
+        let history = match chat {
+            Some(draft) => {
+                let history = prepare_chat_turn_in(
+                    &transaction,
+                    draft.request,
+                    draft.request_hash,
+                    &attempt,
+                    draft.content,
+                    draft.images,
+                )?;
+                let launch = ChatLaunch {
+                    version: CHAT_LAUNCH_VERSION,
+                    target: draft.target.clone(),
+                    effort: draft.effort.clone(),
+                    messages: history,
+                };
+                transaction
+                    .execute(
+                        "UPDATE domain_chat_turns SET launch=?2 WHERE attempt_id=?1",
+                        params![
+                            attempt.id,
+                            serde_json::to_string(&launch)
+                                .map_err(|error| invalid(&error.to_string()))?
+                        ],
+                    )
+                    .map_err(sql)?;
+                // The first request is resolved from the frozen form itself, so
+                // it and any later replay of this turn are one request.
+                Some(resolve_chat_history_in(
+                    &transaction,
+                    &draft.request.project_id,
+                    &launch.messages,
+                )?)
+            }
+            None => None,
+        };
         transaction.commit().map_err(sql)?;
-        Ok((attempt, executor))
+        Ok((attempt, executor, history))
     }
 
     /// Fence the current Attempt and publish a new generation for the same
@@ -5276,9 +5521,93 @@ CREATE INDEX IF NOT EXISTS domain_watchdog_by_job
         transaction.commit().map_err(sql)
     }
 
+    /// Settle a still-authoritative Attempt whose external effect may or may
+    /// not have happened as `unknown`, recording why.
+    pub(crate) fn settle_attempt_unknown(
+        &mut self,
+        attempt_id: &str,
+        failure: &Failure,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        finish_attempt_with_reason_in(&transaction, attempt_id, "unknown", false, Some(failure))?;
+        transaction.commit().map_err(sql)
+    }
+
     pub fn confirm_cancel(&mut self, attempt_id: &str, stopped: bool) -> Result<()> {
+        self.confirm_cancel_with_cause(attempt_id, stopped, None)
+    }
+
+    /// Confirm a requested cancellation, recording the Core's `cause` when it
+    /// initiated the stop. The terminal state is the same either way.
+    pub(crate) fn confirm_cancel_with_cause(
+        &mut self,
+        attempt_id: &str,
+        stopped: bool,
+        cause: Option<CancelCause>,
+    ) -> Result<()> {
         let terminal = if stopped { "cancelled" } else { "unknown" };
-        self.set_attempt_terminal_or_cancelling(attempt_id, terminal, true)
+        let mut reason = cancel_reason(terminal, true);
+        if let (Some(reason), Some(cause)) = (reason.as_mut(), cause) {
+            reason.message = format!("{}; {}", cause.summary(), reason.message);
+            reason.details = Some(serde_json::json!({ "cause": cause.code() }));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        finish_attempt_with_reason_in(&transaction, attempt_id, terminal, true, reason.as_ref())?;
+        transaction.commit().map_err(sql)
+    }
+
+    /// The Attempt of a Chat turn whose admission was interrupted after the
+    /// turn was persisted but before its provider Call was published.
+    ///
+    /// Only the frozen request on that Call carries the turn's Conversation
+    /// context, so such an Attempt has nothing to resume from. With no Call
+    /// and no DispatchIntent, nothing was sent to a provider.
+    pub(crate) fn unpublished_chat_admission(&self, job_id: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT a.id FROM domain_jobs j
+                 JOIN domain_chat_turns t ON t.job_id=j.id
+                 JOIN domain_attempts a ON a.id=j.authoritative_attempt_id AND a.generation=j.generation
+                 WHERE j.id=?1 AND j.state='running' AND j.automatic_admission=1
+                   AND NOT EXISTS(SELECT 1 FROM domain_calls c WHERE c.attempt_id=a.id)
+                   AND NOT EXISTS(SELECT 1 FROM domain_dispatch_intents i WHERE i.attempt_id=a.id)",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql)
+    }
+
+    /// Chat-root Jobs whose current Attempt was created at or before `cutoff`
+    /// and is still queued or running.
+    ///
+    /// The deadline is anchored on the durable Attempt, not on any transport,
+    /// so it holds with no stream attached and for an Attempt that restart
+    /// recovery re-dispatched. A Chat retry mints a new Attempt and so a new
+    /// deadline. A Job already cancelling is left to that cancellation.
+    pub(crate) fn chat_execution_deadline_due(&self, cutoff: i64) -> Result<Vec<(String, u64)>> {
+        query_all(
+            &self.connection,
+            "SELECT j.id,j.generation FROM domain_chat_turns t
+             JOIN domain_jobs j ON j.id=t.job_id
+             JOIN domain_attempts a ON a.id=j.authoritative_attempt_id AND a.generation=j.generation
+             WHERE j.depth=0 AND j.state='running' AND a.state IN ('queued','running') AND a.created_at<=?1
+             ORDER BY a.created_at,j.id",
+            &[&cutoff],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    u64::try_from(row.get::<_, i64>(1)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                ))
+            },
+        )
     }
 
     pub fn mark_orphaned(&mut self, attempt_id: &str) -> Result<()> {
@@ -7814,7 +8143,18 @@ fn finish_attempt_in(
     state: &str,
     require_cancelling: bool,
 ) -> Result<()> {
-    let reason = match state {
+    finish_attempt_with_reason_in(
+        transaction,
+        attempt_id,
+        state,
+        require_cancelling,
+        cancel_reason(state, require_cancelling).as_ref(),
+    )
+}
+
+/// The termination reason a cancellation lifecycle records for `state`.
+fn cancel_reason(state: &str, require_cancelling: bool) -> Option<Failure> {
+    match state {
         "cancelled" => Some(job_failure(
             "job_cancelled",
             FailureClass::Cancelled,
@@ -7834,14 +8174,39 @@ fn finish_attempt_in(
             true,
         )),
         _ => None,
-    };
-    finish_attempt_with_reason_in(
-        transaction,
-        attempt_id,
-        state,
-        require_cancelling,
-        reason.as_ref(),
-    )
+    }
+}
+
+/// Why the Core itself, rather than an operator, cancelled an execution.
+///
+/// The cause never changes the terminal state, which still records whether
+/// the stop was confirmed (`cancelled`) or not (`unknown`). It rides the
+/// termination reason's details, so a Core-initiated stop is never presented
+/// as an operator's cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelCause {
+    /// A Chat turn outlived its execution deadline.
+    ChatExecutionTimeout,
+}
+
+impl CancelCause {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ChatExecutionTimeout => "chat_execution_timeout",
+        }
+    }
+
+    pub(crate) fn summary(self) -> &'static str {
+        match self {
+            Self::ChatExecutionTimeout => "Chat execution exceeded its deadline",
+        }
+    }
+
+    /// The cause a committed termination reason records, if any.
+    pub(crate) fn recorded_in(reason: &Failure) -> Option<Self> {
+        let code = reason.details.as_ref()?.get("cause")?.as_str()?;
+        (code == Self::ChatExecutionTimeout.code()).then_some(Self::ChatExecutionTimeout)
+    }
 }
 
 pub(crate) fn job_failure(

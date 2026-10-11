@@ -334,6 +334,40 @@ pub struct BoundedDispatcher {
     sender: Arc<Mutex<Option<flume::Sender<ExecutionEnvelope>>>>,
     receiver: flume::Receiver<ExecutionEnvelope>,
     cancellations: Arc<Mutex<HashMap<String, Vec<Weak<CancellationInner>>>>>,
+    ownership: Arc<Mutex<HashMap<String, AttemptOwnership>>>,
+}
+
+/// What this runtime holds of one Attempt's execution: envelopes waiting in
+/// the queue, and execution actors working on dequeued ones.
+#[derive(Debug, Default)]
+struct AttemptOwnership {
+    queued: usize,
+    active: usize,
+}
+
+/// One execution actor's hold on an Attempt, from the moment a worker takes
+/// its envelope off the queue until the actor finishes, fails or unwinds.
+/// Ownership is exactly the set of live leases and queued envelopes: nothing
+/// else, a cancellation token or an observer of the execution included, can
+/// keep an Attempt owned.
+pub struct ExecutionLease {
+    ownership: Arc<Mutex<HashMap<String, AttemptOwnership>>>,
+    attempt_id: String,
+}
+
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        let mut ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(held) = ownership.get_mut(&self.attempt_id) {
+            held.active = held.active.saturating_sub(1);
+            if held.queued == 0 && held.active == 0 {
+                ownership.remove(&self.attempt_id);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for BoundedDispatcher {
@@ -351,6 +385,7 @@ impl Clone for BoundedDispatcher {
             sender: self.sender.clone(),
             receiver: self.receiver.clone(),
             cancellations: self.cancellations.clone(),
+            ownership: self.ownership.clone(),
         }
     }
 }
@@ -366,6 +401,7 @@ impl BoundedDispatcher {
             sender: Arc::new(Mutex::new(Some(sender))),
             receiver,
             cancellations: Arc::new(Mutex::new(HashMap::new())),
+            ownership: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -391,9 +427,46 @@ impl BoundedDispatcher {
                 .or_default()
                 .push(Arc::downgrade(&value.cancelled.inner));
         }
-        sender
-            .send(value)
-            .map_err(|_| invalid("dispatcher is closed"))
+        let attempt_id = value.attempt_id.clone();
+        self.ownership
+            .lock()
+            .map_err(|_| invalid("dispatcher ownership lock poisoned"))?
+            .entry(attempt_id.clone())
+            .or_default()
+            .queued += 1;
+        sender.send(value).map_err(|_| {
+            self.dequeued(&attempt_id);
+            invalid("dispatcher is closed")
+        })
+    }
+
+    /// An envelope left the queue.
+    fn dequeued(&self, attempt_id: &str) {
+        let mut ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(held) = ownership.get_mut(attempt_id) {
+            held.queued = held.queued.saturating_sub(1);
+            if held.queued == 0 && held.active == 0 {
+                ownership.remove(attempt_id);
+            }
+        }
+    }
+
+    /// Move a dequeued envelope's Attempt to an active execution actor.
+    fn lease(&self, envelope: &ExecutionEnvelope) -> ExecutionLease {
+        let mut ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let held = ownership.entry(envelope.attempt_id.clone()).or_default();
+        held.queued = held.queued.saturating_sub(1);
+        held.active += 1;
+        ExecutionLease {
+            ownership: self.ownership.clone(),
+            attempt_id: envelope.attempt_id.clone(),
+        }
     }
 
     pub fn cancel_attempt(&self, attempt_id: &str) -> Result<bool> {
@@ -410,33 +483,33 @@ impl BoundedDispatcher {
         Ok(signalled)
     }
 
-    /// Whether this runtime still holds a live cancellation token for the Attempt.
+    /// Whether this runtime still owns the Attempt's execution: an envelope
+    /// of it is queued, or an execution actor holds its lease.
     ///
-    /// A live token is the provider worker's ownership of a queued or running
-    /// Call. It is not a heartbeat and it is not execution progress: the worker
-    /// may be blocked on an HTTP read whose deadline is the transport timeout.
-    /// Absence means this process no longer owns the Call, which is the only
-    /// fact a reconciler may treat as disappearance.
+    /// This is not a heartbeat and not execution progress: an actor may be
+    /// blocked on an HTTP read whose deadline is the transport timeout. It is
+    /// also independent of every cancellation token and observer, which may
+    /// outlive the actor. Absence means this process no longer executes the
+    /// Attempt, which is the only fact a reconciler may treat as
+    /// disappearance.
     pub fn owns_attempt(&self, attempt_id: &str) -> Result<bool> {
-        let mut cancellations = self
-            .cancellations
+        Ok(self
+            .ownership
             .lock()
-            .map_err(|_| invalid("dispatcher cancellation lock poisoned"))?;
-        let Some(tokens) = cancellations.get_mut(attempt_id) else {
-            return Ok(false);
-        };
-        tokens.retain(|token| token.strong_count() > 0);
-        let owned = !tokens.is_empty();
-        if !owned {
-            cancellations.remove(attempt_id);
-        }
-        Ok(owned)
+            .map_err(|_| invalid("dispatcher ownership lock poisoned"))?
+            .get(attempt_id)
+            .is_some_and(|held| held.queued > 0 || held.active > 0))
     }
 
-    /// Blocking consumer operation intended for a synchronous execution lane.
-    pub fn recv(&self) -> Result<Option<ExecutionEnvelope>> {
+    /// Blocking consumer operation for a synchronous execution lane: take
+    /// the next envelope and become its execution actor until the
+    /// returned lease is dropped.
+    pub fn recv_leased(&self) -> Result<Option<(ExecutionEnvelope, ExecutionLease)>> {
         match self.receiver.recv() {
-            Ok(value) => Ok(Some(value)),
+            Ok(value) => {
+                let lease = self.lease(&value);
+                Ok(Some((value, lease)))
+            }
             Err(_) => Ok(None),
         }
     }
@@ -444,16 +517,25 @@ impl BoundedDispatcher {
     /// Async consumer operation for a dispatcher owned by an async execution
     /// runtime. The channel remains bounded; only the receive operation changes
     /// how the worker waits for the next envelope.
-    pub async fn recv_async(&self) -> Result<Option<ExecutionEnvelope>> {
+    pub async fn recv_async(&self) -> Result<Option<(ExecutionEnvelope, ExecutionLease)>> {
         match self.receiver.recv_async().await {
-            Ok(value) => Ok(Some(value)),
+            Ok(value) => {
+                let lease = self.lease(&value);
+                Ok(Some((value, lease)))
+            }
             Err(_) => Ok(None),
         }
     }
 
-    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Option<ExecutionEnvelope>> {
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<(ExecutionEnvelope, ExecutionLease)>> {
         match self.receiver.recv_timeout(timeout) {
-            Ok(value) => Ok(Some(value)),
+            Ok(value) => {
+                let lease = self.lease(&value);
+                Ok(Some((value, lease)))
+            }
             Err(flume::RecvTimeoutError::Timeout | flume::RecvTimeoutError::Disconnected) => {
                 Ok(None)
             }
@@ -494,5 +576,76 @@ impl BoundedDispatcher {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn envelope(attempt_id: &str) -> ExecutionEnvelope {
+        let (events, _) = flume::unbounded();
+        ExecutionEnvelope {
+            call_id: format!("call-{attempt_id}"),
+            job_id: format!("job-{attempt_id}"),
+            attempt_id: attempt_id.to_string(),
+            executor_id: None,
+            generation: 1,
+            payload: "{}".into(),
+            dispatch_id: None,
+            events,
+            provider_config: None,
+            cancelled: CallCancellation::new(),
+        }
+    }
+
+    #[test]
+    fn queued_work_and_live_lease_own_the_attempt_until_the_actor_returns() {
+        let dispatcher = BoundedDispatcher::new(2).expect("dispatcher");
+        dispatcher.send(envelope("attempt-a")).expect("queue");
+        assert!(dispatcher.owns_attempt("attempt-a").expect("owned"));
+
+        let (_, lease) = dispatcher
+            .recv_leased()
+            .expect("receive")
+            .expect("envelope");
+        assert!(dispatcher.is_empty().expect("empty"));
+        assert!(dispatcher
+            .owns_attempt("attempt-a")
+            .expect("owned while leased"));
+
+        drop(lease);
+        assert!(!dispatcher.owns_attempt("attempt-a").expect("released"));
+    }
+
+    #[test]
+    fn retained_cancellation_token_does_not_keep_an_attempt_owned() {
+        let dispatcher = BoundedDispatcher::new(2).expect("dispatcher");
+        let work = envelope("attempt-b");
+        // A Chat observer keeps its clone of the token after the actor is gone.
+        let observer_token = work.cancelled.clone();
+        dispatcher.send(work).expect("queue");
+        let (_, lease) = dispatcher
+            .recv_leased()
+            .expect("receive")
+            .expect("envelope");
+        drop(lease);
+
+        assert!(!observer_token.is_cancelled());
+        assert!(!dispatcher.owns_attempt("attempt-b").expect("not owned"));
+    }
+
+    #[test]
+    fn an_actor_that_unwinds_releases_its_lease() {
+        let dispatcher = BoundedDispatcher::new(2).expect("dispatcher");
+        dispatcher.send(envelope("attempt-c")).expect("queue");
+        let actor = dispatcher.clone();
+        let panicked = std::thread::spawn(move || {
+            let (_, _lease) = actor.recv_leased().expect("receive").expect("envelope");
+            panic!("executor failed while holding its Attempt");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(!dispatcher.owns_attempt("attempt-c").expect("released"));
     }
 }

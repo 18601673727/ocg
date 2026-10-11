@@ -467,6 +467,7 @@ pub(crate) fn reserve(
     context: &mut AdmissionContext<'_>,
     job: &Job,
     resolved: &ResolvedTarget,
+    chat: Option<&super::domain::ChatTurnDraft<'_>>,
 ) -> Result<std::result::Result<ReservedExecution, AdmissionRefusal>> {
     if resolved.reservation.pickup == AdmissionPickup::Explicit
         && resolved.reservation.exact.is_none()
@@ -482,6 +483,7 @@ pub(crate) fn reserve(
             attempt: reserved.attempt,
             executor: reserved.executor,
             existing_call: !calls.is_empty(),
+            chat_history: None,
         }));
     }
     let quota = placement::quota(
@@ -505,9 +507,9 @@ pub(crate) fn reserve(
     };
     match context
         .domain
-        .dispatch_job_for_admission(&job.id, &resolved.reservation, placement)
+        .dispatch_job_for_admission(&job.id, &resolved.reservation, placement, chat)
     {
-        Ok((attempt, executor)) => {
+        Ok((attempt, executor, chat_history)) => {
             let mode = match &resolved.reservation.exact {
                 Some(exact) => super::placement_projection::PlacementMode::Exact {
                     provider: exact.provider.clone(),
@@ -530,6 +532,7 @@ pub(crate) fn reserve(
                 attempt,
                 executor,
                 existing_call: false,
+                chat_history,
             }))
         }
         Err(error) => Ok(Err(AdmissionRefusal {
@@ -666,6 +669,9 @@ pub(crate) struct ReservedExecution {
     /// True when this Attempt already owns a Call. The origin must not prepare
     /// another payload; [`publish_call`] resumes the existing one.
     pub existing_call: bool,
+    /// For a Chat reservation, the first request's messages, resolved from the
+    /// frozen request committed with the reservation.
+    pub chat_history: Option<Vec<serde_json::Value>>,
 }
 
 pub(crate) struct AdmittedExecution {
@@ -691,5 +697,6 @@ fn resume_reserved(domain: &DomainRepository, job: &Job) -> Result<ReservedExecu
         attempt,
         executor,
         existing_call: false,
+        chat_history: None,
     })
 }

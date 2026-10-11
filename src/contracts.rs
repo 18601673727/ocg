@@ -47,6 +47,35 @@ pub use crate::provider_protocol::ProviderProtocol;
 /// version bump is a compile-time mismatch rather than a runtime surprise.
 pub const PROFILE_API_VERSION: &str = PROVIDER_PROFILE_API_VERSION;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticationMode {
+    Local,
+    CloudflareAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct AuthenticationSession {
+    pub mode: AuthenticationMode,
+    pub user_id: Option<String>,
+    pub expires_at: Option<i64>,
+    pub remote_execution: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectOwnershipRequest {
+    pub project_id: String,
+    pub issuer: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ProjectOwnershipResponse {
+    pub project_id: String,
+    pub user_id: String,
+}
+
 /// The error envelope every failing control route returns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ApiErrorBody {
@@ -632,6 +661,9 @@ fn config(out_dir: &Path) -> Config {
 /// transitive dependencies, so a new field of a new type can never produce a
 /// file that references a type it does not declare.
 fn export_roots(cfg: &Config) -> Result<(), ts_rs::ExportError> {
+    AuthenticationSession::export_all(cfg)?;
+    ProjectOwnershipRequest::export_all(cfg)?;
+    ProjectOwnershipResponse::export_all(cfg)?;
     ApiErrorEnvelope::export_all(cfg)?;
     CanonicalProjectsResponse::export_all(cfg)?;
     CanonicalConfigurationEnvelope::export_all(cfg)?;

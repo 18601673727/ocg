@@ -519,6 +519,8 @@ fn native_cache(
 }
 
 fn reconcile_command(root: &Path, _args: &[OsString], pretty: bool) -> Result<i32, Failure> {
+    // Recovery acts only while this process owns the Project's execution.
+    let _ownership = crate::orchestration::execution_runtime::ProjectOwnership::acquire(root)?;
     let mut repository = crate::orchestration::domain::DomainRepository::open(root)?;
     repository.recover_startup()?;
     print_json(&repository.reconcile_dispatches()?, pretty).map(|_| 0)
@@ -646,6 +648,25 @@ fn work_command(
                     .find_map(|word| word.strip_prefix(&prefix).map(str::to_string))
             })
     };
+    // Operators that claim, settle or recover execution authority act only
+    // while this process owns the Project's execution; read-only ones never
+    // take it. The ownership is held until the command returns.
+    let _ownership = matches!(
+        subcommand.as_str(),
+        "admit"
+            | "create"
+            | "spawn"
+            | "plan"
+            | "child"
+            | "dispatch"
+            | "replace"
+            | "finish"
+            | "deliver"
+            | "recover"
+            | "reconcile"
+    )
+    .then(|| crate::orchestration::execution_runtime::ProjectOwnership::acquire(root))
+    .transpose()?;
     let mut repository = crate::orchestration::domain::DomainRepository::open(root)?;
     let project = repository.ensure_project(root)?;
     let required = |name: &str| -> Result<String, Failure> {

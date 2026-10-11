@@ -268,6 +268,34 @@ fn fence_disappeared(
             attempt_id: attempt_id.to_string(),
         });
     }
+    if domain.chat_session_for_job(&observation.job.id)?.is_some() {
+        // A Chat turn runs again only through Chat retry, which replays its
+        // frozen request with the Conversation's context; Placement would
+        // rebuild it from the objective alone. Its effect may already have
+        // left this process, so the Attempt settles as unknown, not failed,
+        // and the Job waits for that explicit retry.
+        if let Some(call_id) = call_id {
+            if let Err(error) =
+                domain.fence_dispatch_intent(call_id, "watchdog_executor_disappeared")
+            {
+                tracing::debug!(%error, call_id, "watchdog fence found the Call already settled");
+            }
+        }
+        match domain.settle_attempt_unknown(
+            attempt_id,
+            &failure(
+                "watchdog_executor_disappeared",
+                "Provider executor disappeared during this Chat turn; whether its effect completed is unknown. Retry the turn to run it again",
+            ),
+        ) {
+            Ok(()) => {}
+            Err(error) if authority_moved(&error) => {}
+            Err(error) => return Err(error),
+        }
+        return Ok(WatchdogRecovery::Fenced {
+            attempt_id: attempt_id.to_string(),
+        });
+    }
     // Candidate work may be placed again, but only by admission. Fencing this
     // generation and clearing the authority pointer returns the Job to
     // eligibility. The admission worker is the only component that runs
@@ -286,7 +314,9 @@ fn fence_disappeared(
 
 fn authority_moved(error: &OcgError) -> bool {
     let message = error.to_string();
-    message.contains("authority changed") || message.contains("already terminal")
+    message.contains("authority changed")
+        || message.contains("already terminal")
+        || message.contains("no longer authoritative")
 }
 
 fn failure(code: &str, message: &str) -> Failure {
@@ -450,5 +480,195 @@ fn outcome_of(recovery: &WatchdogRecovery) -> String {
         WatchdogRecovery::Readmitted { .. } => "readmitted".to_string(),
         WatchdogRecovery::CancelConfirmed { stopped: true, .. } => "cancel_stopped".to_string(),
         WatchdogRecovery::CancelConfirmed { stopped: false, .. } => "cancel_unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::domain::{Call, DomainRepository, EffectIntentKind};
+    use crate::orchestration::execution_dispatch::{
+        BoundedDispatcher, CallCancellation, ExecutionEnvelope,
+    };
+    use crate::orchestration::execution_runtime::ExecutionRuntimeHandle;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    /// One Job with its only provider Call admitted, and that Call's envelope
+    /// held by the test until it chooses to queue it.
+    struct Fixture {
+        _root: TempDir,
+        domain: DomainRepository,
+        dispatcher: BoundedDispatcher,
+        handle: ExecutionRuntimeHandle,
+        envelope: ExecutionEnvelope,
+        job_id: String,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("Project");
+            let mut domain = DomainRepository::open(root.path()).expect("domain");
+            let project = domain.ensure_project(root.path()).expect("Project");
+            let job = domain
+                .create_job(&project.id, &json!({"objective": "watchdog"}).to_string())
+                .expect("Job");
+            let (attempt, executor) = domain.dispatch_job(&job.id, "provider").expect("Attempt");
+            let payload = json!({
+                "executor_transport": "provider",
+                "arguments": {"model": "example", "messages": [{"role": "user", "content": "watchdog"}]}
+            })
+            .to_string();
+            let call = domain
+                .create_call_with_effect(
+                    &attempt.id,
+                    Some(&executor.id),
+                    attempt.generation,
+                    EffectIntentKind::StrictFenced,
+                    &payload,
+                )
+                .expect("Call");
+            domain
+                .mark_dispatch_queued(&call.id)
+                .expect("queued intent");
+            let dispatcher = BoundedDispatcher::new(4).expect("dispatcher");
+            let handle = ExecutionRuntimeHandle::for_dispatcher(root.path(), dispatcher.clone())
+                .expect("handle");
+            let (events, _) = flume::unbounded();
+            let envelope = ExecutionEnvelope {
+                call_id: call.id,
+                job_id: job.id.clone(),
+                attempt_id: attempt.id,
+                executor_id: Some(executor.id),
+                generation: attempt.generation,
+                payload,
+                dispatch_id: None,
+                events,
+                provider_config: None,
+                cancelled: CallCancellation::new(),
+            };
+            Self {
+                _root: root,
+                domain,
+                dispatcher,
+                handle,
+                envelope,
+                job_id: job.id,
+            }
+        }
+
+        fn call(&self) -> Call {
+            self.domain.call(&self.envelope.call_id).expect("Call read")
+        }
+
+        fn attempt_authoritative(&self) -> bool {
+            self.domain
+                .attempt(&self.envelope.attempt_id)
+                .expect("Attempt read")
+                .expect("Attempt")
+                .authoritative
+        }
+
+        /// The Call's claim, which is the point at which its effect may start.
+        fn claim(&mut self) {
+            assert!(self
+                .domain
+                .claim_call(
+                    &self.envelope.call_id,
+                    &self.envelope.attempt_id,
+                    self.envelope.generation,
+                )
+                .expect("claim"));
+        }
+
+        fn reconcile(&mut self) -> (WatchdogClass, WatchdogRecovery) {
+            let results =
+                reconcile_repository(&mut self.domain, Some(&self.handle)).expect("watchdog pass");
+            results
+                .into_iter()
+                .find(|(finding, _)| finding.job_id == self.job_id)
+                .map(|(finding, recovery)| (finding.class, recovery))
+                .expect("Job observed")
+        }
+    }
+
+    #[test]
+    fn queued_work_is_owned_and_never_fenced() {
+        let mut fixture = Fixture::new();
+        fixture
+            .dispatcher
+            .send(fixture.envelope.clone())
+            .expect("queue work");
+
+        let (class, recovery) = fixture.reconcile();
+
+        assert!(matches!(class, WatchdogClass::Alive { .. }));
+        assert!(matches!(recovery, WatchdogRecovery::None));
+        assert!(fixture.attempt_authoritative());
+        assert_eq!(fixture.call().state, "created");
+    }
+
+    #[test]
+    fn a_live_execution_actor_keeps_a_started_effect_alive() {
+        let mut fixture = Fixture::new();
+        fixture.claim();
+        fixture
+            .dispatcher
+            .send(fixture.envelope.clone())
+            .expect("queue work");
+        let (_envelope, lease) = fixture
+            .dispatcher
+            .recv_leased()
+            .expect("receive")
+            .expect("envelope");
+
+        let (class, recovery) = fixture.reconcile();
+
+        assert!(matches!(class, WatchdogClass::Alive { .. }));
+        assert!(matches!(recovery, WatchdogRecovery::None));
+        assert!(fixture.attempt_authoritative());
+        assert_eq!(fixture.call().state, "running");
+        drop(lease);
+    }
+
+    #[test]
+    fn a_retained_token_does_not_keep_an_abandoned_started_effect_owned() {
+        let mut fixture = Fixture::new();
+        fixture.claim();
+        // A Chat observer keeps its clone of the Call's token after its actor is gone.
+        let observer = fixture.envelope.cancelled.clone();
+        fixture
+            .dispatcher
+            .send(fixture.envelope.clone())
+            .expect("queue work");
+        let (_envelope, lease) = fixture
+            .dispatcher
+            .recv_leased()
+            .expect("receive")
+            .expect("envelope");
+        drop(lease);
+
+        let (class, recovery) = fixture.reconcile();
+
+        assert!(matches!(class, WatchdogClass::Disappeared { .. }));
+        assert!(!matches!(recovery, WatchdogRecovery::None));
+        assert!(!fixture.attempt_authoritative());
+        assert_eq!(fixture.call().state, "unknown");
+        assert!(!observer.is_cancelled());
+    }
+
+    #[test]
+    fn unowned_admission_work_is_left_to_admission() {
+        let mut fixture = Fixture::new();
+
+        let (class, recovery) = fixture.reconcile();
+
+        assert!(!matches!(
+            class,
+            WatchdogClass::Alive { .. } | WatchdogClass::Disappeared { .. }
+        ));
+        assert!(matches!(recovery, WatchdogRecovery::None));
+        assert!(fixture.attempt_authoritative());
+        assert_eq!(fixture.call().state, "created");
     }
 }

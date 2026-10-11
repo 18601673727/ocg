@@ -1271,6 +1271,26 @@ fn with_store<T>(
     cancelled: &dyn Fn() -> bool,
     action: impl FnOnce(&mut Connection, bool) -> VResult<T>,
 ) -> VResult<T> {
+    if crate::remote_execution::native_confined() {
+        active(cancelled)?;
+        let path = if root.path().join(".ocg/index").symlink_metadata().is_ok() {
+            Some(
+                root.resolve_for_create(".ocg/index/validation-evidence.sqlite3")
+                    .map_err(|error| error.message)?,
+            )
+        } else {
+            None
+        };
+        let mut connection = if let Some(path) = path.filter(|path| path.exists()) {
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?
+        } else {
+            let connection = Connection::open_in_memory()?;
+            connection.execute_batch("CREATE TABLE evidence(call_id TEXT PRIMARY KEY,finished INTEGER NOT NULL,body TEXT NOT NULL);")?;
+            connection
+        };
+        connection.busy_timeout(Duration::from_millis(100))?;
+        return action(&mut connection, false);
+    }
     for directory in [".ocg", ".ocg/index"] {
         let path = root
             .resolve_for_create(directory)
@@ -1477,9 +1497,13 @@ pub(super) fn query(
 ) -> ToolResult {
     let started = Instant::now();
     let query = || -> VResult<ToolResult> {
-        let project = DomainRepository::open_existing(root.path())?
-            .project_at_root(root.path())?
-            .ok_or("Project missing")?;
+        let project = if crate::remote_execution::native_confined() {
+            DomainRepository::open_read_only(root.path())?
+        } else {
+            DomainRepository::open_existing(root.path())?
+        }
+        .project_at_root(root.path())?
+        .ok_or("Project missing")?;
         let source_started = Instant::now();
         let current = snapshot(root, cancelled)?;
         let source_revision_ms = source_started.elapsed().as_millis();

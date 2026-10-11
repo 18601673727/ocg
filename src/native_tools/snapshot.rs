@@ -384,7 +384,11 @@ pub(super) fn query(
     let started = Instant::now();
     let query = || -> SnapshotResult<ToolResult> {
         active(cancelled)?;
-        let domain = DomainRepository::open_existing(root.path())?;
+        let domain = if crate::remote_execution::native_confined() {
+            DomainRepository::open_read_only(root.path())?
+        } else {
+            DomainRepository::open_existing(root.path())?
+        };
         let project = domain
             .project_at_root(root.path())?
             .ok_or("Project missing")?;

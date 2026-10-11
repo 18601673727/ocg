@@ -11,6 +11,8 @@
  */
 
 export type {
+  AuthenticationMode,
+  AuthenticationSession,
   ChatSendRequest,
   ChatImage,
   ChatImageUploadRequest,
@@ -136,3 +138,5 @@ export type {
 
 export type { UsageQuantity, UsageTokenTotals, UsageCurrencyCost, UsageCost, ContextCostTotals, UsageTotals, UsageBreakdown, UsageConversationRow, ProjectUsageResponse, ConversationUsageResponse, JobUsageResponse, UsageCompleteness, UsageWindow, UsageCostSource } from "./generated";
 export { decodeProjectUsageResponse, decodeConversationUsageResponse, decodeJobUsageResponse } from "./usage-decode";
+
+export { decodeAuthenticationSession } from "./authentication-decode";

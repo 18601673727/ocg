@@ -19,6 +19,7 @@ import {
 } from "@/components/ocg/primitives";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
+import { useRemoteLogout } from "../login/access-boundary";
 
 type OcgTopbarProps = {
   session?: ChatSession;
@@ -48,6 +49,7 @@ export function OcgTopbar({
   syncStatus,
 }: OcgTopbarProps) {
   const { t } = useI18n();
+  const logout = useRemoteLogout();
   const fallbackProjectName = t("topbar.workspace");
   const displayProjectName = projectName ?? fallbackProjectName;
   // Degraded sync states are the only ones the bar surfaces; the visual comes
@@ -127,6 +129,7 @@ export function OcgTopbar({
           </Button>
         </>
       )}
+      {logout && <Button variant="ghost" size="sm" onClick={() => { void logout(); }}>Sign out</Button>}
       {onOpenSettings && <Button
         variant={activeView === "settings" ? "secondary" : "ghost"}
         size="icon-xs"
