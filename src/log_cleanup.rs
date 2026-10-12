@@ -378,6 +378,7 @@ fn execute(
             summary: Some(parameters.to_string()),
             code: None,
             goal_reached: None,
+            value: None,
         },
     ))
     .map_err(|source| CleanupError::Persistence {
@@ -420,6 +421,7 @@ fn execute(
                 && !summary.scan_interrupted
                 && summary.additional_candidates_remain == Some(false),
         ),
+        value: None,
     };
     wait(
         shared
@@ -718,7 +720,7 @@ mod tests {
             name: "__CORE__".into(),
             executor_type: ExecutorType::System,
             concurrency_limit: NonZeroU32::new(1).expect("nonzero concurrency"),
-            serves: Vec::new(),
+            llm_transports: Default::default(),
         }))
         .expect("create core executor");
         let input = wait(database.save_job_input(None, JobInputDraft::default())).expect("save owner input");

@@ -28,9 +28,10 @@ pub struct ExecutionPlan {
     /// An existing durable Executor record. This is never registered as part
     /// of executing a plan, so repeated plans do not grow the executor table.
     /// When `job.configuration` names an LLM Profile, the Job is refused
-    /// unless this Executor is registered to serve exactly that Profile; see
-    /// [`DatabaseHandle::compatible_executors`]. Choosing among compatible
-    /// Executors is the caller's decision.
+    /// unless this is an Llm Executor supporting the transport of the
+    /// configuration frozen for it; see [`DatabaseHandle::compatible_executors`].
+    /// Choosing among compatible Executors is the caller's decision, and the
+    /// choice never changes the frozen Provider, model or parameters.
     pub executor_id: ExecutorId,
     pub input: JobInputDraft,
     pub job: NewJob,

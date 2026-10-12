@@ -3,10 +3,10 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, TransportError};
+use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::storage::{
-    AgentRow, Batch, BatchError, ExecutorRow, HealthCheckRow, JobInputRow, JobRow, MarkerSubjects,
-    ProfileLinks, ProfileRow, dependency_state,
+    AgentRow, AvailabilityStatRow, Batch, BatchError, ExecutorRow, JobInputRow, JobRow,
+    MarkerSubjects, MetricsRow, ProfileLinks, ProfileRow, dependency_state,
 };
 
 /// Microseconds since the Unix epoch, as recorded by the database worker.
@@ -65,7 +65,8 @@ record_id_type!(ProjectId, "project");
 record_id_type!(ProfileId, "profile");
 record_id_type!(AgentId, "agent");
 record_id_type!(LlmProviderId, "llm_provider");
-record_id_type!(HealthCheckId, "health_check");
+record_id_type!(MetricsId, "metrics");
+record_id_type!(AvailabilityStatId, "availability_stat");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecordRef {
@@ -77,7 +78,8 @@ pub enum RecordRef {
     Profile(ProfileId),
     Agent(AgentId),
     LlmProvider(LlmProviderId),
-    HealthCheck(HealthCheckId),
+    Metrics(MetricsId),
+    AvailabilityStat(AvailabilityStatId),
 }
 
 impl fmt::Display for RecordRef {
@@ -91,7 +93,8 @@ impl fmt::Display for RecordRef {
             Self::Profile(id) => id.fmt(f),
             Self::Agent(id) => id.fmt(f),
             Self::LlmProvider(id) => id.fmt(f),
-            Self::HealthCheck(id) => id.fmt(f),
+            Self::Metrics(id) => id.fmt(f),
+            Self::AvailabilityStat(id) => id.fmt(f),
         }
     }
 }
@@ -182,20 +185,21 @@ pub struct NewJob {
     /// Present for an LLM execution child; absent for orchestrating or
     /// system work.
     pub configuration: Option<ExecutionConfiguration>,
-    /// Must be able to serve `configuration`'s LLM Profile when one is given.
+    /// When `configuration` is given, must be an Llm Executor supporting the
+    /// transport of the LLM configuration frozen for it.
     pub assigned_executor: Option<ExecutorId>,
     pub previous: Option<JobId>,
     pub replaces: Option<JobId>,
 }
 
 /// The configuration an LLM execution child Job is submitted with. Both
-/// references are fixed at submission, and `llm_profile` must be one of
-/// `agent_profile`'s configured LLM targets. The effective model, Provider,
-/// parameters and declared capabilities are read from these immutable
-/// Profiles, never copied into the Job.
+/// references are fixed at submission. Work that runs an LLM directly, such
+/// as a fixed capability check, names no Agent Profile; when one is named,
+/// `llm_profile` must be one of its configured LLM targets. The values the
+/// Job executes with are frozen into its input at submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionConfiguration {
-    pub agent_profile: ProfileId,
+    pub agent_profile: Option<ProfileId>,
     pub llm_profile: ProfileId,
 }
 
@@ -229,12 +233,16 @@ pub struct JobRetry {
     pub assigned_executor: Option<ExecutorId>,
 }
 
+/// `value` carries a machine-readable payload, such as the conclusion of a
+/// capability check. It is published as given and never changes the Job's
+/// outcome.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewJobOutput {
     pub kind: IntermediateOutputKind,
     pub summary: Option<String>,
     pub code: Option<String>,
     pub goal_reached: Option<bool>,
+    pub value: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -242,6 +250,7 @@ pub struct FinalResult {
     pub summary: Option<String>,
     pub code: Option<String>,
     pub goal_reached: Option<bool>,
+    pub value: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -281,9 +290,9 @@ pub struct NewExecutor {
     pub name: String,
     pub executor_type: ExecutorType,
     pub concurrency_limit: NonZeroU32,
-    /// The LLM Profiles this Executor can serve, fixed at registration. Only
-    /// an `ExecutorType::Llm` Executor may serve any.
-    pub serves: Vec<ProfileId>,
+    /// The LLM transports this Executor's adapter implements, fixed at
+    /// registration. Only an `ExecutorType::Llm` Executor may name any.
+    pub llm_transports: BTreeSet<LlmTransport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -306,6 +315,9 @@ pub struct JobRecord {
     pub failed_at: Option<Timestamp>,
     pub cancelled_at: Option<Timestamp>,
     pub unknown_at: Option<Timestamp>,
+    /// When the trusted execution path confirmed that an unknown-outcome
+    /// Job's execution has actually stopped. The outcome stays unknown.
+    pub stop_confirmed_at: Option<Timestamp>,
     pub next_due_at: Option<Timestamp>,
     pub next_iteration_no: Option<i64>,
     pub iteration_no: Option<i64>,
@@ -316,7 +328,7 @@ pub struct JobRecord {
     /// The Genesis Job is its own parent; every other Job has a different one.
     pub parent: JobId,
     pub projects: Vec<ProjectId>,
-    /// Assembled from APPLIES_PROFILE and RUNS_LLM_PROFILE.
+    /// Assembled from RUNS_LLM_PROFILE and, when present, APPLIES_PROFILE.
     pub configuration: Option<ExecutionConfiguration>,
     pub assigned_executor: Option<ExecutorId>,
     pub previous: Option<JobId>,
@@ -342,15 +354,6 @@ pub struct JobInputRecord {
     pub configuration: Option<FrozenExecutionConfig>,
 }
 
-/// An LLM Profile an Executor is registered to serve, with that Profile's
-/// configuration as it was at registration. A later edit of the Profile does
-/// not extend the registration to the new configuration.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ServedConfiguration {
-    pub profile: ProfileId,
-    pub configuration: FrozenLlmConfig,
-}
-
 /// A stored Executor.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutorRecord {
@@ -362,8 +365,7 @@ pub struct ExecutorRecord {
     pub latest_disabled_at: Option<Timestamp>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    /// Assembled from SERVES, in Profile ID order.
-    pub serves: Vec<ServedConfiguration>,
+    pub llm_transports: BTreeSet<LlmTransport>,
 }
 
 /// A published output. Outputs have no update path, so they carry no
@@ -377,6 +379,7 @@ pub struct JobOutputRecord {
     pub summary: Option<String>,
     pub code: Option<String>,
     pub goal_reached: Option<bool>,
+    pub value: Option<serde_json::Value>,
     pub created_at: Timestamp,
 }
 
@@ -395,9 +398,20 @@ pub struct ProjectRecord {
     pub created_at: Timestamp,
 }
 
+/// The wire protocol an LLM request is sent with. Each variant is an adapter
+/// OCG implements; a Provider states which one it speaks, and an Executor
+/// which ones it can run. Compatibility is never inferred from a model name
+/// or an endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LlmTransport {
+    /// [`crate::openai_compatible`] Chat Completions.
+    OpenAiChatCompletions,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewLlmProvider {
     pub name: String,
+    pub transport: LlmTransport,
     pub endpoint: Option<String>,
     /// The name of a stored credential, never the secret itself.
     pub credential_ref: Option<String>,
@@ -407,12 +421,13 @@ pub struct NewLlmProvider {
 pub struct LlmProviderRecord {
     pub id: LlmProviderId,
     pub name: String,
+    pub transport: LlmTransport,
     pub endpoint: Option<String>,
     pub credential_ref: Option<String>,
     pub created_at: Timestamp,
 }
 
-/// A capability a user declares for a model, or that a HealthCheck verifies.
+/// A capability a user declares for a model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModelCapability {
     Chat,
@@ -437,7 +452,8 @@ pub struct LlmParameters {
 pub struct LlmConfig {
     pub model: String,
     pub parameters: LlmParameters,
-    /// What the user states the model supports. HealthChecks never change it.
+    /// What the user states the model supports. Observed capability check
+    /// results never change it.
     pub declared_capabilities: BTreeSet<ModelCapability>,
 }
 
@@ -495,8 +511,8 @@ pub struct NewProfile {
 }
 
 /// A stored Profile of either kind, as currently configured. It can be
-/// edited while no unfinished Job uses it; submitted Jobs and HealthChecks
-/// keep their own frozen copies of what they used.
+/// edited while no submitted execution holds it; submitted Jobs keep their
+/// own frozen copies of what they used.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileRecord {
     pub id: ProfileId,
@@ -511,8 +527,9 @@ pub struct ProfileRecord {
 }
 
 /// Whether a Profile can be edited now. Every Job submitted with the
-/// Profile that has no completed, failed or cancelled outcome holds it,
-/// queued, paused and unknown-outcome Jobs included.
+/// Profile holds it until the Job is completed, failed or cancelled, or, for
+/// an unknown outcome, until its execution is confirmed stopped. Queued,
+/// started and paused Jobs hold it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileEditability {
     /// The holding Jobs in ID order, at most 1,000 of them.
@@ -604,6 +621,7 @@ impl<C: ProfileVariant> TryFrom<ProfileRecord> for Profile<C> {
 pub struct ProviderSnapshot {
     pub id: LlmProviderId,
     pub name: String,
+    pub transport: LlmTransport,
     pub endpoint: Option<String>,
     pub credential_ref: Option<String>,
 }
@@ -617,10 +635,11 @@ pub struct FrozenLlmConfig {
 }
 
 /// What a submitted LLM execution child was configured to execute, frozen
-/// in its JobInput when it was submitted.
+/// in its JobInput when it was submitted. `agent` is absent for work
+/// submitted without an Agent Profile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrozenExecutionConfig {
-    pub agent: AgentConfig,
+    pub agent: Option<AgentConfig>,
     pub llm: FrozenLlmConfig,
 }
 
@@ -629,7 +648,7 @@ pub struct FrozenExecutionConfig {
 /// it executes. Later Profile edits change neither.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmittedConfiguration {
-    pub agent_profile: ProfileId,
+    pub agent_profile: Option<ProfileId>,
     pub llm_profile: ProfileId,
     pub frozen: FrozenExecutionConfig,
 }
@@ -651,54 +670,194 @@ pub struct AgentRecord {
     pub created_at: Timestamp,
 }
 
-/// What a HealthCheck observed. A failure keeps the transport's own error,
-/// so a network, authentication, timeout or rate-limit failure is never
-/// recorded as a missing capability.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HealthCheckOutcome {
-    Passed,
-    Failed(TransportError),
-}
-
-/// Times measured by the checker. Unmeasured durations stay `None`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HealthCheckTiming {
-    pub started_at: Timestamp,
-    pub finished_at: Timestamp,
+/// Measurements of one request. Every measurement is optional: one that was
+/// not measured or reported stays `None` and is never stored as zero.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Measurements {
     pub ttfb_ms: Option<u64>,
     pub reasoning_ttft_ms: Option<u64>,
     pub output_ttft_ms: Option<u64>,
     pub request_finished_in_ms: Option<u64>,
+    pub usage: NormalizedUsage,
 }
 
-/// One verification of one capability of an LLM Profile. It is a fact of its
-/// own: recording it never changes the Profile's declared capabilities.
+impl Measurements {
+    fn is_empty(&self) -> bool {
+        let usage = &self.usage;
+        [self.ttfb_ms, self.reasoning_ttft_ms, self.output_ttft_ms, self.request_finished_in_ms].iter().all(Option::is_none)
+            && [usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens]
+                .iter()
+                .all(Option::is_none)
+            && usage.raw.is_none()
+    }
+}
+
+/// Measurements taken for a Job, such as one of its LLM requests. Any Job
+/// may be measured; one that runs no LLM has no LLM identity. Recording
+/// them never changes the Job, and a Job may have any number of them.
 #[derive(Clone, Debug, PartialEq)]
-pub struct NewHealthCheck {
-    /// The configuration that was actually checked, captured when the check
-    /// started, for example with `DatabaseHandle::current_llm_configuration`.
-    pub checked: FrozenLlmConfig,
-    pub capability: ModelCapability,
-    pub outcome: HealthCheckOutcome,
-    /// Unreported counters stay `None`; they are never stored as zero.
-    pub usage: NormalizedUsage,
-    pub finish_reason: Option<ChatFinishReason>,
-    pub timing: HealthCheckTiming,
+pub struct NewMetrics {
+    pub job: JobId,
+    /// When the measured activity happened, as its producer reports it.
+    /// Observation queries filter and order by this time.
+    pub observed_at: Timestamp,
+    pub measurements: Measurements,
+}
+
+/// The LLM a Job ran, as its submission froze it: the LLM Profile as
+/// provenance and the configuration the Job actually used. Later Profile
+/// edits change neither.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LlmTarget {
+    pub llm_profile: ProfileId,
+    pub frozen: FrozenLlmConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct HealthCheckRecord {
-    pub id: HealthCheckId,
-    /// Assembled from CHECKS. Provenance only: the Profile may have been
-    /// edited since, so `checked` says what was verified.
-    pub profile: ProfileId,
-    pub checked: FrozenLlmConfig,
-    pub capability: ModelCapability,
-    pub outcome: HealthCheckOutcome,
-    pub usage: NormalizedUsage,
-    pub finish_reason: Option<ChatFinishReason>,
-    pub timing: HealthCheckTiming,
+pub struct MetricsRecord {
+    pub id: MetricsId,
+    /// Assembled from MEASURES.
+    pub job: JobId,
+    /// Read from the Job's frozen input; `None` for a Job without an LLM.
+    pub target: Option<LlmTarget>,
+    /// The producer's time, see [`NewMetrics::observed_at`].
+    pub observed_at: Timestamp,
+    pub measurements: Measurements,
+    /// The wall-clock time at which the database's write transaction that
+    /// stored the record began, not when its commit completed. Wall-clock
+    /// time is not monotonic. It is never used in place of `observed_at`.
     pub recorded_at: Timestamp,
+}
+
+/// The facts observed about one request that was sent to an LLM Provider.
+/// A request refused locally before it was sent has no observation. These
+/// are raw facts: nothing here classifies the request as available or not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AvailabilityObservation {
+    /// The HTTP status the Provider answered with, when one was seen.
+    pub status_code: Option<u16>,
+    /// How the response ended, when it reported a finish reason.
+    pub finish_reason: Option<ChatFinishReason>,
+    pub raw_finish_reason: Option<String>,
+    /// The Provider or transport failure as the transport reported it. It
+    /// may accompany a response that had already begun.
+    pub failure: Option<ProviderFailure>,
+}
+
+impl AvailabilityObservation {
+    fn is_empty(&self) -> bool {
+        self.status_code.is_none() && self.finish_reason.is_none() && self.raw_finish_reason.is_none() && self.failure.is_none()
+    }
+}
+
+/// One availability observation of an LLM request made by a Job. The LLM it
+/// concerns is the one the Job froze at submission, never a caller-supplied
+/// target. The Job's outcome is neither consulted nor changed, so an
+/// observation may be recorded, and stays, whatever the Job's outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewAvailabilityStat {
+    pub job: JobId,
+    /// When the request was observed, as its producer reports it.
+    /// Observation queries filter and order by this time.
+    pub observed_at: Timestamp,
+    pub observation: AvailabilityObservation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AvailabilityStatRecord {
+    pub id: AvailabilityStatId,
+    /// Assembled from OBSERVES.
+    pub job: JobId,
+    /// Read from the Job's frozen input.
+    pub target: LlmTarget,
+    /// The producer's time, see [`NewAvailabilityStat::observed_at`].
+    pub observed_at: Timestamp,
+    pub observation: AvailabilityObservation,
+    /// The wall-clock time at which the database's write transaction that
+    /// stored the record began, not when its commit completed. Wall-clock
+    /// time is not monotonic. It is never used in place of `observed_at`.
+    pub recorded_at: Timestamp,
+}
+
+/// A half-open time range, `from` included and `until` excluded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeRange {
+    pub from: Timestamp,
+    pub until: Timestamp,
+}
+
+/// Selects Metrics or AvailabilityStats. Each `Some` field must match; a
+/// record without an LLM matches only when every LLM field is `None`.
+/// Provider and model are compared with the target its Job froze, never with
+/// the current contents of any Profile, so records from before a Profile
+/// edit stay selectable by what they actually ran. Choosing records this way
+/// decides nothing about grouping, current validity or availability.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservationFilter {
+    /// Compared with the producer's observation time; the time a record was
+    /// committed cannot be filtered on.
+    pub observed: TimeRange,
+    pub llm_profile: Option<ProfileId>,
+    pub provider: Option<LlmProviderId>,
+    /// Compared exactly with the frozen model name.
+    pub model: Option<String>,
+}
+
+/// A position in observation order, which is `observed_at` and then record
+/// ID, so records with equal times keep a stable order. A page continues
+/// strictly after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservationCursor<I> {
+    pub observed_at: Timestamp,
+    pub record: I,
+}
+
+/// One page of an observation query. `next` is `None` once nothing in the
+/// filter's time range remains after this page. A page may be empty while
+/// `next` is set: the bounded scan behind it found no match, and the query
+/// continues from `next`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObservationPage<T, I> {
+    pub records: Vec<T>,
+    pub next: Option<ObservationCursor<I>>,
+}
+
+/// Selects historical (Provider, model) choices: the frozen targets of LLM
+/// Metrics and AvailabilityStats observed within `observed`, which is
+/// compared with the producer's observation time like
+/// [`ObservationFilter::observed`]. A configured model nothing observed has
+/// no choice here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedModelFilter {
+    pub observed: TimeRange,
+    pub provider: Option<LlmProviderId>,
+}
+
+/// A Provider and an exact, case-sensitive model name that observations
+/// were recorded against, as their Jobs froze them. Choices are ordered by
+/// Provider ID and then by the model name's UTF-8 bytes, and a choice is
+/// also the cursor that continues strictly after it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObservedModel {
+    pub provider: LlmProviderId,
+    pub model: String,
+}
+
+/// Which records within the time range a choice comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedModelChoice {
+    pub model: ObservedModel,
+    pub has_metrics: bool,
+    pub has_availability_stats: bool,
+}
+
+/// One page of choices. `next` is `None` once no later pair exists; a page
+/// may be empty while `next` is set, when every pair it examined had no
+/// record within the time range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedModelPage {
+    pub choices: Vec<ObservedModelChoice>,
+    pub next: Option<ObservedModel>,
 }
 
 /// Identifies one submitted command. `epoch` is allocated durably each time
@@ -747,7 +906,9 @@ pub enum OperationKind {
     CreateProfile,
     UpdateProfile,
     CreateAgent,
-    RecordHealthCheck,
+    ConfirmJobStopped,
+    RecordMetrics,
+    RecordAvailabilityStat,
 }
 
 /// Written in the same transaction as every accepted mutation, so its
@@ -760,6 +921,9 @@ pub struct OperationMarker {
     pub subject: RecordRef,
     /// The record the command created, when it created one.
     pub created: Option<RecordRef>,
+    /// The wall-clock time at which the command's write transaction began,
+    /// not when its commit completed; the same value as the timestamps the
+    /// command wrote. Wall-clock time is not monotonic.
     pub committed_at: Timestamp,
 }
 
@@ -814,14 +978,20 @@ pub enum Violation {
     NotAConfiguredTarget { agent_profile: ProfileId, llm_profile: ProfileId },
     #[error("the configuration of {0} was fixed when it was submitted")]
     ConfigurationFixed(JobId),
-    #[error("{executor} is not registered to serve {llm_profile} as configured for this work")]
-    ExecutorCannotServe { executor: ExecutorId, llm_profile: ProfileId },
+    #[error("{executor} does not support the {transport:?} transport this work's LLM configuration uses")]
+    ExecutorLacksTransport { executor: ExecutorId, transport: LlmTransport },
     #[error("{profile} is used by unfinished work, such as {blocking_jobs:?}, and cannot be edited")]
     ProfileLocked { profile: ProfileId, blocking_jobs: Vec<JobId> },
     #[error("the configuration frozen in {0} differs from the retry's; submit the retry with a new input")]
     ConfigurationMismatch(JobInputId),
-    #[error("{executor} is a {found:?} Executor; serving an LLM Profile needs an Llm Executor")]
+    #[error("{executor} is a {found:?} Executor; running an LLM configuration needs an Llm Executor")]
     IncompatibleExecutorKind { executor: ExecutorId, found: ExecutorType },
+    #[error("{0} has no unknown outcome, so it has no unresolved execution to confirm stopped")]
+    StopNeedsUnknownOutcome(JobId),
+    #[error("the execution of {0} was already confirmed stopped")]
+    StopAlreadyConfirmed(JobId),
+    #[error("{0} was submitted without an LLM configuration")]
+    NotAnLlmExecution(JobId),
 }
 
 pub(crate) type OpResult<T> = Result<(T, MarkerSubjects), BatchError>;
@@ -854,7 +1024,7 @@ pub(crate) fn begin_core_log_cleanup(
         replaces: None,
     }, input)?;
     start_job(batch, job)?;
-    publish_output(batch, job, started.kind.into(), started.summary, started.code, started.goal_reached)?;
+    publish_output(batch, job, started.kind.into(), started.summary, started.code, started.goal_reached, started.value)?;
     Ok((crate::log_cleanup::CleanupRecords { job },
         MarkerSubjects::created(RecordRef::Job(owner), RecordRef::Job(job))))
 }
@@ -917,8 +1087,8 @@ struct Admission {
     projects: Vec<ProjectId>,
     dependencies: Vec<(JobId, DependencyCondition)>,
     configuration: Option<ExecutionConfiguration>,
-    /// The LLM configuration frozen for `configuration`, which an assigned
-    /// Executor must be registered for.
+    /// The LLM configuration frozen for `configuration`, whose transport an
+    /// assigned Executor must support.
     frozen_llm: Option<FrozenLlmConfig>,
     assigned_executor: Option<ExecutorId>,
     previous: Option<JobId>,
@@ -971,8 +1141,7 @@ fn admit_job(batch: &mut Batch, job: Admission, input: JobInputId) -> Result<Job
         batch.require_configuration(configuration)?;
     }
     if let Some(executor) = job.assigned_executor {
-        let served = job.configuration.zip(job.frozen_llm.as_ref()).map(|(configuration, frozen)| (configuration.llm_profile, frozen));
-        batch.require_executor_for(executor, served)?;
+        batch.require_executor_for(executor, job.frozen_llm.as_ref())?;
     }
     for lineage in [job.previous, job.replaces, job.retry_of].into_iter().flatten() {
         batch.require_job(lineage)?;
@@ -999,6 +1168,7 @@ fn admit_job(batch: &mut Batch, job: Admission, input: JobInputId) -> Result<Job
         failed_at: None,
         cancelled_at: None,
         unknown_at: None,
+        stop_confirmed_at: None,
         next_due_at: job.next_due_at,
         next_iteration_no: job.next_iteration_no,
         iteration_no: job.iteration_no,
@@ -1125,11 +1295,12 @@ pub(crate) fn start_job(batch: &mut Batch, job: JobId) -> OpResult<()> {
 }
 
 /// Replaces the Job's main Executor; refused once the Job has started. The
-/// Executor must be registered for the LLM configuration the Job froze, if any.
+/// Executor must support the transport of the LLM configuration the Job
+/// froze, if any; the Job's Provider, model and parameters stay as frozen.
 pub(crate) fn assign_job_executor(batch: &mut Batch, job: JobId, executor: ExecutorId) -> OpResult<()> {
     let row = batch.require_job(job)?;
-    let served = batch.job_frozen_llm(job)?;
-    batch.require_executor_for(executor, served.as_ref().map(|(profile, frozen)| (*profile, frozen)))?;
+    let frozen = batch.job_frozen_llm(job)?;
+    batch.require_executor_for(executor, frozen.as_ref())?;
     if row.started_at.is_some() || row.any_terminal() {
         return batch.reject(Violation::ExecutorChangeAfterStart(job));
     }
@@ -1160,7 +1331,7 @@ pub(crate) fn append_job_output(batch: &mut Batch, job: JobId, output: NewJobOut
     if row.any_terminal() {
         return batch.reject(Violation::JobHasTerminalOutcome(job));
     }
-    let appended = publish_output(batch, job, output.kind.into(), output.summary, output.code, output.goal_reached)?;
+    let appended = publish_output(batch, job, output.kind.into(), output.summary, output.code, output.goal_reached, output.value)?;
     let output_id = appended.output;
     Ok((appended, MarkerSubjects::created(RecordRef::Job(job), RecordRef::JobOutput(output_id))))
 }
@@ -1174,6 +1345,7 @@ fn publish_output(
     summary: Option<String>,
     code: Option<String>,
     goal_reached: Option<bool>,
+    value: Option<serde_json::Value>,
 ) -> Result<AppendedOutput, BatchError> {
     let seq = batch.last_output_seq(job)? + 1;
     let id = JobOutputId(batch.next_id(crate::storage::Sequence::JobOutput)?);
@@ -1185,6 +1357,7 @@ fn publish_output(
         summary,
         code,
         goal_reached,
+        value,
         created_at: batch.now(),
     };
     batch.insert_output(&record)?;
@@ -1226,7 +1399,7 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
         }
     }
     row.sterilized_at.get_or_insert(now);
-    let appended = publish_output(batch, job, OutputKind::Result, result.summary, result.code, result.goal_reached)?;
+    let appended = publish_output(batch, job, OutputKind::Result, result.summary, result.code, result.goal_reached, result.value)?;
     *outcome(&mut row) = Some(now);
     row.updated_at = now;
     batch.put_job(&row)?;
@@ -1234,22 +1407,16 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
     Ok((Some(appended), MarkerSubjects::created(RecordRef::Job(job), RecordRef::JobOutput(output_id))))
 }
 
-/// Registers an Executor together with the LLM Profiles it can serve, each
-/// frozen as configured now. Registrations hold no Profile lock.
+/// Registers an Executor with the LLM transports its adapter implements. It
+/// names no Profile or model, so it holds no Profile lock and can run any
+/// LLM configuration whose Provider speaks one of those transports.
 pub(crate) fn create_executor(batch: &mut Batch, executor: NewExecutor) -> OpResult<ExecutorId> {
     let now = batch.now();
-    if !executor.serves.is_empty() && executor.executor_type != ExecutorType::Llm {
-        return batch.reject(Violation::InvalidValue("serves", "only an Llm Executor can serve LLM Profiles"));
-    }
-    let mut served = Vec::with_capacity(executor.serves.len());
-    for (index, profile) in executor.serves.iter().enumerate() {
-        if executor.serves[..index].contains(profile) {
-            return batch.reject(Violation::DuplicateReference(RecordRef::Profile(*profile)));
-        }
-        served.push(ServedConfiguration { profile: *profile, configuration: batch.freeze_llm(*profile)? });
+    if !executor.llm_transports.is_empty() && executor.executor_type != ExecutorType::Llm {
+        return batch.reject(Violation::InvalidValue("llm_transports", "only an Llm Executor can run LLM transports"));
     }
     let id = ExecutorId(batch.next_id(crate::storage::Sequence::Executor)?);
-    batch.insert_executor(&served, &ExecutorRow {
+    batch.insert_executor(&ExecutorRow {
         id,
         name: executor.name,
         executor_type: executor.executor_type,
@@ -1258,6 +1425,7 @@ pub(crate) fn create_executor(batch: &mut Batch, executor: NewExecutor) -> OpRes
         latest_disabled_at: None,
         created_at: now,
         updated_at: now,
+        llm_transports: executor.llm_transports,
     })?;
     Ok((id, MarkerSubjects::created(RecordRef::Executor(id), RecordRef::Executor(id))))
 }
@@ -1281,6 +1449,7 @@ pub(crate) fn create_llm_provider(batch: &mut Batch, provider: NewLlmProvider) -
     batch.insert_llm_provider(&LlmProviderRecord {
         id,
         name: provider.name,
+        transport: provider.transport,
         endpoint: provider.endpoint,
         credential_ref: provider.credential_ref,
         created_at: batch.now(),
@@ -1338,10 +1507,10 @@ pub(crate) fn create_profile(batch: &mut Batch, profile: NewProfile) -> OpResult
 }
 
 /// Replaces a Profile's name, payload and defining references, keeping its
-/// identity and kind. Refused while any unfinished Job holds the Profile;
-/// the check and the edit share this transaction, so no submission or
-/// finalization can come between them. Submitted Jobs and HealthChecks keep
-/// the configuration they froze.
+/// identity and kind. Refused while any submitted execution holds the
+/// Profile; the check and the edit share this transaction, so no submission,
+/// finalization or stop confirmation can come between them. Submitted Jobs
+/// keep the configuration they froze.
 pub(crate) fn update_profile(batch: &mut Batch, id: ProfileId, profile: NewProfile) -> OpResult<()> {
     let existing = batch.require_profile_row(id)?;
     let (config, links) = profile_parts(batch, profile.config)?;
@@ -1375,25 +1544,56 @@ pub(crate) fn create_agent(batch: &mut Batch, agent: NewAgent) -> OpResult<Agent
     Ok((id, MarkerSubjects::created(RecordRef::Agent(id), RecordRef::Agent(id))))
 }
 
-/// Appends a verification fact for an LLM Profile, with the configuration
-/// the checker actually checked. The Profile itself, its declared
-/// capabilities included, is not touched, and is not read in place of the
-/// checked configuration.
-pub(crate) fn record_health_check(batch: &mut Batch, profile: ProfileId, check: NewHealthCheck) -> OpResult<HealthCheckId> {
-    batch.require_profile_kind(profile, ProfileKind::Llm)?;
-    validate_llm_config(batch, &check.checked.config)?;
-    batch.require_llm_provider(check.checked.provider.id)?;
-    let id = HealthCheckId(batch.next_id(crate::storage::Sequence::HealthCheck)?);
-    batch.insert_health_check(&HealthCheckRow {
-        id,
-        checked: check.checked,
-        capability: check.capability,
-        outcome: check.outcome,
-        usage: check.usage,
-        finish_reason: check.finish_reason,
-        timing: check.timing,
-        recorded_at: batch.now(),
-    })?;
-    batch.link_check(id, profile)?;
-    Ok((id, MarkerSubjects::created(RecordRef::Profile(profile), RecordRef::HealthCheck(id))))
+/// Records that an unknown-outcome Job's execution has actually stopped,
+/// which releases the Profiles it holds. Only the trusted execution path
+/// that ran the Job may call this, and only once it has observed the
+/// termination; a timeout, a cancel request, a disabled Executor or a
+/// restart is not such an observation. The unknown outcome stays as it is.
+pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId) -> OpResult<()> {
+    let now = batch.now();
+    let mut row = batch.require_job(job)?;
+    if row.unknown_at.is_none() {
+        return batch.reject(Violation::StopNeedsUnknownOutcome(job));
+    }
+    if row.stop_confirmed_at.is_some() {
+        return batch.reject(Violation::StopAlreadyConfirmed(job));
+    }
+    row.stop_confirmed_at = Some(now);
+    row.updated_at = now;
+    batch.put_job(&row)?;
+    Ok(((), MarkerSubjects::addressed(RecordRef::Job(job))))
+}
+
+/// Appends measurements for a Job. Their LLM, if any, is the one the Job
+/// froze; the Job itself is not changed.
+pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult<MetricsId> {
+    batch.require_job(metrics.job)?;
+    if metrics.measurements.is_empty() {
+        return batch.reject(Violation::InvalidValue("measurements", "records no measurement"));
+    }
+    let id = MetricsId(batch.next_id(crate::storage::Sequence::Metrics)?);
+    batch.insert_metrics(
+        &MetricsRow { id, observed_at: metrics.observed_at, measurements: metrics.measurements, recorded_at: batch.now() },
+        metrics.job,
+    )?;
+    Ok((id, MarkerSubjects::created(RecordRef::Job(metrics.job), RecordRef::Metrics(id))))
+}
+
+/// Appends one availability observation of an LLM request made by a Job
+/// that was submitted with an LLM configuration. Neither the Job nor its
+/// outcome is changed or consulted.
+pub(crate) fn record_availability_stat(batch: &mut Batch, stat: NewAvailabilityStat) -> OpResult<AvailabilityStatId> {
+    batch.require_job(stat.job)?;
+    if batch.job_llm_profile(stat.job)?.is_none() {
+        return batch.reject(Violation::NotAnLlmExecution(stat.job));
+    }
+    if stat.observation.is_empty() {
+        return batch.reject(Violation::InvalidValue("observation", "records no response or failure"));
+    }
+    let id = AvailabilityStatId(batch.next_id(crate::storage::Sequence::AvailabilityStat)?);
+    batch.insert_availability_stat(
+        &AvailabilityStatRow { id, observed_at: stat.observed_at, observation: stat.observation, recorded_at: batch.now() },
+        stat.job,
+    )?;
+    Ok((id, MarkerSubjects::created(RecordRef::Job(stat.job), RecordRef::AvailabilityStat(id))))
 }

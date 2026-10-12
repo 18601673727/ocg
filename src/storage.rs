@@ -27,7 +27,7 @@
 //! bounded petgraph view from records read inside the current write
 //! transaction, adds the proposed edges and rejects any cycle.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -36,16 +36,18 @@ use redb::{
     TableDefinition, WriteTransaction,
 };
 
-use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure, TransportError};
+use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::persistence::{
-    AgentConfig, AgentId, AgentRecord, DependencyCondition, DependencyState,
-    ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorRecord, ExecutorType,
-    FrozenExecutionConfig, FrozenLlmConfig, HealthCheckId, ProfileEditability, ProviderSnapshot,
-    ServedConfiguration, SubmittedConfiguration, HealthCheckOutcome, HealthCheckRecord,
-    HealthCheckTiming, JobId, JobInputId, JobOutputId, JobOutputRecord, JobRecord, LlmConfig,
-    LlmParameters, LlmProviderId, LlmProviderRecord, ModelCapability, OperationId, OperationKind,
-    OperationMarker, OutputKind, ProfileConfig, ProfileId, ProfileKind, ProfileRecord, ProjectId,
-    ProjectRecord, RecordRef, Timestamp, Violation, WrongProfileKind,
+    AgentConfig, AgentId, AgentRecord, AvailabilityObservation, AvailabilityStatId,
+    AvailabilityStatRecord, DependencyCondition, DependencyState, ExecutionConfiguration,
+    ExecutionMode, ExecutorId, ExecutorRecord, ExecutorType, FrozenExecutionConfig,
+    FrozenLlmConfig, JobId, JobInputId, JobOutputId, JobOutputRecord, JobRecord, LlmConfig,
+    LlmParameters, LlmProviderId, LlmProviderRecord, LlmTarget, LlmTransport, Measurements,
+    MetricsId, MetricsRecord, ModelCapability, ObservationCursor, ObservationFilter,
+    ObservationPage, ObservedModel, ObservedModelChoice, ObservedModelFilter, ObservedModelPage,
+    OperationId, OperationKind, OperationMarker, OutputKind, ProfileConfig,
+    ProfileEditability, ProfileId, ProfileKind, ProfileRecord, ProjectId, ProjectRecord,
+    ProviderSnapshot, RecordRef, SubmittedConfiguration, Timestamp, Violation, WrongProfileKind,
 };
 
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
@@ -58,16 +60,27 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// Version 4 made Profiles editable: JobInputs freeze their Job's execution
 /// configuration, Profiles carry `updated_at`, HealthChecks record the
 /// configuration they checked and SERVES entries the configuration they
-/// were registered for. Files of any other version are refused on open,
-/// before anything is written to them.
-pub(crate) const FORMAT_VERSION: u32 = 4;
+/// were registered for. Version 5 retired HealthChecks and SERVES: Providers
+/// and Executors name LLM transports, configured Jobs may run an LLM without
+/// an Agent Profile, Jobs record a confirmed stop, outputs carry a JSON
+/// value, and Metrics and AvailabilityStats are recorded per Job. Version 6
+/// replaced the per-LLM-Profile observation indexes with indexes by
+/// observation scope; a version 5 file lacks their entries. Files of any
+/// other version are refused on open, before anything is written to them.
+pub(crate) const FORMAT_VERSION: u32 = 6;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;
+/// The most index entries one observation query reads, matching or not.
+pub(crate) const MAX_OBSERVATION_SCAN: usize = 5_000;
+/// The most distinct (Provider, model) pairs one choice query examines,
+/// matching or not.
+pub(crate) const MAX_OBSERVED_MODEL_SCAN: usize = 2_000;
 
 type Records = TableDefinition<'static, u64, &'static [u8]>;
 type Link = TableDefinition<'static, u64, u64>;
 type PairSet = TableDefinition<'static, (u64, u64), ()>;
+type ScopeIndex = TableDefinition<'static, (&'static [u8], i64, u64), ()>;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const GENESIS_KEY: &str = "genesis";
@@ -80,7 +93,8 @@ const PROJECTS: Records = TableDefinition::new("project");
 const PROFILES: Records = TableDefinition::new("profile");
 const AGENTS: Records = TableDefinition::new("agent");
 const LLM_PROVIDERS: Records = TableDefinition::new("llm_provider");
-const HEALTH_CHECKS: Records = TableDefinition::new("health_check");
+const METRICS: Records = TableDefinition::new("metrics");
+const AVAILABILITY_STATS: Records = TableDefinition::new("availability_stat");
 /// job -> input, and its incoming index (input, job). A retry may run with
 /// its original's frozen input, so one input can serve several Jobs.
 const HAS_INPUT: Link = TableDefinition::new("has_input");
@@ -110,25 +124,33 @@ const PROFILE_AGENTS: PairSet = TableDefinition::new("uses_profile_in");
 /// LLM Profile -> LLM Provider, and its incoming index (provider, profile).
 const USES_PROVIDER: Link = TableDefinition::new("uses_provider");
 const PROVIDER_PROFILES: PairSet = TableDefinition::new("uses_provider_in");
-/// HealthCheck -> the LLM Profile it checked, and its incoming index
-/// (profile, check), ordered by check ID and therefore by recording order.
-const CHECKS: Link = TableDefinition::new("checks");
-const PROFILE_CHECKS: PairSet = TableDefinition::new("checks_in");
 /// (Agent Profile, LLM Profile): the LLM Profiles an Agent Profile may run
 /// with, fixed when the Agent Profile is created.
 const TARGETS_LLM: PairSet = TableDefinition::new("targets_llm");
 /// Job -> the Agent Profile its submission applied, and its incoming index.
 const APPLIES_PROFILE: Link = TableDefinition::new("applies_profile");
 const AGENT_PROFILE_JOBS: PairSet = TableDefinition::new("applies_profile_in");
-/// Job -> the LLM Profile its submission chose, and its incoming index.
-/// A Job has both of these edges or neither.
+/// Job -> the LLM Profile its submission chose, and its incoming index. A
+/// Job with an APPLIES_PROFILE edge has this one too; a Job that runs an LLM
+/// without an Agent Profile has only this one.
 const RUNS_LLM_PROFILE: Link = TableDefinition::new("runs_llm_profile");
 const LLM_PROFILE_JOBS: PairSet = TableDefinition::new("runs_llm_profile_in");
-/// (Executor, LLM Profile) it can serve -> that Profile's configuration as
-/// registered, fixed at registration, and its incoming index (profile,
-/// executor) for finding compatible Executors.
-const SERVES: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("serves");
-const SERVED_BY: PairSet = TableDefinition::new("serves_in");
+/// (transport code, Executor): an index of the transports in each Executor
+/// record, written with the record at registration.
+const TRANSPORT_EXECUTORS: TableDefinition<(u8, u64), ()> = TableDefinition::new("llm_transport_executors");
+/// Metrics -> the Job it measured, and its incoming index (job, metrics).
+const MEASURES: Link = TableDefinition::new("measures");
+const JOB_METRICS: PairSet = TableDefinition::new("measures_in");
+/// (scope, observed_at, metrics) for every [`Scope`] a Metrics record is
+/// in, written with the record from its MEASURES Job and that Job's frozen
+/// input, all fixed.
+const METRICS_BY_SCOPE: ScopeIndex = TableDefinition::new("metrics_by_scope");
+/// AvailabilityStat -> the Job whose request it observed, and its incoming
+/// index (job, stat).
+const OBSERVES: Link = TableDefinition::new("observes");
+const JOB_AVAILABILITY: PairSet = TableDefinition::new("observes_in");
+/// (scope, observed_at, stat), written like METRICS_BY_SCOPE.
+const AVAILABILITY_BY_SCOPE: ScopeIndex = TableDefinition::new("availability_stat_by_scope");
 /// (epoch, seq) -> operation marker.
 const OPERATIONS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("operation");
 
@@ -200,8 +222,9 @@ const TAG_PROJECT: u8 = 7;
 const TAG_PROFILE: u8 = 8;
 const TAG_AGENT: u8 = 9;
 const TAG_LLM_PROVIDER: u8 = 10;
-const TAG_HEALTH_CHECK: u8 = 11;
-const TAG_SERVED: u8 = 12;
+// Tags 11 and 12 were the retired HealthCheck and SERVES records.
+const TAG_METRICS: u8 = 13;
+const TAG_AVAILABILITY_STAT: u8 = 14;
 
 struct Enc(Vec<u8>);
 
@@ -278,7 +301,9 @@ impl Enc {
             RecordRef::Profile(id) => (7, id.get()),
             RecordRef::Agent(id) => (8, id.get()),
             RecordRef::LlmProvider(id) => (9, id.get()),
-            RecordRef::HealthCheck(id) => (10, id.get()),
+            // Tag 10 was the retired HealthCheck reference.
+            RecordRef::Metrics(id) => (11, id.get()),
+            RecordRef::AvailabilityStat(id) => (12, id.get()),
         };
         self.u8(tag);
         self.u64(id);
@@ -316,40 +341,34 @@ impl Enc {
         let provider = &frozen.provider;
         self.u64(provider.id.get());
         self.str(&provider.name);
+        self.u8(provider.transport.code());
         self.ostr(&provider.endpoint);
         self.ostr(&provider.credential_ref);
     }
     fn frozen_execution(&mut self, frozen: &FrozenExecutionConfig) {
-        self.agent_config(&frozen.agent);
+        self.opt(&frozen.agent, Enc::agent_config);
         self.frozen_llm(&frozen.llm);
     }
-    fn transport_error(&mut self, error: &TransportError) {
-        match error {
-            TransportError::InvalidRequest { field, message } => {
-                self.u8(1);
-                self.str(field);
-                self.str(message);
-            }
-            TransportError::Unsupported { field, message } => {
-                self.u8(2);
-                self.str(field);
-                self.str(message);
-            }
-            TransportError::Build { message } => {
-                self.u8(3);
-                self.str(message);
-            }
-            TransportError::Provider(failure) => {
-                self.u8(4);
-                self.str(&failure.message);
-                self.opt(&failure.status_code, |e, v| e.u16(*v));
-                self.ostr(&failure.provider_code);
-                self.ostr(&failure.response_body);
-                self.ostr(&failure.request_id);
-                self.ou64(failure.retry_after_ms);
-                self.bool(failure.retryable);
-            }
+    fn transports(&mut self, transports: &BTreeSet<LlmTransport>) {
+        self.u32(u32::try_from(transports.len()).unwrap_or(u32::MAX));
+        for transport in transports {
+            self.u8(transport.code());
         }
+    }
+    fn provider_failure(&mut self, failure: &ProviderFailure) {
+        self.str(&failure.message);
+        self.opt(&failure.status_code, |e, v| e.u16(*v));
+        self.ostr(&failure.provider_code);
+        self.ostr(&failure.response_body);
+        self.ostr(&failure.request_id);
+        self.ou64(failure.retry_after_ms);
+        self.bool(failure.retryable);
+    }
+    fn usage(&mut self, usage: &NormalizedUsage) {
+        for count in [usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens] {
+            self.ou32(count);
+        }
+        self.ojson(&usage.raw);
     }
 }
 
@@ -455,7 +474,8 @@ impl<'a> Dec<'a> {
             7 => RecordRef::Profile(ProfileId::new(id)),
             8 => RecordRef::Agent(AgentId::new(id)),
             9 => RecordRef::LlmProvider(LlmProviderId::new(id)),
-            10 => RecordRef::HealthCheck(HealthCheckId::new(id)),
+            11 => RecordRef::Metrics(MetricsId::new(id)),
+            12 => RecordRef::AvailabilityStat(AvailabilityStatId::new(id)),
             _ => return Err(StorageError::corrupted("invalid record reference")),
         })
     }
@@ -491,29 +511,43 @@ impl<'a> Dec<'a> {
         let provider = ProviderSnapshot {
             id: LlmProviderId::new(self.u64()?),
             name: self.str()?,
+            transport: self.code(LlmTransport::from_code)?,
             endpoint: self.ostr()?,
             credential_ref: self.ostr()?,
         };
         Ok(FrozenLlmConfig { config, provider })
     }
     fn frozen_execution(&mut self) -> DecodeResult<FrozenExecutionConfig> {
-        Ok(FrozenExecutionConfig { agent: self.agent_config()?, llm: self.frozen_llm()? })
+        Ok(FrozenExecutionConfig { agent: self.opt(Self::agent_config)?, llm: self.frozen_llm()? })
     }
-    fn transport_error(&mut self) -> DecodeResult<TransportError> {
-        Ok(match self.u8()? {
-            1 => TransportError::InvalidRequest { field: self.str()?, message: self.str()? },
-            2 => TransportError::Unsupported { field: self.str()?, message: self.str()? },
-            3 => TransportError::Build { message: self.str()? },
-            4 => TransportError::Provider(ProviderFailure {
-                message: self.str()?,
-                status_code: self.opt(Self::u16)?,
-                provider_code: self.ostr()?,
-                response_body: self.ostr()?,
-                request_id: self.ostr()?,
-                retry_after_ms: self.ou64()?,
-                retryable: self.bool()?,
-            }),
-            _ => return Err(StorageError::corrupted("invalid transport error kind")),
+    fn transports(&mut self) -> DecodeResult<BTreeSet<LlmTransport>> {
+        let mut transports = BTreeSet::new();
+        for _ in 0..self.u32()? {
+            if !transports.insert(self.code(LlmTransport::from_code)?) {
+                return Err(StorageError::corrupted("repeated LLM transport"));
+            }
+        }
+        Ok(transports)
+    }
+    fn provider_failure(&mut self) -> DecodeResult<ProviderFailure> {
+        Ok(ProviderFailure {
+            message: self.str()?,
+            status_code: self.opt(Self::u16)?,
+            provider_code: self.ostr()?,
+            response_body: self.ostr()?,
+            request_id: self.ostr()?,
+            retry_after_ms: self.ou64()?,
+            retryable: self.bool()?,
+        })
+    }
+    fn usage(&mut self) -> DecodeResult<NormalizedUsage> {
+        Ok(NormalizedUsage {
+            input_tokens: self.ou32()?,
+            output_tokens: self.ou32()?,
+            cache_read_tokens: self.ou32()?,
+            cache_write_tokens: self.ou32()?,
+            reasoning_tokens: self.ou32()?,
+            raw: self.ojson()?,
         })
     }
     fn end(self) -> DecodeResult<()> {
@@ -540,18 +574,19 @@ codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, Output
 codes!(ExecutorType { ExecutorType::System = 1, ExecutorType::Llm = 2, ExecutorType::Agent = 3, ExecutorType::Tool = 4, ExecutorType::Database = 5, ExecutorType::Frontend = 6 });
 codes!(DependencyCondition { DependencyCondition::Success = 1, DependencyCondition::Settled = 2 });
 codes!(ModelCapability { ModelCapability::Chat = 1, ModelCapability::Tools = 2, ModelCapability::Vision = 3, ModelCapability::Reasoning = 4 });
+codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1 });
 codes!(ChatFinishReason {
     ChatFinishReason::Stop = 1, ChatFinishReason::Length = 2, ChatFinishReason::ToolCalls = 3,
     ChatFinishReason::ContentFilter = 4, ChatFinishReason::Error = 5, ChatFinishReason::Other = 6,
 });
-// Codes 4, 5 and 6 were the retired JobStep commands.
+// Codes 4, 5 and 6 were the retired JobStep commands; 18 recorded HealthChecks.
 codes!(OperationKind {
     OperationKind::SaveJobInput = 1, OperationKind::CreateJobWithInput = 2, OperationKind::AssignJobExecutor = 3,
     OperationKind::AppendJobOutput = 7, OperationKind::FinalizeJob = 8, OperationKind::CreateExecutor = 9,
     OperationKind::BeginCoreLogCleanup = 10, OperationKind::StartJob = 11, OperationKind::RetryJob = 12,
     OperationKind::AssociateJobProject = 13, OperationKind::CreateProject = 14, OperationKind::CreateLlmProvider = 15,
-    OperationKind::CreateProfile = 16, OperationKind::CreateAgent = 17, OperationKind::RecordHealthCheck = 18,
-    OperationKind::UpdateProfile = 19,
+    OperationKind::CreateProfile = 16, OperationKind::CreateAgent = 17, OperationKind::UpdateProfile = 19,
+    OperationKind::ConfirmJobStopped = 20, OperationKind::RecordMetrics = 21, OperationKind::RecordAvailabilityStat = 22,
 });
 
 // ---- rows ------------------------------------------------------------------------
@@ -569,6 +604,7 @@ pub(crate) struct JobRow {
     pub(crate) failed_at: Option<Timestamp>,
     pub(crate) cancelled_at: Option<Timestamp>,
     pub(crate) unknown_at: Option<Timestamp>,
+    pub(crate) stop_confirmed_at: Option<Timestamp>,
     pub(crate) next_due_at: Option<Timestamp>,
     pub(crate) next_iteration_no: Option<i64>,
     pub(crate) iteration_no: Option<i64>,
@@ -586,6 +622,13 @@ impl JobRow {
         self.confirmed_terminal() || self.unknown_at.is_some()
     }
 
+    /// Whether this Job holds the Profiles it was submitted with: until a
+    /// confirmed outcome, or, for an unknown outcome, until its execution is
+    /// confirmed stopped.
+    pub(crate) fn holds_profiles(&self) -> bool {
+        !self.confirmed_terminal() && self.stop_confirmed_at.is_none()
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB);
         e.u64(self.id.get());
@@ -600,6 +643,7 @@ impl JobRow {
             self.failed_at,
             self.cancelled_at,
             self.unknown_at,
+            self.stop_confirmed_at,
             self.next_due_at,
         ] {
             e.ots(at);
@@ -626,6 +670,7 @@ impl JobRow {
             failed_at: d.ots()?,
             cancelled_at: d.ots()?,
             unknown_at: d.ots()?,
+            stop_confirmed_at: d.ots()?,
             next_due_at: d.ots()?,
             next_iteration_no: d.oi64()?,
             iteration_no: d.oi64()?,
@@ -696,6 +741,7 @@ fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
     e.ostr(&o.summary);
     e.ostr(&o.code);
     e.opt(&o.goal_reached, |e, v| e.bool(*v));
+    e.ojson(&o.value);
     e.ts(o.created_at);
     e.0
 }
@@ -710,6 +756,7 @@ fn decode_output(bytes: &[u8]) -> DecodeResult<JobOutputRecord> {
         summary: d.ostr()?,
         code: d.ostr()?,
         goal_reached: d.opt(Dec::bool)?,
+        value: d.ojson()?,
         created_at: d.ts()?,
     };
     d.end()?;
@@ -726,6 +773,7 @@ pub(crate) struct ExecutorRow {
     pub(crate) latest_disabled_at: Option<Timestamp>,
     pub(crate) created_at: Timestamp,
     pub(crate) updated_at: Timestamp,
+    pub(crate) llm_transports: BTreeSet<LlmTransport>,
 }
 
 impl ExecutorRow {
@@ -740,6 +788,7 @@ impl ExecutorRow {
             latest_disabled_at: decoder.ots()?,
             created_at: decoder.ts()?,
             updated_at: decoder.ts()?,
+            llm_transports: decoder.transports()?,
         };
         decoder.end()?;
         Ok(row)
@@ -755,6 +804,7 @@ impl ExecutorRow {
         e.ots(self.latest_disabled_at);
         e.ts(self.created_at);
         e.ts(self.updated_at);
+        e.transports(&self.llm_transports);
         e.0
     }
 }
@@ -784,10 +834,21 @@ fn encode_llm_provider(p: &LlmProviderRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_LLM_PROVIDER);
     e.u64(p.id.get());
     e.str(&p.name);
+    e.u8(p.transport.code());
     e.ostr(&p.endpoint);
     e.ostr(&p.credential_ref);
     e.ts(p.created_at);
     e.0
+}
+
+fn provider_snapshot(provider: LlmProviderRecord) -> ProviderSnapshot {
+    ProviderSnapshot {
+        id: provider.id,
+        name: provider.name,
+        transport: provider.transport,
+        endpoint: provider.endpoint,
+        credential_ref: provider.credential_ref,
+    }
 }
 
 fn decode_llm_provider(bytes: &[u8]) -> DecodeResult<LlmProviderRecord> {
@@ -795,6 +856,7 @@ fn decode_llm_provider(bytes: &[u8]) -> DecodeResult<LlmProviderRecord> {
     let p = LlmProviderRecord {
         id: LlmProviderId::new(d.u64()?),
         name: d.str()?,
+        transport: d.code(LlmTransport::from_code)?,
         endpoint: d.ostr()?,
         credential_ref: d.ostr()?,
         created_at: d.ts()?,
@@ -870,75 +932,40 @@ impl AgentRow {
     }
 }
 
-/// A HealthCheck's own attributes; the Profile it checked lives in CHECKS.
+/// A Metrics record's own attributes; its Job lives in MEASURES.
 #[derive(Clone, Debug)]
-pub(crate) struct HealthCheckRow {
-    pub(crate) id: HealthCheckId,
-    pub(crate) checked: FrozenLlmConfig,
-    pub(crate) capability: ModelCapability,
-    pub(crate) outcome: HealthCheckOutcome,
-    pub(crate) usage: NormalizedUsage,
-    pub(crate) finish_reason: Option<ChatFinishReason>,
-    pub(crate) timing: HealthCheckTiming,
+pub(crate) struct MetricsRow {
+    pub(crate) id: MetricsId,
+    pub(crate) observed_at: Timestamp,
+    pub(crate) measurements: Measurements,
     pub(crate) recorded_at: Timestamp,
 }
 
-impl HealthCheckRow {
+impl MetricsRow {
     fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_HEALTH_CHECK);
+        let mut e = Enc::new(TAG_METRICS);
         e.u64(self.id.get());
-        e.frozen_llm(&self.checked);
-        e.u8(self.capability.code());
-        match &self.outcome {
-            HealthCheckOutcome::Passed => e.u8(1),
-            HealthCheckOutcome::Failed(error) => {
-                e.u8(2);
-                e.transport_error(error);
-            }
-        }
-        let usage = &self.usage;
-        for count in [usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens] {
-            e.ou32(count);
-        }
-        e.ojson(&usage.raw);
-        e.opt(&self.finish_reason, |e, v| e.u8(v.code()));
-        let timing = &self.timing;
-        e.ts(timing.started_at);
-        e.ts(timing.finished_at);
-        for ms in [timing.ttfb_ms, timing.reasoning_ttft_ms, timing.output_ttft_ms, timing.request_finished_in_ms] {
+        e.ts(self.observed_at);
+        let m = &self.measurements;
+        for ms in [m.ttfb_ms, m.reasoning_ttft_ms, m.output_ttft_ms, m.request_finished_in_ms] {
             e.ou64(ms);
         }
+        e.usage(&m.usage);
         e.ts(self.recorded_at);
         e.0
     }
 
     fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_HEALTH_CHECK)?;
+        let mut d = Dec::new(bytes, TAG_METRICS)?;
         let row = Self {
-            id: HealthCheckId::new(d.u64()?),
-            checked: d.frozen_llm()?,
-            capability: d.code(ModelCapability::from_code)?,
-            outcome: match d.u8()? {
-                1 => HealthCheckOutcome::Passed,
-                2 => HealthCheckOutcome::Failed(d.transport_error()?),
-                _ => return Err(StorageError::corrupted("invalid HealthCheck outcome")),
-            },
-            usage: NormalizedUsage {
-                input_tokens: d.ou32()?,
-                output_tokens: d.ou32()?,
-                cache_read_tokens: d.ou32()?,
-                cache_write_tokens: d.ou32()?,
-                reasoning_tokens: d.ou32()?,
-                raw: d.ojson()?,
-            },
-            finish_reason: d.opt(|d| d.code(ChatFinishReason::from_code))?,
-            timing: HealthCheckTiming {
-                started_at: d.ts()?,
-                finished_at: d.ts()?,
+            id: MetricsId::new(d.u64()?),
+            observed_at: d.ts()?,
+            measurements: Measurements {
                 ttfb_ms: d.ou64()?,
                 reasoning_ttft_ms: d.ou64()?,
                 output_ttft_ms: d.ou64()?,
                 request_finished_in_ms: d.ou64()?,
+                usage: d.usage()?,
             },
             recorded_at: d.ts()?,
         };
@@ -947,17 +974,45 @@ impl HealthCheckRow {
     }
 }
 
-fn encode_served(configuration: &FrozenLlmConfig) -> Vec<u8> {
-    let mut e = Enc::new(TAG_SERVED);
-    e.frozen_llm(configuration);
-    e.0
+/// An AvailabilityStat's own attributes; its Job lives in OBSERVES.
+#[derive(Clone, Debug)]
+pub(crate) struct AvailabilityStatRow {
+    pub(crate) id: AvailabilityStatId,
+    pub(crate) observed_at: Timestamp,
+    pub(crate) observation: AvailabilityObservation,
+    pub(crate) recorded_at: Timestamp,
 }
 
-fn decode_served(bytes: &[u8]) -> DecodeResult<FrozenLlmConfig> {
-    let mut d = Dec::new(bytes, TAG_SERVED)?;
-    let configuration = d.frozen_llm()?;
-    d.end()?;
-    Ok(configuration)
+impl AvailabilityStatRow {
+    fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new(TAG_AVAILABILITY_STAT);
+        e.u64(self.id.get());
+        e.ts(self.observed_at);
+        let o = &self.observation;
+        e.opt(&o.status_code, |e, v| e.u16(*v));
+        e.opt(&o.finish_reason, |e, v| e.u8(v.code()));
+        e.ostr(&o.raw_finish_reason);
+        e.opt(&o.failure, Enc::provider_failure);
+        e.ts(self.recorded_at);
+        e.0
+    }
+
+    fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        let mut d = Dec::new(bytes, TAG_AVAILABILITY_STAT)?;
+        let row = Self {
+            id: AvailabilityStatId::new(d.u64()?),
+            observed_at: d.ts()?,
+            observation: AvailabilityObservation {
+                status_code: d.opt(Dec::u16)?,
+                finish_reason: d.opt(|d| d.code(ChatFinishReason::from_code))?,
+                raw_finish_reason: d.ostr()?,
+                failure: d.opt(Dec::provider_failure)?,
+            },
+            recorded_at: d.ts()?,
+        };
+        d.end()?;
+        Ok(row)
+    }
 }
 
 fn encode_marker(m: &OperationMarker) -> Vec<u8> {
@@ -992,7 +1047,8 @@ pub(crate) enum Sequence {
     Profile,
     Agent,
     LlmProvider,
-    HealthCheck,
+    Metrics,
+    AvailabilityStat,
 }
 
 impl Sequence {
@@ -1006,12 +1062,88 @@ impl Sequence {
             Self::Profile => "profile",
             Self::Agent => "agent",
             Self::LlmProvider => "llm_provider",
-            Self::HealthCheck => "health_check",
+            Self::Metrics => "metrics",
+            Self::AvailabilityStat => "availability_stat",
         }
     }
 }
 
 const OPEN_EPOCH: &str = "open_epoch";
+
+/// A set of observation records with an index range of its own. Every
+/// record is in `All`; one whose Job ran an LLM is also in the four scopes
+/// of the target that Job froze.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Scope<'a> {
+    All,
+    LlmProfile(ProfileId),
+    Provider(LlmProviderId),
+    Model(&'a str),
+    ProviderModel(LlmProviderId, &'a str),
+}
+
+impl Scope<'_> {
+    /// A tag byte, then the scope's identity: IDs as 8 big-endian bytes and
+    /// the model name as its UTF-8 bytes. Each tag's encoding is injective.
+    fn key(&self) -> Vec<u8> {
+        let mut key = Vec::new();
+        match self {
+            Self::All => key.push(0),
+            Self::LlmProfile(profile) => {
+                key.push(1);
+                key.extend_from_slice(&profile.get().to_be_bytes());
+            }
+            Self::Provider(provider) => {
+                key.push(2);
+                key.extend_from_slice(&provider.get().to_be_bytes());
+            }
+            Self::Model(model) => {
+                key.push(3);
+                key.extend_from_slice(model.as_bytes());
+            }
+            Self::ProviderModel(provider, model) => {
+                key.push(4);
+                key.extend_from_slice(&provider.get().to_be_bytes());
+                key.extend_from_slice(model.as_bytes());
+            }
+        }
+        key
+    }
+
+    fn of(target: Option<&LlmTarget>) -> Vec<Scope<'_>> {
+        let mut scopes = vec![Scope::All];
+        if let Some(target) = target {
+            let (provider, model) = (target.frozen.provider.id, target.frozen.config.model.as_str());
+            scopes.extend([Scope::LlmProfile(target.llm_profile), Scope::Provider(provider), Scope::Model(model), Scope::ProviderModel(provider, model)]);
+        }
+        scopes
+    }
+
+    /// The scope a query scans: the LLM Profile when one is given, since a
+    /// Profile's history may span several targets, and otherwise the
+    /// narrowest scope the filter names. The filter is still checked
+    /// against every record read.
+    fn for_filter(filter: &ObservationFilter) -> Scope<'_> {
+        match (filter.llm_profile, filter.provider, filter.model.as_deref()) {
+            (Some(profile), _, _) => Scope::LlmProfile(profile),
+            (None, Some(provider), Some(model)) => Scope::ProviderModel(provider, model),
+            (None, Some(provider), None) => Scope::Provider(provider),
+            (None, None, Some(model)) => Scope::Model(model),
+            (None, None, None) => Scope::All,
+        }
+    }
+}
+
+fn filter_matches(filter: &ObservationFilter, target: Option<&LlmTarget>) -> bool {
+    match target {
+        Some(target) => {
+            filter.llm_profile.is_none_or(|profile| profile == target.llm_profile)
+                && filter.provider.is_none_or(|provider| provider == target.frozen.provider.id)
+                && filter.model.as_deref().is_none_or(|model| model == target.frozen.config.model)
+        }
+        None => filter.llm_profile.is_none() && filter.provider.is_none() && filter.model.is_none(),
+    }
+}
 
 // ---- open ----------------------------------------------------------------------
 
@@ -1130,19 +1262,22 @@ fn initialize(database: &Database) -> Result<(u64, JobId), OpenError> {
 }
 
 fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
-    for table in [JOBS, JOB_INPUTS, JOB_OUTPUTS, EXECUTORS, PROJECTS, PROFILES, AGENTS, LLM_PROVIDERS, HEALTH_CHECKS] {
+    for table in [JOBS, JOB_INPUTS, JOB_OUTPUTS, EXECUTORS, PROJECTS, PROFILES, AGENTS, LLM_PROVIDERS, METRICS, AVAILABILITY_STATS] {
         tx.open_table(table)?;
     }
-    for table in [HAS_INPUT, LATEST_OUTPUT, CHILD_OF, ASSIGNED_TO, PREVIOUS, REPLACES, RETRY_OF, USES_PROVIDER, CHECKS, APPLIES_PROFILE, RUNS_LLM_PROFILE] {
+    for table in [HAS_INPUT, LATEST_OUTPUT, CHILD_OF, ASSIGNED_TO, PREVIOUS, REPLACES, RETRY_OF, USES_PROVIDER, APPLIES_PROFILE, RUNS_LLM_PROFILE, MEASURES, OBSERVES] {
         tx.open_table(table)?;
     }
     for table in [
-        INPUT_JOBS, CHILDREN, RETRIES, IN_PROJECT, PROJECT_JOBS, USES_PROFILE, PROFILE_AGENTS, PROVIDER_PROFILES, PROFILE_CHECKS,
-        TARGETS_LLM, AGENT_PROFILE_JOBS, LLM_PROFILE_JOBS, SERVED_BY,
+        INPUT_JOBS, CHILDREN, RETRIES, IN_PROJECT, PROJECT_JOBS, USES_PROFILE, PROFILE_AGENTS, PROVIDER_PROFILES,
+        TARGETS_LLM, AGENT_PROFILE_JOBS, LLM_PROFILE_JOBS, JOB_METRICS, JOB_AVAILABILITY,
     ] {
         tx.open_table(table)?;
     }
-    tx.open_table(SERVES)?;
+    for table in [METRICS_BY_SCOPE, AVAILABILITY_BY_SCOPE] {
+        tx.open_table(table)?;
+    }
+    tx.open_table(TRANSPORT_EXECUTORS)?;
     tx.open_table(HAS_OUTPUT)?;
     tx.open_table(DEPENDS_ON)?;
     tx.open_table(OPERATIONS)?;
@@ -1187,6 +1322,7 @@ fn create_genesis(tx: &WriteTransaction) -> Result<JobId, StorageError> {
         failed_at: None,
         cancelled_at: None,
         unknown_at: None,
+        stop_confirmed_at: None,
         next_due_at: None,
         next_iteration_no: None,
         iteration_no: None,
@@ -1346,6 +1482,8 @@ fn finish_abort<T>(tx: WriteTransaction, failure: Failure) -> BatchOutcome<T> {
 }
 
 impl Batch {
+    /// The wall-clock time read once when this batch's write transaction
+    /// began. Every timestamp the batch writes uses it.
     pub(crate) fn now(&self) -> Timestamp {
         self.now
     }
@@ -1500,27 +1638,20 @@ impl Batch {
     }
 
     /// Refuses the batch unless the Executor exists and, when the Job runs
-    /// with an LLM configuration, is an Llm Executor registered for that LLM
-    /// Profile with exactly the configuration the Job froze. Matching IDs
-    /// alone are not enough once the Profile has been edited.
-    pub(crate) fn require_executor_for(&mut self, executor: ExecutorId, served: Option<(ProfileId, &FrozenLlmConfig)>) -> Result<(), BatchError> {
+    /// an LLM configuration, is an Llm Executor whose adapter supports the
+    /// transport that configuration froze. The Executor never changes which
+    /// Provider, model or parameters the Job runs.
+    pub(crate) fn require_executor_for(&mut self, executor: ExecutorId, frozen: Option<&FrozenLlmConfig>) -> Result<(), BatchError> {
         let row = self.require_executor_row(executor)?;
-        let Some((llm_profile, frozen)) = served else {
+        let Some(frozen) = frozen else {
             return Ok(());
         };
         if row.executor_type != ExecutorType::Llm {
             return self.reject(Violation::IncompatibleExecutorKind { executor, found: row.executor_type });
         }
-        let registered = self.step(|tx| Ok(tx.open_table(SERVES)?.get((executor.get(), llm_profile.get()))?.map(|v| v.value().to_vec())))?;
-        let registered = match registered {
-            Some(bytes) => {
-                let decoded = decode_served(&bytes);
-                Some(self.decoded(decoded)?)
-            }
-            None => None,
-        };
-        if registered.as_ref() != Some(frozen) {
-            return self.reject(Violation::ExecutorCannotServe { executor, llm_profile });
+        let transport = frozen.provider.transport;
+        if !row.llm_transports.contains(&transport) {
+            return self.reject(Violation::ExecutorLacksTransport { executor, transport });
         }
         Ok(())
     }
@@ -1533,31 +1664,22 @@ impl Batch {
         Ok(())
     }
 
-    /// Inserts the Executor with the LLM configurations it serves. Inserting
-    /// refuses an existing Executor, so SERVES never changes after registration.
-    pub(crate) fn insert_executor(&mut self, serves: &[ServedConfiguration], row: &ExecutorRow) -> Result<(), BatchError> {
-        self.insert_new(EXECUTORS, row.id.get(), row.encode(), RecordRef::Executor(row.id))?;
-        for served in serves {
-            self.require_profile_kind(served.profile, ProfileKind::Llm)?;
-            if row.executor_type != ExecutorType::Llm {
-                return self.reject(Violation::IncompatibleExecutorKind { executor: row.id, found: row.executor_type });
-            }
-            let (executor, profile, bytes) = (row.id.get(), served.profile.get(), encode_served(&served.configuration));
-            let inserted = self.step(|tx| {
-                let mut table = tx.open_table(SERVES)?;
-                if table.get((executor, profile))?.is_some() {
-                    return Ok(false);
-                }
-                table.insert((executor, profile), bytes.as_slice())?;
-                drop(table);
-                tx.open_table(SERVED_BY)?.insert((profile, executor), ())?;
-                Ok(true)
-            })?;
-            if !inserted {
-                return self.reject(Violation::DuplicateReference(RecordRef::Profile(served.profile)));
-            }
+    /// Inserts the Executor and indexes its LLM transports. Inserting refuses
+    /// an existing Executor, so its transports never change after registration.
+    pub(crate) fn insert_executor(&mut self, row: &ExecutorRow) -> Result<(), BatchError> {
+        if !row.llm_transports.is_empty() && row.executor_type != ExecutorType::Llm {
+            return self.reject(Violation::IncompatibleExecutorKind { executor: row.id, found: row.executor_type });
         }
-        Ok(())
+        self.insert_new(EXECUTORS, row.id.get(), row.encode(), RecordRef::Executor(row.id))?;
+        let executor = row.id.get();
+        let transports: Vec<u8> = row.llm_transports.iter().map(|transport| transport.code()).collect();
+        self.step(|tx| {
+            let mut index = tx.open_table(TRANSPORT_EXECUTORS)?;
+            for transport in transports {
+                index.insert((transport, executor), ())?;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn require_project(&mut self, id: ProjectId) -> Result<(), BatchError> {
@@ -1643,13 +1765,18 @@ impl Batch {
         }
     }
 
-    /// Refuses the batch unless both Profiles have the right kinds and the
-    /// LLM Profile is one of the Agent Profile's configured targets.
+    /// Refuses the batch unless the Profiles have the right kinds and, when
+    /// an Agent Profile is named, the LLM Profile is one of its configured
+    /// targets.
     pub(crate) fn require_configuration(&mut self, configuration: ExecutionConfiguration) -> Result<(), BatchError> {
         let ExecutionConfiguration { agent_profile, llm_profile } = configuration;
-        self.require_profile_kind(agent_profile, ProfileKind::Agent)?;
+        if let Some(agent_profile) = agent_profile {
+            self.require_profile_kind(agent_profile, ProfileKind::Agent)?;
+        }
         self.require_profile_kind(llm_profile, ProfileKind::Llm)?;
-        if !self.has_pair(TARGETS_LLM, agent_profile.get(), llm_profile.get())? {
+        if let Some(agent_profile) = agent_profile
+            && !self.has_pair(TARGETS_LLM, agent_profile.get(), llm_profile.get())?
+        {
             return self.reject(Violation::NotAConfiguredTarget { agent_profile, llm_profile });
         }
         Ok(())
@@ -1659,8 +1786,47 @@ impl Batch {
         self.insert_new(AGENTS, row.id.get(), row.encode(), RecordRef::Agent(row.id))
     }
 
-    pub(crate) fn insert_health_check(&mut self, row: &HealthCheckRow) -> Result<(), BatchError> {
-        self.insert_new(HEALTH_CHECKS, row.id.get(), row.encode(), RecordRef::HealthCheck(row.id))
+    /// Inserts the Metrics with its MEASURES edge, the edge's incoming index
+    /// and its scope index entries.
+    pub(crate) fn insert_metrics(&mut self, row: &MetricsRow, job: JobId) -> Result<(), BatchError> {
+        self.insert_new(METRICS, row.id.get(), row.encode(), RecordRef::Metrics(row.id))?;
+        self.insert_observation(MEASURES, JOB_METRICS, METRICS_BY_SCOPE, row.id.get(), job, row.observed_at)?;
+        Ok(())
+    }
+
+    /// Inserts the AvailabilityStat with its OBSERVES edge, the edge's
+    /// incoming index and its scope index entries. The caller has checked
+    /// that the Job ran an LLM.
+    pub(crate) fn insert_availability_stat(&mut self, row: &AvailabilityStatRow, job: JobId) -> Result<(), BatchError> {
+        self.insert_new(AVAILABILITY_STATS, row.id.get(), row.encode(), RecordRef::AvailabilityStat(row.id))?;
+        if !self.insert_observation(OBSERVES, JOB_AVAILABILITY, AVAILABILITY_BY_SCOPE, row.id.get(), job, row.observed_at)? {
+            return self.corrupted(format!("availability_stat {} observes {job}, which ran no LLM", row.id.get()));
+        }
+        Ok(())
+    }
+
+    /// Links a just-inserted observation record to its Job and writes its
+    /// scope index entries from the target the Job froze. The target is
+    /// never taken from the caller. Returns whether the Job ran an LLM.
+    fn insert_observation(&mut self, forward: Link, incoming: PairSet, by_scope: ScopeIndex, record: u64, job: JobId, observed_at: Timestamp) -> Result<bool, BatchError> {
+        self.require_job(job)?;
+        let target = match (self.job_llm_profile(job)?, self.job_frozen_llm(job)?) {
+            (Some(llm_profile), Some(frozen)) => Some(LlmTarget { llm_profile, frozen }),
+            _ => None,
+        };
+        if !self.insert_indexed_link(forward, incoming, record, job.get())? {
+            return self.corrupted(format!("observation record {record} is already linked"));
+        }
+        let keys: Vec<Vec<u8>> = Scope::of(target.as_ref()).iter().map(Scope::key).collect();
+        let at = observed_at.as_unix_micros();
+        self.step(|tx| {
+            let mut index = tx.open_table(by_scope)?;
+            for key in &keys {
+                index.insert((key.as_slice(), at, record), ())?;
+            }
+            Ok(())
+        })?;
+        Ok(target.is_some())
     }
 
     // -- relationships --
@@ -1861,7 +2027,6 @@ impl Batch {
         }
     }
 
-    /// The LLM Profile a Job was submitted with, if any.
     /// An LLM Profile's configuration and Provider as they are now.
     pub(crate) fn freeze_llm(&mut self, profile: ProfileId) -> Result<FrozenLlmConfig, BatchError> {
         let row = self.require_profile_row(profile)?;
@@ -1878,50 +2043,56 @@ impl Batch {
         let provider = self.decoded(decoded)?;
         Ok(FrozenLlmConfig {
             config,
-            provider: ProviderSnapshot {
-                id: provider.id,
-                name: provider.name,
-                endpoint: provider.endpoint,
-                credential_ref: provider.credential_ref,
-            },
+            provider: provider_snapshot(provider),
         })
     }
 
     /// Validates a submission's configuration and reads the values it will
     /// execute with from its Profiles as they are now.
+    /// No Agent configuration is read, or made up, for work submitted
+    /// without an Agent Profile.
     pub(crate) fn freeze_configuration(&mut self, configuration: ExecutionConfiguration) -> Result<FrozenExecutionConfig, BatchError> {
         self.require_configuration(configuration)?;
-        let ProfileConfig::Agent(agent) = self.require_profile_row(configuration.agent_profile)?.config else {
-            return self.corrupted(format!("{} changed kind", configuration.agent_profile));
+        let agent = match configuration.agent_profile {
+            Some(profile) => {
+                let ProfileConfig::Agent(agent) = self.require_profile_row(profile)?.config else {
+                    return self.corrupted(format!("{profile} changed kind"));
+                };
+                Some(agent)
+            }
+            None => None,
         };
         let llm = self.freeze_llm(configuration.llm_profile)?;
         Ok(FrozenExecutionConfig { agent, llm })
     }
 
-    /// The LLM Profile a Job was submitted with and the LLM configuration its
-    /// input froze for it, if the Job is configured.
-    pub(crate) fn job_frozen_llm(&mut self, job: JobId) -> Result<Option<(ProfileId, FrozenLlmConfig)>, BatchError> {
-        let Some(profile) = self.link_target(RUNS_LLM_PROFILE, job.get())? else {
+    /// The LLM Profile a stored Job was submitted with, if any.
+    pub(crate) fn job_llm_profile(&mut self, job: JobId) -> Result<Option<ProfileId>, BatchError> {
+        Ok(self.link_target(RUNS_LLM_PROFILE, job.get())?.map(ProfileId::new))
+    }
+
+    /// The LLM configuration a Job's input froze for it, if the Job is configured.
+    pub(crate) fn job_frozen_llm(&mut self, job: JobId) -> Result<Option<FrozenLlmConfig>, BatchError> {
+        if self.job_llm_profile(job)?.is_none() {
             return Ok(None);
-        };
+        }
         let input = self.input_of(job)?;
         match self.require_input(input)?.configuration {
-            Some(frozen) => Ok(Some((ProfileId::new(profile), frozen.llm))),
+            Some(frozen) => Ok(Some(frozen.llm)),
             None => self.corrupted(format!("the configured {job} has no frozen configuration in {input}")),
         }
     }
 
-    /// The Jobs holding a Profile: those submitted with it that have no
-    /// completed, failed or cancelled outcome. Returns at most `limit` in ID
-    /// order, and whether there are more.
+    /// The Jobs holding a Profile, see [`JobRow::holds_profiles`]. Returns at
+    /// most `limit` in ID order, and whether there are more.
     pub(crate) fn profile_holders(&mut self, profile: ProfileId, limit: usize) -> Result<(Vec<JobId>, bool), BatchError> {
         let kind = self.require_profile_row(profile)?.config.kind();
         self.step(|tx| profile_holders(&tx.open_table(profile_jobs_index(kind))?, &tx.open_table(JOBS)?, profile, limit))
     }
 
-    /// APPLIES_PROFILE and RUNS_LLM_PROFILE together: the configuration an
-    /// execution child Job is submitted with. Refused for a Job that already
-    /// has one, whatever the new Profiles are.
+    /// RUNS_LLM_PROFILE and, when an Agent Profile is named, APPLIES_PROFILE:
+    /// the configuration an execution child Job is submitted with. Refused
+    /// for a Job that already has one, whatever the new Profiles are.
     pub(crate) fn link_configuration(&mut self, job: JobId, configuration: ExecutionConfiguration) -> Result<(), BatchError> {
         self.require_job(job)?;
         self.require_configuration(configuration)?;
@@ -1929,7 +2100,9 @@ impl Batch {
         if bound {
             return self.reject(Violation::ConfigurationFixed(job));
         }
-        self.insert_indexed_link(APPLIES_PROFILE, AGENT_PROFILE_JOBS, job.get(), configuration.agent_profile.get())?;
+        if let Some(agent_profile) = configuration.agent_profile {
+            self.insert_indexed_link(APPLIES_PROFILE, AGENT_PROFILE_JOBS, job.get(), agent_profile.get())?;
+        }
         self.insert_indexed_link(RUNS_LLM_PROFILE, LLM_PROFILE_JOBS, job.get(), configuration.llm_profile.get())?;
         Ok(())
     }
@@ -1942,17 +2115,6 @@ impl Batch {
             Ok(())
         } else {
             self.reject(Violation::DuplicateId(RecordRef::Profile(profile)))
-        }
-    }
-
-    /// CHECKS: one LLM Profile per HealthCheck, fixed at creation.
-    pub(crate) fn link_check(&mut self, check: HealthCheckId, profile: ProfileId) -> Result<(), BatchError> {
-        self.require_exists(HEALTH_CHECKS, RecordRef::HealthCheck(check), check.get())?;
-        self.require_profile_kind(profile, ProfileKind::Llm)?;
-        if self.insert_indexed_link(CHECKS, PROFILE_CHECKS, check.get(), profile.get())? {
-            Ok(())
-        } else {
-            self.reject(Violation::DuplicateId(RecordRef::HealthCheck(check)))
         }
     }
 
@@ -2001,10 +2163,11 @@ fn profile_jobs_index(kind: ProfileKind) -> PairSet {
     }
 }
 
-/// The lock on a Profile, derived from canonical Job outcomes on every
-/// call: a Job submitted with it holds it until the Job is completed,
-/// failed or cancelled. Queued, started, paused and unknown-outcome Jobs
-/// hold it; an unknown outcome may still be executing.
+/// The lock on a Profile, derived from canonical Job facts on every call: a
+/// Job submitted with it holds it until the Job is completed, failed or
+/// cancelled. Queued, started and paused Jobs hold it, and so does an
+/// unknown outcome, which may still be executing, until its stop is
+/// confirmed.
 fn profile_holders(
     index: &impl ReadableTable<(u64, u64), ()>,
     jobs: &impl ReadableTable<u64, &'static [u8]>,
@@ -2015,7 +2178,7 @@ fn profile_holders(
     for entry in index.range((profile.get(), 0)..=(profile.get(), u64::MAX))? {
         let job = entry?.0.value().1;
         let bytes = jobs.get(job)?.ok_or_else(|| StorageError::corrupted(format!("{profile} is held by missing job {job}")))?;
-        if JobRow::decode(bytes.value())?.confirmed_terminal() {
+        if !JobRow::decode(bytes.value())?.holds_profiles() {
             continue;
         }
         if holders.len() == limit {
@@ -2218,12 +2381,12 @@ fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord, StorageErr
         .ok_or_else(|| StorageError::corrupted(format!("{} has no parent", row.id)))?;
     let projects = read_pairs(rx, IN_PROJECT, id, None, usize::MAX)?.into_iter().map(ProjectId::new).collect();
     let configuration = match (read_link(rx, APPLIES_PROFILE, id)?, read_link(rx, RUNS_LLM_PROFILE, id)?) {
-        (Some(agent_profile), Some(llm_profile)) => Some(ExecutionConfiguration {
-            agent_profile: ProfileId::new(agent_profile),
+        (agent_profile, Some(llm_profile)) => Some(ExecutionConfiguration {
+            agent_profile: agent_profile.map(ProfileId::new),
             llm_profile: ProfileId::new(llm_profile),
         }),
         (None, None) => None,
-        _ => return Err(StorageError::corrupted(format!("{} has only half of its configuration", row.id))),
+        (Some(_), None) => return Err(StorageError::corrupted(format!("{} applies an Agent Profile without an LLM Profile", row.id))),
     };
     Ok(JobRecord {
         id: row.id,
@@ -2237,6 +2400,7 @@ fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord, StorageErr
         failed_at: row.failed_at,
         cancelled_at: row.cancelled_at,
         unknown_at: row.unknown_at,
+        stop_confirmed_at: row.stop_confirmed_at,
         next_due_at: row.next_due_at,
         next_iteration_no: row.next_iteration_no,
         iteration_no: row.iteration_no,
@@ -2379,19 +2543,8 @@ pub(crate) fn read_job_input_for_job(database: &Database, job: JobId) -> Result<
     JobInputRow::decode(bytes.value()).map(Some)
 }
 
-/// The LLM configurations an Executor was registered for, in Profile order.
-fn served_configurations(rx: &ReadTransaction, executor: u64) -> Result<Vec<ServedConfiguration>, StorageError> {
-    let mut served = Vec::new();
-    for entry in rx.open_table(SERVES)?.range((executor, 0)..=(executor, u64::MAX))? {
-        let (key, value) = entry?;
-        served.push(ServedConfiguration { profile: ProfileId::new(key.value().1), configuration: decode_served(value.value())? });
-    }
-    Ok(served)
-}
-
-fn executor_record(rx: &ReadTransaction, row: ExecutorRow) -> Result<ExecutorRecord, StorageError> {
-    let serves = served_configurations(rx, row.id.get())?;
-    Ok(ExecutorRecord {
+fn executor_record(row: ExecutorRow) -> ExecutorRecord {
+    ExecutorRecord {
         id: row.id,
         name: row.name,
         executor_type: row.executor_type,
@@ -2400,15 +2553,15 @@ fn executor_record(rx: &ReadTransaction, row: ExecutorRow) -> Result<ExecutorRec
         latest_disabled_at: row.latest_disabled_at,
         created_at: row.created_at,
         updated_at: row.updated_at,
-        serves,
-    })
+        llm_transports: row.llm_transports,
+    }
 }
 
 /// A single executor.
 pub(crate) fn read_executor(database: &Database, id: ExecutorId) -> Result<Option<ExecutorRecord>, StorageError> {
     let rx = read(database)?;
     let row = rx.open_table(EXECUTORS)?.get(id.get())?.map(|v| ExecutorRow::decode(v.value())).transpose()?;
-    row.map(|row| executor_record(&rx, row)).transpose()
+    Ok(row.map(executor_record))
 }
 
 /// Records of `table` in reverse ID order, newest first, strictly before
@@ -2428,38 +2581,29 @@ fn newest<T>(rx: &ReadTransaction, table: Records, before: Option<u64>, limit: u
 pub(crate) fn read_executors(database: &Database, before: Option<ExecutorId>, limit: usize) -> Result<Vec<ExecutorRecord>, StorageError> {
     let rx = read(database)?;
     let rows = newest(&rx, EXECUTORS, before.map(ExecutorId::get), limit, ExecutorRow::decode)?;
-    rows.into_iter().map(|row| executor_record(&rx, row)).collect()
+    Ok(rows.into_iter().map(executor_record).collect())
 }
 
-/// The Executors registered to serve an LLM Profile, in ID order. Every one
-/// is an Llm Executor; which of them runs a Job is the caller's choice.
-/// The Executors registered for `llm_profile` with exactly `configuration`.
-fn executors_registered_for(rx: &ReadTransaction, llm_profile: ProfileId, configuration: &FrozenLlmConfig) -> Result<Vec<ExecutorId>, StorageError> {
-    let serves = rx.open_table(SERVES)?;
-    let mut compatible = Vec::new();
-    for executor in read_pairs(rx, SERVED_BY, llm_profile.get(), None, usize::MAX)? {
-        let bytes = serves
-            .get((executor, llm_profile.get()))?
-            .ok_or_else(|| StorageError::corrupted(format!("SERVES lacks the registration of executor {executor} for {llm_profile}")))?;
-        if decode_served(bytes.value())? == *configuration {
-            compatible.push(ExecutorId::new(executor));
-            if compatible.len() == MAX_PAGE {
-                break;
-            }
-        }
+/// The Executors whose adapter supports `transport`, in ID order, at most
+/// [`MAX_PAGE`]. Every one is an Llm Executor.
+fn executors_supporting(rx: &ReadTransaction, transport: LlmTransport) -> Result<Vec<ExecutorId>, StorageError> {
+    let code = transport.code();
+    let mut executors = Vec::new();
+    for entry in rx.open_table(TRANSPORT_EXECUTORS)?.range((code, 0)..=(code, u64::MAX))?.take(MAX_PAGE) {
+        executors.push(ExecutorId::new(entry?.0.value().1));
     }
-    Ok(compatible)
+    Ok(executors)
 }
 
-/// An LLM Profile's configuration and Provider as they are now; the inner
-/// error names an Agent Profile.
-fn current_llm(rx: &ReadTransaction, profile: ProfileId) -> Result<Option<Result<FrozenLlmConfig, WrongProfileKind>>, StorageError> {
+/// The transport of an LLM Profile's Provider as configured now; `None` for
+/// a missing Profile or an Agent Profile.
+fn current_transport(rx: &ReadTransaction, profile: ProfileId) -> Result<Option<LlmTransport>, StorageError> {
     let Some(row) = rx.open_table(PROFILES)?.get(profile.get())?.map(|v| ProfileRow::decode(v.value())).transpose()? else {
         return Ok(None);
     };
-    let ProfileConfig::Llm(config) = row.config else {
-        return Ok(Some(Err(WrongProfileKind { profile, expected: ProfileKind::Llm, found: ProfileKind::Agent })));
-    };
+    if row.config.kind() != ProfileKind::Llm {
+        return Ok(None);
+    }
     let provider = read_link(rx, USES_PROVIDER, profile.get())?.ok_or_else(|| StorageError::corrupted(format!("{profile} has no Provider")))?;
     let provider = rx
         .open_table(LLM_PROVIDERS)?
@@ -2467,33 +2611,27 @@ fn current_llm(rx: &ReadTransaction, profile: ProfileId) -> Result<Option<Result
         .map(|v| decode_llm_provider(v.value()))
         .transpose()?
         .ok_or_else(|| StorageError::corrupted(format!("{profile} names missing Provider {provider}")))?;
-    let provider = ProviderSnapshot { id: provider.id, name: provider.name, endpoint: provider.endpoint, credential_ref: provider.credential_ref };
-    Ok(Some(Ok(FrozenLlmConfig { config, provider })))
+    Ok(Some(provider.transport))
 }
 
-pub(crate) fn read_current_llm_configuration(database: &Database, profile: ProfileId) -> Result<Option<Result<FrozenLlmConfig, WrongProfileKind>>, StorageError> {
-    current_llm(&read(database)?, profile)
-}
-
-/// The Executors registered for an LLM Profile as it is configured now, in
-/// ID order. A registration made before the Profile was edited is not
-/// listed: it was made for another configuration.
+/// The Executors that can run an LLM Profile as it is configured now, in ID
+/// order: those supporting its Provider's transport.
 pub(crate) fn read_compatible_executors(database: &Database, llm_profile: ProfileId) -> Result<Vec<ExecutorId>, StorageError> {
     let rx = read(database)?;
-    match current_llm(&rx, llm_profile)? {
-        Some(Ok(configuration)) => executors_registered_for(&rx, llm_profile, &configuration),
-        Some(Err(_)) | None => Ok(Vec::new()),
+    match current_transport(&rx, llm_profile)? {
+        Some(transport) => executors_supporting(&rx, transport),
+        None => Ok(Vec::new()),
     }
 }
 
-/// The Executors registered for exactly the LLM configuration a submitted
-/// Job froze, in ID order; empty for a Job without one.
+/// The Executors that can run the LLM configuration a submitted Job froze,
+/// in ID order; empty for a Job without one.
 pub(crate) fn read_job_compatible_executors(database: &Database, job: JobId) -> Result<Vec<ExecutorId>, StorageError> {
     let rx = read(database)?;
     let Some(submitted) = submitted_configuration(&rx, job)? else {
         return Ok(Vec::new());
     };
-    executors_registered_for(&rx, submitted.llm_profile, &submitted.frozen.llm)
+    executors_supporting(&rx, submitted.frozen.llm.provider.transport)
 }
 
 pub(crate) fn read_project(database: &Database, id: ProjectId) -> Result<Option<ProjectRecord>, StorageError> {
@@ -2618,54 +2756,291 @@ pub(crate) fn read_agent(database: &Database, id: AgentId) -> Result<Option<Agen
     Ok(Some(AgentRecord { id: row.id, name: row.name, profiles, created_at: row.created_at }))
 }
 
-fn health_check_record(row: HealthCheckRow, profile: ProfileId) -> HealthCheckRecord {
-    HealthCheckRecord {
-        id: row.id,
-        profile,
-        checked: row.checked,
-        capability: row.capability,
-        outcome: row.outcome,
-        usage: row.usage,
-        finish_reason: row.finish_reason,
-        timing: row.timing,
-        recorded_at: row.recorded_at,
+/// The LLM target a stored Job froze, read from only the links and the input
+/// that define it: RUNS_LLM_PROFILE, APPLIES_PROFILE for its consistency,
+/// HAS_INPUT and the frozen input. `None` for a Job submitted without an
+/// LLM configuration. Unlike [`submitted_configuration`], it assembles no
+/// [`JobRecord`], so the Job's Projects, parent, assignment and lineage are
+/// never read.
+fn frozen_llm_target(rx: &ReadTransaction, job: JobId) -> Result<Option<LlmTarget>, StorageError> {
+    if rx.open_table(JOBS)?.get(job.get())?.map(|v| JobRow::decode(v.value())).transpose()?.is_none() {
+        return Err(StorageError::corrupted(format!("an observation names missing {job}")));
     }
-}
-
-fn read_check(rx: &ReadTransaction, check: u64, profile: ProfileId) -> Result<HealthCheckRecord, StorageError> {
-    let bytes = rx
-        .open_table(HEALTH_CHECKS)?
-        .get(check)?
-        .ok_or_else(|| StorageError::corrupted(format!("CHECKS names missing HealthCheck {check}")))?;
-    Ok(health_check_record(HealthCheckRow::decode(bytes.value())?, profile))
-}
-
-/// An LLM Profile's HealthCheck history in recording order, strictly after
-/// `after` when given.
-pub(crate) fn read_health_checks(database: &Database, profile: ProfileId, after: Option<HealthCheckId>, limit: usize) -> Result<Vec<HealthCheckRecord>, StorageError> {
-    let rx = read(database)?;
-    let checks = read_pairs(&rx, PROFILE_CHECKS, profile.get(), after.map(HealthCheckId::get), limit.min(MAX_PAGE))?;
-    checks.into_iter().map(|check| read_check(&rx, check, profile)).collect()
-}
-
-/// The newest HealthCheck of each capability that checked the Profile's
-/// current configuration. A check of a configuration the Profile had before
-/// an edit is history, not verification of the current one, and a
-/// capability no such check covered has no entry.
-pub(crate) fn read_current_health_checks(database: &Database, profile: ProfileId) -> Result<BTreeMap<ModelCapability, HealthCheckRecord>, StorageError> {
-    let rx = read(database)?;
-    let mut latest = BTreeMap::new();
-    let Some(Ok(current)) = current_llm(&rx, profile)? else {
-        return Ok(latest);
+    let Some(llm_profile) = read_link(rx, RUNS_LLM_PROFILE, job.get())? else {
+        if read_link(rx, APPLIES_PROFILE, job.get())?.is_some() {
+            return Err(StorageError::corrupted(format!("{job} applies an Agent Profile without an LLM Profile")));
+        }
+        return Ok(None);
     };
-    let index = rx.open_table(PROFILE_CHECKS)?;
-    for entry in index.range((profile.get(), 0)..=(profile.get(), u64::MAX))?.rev() {
-        let record = read_check(&rx, entry?.0.value().1, profile)?;
-        if record.checked == current {
-            latest.entry(record.capability).or_insert(record);
+    let input = read_link(rx, HAS_INPUT, job.get())?
+        .map(JobInputId::new)
+        .ok_or_else(|| StorageError::corrupted(format!("{job} has no input")))?;
+    let row = rx
+        .open_table(JOB_INPUTS)?
+        .get(input.get())?
+        .map(|v| JobInputRow::decode(v.value()))
+        .transpose()?
+        .ok_or_else(|| StorageError::corrupted(format!("{job} names missing {input}")))?;
+    let frozen = row.configuration.ok_or_else(|| StorageError::corrupted(format!("the configured {job} has no frozen configuration in {input}")))?;
+    Ok(Some(LlmTarget { llm_profile: ProfileId::new(llm_profile), frozen: frozen.llm }))
+}
+
+/// The LLM a Job ran, as its input froze it, cached per Job for one read.
+fn job_target(rx: &ReadTransaction, cache: &mut HashMap<JobId, Option<LlmTarget>>, job: JobId) -> Result<Option<LlmTarget>, StorageError> {
+    if let Some(target) = cache.get(&job) {
+        return Ok(target.clone());
+    }
+    let target = frozen_llm_target(rx, job)?;
+    cache.insert(job, target.clone());
+    Ok(target)
+}
+
+/// A Metrics record whose Job and target the caller has read.
+fn metrics_from(rx: &ReadTransaction, id: u64, job: JobId, target: Option<LlmTarget>) -> Result<MetricsRecord, StorageError> {
+    let bytes = rx.open_table(METRICS)?.get(id)?.ok_or_else(|| StorageError::corrupted(format!("an index names missing metrics {id}")))?;
+    let row = MetricsRow::decode(bytes.value())?;
+    Ok(MetricsRecord { id: row.id, job, target, observed_at: row.observed_at, measurements: row.measurements, recorded_at: row.recorded_at })
+}
+
+/// An AvailabilityStat record whose Job and target the caller has read.
+fn availability_from(rx: &ReadTransaction, id: u64, job: JobId, target: Option<LlmTarget>) -> Result<AvailabilityStatRecord, StorageError> {
+    let bytes = rx
+        .open_table(AVAILABILITY_STATS)?
+        .get(id)?
+        .ok_or_else(|| StorageError::corrupted(format!("an index names missing availability_stat {id}")))?;
+    let row = AvailabilityStatRow::decode(bytes.value())?;
+    let target = target.ok_or_else(|| StorageError::corrupted(format!("availability_stat {id} observes {job}, which ran no LLM")))?;
+    Ok(AvailabilityStatRecord { id: row.id, job, target, observed_at: row.observed_at, observation: row.observation, recorded_at: row.recorded_at })
+}
+
+type BuildObservation<T> = fn(&ReadTransaction, u64, JobId, Option<LlmTarget>) -> Result<T, StorageError>;
+
+fn observation_job(rx: &ReadTransaction, link: Link, id: u64) -> Result<JobId, StorageError> {
+    read_link(rx, link, id)?.map(JobId::new).ok_or_else(|| StorageError::corrupted(format!("observation record {id} is linked to no Job")))
+}
+
+/// Records a Job links to through `incoming`, in recording order.
+fn job_observations<T>(rx: &ReadTransaction, incoming: PairSet, build: BuildObservation<T>, job: JobId, after: Option<u64>, limit: usize) -> Result<Vec<T>, StorageError> {
+    let mut cache = HashMap::new();
+    let target = job_target(rx, &mut cache, job)?;
+    read_pairs(rx, incoming, job.get(), after, limit.min(MAX_PAGE))?.into_iter().map(|id| build(rx, id, job, target.clone())).collect()
+}
+
+/// One page of an observation query. It range-reads the filter's scope from
+/// `index` within the observation time range, strictly after `after`, in
+/// (observed_at, record) order, and checks every entry against the whole
+/// filter. It reads at most `scan_limit` entries, matching or not, and
+/// returns at most `limit` records, each clamped to at least 1 and `limit`
+/// to [`MAX_PAGE`]. The cursor it returns is the last entry read, so a scan
+/// that found nothing still advances.
+#[allow(clippy::too_many_arguments)]
+fn scan_observations<T>(
+    rx: &ReadTransaction,
+    index: ScopeIndex,
+    link: Link,
+    build: BuildObservation<T>,
+    filter: &ObservationFilter,
+    after: Option<ObservationCursor<u64>>,
+    limit: usize,
+    scan_limit: usize,
+) -> Result<ObservationPage<T, u64>, StorageError> {
+    let done = |records| Ok(ObservationPage { records, next: None });
+    let (limit, scan_limit) = (limit.clamp(1, MAX_PAGE), scan_limit.max(1));
+    let until = filter.observed.until.as_unix_micros();
+    let mut start = (filter.observed.from.as_unix_micros(), 0);
+    if let Some(ObservationCursor { observed_at, record }) = after {
+        let at = observed_at.as_unix_micros();
+        let next = match (record.checked_add(1), at.checked_add(1)) {
+            (Some(record), _) => (at, record),
+            (None, Some(later)) => (later, 0),
+            (None, None) => return done(Vec::new()),
+        };
+        start = start.max(next);
+    }
+    if start.0 >= until {
+        return done(Vec::new());
+    }
+    let scope = Scope::for_filter(filter).key();
+    let table = rx.open_table(index)?;
+    // Record IDs start at 1, so (time, 0) sorts before every entry at that time.
+    let mut entries = table.range((scope.as_slice(), start.0, start.1)..(scope.as_slice(), until, 0))?;
+    let mut cache = HashMap::new();
+    let (mut records, mut scanned, mut last) = (Vec::new(), 0, None);
+    while records.len() < limit && scanned < scan_limit {
+        let Some(entry) = entries.next() else {
+            return done(records);
+        };
+        let key = entry?.0;
+        let (_, at, id) = key.value();
+        scanned += 1;
+        last = Some(ObservationCursor { observed_at: Timestamp::from_unix_micros(at), record: id });
+        let job = observation_job(rx, link, id)?;
+        let target = job_target(rx, &mut cache, job)?;
+        if filter_matches(filter, target.as_ref()) {
+            records.push(build(rx, id, job, target)?);
         }
     }
-    Ok(latest)
+    let more = entries.next().transpose()?.is_some();
+    Ok(ObservationPage { records, next: if more { last } else { None } })
+}
+
+/// A Job's Metrics in recording order, strictly after `after` when given.
+pub(crate) fn read_job_metrics(database: &Database, job: JobId, after: Option<MetricsId>, limit: usize) -> Result<Vec<MetricsRecord>, StorageError> {
+    job_observations(&read(database)?, JOB_METRICS, metrics_from, job, after.map(MetricsId::get), limit)
+}
+
+/// A Job's AvailabilityStats in recording order, strictly after `after` when given.
+pub(crate) fn read_job_availability(database: &Database, job: JobId, after: Option<AvailabilityStatId>, limit: usize) -> Result<Vec<AvailabilityStatRecord>, StorageError> {
+    job_observations(&read(database)?, JOB_AVAILABILITY, availability_from, job, after.map(AvailabilityStatId::get), limit)
+}
+
+/// The tag of [`Scope::ProviderModel`] keys.
+const PROVIDER_MODEL_TAG: u8 = 4;
+
+/// The (Provider, model) pair a [`Scope::ProviderModel`] key names.
+fn observed_model(scope: &[u8]) -> Result<ObservedModel, StorageError> {
+    match scope {
+        [PROVIDER_MODEL_TAG, rest @ ..] if rest.len() >= 8 => {
+            let (provider, model) = rest.split_at(8);
+            let provider = LlmProviderId::new(u64::from_be_bytes(provider.try_into().expect("8 bytes")));
+            let model = String::from_utf8(model.to_vec()).map_err(|_| StorageError::corrupted("a scope key names a model that is not UTF-8"))?;
+            Ok(ObservedModel { provider, model })
+        }
+        _ => Err(StorageError::corrupted("expected a Provider and model scope key")),
+    }
+}
+
+/// The first [`Scope::ProviderModel`] key in `index` strictly after the
+/// `after` key, or from `lower` without one, and before `upper`. One seek:
+/// the entries of a skipped key are never read.
+fn next_provider_model(table: &impl ReadableTable<(&'static [u8], i64, u64), ()>, after: Option<&[u8]>, lower: &[u8], upper: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
+    use std::ops::Bound;
+    let start = match after {
+        Some(after) if after >= upper => return Ok(None),
+        Some(after) if after >= lower => Bound::Excluded((after, i64::MAX, u64::MAX)),
+        _ => Bound::Included((lower, i64::MIN, 0)),
+    };
+    let mut entries = table.range::<(&[u8], i64, u64)>((start, Bound::Excluded((upper, i64::MIN, 0))))?;
+    Ok(match entries.next() {
+        Some(entry) => Some(entry?.0.value().0.to_vec()),
+        None => None,
+    })
+}
+
+/// Whether `index` has an entry of `scope` observed within [from, until).
+fn observed_within(table: &impl ReadableTable<(&'static [u8], i64, u64), ()>, scope: &[u8], from: i64, until: i64) -> Result<bool, StorageError> {
+    Ok(table.range((scope, from, 0)..(scope, until, 0))?.next().is_some())
+}
+
+/// One page of distinct historical (Provider, model) pairs from the
+/// Provider-and-model scope entries of both observation indexes, merged in
+/// key order, which is Provider ID and then model bytes. Each examined pair
+/// costs at most two seeks and two range checks, whatever its record count;
+/// at most `scan_limit` pairs are examined and `limit` returned, each
+/// clamped to at least 1 and `limit` to [`MAX_PAGE`]. The cursor is the
+/// last pair examined, so a page whose pairs all fell outside the time range
+/// still advances. One call reads one snapshot.
+pub(crate) fn read_observed_models(
+    database: &Database,
+    filter: &ObservedModelFilter,
+    after: Option<&ObservedModel>,
+    limit: usize,
+    scan_limit: usize,
+) -> Result<ObservedModelPage, StorageError> {
+    let (limit, scan_limit) = (limit.clamp(1, MAX_PAGE), scan_limit.max(1));
+    let (from, until) = (filter.observed.from.as_unix_micros(), filter.observed.until.as_unix_micros());
+    let done = |choices| Ok(ObservedModelPage { choices, next: None });
+    if from >= until {
+        return done(Vec::new());
+    }
+    let (lower, upper) = match filter.provider {
+        Some(provider) => {
+            let lower = Scope::ProviderModel(provider, "").key();
+            let upper = match provider.get().checked_add(1) {
+                Some(following) => Scope::ProviderModel(LlmProviderId::new(following), "").key(),
+                None => vec![PROVIDER_MODEL_TAG + 1],
+            };
+            (lower, upper)
+        }
+        None => (vec![PROVIDER_MODEL_TAG], vec![PROVIDER_MODEL_TAG + 1]),
+    };
+    let after = after.map(|model| Scope::ProviderModel(model.provider, &model.model).key());
+    let rx = read(database)?;
+    let tables = [rx.open_table(METRICS_BY_SCOPE)?, rx.open_table(AVAILABILITY_BY_SCOPE)?];
+    let mut heads = [None, None];
+    for (head, table) in heads.iter_mut().zip(&tables) {
+        *head = next_provider_model(table, after.as_deref(), &lower, &upper)?;
+    }
+    let (mut choices, mut examined, mut last) = (Vec::new(), 0, None);
+    while choices.len() < limit && examined < scan_limit {
+        let Some(key) = heads.iter().flatten().min().cloned() else {
+            return done(choices);
+        };
+        examined += 1;
+        let mut present = [false, false];
+        for ((head, table), present) in heads.iter_mut().zip(&tables).zip(&mut present) {
+            if head.as_deref() == Some(key.as_slice()) {
+                *present = observed_within(table, &key, from, until)?;
+                *head = next_provider_model(table, Some(&key), &lower, &upper)?;
+            }
+        }
+        let model = observed_model(&key)?;
+        if present.contains(&true) {
+            choices.push(ObservedModelChoice { model: model.clone(), has_metrics: present[0], has_availability_stats: present[1] });
+        }
+        last = Some(model);
+    }
+    let more = heads.iter().any(Option::is_some);
+    Ok(ObservedModelPage { choices, next: if more { last } else { None } })
+}
+
+/// One page of the Metrics `filter` selects, see [`scan_observations`].
+pub(crate) fn read_metrics(
+    database: &Database,
+    filter: &ObservationFilter,
+    after: Option<ObservationCursor<MetricsId>>,
+    limit: usize,
+    scan_limit: usize,
+) -> Result<ObservationPage<MetricsRecord, MetricsId>, StorageError> {
+    let after = after.map(|cursor| ObservationCursor { observed_at: cursor.observed_at, record: cursor.record.get() });
+    let page = scan_observations(&read(database)?, METRICS_BY_SCOPE, MEASURES, metrics_from, filter, after, limit, scan_limit)?;
+    let next = page.next.map(|cursor| ObservationCursor { observed_at: cursor.observed_at, record: MetricsId::new(cursor.record) });
+    Ok(ObservationPage { records: page.records, next })
+}
+
+/// One page of the AvailabilityStats `filter` selects, see [`scan_observations`].
+pub(crate) fn read_availability_stats(
+    database: &Database,
+    filter: &ObservationFilter,
+    after: Option<ObservationCursor<AvailabilityStatId>>,
+    limit: usize,
+    scan_limit: usize,
+) -> Result<ObservationPage<AvailabilityStatRecord, AvailabilityStatId>, StorageError> {
+    let after = after.map(|cursor| ObservationCursor { observed_at: cursor.observed_at, record: cursor.record.get() });
+    let page = scan_observations(&read(database)?, AVAILABILITY_BY_SCOPE, OBSERVES, availability_from, filter, after, limit, scan_limit)?;
+    let next = page.next.map(|cursor| ObservationCursor { observed_at: cursor.observed_at, record: AvailabilityStatId::new(cursor.record) });
+    Ok(ObservationPage { records: page.records, next })
+}
+
+/// Test fault probe: replaces IN_PROJECT with a table of another key type,
+/// so every later read that traverses a Job's Projects fails instead of
+/// succeeding unnoticed.
+#[cfg(test)]
+pub(crate) fn break_project_links(database: &Database) -> Result<(), StorageError> {
+    let tx = database.begin_write()?;
+    tx.delete_table(IN_PROJECT)?;
+    tx.open_table(TableDefinition::<&str, u64>::new("in_project"))?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Test fault: removes a Job's HAS_INPUT edge, leaving its incoming index.
+#[cfg(test)]
+pub(crate) fn remove_input_link(database: &Database, job: JobId) -> Result<(), StorageError> {
+    let tx = database.begin_write()?;
+    tx.open_table(HAS_INPUT)?.remove(job.get())?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Checks every relationship table against its incoming index and its
@@ -2673,6 +3048,8 @@ pub(crate) fn read_current_health_checks(database: &Database, profile: ProfileId
 /// one line per inconsistency.
 #[cfg(test)]
 pub(crate) fn relationship_inconsistencies(database: &Database) -> Result<Vec<String>, StorageError> {
+    use std::collections::BTreeMap;
+
     fn ids(rx: &ReadTransaction, table: Records) -> Result<BTreeSet<u64>, StorageError> {
         let mut ids = BTreeSet::new();
         for entry in rx.open_table(table)?.iter()? {
@@ -2707,7 +3084,8 @@ pub(crate) fn relationship_inconsistencies(database: &Database) -> Result<Vec<St
     let projects = ids(&rx, PROJECTS)?;
     let agents = ids(&rx, AGENTS)?;
     let providers = ids(&rx, LLM_PROVIDERS)?;
-    let checks = ids(&rx, HEALTH_CHECKS)?;
+    let metrics = ids(&rx, METRICS)?;
+    let availability_stats = ids(&rx, AVAILABILITY_STATS)?;
     let mut profile_kinds = BTreeMap::new();
     for entry in rx.open_table(PROFILES)?.iter()? {
         let (id, bytes) = entry?;
@@ -2731,7 +3109,8 @@ pub(crate) fn relationship_inconsistencies(database: &Database) -> Result<Vec<St
     let in_project = set_pairs(&rx, IN_PROJECT)?;
     let uses_profile = set_pairs(&rx, USES_PROFILE)?;
     let uses_provider = link_pairs(&rx, USES_PROVIDER)?;
-    let checks_profile = link_pairs(&rx, CHECKS)?;
+    let measures = link_pairs(&rx, MEASURES)?;
+    let observes = link_pairs(&rx, OBSERVES)?;
     check_endpoints("HAS_INPUT", &has_input, &jobs, &inputs);
     check_endpoints("CHILD_OF", &child_of, &jobs, &jobs);
     check_endpoints("ASSIGNED_TO", &link_pairs(&rx, ASSIGNED_TO)?, &jobs, &executors);
@@ -2741,27 +3120,33 @@ pub(crate) fn relationship_inconsistencies(database: &Database) -> Result<Vec<St
     check_endpoints("IN_PROJECT", &in_project, &jobs, &projects);
     check_endpoints("USES_PROFILE", &uses_profile, &agents, &agent_profiles);
     check_endpoints("USES_PROVIDER", &uses_provider, &llm_profiles, &providers);
-    check_endpoints("CHECKS", &checks_profile, &checks, &llm_profiles);
+    check_endpoints("MEASURES", &measures, &metrics, &jobs);
+    check_endpoints("OBSERVES", &observes, &availability_stats, &jobs);
     let targets_llm = set_pairs(&rx, TARGETS_LLM)?;
     let applies_profile = link_pairs(&rx, APPLIES_PROFILE)?;
     let runs_llm_profile = link_pairs(&rx, RUNS_LLM_PROFILE)?;
-    let mut registrations = BTreeMap::new();
-    for entry in rx.open_table(SERVES)?.iter()? {
-        let (key, value) = entry?;
-        registrations.insert(key.value(), decode_served(value.value())?);
-    }
-    let serves: BTreeSet<(u64, u64)> = registrations.keys().copied().collect();
-    let mut llm_executors = BTreeSet::new();
-    for entry in rx.open_table(EXECUTORS)?.iter()? {
-        let (id, bytes) = entry?;
-        if ExecutorRow::decode(bytes.value())?.executor_type == ExecutorType::Llm {
-            llm_executors.insert(id.value());
-        }
-    }
     check_endpoints("TARGETS_LLM", &targets_llm, &agent_profiles, &llm_profiles);
     check_endpoints("APPLIES_PROFILE", &applies_profile, &jobs, &agent_profiles);
     check_endpoints("RUNS_LLM_PROFILE", &runs_llm_profile, &jobs, &llm_profiles);
-    check_endpoints("SERVES", &serves, &llm_executors, &llm_profiles);
+
+    let mut executor_rows = BTreeMap::new();
+    let mut expected_transports = BTreeSet::new();
+    for entry in rx.open_table(EXECUTORS)?.iter()? {
+        let (id, bytes) = entry?;
+        let row = ExecutorRow::decode(bytes.value())?;
+        if !row.llm_transports.is_empty() && row.executor_type != ExecutorType::Llm {
+            problems.push(format!("executor {} is not an Llm Executor but names LLM transports", id.value()));
+        }
+        expected_transports.extend(row.llm_transports.iter().map(|transport| (transport.code(), id.value())));
+        executor_rows.insert(id.value(), row);
+    }
+    let mut indexed_transports = BTreeSet::new();
+    for entry in rx.open_table(TRANSPORT_EXECUTORS)?.iter()? {
+        indexed_transports.insert(entry?.0.value());
+    }
+    if indexed_transports != expected_transports {
+        problems.push("the LLM transport index and the Executor records disagree".into());
+    }
 
     let ordinary_children: BTreeSet<(u64, u64)> = child_of.iter().copied().filter(|(child, parent)| child != parent).collect();
     for (name, forward, incoming) in [
@@ -2771,10 +3156,10 @@ pub(crate) fn relationship_inconsistencies(database: &Database) -> Result<Vec<St
         ("IN_PROJECT", &in_project, set_pairs(&rx, PROJECT_JOBS)?),
         ("USES_PROFILE", &uses_profile, set_pairs(&rx, PROFILE_AGENTS)?),
         ("USES_PROVIDER", &uses_provider, set_pairs(&rx, PROVIDER_PROFILES)?),
-        ("CHECKS", &checks_profile, set_pairs(&rx, PROFILE_CHECKS)?),
+        ("MEASURES", &measures, set_pairs(&rx, JOB_METRICS)?),
+        ("OBSERVES", &observes, set_pairs(&rx, JOB_AVAILABILITY)?),
         ("APPLIES_PROFILE", &applies_profile, set_pairs(&rx, AGENT_PROFILE_JOBS)?),
         ("RUNS_LLM_PROFILE", &runs_llm_profile, set_pairs(&rx, LLM_PROFILE_JOBS)?),
-        ("SERVES", &serves, set_pairs(&rx, SERVED_BY)?),
     ] {
         if reversed(forward) != incoming {
             problems.push(format!("{name} and its incoming index disagree"));
@@ -2806,6 +3191,45 @@ pub(crate) fn relationship_inconsistencies(database: &Database) -> Result<Vec<St
     }
     let agent_profile_of: BTreeMap<u64, u64> = applies_profile.iter().copied().collect();
     let llm_profile_of: BTreeMap<u64, u64> = runs_llm_profile.iter().copied().collect();
+    let mut targets = HashMap::new();
+    for (name, records, links, index, decode_at) in [
+        ("metrics", METRICS, &measures, METRICS_BY_SCOPE, (|bytes| MetricsRow::decode(bytes).map(|row| row.observed_at)) as fn(&[u8]) -> DecodeResult<Timestamp>),
+        ("availability_stat", AVAILABILITY_STATS, &observes, AVAILABILITY_BY_SCOPE, |bytes| AvailabilityStatRow::decode(bytes).map(|row| row.observed_at)),
+    ] {
+        let job_of: BTreeMap<u64, u64> = links.iter().copied().collect();
+        let mut expected = BTreeSet::new();
+        for entry in rx.open_table(records)?.iter()? {
+            let (id, bytes) = entry?;
+            let observed_at = decode_at(bytes.value())?.as_unix_micros();
+            let Some(job) = job_of.get(&id.value()) else {
+                problems.push(format!("{name} {} is linked to no Job", id.value()));
+                continue;
+            };
+            let target = job_target(&rx, &mut targets, JobId::new(*job))?;
+            if target.is_none() && name == "availability_stat" {
+                problems.push(format!("{name} {} observes a Job that ran no LLM", id.value()));
+            }
+            // Stated here rather than taken from `Scope::of`: a record without
+            // an LLM belongs to `All` only.
+            let mut scopes = vec![Scope::All];
+            if let Some(target) = &target {
+                let (provider, model) = (target.frozen.provider.id, target.frozen.config.model.as_str());
+                scopes.extend([Scope::LlmProfile(target.llm_profile), Scope::Provider(provider), Scope::Model(model), Scope::ProviderModel(provider, model)]);
+            }
+            for scope in scopes {
+                expected.insert((scope.key(), observed_at, id.value()));
+            }
+        }
+        let mut indexed = BTreeSet::new();
+        for entry in rx.open_table(index)?.iter()? {
+            let key = entry?.0;
+            let (scope, at, id) = key.value();
+            indexed.insert((scope.to_vec(), at, id));
+        }
+        if indexed != expected {
+            problems.push(format!("the {name} scope index disagrees with its records and their Jobs' frozen targets"));
+        }
+    }
     let assigned: BTreeMap<u64, u64> = link_pairs(&rx, ASSIGNED_TO)?.into_iter().collect();
     let input_of: BTreeMap<u64, u64> = has_input.iter().copied().collect();
     let job_inputs_table = rx.open_table(JOB_INPUTS)?;
@@ -2815,19 +3239,28 @@ pub(crate) fn relationship_inconsistencies(database: &Database) -> Result<Vec<St
             Some(input) => job_inputs_table.get(*input)?.map(|v| JobInputRow::decode(v.value())).transpose()?.and_then(|row| row.configuration),
             None => None,
         };
-        let unfinished = jobs_table.get(*job)?.map(|v| JobRow::decode(v.value())).transpose()?.is_some_and(|row| !row.confirmed_terminal());
+        let row = jobs_table.get(*job)?.map(|v| JobRow::decode(v.value())).transpose()?;
+        if row.as_ref().is_some_and(|row| row.stop_confirmed_at.is_some() && row.unknown_at.is_none()) {
+            problems.push(format!("job {job} has a confirmed stop without an unknown outcome"));
+        }
+        let holds = row.is_some_and(|row| row.holds_profiles());
         match (agent_profile_of.get(job), llm_profile_of.get(job), frozen) {
             (None, None, None) => {}
-            (Some(agent_profile), Some(llm_profile), Some(frozen)) => {
-                // Unfinished work holds both Profiles, so its submission-time
-                // target membership still holds; finished work keeps only provenance.
-                if unfinished && !targets_llm.contains(&(*agent_profile, *llm_profile)) {
-                    problems.push(format!("unfinished job {job} runs an LLM Profile its Agent Profile no longer targets"));
+            (agent_profile, Some(llm_profile), Some(frozen)) if agent_profile.is_some() == frozen.agent.is_some() => {
+                // A holding Job holds both Profiles, so its submission-time
+                // target membership still holds; released work keeps only provenance.
+                if let Some(agent_profile) = agent_profile
+                    && holds
+                    && !targets_llm.contains(&(*agent_profile, *llm_profile))
+                {
+                    problems.push(format!("holding job {job} runs an LLM Profile its Agent Profile no longer targets"));
                 }
                 if let Some(executor) = assigned.get(job)
-                    && registrations.get(&(*executor, *llm_profile)) != Some(&frozen.llm)
+                    && !executor_rows.get(executor).is_some_and(|row| {
+                        row.executor_type == ExecutorType::Llm && row.llm_transports.contains(&frozen.llm.provider.transport)
+                    })
                 {
-                    problems.push(format!("job {job} is assigned an Executor not registered for its frozen configuration"));
+                    problems.push(format!("job {job} is assigned an Executor that does not support its frozen transport"));
                 }
             }
             _ => problems.push(format!("job {job} has an incomplete configuration or snapshot")),
@@ -3072,12 +3505,14 @@ mod tests {
     #[test]
     fn insert_paths_cannot_rebind_a_job_profile_or_executor() {
         use crate::persistence::{
-            AgentConfig, ExecutionConfiguration, LlmConfig, LlmParameters, NewExecutor, NewLlmProvider, NewProfile, NewProfileConfig,
+            AgentConfig, ExecutionConfiguration, LlmConfig, LlmParameters, LlmTransport, NewExecutor, NewLlmProvider, NewProfile,
+            NewProfileConfig,
         };
         let test = TestDatabase::new("configuration");
         let (first, second, agent, other_agent, job, executor) = test
             .batch(1, |batch| {
-                let (provider, _) = persistence::create_llm_provider(batch, NewLlmProvider { name: "p".into(), endpoint: None, credential_ref: None })?;
+                let provider = NewLlmProvider { name: "p".into(), transport: LlmTransport::OpenAiChatCompletions, endpoint: None, credential_ref: None };
+                let (provider, _) = persistence::create_llm_provider(batch, provider)?;
                 let mut llm = |model: &str| {
                     let config = LlmConfig { model: model.into(), parameters: LlmParameters::default(), declared_capabilities: BTreeSet::new() };
                     persistence::create_profile(batch, NewProfile { name: model.into(), config: NewProfileConfig::Llm { provider, config } }).map(|(id, _)| id)
@@ -3092,10 +3527,10 @@ mod tests {
                     name: "llm".into(),
                     executor_type: ExecutorType::Llm,
                     concurrency_limit: std::num::NonZeroU32::MIN,
-                    serves: vec![first],
+                    llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
                 })?;
                 let (input, _) = persistence::save_job_input(batch, None, JobInputDraft::default())?;
-                let configuration = Some(ExecutionConfiguration { agent_profile: agent, llm_profile: first });
+                let configuration = Some(ExecutionConfiguration { agent_profile: Some(agent), llm_profile: first });
                 let (job, _) = persistence::create_job_with_input(batch, NewJob { configuration, ..new_job("child", test.genesis, Vec::new()) }, input)?;
                 Ok(((first, second, agent, other_agent, job, executor), MarkerSubjects::addressed(RecordRef::Job(job))))
             })
@@ -3109,8 +3544,9 @@ mod tests {
 
         // Every rebinding names Profiles that exist and would be valid on a new Job.
         for (sequence, rebinding) in (2..).zip([
-            ExecutionConfiguration { agent_profile: agent, llm_profile: second },
-            ExecutionConfiguration { agent_profile: other_agent, llm_profile: second },
+            ExecutionConfiguration { agent_profile: Some(agent), llm_profile: second },
+            ExecutionConfiguration { agent_profile: Some(other_agent), llm_profile: second },
+            ExecutionConfiguration { agent_profile: None, llm_profile: second },
         ]) {
             let outcome = test.batch(sequence, |batch| {
                 batch.link_configuration(job, rebinding)?;
@@ -3118,16 +3554,15 @@ mod tests {
             });
             assert!(matches!(outcome, Err(BatchFailure::Rejected(Violation::ConfigurationFixed(_)))), "got {outcome:?}");
         }
-        let readd = test.batch(4, |batch| {
+        let readd = test.batch(5, |batch| {
             let row = ProfileRow { id: agent, name: "agent".into(), config: ProfileConfig::Agent(AgentConfig::default()), created_at: batch.now(), updated_at: batch.now() };
             batch.insert_profile(&row, &ProfileLinks::Agent { llm_targets: vec![second] })?;
             Ok(((), MarkerSubjects::addressed(RecordRef::Profile(agent))))
         });
         assert!(matches!(readd, Err(BatchFailure::Rejected(Violation::DuplicateId(RecordRef::Profile(_))))), "got {readd:?}");
-        let reregister = test.batch(5, |batch| {
+        let reregister = test.batch(6, |batch| {
             let row = batch.require_executor_row(executor)?;
-            let configuration = batch.freeze_llm(second)?;
-            batch.insert_executor(&[ServedConfiguration { profile: second, configuration }], &row)?;
+            batch.insert_executor(&ExecutorRow { llm_transports: BTreeSet::new(), ..row })?;
             Ok(((), MarkerSubjects::addressed(RecordRef::Executor(executor))))
         });
         assert!(matches!(reregister, Err(BatchFailure::Rejected(Violation::DuplicateId(RecordRef::Executor(_))))), "got {reregister:?}");

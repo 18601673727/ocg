@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -15,12 +14,14 @@ use crate::disk_protection::{
     RecoveryReport, ReopenFailure, SharedRequest, SpaceMeasurement, SpaceShortage,
 };
 use crate::persistence::{
-    self, AgentId, AgentRecord, AppendedOutput, ExecutorId, HealthCheckId, HealthCheckRecord,
-    JobFinalization, JobId, JobInputDraft, JobInputId, JobOutputRecord, JobRecord, JobRetry,
-    LlmProviderId, LlmProviderRecord, ModelCapability, NewAgent, NewExecutor, NewHealthCheck,
-    NewJob, NewJobOutput, NewLlmProvider, NewProfile, NewProfileConfig, NewProject, OperationId,
-    OperationKind, OperationMarker, Profile, ProfileId, ProfileRecord, ProfileVariant, ProjectId,
-    ProjectRecord, Timestamp, Violation, WrongProfileKind,
+    self, AgentId, AgentRecord, AppendedOutput, AvailabilityStatId, AvailabilityStatRecord,
+    ExecutorId, JobFinalization, JobId, JobInputDraft, JobInputId, JobOutputRecord, JobRecord,
+    JobRetry, LlmProviderId, LlmProviderRecord, MetricsId, MetricsRecord, NewAgent,
+    NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput, NewLlmProvider, NewMetrics,
+    NewProfile, NewProfileConfig, NewProject, ObservationCursor, ObservationFilter,
+    ObservationPage, ObservedModel, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile, ProfileId,
+    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, Timestamp, Violation,
+    WrongProfileKind,
 };
 use crate::storage::{self, BatchError, BatchFailure, MarkerSubjects, OpenError, OpenedFile};
 use crate::system_policy::{self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError};
@@ -30,6 +31,10 @@ pub const COMMAND_QUEUE_CAPACITY: usize = 256;
 /// Reads run on this many dedicated threads, separate from the write worker.
 pub const READ_WORKERS: usize = 2;
 pub const READ_QUEUE_CAPACITY: usize = 64;
+/// The most index entries one observation query reads, matching or not.
+pub const MAX_OBSERVATION_SCAN: usize = storage::MAX_OBSERVATION_SCAN;
+/// The most distinct (Provider, model) pairs one choice query examines.
+pub const MAX_OBSERVED_MODEL_SCAN: usize = storage::MAX_OBSERVED_MODEL_SCAN;
 /// At most one space check and one recovery are pending at a time; later
 /// requests join them.
 const CONTROL_QUEUE_CAPACITY: usize = 2;
@@ -326,11 +331,18 @@ enum Command {
         agent: NewAgent,
         reply: Reply<AgentId>,
     },
-    RecordHealthCheck {
-        profile: ProfileId,
-        // Boxed so its configuration snapshot does not size every queued command.
-        check: Box<NewHealthCheck>,
-        reply: Reply<HealthCheckId>,
+    ConfirmJobStopped {
+        job: JobId,
+        reply: Reply<()>,
+    },
+    // Observations are boxed so they do not size every queued command.
+    RecordMetrics {
+        metrics: Box<NewMetrics>,
+        reply: Reply<MetricsId>,
+    },
+    RecordAvailabilityStat {
+        stat: Box<NewAvailabilityStat>,
+        reply: Reply<AvailabilityStatId>,
     },
 }
 
@@ -387,8 +399,14 @@ impl Command {
             Self::CreateAgent { agent, reply } => run(database, operation, Kind::CreateAgent, reply, |batch| {
                 persistence::create_agent(batch, agent)
             }),
-            Self::RecordHealthCheck { profile, check, reply } => run(database, operation, Kind::RecordHealthCheck, reply, |batch| {
-                persistence::record_health_check(batch, profile, *check)
+            Self::ConfirmJobStopped { job, reply } => run(database, operation, Kind::ConfirmJobStopped, reply, |batch| {
+                persistence::confirm_job_stopped(batch, job)
+            }),
+            Self::RecordMetrics { metrics, reply } => run(database, operation, Kind::RecordMetrics, reply, |batch| {
+                persistence::record_metrics(batch, *metrics)
+            }),
+            Self::RecordAvailabilityStat { stat, reply } => run(database, operation, Kind::RecordAvailabilityStat, reply, |batch| {
+                persistence::record_availability_stat(batch, *stat)
             }),
         }
     }
@@ -398,15 +416,15 @@ impl Command {
     /// rather than wraps, so an absurd payload fails the space check.
     fn expected_write_bytes(&self) -> u64 {
         let payload = match self {
-            Self::BeginCoreLogCleanup { started, .. } => output_bytes(&started.summary, &started.code).saturating_add(256),
+            Self::BeginCoreLogCleanup { started, .. } => output_bytes(&started.summary, &started.code, &started.value).saturating_add(256),
             Self::SaveJobInput { draft, .. } => text_bytes(&draft.submission_id).saturating_add(text_bytes(&draft.objective)),
             Self::CreateJobWithInput { job, .. } => text_bytes(&job.name),
             Self::RetryJob { retry, .. } => text_bytes(&retry.name),
-            Self::StartJob { .. } | Self::AssignJobExecutor { .. } | Self::AssociateJobProject { .. } => 0,
-            Self::AppendJobOutput { output, .. } => output_bytes(&output.summary, &output.code),
+            Self::StartJob { .. } | Self::AssignJobExecutor { .. } | Self::AssociateJobProject { .. } | Self::ConfirmJobStopped { .. } => 0,
+            Self::AppendJobOutput { output, .. } => output_bytes(&output.summary, &output.code, &output.value),
             Self::FinalizeJob { finalization, .. } => match finalization {
                 JobFinalization::Completed(result) | JobFinalization::Failed(result) | JobFinalization::Cancelled(result) => {
-                    output_bytes(&result.summary, &result.code)
+                    output_bytes(&result.summary, &result.code, &result.value)
                 }
                 JobFinalization::Unknown => 0,
             },
@@ -420,13 +438,16 @@ impl Command {
                 NewProfileConfig::Llm { config, .. } => byte_count(config.model.len()),
             }),
             Self::CreateAgent { agent, .. } => byte_count(agent.name.len()),
-            Self::RecordHealthCheck { check, .. } => {
-                let failure = match &check.outcome {
-                    persistence::HealthCheckOutcome::Passed => 0,
-                    persistence::HealthCheckOutcome::Failed(error) => byte_count(error.to_string().len()).saturating_mul(2),
-                };
-                let raw_usage = check.usage.raw.as_ref().map_or(0, |raw| byte_count(raw.to_string().len()));
-                failure.saturating_add(raw_usage)
+            Self::RecordMetrics { metrics, .. } => json_bytes(&metrics.measurements.usage.raw),
+            Self::RecordAvailabilityStat { stat, .. } => {
+                let observation = &stat.observation;
+                let failure = observation.failure.as_ref().map_or(0, |failure| {
+                    byte_count(failure.message.len())
+                        .saturating_add(text_bytes(&failure.provider_code))
+                        .saturating_add(text_bytes(&failure.response_body))
+                        .saturating_add(text_bytes(&failure.request_id))
+                });
+                failure.saturating_add(text_bytes(&observation.raw_finish_reason))
             }
         };
         payload.saturating_mul(2).saturating_add(TRANSACTION_ALLOWANCE_BYTES)
@@ -448,7 +469,9 @@ impl Command {
             Self::CreateProfile { reply, .. } => refuse(reply, error),
             Self::UpdateProfile { reply, .. } => refuse(reply, error),
             Self::CreateAgent { reply, .. } => refuse(reply, error),
-            Self::RecordHealthCheck { reply, .. } => refuse(reply, error),
+            Self::ConfirmJobStopped { reply, .. } => refuse(reply, error),
+            Self::RecordMetrics { reply, .. } => refuse(reply, error),
+            Self::RecordAvailabilityStat { reply, .. } => refuse(reply, error),
         }
     }
 }
@@ -465,8 +488,12 @@ fn text_bytes(text: &Option<String>) -> u64 {
     text.as_ref().map_or(0, |text| byte_count(text.len()))
 }
 
-fn output_bytes(summary: &Option<String>, code: &Option<String>) -> u64 {
-    text_bytes(summary).saturating_add(text_bytes(code))
+fn json_bytes(value: &Option<serde_json::Value>) -> u64 {
+    value.as_ref().map_or(0, |value| byte_count(value.to_string().len()))
+}
+
+fn output_bytes(summary: &Option<String>, code: &Option<String>, value: &Option<serde_json::Value>) -> u64 {
+    text_bytes(summary).saturating_add(text_bytes(code)).saturating_add(json_bytes(value))
 }
 
 /// A storage failure that ends this opening of the database.
@@ -1664,27 +1691,19 @@ impl DatabaseHandle {
         self.read(move |database| storage::read_job_configuration(database, job)).await
     }
 
-    /// The Executors registered for an LLM Profile as it is configured now,
-    /// oldest first. This lists candidates for new work only; it neither
-    /// ranks nor reserves them.
+    /// The Executors that support the transport of an LLM Profile's Provider
+    /// as configured now, oldest first, at most 1,000. This lists candidates
+    /// for new work only; it neither ranks nor reserves them, and running on
+    /// any of them never changes the Provider, model or parameters.
     pub async fn compatible_executors(&self, llm_profile: ProfileId) -> Result<Vec<ExecutorId>, DatabaseError> {
         self.read(move |database| storage::read_compatible_executors(database, llm_profile)).await
     }
 
-    /// The Executors registered for exactly the LLM configuration a
-    /// submitted Job froze, oldest first; empty for an unconfigured Job.
+    /// The Executors that support the transport of the LLM configuration a
+    /// submitted Job froze, oldest first, at most 1,000; empty for an
+    /// unconfigured Job.
     pub async fn job_compatible_executors(&self, job: JobId) -> Result<Vec<ExecutorId>, DatabaseError> {
         self.read(move |database| storage::read_job_compatible_executors(database, job)).await
-    }
-
-    /// An LLM Profile's configuration as it is now, for a HealthCheck to
-    /// capture when it starts. Refused for an Agent Profile.
-    pub async fn current_llm_configuration(&self, profile: ProfileId) -> Result<Option<persistence::FrozenLlmConfig>, DatabaseError> {
-        match self.read(move |database| storage::read_current_llm_configuration(database, profile)).await? {
-            Some(Ok(configuration)) => Ok(Some(configuration)),
-            Some(Err(mismatch)) => Err(DatabaseError::WrongProfileKind(mismatch)),
-            None => Ok(None),
-        }
     }
 
     /// Whether a Profile can be edited now, with the unfinished Jobs that
@@ -1806,17 +1825,76 @@ impl DatabaseHandle {
         self.read(move |database| storage::read_agent(database, id)).await
     }
 
-    /// An LLM Profile's HealthCheck history in recording order, strictly
-    /// after `after` when given; at most 1,000 per call.
-    pub async fn health_checks(&self, profile: ProfileId, after: Option<HealthCheckId>, limit: usize) -> Result<Vec<HealthCheckRecord>, DatabaseError> {
-        self.read(move |database| storage::read_health_checks(database, profile, after, limit)).await
+    /// A Job's Metrics in recording order, strictly after `after` when
+    /// given; at most 1,000 per call.
+    pub async fn job_metrics(&self, job: JobId, after: Option<MetricsId>, limit: usize) -> Result<Vec<MetricsRecord>, DatabaseError> {
+        self.read(move |database| storage::read_job_metrics(database, job, after, limit)).await
     }
 
-    /// The newest HealthCheck of each capability that checked the
-    /// Profile's current configuration. A capability that no such check
-    /// verified has no entry, whatever was declared or verified before an edit.
-    pub async fn current_health_checks(&self, profile: ProfileId) -> Result<BTreeMap<ModelCapability, HealthCheckRecord>, DatabaseError> {
-        self.read(move |database| storage::read_current_health_checks(database, profile)).await
+    /// A Job's AvailabilityStats in recording order, strictly after `after`
+    /// when given; at most 1,000 per call.
+    pub async fn job_availability(&self, job: JobId, after: Option<AvailabilityStatId>, limit: usize) -> Result<Vec<AvailabilityStatRecord>, DatabaseError> {
+        self.read(move |database| storage::read_job_availability(database, job, after, limit)).await
+    }
+
+    /// One page of the Metrics `filter` selects, in observation order
+    /// (`observed_at`, then record ID), strictly after `after` when given.
+    /// Pass the returned `next` back as `after` to continue; a page can be
+    /// empty while `next` is set. At most `limit` records (clamped to
+    /// 1..=1,000) per page, and at most [`MAX_OBSERVATION_SCAN`] index
+    /// entries read, matching or not. Each record names the target its Job
+    /// froze, not a Profile's current values.
+    pub async fn metrics(
+        &self,
+        filter: ObservationFilter,
+        after: Option<ObservationCursor<MetricsId>>,
+        limit: usize,
+    ) -> Result<ObservationPage<MetricsRecord, MetricsId>, DatabaseError> {
+        self.read(move |database| storage::read_metrics(database, &filter, after, limit, MAX_OBSERVATION_SCAN)).await
+    }
+
+    /// One page of the AvailabilityStats `filter` selects, paged like
+    /// [`Self::metrics`]. These are raw observations; no availability
+    /// verdict or rate is derived from them here.
+    pub async fn availability_stats(
+        &self,
+        filter: ObservationFilter,
+        after: Option<ObservationCursor<AvailabilityStatId>>,
+        limit: usize,
+    ) -> Result<ObservationPage<AvailabilityStatRecord, AvailabilityStatId>, DatabaseError> {
+        self.read(move |database| storage::read_availability_stats(database, &filter, after, limit, MAX_OBSERVATION_SCAN)).await
+    }
+
+    /// One page of the distinct (Provider, model) pairs that LLM Metrics or
+    /// AvailabilityStats observed within `filter`'s time range were recorded
+    /// against, as their Jobs froze them, ordered by Provider ID and then by
+    /// model name bytes, strictly after `after` when given. Pass the
+    /// returned `next` back as `after` to continue; a page can be empty while
+    /// `next` is set. At most `limit` choices (clamped to 1..=1,000) and
+    /// [`MAX_OBSERVED_MODEL_SCAN`] examined pairs per call.
+    ///
+    /// Each call reads one snapshot; separate calls do not share one. Records
+    /// are never removed, so a pair a page returned never stops being a
+    /// choice, and pages never repeat a pair. A pair first recorded, or first
+    /// observed within the range, after a later page has passed its position
+    /// is not revisited.
+    pub async fn observed_models(
+        &self,
+        filter: ObservedModelFilter,
+        after: Option<ObservedModel>,
+        limit: usize,
+    ) -> Result<ObservedModelPage, DatabaseError> {
+        self.read(move |database| storage::read_observed_models(database, &filter, after.as_ref(), limit, MAX_OBSERVED_MODEL_SCAN)).await
+    }
+
+    /// Runs `f` on a read worker with the open database, for tests that
+    /// inject a storage fault into the database the worker is using.
+    #[cfg(test)]
+    pub(crate) async fn with_database<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Database) -> Result<T, StorageError> + Send + 'static,
+    ) -> Result<T, DatabaseError> {
+        self.read(f).await
     }
 
     /// Operation markers in identifier order, strictly after `after` when
@@ -1899,9 +1977,27 @@ impl DatabaseHandle {
         self.submit(|reply| Command::CreateAgent { agent, reply }).await
     }
 
-    /// Appends a HealthCheck fact for an LLM Profile without changing it.
-    pub async fn record_health_check(&self, profile: ProfileId, check: NewHealthCheck) -> Result<HealthCheckId, DatabaseError> {
-        self.submit(|reply| Command::RecordHealthCheck { profile, check: Box::new(check), reply }).await
+    /// Records that an unknown-outcome Job's execution has actually stopped,
+    /// releasing the Profiles it holds; the outcome stays unknown. Only the
+    /// trusted execution path that observed the termination may call this,
+    /// so it is not part of the public API.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the runtime runs no provider execution yet whose termination it could observe")
+    )]
+    pub(crate) async fn confirm_job_stopped(&self, job: JobId) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::ConfirmJobStopped { job, reply }).await
+    }
+
+    /// Appends measurements for a Job. Their LLM is the one the Job froze.
+    pub async fn record_metrics(&self, metrics: NewMetrics) -> Result<MetricsId, DatabaseError> {
+        self.submit(|reply| Command::RecordMetrics { metrics: Box::new(metrics), reply }).await
+    }
+
+    /// Appends one availability observation of an LLM request a configured
+    /// Job sent. Its LLM is the one the Job froze.
+    pub async fn record_availability_stat(&self, stat: NewAvailabilityStat) -> Result<AvailabilityStatId, DatabaseError> {
+        self.submit(|reply| Command::RecordAvailabilityStat { stat: Box::new(stat), reply }).await
     }
 }
 
