@@ -12,18 +12,19 @@ use serde_json::json;
 
 use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::orchestration::execution_runtime::{
-    ExecutionPlan, ExecutionRuntime, ExecutionRuntimeError,
+    ExecutionPlan, ExecutionRuntime, ExecutionRuntimeError, settle_provider_error,
 };
 use crate::persistence::{
     AgentConfig, AvailabilityObservation, AvailabilityStatId, AvailabilityStatRecord,
     DependencyCondition, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType,
     FinalResult, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobOutcome,
-    JobRetry, LlmConfig, LlmParameters, LlmProviderId, LlmTarget, LlmTransport, Measurements,
-    MetricsRecord, ModelCapability, NewAgent, NewAvailabilityStat, NewExecutor, NewJob,
-    NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
+    JobRecord, JobRetry, LlmConfig, LlmParameters, LlmProviderId, LlmTarget, LlmTransport,
+    Measurements, MetricsRecord, ModelCapability, NewAgent, NewAvailabilityStat, NewExecutor,
+    NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
     ObservationCursor, ObservationFilter, OutputKind, ProfileId, ProfileKind, ProjectId, RecordRef,
     RetryInput, TimeRange, Timestamp, Violation, WrongProfileKind,
 };
+use crate::provider_execution::{ProviderExecutionError, ResponseFacts};
 use crate::test_support::{TestRoot, data_directory as test_data_directory, poll_once, wait};
 
 const SUITE: &str = "ocg-schema";
@@ -3632,6 +3633,237 @@ fn statistics_target_lookup_reads_no_project_associations() {
         before.4,
         "a Job without an LLM needs no input to be measured"
     );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn job_observation_reads_are_empty_without_records_and_corrupt_only_when_dangling() {
+    let (_root, directory) = data_directory("job-observation-reads");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let unknown = JobId::new(9_999);
+    let unobserved = configured_child(&handle, agent, targeted);
+    let measured = configured_child(&handle, agent, targeted);
+    wait(handle.record_metrics(NewMetrics {
+        job: measured,
+        observed_at: at(100),
+        measurements: Measurements {
+            request_finished_in_ms: Some(10),
+            ..Measurements::default()
+        },
+    }))
+    .expect("record Metrics");
+    wait(handle.record_availability_stat(NewAvailabilityStat {
+        job: measured,
+        observed_at: at(100),
+        observation: response(200),
+    }))
+    .expect("record AvailabilityStat");
+    fn corrupted<T>(result: Result<T, DatabaseError>) -> bool {
+        matches!(result, Err(DatabaseError::Read(error)) if error.kind == crate::database::StorageErrorKind::Corrupted)
+    }
+    let empty = |handle: &DatabaseHandle, job| {
+        wait(handle.job_metrics(job, None, 10))
+            .expect("read Metrics of a Job without records")
+            .is_empty()
+            && wait(handle.job_availability(job, None, 10))
+                .expect("read AvailabilityStats of a Job without records")
+                .is_empty()
+    };
+
+    assert!(
+        empty(&handle, unknown),
+        "an unknown Job has no records and reads an empty page"
+    );
+    assert!(
+        empty(&handle, unobserved),
+        "a configured Job without records reads an empty page"
+    );
+
+    // An empty page never resolves the frozen target, so a broken input is not read.
+    wait(
+        handle
+            .with_database(move |database| crate::storage::remove_input_link(database, unobserved)),
+    )
+    .expect("remove the input link");
+    assert!(
+        empty(&handle, unobserved),
+        "a Job without records needs no frozen target"
+    );
+
+    // Records whose Job row is gone are dangling references and must not read as empty.
+    wait(handle.with_database(move |database| crate::storage::remove_job_row(database, measured)))
+        .expect("remove the Job row");
+    assert!(corrupted(wait(handle.job_metrics(measured, None, 10))));
+    assert!(corrupted(wait(handle.job_availability(measured, None, 10))));
+    worker.shutdown().expect("shutdown");
+}
+
+/// A started, configured Job whose provider outcome `error` settles.
+fn settled(
+    handle: &DatabaseHandle,
+    agent: ProfileId,
+    targeted: ProfileId,
+    executor: ExecutorId,
+    error: ProviderExecutionError,
+) -> (JobRecord, Vec<AvailabilityStatRecord>) {
+    let job = configured_child(handle, agent, targeted);
+    wait(handle.start_job(job)).expect("start job");
+    let input = wait(handle.job(job))
+        .expect("read job")
+        .expect("job exists")
+        .input;
+    wait(settle_provider_error(
+        handle.clone(),
+        executor,
+        input,
+        job,
+        error,
+    ))
+    .expect("settle the provider outcome");
+    let record = wait(handle.job(job))
+        .expect("read job")
+        .expect("job exists");
+    let observations =
+        wait(handle.job_availability(job, None, 10)).expect("read AvailabilityStats");
+    (record, observations)
+}
+
+#[test]
+fn a_local_stop_settles_unknown_and_records_only_the_response_facts_it_had() {
+    let (_root, directory) = data_directory("local-stop");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let executor =
+        executor(&handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register Executor");
+    let facts = |finish_reason, raw_finish_reason: Option<&str>| ResponseFacts {
+        status_code: 200,
+        finish_reason,
+        raw_finish_reason: raw_finish_reason.map(str::to_owned),
+    };
+
+    // A user cancellation after the response began: the finish reason was seen.
+    let (cancelled, observations) = settled(
+        &handle,
+        agent,
+        targeted,
+        executor,
+        ProviderExecutionError::Stopped {
+            message: "provider execution was cancelled while streaming".into(),
+            facts: facts(Some(ChatFinishReason::Stop), Some("stop")),
+        },
+    );
+    assert!(
+        cancelled.unknown_at.is_some() && cancelled.failed_at.is_none(),
+        "a local stop leaves the Job's outcome unknown, not failed"
+    );
+    assert_eq!(
+        observations
+            .iter()
+            .map(|record| record.observation.clone())
+            .collect::<Vec<_>>(),
+        [response(200)],
+        "the response facts are kept, and no provider failure is invented"
+    );
+
+    // A local output-write failure before any finish event.
+    let (written, observations) = settled(
+        &handle,
+        agent,
+        targeted,
+        executor,
+        ProviderExecutionError::Stopped {
+            message: "database could not persist provider output".into(),
+            facts: facts(None, None),
+        },
+    );
+    assert!(written.unknown_at.is_some() && written.failed_at.is_none());
+    assert_eq!(
+        observations
+            .iter()
+            .map(|record| record.observation.clone())
+            .collect::<Vec<_>>(),
+        [AvailabilityObservation {
+            status_code: Some(200),
+            finish_reason: None,
+            raw_finish_reason: None,
+            failure: None,
+        }],
+        "a local write failure is not a provider failure"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn provider_and_transport_failures_are_observed_and_refused_requests_are_not() {
+    let (_root, directory) = data_directory("provider-failures");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let executor =
+        executor(&handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register Executor");
+
+    let transport = ProviderExecutionError::Unknown {
+        message: "connection reset".into(),
+    };
+    let transport_message = transport.to_string();
+    let (job, observations) = settled(&handle, agent, targeted, executor, transport);
+    assert!(job.unknown_at.is_some() && job.failed_at.is_none());
+    assert_eq!(
+        observations
+            .iter()
+            .map(|record| record.observation.clone())
+            .collect::<Vec<_>>(),
+        [failure(ProviderFailure {
+            message: transport_message,
+            ..ProviderFailure::default()
+        })],
+        "a transport failure is a genuine observation"
+    );
+
+    let rejected = provider_failure("rate limited", Some(429), true);
+    let (job, observations) = settled(
+        &handle,
+        agent,
+        targeted,
+        executor,
+        ProviderExecutionError::Rejected {
+            failure: rejected.clone(),
+        },
+    );
+    assert!(job.failed_at.is_some() && job.unknown_at.is_none());
+    assert_eq!(
+        observations
+            .iter()
+            .map(|record| record.observation.clone())
+            .collect::<Vec<_>>(),
+        [failure(rejected)],
+        "a genuine HTTP rejection keeps its status and failure"
+    );
+
+    for error in [
+        ProviderExecutionError::NotDelivered {
+            message: "refused".into(),
+        },
+        ProviderExecutionError::Build {
+            message: "bad request".into(),
+        },
+    ] {
+        let (job, observations) = settled(&handle, agent, targeted, executor, error);
+        assert!(job.failed_at.is_some() && job.unknown_at.is_none());
+        assert!(
+            observations.is_empty(),
+            "a request refused before delivery has no observation"
+        );
+    }
     worker.shutdown().expect("shutdown");
 }
 

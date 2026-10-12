@@ -2906,11 +2906,17 @@ fn observation_job(rx: &ReadTransaction, link: Link, id: u64) -> Result<JobId, S
     read_link(rx, link, id)?.map(JobId::new).ok_or_else(|| StorageError::corrupted(format!("observation record {id} is linked to no Job")))
 }
 
-/// Records a Job links to through `incoming`, in recording order.
+/// Records a Job links to through `incoming`, in recording order. The page of
+/// linked IDs is read first, so a Job with no observations needs no frozen
+/// target: only a page with records resolves the Job's target, and a dangling
+/// link there is corrupted.
 fn job_observations<T>(rx: &ReadTransaction, incoming: PairSet, build: BuildObservation<T>, job: JobId, after: Option<u64>, limit: usize) -> Result<Vec<T>, StorageError> {
-    let mut cache = HashMap::new();
-    let target = job_target(rx, &mut cache, job)?;
-    read_pairs(rx, incoming, job.get(), after, limit.min(MAX_PAGE))?.into_iter().map(|id| build(rx, id, job, target.clone())).collect()
+    let ids = read_pairs(rx, incoming, job.get(), after, limit.min(MAX_PAGE))?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let target = frozen_llm_target(rx, job)?;
+    ids.into_iter().map(|id| build(rx, id, job, target.clone())).collect()
 }
 
 /// One page of an observation query. It range-reads the filter's scope from
@@ -3016,7 +3022,8 @@ fn next_provider_model(table: &impl ReadableTable<(&'static [u8], i64, u64), ()>
 
 /// Whether `index` has an entry of `scope` observed within [from, until).
 fn observed_within(table: &impl ReadableTable<(&'static [u8], i64, u64), ()>, scope: &[u8], from: i64, until: i64) -> Result<bool, StorageError> {
-    Ok(table.range((scope, from, 0)..(scope, until, 0))?.next().is_some())
+    // An iteration error is a read failure, not evidence that an entry exists.
+    Ok(table.range((scope, from, 0)..(scope, until, 0))?.next().transpose()?.is_some())
 }
 
 /// One page of distinct historical (Provider, model) pairs from the
@@ -3126,6 +3133,16 @@ pub(crate) fn break_project_links(database: &Database) -> Result<(), StorageErro
 pub(crate) fn remove_input_link(database: &Database, job: JobId) -> Result<(), StorageError> {
     let tx = database.begin_write()?;
     tx.open_table(HAS_INPUT)?.remove(job.get())?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Test fault: removes a Job's row while its observations still link to it,
+/// a dangling observation reference.
+#[cfg(test)]
+pub(crate) fn remove_job_row(database: &Database, job: JobId) -> Result<(), StorageError> {
+    let tx = database.begin_write()?;
+    tx.open_table(JOBS)?.remove(job.get())?;
     tx.commit()?;
     Ok(())
 }

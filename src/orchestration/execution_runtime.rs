@@ -15,8 +15,8 @@ use crate::persistence::{
     Timestamp,
 };
 use crate::provider_execution::{
-    self, CredentialResolver, EnvironmentCredentialResolver, ProviderExecutionConfig,
-    ProviderExecutionError, ProviderOutputSink,
+    self, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
+    ProviderExecutionConfig, ProviderExecutionError, ProviderOutputSink,
 };
 
 pub const SCHEDULER_QUEUE_CAPACITY: usize = 64;
@@ -494,7 +494,7 @@ impl ProviderOutputSink for DatabaseOutputSink {
     fn append<'a>(
         &'a mut self,
         text: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProviderExecutionError>> + 'a>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OutputSinkError>> + 'a>>
     {
         Box::pin(async move {
             self.database
@@ -510,14 +510,17 @@ impl ProviderOutputSink for DatabaseOutputSink {
                 )
                 .await
                 .map(|_| ())
-                .map_err(|error| ProviderExecutionError::Unknown {
+                .map_err(|error| OutputSinkError {
                     message: format!("database could not persist provider output: {error}"),
                 })
         })
     }
 }
 
-async fn settle_provider_error(
+/// Settles a failed provider execution. Its Job outcome follows the error
+/// alone; its availability observation records only the facts the error
+/// carries, see [`provider_execution::error_observation`].
+pub(crate) async fn settle_provider_error(
     database: DatabaseHandle,
     executor: ExecutorId,
     input: JobInputId,
@@ -526,7 +529,9 @@ async fn settle_provider_error(
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let unknown = matches!(
         error,
-        ProviderExecutionError::Unknown { .. } | ProviderExecutionError::Incomplete { .. }
+        ProviderExecutionError::Unknown { .. }
+            | ProviderExecutionError::Incomplete { .. }
+            | ProviderExecutionError::Stopped { .. }
     );
     let result = if unknown {
         database.finalize_job(job, JobFinalization::Unknown).await?
@@ -543,15 +548,12 @@ async fn settle_provider_error(
             )
             .await?
     };
-    if !matches!(
-        error,
-        ProviderExecutionError::NotDelivered { .. } | ProviderExecutionError::Build { .. }
-    ) {
+    if let Some(observation) = provider_execution::error_observation(&error) {
         database
             .record_availability_stat(NewAvailabilityStat {
                 job,
                 observed_at: Timestamp::now(),
-                observation: provider_execution::error_observation(&error),
+                observation,
             })
             .await?;
     }

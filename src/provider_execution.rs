@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
 use ntex::client::{Client, ClientResponse, error::ClientError};
-use ntex::http::StatusCode;
 use ntex::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use ntex::http::{Payload, StatusCode};
 use ntex::time::Millis;
 use serde_json::{Value, json};
 
@@ -38,7 +38,14 @@ pub trait ProviderOutputSink {
     fn append<'a>(
         &'a mut self,
         text: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ProviderExecutionError>> + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>>;
+}
+
+/// A local failure to persist a streamed delta. It is a fact about this
+/// runtime, not about the provider, so it never becomes a provider failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSinkError {
+    pub message: String,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -105,6 +112,16 @@ pub struct ProviderExecutionResult {
     pub finished_in: Duration,
 }
 
+/// The facts of a provider response observed before execution stopped on
+/// this side. The status is always present: a stop happens only after the
+/// response head arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseFacts {
+    pub status_code: u16,
+    pub finish_reason: Option<ChatFinishReason>,
+    pub raw_finish_reason: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderExecutionError {
     #[error("provider request could not be built: {message}")]
@@ -117,6 +134,15 @@ pub enum ProviderExecutionError {
     Rejected { failure: ProviderFailure },
     #[error("provider stream was incomplete: {message}")]
     Incomplete { message: String },
+    /// Execution stopped on this side after the provider had answered: the
+    /// caller cancelled, or the runtime could not persist streamed output.
+    /// Neither is a provider or transport fault, so only the response facts
+    /// already observed are kept.
+    #[error("provider execution stopped locally: {message}")]
+    Stopped {
+        message: String,
+        facts: ResponseFacts,
+    },
 }
 
 impl ProviderExecutionError {
@@ -215,10 +241,12 @@ async fn execute_chat_inner(
         });
     }
 
+    let payload = response.take_payload();
     ntex::time::timeout(
         config.timeout,
         parse_stream(
-            response,
+            payload,
+            status,
             started,
             request_id,
             config.max_output_bytes,
@@ -276,14 +304,14 @@ fn request_body(
 }
 
 async fn parse_stream(
-    response: ClientResponse,
+    mut payload: Payload,
+    status_code: u16,
     started: Instant,
     request_id: Option<String>,
     max_output_bytes: usize,
     cancellation: CancellationToken,
     mut sink: Option<&mut dyn ProviderOutputSink>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-    let mut payload = response.take_payload();
     let mut buffer = Vec::with_capacity(MAX_SSE_LINE_BYTES);
     let mut text = String::new();
     let mut usage = NormalizedUsage::default();
@@ -291,13 +319,15 @@ async fn parse_stream(
     let mut raw_finish_reason = None;
     let mut saw_event = false;
     let mut first_byte = None;
-    let status_code = response.status().as_u16();
 
     while let Some(chunk) = payload.recv().await {
         if cancellation.is_cancelled() {
-            return Err(ProviderExecutionError::Unknown {
-                message: "provider execution was cancelled while streaming".to_owned(),
-            });
+            return Err(local_stop(
+                "provider execution was cancelled while streaming",
+                status_code,
+                finish_reason,
+                raw_finish_reason.as_deref(),
+            ));
         }
         let chunk = chunk.map_err(|error| ProviderExecutionError::Unknown {
             message: error.to_string(),
@@ -345,9 +375,27 @@ async fn parse_stream(
             if let Some(delta) = delta.as_deref()
                 && let Some(sink) = sink.as_deref_mut()
             {
-                sink.append(delta).await?;
+                // The failed delta's event is already applied, so its finish reason is kept.
+                sink.append(delta).await.map_err(|error| {
+                    local_stop(
+                        &error.message,
+                        status_code,
+                        finish_reason,
+                        raw_finish_reason.as_deref(),
+                    )
+                })?;
             }
         }
+    }
+    // A stream cut short after cancellation is the local stop, not the provider's incomplete stream.
+    let cut_short = !buffer.is_empty() || !saw_event || finish_reason.is_none();
+    if cut_short && cancellation.is_cancelled() {
+        return Err(local_stop(
+            "provider execution was cancelled before the stream finished",
+            status_code,
+            finish_reason,
+            raw_finish_reason.as_deref(),
+        ));
     }
     if !buffer.is_empty() {
         return Err(ProviderExecutionError::Incomplete {
@@ -370,6 +418,23 @@ async fn parse_stream(
         ttfb: first_byte.map_or(finished_in, |first| first.duration_since(started)),
         finished_in,
     })
+}
+
+/// A stop on this side after the response head arrived, keeping the facts seen so far.
+fn local_stop(
+    message: &str,
+    status_code: u16,
+    finish_reason: Option<ChatFinishReason>,
+    raw_finish_reason: Option<&str>,
+) -> ProviderExecutionError {
+    ProviderExecutionError::Stopped {
+        message: message.to_owned(),
+        facts: ResponseFacts {
+            status_code,
+            finish_reason,
+            raw_finish_reason: raw_finish_reason.map(str::to_owned),
+        },
+    }
 }
 
 fn consume_event(
@@ -515,19 +580,39 @@ pub fn metrics(result: &ProviderExecutionResult) -> crate::persistence::Measurem
     }
 }
 
+/// The availability observation an error proves, if it proves one. Only what
+/// the provider or transport actually reported becomes a failure: a refusal
+/// before delivery proves nothing, and a local stop keeps just the response
+/// facts it already had. Nothing is inferred from an unknown outcome.
 pub fn error_observation(
     error: &ProviderExecutionError,
-) -> crate::persistence::AvailabilityObservation {
-    crate::persistence::AvailabilityObservation {
-        status_code: error.failure().and_then(|failure| failure.status_code),
-        finish_reason: None,
-        raw_finish_reason: None,
-        failure: error.failure().cloned().or_else(|| {
-            Some(ProviderFailure {
-                message: error.to_string(),
-                ..ProviderFailure::default()
-            })
+) -> Option<crate::persistence::AvailabilityObservation> {
+    use crate::persistence::AvailabilityObservation;
+    match error {
+        ProviderExecutionError::Build { .. } | ProviderExecutionError::NotDelivered { .. } => None,
+        ProviderExecutionError::Stopped { facts, .. } => Some(AvailabilityObservation {
+            status_code: Some(facts.status_code),
+            finish_reason: facts.finish_reason,
+            raw_finish_reason: facts.raw_finish_reason.clone(),
+            failure: None,
         }),
+        ProviderExecutionError::Rejected { failure } => Some(AvailabilityObservation {
+            status_code: failure.status_code,
+            finish_reason: None,
+            raw_finish_reason: None,
+            failure: Some(failure.clone()),
+        }),
+        ProviderExecutionError::Unknown { .. } | ProviderExecutionError::Incomplete { .. } => {
+            Some(AvailabilityObservation {
+                status_code: None,
+                finish_reason: None,
+                raw_finish_reason: None,
+                failure: Some(ProviderFailure {
+                    message: error.to_string(),
+                    ..ProviderFailure::default()
+                }),
+            })
+        }
     }
 }
 
@@ -549,4 +634,254 @@ pub fn result_value(result: &ProviderExecutionResult) -> Value {
         value.insert("finish_reason".to_owned(), Value::String(reason.to_owned()));
     }
     Value::Object(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::io;
+    use std::time::Instant;
+
+    use ntex::http::error::PayloadError;
+    use ntex::util::{Bytes, Stream};
+
+    use super::*;
+    use crate::test_support::wait;
+
+    const CONTENT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+    const STOP: &str = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+
+    /// One scripted step of a response body.
+    enum Step {
+        Chunk(&'static str),
+        Fail,
+        /// Cancels the execution, then yields the next chunk so the parser sees it.
+        Cancel,
+    }
+
+    struct Body {
+        steps: VecDeque<Step>,
+        cancellation: CancellationToken,
+    }
+
+    impl Stream for Body {
+        type Item = Result<Bytes, PayloadError>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            use std::task::Poll;
+            while let Some(step) = self.steps.pop_front() {
+                match step {
+                    Step::Cancel => self.cancellation.cancel(),
+                    Step::Chunk(text) => {
+                        return Poll::Ready(Some(Ok(Bytes::from_static(text.as_bytes()))));
+                    }
+                    Step::Fail => {
+                        return Poll::Ready(Some(Err(PayloadError::Incomplete(Some(
+                            io::Error::other("connection reset"),
+                        )))));
+                    }
+                }
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        deltas: Vec<String>,
+        fail: Option<&'static str>,
+    }
+
+    impl ProviderOutputSink for RecordingSink {
+        fn append<'a>(
+            &'a mut self,
+            text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+            Box::pin(async move {
+                match self.fail {
+                    Some(message) => Err(OutputSinkError {
+                        message: message.to_owned(),
+                    }),
+                    None => {
+                        self.deltas.push(text.to_owned());
+                        Ok(())
+                    }
+                }
+            })
+        }
+    }
+
+    fn parse(
+        steps: Vec<Step>,
+        sink: Option<&mut dyn ProviderOutputSink>,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        let cancellation = CancellationToken::default();
+        let payload = Payload::from_stream(Body {
+            steps: steps.into(),
+            cancellation: cancellation.clone(),
+        });
+        wait(parse_stream(
+            payload,
+            200,
+            Instant::now(),
+            None,
+            MAX_OUTPUT_BYTES,
+            cancellation,
+            sink,
+        ))
+    }
+
+    fn facts(finish_reason: Option<ChatFinishReason>, raw: Option<&str>) -> ResponseFacts {
+        ResponseFacts {
+            status_code: 200,
+            finish_reason,
+            raw_finish_reason: raw.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_complete_stream_streams_each_delta_to_the_sink() {
+        let mut sink = RecordingSink::default();
+        let result = parse(
+            vec![Step::Chunk(CONTENT), Step::Chunk(STOP)],
+            Some(&mut sink),
+        )
+        .expect("a finished stream succeeds");
+        assert_eq!(result.text, "hi");
+        assert_eq!(sink.deltas, ["hi"]);
+    }
+
+    #[test]
+    fn a_cancelled_stream_keeps_the_response_facts_it_already_had() {
+        let error = parse(
+            vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk(STOP),
+                Step::Cancel,
+                Step::Chunk(CONTENT),
+            ],
+            None,
+        )
+        .expect_err("a cancelled stream stops");
+        match error {
+            ProviderExecutionError::Stopped { facts, .. } => {
+                assert_eq!(
+                    facts,
+                    self::facts(Some(ChatFinishReason::Stop), Some("stop"))
+                )
+            }
+            other => panic!("cancellation after send is a local stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cancelled_stream_that_ends_early_is_a_local_stop_not_an_incomplete_stream() {
+        let error = parse(vec![Step::Chunk(CONTENT), Step::Cancel], None)
+            .expect_err("a cancelled stream stops");
+        match error {
+            ProviderExecutionError::Stopped { facts, .. } => {
+                assert_eq!(facts, self::facts(None, None))
+            }
+            other => panic!("a cut-short stream after cancellation is local, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cancellation_before_the_finish_keeps_only_the_status() {
+        let error = parse(
+            vec![Step::Chunk(CONTENT), Step::Cancel, Step::Chunk(STOP)],
+            None,
+        )
+        .expect_err("a cancelled stream stops");
+        match error {
+            ProviderExecutionError::Stopped { facts, .. } => {
+                assert_eq!(facts, self::facts(None, None))
+            }
+            other => panic!("cancellation after send is a local stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_local_output_failure_keeps_the_facts_of_the_event_that_failed() {
+        let mut sink = RecordingSink {
+            fail: Some("database could not persist provider output"),
+            ..RecordingSink::default()
+        };
+        let error = parse(
+            vec![Step::Chunk(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            )],
+            Some(&mut sink),
+        )
+        .expect_err("a sink failure stops the stream");
+        match error {
+            ProviderExecutionError::Stopped { message, facts } => {
+                assert_eq!(message, "database could not persist provider output");
+                assert_eq!(
+                    facts,
+                    self::facts(Some(ChatFinishReason::Stop), Some("stop"))
+                );
+            }
+            other => panic!("a local write failure is a local stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_transport_failure_mid_stream_stays_an_unknown_provider_outcome() {
+        let error =
+            parse(vec![Step::Chunk(CONTENT), Step::Fail], None).expect_err("a broken body fails");
+        assert!(
+            matches!(error, ProviderExecutionError::Unknown { .. }),
+            "a transport failure is reported as it occurred, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_stream_without_a_finish_event_stays_incomplete() {
+        let error = parse(vec![Step::Chunk(CONTENT)], None).expect_err("no finish event");
+        assert!(matches!(error, ProviderExecutionError::Incomplete { .. }));
+    }
+
+    #[test]
+    fn only_provider_and_transport_facts_become_availability_observations() {
+        let stopped = ProviderExecutionError::Stopped {
+            message: "cancelled".to_owned(),
+            facts: facts(Some(ChatFinishReason::Stop), Some("stop")),
+        };
+        assert_eq!(
+            error_observation(&stopped),
+            Some(crate::persistence::AvailabilityObservation {
+                status_code: Some(200),
+                finish_reason: Some(ChatFinishReason::Stop),
+                raw_finish_reason: Some("stop".to_owned()),
+                failure: None,
+            }),
+            "a local stop keeps the response facts and no failure"
+        );
+        assert_eq!(
+            error_observation(&ProviderExecutionError::Build {
+                message: "bad".to_owned()
+            }),
+            None
+        );
+        assert_eq!(
+            error_observation(&ProviderExecutionError::NotDelivered {
+                message: "refused".to_owned()
+            }),
+            None
+        );
+
+        let unknown = ProviderExecutionError::Unknown {
+            message: "reset".to_owned(),
+        };
+        let observation = error_observation(&unknown).expect("a transport fact");
+        assert_eq!(observation.status_code, None);
+        assert_eq!(
+            observation.failure.map(|failure| failure.message),
+            Some(unknown.to_string())
+        );
+    }
 }
