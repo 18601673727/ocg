@@ -4,6 +4,7 @@ import { useEffect, useId, useState } from "react";
 import { ChevronDown, LockKeyhole, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { STATUS_TEXT } from "../primitives/tone";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatModelSelection, Model, ProfileView } from "../contracts";
 import { useI18n } from "../i18n";
 import type { ActiveExecutionTarget, ActivityStep, ExecutionPhase } from "./execution-status";
@@ -126,16 +127,15 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
           {(busy || active) && <LockKeyhole className={`size-3.5 shrink-0 ${STATUS_TEXT['warning']}`} aria-hidden="true" />}
           <ChevronDown className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", expanded && "rotate-180")} aria-hidden="true" />
         </button>
-        {baseUrl && <button
+        {baseUrl && <Tooltip><TooltipTrigger render={<button
           type="button"
           aria-label={t(error ? "common.retry" : "chat.refreshModels")}
-          title={t(error ? "common.retry" : "chat.refreshModels")}
           disabled={busy || loading}
           onClick={() => setRefresh(value => value + 1)}
           className="flex size-11 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40 sm:size-9"
         >
           <RefreshCw className={cn("size-3.5", loading && "animate-spin")} aria-hidden="true" />
-        </button>}
+        </button>} /><TooltipContent>{t(error ? "common.retry" : "chat.refreshModels")}</TooltipContent></Tooltip>}
       </div>
       {expanded && <div id={id + "-panel"} className="mt-2 max-h-[min(25dvh,12rem)] space-y-2 overflow-y-auto overscroll-contain border-t border-border pt-2 [@media(max-height:600px)]:max-h-[18dvh]">
         <fieldset disabled={disabled} aria-describedby={id + "-status"} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-12">

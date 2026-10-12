@@ -718,6 +718,12 @@ export const en = {
   "control.noModelMatch": "No model matches the current search and provider filter.",
   "control.selectModel": "Select a model to inspect its full identity and capability support.",
   "control.noProfileAvailable": "No profile is available in this workspace.",
+  "control.costDataNotReported": "Cost data is not reported in this summary. Detailed attribution stays in the Resource Ledger.",
+  "control.authRequired": "Auth required",
+  "control.available": "available",
+  "control.degraded": "degraded",
+  "control.unavailable": "unavailable",
+  "control.profileReportedByRuntime": "Profile reported by the runtime",
 
   // -- execution / job -----------------------------------------------------------
   "execution.title": "Job",
@@ -1811,6 +1817,12 @@ export const zh: Dictionary = {
   "control.noModelMatch": "没有符合当前搜索和服务商筛选的模型。",
   "control.selectModel": "选择一个模型以查看其完整标识和能力支持。",
   "control.noProfileAvailable": "此工作区中暂无可用配置。",
+  "control.costDataNotReported": "此摘要中未上报成本数据。详细归属信息保存在资源账本中。",
+  "control.authRequired": "需要授权",
+  "control.available": "可用",
+  "control.degraded": "已降级",
+  "control.unavailable": "不可用",
+  "control.profileReportedByRuntime": "运行时上报的配置",
 
   "execution.title": "任务",
   "execution.currentActivity": "当前活动",

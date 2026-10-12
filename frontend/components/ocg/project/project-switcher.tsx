@@ -89,7 +89,6 @@ export function ProjectSwitcher({
                 variant="ghost"
                 size="icon-sm"
                 aria-label={collapsedAria}
-                title={collapsedAria}
               >
                 <FolderKanban className="size-4" aria-hidden="true" />
               </Button>

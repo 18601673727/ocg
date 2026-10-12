@@ -61,7 +61,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
   const placement = placementOf(execution);
 
   return (
-    <PageSurface className={embedded ? "space-y-5 p-4 text-xs sm:p-4 lg:p-4" : "space-y-5 text-xs"}>
+    <PageSurface className={embedded ? "@container space-y-4 p-4 text-xs sm:p-4 lg:p-4" : "@container space-y-4 text-xs"}>
       {executions.length > 0 && <nav aria-label="Project Jobs" className="rounded border border-border p-3">
         <SectionTitle detail={`${executions.length} ${executions.length === 1 ? "Job" : "Jobs"}`}>Project Jobs</SectionTitle>
         <ul className="mt-2 flex flex-wrap gap-2">
@@ -78,6 +78,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
           </li>)}
         </ul>
       </nav>}
+
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
           <p className="text-xs uppercase tracking-wider text-muted-foreground">{t("execution.title")}</p>
@@ -86,10 +87,12 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
           </ViewTransition>
           <p className="mt-1 text-muted-foreground">{t("home.projectLabel", { project: execution.projectId })}</p>
         </div>
-        <Pill tone={jobState.tone} dot pulse={jobState.pulse}>{runtimeStateLabel(t, execution.state)}</Pill>
-        {execution.canCancel && onCancelJob && <Button variant="outline" size="xs" disabled={operationPending} onClick={() => void operate(onCancelJob)}>{t("common.cancel")}</Button>}
-        {execution.canRetry && onRetryJob && <Button variant="outline" size="xs" disabled={operationPending} onClick={() => void operate(onRetryJob)}>{t("common.retry")}</Button>}
-        {onOpenInspector && <Button variant="outline" size="xs" onClick={onOpenInspector}>{t("execution.openInspector")}</Button>}
+        <div className="flex flex-wrap items-center gap-2">
+          <Pill tone={jobState.tone} dot pulse={jobState.pulse}>{runtimeStateLabel(t, execution.state)}</Pill>
+          {execution.canCancel && onCancelJob && <Button variant="outline" size="xs" disabled={operationPending} onClick={() => void operate(onCancelJob)}>{t("common.cancel")}</Button>}
+          {execution.canRetry && onRetryJob && <Button variant="outline" size="xs" disabled={operationPending} onClick={() => void operate(onRetryJob)}>{t("common.retry")}</Button>}
+          {onOpenInspector && <Button variant="outline" size="xs" onClick={onOpenInspector}>{t("execution.openInspector")}</Button>}
+        </div>
       </header>
 
       {operationError && <p role="alert" className="text-destructive">{operationError}</p>}
@@ -98,99 +101,121 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
         <p className="mt-1 whitespace-pre-wrap break-words">{execution.terminationReason.message}</p>
       </section>}
 
-      <section aria-label={t("execution.currentActivity")} className="rounded-lg border border-border bg-card p-3">
-        <SectionTitle>{t("execution.currentActivity")}</SectionTitle>
-        {execution.currentCall ? (
-          <p className="mt-2 flex items-center gap-2 text-xs">
-            <Pill tone="amber" dot pulse>{t("state.running")}</Pill>
-            <span>{t("execution.activityRunning")}</span>
-          </p>
-        ) : (
-          <p className="mt-2 text-xs text-muted-foreground">{t("execution.activityNotReported")}</p>
-        )}
-      </section>
+      {/* Usage-first layout: usage leads on narrow, moves right on @3xl */}
+      <div className="grid items-start gap-4 @3xl:grid-cols-[minmax(0,1fr)_minmax(0,400px)]">
+        {/* Usage & cost (order-2 on wide) */}
+        <div className="min-w-0 space-y-4 @3xl:order-2">
+          <section aria-label={t("execution.usage")} className="sticky top-0 rounded-lg border border-border bg-card p-4">
+            <SectionTitle>{t("execution.usage")}</SectionTitle>
+            <div className="mt-2"><UsageScopeNote scope="job" generatedAt={usage?.generated_at} /></div>
+            {usage ? hasRecordedUsage(usage.totals) ? (
+              <div className="mt-3 space-y-4">
+                {/* Cost summary - prominent */}
+                <div className="rounded-md bg-muted/30 p-3">
+                  <p className="text-xs font-semibold">{t("usage.cost")}</p>
+                  <CostDetails cost={usage.totals.cost} />
+                </div>
 
-      <section aria-label={t("execution.overview")} className="rounded-lg border border-border bg-card p-4">
-        <SectionTitle>{t("execution.overview")}</SectionTitle>
-        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
-          <div>
-            <dt className="text-xs text-muted-foreground">{t("execution.createdAt")}</dt>
-            <dd><time dateTime={createdAt}>{createdAt}</time></dd>
-          </div>
-          <div>
-            <dt className="text-xs text-muted-foreground">{t("execution.updatedAt")}</dt>
-            <dd><time dateTime={updatedAt}>{updatedAt}</time></dd>
-          </div>
-          <div>
-            <dt className="text-xs text-muted-foreground">{t("execution.elapsedAtUpdate")}</dt>
-            <dd>{formatDuration(elapsed)}</dd>
-          </div>
-        </dl>
-        {execution.state === "failed" && reportedFailure && (
-          <div role="alert" className="mt-4 rounded-md border border-destructive/30 bg-destructive/5 p-3">
-            <p className="text-xs font-semibold">{t("execution.reportedFailureDetail")}</p>
-            <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">{reportedFailure}</p>
-          </div>
-        )}
-        <p className="mt-4 text-xs leading-5 text-muted-foreground">{t("execution.jobDetailsNotReported")}</p>
-      </section>
+                {/* Token metrics */}
+                <div>
+                  <p className="text-xs font-semibold">{t("usage.tokens")}</p>
+                  <TokenMetrics totals={usage.totals} />
+                </div>
 
-      <JobRelationsPanel execution={execution} executions={executions} onSelectJob={onSelectJob} />
+                {/* Activity metrics */}
+                <div>
+                  <p className="text-xs font-semibold">{t("usage.activity")}</p>
+                  <ActivityMetrics totals={usage.totals} />
+                </div>
 
-      <JobRecoveryPanel execution={execution} />
+                {/* Breakdown */}
+                <div>
+                  <p className="text-xs font-semibold">{t("usage.breakdown")}</p>
+                  <UsageBreakdownList rows={usage.models} />
+                </div>
 
-      <PlacementSection placement={placement} requested={execution.requestedTarget} jobFailureShown={execution.terminationReason !== null} jobTerminal={isTerminalJobState(execution.state)} />
+                {/* Context metrics */}
+                <div>
+                  <p className="text-xs font-semibold">{t("usage.context")}</p>
+                  <ContextMetrics totals={usage.totals} />
+                </div>
 
-      <section aria-label={t("execution.usage")} className="rounded-lg border border-border bg-card p-4">
-        <SectionTitle>{t("execution.usage")}</SectionTitle>
-        <div className="mt-2"><UsageScopeNote scope="job" generatedAt={usage?.generated_at} /></div>
-        {accounting?.ceiling && (
-          <p className="mt-3 text-xs text-muted-foreground">
-            {t("execution.budgetCeiling")}: <strong className="font-medium text-foreground">{formatNumber(accounting.ceiling.amount)} {accounting.ceiling.unit}</strong>
-            <span> · {t("execution.budgetCeilingSource", { source: accounting.ceiling.source })}</span>
-            <span className="block">{t("execution.budgetNotSpend")}</span>
-          </p>
-        )}
-        {usage ? hasRecordedUsage(usage.totals) ? (
-          <div className="mt-3 space-y-3">
-            <section aria-label={t("usage.cost")}>
-              <SectionTitle>{t("usage.cost")}</SectionTitle>
-              <CostDetails cost={usage.totals.cost} />
-            </section>
-            <section aria-label={t("usage.tokens")}>
-              <SectionTitle>{t("usage.tokens")}</SectionTitle>
-              <TokenMetrics totals={usage.totals} />
-            </section>
-            <section aria-label={t("usage.activity")}>
-              <SectionTitle>{t("usage.activity")}</SectionTitle>
-              <ActivityMetrics totals={usage.totals} />
-            </section>
-            <section aria-label={t("usage.breakdown")}>
-              <SectionTitle>{t("usage.breakdown")}</SectionTitle>
-              <UsageBreakdownList rows={usage.models} />
-            </section>
-            <section aria-label={t("usage.context")}>
-              <SectionTitle>{t("usage.context")}</SectionTitle>
-              <ContextMetrics totals={usage.totals} />
-            </section>
-            {usage.truncated && <p className="text-xs text-muted-foreground">{t("usage.limited")}</p>}
-          </div>
-        ) : (
-          <p className="mt-3 text-xs text-muted-foreground">{t("usage.noJobUsage")}</p>
-        ) : (
-          <div className="mt-3 space-y-3">
-            {accounting?.consumption && <CostDetails cost={accounting.consumption} />}
-            {usageLoading && <p role="status" className="text-xs text-muted-foreground">{t("execution.usageLoading")}</p>}
-            {usageError && (
-              <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-destructive">
-                <span>{t("execution.usageLoadFailed")}</span>
-                {onRetryUsage && <Button size="xs" variant="outline" onClick={onRetryUsage}>{t("execution.retryUsage")}</Button>}
+                {usage.truncated && <p className="text-xs text-muted-foreground">{t("usage.limited")}</p>}
+              </div>
+            ) : (
+              <p className="mt-3 text-xs text-muted-foreground">{t("usage.noJobUsage")}</p>
+            ) : (
+              <div className="mt-3 space-y-3">
+                {accounting?.consumption && <div className="rounded-md bg-muted/30 p-3"><CostDetails cost={accounting.consumption} /></div>}
+                {usageLoading && <p role="status" className="text-xs text-muted-foreground">{t("execution.usageLoading")}</p>}
+                {usageError && (
+                  <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-destructive">
+                    <span>{t("execution.usageLoadFailed")}</span>
+                    {onRetryUsage && <Button size="xs" variant="outline" onClick={onRetryUsage}>{t("execution.retryUsage")}</Button>}
+                  </div>
+                )}
+                {!accounting?.consumption && !usageLoading && !usageError && <p className="text-xs text-muted-foreground">{t("execution.usageNotReported")}</p>}
               </div>
             )}
-            {!accounting?.consumption && !usageLoading && !usageError && <p className="text-xs text-muted-foreground">{t("execution.usageNotReported")}</p>}
-          </div>
-        )}
-      </section>
+          </section>
+        </div>
+
+        {/* Core details (order-1 on wide) */}
+        <div className="min-w-0 space-y-4 @3xl:order-1">
+          {/* Current activity */}
+          <section aria-label={t("execution.currentActivity")} className="rounded-lg border border-border bg-card p-3">
+            <SectionTitle>{t("execution.currentActivity")}</SectionTitle>
+            {execution.currentCall ? (
+              <p className="mt-2 flex items-center gap-2 text-xs">
+                <Pill tone="amber" dot pulse>{t("state.running")}</Pill>
+                <span>{t("execution.activityRunning")}</span>
+              </p>
+            ) : (
+              <p className="mt-2 text-xs text-muted-foreground">{t("execution.activityNotReported")}</p>
+            )}
+          </section>
+
+          {/* Overview */}
+          <section aria-label={t("execution.overview")} className="rounded-lg border border-border bg-card p-4">
+            <SectionTitle>{t("execution.overview")}</SectionTitle>
+            <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div>
+                <dt className="text-xs text-muted-foreground">{t("execution.createdAt")}</dt>
+                <dd className="text-xs"><time dateTime={createdAt}>{createdAt}</time></dd>
+              </div>
+              <div>
+                <dt className="text-xs text-muted-foreground">{t("execution.updatedAt")}</dt>
+                <dd className="text-xs"><time dateTime={updatedAt}>{updatedAt}</time></dd>
+              </div>
+              <div>
+                <dt className="text-xs text-muted-foreground">{t("execution.elapsedAtUpdate")}</dt>
+                <dd className="text-xs">{formatDuration(elapsed)}</dd>
+              </div>
+              {accounting?.ceiling && (
+                <div>
+                  <dt className="text-xs text-muted-foreground">{t("execution.budgetCeiling")}</dt>
+                  <dd className="text-xs font-medium">{formatNumber(accounting.ceiling.amount)} {accounting.ceiling.unit}</dd>
+                </div>
+              )}
+            </dl>
+            {execution.state === "failed" && reportedFailure && (
+              <div role="alert" className="mt-4 rounded-md border border-destructive/30 bg-destructive/5 p-3">
+                <p className="text-xs font-semibold">{t("execution.reportedFailureDetail")}</p>
+                <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">{reportedFailure}</p>
+              </div>
+            )}
+          </section>
+
+          {/* Placement */}
+          <PlacementSection placement={placement} requested={execution.requestedTarget} jobFailureShown={execution.terminationReason !== null} jobTerminal={isTerminalJobState(execution.state)} />
+
+          {/* Relations */}
+          <JobRelationsPanel execution={execution} executions={executions} onSelectJob={onSelectJob} />
+
+          {/* Recovery */}
+          <JobRecoveryPanel execution={execution} />
+        </div>
+      </div>
 
       <details className="rounded-lg border border-border bg-card p-4">
         <summary className="cursor-pointer text-[13px] font-semibold">{t("execution.diagnosticsDetails")}</summary>

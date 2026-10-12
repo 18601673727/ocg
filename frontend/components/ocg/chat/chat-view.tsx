@@ -25,6 +25,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { BORDER_TONE, StatusDot, STATUS_TEXT, TEXT_TONE, TOOL_STATUS } from "@/components/ocg/primitives";
 import { ActivityPulse } from "../activity-pulse";
@@ -92,16 +93,22 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
         <span className="font-mono text-xs text-muted-foreground">
           {language || t("chat.code")}
         </span>
-        <button
-          type="button"
-          onClick={() => copyToClipboard(code)}
-          className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-          aria-label={isCopied ? t("common.copied") : t("chat.copyCodeToClipboard")}
-          title={t("chat.copyCode")}
-        >
-          {isCopied ? <Check className="size-3" /> : <Copy className="size-3" />}
-          {isCopied ? t("common.copied") : t("common.copy")}
-        </button>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <button
+                type="button"
+                onClick={() => copyToClipboard(code)}
+                className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                aria-label={isCopied ? t("common.copied") : t("chat.copyCodeToClipboard")}
+              >
+                {isCopied ? <Check className="size-3" /> : <Copy className="size-3" />}
+                {isCopied ? t("common.copied") : t("common.copy")}
+              </button>
+            }
+          />
+          <TooltipContent side="left">{t("chat.copyCode")}</TooltipContent>
+        </Tooltip>
       </div>
       <pre className="overflow-x-auto p-2.5 font-mono text-xs leading-5 text-foreground">
         <code>{code}</code>
@@ -366,17 +373,23 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
           <div className="mb-1 flex items-center gap-2">
             <span className="text-xs font-semibold">{isUser ? t("chat.you") : t("chat.assistant")}</span>
             <span className="text-xs text-muted-foreground">{message.createdAt}</span>
-            <button
-              type="button"
-              onClick={() => copyToClipboard(message.content)}
-              disabled={message.content.length === 0}
-              className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
-              aria-label={isUser ? t("chat.copyRawUserMessage") : t("chat.copyRawAssistantMessage")}
-              title={t("chat.copyRawMessage")}
-            >
-              {isCopied ? <Check className="size-3" aria-hidden="true" /> : <Copy className="size-3" aria-hidden="true" />}
-              <span role="status">{isCopied ? t("common.copied") : t("common.copy")}</span>
-            </button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(message.content)}
+                    disabled={message.content.length === 0}
+                    className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+                    aria-label={isUser ? t("chat.copyRawUserMessage") : t("chat.copyRawAssistantMessage")}
+                  >
+                    {isCopied ? <Check className="size-3" aria-hidden="true" /> : <Copy className="size-3" aria-hidden="true" />}
+                    <span role="status">{isCopied ? t("common.copied") : t("common.copy")}</span>
+                  </button>
+                }
+              />
+              <TooltipContent side="left">{t("chat.copyRawMessage")}</TooltipContent>
+            </Tooltip>
           </div>
           {!isUser && message.reasoning && (
             <Collapsible open={reasoningOpen} onOpenChange={setReasoningOpen}>
@@ -732,33 +745,64 @@ function Composer({
             </p>
           )}
           <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              className="size-11 rounded-md sm:size-9"
-              aria-label={t("chat.attachFile")}
-              title={t("chat.attachFile")}
-              disabled={submitting || cancelling}
-              onClick={() => fileInput.current?.click()}
-            >
-              <Paperclip className="size-4" />
-            </Button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="size-11 rounded-md sm:size-9"
+                    aria-label={t("chat.attachFile")}
+                    disabled={submitting || cancelling}
+                    onClick={() => fileInput.current?.click()}
+                  >
+                    <Paperclip className="size-4" />
+                  </Button>
+                }
+              />
+              <TooltipContent side="top">{t("chat.attachFile")}</TooltipContent>
+            </Tooltip>
             <span id="composer-hint" className="sr-only sm:ml-1 sm:not-sr-only sm:text-xs sm:text-muted-foreground">
               <span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span>
               <span className="pointer-coarse:hidden">{busy ? t("chat.queueHint") : t("chat.hint")}</span>
             </span>
             <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
-              {busy && onCancel && <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={submitting || cancelling} onClick={() => void cancel()} title={t("chat.cancel")}>
-                {cancelling ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}{t("chat.cancel")}
-              </Button>}
-              {busy && <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={!canSend || !chatReady || submitting || cancelling} onClick={() => void submit("steer")} title={t("chat.steerHint")}>
-                {t("chat.steer")}
-              </Button>}
-              <Button type="submit" size={queueing ? "xs" : "icon-sm"} className={cn("h-11 rounded-md tracking-normal normal-case sm:h-9", !queueing && "w-11 sm:w-9")} disabled={!canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat")} aria-label={t(queueing ? "chat.queue" : "chat.send")} title={t(busy ? "chat.queueHint" : "chat.send")}>
-                {submitting ? <Loader2 className="size-4 animate-spin" /> : busy ? <ListPlus className="size-4" /> : <ArrowUp className="size-4" />}
-                {queueing && t("chat.queue")}
-              </Button>
+              {busy && onCancel && (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={submitting || cancelling} onClick={() => void cancel()}>
+                        {cancelling ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}{t("chat.cancel")}
+                      </Button>
+                    }
+                  />
+                  <TooltipContent side="top">{t("chat.cancel")}</TooltipContent>
+                </Tooltip>
+              )}
+              {busy && (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={!canSend || !chatReady || submitting || cancelling} onClick={() => void submit("steer")}>
+                        {t("chat.steer")}
+                      </Button>
+                    }
+                  />
+                  <TooltipContent side="top">{t("chat.steerHint")}</TooltipContent>
+                </Tooltip>
+              )}
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button type="submit" size={queueing ? "xs" : "icon-sm"} className={cn("h-11 rounded-md tracking-normal normal-case sm:h-9", !queueing && "w-11 sm:w-9")} disabled={!canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat")} aria-label={t(queueing ? "chat.queue" : "chat.send")}>
+                      {submitting ? <Loader2 className="size-4 animate-spin" /> : busy ? <ListPlus className="size-4" /> : <ArrowUp className="size-4" />}
+                      {queueing && t("chat.queue")}
+                    </Button>
+                  }
+                />
+                <TooltipContent side="top">{t(busy ? "chat.queueHint" : "chat.send")}</TooltipContent>
+              </Tooltip>
             </div>
           </div>
         </div>

@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import type { ChatSession } from "../types";
 import { isDegradedSyncStatus, type RuntimeSyncStatus } from "../runtime/reconciler";
 import {
@@ -38,6 +39,7 @@ type OcgTopbarProps = {
 
 export function OcgTopbar({
   session,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   projectName,
   inspectorOpen,
   inspectorControls = true,
@@ -50,8 +52,25 @@ export function OcgTopbar({
 }: OcgTopbarProps) {
   const { t } = useI18n();
   const logout = useRemoteLogout();
-  const fallbackProjectName = t("topbar.workspace");
-  const displayProjectName = projectName ?? fallbackProjectName;
+  
+  // Map view types to i18n title keys
+  const getViewTitle = (view: WorkspaceView): string => {
+    const viewTitleMap: Record<WorkspaceView, string> = {
+      chat: t("nav.chat"),
+      home: t("nav.home"),
+      usage: t("nav.usage"),
+      attention: t("nav.attention"),
+      ledger: t("ledger.title"),
+      "control-center": t("nav.controlCenter"),
+      "job-execution": t("nav.jobExecution"),
+      health: t("nav.health"),
+      logs: t("logs.title"),
+      settings: t("settings.title"),
+      canonical: t("nav.canonical"),
+    };
+    return viewTitleMap[view];
+  };
+  
   // Degraded sync states are the only ones the bar surfaces; the visual comes
   // from the shared scale so it matches the inspector and the ledger.
   const sync = syncStatus ? SYNC_STATUS[syncStatus] : null;
@@ -66,21 +85,27 @@ export function OcgTopbar({
   return (
     <header className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border bg-background px-2 sm:px-3">
       {/* Mobile sidebar toggle */}
-      <Button
-        variant="ghost"
-        size="icon-xs"
-        className="size-11 rounded-md lg:hidden"
-        onClick={onOpenMobileSidebar}
-        aria-label={t("topbar.openNavigation")}
-        title={t("topbar.openNavigation")}
-      >
-        <PanelLeft className="size-4" />
-      </Button>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="size-11 rounded-md lg:hidden"
+              onClick={onOpenMobileSidebar}
+              aria-label={t("topbar.openNavigation")}
+            >
+              <PanelLeft className="size-4" />
+            </Button>
+          }
+        />
+        <TooltipContent side="bottom">{t("topbar.openNavigation")}</TooltipContent>
+      </Tooltip>
       <div className="flex min-w-0 flex-1 items-center gap-2">
         {session && activeView === "chat" ? (
           <h1 className="truncate text-[13px] font-semibold tracking-tight">{session.title}</h1>
         ) : (
-          <h1 className="truncate text-[13px] font-semibold tracking-tight">{displayProjectName}</h1>
+          <h1 className="truncate text-[13px] font-semibold tracking-tight">{getViewTitle(activeView)}</h1>
         )}
       </div>
 
@@ -101,45 +126,65 @@ export function OcgTopbar({
       {inspectorControls && (
         <>
           {/* Mobile job inspector toggle */}
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            className="size-11 rounded-md lg:hidden"
-            onClick={onOpenMobileInspector}
-            aria-label={t("topbar.openInspector")}
-            title={t("topbar.openInspector")}
-          >
-            <PanelRight className="size-4" />
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="size-11 rounded-md lg:hidden"
+                  onClick={onOpenMobileInspector}
+                  aria-label={t("topbar.openInspector")}
+                >
+                  <PanelRight className="size-4" />
+                </Button>
+              }
+            />
+            <TooltipContent side="bottom">{t("topbar.openInspector")}</TooltipContent>
+          </Tooltip>
           {/* Desktop job inspector toggle */}
-          <Button
-            variant={!inspectorOpen ? "secondary" : "ghost"}
-            size="icon-xs"
-            className="hidden lg:inline-flex"
-            onClick={onToggleInspector}
-            aria-label={inspectorLabel}
-            aria-expanded={inspectorOpen}
-            title={inspectorLabel}
-          >
-            {inspectorOpen ? (
-              <ChevronsRight className="size-4" />
-            ) : (
-              <ChevronsLeft className="size-4" />
-            )}
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant={!inspectorOpen ? "secondary" : "ghost"}
+                  size="icon-xs"
+                  className="hidden lg:inline-flex"
+                  onClick={onToggleInspector}
+                  aria-label={inspectorLabel}
+                  aria-expanded={inspectorOpen}
+                >
+                  {inspectorOpen ? (
+                    <ChevronsRight className="size-4" />
+                  ) : (
+                    <ChevronsLeft className="size-4" />
+                  )}
+                </Button>
+              }
+            />
+            <TooltipContent side="bottom">{inspectorLabel}</TooltipContent>
+          </Tooltip>
         </>
       )}
       {logout && <Button variant="ghost" size="sm" onClick={() => { void logout(); }}>Sign out</Button>}
-      {onOpenSettings && <Button
-        variant={activeView === "settings" ? "secondary" : "ghost"}
-        size="icon-xs"
-        className="size-11 rounded-md sm:size-8"
-        onClick={onOpenSettings}
-        aria-label={t("sidebar.openSettings")}
-        title={t("sidebar.openSettings")}
-      >
-        <Settings className="size-4" />
-      </Button>}
+      {onOpenSettings && (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                variant={activeView === "settings" ? "secondary" : "ghost"}
+                size="icon-xs"
+                className="size-11 rounded-md sm:size-8"
+                onClick={onOpenSettings}
+                aria-label={t("sidebar.openSettings")}
+              >
+                <Settings className="size-4" />
+              </Button>
+            }
+          />
+          <TooltipContent side="bottom">{t("sidebar.openSettings")}</TooltipContent>
+        </Tooltip>
+      )}
     </header>
   );
 }

@@ -1,10 +1,10 @@
 "use client";
 
 import { startTransition, useMemo, useState, ViewTransition } from "react";
-import { Activity, Coins, Cpu, Layers, Server, Users } from "lucide-react";
+import { Coins, Cpu, Layers, Server, Users } from "lucide-react";
 import { formatCostMicros } from "@/lib/format";
 import { Button } from "@/components/ui/button";
-import { Metric, Pill, SegmentedTabs, type TabItem } from "@/components/ocg/primitives";
+import { Pill, SegmentedTabs, type TabItem } from "@/components/ocg/primitives";
 import type {
   BootstrapModelStatus,
   BootstrapProviderState,
@@ -38,11 +38,12 @@ const VIEW_LABEL_KEY = {
 } as const;
 
 function LedgerStrip({ ledger }: { ledger: ResourceLedger | null }) {
+  const { t } = useI18n();
   const summary = useMemo(() => (ledger ? summarize(ledger.entries) : null), [ledger]);
   if (!summary) {
     return (
       <p className="text-xs text-muted-foreground">
-        Cost data is not reported in this summary. Detailed attribution stays in the Resource Ledger.
+        {t("control.costDataNotReported")}
       </p>
     );
   }
@@ -113,19 +114,39 @@ export function ControlCenterSurface({
       <header className="shrink-0 border-b border-border px-4 sm:px-6 lg:px-8 py-3 sm:py-4 lg:py-5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <h1 className="text-[13px] font-semibold tracking-tight">{t("control.title")}</h1>
-          <Pill tone="sky" title="Profile reported by the runtime">
+          <Pill tone="sky" title={t("control.profileReportedByRuntime")}>
             {summary.activeProfileLabel ?? t("common.notReported")}
           </Pill>
-          <span className="text-xs text-muted-foreground">
-            {summary.profileCount} profiles reported · {summary.providerCount === null ? t("common.notReported") : `${summary.providerCount} providers`} · {summary.modelCount} models reported
+        </div>
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          <span>
+            {summary.profileCount} {t("control.profiles").toLowerCase()}
           </span>
-          <span className="ml-auto flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
-            <Activity className="size-3" aria-hidden="true" />
-            {summary.availableModelCount} available · {summary.pendingModelCount} pending · {summary.unavailableModelCount} unavailable · {summary.unknownModelCount} unknown
+          <span>·</span>
+          <span>
+            {summary.providerCount === null ? t("common.notReported") : summary.providerCount} {t("control.providers").toLowerCase()}
+            {summary.providerCount !== null && summary.degradedProviderCount !== null && summary.degradedProviderCount > 0 && (
+              <> ({summary.degradedProviderCount} {t("control.degraded")})</>
+            )}
+            {summary.providerCount !== null && summary.unavailableProviderCount !== null && summary.unavailableProviderCount > 0 && (
+              <> ({summary.unavailableProviderCount} {t("control.unavailable")})</>
+            )}
+          </span>
+          {summary.authRequiredProviderCount !== null && summary.authRequiredProviderCount > 0 && (
+            <>
+              <span>·</span>
+              <span className="text-foreground">
+                {summary.authRequiredProviderCount} {t("control.authRequired").toLowerCase()}
+              </span>
+            </>
+          )}
+          <span>·</span>
+          <span>
+            {summary.modelCount} {t("control.models").toLowerCase()} ({summary.availableModelCount} {t("control.available").toLowerCase()})
           </span>
         </div>
         {summary.stateIncomplete && <p className="mt-1 text-xs text-muted-foreground">{t("control.stateIncomplete")}</p>}
-        <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/10 px-2.5 py-2">
+        <div className="mt-2.5 flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/10 px-2.5 py-2">
           <div className="min-w-0 flex-1">
             <p className="text-xs font-semibold">{t("control.needsAttention")}</p>
             <p className="text-xs text-muted-foreground">
@@ -134,25 +155,7 @@ export function ControlCenterSurface({
           </div>
           <Button size="xs" variant="outline" onClick={() => onNavigate("attention")}>{t("home.viewAll")}</Button>
         </div>
-        <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-4">
-          <Metric
-            label={t("control.profiles")}
-            value={String(summary.profileCount)}
-            detail={summary.activeProfileLabel ? `${summary.activeProfileLabel} active` : t("common.notReported")}
-          />
-          <Metric
-            label={t("control.providers")}
-            value={summary.providerCount === null ? t("common.notReported") : String(summary.providerCount)}
-            detail={`${summary.degradedProviderCount ?? t("common.notReported")} degraded · ${summary.unavailableProviderCount ?? t("common.notReported")} unavailable`}
-          />
-          <Metric
-            label="Auth required"
-            value={summary.authRequiredProviderCount === null ? t("common.notReported") : String(summary.authRequiredProviderCount)}
-            detail={`${summary.unknownProviderCount ?? t("common.notReported")} unknown`}
-          />
-          <Metric label="Available models" value={String(summary.availableModelCount)} detail={`${summary.modelCount} reported`} />
-        </div>
-        <div className="mt-2 min-w-0">
+        <div className="mt-2.5 min-w-0">
           <LedgerStrip ledger={ledger} />
         </div>
       </header>

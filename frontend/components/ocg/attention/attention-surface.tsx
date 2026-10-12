@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import {
   EmptyPanel,
   PageSurface,
@@ -478,9 +479,16 @@ function AttentionInspector({
             {ATTENTION_SOURCE_LABELS[item.source]} · created {item.createdAt} · updated {item.updatedAt}
           </p>
         </div>
-        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("attention.closeDetails")}>
-          <X className="size-4" />
-        </Button>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("attention.closeDetails")}>
+                <X className="size-4" />
+              </Button>
+            }
+          />
+          <TooltipContent side="left">{t("attention.closeDetails")}</TooltipContent>
+        </Tooltip>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
@@ -506,24 +514,38 @@ function AttentionInspector({
       <div className="shrink-0 border-t border-border px-4 py-3">
         {approval && approval.decision === "pending" ? (
           <div className="flex items-center gap-2">
-            <Button
-              variant="default"
-              size="sm"
-              className="flex-1"
-              onClick={() => onDecide(item.id, "approved")}
-              aria-label={`Approve: ${approval.requestedAction}`}
-            >
-              <Check className="size-3.5" data-icon="inline-start" /> {t("attention.approve")}
-            </Button>
-            <Button
-              variant="destructive"
-              size="sm"
-              className="flex-1"
-              onClick={() => onDecide(item.id, "rejected")}
-              aria-label={`Reject: ${approval.requestedAction}`}
-            >
-              <X className="size-3.5" data-icon="inline-start" /> {t("attention.reject")}
-            </Button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="default"
+                    size="sm"
+                    className="flex-1"
+                    onClick={() => onDecide(item.id, "approved")}
+                    aria-label={`Approve: ${approval.requestedAction}`}
+                  >
+                    <Check className="size-3.5" data-icon="inline-start" /> {t("attention.approve")}
+                  </Button>
+                }
+              />
+              <TooltipContent>{approval.requestedAction}</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    className="flex-1"
+                    onClick={() => onDecide(item.id, "rejected")}
+                    aria-label={`Reject: ${approval.requestedAction}`}
+                  >
+                    <X className="size-3.5" data-icon="inline-start" /> {t("attention.reject")}
+                  </Button>
+                }
+              />
+              <TooltipContent>{approval.requestedAction}</TooltipContent>
+            </Tooltip>
           </div>
         ) : (
           <div className="flex flex-wrap items-center gap-2">
@@ -531,14 +553,28 @@ function AttentionInspector({
               {t("common.open")} {DESTINATION_LABELS[item.destination]} <ArrowRight className="size-3.5" data-icon="inline-end" />
             </Button>
             {unresolved && item.status === "pending" && (
-              <Button variant="ghost" size="sm" onClick={() => onAcknowledge(item.id)} aria-label={`Acknowledge ${item.title}`}>
-                {t("attention.acknowledge")}
-              </Button>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button variant="ghost" size="sm" onClick={() => onAcknowledge(item.id)} aria-label={`Acknowledge ${item.title}`}>
+                      {t("attention.acknowledge")}
+                    </Button>
+                  }
+                />
+                <TooltipContent>{item.title}</TooltipContent>
+              </Tooltip>
             )}
             {unresolved && !approval && (
-              <Button variant="ghost" size="sm" onClick={() => onResolve(item.id)} aria-label={t("attention.detailsFor", { title: item.title })}>
-                <CircleCheck className="size-3.5" data-icon="inline-start" /> {t("attention.markResolved")}
-              </Button>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button variant="ghost" size="sm" onClick={() => onResolve(item.id)} aria-label={t("attention.detailsFor", { title: item.title })}>
+                      <CircleCheck className="size-3.5" data-icon="inline-start" /> {t("attention.markResolved")}
+                    </Button>
+                  }
+                />
+                <TooltipContent>{item.title}</TooltipContent>
+              </Tooltip>
             )}
             {!unresolved && (
               <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">

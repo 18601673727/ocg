@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Pause, Play, Search, ShieldCheck, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   EmptyState,
   FilterOption,
@@ -89,7 +90,7 @@ function LogDetail({ entry, onClose }: { entry: LogEntry | undefined; onClose?: 
           <div className="flex flex-wrap items-center gap-2"><LogLevelPill level={entry.level} /><span className="text-xs text-muted-foreground">{entry.source}</span>{entry.redacted && <Pill tone="amber" className="text-[9px] normal-case"><ShieldCheck className="size-3" />{t("logs.redacted")}</Pill>}</div>
           <h2 className="mt-1.5 break-words text-[13px] font-semibold leading-5">{entry.message}</h2>
         </div>
-        {onClose && <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("logs.closeDetails")} title={t("logs.closeDetails")}><X className="size-3.5" /></Button>}
+        {onClose && <Tooltip><TooltipTrigger render={<Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("logs.closeDetails")}><X className="size-3.5" /></Button>} /><TooltipContent>{t("logs.closeDetails")}</TooltipContent></Tooltip>}
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
         <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 text-xs">
@@ -195,9 +196,7 @@ export function LogsSurface({ snapshot, projectId }: { snapshot: RuntimeSnapshot
           <div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("logs.diagnostics")}</span>{projectId && <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{selectProject(projectId).name}</span>}{live && <span className="text-xs text-muted-foreground">{t("logs.liveStream")}</span>}</div><h1 className="mt-1 text-base font-semibold tracking-tight">{t("logs.title")}</h1><p className="mt-0.5 text-xs text-muted-foreground">{t("logs.subtitle")}</p></div>
           <div className="flex shrink-0 items-center gap-2">
             <span className="text-xs tabular-nums text-muted-foreground">{t("logs.count", { filtered: filteredEntries.length, total: entries.length, limit: LOG_HISTORY_LIMIT })}</span>
-            <Button variant={following ? "secondary" : "outline"} size="xs" onClick={() => following ? setFollowing(false) : scrollToLatest()} aria-pressed={following} title={following ? t("logs.pauseFollow") : t("logs.resumeFollow")}>
-              {following ? <Pause className="size-3" /> : <Play className="size-3" />}{following ? t("logs.follow") : t("logs.paused")}
-            </Button>
+            <Tooltip><TooltipTrigger render={<Button variant={following ? "secondary" : "outline"} size="xs" onClick={() => following ? setFollowing(false) : scrollToLatest()} aria-pressed={following}>{following ? <Pause className="size-3" /> : <Play className="size-3" />}{following ? t("logs.follow") : t("logs.paused")}</Button>} /><TooltipContent>{following ? t("logs.pauseFollow") : t("logs.resumeFollow")}</TooltipContent></Tooltip>
           </div>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-10">

@@ -289,6 +289,18 @@ export function OcgSidebar({
           </div>
         )}
 
+        <div className="px-3 pb-2">
+          <Button
+            variant="outline"
+            size="sm"
+            className="w-full justify-start"
+            onClick={onNewChat}
+          >
+            <Plus className="size-3.5" data-icon="inline-start" />
+            {t("sidebar.newChat")}
+          </Button>
+        </div>
+
         {hasNav && (
           <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
             <ul className="flex flex-col gap-px">
@@ -302,18 +314,6 @@ export function OcgSidebar({
             </details>}
           </nav>
         )}
-
-        <div className="px-3 pb-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full justify-start"
-            onClick={onNewChat}
-          >
-            <Plus className="size-3.5" data-icon="inline-start" />
-            {t("sidebar.newChat")}
-          </Button>
-        </div>
 
         <nav
           aria-label={t("nav.chatSessions")}
