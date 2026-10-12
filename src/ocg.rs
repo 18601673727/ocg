@@ -6,6 +6,7 @@ pub mod log_cleanup;
 pub mod openai_compatible;
 pub mod orchestration;
 pub mod persistence;
+pub mod provider_execution;
 pub mod system_policy;
 mod storage;
 #[cfg(test)]
