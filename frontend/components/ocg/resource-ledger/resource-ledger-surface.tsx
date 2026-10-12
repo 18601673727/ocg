@@ -192,7 +192,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
 
   return (
     <div className="flex h-full min-h-0 w-full min-w-0 flex-col">
-      <header className="shrink-0 border-b border-border px-3 py-2.5">
+      <header className="shrink-0 border-b border-border px-4 sm:px-6 lg:px-8 py-3 sm:py-4 lg:py-5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <h2 className="text-[13px] font-semibold tracking-tight">{t("ledger.title")}</h2>
           <Pill tone="slate" title={t("ledger.filters")}>
@@ -210,7 +210,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
         </div>
       </header>
 
-      <nav className="shrink-0 border-b border-border px-3 py-1.5">
+      <nav className="shrink-0 border-b border-border px-4 sm:px-6 lg:px-8 py-2 sm:py-3 lg:py-4">
         <SegmentedTabs
           tabs={tabs}
           value={tab}
@@ -236,7 +236,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
         id={`resource-ledger-${tab}`}
         role="tabpanel"
         aria-label={t(TAB_LABEL_KEY[tab])}
-        className="min-h-0 flex-1 overflow-y-auto px-3 py-3"
+        className="min-h-0 flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8"
       >
         {tab === "overview" && (
           <div className="flex min-w-0 flex-col gap-3">

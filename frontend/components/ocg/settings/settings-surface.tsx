@@ -159,7 +159,7 @@ export function SettingsSurface({ snapshot }: { snapshot: RuntimeSnapshot }) {
   }, []);
 
   return (
-    <PageSurface className="mx-auto w-full max-w-5xl pb-[max(2rem,env(safe-area-inset-bottom))]">
+    <PageSurface className="mx-auto w-full max-w-6xl pb-[max(2rem,env(safe-area-inset-bottom))]">
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight"><Settings2 className="size-5 text-muted-foreground" />{t("settings.title")}</h1>

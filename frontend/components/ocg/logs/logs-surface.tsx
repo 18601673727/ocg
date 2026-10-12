@@ -190,7 +190,7 @@ export function LogsSurface({ snapshot, projectId }: { snapshot: RuntimeSnapshot
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-background">
-      <header className="shrink-0 border-b border-border px-3 py-3 sm:px-4">
+      <header className="shrink-0 border-b border-border px-4 sm:px-6 lg:px-8 py-3 sm:py-4 lg:py-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{t("logs.diagnostics")}</span>{projectId && <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{selectProject(projectId).name}</span>}{live && <span className="text-[10px] text-muted-foreground">{t("logs.liveStream")}</span>}</div><h1 className="mt-1 text-[16px] font-semibold tracking-tight">{t("logs.title")}</h1><p className="mt-0.5 text-[11px] text-muted-foreground">{t("logs.subtitle")}</p></div>
           <div className="flex shrink-0 items-center gap-2">

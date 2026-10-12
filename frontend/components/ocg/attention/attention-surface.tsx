@@ -304,7 +304,7 @@ function MockAttentionSurface(props: AttentionSurfaceProps) {
           </div>
         </div>
 
-        <div id="attention-panel" role="tabpanel" aria-label={t("attention.detailsFor", { title: tabLabel(filters.tab) })} className="min-h-0 flex-1 overflow-y-auto px-4 py-3 sm:px-6">
+        <div id="attention-panel" role="tabpanel" aria-label={t("attention.detailsFor", { title: tabLabel(filters.tab) })} className="min-h-0 flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8">
           {visible.length === 0 ? (
             <EmptyState tab={filters.tab} hasItems={items.length > 0} />
           ) : (
