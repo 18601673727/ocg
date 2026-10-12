@@ -1655,8 +1655,32 @@ fn chat_queue_supersede_cancel_and_empty_final_keep_one_consumer_progressing() {
     runtime.shutdown().expect("shutdown");
 }
 
+/// How the Profile changes between the crash and recovery.
+enum ProfileChange {
+    /// The reserved Model leaves the Profile; another one, served by the same
+    /// endpoint, takes its place.
+    ReplaceModel,
+    /// No Profile is configured any more.
+    Remove,
+}
+
 #[test]
-fn unrecoverable_unpublished_reservation_settles_on_restart_without_sending() {
+fn unpublished_reservation_whose_model_left_the_profile_settles_on_restart() {
+    assert_unpublished_reservation_settles(
+        ProfileChange::ReplaceModel,
+        "model not found: local/example",
+    );
+}
+
+#[test]
+fn unpublished_reservation_without_a_profile_settles_on_restart() {
+    assert_unpublished_reservation_settles(ProfileChange::Remove, "profile not configured");
+}
+
+/// An ordinary Job reserved before a crash, but never published, settles on
+/// recovery once its committed target can no longer run, without sending
+/// anything and without choosing another target.
+fn assert_unpublished_reservation_settles(change: ProfileChange, refused: &str) {
     use crate::orchestration::admission::{AdmissionPickup, AdmissionReservation};
     use crate::orchestration::domain::{
         AttemptState, ExecutionTarget, InputContent, InputPayload, InputReplay, JobInputDraft,
@@ -1739,9 +1763,10 @@ fn unrecoverable_unpublished_reservation_settles_on_restart_without_sending() {
     assert_eq!(frozen.replay, InputReplay::Replaceable);
     drop(domain);
 
-    // Before recovery the reserved Model leaves the Profile; another one,
-    // served by the same endpoint, takes its place.
-    write_profile("local/other");
+    match change {
+        ProfileChange::ReplaceModel => write_profile("local/other"),
+        ProfileChange::Remove => std::fs::remove_file(&profile_path).expect("remove Profile"),
+    }
 
     let runtime = ExecutionRuntime::start(
         root.path(),
@@ -1753,7 +1778,7 @@ fn unrecoverable_unpublished_reservation_settles_on_restart_without_sending() {
     )
     .expect("execution runtime");
     let service = service().with_runtime_handle(ExecutionRuntimeHandle::new(&runtime));
-    for _ in 0..2 {
+    for _ in 0..3 {
         let _ = service.admit_eligible_jobs();
         service.reconcile_watchdog().expect("watchdog");
     }
@@ -1766,7 +1791,7 @@ fn unrecoverable_unpublished_reservation_settles_on_restart_without_sending() {
     assert_eq!(reason.code, "admission_interrupted", "{reason:?}");
     assert!(
         reason.message.contains("nothing was sent to the provider")
-            && reason.message.contains("model not found: local/example"),
+            && reason.message.contains(refused),
         "{reason:?}"
     );
     let attempts = domain.attempts_for_job(&job.id).expect("Attempts");

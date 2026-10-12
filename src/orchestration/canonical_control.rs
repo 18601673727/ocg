@@ -183,6 +183,33 @@ fn unpublished_admission_failure(why: &str) -> Failure {
     )
 }
 
+/// Settle a resumed reservation that admission refused. It is refused only
+/// when its committed target can no longer run, so an Attempt that never
+/// published a Call settles now instead of being refused on every pass. A
+/// Job that holds no such Attempt is left as it is.
+fn settle_unpublished_reservation(
+    domain: &mut DomainRepository,
+    project_id: &str,
+    job: &Job,
+    why: &str,
+) -> Result<()> {
+    let Some(attempt_id) = job
+        .authoritative_attempt_id
+        .as_deref()
+        .filter(|_| job.state == super::domain::JobState::Running)
+    else {
+        return Ok(());
+    };
+    if domain
+        .unpublished_admissions(project_id)?
+        .iter()
+        .any(|(_, unpublished, _)| unpublished == attempt_id)
+    {
+        domain.fail_attempt(attempt_id, &unpublished_admission_failure(why))?;
+    }
+    Ok(())
+}
+
 fn provider_concurrency(defaults: &Value) -> Result<usize> {
     match defaults.get("provider_concurrency") {
         None => Ok(1),
@@ -2963,6 +2990,12 @@ impl CanonicalControlService {
                     duplicate: false,
                 };
                 if let Some(job) = &existing_job {
+                    settle_unpublished_reservation(
+                        &mut domain,
+                        &project.project_id,
+                        job,
+                        &response.message,
+                    )?;
                     domain.record_admission_failure(
                         &job.id,
                         &super::domain::job_failure(
@@ -3062,25 +3095,12 @@ impl CanonicalControlService {
             Ok(resolved) => resolved,
             Err(refusal) => {
                 if let Some(job) = &existing_job {
-                    // A resumed reservation is refused only when its committed
-                    // target can no longer run. Nothing was published for it,
-                    // so it settles now instead of being refused on every pass.
-                    if let Some(attempt_id) = job
-                        .authoritative_attempt_id
-                        .as_deref()
-                        .filter(|_| job.state == super::domain::JobState::Running)
-                    {
-                        if domain
-                            .unpublished_admissions(&project.project_id)?
-                            .iter()
-                            .any(|(_, unpublished, _)| unpublished == attempt_id)
-                        {
-                            domain.fail_attempt(
-                                attempt_id,
-                                &unpublished_admission_failure(&refusal.message),
-                            )?;
-                        }
-                    }
+                    settle_unpublished_reservation(
+                        &mut domain,
+                        &project.project_id,
+                        job,
+                        &refusal.message,
+                    )?;
                     domain.record_admission_failure(&job.id, &refusal.failure)?;
                     if refusal.profile_incompatible
                         && job.state == super::domain::JobState::Eligible
