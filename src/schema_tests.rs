@@ -15,14 +15,15 @@ use crate::orchestration::execution_runtime::{
     ExecutionPlan, ExecutionRuntime, ExecutionRuntimeError, settle_provider_error,
 };
 use crate::persistence::{
-    AgentConfig, AvailabilityObservation, AvailabilityStatId, AvailabilityStatRecord,
-    DependencyCondition, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType,
-    FinalResult, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobOutcome,
-    JobRecord, JobRetry, LlmConfig, LlmParameters, LlmProviderId, LlmTarget, LlmTransport,
-    Measurements, MetricsRecord, ModelCapability, NewAgent, NewAvailabilityStat, NewExecutor,
-    NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
-    ObservationCursor, ObservationFilter, OutputKind, ProfileId, ProfileKind, ProjectId, RecordRef,
-    RetryInput, TimeRange, Timestamp, Violation, WrongProfileKind,
+    AgentConfig, AvailabilityClassification, AvailabilityObservation, AvailabilityStatId,
+    AvailabilityStatRecord, DependencyCondition, ExecutionConfiguration, ExecutionMode, ExecutorId,
+    ExecutorType, FinalResult, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft,
+    JobOutcome, JobRecord, JobRetry, LlmConfig, LlmParameters, LlmProviderId, LlmTarget,
+    LlmTransport, Measurements, MetricsRecord, ModelCapability, NewAgent, NewAvailabilityStat,
+    NewExecutor, NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig,
+    NewProject, ObservationCursor, ObservationFilter, OutputKind, ProfileId, ProfileKind,
+    ProjectId, RecordRef, RejectionCause, RetryInput, TimeRange, Timestamp, UnavailableCause,
+    Violation, WrongProfileKind,
 };
 use crate::provider_execution::{ProviderExecutionError, ResponseFacts};
 use crate::test_support::{TestRoot, data_directory as test_data_directory, poll_once, wait};
@@ -3771,6 +3772,11 @@ fn a_local_stop_settles_unknown_and_records_only_the_response_facts_it_had() {
         [response(200)],
         "the response facts are kept, and no provider failure is invented"
     );
+    assert_eq!(
+        observations[0].observation.classification(),
+        AvailabilityClassification::Available,
+        "a normal finish stays valid after a local stop leaves the Job unknown"
+    );
 
     // A local output-write failure before any finish event.
     let (written, observations) = settled(
@@ -3796,6 +3802,11 @@ fn a_local_stop_settles_unknown_and_records_only_the_response_facts_it_had() {
             failure: None,
         }],
         "a local write failure is not a provider failure"
+    );
+    assert_eq!(
+        observations[0].observation.classification(),
+        AvailabilityClassification::Unconfirmed,
+        "a local write failure without a finish reason is not availability evidence"
     );
     worker.shutdown().expect("shutdown");
 }
@@ -3828,6 +3839,11 @@ fn provider_and_transport_failures_are_observed_and_refused_requests_are_not() {
         })],
         "a transport failure is a genuine observation"
     );
+    assert_eq!(
+        observations[0].observation.classification(),
+        AvailabilityClassification::Unconfirmed,
+        "a transport failure without an observed status is not proof of unavailability"
+    );
 
     let rejected = provider_failure("rate limited", Some(429), true);
     let (job, observations) = settled(
@@ -3847,6 +3863,28 @@ fn provider_and_transport_failures_are_observed_and_refused_requests_are_not() {
             .collect::<Vec<_>>(),
         [failure(rejected)],
         "a genuine HTTP rejection keeps its status and failure"
+    );
+    assert_eq!(
+        observations[0].observation.classification(),
+        AvailabilityClassification::Rejected(RejectionCause::RateLimited),
+        "a rate-limit rejection is a definite refusal, not unavailability"
+    );
+
+    let server_error = provider_failure("overloaded", Some(503), true);
+    let (job, observations) = settled(
+        &handle,
+        agent,
+        targeted,
+        executor,
+        ProviderExecutionError::Rejected {
+            failure: server_error.clone(),
+        },
+    );
+    assert!(job.failed_at.is_some() && job.unknown_at.is_none());
+    assert_eq!(
+        observations[0].observation.classification(),
+        AvailabilityClassification::Unavailable(UnavailableCause::ProviderServerError),
+        "an observed HTTP 5xx is Provider unavailability"
     );
 
     for error in [

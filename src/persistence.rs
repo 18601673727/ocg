@@ -731,7 +731,8 @@ pub struct MetricsRecord {
 
 /// The facts observed about one request that was sent to an LLM Provider.
 /// A request refused locally before it was sent has no observation. These
-/// are raw facts: nothing here classifies the request as available or not.
+/// are raw facts; [`AvailabilityObservation::classification`] derives their
+/// availability meaning on demand, and nothing is stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvailabilityObservation {
     /// The HTTP status the Provider answered with, when one was seen.
@@ -744,9 +745,78 @@ pub struct AvailabilityObservation {
     pub failure: Option<ProviderFailure>,
 }
 
+/// The availability meaning of one observation, derived from its structured
+/// facts. It is a view, never stored, and never changes the observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvailabilityClassification {
+    /// HTTP 200 whose stream reached a normal terminal finish reason.
+    Available,
+    /// Provider evidence of unavailability.
+    Unavailable(UnavailableCause),
+    /// A definite refusal. It says nothing about availability and is kept
+    /// apart from the availability denominator.
+    Rejected(RejectionCause),
+    /// No valid terminal evidence, or evidence this classification does not
+    /// support. Reportable, but neither success nor failure.
+    Unconfirmed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnavailableCause {
+    /// The Provider answered with an HTTP 5xx status.
+    ProviderServerError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectionCause {
+    /// HTTP 429.
+    RateLimited,
+    /// HTTP 401 or 403.
+    AuthOrPermission,
+    /// HTTP 400, 404 or 422.
+    RequestOrTarget,
+}
+
 impl AvailabilityObservation {
     fn is_empty(&self) -> bool {
-        self.status_code.is_none() && self.finish_reason.is_none() && self.raw_finish_reason.is_none() && self.failure.is_none()
+        self.status_code.is_none()
+            && self.finish_reason.is_none()
+            && self.raw_finish_reason.is_none()
+            && self.failure.is_none()
+    }
+
+    /// Classifies this observation from its observed HTTP status and finish
+    /// reason. The failure text never decides a class: a failure without an
+    /// observed status is Unconfirmed, because a timeout, reset or incomplete
+    /// exchange does not prove that the Provider was unavailable.
+    #[must_use]
+    pub fn classification(&self) -> AvailabilityClassification {
+        use AvailabilityClassification::{Available, Rejected, Unavailable, Unconfirmed};
+        match self.status_code {
+            Some(200) if self.terminates_normally() => Available,
+            Some(500..=599) => Unavailable(UnavailableCause::ProviderServerError),
+            Some(429) => Rejected(RejectionCause::RateLimited),
+            Some(401 | 403) => Rejected(RejectionCause::AuthOrPermission),
+            Some(400 | 404 | 422) => Rejected(RejectionCause::RequestOrTarget),
+            Some(_) | None => Unconfirmed,
+        }
+    }
+
+    /// Whether the response ended with a normal terminal finish reason that
+    /// no other fact contradicts. Missing usage is not a contradiction.
+    fn terminates_normally(&self) -> bool {
+        let Some(finish) = self.finish_reason else {
+            return false;
+        };
+        let normal = matches!(finish, ChatFinishReason::Stop | ChatFinishReason::Length);
+        // A failure beside a finish reason is conflicting evidence, and a raw
+        // reason that names a different finish reason contradicts the typed one.
+        normal
+            && self.failure.is_none()
+            && self
+                .raw_finish_reason
+                .as_deref()
+                .is_none_or(|raw| raw == finish.as_openai_str())
     }
 }
 
@@ -1596,4 +1666,140 @@ pub(crate) fn record_availability_stat(batch: &mut Batch, stat: NewAvailabilityS
         stat.job,
     )?;
     Ok((id, MarkerSubjects::created(RecordRef::Job(stat.job), RecordRef::AvailabilityStat(id))))
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+
+    fn observation(
+        status_code: Option<u16>,
+        finish_reason: Option<ChatFinishReason>,
+        raw_finish_reason: Option<&str>,
+        failure: Option<&str>,
+    ) -> AvailabilityObservation {
+        AvailabilityObservation {
+            status_code,
+            finish_reason,
+            raw_finish_reason: raw_finish_reason.map(str::to_owned),
+            failure: failure.map(|message| ProviderFailure {
+                message: message.to_owned(),
+                status_code,
+                ..ProviderFailure::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn classification_follows_only_observed_status_and_finish_facts() {
+        use AvailabilityClassification::{Available, Rejected, Unavailable, Unconfirmed};
+        use ChatFinishReason::{ContentFilter, Error, Length, Other, Stop, ToolCalls};
+        let cases = [
+            // HTTP 200 needs a normal terminal finish reason.
+            (observation(Some(200), None, None, None), Unconfirmed),
+            (
+                observation(Some(200), Some(Stop), Some("stop"), None),
+                Available,
+            ),
+            (observation(Some(200), Some(Stop), None, None), Available),
+            (
+                observation(Some(200), Some(Length), Some("length"), None),
+                Available,
+            ),
+            (
+                observation(Some(201), Some(Stop), Some("stop"), None),
+                Unconfirmed,
+            ),
+            (
+                observation(Some(200), Some(ToolCalls), Some("tool_calls"), None),
+                Unconfirmed,
+            ),
+            (
+                observation(Some(200), Some(ContentFilter), Some("content_filter"), None),
+                Unconfirmed,
+            ),
+            (
+                observation(Some(200), Some(Error), Some("error"), None),
+                Unconfirmed,
+            ),
+            (
+                observation(Some(200), Some(Other), Some("other"), None),
+                Unconfirmed,
+            ),
+            // Conflicting facts are not evidence of completion.
+            (
+                observation(Some(200), Some(Stop), Some("length"), None),
+                Unconfirmed,
+            ),
+            (
+                observation(Some(200), Some(Stop), Some("stop"), Some("stream reset")),
+                Unconfirmed,
+            ),
+            (
+                observation(Some(200), None, Some("stop"), None),
+                Unconfirmed,
+            ),
+            (
+                observation(None, Some(Stop), Some("stop"), None),
+                Unconfirmed,
+            ),
+            // Provider HTTP 5xx is unavailability.
+            (
+                observation(Some(500), None, None, Some("server error")),
+                Unavailable(UnavailableCause::ProviderServerError),
+            ),
+            (
+                observation(Some(503), None, None, Some("overloaded")),
+                Unavailable(UnavailableCause::ProviderServerError),
+            ),
+            (
+                observation(Some(599), None, None, None),
+                Unavailable(UnavailableCause::ProviderServerError),
+            ),
+            // Definite refusals are kept apart by cause.
+            (
+                observation(Some(429), None, None, Some("rate limited")),
+                Rejected(RejectionCause::RateLimited),
+            ),
+            (
+                observation(Some(401), None, None, Some("bad key")),
+                Rejected(RejectionCause::AuthOrPermission),
+            ),
+            (
+                observation(Some(403), None, None, Some("forbidden")),
+                Rejected(RejectionCause::AuthOrPermission),
+            ),
+            (
+                observation(Some(400), None, None, Some("bad body")),
+                Rejected(RejectionCause::RequestOrTarget),
+            ),
+            (
+                observation(Some(404), None, None, Some("no model")),
+                Rejected(RejectionCause::RequestOrTarget),
+            ),
+            (
+                observation(Some(422), None, None, Some("invalid")),
+                Rejected(RejectionCause::RequestOrTarget),
+            ),
+            // Statuses with no approved mapping are not invented into a class.
+            (
+                observation(Some(408), None, None, Some("timeout")),
+                Unconfirmed,
+            ),
+            (observation(Some(302), None, None, None), Unconfirmed),
+            // A transport failure without an observed Provider status is not proof.
+            (
+                observation(None, None, None, Some("connection reset")),
+                Unconfirmed,
+            ),
+            (observation(None, None, None, None), Unconfirmed),
+        ];
+        for (observation, expected) in cases {
+            assert_eq!(
+                observation.classification(),
+                expected,
+                "classifying {observation:?}"
+            );
+        }
+    }
 }
