@@ -28,6 +28,20 @@ impl ChatFinishReason {
             Self::Other => "other",
         }
     }
+
+    /// The finish reason a raw OpenAI `finish_reason` string names. Any string
+    /// without a known name is `Other`, exactly as the stream parser reads it.
+    #[must_use]
+    pub fn from_openai_str(raw: &str) -> Self {
+        match raw {
+            "stop" => Self::Stop,
+            "length" => Self::Length,
+            "tool_calls" => Self::ToolCalls,
+            "content_filter" => Self::ContentFilter,
+            "error" => Self::Error,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// Normalized token usage. Unreported counters stay `None`; they are never

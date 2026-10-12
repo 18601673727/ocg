@@ -15,15 +15,15 @@ use crate::orchestration::execution_runtime::{
     ExecutionPlan, ExecutionRuntime, ExecutionRuntimeError, settle_provider_error,
 };
 use crate::persistence::{
-    AgentConfig, AvailabilityClassification, AvailabilityObservation, AvailabilityStatId,
-    AvailabilityStatRecord, DependencyCondition, ExecutionConfiguration, ExecutionMode, ExecutorId,
-    ExecutorType, FinalResult, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft,
-    JobOutcome, JobRecord, JobRetry, LlmConfig, LlmParameters, LlmProviderId, LlmTarget,
-    LlmTransport, Measurements, MetricsRecord, ModelCapability, NewAgent, NewAvailabilityStat,
-    NewExecutor, NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig,
-    NewProject, ObservationCursor, ObservationFilter, OutputKind, ProfileId, ProfileKind,
-    ProjectId, RecordRef, RejectionCause, RetryInput, TimeRange, Timestamp, UnavailableCause,
-    Violation, WrongProfileKind,
+    AgentConfig, AvailabilityClassification, AvailabilityObservation, AvailabilityRequestSample,
+    AvailabilityStatId, AvailabilityStatRecord, DependencyCondition, ExecutionConfiguration,
+    ExecutionMode, ExecutorId, ExecutorType, FinalResult, IntermediateOutputKind, JobFinalization,
+    JobId, JobInputDraft, JobOutcome, JobRecord, JobRetry, LlmConfig, LlmParameters, LlmProviderId,
+    LlmTarget, LlmTransport, Measurements, MetricsRecord, MixedJobs, ModelCapability, NewAgent,
+    NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile,
+    NewProfileConfig, NewProject, ObservationCursor, ObservationFilter, OutputKind, ProfileId,
+    ProfileKind, ProjectId, RecordRef, RejectionCause, RetryInput, TimeRange, Timestamp,
+    UnavailableCause, Violation, WrongProfileKind,
 };
 use crate::provider_execution::{ProviderExecutionError, ResponseFacts};
 use crate::test_support::{TestRoot, data_directory as test_data_directory, poll_once, wait};
@@ -3902,6 +3902,396 @@ fn provider_and_transport_failures_are_observed_and_refused_requests_are_not() {
             "a request refused before delivery has no observation"
         );
     }
+    worker.shutdown().expect("shutdown");
+}
+
+/// Records one observation of `job`, observed at `micros`.
+fn observe(handle: &DatabaseHandle, job: JobId, micros: i64, observation: AvailabilityObservation) {
+    wait(handle.record_availability_stat(NewAvailabilityStat {
+        job,
+        observed_at: at(micros),
+        observation,
+    }))
+    .expect("record AvailabilityStat");
+}
+
+/// The Job's raw AvailabilityStats, in recording order.
+fn stats(handle: &DatabaseHandle, job: JobId) -> Vec<AvailabilityStatRecord> {
+    wait(handle.job_availability(job, None, 100)).expect("read AvailabilityStats")
+}
+
+/// The sample of records that all belong to one Job.
+fn sample_of<'a>(
+    records: impl IntoIterator<Item = &'a AvailabilityStatRecord>,
+) -> AvailabilityRequestSample {
+    AvailabilityRequestSample::from_records(records)
+        .expect("one Job")
+        .expect("records exist")
+}
+
+/// An HTTP status with no finish reason and no failure.
+fn bare(status_code: u16) -> AvailabilityObservation {
+    AvailabilityObservation {
+        status_code: Some(status_code),
+        finish_reason: None,
+        raw_finish_reason: None,
+        failure: None,
+    }
+}
+
+#[test]
+fn a_request_is_available_once_a_normal_finish_is_observed() {
+    let (_root, directory) = data_directory("request-sample-finish");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+
+    let stop = configured_child(&handle, agent, targeted);
+    observe(&handle, stop, 100, bare(200));
+    assert_eq!(
+        sample_of(&stats(&handle, stop)).classification,
+        AvailabilityClassification::Unconfirmed,
+        "HTTP 200 alone is not completion"
+    );
+    observe(&handle, stop, 200, response(200));
+    let records = stats(&handle, stop);
+    let sample = sample_of(&records);
+    assert_eq!(
+        (
+            sample.job,
+            sample.first_record,
+            sample.observed_at,
+            sample.classification
+        ),
+        (
+            stop,
+            records[0].id,
+            at(100),
+            AvailabilityClassification::Available
+        ),
+        "a Stop finish after a bare 200 makes the request available"
+    );
+
+    let length = configured_child(&handle, agent, targeted);
+    observe(&handle, length, 100, bare(200));
+    observe(
+        &handle,
+        length,
+        200,
+        AvailabilityObservation {
+            status_code: Some(200),
+            finish_reason: Some(ChatFinishReason::Length),
+            raw_finish_reason: Some("length".into()),
+            failure: None,
+        },
+    );
+    assert_eq!(
+        sample_of(&stats(&handle, length)).classification,
+        AvailabilityClassification::Available,
+        "a Length finish is a normal termination too"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn confirmed_completion_is_not_downgraded_by_missing_or_transport_only_evidence() {
+    let (_root, directory) = data_directory("request-sample-completion");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let job = configured_child(&handle, agent, targeted);
+
+    observe(&handle, job, 100, response(200));
+    observe(
+        &handle,
+        job,
+        200,
+        failure(ProviderFailure {
+            message: "connection reset".into(),
+            ..ProviderFailure::default()
+        }),
+    );
+    observe(
+        &handle,
+        job,
+        300,
+        failure(ProviderFailure {
+            message: "stream ended early".into(),
+            status_code: Some(200),
+            ..ProviderFailure::default()
+        }),
+    );
+    observe(&handle, job, 400, response(200));
+
+    let records = stats(&handle, job);
+    for prefix in 1..=records.len() {
+        assert_eq!(
+            sample_of(&records[..prefix]).classification,
+            AvailabilityClassification::Available,
+            "a valid normal termination survives each later observation, {prefix} seen"
+        );
+    }
+    let replayed = records.iter().chain(&records);
+    assert_eq!(
+        sample_of(replayed),
+        sample_of(&records),
+        "repeated evidence reaches the same sample"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_provider_fault_or_rejection_is_not_erased_by_missing_evidence() {
+    let (_root, directory) = data_directory("request-sample-fault");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let transport = || {
+        failure(ProviderFailure {
+            message: "connection reset".into(),
+            ..ProviderFailure::default()
+        })
+    };
+
+    let unavailable = configured_child(&handle, agent, targeted);
+    observe(
+        &handle,
+        unavailable,
+        100,
+        failure(provider_failure("overloaded", Some(503), true)),
+    );
+    observe(&handle, unavailable, 200, transport());
+    assert_eq!(
+        sample_of(&stats(&handle, unavailable)).classification,
+        AvailabilityClassification::Unavailable(UnavailableCause::ProviderServerError),
+        "transport-only evidence after an observed 5xx does not erase it"
+    );
+
+    let rejected = configured_child(&handle, agent, targeted);
+    observe(
+        &handle,
+        rejected,
+        100,
+        failure(provider_failure("rate limited", Some(429), true)),
+    );
+    observe(&handle, rejected, 200, transport());
+    assert_eq!(
+        sample_of(&stats(&handle, rejected)).classification,
+        AvailabilityClassification::Rejected(RejectionCause::RateLimited),
+        "transport-only evidence after a rejection does not erase it"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn explicit_contradictions_make_a_request_unconfirmed_and_keep_its_history() {
+    let (_root, directory) = data_directory("request-sample-conflict");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let cases = [
+        (
+            "two HTTP statuses",
+            vec![
+                response(200),
+                failure(provider_failure("overloaded", Some(503), true)),
+            ],
+        ),
+        (
+            "two finish reasons",
+            vec![
+                response(200),
+                AvailabilityObservation {
+                    status_code: Some(200),
+                    finish_reason: Some(ChatFinishReason::Length),
+                    raw_finish_reason: Some("length".into()),
+                    failure: None,
+                },
+            ],
+        ),
+        (
+            "a raw finish reason naming another reason",
+            vec![
+                response(200),
+                AvailabilityObservation {
+                    status_code: Some(200),
+                    finish_reason: Some(ChatFinishReason::Stop),
+                    raw_finish_reason: Some("length".into()),
+                    failure: None,
+                },
+            ],
+        ),
+        (
+            "a failure status that the observed status does not carry",
+            vec![
+                response(200),
+                AvailabilityObservation {
+                    status_code: None,
+                    finish_reason: None,
+                    raw_finish_reason: None,
+                    failure: Some(provider_failure("overloaded", Some(503), true)),
+                },
+            ],
+        ),
+    ];
+    for (case, observations) in cases {
+        let job = configured_child(&handle, agent, targeted);
+        for (index, observation) in observations.iter().enumerate() {
+            observe(&handle, job, (index as i64 + 1) * 100, observation.clone());
+        }
+        let records = stats(&handle, job);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.observation.clone())
+                .collect::<Vec<_>>(),
+            observations,
+            "the raw history of {case} is kept as recorded"
+        );
+        assert_eq!(
+            sample_of(&records).classification,
+            AvailabilityClassification::Unconfirmed,
+            "{case} is an explicit contradiction"
+        );
+    }
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn the_first_record_is_the_lowest_id_not_the_earliest_observation() {
+    let (_root, directory) = data_directory("request-sample-first");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let job = configured_child(&handle, agent, targeted);
+    observe(&handle, job, 200, bare(200));
+    observe(&handle, job, 100, response(200));
+
+    let records = stats(&handle, job);
+    let forward = sample_of(&records);
+    assert_eq!(
+        (
+            forward.first_record,
+            forward.observed_at,
+            forward.classification
+        ),
+        (
+            records[0].id,
+            at(200),
+            AvailabilityClassification::Available
+        ),
+        "the later record with the earlier observed_at does not move the sample"
+    );
+    assert_eq!(
+        sample_of(records.iter().rev()),
+        forward,
+        "replay in any order reaches the same sample"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn request_samples_refuse_mixed_jobs_and_report_no_sample_without_records() {
+    let (_root, directory) = data_directory("request-sample-mixed");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let first = configured_child(&handle, agent, targeted);
+    let second = configured_child(&handle, agent, targeted);
+    observe(&handle, first, 100, response(200));
+    observe(&handle, second, 100, response(200));
+    let (first_records, second_records) = (stats(&handle, first), stats(&handle, second));
+
+    assert_eq!(
+        AvailabilityRequestSample::from_records(first_records.iter().chain(&second_records)),
+        Err(MixedJobs {
+            first,
+            other: second
+        }),
+        "evidence from two Jobs is never one request"
+    );
+    assert_eq!(
+        AvailabilityRequestSample::from_records(std::iter::empty::<&AvailabilityStatRecord>()),
+        Ok(None),
+        "no records is no sample"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_retry_is_its_own_request_sample_even_with_a_shared_input() {
+    let (_root, directory) = data_directory("request-sample-retry");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let original = configured_child(&handle, agent, targeted);
+    observe(
+        &handle,
+        original,
+        100,
+        failure(provider_failure("overloaded", Some(503), true)),
+    );
+    wait(handle.finalize_job(
+        original,
+        JobFinalization::Failed(result("first try failed")),
+    ))
+    .expect("finish");
+    let input = wait(handle.job(original))
+        .expect("read job")
+        .expect("job exists")
+        .input;
+    let retry = wait(handle.retry_job(JobRetry {
+        original,
+        input: RetryInput::Unchanged,
+        name: None,
+        execution_mode: ExecutionMode::Once,
+        eligible_at: None,
+        scheduled_at: None,
+        next_due_at: None,
+        next_iteration_no: None,
+        iteration_no: None,
+        projects: Vec::new(),
+        dependencies: Vec::new(),
+        configuration: configuration(agent, targeted),
+        assigned_executor: None,
+    }))
+    .expect("retry with the same configuration");
+    observe(&handle, retry, 200, response(200));
+
+    let retry_input = wait(handle.job(retry))
+        .expect("read job")
+        .expect("job exists")
+        .input;
+    assert_eq!(retry_input, input, "the retry shares the frozen input");
+    let original_sample = sample_of(&stats(&handle, original));
+    let retry_sample = sample_of(&stats(&handle, retry));
+    assert_eq!(
+        (original_sample.job, original_sample.classification),
+        (
+            original,
+            AvailabilityClassification::Unavailable(UnavailableCause::ProviderServerError)
+        ),
+        "the failed attempt keeps its own sample"
+    );
+    assert_eq!(
+        (retry_sample.job, retry_sample.classification),
+        (retry, AvailabilityClassification::Available),
+        "the retry is a separate sample"
+    );
     worker.shutdown().expect("shutdown");
 }
 

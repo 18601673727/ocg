@@ -487,14 +487,7 @@ fn consume_event(
     }
     if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
         *raw_finish_reason = Some(raw.to_owned());
-        *finish_reason = Some(match raw {
-            "stop" => ChatFinishReason::Stop,
-            "length" => ChatFinishReason::Length,
-            "tool_calls" => ChatFinishReason::ToolCalls,
-            "content_filter" => ChatFinishReason::ContentFilter,
-            "error" => ChatFinishReason::Error,
-            _ => ChatFinishReason::Other,
-        });
+        *finish_reason = Some(ChatFinishReason::from_openai_str(raw));
     }
     Ok(text_delta)
 }

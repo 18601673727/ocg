@@ -791,14 +791,9 @@ impl AvailabilityObservation {
     /// exchange does not prove that the Provider was unavailable.
     #[must_use]
     pub fn classification(&self) -> AvailabilityClassification {
-        use AvailabilityClassification::{Available, Rejected, Unavailable, Unconfirmed};
         match self.status_code {
-            Some(200) if self.terminates_normally() => Available,
-            Some(500..=599) => Unavailable(UnavailableCause::ProviderServerError),
-            Some(429) => Rejected(RejectionCause::RateLimited),
-            Some(401 | 403) => Rejected(RejectionCause::AuthOrPermission),
-            Some(400 | 404 | 422) => Rejected(RejectionCause::RequestOrTarget),
-            Some(_) | None => Unconfirmed,
+            Some(200) if self.terminates_normally() => AvailabilityClassification::Available,
+            status => classify_status(status),
         }
     }
 
@@ -817,6 +812,149 @@ impl AvailabilityObservation {
                 .raw_finish_reason
                 .as_deref()
                 .is_none_or(|raw| raw == finish.as_openai_str())
+    }
+}
+
+/// The class of an HTTP status alone. Only the statuses approved for a class
+/// have one; every other status, including 200 without a normal finish, is
+/// Unconfirmed.
+fn classify_status(status_code: Option<u16>) -> AvailabilityClassification {
+    use AvailabilityClassification::{Rejected, Unavailable, Unconfirmed};
+    match status_code {
+        Some(500..=599) => Unavailable(UnavailableCause::ProviderServerError),
+        Some(429) => Rejected(RejectionCause::RateLimited),
+        Some(401 | 403) => Rejected(RejectionCause::AuthOrPermission),
+        Some(400 | 404 | 422) => Rejected(RejectionCause::RequestOrTarget),
+        Some(_) | None => Unconfirmed,
+    }
+}
+
+/// One request sample: the evidence that one independent LLM execution Job
+/// produced, reduced to one classification. It is derived on demand from
+/// committed AvailabilityStat records. It is never stored, and no record is
+/// changed. Several records of one Job add facts, not requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AvailabilityRequestSample {
+    pub job: JobId,
+    /// The lowest committed AvailabilityStat ID of the Job.
+    pub first_record: AvailabilityStatId,
+    /// `observed_at` of `first_record`. Later records never move it.
+    pub observed_at: Timestamp,
+    pub classification: AvailabilityClassification,
+}
+
+/// Records of two different Jobs were given to one request sample.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("availability evidence mixes {first} and {other}")]
+pub struct MixedJobs {
+    pub first: JobId,
+    pub other: JobId,
+}
+
+impl AvailabilityRequestSample {
+    /// Reduces the records of one request, in any order. The result depends
+    /// only on the set of records, so a replay yields the same sample. Empty
+    /// input is no sample.
+    ///
+    /// Explicit contradictions always make the sample Unconfirmed. They are:
+    /// two records observed different HTTP statuses; two records, or one
+    /// record, observed different finish reasons; a record whose raw finish
+    /// reason names a different finish reason than its typed one; and a record
+    /// whose failure carries an HTTP status that differs from the observation's
+    /// status, including when the observation has none. A failure without a
+    /// status, a missing field, or an Unconfirmed record alone is not a
+    /// contradiction.
+    ///
+    /// Otherwise a record that is Available on its own makes the sample
+    /// Available, and absent that the HTTP status decides, as
+    /// [`AvailabilityObservation::classification`] does. A raw finish reason
+    /// without a typed one is not evidence and is not a contradiction.
+    pub fn from_records<'a>(
+        records: impl IntoIterator<Item = &'a AvailabilityStatRecord>,
+    ) -> Result<Option<Self>, MixedJobs> {
+        let mut evidence = RequestEvidence::default();
+        for record in records {
+            evidence.add(record)?;
+        }
+        Ok(evidence.sample())
+    }
+}
+
+/// The structured claims that the records of one request have made so far.
+/// It keeps claims, not records, so replay in any order reaches the same state.
+#[derive(Default)]
+struct RequestEvidence {
+    job: Option<JobId>,
+    /// The lowest record ID seen, with its observed time.
+    first: Option<(AvailabilityStatId, Timestamp)>,
+    /// The first HTTP status observed.
+    status: Option<u16>,
+    /// The first finish reason observed.
+    finish: Option<ChatFinishReason>,
+    /// Some record is an Available observation on its own.
+    terminal: bool,
+    /// An explicit contradiction has been seen; see `from_records`.
+    contradictory: bool,
+}
+
+impl RequestEvidence {
+    fn add(&mut self, record: &AvailabilityStatRecord) -> Result<(), MixedJobs> {
+        match self.job {
+            Some(first) if first != record.job => {
+                return Err(MixedJobs {
+                    first,
+                    other: record.job,
+                });
+            }
+            _ => self.job = Some(record.job),
+        }
+        self.first = match self.first {
+            Some((id, observed_at)) if id <= record.id => Some((id, observed_at)),
+            _ => Some((record.id, record.observed_at)),
+        };
+
+        let observation = &record.observation;
+        self.terminal |= observation.classification() == AvailabilityClassification::Available;
+        if let Some(status) = observation.status_code {
+            match self.status {
+                Some(first) => self.contradictory |= first != status,
+                None => self.status = Some(status),
+            }
+        }
+        if let Some(finish) = observation.finish_reason {
+            match self.finish {
+                Some(first) => self.contradictory |= first != finish,
+                None => self.finish = Some(finish),
+            }
+            if let Some(raw) = observation.raw_finish_reason.as_deref() {
+                self.contradictory |= ChatFinishReason::from_openai_str(raw) != finish;
+            }
+        }
+        let failure_status = observation
+            .failure
+            .as_ref()
+            .and_then(|failure| failure.status_code);
+        if let Some(failure_status) = failure_status {
+            self.contradictory |= observation.status_code != Some(failure_status);
+        }
+        Ok(())
+    }
+
+    fn sample(&self) -> Option<AvailabilityRequestSample> {
+        let (job, (first_record, observed_at)) = (self.job?, self.first?);
+        let classification = if self.contradictory {
+            AvailabilityClassification::Unconfirmed
+        } else if self.terminal {
+            AvailabilityClassification::Available
+        } else {
+            classify_status(self.status)
+        };
+        Some(AvailabilityRequestSample {
+            job,
+            first_record,
+            observed_at,
+            classification,
+        })
     }
 }
 
