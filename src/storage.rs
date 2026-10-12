@@ -1538,10 +1538,13 @@ pub(crate) enum CompactFailure {
 
 /// Compacts the file. This is redb's iterative, uninterruptible
 /// `Database::compact`: it needs exclusive access to the handle and runs for
-/// as long as it finds pages to move. Every step commits durably.
-pub(crate) fn compact(database: &mut Database) -> Result<(), CompactFailure> {
+/// as long as it finds pages to move. Every step commits durably. The result
+/// is `true` when redb moved pages and `false` when none could be moved; the
+/// file may still have shrunk on `false`, because redb frees pending pages
+/// before it checks for progress.
+pub(crate) fn compact(database: &mut Database) -> Result<bool, CompactFailure> {
     match database.compact() {
-        Ok(_) => Ok(()),
+        Ok(moved) => Ok(moved),
         Err(redb::CompactionError::TransactionInProgress) => Err(CompactFailure::TransactionInProgress),
         Err(redb::CompactionError::PersistentSavepointExists | redb::CompactionError::EphemeralSavepointExists) => {
             Err(CompactFailure::SavepointExists)

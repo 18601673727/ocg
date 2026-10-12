@@ -199,12 +199,14 @@ pub enum CompactionSkip {
     /// The file's length minus redb's live pages is the most compaction could
     /// return. It is an estimate: fragmentation inside pages is not counted.
     LittleReclaimable { file_bytes: u64, reclaimable_bytes: u64 },
-    /// An earlier attempt, successful or not, was too recent.
+    /// An earlier successful attempt was too recent. Failed attempts do not
+    /// start the cooldown.
     CoolingDown { remaining: Duration },
 }
 
-/// What a compaction did to the file. `file_bytes_after` equal to
-/// `file_bytes_before` means redb found nothing to move.
+/// What a compaction attempt did to the file. The sizes are measured after
+/// the attempt in both cases, because redb can shrink the file even when it
+/// moved no pages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactionReport {
     pub file_bytes_before: u64,
@@ -215,7 +217,10 @@ pub struct CompactionReport {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionOutcome {
     Skipped(CompactionSkip),
+    /// redb moved pages and every step committed.
     Compacted(CompactionReport),
+    /// The attempt completed, but redb found no pages it could move.
+    NoProgress(CompactionReport),
 }
 
 /// Why [`DatabaseHandle::compact_storage`] failed. Except for
@@ -1080,7 +1085,8 @@ struct WriteWorker {
     uncertain: Vec<OperationId>,
     /// Set from a storage failure until a reopen replaces the failed handle.
     storage_failure: Option<StorageError>,
-    /// When compaction last started, whatever its result.
+    /// When the last successful compaction started, including one that moved
+    /// no pages. Failed attempts leave it unchanged.
     last_compaction: Option<Instant>,
     shutdown_requested: bool,
 }
@@ -1517,7 +1523,6 @@ impl WriteWorker {
         }
 
         let began = Instant::now();
-        self.last_compaction = Some(began);
         // The guard ends before any failure is handled, which takes the same
         // lock to release the database.
         let compacted = {
@@ -1529,11 +1534,21 @@ impl WriteWorker {
         };
         let duration = began.elapsed();
         match compacted {
-            Ok(()) => Ok(CompactionOutcome::Compacted(CompactionReport {
-                file_bytes_before: file_bytes,
-                file_bytes_after: file_length(&file)?,
-                duration,
-            })),
+            Ok(moved) => {
+                // Only a completed attempt starts the cooldown. A refused or
+                // failed one leaves it unset.
+                self.last_compaction = Some(began);
+                let report = CompactionReport {
+                    file_bytes_before: file_bytes,
+                    file_bytes_after: file_length(&file)?,
+                    duration,
+                };
+                Ok(if moved {
+                    CompactionOutcome::Compacted(report)
+                } else {
+                    CompactionOutcome::NoProgress(report)
+                })
+            }
             Err(CompactFailure::TransactionInProgress) => Err(MaintenanceError::TransactionInProgress),
             Err(CompactFailure::SavepointExists) => Err(MaintenanceError::SavepointExists),
             Err(CompactFailure::Storage(error)) => Err(self.fail_storage(error)),
