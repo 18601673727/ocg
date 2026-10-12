@@ -279,7 +279,7 @@ pub enum DatabaseStatus {
 type Reply<T> = flume::Sender<Result<T, DatabaseError>>;
 
 enum Message {
-    Run(Envelope),
+    Run(Box<Envelope>),
     Shutdown,
 }
 
@@ -771,6 +771,7 @@ impl Drop for ReleaseOnPanic {
             }
             for message in self.receiver.drain() {
                 if let Message::Run(envelope) = message {
+                    let envelope = *envelope;
                     let operation = envelope.operation;
                     envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
                 }
@@ -1125,7 +1126,7 @@ impl WriteWorker {
             };
             match event {
                 Event::Control(Ok(control)) => self.handle(control),
-                Event::Message(Ok(Message::Run(envelope))) => self.execute_group(envelope),
+                Event::Message(Ok(Message::Run(envelope))) => self.execute_group(*envelope),
                 Event::CheckDue => {}
                 // Without senders, no handle and therefore no caller remains.
                 Event::Message(Ok(Message::Shutdown)) | Event::Message(Err(_)) | Event::Control(Err(_)) => return,
@@ -1204,8 +1205,8 @@ impl WriteWorker {
         let current = SystemPolicy::read_saved(&path).map_err(PolicyOperationError::NotSaved)?;
         if current != expected {
             return Err(PolicyOperationError::Conflict {
-                expected,
-                actual: current,
+                expected: Box::new(expected),
+                actual: Box::new(current),
             });
         }
         candidate
@@ -1220,16 +1221,15 @@ impl WriteWorker {
             PolicyOperationError::NotSaved(SystemPolicyError::Io { source, .. })
             | PolicyOperationError::OutcomeUncertain(SystemPolicyError::Io { source, .. }),
         ) = &result
+            && source.kind() == std::io::ErrorKind::StorageFull
         {
-            if source.kind() == std::io::ErrorKind::StorageFull {
-                self.activate(vec![ProtectionReason::FilesystemWriteFailed {
-                    area: ProtectedArea::Database,
-                    path,
-                    kind: source.kind(),
-                    os_error: source.raw_os_error(),
-                    detail: source.to_string(),
-                }]);
-            }
+            self.activate(vec![ProtectionReason::FilesystemWriteFailed {
+                area: ProtectedArea::Database,
+                path,
+                kind: source.kind(),
+                os_error: source.raw_os_error(),
+                detail: source.to_string(),
+            }]);
         }
         result
     }
@@ -1323,19 +1323,18 @@ impl WriteWorker {
             Ok(PolicySaveResult::SavedForRestart)
         })();
         drop(file);
-        if result.is_err() {
-            if let Err(source) = std::fs::remove_file(&temporary) {
-                if source.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "{}",
-                        system_policy::io_error(
-                            path,
-                            format!("clean up temporary file {}", temporary.display()),
-                            source
-                        )
-                    );
-                }
-            }
+        if result.is_err()
+            && let Err(source) = std::fs::remove_file(&temporary)
+            && source.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "{}",
+                system_policy::io_error(
+                    path,
+                    format!("clean up temporary file {}", temporary.display()),
+                    source
+                )
+            );
         }
         result
     }
@@ -1401,7 +1400,7 @@ impl WriteWorker {
         let mut group = vec![first];
         while group.len() < GROUP_LIMIT {
             match self.receiver.try_recv() {
-                Ok(Message::Run(envelope)) => group.push(envelope),
+                Ok(Message::Run(envelope)) => group.push(*envelope),
                 Ok(Message::Shutdown) => {
                     self.shutdown_requested = true;
                     break;
@@ -1581,6 +1580,7 @@ impl WriteWorker {
         for message in self.receiver.drain() {
             match message {
                 Message::Run(envelope) => {
+                    let envelope = *envelope;
                     let operation = envelope.operation;
                     envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
                 }
@@ -1726,6 +1726,7 @@ impl WriteWorker {
         // finds nothing unless every handle was dropped without a shutdown.
         for message in self.receiver.drain() {
             if let Message::Run(envelope) = message {
+                let envelope = *envelope;
                 let operation = envelope.operation;
                 envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
             }
@@ -1870,7 +1871,7 @@ impl DatabaseHandle {
             let epoch = self.shared.epoch.load(Ordering::SeqCst);
             let operation = OperationId::new(epoch, self.shared.next_operation.fetch_add(1, Ordering::Relaxed));
             let envelope = Envelope { operation, started: started.clone(), command: command(reply) };
-            self.sender.try_send(Message::Run(envelope)).map_err(|error| match error {
+            self.sender.try_send(Message::Run(Box::new(envelope))).map_err(|error| match error {
                 flume::TrySendError::Full(_) => DatabaseError::QueueFull,
                 flume::TrySendError::Disconnected(_) => DatabaseError::ShuttingDown,
             })?;

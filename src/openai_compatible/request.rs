@@ -114,18 +114,18 @@ impl ChatRequest {
                 "only streaming chat completions are supported",
             ));
         }
-        if let Some(options) = &self.stream_options {
-            if options.include_usage == Some(false) {
-                return Err(TransportError::unsupported(
-                    "stream_options.include_usage",
-                    "usage must be included for settlement",
-                ));
-            }
+        if let Some(options) = &self.stream_options
+            && options.include_usage == Some(false)
+        {
+            return Err(TransportError::unsupported(
+                "stream_options.include_usage",
+                "usage must be included for settlement",
+            ));
         }
-        if let Some(n) = self.n {
-            if n != 1 {
-                return Err(TransportError::unsupported("n", "only n = 1 is supported"));
-            }
+        if let Some(n) = self.n
+            && n != 1
+        {
+            return Err(TransportError::unsupported("n", "only n = 1 is supported"));
         }
         if self.max_tokens.is_some() && self.max_completion_tokens.is_some() {
             return Err(TransportError::invalid(
@@ -426,13 +426,13 @@ impl ChatToolCallWire {
                 "tool call id must not be empty",
             ));
         }
-        if let Some(kind) = &self.tool_type {
-            if kind != "function" {
-                return Err(TransportError::unsupported(
-                    format!("{field}.type"),
-                    format!("unsupported tool call type `{kind}`"),
-                ));
-            }
+        if let Some(kind) = &self.tool_type
+            && kind != "function"
+        {
+            return Err(TransportError::unsupported(
+                format!("{field}.type"),
+                format!("unsupported tool call type `{kind}`"),
+            ));
         }
         require_function_name(&self.function.name, field)?;
         parse_tool_arguments(

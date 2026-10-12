@@ -525,7 +525,7 @@ struct Worker {
     flush_due: Option<Instant>,
 }
 enum Event {
-    Record(Result<Record, flume::RecvError>),
+    Record(Box<Result<Record, flume::RecvError>>),
     Wake,
     Protection(Result<(), flume::RecvError>),
     Stop,
@@ -575,7 +575,7 @@ impl Worker {
                 continue;
             }
             let selector = flume::Selector::new()
-                .recv(&self.receiver, Event::Record)
+                .recv(&self.receiver, |record| Event::Record(Box::new(record)))
                 .recv(&wake, |_| Event::Wake)
                 .recv(watch.notifications(), Event::Protection);
             let event = if closing {
@@ -588,11 +588,14 @@ impl Worker {
                 }
             };
             match event {
-                Some(Event::Record(Ok(record))) => {
-                    self.shared.queued.fetch_sub(1, Ordering::SeqCst);
-                    self.append(record);
-                }
-                Some(Event::Stop) | Some(Event::Record(Err(_))) => closing = true,
+                Some(Event::Record(record)) => match *record {
+                    Ok(record) => {
+                        self.shared.queued.fetch_sub(1, Ordering::SeqCst);
+                        self.append(record);
+                    }
+                    Err(_) => closing = true,
+                },
+                Some(Event::Stop) => closing = true,
                 Some(Event::Protection(Err(_))) => {
                     self.shared.accepting.store(false, Ordering::SeqCst);
                     self.shared.disabled.store(true, Ordering::SeqCst);
@@ -891,12 +894,12 @@ impl Worker {
                 }
             }
         }
-        if let Some(file) = self.file.as_mut() {
-            if let Err(error) = file.file.flush() {
-                let path = file.path.as_ref().clone();
-                self.io_failure("flush", path, error);
-                return false;
-            }
+        if let Some(file) = self.file.as_mut()
+            && let Err(error) = file.file.flush()
+        {
+            let path = file.path.as_ref().clone();
+            self.io_failure("flush", path, error);
+            return false;
         }
         self.shared
             .written

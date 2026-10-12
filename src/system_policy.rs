@@ -96,8 +96,8 @@ pub enum PolicyOperationError {
     InsufficientSpace(SpaceShortage),
     #[error("the saved system policy differs from the expected previous policy")]
     Conflict {
-        expected: SystemPolicy,
-        actual: SystemPolicy,
+        expected: Box<SystemPolicy>,
+        actual: Box<SystemPolicy>,
     },
     #[error("failed to read saved system policy: {0}")]
     Read(#[source] SystemPolicyError),

@@ -85,12 +85,11 @@ pub struct CapacityPermit {
 
 impl Drop for CapacityPermit {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.governor.lock() {
-            if let Some(capacity) = state.capacity_state.get_mut(&self.scope) {
-                if capacity.current > 0 {
-                    capacity.current -= 1;
-                }
-            }
+        if let Ok(mut state) = self.governor.lock()
+            && let Some(capacity) = state.capacity_state.get_mut(&self.scope)
+            && capacity.current > 0
+        {
+            capacity.current -= 1;
         }
     }
 }
@@ -197,11 +196,11 @@ impl GovernorState {
     }
 
     fn ensure_rate_limiter(&mut self, scope: &GovernorScope) {
-        if !self.rate_limiters.contains_key(scope) {
-            if let Some(&config) = self.rate_configs.get(scope) {
-                self.rate_limiters
-                    .insert(scope.clone(), RateLimiterState::new(config));
-            }
+        if !self.rate_limiters.contains_key(scope)
+            && let Some(&config) = self.rate_configs.get(scope)
+        {
+            self.rate_limiters
+                .insert(scope.clone(), RateLimiterState::new(config));
         }
     }
 
@@ -223,11 +222,11 @@ impl GovernorState {
     }
 
     fn ensure_capacity_state(&mut self, scope: &GovernorScope) {
-        if !self.capacity_state.contains_key(scope) {
-            if let Some(&config) = self.capacity_configs.get(scope) {
-                self.capacity_state
-                    .insert(scope.clone(), CapacityState::new(config));
-            }
+        if !self.capacity_state.contains_key(scope)
+            && let Some(&config) = self.capacity_configs.get(scope)
+        {
+            self.capacity_state
+                .insert(scope.clone(), CapacityState::new(config));
         }
     }
 }
@@ -280,18 +279,18 @@ impl Governor {
 
         // Check rate limit first
         state.ensure_rate_limiter(&scope);
-        if let Some(rate_limiter) = state.rate_limiters.get_mut(&scope) {
-            if let Err(retry_after) = rate_limiter.check_and_acquire(Instant::now()) {
-                return Ok(Err(GovernorDecision::RateLimited { retry_after }));
-            }
+        if let Some(rate_limiter) = state.rate_limiters.get_mut(&scope)
+            && let Err(retry_after) = rate_limiter.check_and_acquire(Instant::now())
+        {
+            return Ok(Err(GovernorDecision::RateLimited { retry_after }));
         }
 
         // Then check capacity
         state.ensure_capacity_state(&scope);
-        if let Some(capacity) = state.capacity_state.get_mut(&scope) {
-            if !capacity.try_acquire() {
-                return Ok(Err(GovernorDecision::CapacityUnavailable));
-            }
+        if let Some(capacity) = state.capacity_state.get_mut(&scope)
+            && !capacity.try_acquire()
+        {
+            return Ok(Err(GovernorDecision::CapacityUnavailable));
         }
 
         // Success: return a permit that will release capacity on drop
@@ -337,11 +336,11 @@ impl Governor {
             let now = Instant::now();
 
             // Check upstream cooldown first
-            if let Some(until) = rate_limiter.cooldown_until {
-                if now < until {
-                    let retry_after = until.duration_since(now);
-                    return Ok((false, Some(retry_after.as_millis() as u64)));
-                }
+            if let Some(until) = rate_limiter.cooldown_until
+                && now < until
+            {
+                let retry_after = until.duration_since(now);
+                return Ok((false, Some(retry_after.as_millis() as u64)));
             }
 
             // Check sliding window without modifying it

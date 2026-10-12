@@ -342,10 +342,10 @@ async fn parse_stream(
                 &mut raw_finish_reason,
                 max_output_bytes,
             )?;
-            if let Some(delta) = delta.as_deref() {
-                if let Some(sink) = sink.as_deref_mut() {
-                    sink.append(delta).await?;
-                }
+            if let Some(delta) = delta.as_deref()
+                && let Some(sink) = sink.as_deref_mut()
+            {
+                sink.append(delta).await?;
             }
         }
     }
@@ -409,16 +409,16 @@ fn consume_event(
         return Ok(None);
     };
     let mut text_delta = None;
-    if let Some(delta) = choice.get("delta") {
-        if let Some(value) = delta.get("content").and_then(Value::as_str) {
-            if text.len().saturating_add(value.len()) > max_output_bytes {
-                return Err(ProviderExecutionError::Incomplete {
-                    message: "provider output exceeded its limit".to_owned(),
-                });
-            }
-            text.push_str(value);
-            text_delta = Some(value.to_owned());
+    if let Some(delta) = choice.get("delta")
+        && let Some(value) = delta.get("content").and_then(Value::as_str)
+    {
+        if text.len().saturating_add(value.len()) > max_output_bytes {
+            return Err(ProviderExecutionError::Incomplete {
+                message: "provider output exceeded its limit".to_owned(),
+            });
         }
+        text.push_str(value);
+        text_delta = Some(value.to_owned());
     }
     if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
         *raw_finish_reason = Some(raw.to_owned());

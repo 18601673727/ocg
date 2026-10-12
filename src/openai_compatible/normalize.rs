@@ -36,10 +36,10 @@ impl ToolCallNormalizer {
     /// when a start or complete event supplies it.
     pub fn index_for(&mut self, id: &str, name: Option<&str>) -> u32 {
         if let Some(&position) = self.by_id.get(id) {
-            if let Some(name) = name {
-                if !name.is_empty() {
-                    self.slots[position].name = name.to_string();
-                }
+            if let Some(name) = name
+                && !name.is_empty()
+            {
+                self.slots[position].name = name.to_string();
             }
             return u32::try_from(position).unwrap_or(u32::MAX);
         }
