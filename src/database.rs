@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,12 +15,14 @@ use crate::disk_protection::{
     RecoveryReport, ReopenFailure, SharedRequest, SpaceMeasurement, SpaceShortage,
 };
 use crate::persistence::{
-    self, AppendedOutput, AppendedStep, ExecutorId, JobFinalization, JobId, JobInputDraft,
-    JobInputId, JobOutputRecord, JobRecord, JobStepId, NewExecutor, NewJob, NewJobOutput,
-    NewJobStep, OperationId, OperationKind, OperationMarker, StepFacts, StepSettlement,
-    Timestamp, Violation,
+    self, AgentId, AgentRecord, AppendedOutput, ExecutorId, HealthCheckId, HealthCheckRecord,
+    JobFinalization, JobId, JobInputDraft, JobInputId, JobOutputRecord, JobRecord, JobRetry,
+    LlmProviderId, LlmProviderRecord, ModelCapability, NewAgent, NewExecutor, NewHealthCheck,
+    NewJob, NewJobOutput, NewLlmProvider, NewProfile, NewProfileConfig, NewProject, OperationId,
+    OperationKind, OperationMarker, Profile, ProfileId, ProfileRecord, ProfileVariant, ProjectId,
+    ProjectRecord, Timestamp, Violation, WrongProfileKind,
 };
-use crate::storage::{self, BatchError, BatchFailure, MarkerSubjects, OpenError};
+use crate::storage::{self, BatchError, BatchFailure, MarkerSubjects, OpenError, OpenedFile};
 use crate::system_policy::{self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError};
 pub use crate::storage::{StorageError, StorageErrorKind};
 
@@ -102,6 +105,9 @@ pub enum DatabaseError {
     ReadPoolStopped,
     #[error("failed to read from the database: {0}")]
     Read(StorageError),
+    /// A typed Profile read named a Profile of the other kind.
+    #[error("{0}")]
+    WrongProfileKind(WrongProfileKind),
     #[error("failed to start the database worker: {0}")]
     Startup(#[source] std::io::Error),
     #[error("invalid filesystem configuration: {0}")]
@@ -254,7 +260,7 @@ enum Command {
     BeginCoreLogCleanup {
         owner: JobId,
         executor: ExecutorId,
-        facts: StepFacts,
+        started: NewJobOutput,
         reply: Reply<crate::log_cleanup::CleanupRecords>,
     },
     SaveJobInput {
@@ -267,25 +273,22 @@ enum Command {
         input: JobInputId,
         reply: Reply<JobId>,
     },
+    RetryJob {
+        retry: JobRetry,
+        reply: Reply<JobId>,
+    },
+    StartJob {
+        job: JobId,
+        reply: Reply<()>,
+    },
     AssignJobExecutor {
         job: JobId,
         executor: ExecutorId,
         reply: Reply<()>,
     },
-    AppendJobStep {
+    AssociateJobProject {
         job: JobId,
-        step: NewJobStep,
-        reply: Reply<AppendedStep>,
-    },
-    StartJobStep {
-        step: JobStepId,
-        executed_by: Option<ExecutorId>,
-        reply: Reply<()>,
-    },
-    SettleJobStep {
-        step: JobStepId,
-        settlement: StepSettlement,
-        facts: StepFacts,
+        project: ProjectId,
         reply: Reply<()>,
     },
     AppendJobOutput {
@@ -302,6 +305,33 @@ enum Command {
         executor: NewExecutor,
         reply: Reply<ExecutorId>,
     },
+    CreateProject {
+        project: NewProject,
+        reply: Reply<ProjectId>,
+    },
+    CreateLlmProvider {
+        provider: NewLlmProvider,
+        reply: Reply<LlmProviderId>,
+    },
+    CreateProfile {
+        profile: NewProfile,
+        reply: Reply<ProfileId>,
+    },
+    UpdateProfile {
+        id: ProfileId,
+        profile: NewProfile,
+        reply: Reply<()>,
+    },
+    CreateAgent {
+        agent: NewAgent,
+        reply: Reply<AgentId>,
+    },
+    RecordHealthCheck {
+        profile: ProfileId,
+        // Boxed so its configuration snapshot does not size every queued command.
+        check: Box<NewHealthCheck>,
+        reply: Reply<HealthCheckId>,
+    },
 }
 
 impl Command {
@@ -312,8 +342,8 @@ impl Command {
     fn execute(self, database: &Database, operation: OperationId) -> Option<StorageFailure> {
         use OperationKind as Kind;
         match self {
-            Self::BeginCoreLogCleanup { owner, executor, facts, reply } => run(database, operation, Kind::BeginCoreLogCleanup, reply, |batch| {
-                persistence::begin_core_log_cleanup(batch, owner, executor, facts)
+            Self::BeginCoreLogCleanup { owner, executor, started, reply } => run(database, operation, Kind::BeginCoreLogCleanup, reply, |batch| {
+                persistence::begin_core_log_cleanup(batch, owner, executor, started)
             }),
             Self::SaveJobInput { existing, draft, reply } => run(database, operation, Kind::SaveJobInput, reply, |batch| {
                 persistence::save_job_input(batch, existing, draft)
@@ -321,17 +351,17 @@ impl Command {
             Self::CreateJobWithInput { job, input, reply } => run(database, operation, Kind::CreateJobWithInput, reply, |batch| {
                 persistence::create_job_with_input(batch, job, input)
             }),
+            Self::RetryJob { retry, reply } => run(database, operation, Kind::RetryJob, reply, |batch| {
+                persistence::retry_job(batch, retry)
+            }),
+            Self::StartJob { job, reply } => run(database, operation, Kind::StartJob, reply, |batch| {
+                persistence::start_job(batch, job)
+            }),
             Self::AssignJobExecutor { job, executor, reply } => run(database, operation, Kind::AssignJobExecutor, reply, |batch| {
                 persistence::assign_job_executor(batch, job, executor)
             }),
-            Self::AppendJobStep { job, step, reply } => run(database, operation, Kind::AppendJobStep, reply, |batch| {
-                persistence::append_job_step(batch, job, step)
-            }),
-            Self::StartJobStep { step, executed_by, reply } => run(database, operation, Kind::StartJobStep, reply, |batch| {
-                persistence::start_job_step(batch, step, executed_by)
-            }),
-            Self::SettleJobStep { step, settlement, facts, reply } => run(database, operation, Kind::SettleJobStep, reply, |batch| {
-                persistence::settle_job_step(batch, step, settlement, facts)
+            Self::AssociateJobProject { job, project, reply } => run(database, operation, Kind::AssociateJobProject, reply, |batch| {
+                persistence::associate_job_project(batch, job, project)
             }),
             Self::AppendJobOutput { job, output, reply } => run(database, operation, Kind::AppendJobOutput, reply, |batch| {
                 persistence::append_job_output(batch, job, output)
@@ -342,6 +372,24 @@ impl Command {
             Self::CreateExecutor { executor, reply } => run(database, operation, Kind::CreateExecutor, reply, |batch| {
                 persistence::create_executor(batch, executor)
             }),
+            Self::CreateProject { project, reply } => run(database, operation, Kind::CreateProject, reply, |batch| {
+                persistence::create_project(batch, project)
+            }),
+            Self::CreateLlmProvider { provider, reply } => run(database, operation, Kind::CreateLlmProvider, reply, |batch| {
+                persistence::create_llm_provider(batch, provider)
+            }),
+            Self::CreateProfile { profile, reply } => run(database, operation, Kind::CreateProfile, reply, |batch| {
+                persistence::create_profile(batch, profile)
+            }),
+            Self::UpdateProfile { id, profile, reply } => run(database, operation, Kind::UpdateProfile, reply, |batch| {
+                persistence::update_profile(batch, id, profile)
+            }),
+            Self::CreateAgent { agent, reply } => run(database, operation, Kind::CreateAgent, reply, |batch| {
+                persistence::create_agent(batch, agent)
+            }),
+            Self::RecordHealthCheck { profile, check, reply } => run(database, operation, Kind::RecordHealthCheck, reply, |batch| {
+                persistence::record_health_check(batch, profile, *check)
+            }),
         }
     }
 
@@ -350,22 +398,36 @@ impl Command {
     /// rather than wraps, so an absurd payload fails the space check.
     fn expected_write_bytes(&self) -> u64 {
         let payload = match self {
-            Self::BeginCoreLogCleanup { facts, .. } => fact_bytes(facts).saturating_add(256),
+            Self::BeginCoreLogCleanup { started, .. } => output_bytes(&started.summary, &started.code).saturating_add(256),
             Self::SaveJobInput { draft, .. } => text_bytes(&draft.submission_id).saturating_add(text_bytes(&draft.objective)),
             Self::CreateJobWithInput { job, .. } => text_bytes(&job.name),
-            Self::AssignJobExecutor { .. } | Self::StartJobStep { .. } => 0,
-            Self::AppendJobStep { step, .. } => byte_count(step.operation.len())
-                .saturating_add(text_bytes(&step.protocol_call_id))
-                .saturating_add(fact_bytes(&step.facts)),
-            Self::SettleJobStep { facts, .. } => fact_bytes(facts),
-            Self::AppendJobOutput { output, .. } => text_bytes(&output.summary).saturating_add(text_bytes(&output.code)),
+            Self::RetryJob { retry, .. } => text_bytes(&retry.name),
+            Self::StartJob { .. } | Self::AssignJobExecutor { .. } | Self::AssociateJobProject { .. } => 0,
+            Self::AppendJobOutput { output, .. } => output_bytes(&output.summary, &output.code),
             Self::FinalizeJob { finalization, .. } => match finalization {
                 JobFinalization::Completed(result) | JobFinalization::Failed(result) | JobFinalization::Cancelled(result) => {
-                    text_bytes(&result.summary).saturating_add(text_bytes(&result.code))
+                    output_bytes(&result.summary, &result.code)
                 }
                 JobFinalization::Unknown => 0,
             },
             Self::CreateExecutor { executor, .. } => byte_count(executor.name.len()),
+            Self::CreateProject { project, .. } => byte_count(project.name.len()).saturating_add(text_bytes(&project.description)),
+            Self::CreateLlmProvider { provider, .. } => byte_count(provider.name.len())
+                .saturating_add(text_bytes(&provider.endpoint))
+                .saturating_add(text_bytes(&provider.credential_ref)),
+            Self::CreateProfile { profile, .. } | Self::UpdateProfile { profile, .. } => byte_count(profile.name.len()).saturating_add(match &profile.config {
+                NewProfileConfig::Agent { config, .. } => text_bytes(&config.instructions),
+                NewProfileConfig::Llm { config, .. } => byte_count(config.model.len()),
+            }),
+            Self::CreateAgent { agent, .. } => byte_count(agent.name.len()),
+            Self::RecordHealthCheck { check, .. } => {
+                let failure = match &check.outcome {
+                    persistence::HealthCheckOutcome::Passed => 0,
+                    persistence::HealthCheckOutcome::Failed(error) => byte_count(error.to_string().len()).saturating_mul(2),
+                };
+                let raw_usage = check.usage.raw.as_ref().map_or(0, |raw| byte_count(raw.to_string().len()));
+                failure.saturating_add(raw_usage)
+            }
         };
         payload.saturating_mul(2).saturating_add(TRANSACTION_ALLOWANCE_BYTES)
     }
@@ -376,14 +438,17 @@ impl Command {
         match self {
             Self::BeginCoreLogCleanup { reply, .. } => refuse(reply, error),
             Self::SaveJobInput { reply, .. } => refuse(reply, error),
-            Self::CreateJobWithInput { reply, .. } => refuse(reply, error),
-            Self::AssignJobExecutor { reply, .. } => refuse(reply, error),
-            Self::AppendJobStep { reply, .. } => refuse(reply, error),
-            Self::StartJobStep { reply, .. } => refuse(reply, error),
-            Self::SettleJobStep { reply, .. } => refuse(reply, error),
+            Self::CreateJobWithInput { reply, .. } | Self::RetryJob { reply, .. } => refuse(reply, error),
+            Self::StartJob { reply, .. } | Self::AssignJobExecutor { reply, .. } | Self::AssociateJobProject { reply, .. } => refuse(reply, error),
             Self::AppendJobOutput { reply, .. } => refuse(reply, error),
             Self::FinalizeJob { reply, .. } => refuse(reply, error),
             Self::CreateExecutor { reply, .. } => refuse(reply, error),
+            Self::CreateProject { reply, .. } => refuse(reply, error),
+            Self::CreateLlmProvider { reply, .. } => refuse(reply, error),
+            Self::CreateProfile { reply, .. } => refuse(reply, error),
+            Self::UpdateProfile { reply, .. } => refuse(reply, error),
+            Self::CreateAgent { reply, .. } => refuse(reply, error),
+            Self::RecordHealthCheck { reply, .. } => refuse(reply, error),
         }
     }
 }
@@ -400,23 +465,8 @@ fn text_bytes(text: &Option<String>) -> u64 {
     text.as_ref().map_or(0, |text| byte_count(text.len()))
 }
 
-fn fact_bytes(facts: &StepFacts) -> u64 {
-    let json_bytes = |map: &Option<serde_json::Map<String, serde_json::Value>>| {
-        map.as_ref()
-            .map_or(0, |map| serde_json::to_string(map).map_or(u64::MAX, |json| byte_count(json.len())))
-    };
-    [
-        text_bytes(&facts.code),
-        text_bytes(&facts.message),
-        text_bytes(&facts.stdout),
-        text_bytes(&facts.stderr),
-        text_bytes(&facts.external_task_id),
-        text_bytes(&facts.external_session_id),
-        json_bytes(&facts.structured_result),
-        json_bytes(&facts.diagnostic_details),
-    ]
-    .into_iter()
-    .fold(0, u64::saturating_add)
+fn output_bytes(summary: &Option<String>, code: &Option<String>) -> u64 {
+    text_bytes(summary).saturating_add(text_bytes(code))
 }
 
 /// A storage failure that ends this opening of the database.
@@ -485,6 +535,9 @@ struct Shared {
     /// Read workers and the write worker hold the read lock while they use
     /// the database; releasing it takes the write lock, so it waits for them.
     database: RwLock<Option<Opened>>,
+    /// The instance's Genesis Job, read from the file when it was opened.
+    /// A reopen that finds another identity fails, so it never changes.
+    genesis: JobId,
     /// The current opening's epoch. Only recovery changes it, by reopening
     /// while admission is closed, so identifiers allocated under the
     /// admission read lock never mix openings.
@@ -661,7 +714,7 @@ impl DatabaseWorker {
                     ready_sender.send(Err(DatabaseError::InsufficientStartupSpace(shortfalls))).ok();
                     return Ok(());
                 }
-                let (database, epoch) = match storage::open(&directory) {
+                let OpenedFile { database, epoch, genesis } = match storage::open(&directory) {
                     Ok(opened) => opened,
                     Err(error) => {
                         ready_sender.send(Err(open_error(error, &directory))).ok();
@@ -675,6 +728,7 @@ impl DatabaseWorker {
                     cleanup_worker: Arc::new(AtomicBool::new(false)),
                     admission: RwLock::new(Admission::Open),
                     database: RwLock::new(Some(Opened { database, epoch })),
+                    genesis,
                     epoch: AtomicU64::new(epoch),
                     next_operation: AtomicU64::new(1),
                     released: AtomicBool::new(false),
@@ -1056,13 +1110,15 @@ impl WriteWorker {
                     source,
                 )
             })?;
-            directory_file.sync_all().map_err(|source| {
-                PolicyOperationError::OutcomeUncertain(system_policy::io_error(
-                    path,
-                    "confirm replacement directory durability",
-                    source,
-                ))
-            })?;
+            if let Some(directory_file) = directory_file {
+                directory_file.sync_all().map_err(|source| {
+                    PolicyOperationError::OutcomeUncertain(system_policy::io_error(
+                        path,
+                        "confirm replacement directory durability",
+                        source,
+                    ))
+                })?;
+            }
             Ok(PolicySaveResult::SavedForRestart)
         })();
         drop(file);
@@ -1240,8 +1296,14 @@ impl WriteWorker {
     /// so no identifier is allocated while the epoch changes.
     fn reopen(&mut self) -> Result<u64, RecoveryError> {
         self.shared.release_database();
-        let (database, epoch) = storage::open(&self.directory)
+        let OpenedFile { database, epoch, genesis } = storage::open(&self.directory)
             .map_err(|error| RecoveryError::Reopen(reopen_failure(error, &self.directory)))?;
+        if genesis != self.shared.genesis {
+            return Err(RecoveryError::Reopen(ReopenFailure::Storage(StorageError::corrupted(format!(
+                "the reopened database names {genesis} as its Genesis Job, not {}",
+                self.shared.genesis
+            )))));
+        }
         *self.shared.database.write().unwrap_or_else(PoisonError::into_inner) = Some(Opened { database, epoch });
         self.shared.epoch.store(epoch, Ordering::SeqCst);
         self.shared.next_operation.store(1, Ordering::SeqCst);
@@ -1335,9 +1397,9 @@ impl DatabaseHandle {
         &self,
         owner: JobId,
         executor: ExecutorId,
-        facts: StepFacts,
+        started: NewJobOutput,
     ) -> Result<crate::log_cleanup::CleanupRecords, DatabaseError> {
-        self.submit(|reply| Command::BeginCoreLogCleanup { owner, executor, facts, reply }).await
+        self.submit(|reply| Command::BeginCoreLogCleanup { owner, executor, started, reply }).await
     }
 
     pub(crate) fn log_directory(&self) -> &std::path::Path {
@@ -1572,6 +1634,12 @@ impl DatabaseHandle {
         })
     }
 
+    /// The instance's Genesis Job: the root of every parent chain, and the
+    /// parent to name for top-level work.
+    pub fn genesis(&self) -> JobId {
+        self.shared.genesis
+    }
+
     pub async fn job(&self, job: JobId) -> Result<Option<JobRecord>, DatabaseError> {
         self.read(move |database| storage::read_job(database, job)).await
     }
@@ -1582,6 +1650,66 @@ impl DatabaseHandle {
         self.read(move |database| storage::read_jobs(database, before, limit)).await
     }
 
+    /// A Job's ordinary children in ID order, strictly after `after` when
+    /// given; at most 1,000 per call. The Genesis Job is not its own child.
+    pub async fn children(&self, parent: JobId, after: Option<JobId>, limit: usize) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::read_children(database, parent, after, limit)).await
+    }
+
+    /// What a submitted LLM execution child was configured to execute, as
+    /// frozen in its input, with the Profiles it was submitted with as
+    /// provenance. Later Profile edits do not change it. `None` for a Job
+    /// submitted without a configuration.
+    pub async fn job_configuration(&self, job: JobId) -> Result<Option<persistence::SubmittedConfiguration>, DatabaseError> {
+        self.read(move |database| storage::read_job_configuration(database, job)).await
+    }
+
+    /// The Executors registered for an LLM Profile as it is configured now,
+    /// oldest first. This lists candidates for new work only; it neither
+    /// ranks nor reserves them.
+    pub async fn compatible_executors(&self, llm_profile: ProfileId) -> Result<Vec<ExecutorId>, DatabaseError> {
+        self.read(move |database| storage::read_compatible_executors(database, llm_profile)).await
+    }
+
+    /// The Executors registered for exactly the LLM configuration a
+    /// submitted Job froze, oldest first; empty for an unconfigured Job.
+    pub async fn job_compatible_executors(&self, job: JobId) -> Result<Vec<ExecutorId>, DatabaseError> {
+        self.read(move |database| storage::read_job_compatible_executors(database, job)).await
+    }
+
+    /// An LLM Profile's configuration as it is now, for a HealthCheck to
+    /// capture when it starts. Refused for an Agent Profile.
+    pub async fn current_llm_configuration(&self, profile: ProfileId) -> Result<Option<persistence::FrozenLlmConfig>, DatabaseError> {
+        match self.read(move |database| storage::read_current_llm_configuration(database, profile)).await? {
+            Some(Ok(configuration)) => Ok(Some(configuration)),
+            Some(Err(mismatch)) => Err(DatabaseError::WrongProfileKind(mismatch)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a Profile can be edited now, with the unfinished Jobs that
+    /// hold it. `None` for a missing Profile.
+    pub async fn profile_editability(&self, profile: ProfileId) -> Result<Option<persistence::ProfileEditability>, DatabaseError> {
+        self.read(move |database| storage::read_profile_editability(database, profile)).await
+    }
+
+    /// The Jobs submitted with a Profile in ID order, strictly after `after`
+    /// when given; at most 1,000 per call.
+    pub async fn profile_jobs(&self, profile: ProfileId, after: Option<JobId>, limit: usize) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::read_profile_jobs(database, profile, after, limit)).await
+    }
+
+    /// The Jobs submitted with an input, oldest first: the Job that froze it
+    /// and every retry that reused it.
+    pub async fn input_jobs(&self, input: JobInputId) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::read_input_jobs(database, input)).await
+    }
+
+    /// The Jobs that explicitly retry `original`, oldest first.
+    pub async fn retries(&self, original: JobId) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::read_retries(database, original)).await
+    }
+
     /// A Job's outputs in seq order, strictly after `after_seq` when given;
     /// at most 1,000 per call.
     pub async fn job_outputs(&self, job: JobId, after_seq: Option<i64>, limit: usize) -> Result<Vec<JobOutputRecord>, DatabaseError> {
@@ -1590,6 +1718,105 @@ impl DatabaseHandle {
 
     pub async fn latest_output(&self, job: JobId) -> Result<Option<JobOutputRecord>, DatabaseError> {
         self.read(move |database| storage::read_latest_output(database, job)).await
+    }
+
+    pub async fn job_input(&self, id: JobInputId) -> Result<Option<persistence::JobInputRecord>, DatabaseError> {
+        self.read(move |database| {
+            storage::read_job_input(database, id).map(|opt| opt.map(storage::job_input_record))
+        }).await
+    }
+
+    pub async fn job_input_for_job(&self, job: JobId) -> Result<Option<persistence::JobInputRecord>, DatabaseError> {
+        self.read(move |database| {
+            storage::read_job_input_for_job(database, job).map(|opt| opt.map(storage::job_input_record))
+        }).await
+    }
+
+    pub async fn executor(&self, id: ExecutorId) -> Result<Option<persistence::ExecutorRecord>, DatabaseError> {
+        self.read(move |database| storage::read_executor(database, id)).await
+    }
+
+    /// Executors in reverse ID order, newest first. Strictly before `before` when given;
+    /// at most 1,000 per call.
+    pub async fn executors(&self, before: Option<ExecutorId>, limit: usize) -> Result<Vec<persistence::ExecutorRecord>, DatabaseError> {
+        self.read(move |database| storage::read_executors(database, before, limit)).await
+    }
+
+    pub async fn project(&self, id: ProjectId) -> Result<Option<ProjectRecord>, DatabaseError> {
+        self.read(move |database| storage::read_project(database, id)).await
+    }
+
+    /// Projects newest first, strictly before `before` when given; at most
+    /// 1,000 per call.
+    pub async fn projects(&self, before: Option<ProjectId>, limit: usize) -> Result<Vec<ProjectRecord>, DatabaseError> {
+        self.read(move |database| storage::read_projects(database, before, limit)).await
+    }
+
+    /// The Jobs associated with a Project in ID order, strictly after
+    /// `after` when given; at most 1,000 per call.
+    pub async fn project_jobs(&self, project: ProjectId, after: Option<JobId>, limit: usize) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::read_project_jobs(database, project, after, limit)).await
+    }
+
+    pub async fn llm_provider(&self, id: LlmProviderId) -> Result<Option<LlmProviderRecord>, DatabaseError> {
+        self.read(move |database| storage::read_llm_provider(database, id)).await
+    }
+
+    /// LLM Providers newest first, strictly before `before` when given; at
+    /// most 1,000 per call.
+    pub async fn llm_providers(&self, before: Option<LlmProviderId>, limit: usize) -> Result<Vec<LlmProviderRecord>, DatabaseError> {
+        self.read(move |database| storage::read_llm_providers(database, before, limit)).await
+    }
+
+    /// The LLM Profiles that use a Provider, oldest first.
+    pub async fn provider_profiles(&self, provider: LlmProviderId) -> Result<Vec<ProfileId>, DatabaseError> {
+        self.read(move |database| storage::read_provider_profiles(database, provider)).await
+    }
+
+    /// A Profile of either kind.
+    pub async fn profile(&self, id: ProfileId) -> Result<Option<ProfileRecord>, DatabaseError> {
+        self.read(move |database| storage::read_profile(database, id)).await
+    }
+
+    /// Profiles of both kinds newest first, strictly before `before` when
+    /// given; at most 1,000 per call.
+    pub async fn profiles(&self, before: Option<ProfileId>, limit: usize) -> Result<Vec<ProfileRecord>, DatabaseError> {
+        self.read(move |database| storage::read_profiles(database, before, limit)).await
+    }
+
+    /// A Profile in its typed form, such as `typed_profile::<AgentConfig>`
+    /// for an Agent Profile. A Profile of the other kind is refused with
+    /// [`DatabaseError::WrongProfileKind`].
+    pub async fn typed_profile<C: ProfileVariant>(&self, id: ProfileId) -> Result<Option<Profile<C>>, DatabaseError> {
+        let Some(record) = self.profile(id).await? else {
+            return Ok(None);
+        };
+        Profile::try_from(record).map(Some).map_err(DatabaseError::WrongProfileKind)
+    }
+
+    pub async fn agent_profile(&self, id: ProfileId) -> Result<Option<persistence::AgentProfile>, DatabaseError> {
+        self.typed_profile(id).await
+    }
+
+    pub async fn llm_profile(&self, id: ProfileId) -> Result<Option<persistence::LlmProfile>, DatabaseError> {
+        self.typed_profile(id).await
+    }
+
+    pub async fn agent(&self, id: AgentId) -> Result<Option<AgentRecord>, DatabaseError> {
+        self.read(move |database| storage::read_agent(database, id)).await
+    }
+
+    /// An LLM Profile's HealthCheck history in recording order, strictly
+    /// after `after` when given; at most 1,000 per call.
+    pub async fn health_checks(&self, profile: ProfileId, after: Option<HealthCheckId>, limit: usize) -> Result<Vec<HealthCheckRecord>, DatabaseError> {
+        self.read(move |database| storage::read_health_checks(database, profile, after, limit)).await
+    }
+
+    /// The newest HealthCheck of each capability that checked the
+    /// Profile's current configuration. A capability that no such check
+    /// verified has no entry, whatever was declared or verified before an edit.
+    pub async fn current_health_checks(&self, profile: ProfileId) -> Result<BTreeMap<ModelCapability, HealthCheckRecord>, DatabaseError> {
+        self.read(move |database| storage::read_current_health_checks(database, profile)).await
     }
 
     /// Operation markers in identifier order, strictly after `after` when
@@ -1620,20 +1847,21 @@ impl DatabaseHandle {
         self.submit(|reply| Command::CreateJobWithInput { job, input, reply }).await
     }
 
+    /// Creates a new Job that retries `retry.original`; see [`JobRetry`].
+    pub async fn retry_job(&self, retry: JobRetry) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::RetryJob { retry, reply }).await
+    }
+
+    pub async fn start_job(&self, job: JobId) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::StartJob { job, reply }).await
+    }
+
     pub async fn assign_job_executor(&self, job: JobId, executor: ExecutorId) -> Result<(), DatabaseError> {
         self.submit(|reply| Command::AssignJobExecutor { job, executor, reply }).await
     }
 
-    pub async fn append_job_step(&self, job: JobId, step: NewJobStep) -> Result<AppendedStep, DatabaseError> {
-        self.submit(|reply| Command::AppendJobStep { job, step, reply }).await
-    }
-
-    pub async fn start_job_step(&self, step: JobStepId, executed_by: Option<ExecutorId>) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::StartJobStep { step, executed_by, reply }).await
-    }
-
-    pub async fn settle_job_step(&self, step: JobStepId, settlement: StepSettlement, facts: StepFacts) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::SettleJobStep { step, settlement, facts, reply }).await
+    pub async fn associate_job_project(&self, job: JobId, project: ProjectId) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::AssociateJobProject { job, project, reply }).await
     }
 
     pub async fn append_job_output(&self, job: JobId, output: NewJobOutput) -> Result<AppendedOutput, DatabaseError> {
@@ -1647,6 +1875,34 @@ impl DatabaseHandle {
     pub async fn create_executor(&self, executor: NewExecutor) -> Result<ExecutorId, DatabaseError> {
         self.submit(|reply| Command::CreateExecutor { executor, reply }).await
     }
+
+    pub async fn create_project(&self, project: NewProject) -> Result<ProjectId, DatabaseError> {
+        self.submit(|reply| Command::CreateProject { project, reply }).await
+    }
+
+    pub async fn create_llm_provider(&self, provider: NewLlmProvider) -> Result<LlmProviderId, DatabaseError> {
+        self.submit(|reply| Command::CreateLlmProvider { provider, reply }).await
+    }
+
+    pub async fn create_profile(&self, profile: NewProfile) -> Result<ProfileId, DatabaseError> {
+        self.submit(|reply| Command::CreateProfile { profile, reply }).await
+    }
+
+    /// Replaces a Profile's name, payload and defining references, keeping
+    /// its identity and kind. Refused with [`Violation::ProfileLocked`] while
+    /// unfinished work holds it; see [`Self::profile_editability`].
+    pub async fn update_profile(&self, id: ProfileId, profile: NewProfile) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::UpdateProfile { id, profile, reply }).await
+    }
+
+    pub async fn create_agent(&self, agent: NewAgent) -> Result<AgentId, DatabaseError> {
+        self.submit(|reply| Command::CreateAgent { agent, reply }).await
+    }
+
+    /// Appends a HealthCheck fact for an LLM Profile without changing it.
+    pub async fn record_health_check(&self, profile: ProfileId, check: NewHealthCheck) -> Result<HealthCheckId, DatabaseError> {
+        self.submit(|reply| Command::RecordHealthCheck { profile, check: Box::new(check), reply }).await
+    }
 }
 
 #[cfg(test)]
@@ -1656,62 +1912,19 @@ mod read_pool_tests {
     //! makes a read worker exit; every wait is bounded.
 
     use std::future::Future;
-    use std::path::PathBuf;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use super::*;
+    use crate::test_support::{WAIT, data_directory as test_data_directory, poll_once, wait};
 
-    const WAIT: Duration = Duration::from_secs(10);
+    const SUITE: &str = "ocg-read-pool";
     const QUEUED: usize = 5;
 
     type PendingRead<'a, T> = Pin<Box<dyn Future<Output = Result<T, DatabaseError>> + 'a>>;
 
-    struct Unpark(std::thread::Thread);
-
-    impl Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    fn poll_once<F: Future + ?Sized>(future: Pin<&mut F>) -> Option<F::Output> {
-        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-        match future.poll(&mut Context::from_waker(&waker)) {
-            Poll::Ready(value) => Some(value),
-            Poll::Pending => None,
-        }
-    }
-
-    /// Drives a future on this thread, failing the test if it does not resolve in time.
-    fn wait<F: Future>(future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        let deadline = Instant::now() + WAIT;
-        loop {
-            if let Some(value) = poll_once(future.as_mut()) {
-                return value;
-            }
-            let now = Instant::now();
-            assert!(now < deadline, "a caller did not resolve within {WAIT:?}");
-            std::thread::park_timeout(deadline - now);
-        }
-    }
-
-    struct TestRoot(PathBuf);
-
-    impl Drop for TestRoot {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).ok();
-        }
-    }
-
-    fn data_directory(name: &str) -> (TestRoot, DataDirectory) {
-        let root = std::env::temp_dir().join(format!("ocg-read-pool-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&root).ok();
-        let directory = DataDirectory::bootstrap(root.clone().into_os_string()).expect("bootstrap data directory");
-        (TestRoot(root), directory)
+    fn data_directory(name: &str) -> (crate::test_support::TestRoot, DataDirectory) {
+        test_data_directory(SUITE, name)
     }
 
     /// Occupies every read worker with a read that reports it has started,

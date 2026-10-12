@@ -267,13 +267,15 @@ impl SystemPolicy {
                 source,
             )
         })?;
-        directory_file.sync_all().map_err(|source| {
-            io_error(
-                path,
-                "persist policy directory entry (publication durability uncertain)",
-                source,
-            )
-        })?;
+        if let Some(directory_file) = directory_file {
+            directory_file.sync_all().map_err(|source| {
+                io_error(
+                    path,
+                    "persist policy directory entry (publication durability uncertain)",
+                    source,
+                )
+            })?;
+        }
         Ok(())
     }
 }
@@ -310,14 +312,13 @@ pub(crate) fn io_error(
 }
 
 #[cfg(unix)]
-pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
-    File::open(path)
+pub(crate) fn open_directory(path: &Path) -> io::Result<Option<File>> {
+    File::open(path).map(Some)
 }
 
+/// Directory handles cannot be fsynced on this platform; publication relies
+/// on the filesystem persisting the directory entry with the file metadata.
 #[cfg(not(unix))]
-pub(crate) fn open_directory(_path: &Path) -> io::Result<File> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "durable system policy directory publication is unsupported on this platform",
-    ))
+pub(crate) fn open_directory(_path: &Path) -> io::Result<Option<File>> {
+    Ok(None)
 }

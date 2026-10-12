@@ -446,3 +446,96 @@ impl<T: Clone> SharedRequest<T> {
         self.waiters.lock().unwrap_or_else(PoisonError::into_inner).take();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::{DatabaseStatus, DatabaseWorker};
+    use crate::test_support::{data_directory as test_data_directory, wait};
+
+    const SUITE: &str = "ocg-disk-protection";
+
+    fn data_directory(name: &str) -> (crate::test_support::TestRoot, DataDirectory) {
+        test_data_directory(SUITE, name)
+    }
+
+    #[test]
+    fn space_allowance_respects_lock_threshold() {
+        assert!(leaves_threshold(100, 10, 90));
+        assert!(!leaves_threshold(100, 11, 90));
+        assert!(!leaves_threshold(10, 11, 1));
+
+        let root = std::env::temp_dir().join(format!("ocg-space-check-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).expect("create space-check directory");
+        assert!(check_space(ProtectedArea::Database, &root, 0, 1).is_ok());
+        assert!(matches!(
+            check_space(ProtectedArea::Database, &root, u64::MAX, 1),
+            Err(ProtectionReason::InsufficientSpace(_))
+        ));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn protected_database_recovers_only_after_resume_threshold_is_met() {
+        let (_root, directory) = data_directory("hysteresis");
+        let worker = DatabaseWorker::start_with_config(
+            &directory,
+            FilesystemConfig {
+                disk_lock_threshold_bytes: 1,
+                disk_resume_threshold_bytes: 2,
+                disk_check_interval_ms: 60_000,
+                cleanup_config: CleanupConfig::default(),
+            },
+        )
+        .expect("start database");
+        let handle = worker.handle();
+        let reason = ProtectionReason::InsufficientSpace(SpaceShortage {
+            area: ProtectedArea::Database,
+            path: directory.database_path().to_path_buf(),
+            available_bytes: 0,
+            expected_write_bytes: 0,
+            threshold_bytes: 1,
+        });
+        assert!(handle.activate_filesystem_protection(reason));
+        assert_eq!(handle.status(), DatabaseStatus::Protected);
+        assert!(handle.disk_protection().lock.is_some());
+
+        let report = wait(handle.recover_storage()).expect("recover protected database");
+        assert_eq!(report.reopened_epoch, None);
+        assert_eq!(handle.status(), DatabaseStatus::Open);
+        assert!(handle.disk_protection().lock.is_none());
+        assert!(handle.disk_protection().recovery_attempts >= 1);
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn protected_database_stays_locked_when_resume_threshold_is_not_met() {
+        let (_root, directory) = data_directory("hysteresis-blocked");
+        let worker = DatabaseWorker::start_with_config(
+            &directory,
+            FilesystemConfig {
+                disk_lock_threshold_bytes: 1,
+                disk_resume_threshold_bytes: u64::MAX,
+                disk_check_interval_ms: 60_000,
+                cleanup_config: CleanupConfig::default(),
+            },
+        )
+        .expect("start database at the lock threshold");
+        let handle = worker.handle();
+        let reason = ProtectionReason::InsufficientSpace(SpaceShortage {
+            area: ProtectedArea::Database,
+            path: directory.database_path().to_path_buf(),
+            available_bytes: 0,
+            expected_write_bytes: 1,
+            threshold_bytes: 1,
+        });
+        assert!(handle.activate_filesystem_protection(reason));
+
+        let recovery = wait(handle.recover_storage());
+        assert!(matches!(recovery, Err(RecoveryError::Space(_))));
+        assert_eq!(handle.status(), DatabaseStatus::Protected);
+        assert!(handle.disk_protection().lock.is_some());
+        worker.shutdown().expect("shutdown database");
+    }
+}

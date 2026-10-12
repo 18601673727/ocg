@@ -12,7 +12,7 @@ use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::disk_protection::{ProtectedArea, ProtectionReason};
 use crate::logger::is_runtime_file_name;
 use crate::persistence::{
-    ExecutorId, FinalResult, JobFinalization, JobId, JobStepId, StepFacts, StepSettlement,
+    ExecutorId, FinalResult, IntermediateOutputKind, JobId, JobOutcome, NewJobOutput,
 };
 
 pub const CLEANUP_QUEUE_CAPACITY: usize = 8;
@@ -22,7 +22,6 @@ const FAILURE_MESSAGE_BYTES: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CleanupRecords {
     pub job: JobId,
-    pub step: JobStepId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -85,7 +84,7 @@ fn bounded(text: &str, limit: usize) -> String {
 #[derive(Debug)]
 pub struct CleanupResult {
     pub records: CleanupRecords,
-    pub outcome: StepSettlement,
+    pub outcome: JobOutcome,
     pub summary: CleanupSummary,
 }
 
@@ -362,29 +361,25 @@ fn execute(
     let cutoff = SystemTime::now().checked_sub(Duration::from_secs(
         u64::from(summary.retention_days) * 86400,
     ));
-    let records = wait(
-        shared.database.begin_core_log_cleanup(
-            owner,
-            executor,
-            StepFacts {
-                structured_result: Some(serde_json::Map::from_iter([
-                    ("retention_days".into(), summary.retention_days.into()),
-                    (
-                        "max_log_files_per_run".into(),
-                        summary.max_log_files_per_run.into(),
-                    ),
-                    (
-                        "cutoff_unix_micros".into(),
-                        cutoff
-                            .and_then(|cutoff| cutoff.duration_since(UNIX_EPOCH).ok())
-                            .map(|duration| duration.as_micros().to_string())
-                            .into(),
-                    ),
-                ])),
-                ..StepFacts::default()
-            },
-        ),
-    )
+    // The cleanup Job publishes the parameters it runs with as its first
+    // output, in the transaction that creates it.
+    let parameters = serde_json::json!({
+        "retention_days": summary.retention_days,
+        "max_log_files_per_run": summary.max_log_files_per_run,
+        "cutoff_unix_micros": cutoff
+            .and_then(|cutoff| cutoff.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_micros().to_string()),
+    });
+    let records = wait(shared.database.begin_core_log_cleanup(
+        owner,
+        executor,
+        NewJobOutput {
+            kind: IntermediateOutputKind::Progress,
+            summary: Some(parameters.to_string()),
+            code: None,
+            goal_reached: None,
+        },
+    ))
     .map_err(|source| CleanupError::Persistence {
         stage: "begin",
         records: None,
@@ -403,36 +398,20 @@ fn execute(
         }
     }
     let outcome = if summary.failure_count != 0 {
-        StepSettlement::Failed
+        JobOutcome::Failed
     } else if summary.scan_interrupted {
-        StepSettlement::Cancelled
+        JobOutcome::Cancelled
     } else {
-        StepSettlement::Completed
+        JobOutcome::Completed
     };
     let code = match outcome {
-        StepSettlement::Failed => "LOG_CLEANUP_FAILED",
-        StepSettlement::Cancelled => "LOG_CLEANUP_INTERRUPTED",
+        JobOutcome::Failed => "LOG_CLEANUP_FAILED",
+        JobOutcome::Cancelled => "LOG_CLEANUP_INTERRUPTED",
         _ if summary.additional_candidates_remain == Some(true) => "LOG_CLEANUP_BATCH_LIMIT",
         _ => "LOG_CLEANUP_COMPLETED",
     };
+    // The summary, `failure_details_truncated` included, is the result.
     let value = serde_json::json!(summary);
-    let facts = StepFacts {
-        code: Some(code.into()),
-        structured_result: value.as_object().cloned(),
-        truncated: summary.failure_details_truncated,
-        ..StepFacts::default()
-    };
-    wait(
-        shared
-            .database
-            .settle_job_step(records.step, outcome, facts),
-    )
-    .map_err(|source| CleanupError::Persistence {
-        stage: "step settlement",
-        records: Some(records),
-        summary: Some(Box::new(summary.clone())),
-        source,
-    })?;
     let result = FinalResult {
         summary: Some(value.to_string()),
         code: Some(code.into()),
@@ -442,18 +421,16 @@ fn execute(
                 && summary.additional_candidates_remain == Some(false),
         ),
     };
-    let finalization = match outcome {
-        StepSettlement::Failed => JobFinalization::Failed(result),
-        StepSettlement::Cancelled => JobFinalization::Cancelled(result),
-        _ => JobFinalization::Completed(result),
-    };
-    wait(shared.database.finalize_job(records.job, finalization)).map_err(|source| {
-        CleanupError::Persistence {
-            stage: "job finalization",
-            records: Some(records),
-            summary: Some(Box::new(summary.clone())),
-            source,
-        }
+    wait(
+        shared
+            .database
+            .finalize_job(records.job, outcome.finalization(result)),
+    )
+    .map_err(|source| CleanupError::Persistence {
+        stage: "job finalization",
+        records: Some(records),
+        summary: Some(Box::new(summary.clone())),
+        source,
     })?;
     Ok(CleanupResult {
         records,
@@ -666,4 +643,141 @@ fn scan(shared: &Shared, epoch: u64, cutoff: SystemTime, summary: &mut CleanupSu
     } else {
         Some(false)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_directory::DataDirectory;
+    use crate::database::{DatabaseStatus, DatabaseWorker};
+    use crate::logger::{LoggerLevel, RuntimeLogger};
+    use crate::persistence::{
+        ExecutionMode, ExecutorType, JobInputDraft, NewExecutor, NewJob, OutputKind,
+    };
+    use crate::system_policy::SystemPolicy;
+    use crate::test_support::{data_directory as test_data_directory, wait};
+    use std::num::NonZeroU32;
+
+    const SUITE: &str = "ocg-log-cleanup";
+
+    fn data_directory(name: &str) -> (crate::test_support::TestRoot, DataDirectory) {
+        test_data_directory(SUITE, name)
+    }
+
+    fn policy() -> SystemPolicy {
+        let mut policy = SystemPolicy::default();
+        policy.filesystem_config.disk_lock_threshold_bytes = 1;
+        policy.filesystem_config.disk_resume_threshold_bytes = 2;
+        policy.filesystem_config.disk_check_interval_ms = 60_000;
+        policy.logger_config.level = LoggerLevel::Trace;
+        policy.logger_config.retention_days = 1;
+        policy.logger_config.max_file_size_bytes = 96;
+        policy.logger_config.flush_interval_ms = 1;
+        policy
+    }
+
+    #[test]
+    fn logger_creates_and_rotates_runtime_files() {
+        let (_root, directory) = data_directory("rotation");
+        let worker = DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
+        let database = worker.handle();
+        let logger = RuntimeLogger::start(database).expect("start runtime logger");
+        let handle = logger.handle();
+
+        for index in 0..12 {
+            log::Log::log(
+                &handle,
+                &log::Record::builder()
+                    .args(format_args!("rotation record {index} with enough bytes to roll the file"))
+                    .level(log::Level::Info)
+                    .target("log-cleanup-test")
+                    .build(),
+            );
+        }
+        log::Log::flush(&handle);
+        let status = logger.shutdown().expect("flush and stop logger");
+        let entries = std::fs::read_dir(directory.logs_path())
+            .expect("read log directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read log entries");
+        let runtime_files = entries
+            .iter()
+            .filter(|entry| crate::logger::is_runtime_file_name(&entry.file_name()))
+            .count();
+        assert!(status.written_records >= 12, "logger status: {status:?}");
+        assert!(runtime_files >= 2, "expected rotation, found {runtime_files} runtime file(s)");
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn housekeeping_executes_and_publishes_cleanup_result() {
+        let (_root, directory) = data_directory("housekeeping");
+        let worker = DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
+        let database = worker.handle();
+        let executor = wait(database.create_executor(NewExecutor {
+            name: "__CORE__".into(),
+            executor_type: ExecutorType::System,
+            concurrency_limit: NonZeroU32::new(1).expect("nonzero concurrency"),
+            serves: Vec::new(),
+        }))
+        .expect("create core executor");
+        let input = wait(database.save_job_input(None, JobInputDraft::default())).expect("save owner input");
+        let owner = wait(database.create_job_with_input(
+            NewJob {
+                name: Some("cleanup owner".into()),
+                execution_mode: ExecutionMode::Once,
+                eligible_at: None,
+                scheduled_at: None,
+                next_due_at: None,
+                next_iteration_no: None,
+                iteration_no: None,
+                parent: database.genesis(),
+                projects: Vec::new(),
+                dependencies: Vec::new(),
+                configuration: None,
+                assigned_executor: Some(executor),
+                previous: None,
+                replaces: None,
+            },
+            input,
+        ))
+        .expect("create cleanup owner");
+
+        let cleanup = CoreLogCleanup::start(database.clone()).expect("start cleanup worker");
+        let result = wait(cleanup.handle().invoke(owner, executor)).expect("run cleanup");
+        assert_eq!(result.outcome, JobOutcome::Completed);
+        assert_eq!(result.summary.failure_count, 0);
+        assert_eq!(result.summary.additional_candidates_remain, Some(false));
+
+        let job = wait(database.job(result.records.job))
+            .expect("read cleanup job")
+            .expect("cleanup job exists");
+        assert!(job.started_at.is_some() && job.completed_at.is_some());
+        assert_eq!(job.parent, owner, "the cleanup Job is a child of its owner");
+        assert_eq!(job.assigned_executor, Some(executor));
+        let outputs = wait(database.job_outputs(job.id, None, 10)).expect("read cleanup outputs");
+        let kinds: Vec<_> = outputs.iter().map(|output| output.kind).collect();
+        assert_eq!(kinds, [OutputKind::Progress, OutputKind::Result]);
+        let parameters: serde_json::Value = serde_json::from_str(
+            outputs[0]
+                .summary
+                .as_deref()
+                .expect("parameters are published"),
+        )
+        .expect("parameters are JSON");
+        assert_eq!(parameters["retention_days"], 1);
+        assert!(parameters["cutoff_unix_micros"].is_string());
+        assert_eq!(outputs[1].code.as_deref(), Some("LOG_CLEANUP_COMPLETED"));
+        let published: serde_json::Value = serde_json::from_str(
+            outputs[1]
+                .summary
+                .as_deref()
+                .expect("the summary is published"),
+        )
+        .expect("summary is JSON");
+        assert_eq!(published["failure_details_truncated"], false);
+        cleanup.shutdown().expect("shutdown cleanup worker");
+        assert_eq!(database.status(), DatabaseStatus::Open);
+        worker.shutdown().expect("shutdown database");
+    }
 }

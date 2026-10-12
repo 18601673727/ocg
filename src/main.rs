@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use ocg::data_directory::DataDirectory;
 use ocg::database::DatabaseWorker;
 use ocg::logger::RuntimeLogger;
+use ocg::orchestration::execution_runtime::ExecutionRuntime;
 use ocg::system_policy::SystemPolicy;
 
 fn main() -> ExitCode {
@@ -20,9 +21,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("OCG data directory: {}", data_directory.root().display());
     let policy = SystemPolicy::load_for_startup(&data_directory)?;
     let database = DatabaseWorker::start_with_policy(&data_directory, policy)?;
+    let execution = ExecutionRuntime::start(database.handle())?;
     let operation = run_with_logging(&database);
+    let execution_closed = execution.shutdown();
     let closed = database.shutdown();
     operation?;
+    execution_closed?;
     closed?;
     Ok(())
 }
