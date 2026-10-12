@@ -110,7 +110,7 @@ export function ControlCenterSurface({
 
   return (
     <div className="flex h-full min-h-0 w-full min-w-0 flex-col">
-      <header className="shrink-0 border-b border-border px-3 py-2.5">
+      <header className="shrink-0 border-b border-border px-4 sm:px-6 lg:px-8 py-3 sm:py-4 lg:py-5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <h1 className="text-[13px] font-semibold tracking-tight">{t("control.title")}</h1>
           <Pill tone="sky" title="Profile reported by the runtime">
@@ -157,7 +157,7 @@ export function ControlCenterSurface({
         </div>
       </header>
 
-      <nav className="shrink-0 border-b border-border px-3 py-1.5">
+      <nav className="shrink-0 border-b border-border px-4 sm:px-6 lg:px-8 py-2 sm:py-3 lg:py-4">
         <SegmentedTabs
           tabs={tabs}
           value={view}
@@ -169,7 +169,7 @@ export function ControlCenterSurface({
       </nav>
 
       <ViewTransition key={view} enter="vt-detail" exit="vt-detail" default="none">
-        <div id={`control-center-${view}`} role="tabpanel" aria-label={t(VIEW_LABEL_KEY[view])} className="min-h-0 min-w-0 flex-1 overflow-y-auto px-3 py-3">
+        <div id={`control-center-${view}`} role="tabpanel" aria-label={t(VIEW_LABEL_KEY[view])} className="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8">
           {view === "profiles" && canActivateProfiles && (
             <ProfilesView
               bootstrap={bootstrap}

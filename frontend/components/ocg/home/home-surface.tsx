@@ -124,7 +124,7 @@ export function HomeSurface(props: HomeSurfaceProps) {
   const activity = useMemo(() => selectRecentProductActivity(snapshot, t), [snapshot, t]);
 
   return (
-    <PageSurface className="flex flex-col gap-5">
+    <PageSurface className="mx-auto flex max-w-6xl flex-col gap-5">
       {/* Hero entry */}
       <section className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">

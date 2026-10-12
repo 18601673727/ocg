@@ -105,7 +105,7 @@ export function HealthSurface({ baseUrl, projectId }: { baseUrl: string | null; 
   const summary = matrix?.summary;
   return (
     <PageSurface>
-      <div className="mx-auto min-w-0 max-w-3xl space-y-5">
+      <div className="mx-auto min-w-0 max-w-6xl space-y-5">
         <header className="flex min-w-0 flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-lg font-semibold tracking-tight">{t("health.title")}</h1>

@@ -301,7 +301,7 @@ export function CanonicalControlSurface({
 
   return (
     <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-auto">
-      <div className="space-y-3 p-3">
+      <div className="space-y-3 px-4 sm:px-6 lg:px-8 py-4 sm:py-6 lg:py-8">
         {error ? (
           <p className={`rounded-md border px-3 py-2 text-xs ${STATUS_BG['warning']} ${STATUS_TEXT['warning']}`}>
             {error}

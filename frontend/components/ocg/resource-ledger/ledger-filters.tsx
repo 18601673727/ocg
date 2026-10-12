@@ -79,7 +79,7 @@ export function LedgerFilters({
     label: t(TIME_WINDOW_KEY[window]),
   }));
   return (
-    <section aria-label={t("ledger.filters")} className="border-b border-border px-3 py-2">
+    <section aria-label={t("ledger.filters")} className="border-b border-border px-4 sm:px-6 lg:px-8 py-3 sm:py-4 lg:py-5">
       <div className="flex flex-wrap items-end gap-x-2 gap-y-1.5">
         <FilterSelect
           label={t("ledger.filter.window")}
