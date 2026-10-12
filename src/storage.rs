@@ -1413,12 +1413,37 @@ pub(crate) struct Batch {
     now: Timestamp,
 }
 
-/// Runs one command as one batch and commits it with its operation marker
-/// only if no operation in it failed.
+/// How a batch's commit becomes durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Commit {
+    /// The commit is durable when it returns.
+    Durable,
+    /// The commit is visible to new read transactions at once but is durable
+    /// only after a later [`persist_staged`] succeeds. Until then a crash or
+    /// a failed [`persist_staged`] can lose it.
+    Staged,
+}
+
+/// Runs one command as one batch and commits it durably with its operation
+/// marker only if no operation in it failed.
+#[cfg(test)]
 pub(crate) fn run_batch<T>(
     database: &Database,
     operation: OperationId,
     kind: OperationKind,
+    body: impl FnOnce(&mut Batch) -> Result<(T, MarkerSubjects), BatchError>,
+) -> BatchOutcome<T> {
+    run_batch_with(database, operation, kind, Commit::Durable, body)
+}
+
+/// Like [`run_batch`], with the commit's durability chosen. A
+/// [`Commit::Staged`] success is not durable yet, and the caller must keep
+/// readers away from it until [`persist_staged`] has succeeded.
+pub(crate) fn run_batch_with<T>(
+    database: &Database,
+    operation: OperationId,
+    kind: OperationKind,
+    commit: Commit,
     body: impl FnOnce(&mut Batch) -> Result<(T, MarkerSubjects), BatchError>,
 ) -> BatchOutcome<T> {
     let not_committed = |error: StorageError| BatchOutcome {
@@ -1429,7 +1454,11 @@ pub(crate) fn run_batch<T>(
         Ok(tx) => tx,
         Err(error) => return not_committed(error.into()),
     };
-    if let Err(error) = tx.set_durability(Durability::Immediate) {
+    let durability = match commit {
+        Commit::Durable => Durability::Immediate,
+        Commit::Staged => Durability::None,
+    };
+    if let Err(error) = tx.set_durability(durability) {
         return finish_abort(tx, Failure::Storage(error.into()));
     }
     let mut batch = Batch { tx, failed: None, now: Timestamp::now() };
@@ -1464,6 +1493,61 @@ pub(crate) fn run_batch<T>(
                 storage_failure: Some(error),
             }
         }
+    }
+}
+
+/// Makes every earlier [`Commit::Staged`] commit durable with an empty
+/// `Durability::Immediate` transaction: redb writes the unpersisted pages of
+/// earlier non-durable commits and publishes their roots when a durable
+/// commit follows. An error leaves those commits' durability unknown, as for
+/// any failed commit.
+pub(crate) fn persist_staged(database: &Database) -> Result<(), StorageError> {
+    let mut tx = database.begin_write()?;
+    tx.set_durability(Durability::Immediate)?;
+    tx.commit()?;
+    Ok(())
+}
+
+// ---- maintenance ---------------------------------------------------------------
+
+/// The bytes of the file that redb's live pages occupy, read in a write
+/// transaction that changes nothing. The file's length minus this is an upper
+/// bound on what compaction can return, not a promise: it counts free pages
+/// anywhere in the file, and `fragmented_bytes` is deliberately not part of
+/// it because compaction does not recover space inside pages.
+pub(crate) fn allocated_bytes(database: &Database) -> Result<u64, StorageError> {
+    let tx = database.begin_write()?;
+    let stats = tx.stats()?;
+    tx.abort()?;
+    let page_size = u64::try_from(stats.page_size()).unwrap_or(u64::MAX);
+    Ok(stats.allocated_pages().saturating_mul(page_size))
+}
+
+/// Why compaction did not run to completion.
+#[derive(Debug)]
+pub(crate) enum CompactFailure {
+    /// A transaction was still open on the handle. Nothing was changed.
+    TransactionInProgress,
+    /// A savepoint exists. Nothing was changed.
+    SavepointExists,
+    /// The storage engine failed part way. Every compaction step is its own
+    /// atomic commit, so the file is consistent, but the handle is no longer
+    /// usable and must be reopened.
+    Storage(StorageError),
+}
+
+/// Compacts the file. This is redb's iterative, uninterruptible
+/// `Database::compact`: it needs exclusive access to the handle and runs for
+/// as long as it finds pages to move. Every step commits durably.
+pub(crate) fn compact(database: &mut Database) -> Result<(), CompactFailure> {
+    match database.compact() {
+        Ok(_) => Ok(()),
+        Err(redb::CompactionError::TransactionInProgress) => Err(CompactFailure::TransactionInProgress),
+        Err(redb::CompactionError::PersistentSavepointExists | redb::CompactionError::EphemeralSavepointExists) => {
+            Err(CompactFailure::SavepointExists)
+        }
+        Err(redb::CompactionError::Storage(error)) => Err(CompactFailure::Storage(error.into())),
+        Err(error) => Err(CompactFailure::Storage(redb::Error::from(error).into())),
     }
 }
 

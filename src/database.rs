@@ -1,9 +1,9 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockWriteGuard};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use redb::Database;
 
@@ -23,11 +23,26 @@ use crate::persistence::{
     ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, Timestamp, Violation,
     WrongProfileKind,
 };
-use crate::storage::{self, BatchError, BatchFailure, MarkerSubjects, OpenError, OpenedFile};
+use crate::storage::{self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile};
 use crate::system_policy::{self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError};
 pub use crate::storage::{StorageError, StorageErrorKind};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
+/// The most queued commands one group commit covers. Commands that queue up
+/// while the worker is busy form a group without any waiting, so a lone
+/// command is never delayed. A group is also the most commands whose outcome
+/// a failed durable commit leaves unknown, and the longest stretch readers
+/// can be held back, so it stays small.
+const GROUP_LIMIT: usize = 32;
+/// Compaction policy. `compact` is uninterruptible and holds off every read
+/// and command while it runs, so it is only worth running on a large file
+/// with a lot of free space, and not again soon after an attempt. These are
+/// deliberately conservative and not tuned to a measured workload.
+const COMPACTION_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const COMPACTION_MIN_RECLAIMABLE_BYTES: u64 = 32 * 1024 * 1024;
+/// The estimated free space must also be at least `1 / this` of the file.
+const COMPACTION_MIN_RECLAIMABLE_DIVISOR: u64 = 4;
+const COMPACTION_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 /// Reads run on this many dedicated threads, separate from the write worker.
 pub const READ_WORKERS: usize = 2;
 pub const READ_QUEUE_CAPACITY: usize = 64;
@@ -177,6 +192,59 @@ pub enum OperationStatus {
     NotCommittedYet,
 }
 
+/// Why [`DatabaseHandle::compact_storage`] left the file alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompactionSkip {
+    FileTooSmall { file_bytes: u64 },
+    /// The file's length minus redb's live pages is the most compaction could
+    /// return. It is an estimate: fragmentation inside pages is not counted.
+    LittleReclaimable { file_bytes: u64, reclaimable_bytes: u64 },
+    /// An earlier attempt, successful or not, was too recent.
+    CoolingDown { remaining: Duration },
+}
+
+/// What a compaction did to the file. `file_bytes_after` equal to
+/// `file_bytes_before` means redb found nothing to move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub file_bytes_before: u64,
+    pub file_bytes_after: u64,
+    pub duration: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompactionOutcome {
+    Skipped(CompactionSkip),
+    Compacted(CompactionReport),
+}
+
+/// Why [`DatabaseHandle::compact_storage`] failed. Except for
+/// [`Storage`](Self::Storage), a failure leaves the database as it was.
+#[derive(Debug, thiserror::Error)]
+pub enum MaintenanceError {
+    #[error("the control queue is full; the compaction was not accepted")]
+    ControlQueueFull,
+    #[error("the database is shutting down; the compaction was not accepted")]
+    ShuttingDown,
+    #[error("the database worker stopped; the compaction did not run")]
+    WorkerStopped,
+    #[error("disk protection is active; the compaction was not accepted: {0}")]
+    DiskProtected(ProtectionLock),
+    #[error(
+        "compaction was refused: {} has {} bytes available, and the {} byte allowance would leave less than {}",
+        .0.path.display(), .0.available_bytes, .0.expected_write_bytes, .0.threshold_bytes
+    )]
+    InsufficientSpace(SpaceShortage),
+    #[error("a transaction was still open on the database; nothing was compacted")]
+    TransactionInProgress,
+    #[error("a savepoint exists on the database; nothing was compacted")]
+    SavepointExists,
+    /// A storage failure releases the database like a failed command's commit
+    /// does, and [`DatabaseHandle::recover_storage`] reopens it.
+    #[error("storage failed during maintenance: {0}")]
+    Storage(StorageError),
+}
+
 fn describe_reasons(reasons: &[ProtectionReason]) -> String {
     reasons.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
 }
@@ -220,6 +288,7 @@ enum Control {
     },
     CheckSpace,
     Recover,
+    CompactStorage(flume::Sender<Result<CompactionOutcome, MaintenanceError>>),
     ReadPolicy(flume::Sender<Result<SystemPolicy, PolicyOperationError>>),
     SavePolicy {
         expected: SystemPolicy,
@@ -242,6 +311,9 @@ impl Control {
             }
             Self::SavePolicy { reply, .. } => {
                 reply.send(Err(error)).ok();
+            }
+            Self::CompactStorage(reply) => {
+                reply.send(Err(if stopped { MaintenanceError::WorkerStopped } else { MaintenanceError::ShuttingDown })).ok();
             }
             Self::CheckSpace | Self::Recover => {}
             Self::FilesystemFailure { reply, .. } => {
@@ -347,65 +419,65 @@ enum Command {
 }
 
 impl Command {
-    /// Runs the command as one batch and answers it. Returns the storage
-    /// failure that must release this opening of the database, if any. A
-    /// dropped reply receiver means the caller stopped waiting; the batch has
-    /// ended either way.
-    fn execute(self, database: &Database, operation: OperationId) -> Option<StorageFailure> {
+    /// Runs the command as one batch. The answer is returned, not sent, so
+    /// the caller can hold it until the commit is durable. A dropped reply
+    /// receiver means the caller stopped waiting; the batch has ended either
+    /// way.
+    fn execute(self, database: &Database, operation: OperationId, commit: Commit) -> Executed {
         use OperationKind as Kind;
         match self {
-            Self::BeginCoreLogCleanup { owner, executor, started, reply } => run(database, operation, Kind::BeginCoreLogCleanup, reply, |batch| {
+            Self::BeginCoreLogCleanup { owner, executor, started, reply } => run(database, operation, commit, Kind::BeginCoreLogCleanup, reply, |batch| {
                 persistence::begin_core_log_cleanup(batch, owner, executor, started)
             }),
-            Self::SaveJobInput { existing, draft, reply } => run(database, operation, Kind::SaveJobInput, reply, |batch| {
+            Self::SaveJobInput { existing, draft, reply } => run(database, operation, commit, Kind::SaveJobInput, reply, |batch| {
                 persistence::save_job_input(batch, existing, draft)
             }),
-            Self::CreateJobWithInput { job, input, reply } => run(database, operation, Kind::CreateJobWithInput, reply, |batch| {
+            Self::CreateJobWithInput { job, input, reply } => run(database, operation, commit, Kind::CreateJobWithInput, reply, |batch| {
                 persistence::create_job_with_input(batch, job, input)
             }),
-            Self::RetryJob { retry, reply } => run(database, operation, Kind::RetryJob, reply, |batch| {
+            Self::RetryJob { retry, reply } => run(database, operation, commit, Kind::RetryJob, reply, |batch| {
                 persistence::retry_job(batch, retry)
             }),
-            Self::StartJob { job, reply } => run(database, operation, Kind::StartJob, reply, |batch| {
+            Self::StartJob { job, reply } => run(database, operation, commit, Kind::StartJob, reply, |batch| {
                 persistence::start_job(batch, job)
             }),
-            Self::AssignJobExecutor { job, executor, reply } => run(database, operation, Kind::AssignJobExecutor, reply, |batch| {
+            Self::AssignJobExecutor { job, executor, reply } => run(database, operation, commit, Kind::AssignJobExecutor, reply, |batch| {
                 persistence::assign_job_executor(batch, job, executor)
             }),
-            Self::AssociateJobProject { job, project, reply } => run(database, operation, Kind::AssociateJobProject, reply, |batch| {
+            Self::AssociateJobProject { job, project, reply } => run(database, operation, commit, Kind::AssociateJobProject, reply, |batch| {
                 persistence::associate_job_project(batch, job, project)
             }),
-            Self::AppendJobOutput { job, output, reply } => run(database, operation, Kind::AppendJobOutput, reply, |batch| {
+            Self::AppendJobOutput { job, output, reply } => run(database, operation, commit, Kind::AppendJobOutput, reply, |batch| {
                 persistence::append_job_output(batch, job, output)
             }),
-            Self::FinalizeJob { job, finalization, reply } => run(database, operation, Kind::FinalizeJob, reply, |batch| {
+            Self::FinalizeJob { job, finalization, reply } => run(database, operation, commit, Kind::FinalizeJob, reply, |batch| {
                 persistence::finalize_job(batch, job, finalization)
             }),
-            Self::CreateExecutor { executor, reply } => run(database, operation, Kind::CreateExecutor, reply, |batch| {
+            Self::CreateExecutor { executor, reply } => run(database, operation, commit, Kind::CreateExecutor, reply, |batch| {
                 persistence::create_executor(batch, executor)
             }),
-            Self::CreateProject { project, reply } => run(database, operation, Kind::CreateProject, reply, |batch| {
+            Self::CreateProject { project, reply } => run(database, operation, commit, Kind::CreateProject, reply, |batch| {
                 persistence::create_project(batch, project)
             }),
-            Self::CreateLlmProvider { provider, reply } => run(database, operation, Kind::CreateLlmProvider, reply, |batch| {
+            Self::CreateLlmProvider { provider, reply } => run(database, operation, commit, Kind::CreateLlmProvider, reply, |batch| {
                 persistence::create_llm_provider(batch, provider)
             }),
-            Self::CreateProfile { profile, reply } => run(database, operation, Kind::CreateProfile, reply, |batch| {
+            Self::CreateProfile { profile, reply } => run(database, operation, commit, Kind::CreateProfile, reply, |batch| {
                 persistence::create_profile(batch, profile)
             }),
-            Self::UpdateProfile { id, profile, reply } => run(database, operation, Kind::UpdateProfile, reply, |batch| {
+            Self::UpdateProfile { id, profile, reply } => run(database, operation, commit, Kind::UpdateProfile, reply, |batch| {
                 persistence::update_profile(batch, id, profile)
             }),
-            Self::CreateAgent { agent, reply } => run(database, operation, Kind::CreateAgent, reply, |batch| {
+            Self::CreateAgent { agent, reply } => run(database, operation, commit, Kind::CreateAgent, reply, |batch| {
                 persistence::create_agent(batch, agent)
             }),
-            Self::ConfirmJobStopped { job, reply } => run(database, operation, Kind::ConfirmJobStopped, reply, |batch| {
+            Self::ConfirmJobStopped { job, reply } => run(database, operation, commit, Kind::ConfirmJobStopped, reply, |batch| {
                 persistence::confirm_job_stopped(batch, job)
             }),
-            Self::RecordMetrics { metrics, reply } => run(database, operation, Kind::RecordMetrics, reply, |batch| {
+            Self::RecordMetrics { metrics, reply } => run(database, operation, commit, Kind::RecordMetrics, reply, |batch| {
                 persistence::record_metrics(batch, *metrics)
             }),
-            Self::RecordAvailabilityStat { stat, reply } => run(database, operation, Kind::RecordAvailabilityStat, reply, |batch| {
+            Self::RecordAvailabilityStat { stat, reply } => run(database, operation, commit, Kind::RecordAvailabilityStat, reply, |batch| {
                 persistence::record_availability_stat(batch, *stat)
             }),
         }
@@ -503,14 +575,29 @@ struct StorageFailure {
     outcome_unknown: bool,
 }
 
-fn run<T>(
+/// Sends a command's result. It receives the error of the group's durable
+/// commit when that failed, and `None` otherwise.
+type Answer = Box<dyn FnOnce(Option<&StorageError>) + Send>;
+
+/// A command that ran and has not been answered.
+struct Executed {
+    operation: OperationId,
+    /// Its changes are in a staged commit that is not durable yet.
+    staged: bool,
+    answer: Answer,
+    /// The storage failure that must release this opening of the database.
+    failure: Option<StorageFailure>,
+}
+
+fn run<T: Send + 'static>(
     database: &Database,
     operation: OperationId,
+    commit: Commit,
     kind: OperationKind,
     reply: Reply<T>,
     body: impl FnOnce(&mut storage::Batch) -> Result<(T, MarkerSubjects), BatchError>,
-) -> Option<StorageFailure> {
-    let outcome = storage::run_batch(database, operation, kind, body);
+) -> Executed {
+    let outcome = storage::run_batch_with(database, operation, kind, commit, body);
     let result = outcome.result.map_err(|failure| match failure {
         BatchFailure::Rejected(violation) => DatabaseError::Rejected(violation),
         BatchFailure::NotCommitted(error) => DatabaseError::RolledBack(error),
@@ -520,8 +607,26 @@ fn run<T>(
         },
     });
     let outcome_unknown = matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
-    reply.send(result).ok();
-    outcome.storage_failure.map(|error| StorageFailure { error, outcome_unknown })
+    let staged = commit == Commit::Staged && result.is_ok();
+    let answer: Answer = Box::new(move |lost| {
+        let result = match (result, lost) {
+            (Ok(_), Some(error)) => Err(DatabaseError::OutcomeUnknown {
+                operation,
+                cause: UnknownCause::Commit(error.clone()),
+            }),
+            // The refusal may rest on state that a lost commit of the same
+            // group had written. Nothing of this command was committed.
+            (Err(DatabaseError::Rejected(_)), Some(error)) => Err(DatabaseError::RolledBack(error.clone())),
+            (result, _) => result,
+        };
+        reply.send(result).ok();
+    });
+    Executed {
+        operation,
+        staged,
+        answer,
+        failure: outcome.storage_failure.map(|error| StorageFailure { error, outcome_unknown }),
+    }
 }
 
 /// A read, boxed with its reply channel. It receives the opened database
@@ -562,6 +667,13 @@ struct Shared {
     /// Read workers and the write worker hold the read lock while they use
     /// the database; releasing it takes the write lock, so it waits for them.
     database: RwLock<Option<Opened>>,
+    /// The read barrier of group commit. A redb read transaction sees every
+    /// commit, durable or not, so the write worker holds this for writing from
+    /// a group's first staged commit until the group's durable commit has
+    /// succeeded, or until a failed one has released the database. Every read
+    /// holds it for reading, so none can see changes that a failure could
+    /// still lose. Always taken before `database`, never while holding it.
+    staging: RwLock<()>,
     /// The instance's Genesis Job, read from the file when it was opened.
     /// A reopen that finds another identity fails, so it never changes.
     genesis: JobId,
@@ -604,6 +716,31 @@ impl Shared {
         let database = self.database.write().unwrap_or_else(PoisonError::into_inner).take();
         drop(database);
         self.released.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The write worker's hold on [`Shared::staging`]. If the worker unwinds while
+/// it is held, the staged commits can no longer be made durable, so the
+/// database is released before readers are let in again; otherwise a reader
+/// could see changes that are lost and whose commands are answered as unknown.
+struct StagingBarrier<'a> {
+    shared: &'a Shared,
+    _held: RwLockWriteGuard<'a, ()>,
+}
+
+impl<'a> StagingBarrier<'a> {
+    fn raise(shared: &'a Shared) -> Self {
+        Self { shared, _held: shared.staging.write().unwrap_or_else(PoisonError::into_inner) }
+    }
+}
+
+impl Drop for StagingBarrier<'_> {
+    fn drop(&mut self) {
+        // The fields drop after this, so the lock is still held while the
+        // database is released. The worker's own database guard is already gone.
+        if std::thread::panicking() {
+            self.shared.release_database();
+        }
     }
 }
 
@@ -755,6 +892,7 @@ impl DatabaseWorker {
                     cleanup_worker: Arc::new(AtomicBool::new(false)),
                     admission: RwLock::new(Admission::Open),
                     database: RwLock::new(Some(Opened { database, epoch })),
+                    staging: RwLock::new(()),
                     genesis,
                     epoch: AtomicU64::new(epoch),
                     next_operation: AtomicU64::new(1),
@@ -780,6 +918,7 @@ impl DatabaseWorker {
                     next_check: None,
                     uncertain: Vec::new(),
                     storage_failure: None,
+                    last_compaction: None,
                     shutdown_requested: false,
                 };
                 worker.check_all_paths();
@@ -869,6 +1008,24 @@ impl DatabaseWorker {
     }
 }
 
+fn file_length(path: &std::path::Path) -> Result<u64, MaintenanceError> {
+    std::fs::metadata(path).map(|metadata| metadata.len()).map_err(|error| {
+        MaintenanceError::Storage(StorageError {
+            kind: StorageErrorKind::Io(error.kind()),
+            os_error: error.raw_os_error(),
+            detail: format!("cannot measure {}: {error}", path.display()),
+        })
+    })
+}
+
+fn database_not_open() -> StorageError {
+    StorageError {
+        kind: StorageErrorKind::Closed,
+        os_error: None,
+        detail: "the database is not open".to_string(),
+    }
+}
+
 fn open_error(error: OpenError, directory: &std::path::Path) -> DatabaseError {
     match error {
         OpenError::Storage(error) => DatabaseError::Open(error),
@@ -923,7 +1080,14 @@ struct WriteWorker {
     uncertain: Vec<OperationId>,
     /// Set from a storage failure until a reopen replaces the failed handle.
     storage_failure: Option<StorageError>,
+    /// When compaction last started, whatever its result.
+    last_compaction: Option<Instant>,
     shutdown_requested: bool,
+}
+
+enum SpaceRefusal {
+    Short(SpaceShortage),
+    Locked(ProtectionLock),
 }
 
 enum Event {
@@ -955,7 +1119,7 @@ impl WriteWorker {
             };
             match event {
                 Event::Control(Ok(control)) => self.handle(control),
-                Event::Message(Ok(Message::Run(envelope))) => self.execute(envelope),
+                Event::Message(Ok(Message::Run(envelope))) => self.execute_group(envelope),
                 Event::CheckDue => {}
                 // Without senders, no handle and therefore no caller remains.
                 Event::Message(Ok(Message::Shutdown)) | Event::Message(Err(_)) | Event::Control(Err(_)) => return,
@@ -982,6 +1146,10 @@ impl WriteWorker {
             Control::Recover => {
                 let result = self.recover();
                 self.shared.recovery.complete(result);
+            }
+            Control::CompactStorage(reply) => {
+                let result = self.compact_storage();
+                reply.send(result).ok();
             }
             Control::ReadPolicy(reply) => {
                 let result = match self.shared.admission() {
@@ -1166,52 +1334,218 @@ impl WriteWorker {
         result
     }
 
-    /// Checks the database filesystem for the command's allowance and runs
-    /// it. Space already below the lock threshold, or a failed measurement,
-    /// locks; an allowance that alone would cross the threshold refuses only
-    /// this command. Either way the command is refused before it starts.
-    fn execute(&mut self, envelope: Envelope) {
+    /// Refuses a command whose allowance the database filesystem cannot
+    /// give, or any command while protection is locked. A refused command is
+    /// answered here, before it starts, and `None` is returned.
+    fn admit(&mut self, envelope: Envelope) -> Option<Envelope> {
         let operation = envelope.operation;
         // Activation drains the queue, so no command should arrive while
         // locked; refusing here keeps that true even if one did.
         if let Some(lock) = self.shared.protection.status().lock {
             envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
-            return;
+            return None;
         }
-        let expected_write_bytes = envelope.command.expected_write_bytes();
+        match self.check_database_space(envelope.command.expected_write_bytes()) {
+            Ok(()) => Some(envelope),
+            Err(SpaceRefusal::Short(shortage)) => {
+                envelope.command.refuse(|| DatabaseError::InsufficientSpace { operation, shortage: shortage.clone() });
+                None
+            }
+            Err(SpaceRefusal::Locked(lock)) => {
+                envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+                None
+            }
+        }
+    }
+
+    /// Checks the database filesystem for `expected_write_bytes`. Space
+    /// already below the lock threshold, or a failed measurement, locks; an
+    /// allowance that alone would cross the threshold refuses only this write.
+    fn check_database_space(&mut self, expected_write_bytes: u64) -> Result<(), SpaceRefusal> {
         match disk_protection::check_space(
             ProtectedArea::Database,
             &self.directory,
             expected_write_bytes,
             self.config.disk_lock_threshold_bytes,
         ) {
-            Ok(_) => {}
+            Ok(_) => Ok(()),
             Err(ProtectionReason::InsufficientSpace(shortage)) if shortage.available_bytes >= shortage.threshold_bytes => {
-                envelope.command.refuse(|| DatabaseError::InsufficientSpace { operation, shortage: shortage.clone() });
-                return;
+                Err(SpaceRefusal::Short(shortage))
             }
-            Err(reason) => {
-                let lock = self.activate(vec![reason]);
-                envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
-                return;
+            Err(reason) => Err(SpaceRefusal::Locked(self.activate(vec![reason]))),
+        }
+    }
+
+    /// Runs `first` and the commands queued behind it, up to [`GROUP_LIMIT`],
+    /// in queue order, and answers each of them.
+    ///
+    /// A lone command commits durably, as it always did. A group runs each
+    /// command in its own write transaction with staged durability, so a
+    /// refused or failed command rolls back only itself, then makes all of
+    /// them durable with one empty durable transaction. The separate
+    /// transactions are not one atomic batch: a failure of the durable commit
+    /// leaves every staged command's outcome unknown.
+    ///
+    /// No command is answered before that durable commit, so no caller acts
+    /// on a change that can still be lost, and readers are held back by
+    /// [`Shared::staging`] meanwhile. A storage failure stops the group; the
+    /// commands not yet run are refused like queued ones, and the staged
+    /// commands are still made durable if the database allows it.
+    fn execute_group(&mut self, first: Envelope) {
+        let mut group = vec![first];
+        while group.len() < GROUP_LIMIT {
+            match self.receiver.try_recv() {
+                Ok(Message::Run(envelope)) => group.push(envelope),
+                Ok(Message::Shutdown) => {
+                    self.shutdown_requested = true;
+                    break;
+                }
+                Err(_) => break,
             }
         }
-        let failure = {
-            let guard = self.shared.database.read().unwrap_or_else(PoisonError::into_inner);
-            let Some(opened) = guard.as_ref() else {
-                envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
-                return;
-            };
-            envelope.started.store(true, Ordering::SeqCst);
-            envelope.command.execute(&opened.database, operation)
-        };
-        if let Some(failure) = failure {
-            if failure.outcome_unknown {
-                self.uncertain.push(operation);
+        let commit = if group.len() > 1 { Commit::Staged } else { Commit::Durable };
+        let shared = self.shared.clone();
+        let staging = (commit == Commit::Staged).then(|| StagingBarrier::raise(&shared));
+
+        let mut executed = Vec::with_capacity(group.len());
+        let mut unrun = Vec::new();
+        let mut failure: Option<StorageFailure> = None;
+        let mut lost: Option<StorageError> = None;
+        {
+            let guard = shared.database.read().unwrap_or_else(PoisonError::into_inner);
+            for envelope in group {
+                if failure.is_some() {
+                    unrun.push(envelope);
+                    continue;
+                }
+                let Some(envelope) = self.admit(envelope) else { continue };
+                let operation = envelope.operation;
+                let Some(opened) = guard.as_ref() else {
+                    envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
+                    continue;
+                };
+                envelope.started.store(true, Ordering::SeqCst);
+                let mut ran = envelope.command.execute(&opened.database, operation, commit);
+                failure = ran.failure.take();
+                executed.push((ran, failure.as_ref().is_some_and(|failure| failure.outcome_unknown)));
             }
+            if executed.iter().any(|(ran, _)| ran.staged)
+                && let Some(opened) = guard.as_ref()
+            {
+                lost = storage::persist_staged(&opened.database).err();
+            }
+        }
+        if let Some(error) = &lost {
+            for (ran, _) in &executed {
+                if ran.staged {
+                    self.uncertain.push(ran.operation);
+                }
+            }
+            failure.get_or_insert(StorageFailure { error: error.clone(), outcome_unknown: false });
+        }
+        for (ran, outcome_unknown) in &executed {
+            if *outcome_unknown {
+                self.uncertain.push(ran.operation);
+            }
+        }
+        // The database guard is gone and the staging barrier still held, so
+        // releasing the database waits for no reader and no reader can see a
+        // lost change before it is released.
+        let lock = failure.map(|failure| {
             self.storage_failure = Some(failure.error.clone());
-            self.activate(vec![ProtectionReason::StorageUnavailable(failure.error)]);
+            self.activate(vec![ProtectionReason::StorageUnavailable(failure.error)])
+        });
+        drop(staging);
+        for (ran, _) in executed {
+            (ran.answer)(lost.as_ref());
         }
+        if let Some(lock) = lock {
+            for envelope in unrun {
+                let operation = envelope.operation;
+                envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+            }
+        }
+    }
+
+    /// Compacts the file if the policy allows, between command groups, so
+    /// nothing is staged and every earlier commit is already durable.
+    ///
+    /// Taking the database lock for writing waits for every executing read
+    /// and holds off new ones, so redb sees no read transaction on the handle
+    /// and `compact` gets its exclusive `&mut Database` without any unsafe
+    /// code. The worker is the only writer, so no write transaction exists
+    /// either. Reads and commands wait, up to their queue limits, for as long
+    /// as `compact` runs, which grows with the file; it cannot be interrupted,
+    /// and shutdown waits for it. Hence the policy and the cooldown.
+    fn compact_storage(&mut self) -> Result<CompactionOutcome, MaintenanceError> {
+        match self.shared.admission() {
+            Admission::Open => {}
+            Admission::Protected(lock) => return Err(MaintenanceError::DiskProtected(lock)),
+            Admission::ShuttingDown => return Err(MaintenanceError::ShuttingDown),
+            Admission::WorkerStopped => return Err(MaintenanceError::WorkerStopped),
+        }
+        if let Some(remaining) = self
+            .last_compaction
+            .and_then(|last| COMPACTION_COOLDOWN.checked_sub(last.elapsed()))
+        {
+            return Ok(CompactionOutcome::Skipped(CompactionSkip::CoolingDown { remaining }));
+        }
+        let file = storage::database_file(&self.directory);
+        let file_bytes = file_length(&file)?;
+        if file_bytes < COMPACTION_MIN_FILE_BYTES {
+            return Ok(CompactionOutcome::Skipped(CompactionSkip::FileTooSmall { file_bytes }));
+        }
+        let shared = self.shared.clone();
+        let allocated = {
+            let guard = shared.database.read().unwrap_or_else(PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(opened) => storage::allocated_bytes(&opened.database),
+                None => Err(database_not_open()),
+            }
+        };
+        let allocated = allocated.map_err(|error| self.fail_storage(error))?;
+        let reclaimable_bytes = file_bytes.saturating_sub(allocated);
+        if reclaimable_bytes < COMPACTION_MIN_RECLAIMABLE_BYTES
+            || reclaimable_bytes < file_bytes / COMPACTION_MIN_RECLAIMABLE_DIVISOR
+        {
+            return Ok(CompactionOutcome::Skipped(CompactionSkip::LittleReclaimable { file_bytes, reclaimable_bytes }));
+        }
+        match self.check_database_space(TRANSACTION_ALLOWANCE_BYTES) {
+            Ok(()) => {}
+            Err(SpaceRefusal::Short(shortage)) => return Err(MaintenanceError::InsufficientSpace(shortage)),
+            Err(SpaceRefusal::Locked(lock)) => return Err(MaintenanceError::DiskProtected(lock)),
+        }
+
+        let began = Instant::now();
+        self.last_compaction = Some(began);
+        // The guard ends before any failure is handled, which takes the same
+        // lock to release the database.
+        let compacted = {
+            let mut guard = shared.database.write().unwrap_or_else(PoisonError::into_inner);
+            match guard.as_mut() {
+                Some(opened) => storage::compact(&mut opened.database),
+                None => Err(CompactFailure::Storage(database_not_open())),
+            }
+        };
+        let duration = began.elapsed();
+        match compacted {
+            Ok(()) => Ok(CompactionOutcome::Compacted(CompactionReport {
+                file_bytes_before: file_bytes,
+                file_bytes_after: file_length(&file)?,
+                duration,
+            })),
+            Err(CompactFailure::TransactionInProgress) => Err(MaintenanceError::TransactionInProgress),
+            Err(CompactFailure::SavepointExists) => Err(MaintenanceError::SavepointExists),
+            Err(CompactFailure::Storage(error)) => Err(self.fail_storage(error)),
+        }
+    }
+
+    /// Ends this opening of the database for a storage failure that no
+    /// command observed, so it is released and awaits recovery like any other.
+    fn fail_storage(&mut self, error: StorageError) -> MaintenanceError {
+        self.storage_failure = Some(error.clone());
+        self.activate(vec![ProtectionReason::StorageUnavailable(error.clone())]);
+        MaintenanceError::Storage(error)
     }
 
     /// Closes command admission, refuses every queued command, and releases
@@ -1355,13 +1689,7 @@ impl WriteWorker {
                     })
                     .collect::<Result<Vec<_>, _>>(),
                 None if self.uncertain.is_empty() => Ok(Vec::new()),
-                None => {
-                    return Err(RecoveryError::Reopen(ReopenFailure::Storage(StorageError {
-                        kind: StorageErrorKind::Closed,
-                        os_error: None,
-                        detail: "the database is not open".to_string(),
-                    })));
-                }
+                None => return Err(RecoveryError::Reopen(ReopenFailure::Storage(database_not_open()))),
             }
         };
         reconciled.map_err(|(operation, error)| {
@@ -1400,9 +1728,13 @@ impl WriteWorker {
     }
 }
 
-/// Runs reads until stopped, holding the database open for each one.
+/// Runs reads until stopped, holding the database open for each one. The
+/// database guard lasts as long as the read's transactions, which is what
+/// lets the write worker release or reopen the database knowing no read is
+/// left on it.
 fn serve_reads(shared: &Shared, receiver: &flume::Receiver<ReadMessage>) {
     while let Ok(ReadMessage::Run(read)) = receiver.recv() {
+        let _staging = shared.staging.read().unwrap_or_else(PoisonError::into_inner);
         let guard = shared.database.read().unwrap_or_else(PoisonError::into_inner);
         match guard.as_ref() {
             Some(opened) => read(Ok(opened)),
@@ -1630,6 +1962,35 @@ impl DatabaseHandle {
             Ok(None) => Err(DatabaseError::ShuttingDown),
             Err(_) => Err(DatabaseError::WorkerPanicked),
         }
+    }
+
+    /// Compacts the database file when the policy says it is worth it: the
+    /// file is large, a large share of it is free, and no attempt was made
+    /// recently. Otherwise reports why it did not. Nothing calls this
+    /// automatically, because redb's compaction cannot be interrupted and
+    /// holds off every read and command for as long as it runs; the caller
+    /// chooses a quiet moment. Commands and reads that arrive meanwhile wait
+    /// in their queues and fail with a full-queue error beyond their limits,
+    /// and [`DatabaseWorker::shutdown`] waits for it.
+    ///
+    /// Every earlier command is already durable and acknowledged by the time
+    /// it runs, and a failed compaction leaves the file consistent.
+    pub async fn compact_storage(&self) -> Result<CompactionOutcome, MaintenanceError> {
+        let (reply, response) = flume::bounded(1);
+        {
+            let admission = self.shared.admission.read().unwrap_or_else(PoisonError::into_inner);
+            match &*admission {
+                Admission::Open => {}
+                Admission::Protected(lock) => return Err(MaintenanceError::DiskProtected(lock.clone())),
+                Admission::ShuttingDown => return Err(MaintenanceError::ShuttingDown),
+                Admission::WorkerStopped => return Err(MaintenanceError::WorkerStopped),
+            }
+            self.control_sender.try_send(Control::CompactStorage(reply)).map_err(|error| match error {
+                flume::TrySendError::Full(_) => MaintenanceError::ControlQueueFull,
+                flume::TrySendError::Disconnected(_) => MaintenanceError::WorkerStopped,
+            })?;
+        }
+        response.recv_async().await.unwrap_or(Err(MaintenanceError::WorkerStopped))
     }
 
     /// Clears disk protection once every protected filesystem has the resume
