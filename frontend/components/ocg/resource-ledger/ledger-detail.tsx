@@ -1,5 +1,7 @@
 "use client";
 
+import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import {
   USAGE_COMPONENT_LABEL,
   USAGE_COMPONENTS,
@@ -27,8 +29,8 @@ import {
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="min-w-0">
-      <dt className="text-[10px] tracking-wider text-muted-foreground uppercase">{label}</dt>
-      <dd className="min-w-0 break-words text-[11px] font-medium">{children}</dd>
+      <dt className="text-xs tracking-wider text-muted-foreground uppercase">{label}</dt>
+      <dd className="min-w-0 break-words text-xs font-medium">{children}</dd>
     </div>
   );
 }
@@ -52,7 +54,7 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
             attempt {entry.attempt}
           </Pill>
         )}
-        <span className="ml-auto font-mono text-[10px] text-muted-foreground" title={entry.timestamp}>
+        <span className="ml-auto font-mono text-xs text-muted-foreground" title={entry.timestamp}>
           {formatTimestamp(entry.timestamp)}
         </span>
       </div>
@@ -83,7 +85,7 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
 
       <section aria-label="Usage components">
         <SectionTitle detail="tokens">Usage</SectionTitle>
-        <table className="w-full table-fixed text-[11px]">
+        <table className="w-full table-fixed text-xs">
           <tbody>
             {USAGE_COMPONENTS.map((component) => {
               const value = entry.usage?.[component];
@@ -101,15 +103,15 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
           </tbody>
         </table>
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-          <span className="text-[10px] text-muted-foreground">Usage authority</span>
+          <span className="text-xs text-muted-foreground">Usage authority</span>
           <AuthorityPill value={entry.usageAuthority} />
         </div>
         {entry.usage === null && (
-          <p className="mt-1 text-[10px] text-muted-foreground">
+          <p className="mt-1 text-xs text-muted-foreground">
             No usage was observed for this call. This is unavailable, not zero.
           </p>
         )}
-        <dl className="mt-2 grid grid-cols-3 gap-2 rounded border border-border/60 bg-muted/20 p-2 text-[10px]">
+        <dl className="mt-2 grid grid-cols-3 gap-2 rounded border border-border/60 bg-muted/20 p-2 text-xs">
           <div>
             <dt className="text-muted-foreground">Component traffic</dt>
             <dd className="font-semibold tabular-nums">{traffic.total === null ? UNKNOWN : traffic.total.toLocaleString("en-US")}</dd>
@@ -128,16 +130,16 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
       <section aria-label="Cost">
         <SectionTitle>Cost</SectionTitle>
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[13px] font-semibold tabular-nums" title={`${entry.costMicros ?? UNKNOWN} micros`}>
+          <span className={cn(TYPOGRAPHY_SCALE.body_sm, "font-semibold tabular-nums")} title={`${entry.costMicros ?? UNKNOWN} micros`}>
             {formatCostMicros(entry.costMicros)}
           </span>
           <CostPill value={entry.costProvenance} />
         </div>
         {entry.costMicros === 0 && (
-          <p className="mt-1 text-[10px] text-muted-foreground">Explicit zero: this call was known to be free.</p>
+          <p className="mt-1 text-xs text-muted-foreground">Explicit zero: this call was known to be free.</p>
         )}
         {entry.costMicros === null && (
-          <p className="mt-1 text-[10px] text-muted-foreground">Cost was not observed for this call.</p>
+          <p className="mt-1 text-xs text-muted-foreground">Cost was not observed for this call.</p>
         )}
       </section>
 
@@ -145,7 +147,7 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
         <SectionTitle>Attribution</SectionTitle>
         <div className="flex flex-wrap items-center gap-1.5">
           <AttributionPill value={entry.attributionConfidence} />
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-xs text-muted-foreground">
             Attributed to {entry.attributedJobId ?? "an unknown Job"}
             {entry.attributedTaskId ? ` / ${entry.attributedTaskId}` : " / unknown task"}
           </span>
@@ -158,7 +160,7 @@ export function CallDetail({ entry }: { entry: ResourceLedgerEntry }) {
       </section>
 
       {entry.note && (
-        <p className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[11px] text-muted-foreground">
+        <p className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-xs text-muted-foreground">
           {entry.note}
         </p>
       )}

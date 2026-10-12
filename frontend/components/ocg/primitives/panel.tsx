@@ -2,6 +2,7 @@
 
 import { useId, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE, CONTAINER_PADDING, GAP_SCALE } from "@/lib/design-tokens";
 
 /**
  * Bordered block that owns one idea inside a surface.
@@ -36,7 +37,7 @@ export function Panel({
   return (
     <section
       aria-labelledby={labelledBy ?? (titled ? headingId : undefined)}
-      className={cn("min-w-0 rounded-md border border-border bg-card p-2.5", className)}
+      className={cn("min-w-0 rounded-md border border-border bg-card", CONTAINER_PADDING.panel, className)}
     >
       {titled && <PanelHeader headingId={headingId} title={title} detail={detail} className="mb-2">{action}</PanelHeader>}
       {/* Only wrap the body when it needs its own box, so an existing flex
@@ -64,14 +65,14 @@ export function PanelHeader({
     <div className={cn("flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1", className)}>
       <h2
         id={headingId}
-        className="min-w-0 truncate text-[11px] font-semibold tracking-wider text-muted-foreground uppercase"
+        className={cn("min-w-0 truncate", TYPOGRAPHY_SCALE.caption, "font-semibold tracking-wider text-muted-foreground uppercase")}
       >
         {title}
       </h2>
       {detail !== undefined && (
-        <span className="ml-auto min-w-0 truncate text-[10px] text-muted-foreground">{detail}</span>
+        <span className={cn("ml-auto min-w-0 truncate", TYPOGRAPHY_SCALE.caption, "text-muted-foreground")}>{detail}</span>
       )}
-      {children ? <span className="ml-auto flex shrink-0 items-center gap-1.5">{children}</span> : null}
+      {children ? <span className={cn("ml-auto flex shrink-0 items-center", GAP_SCALE.tight)}>{children}</span> : null}
     </div>
   );
 }

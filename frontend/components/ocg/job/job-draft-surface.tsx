@@ -11,9 +11,11 @@
 import { useRef, useState } from "react";
 import { AlertTriangle, Check, Rocket, Target, X } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { STATUS_BG, STATUS_TEXT, type StatusTone } from "../primitives/tone";
 import type { ProjectSummary } from "../project/domain";
 import type { JobLaunchResult } from "../runtime/runtime-types";
 import {
@@ -40,12 +42,19 @@ type JobDraftSurfaceProps = {
   onClose: () => void;
 };
 
-const OUTCOME_TONE: Record<JobLaunchResult["outcome"], string> = {
-  accepted: "border-emerald-500/40 bg-emerald-500/5 text-emerald-800 dark:text-emerald-200",
-  rejected: "border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-200",
-  "requires-attention": "border-violet-500/40 bg-violet-500/5 text-violet-800 dark:text-violet-200",
-  failed: "border-red-500/40 bg-red-500/5 text-red-800 dark:text-red-200",
+const OUTCOME_STATUS_MAP: Record<JobLaunchResult["outcome"], StatusTone> = {
+  accepted: "success",
+  rejected: "warning",
+  "requires-attention": "pending",
+  failed: "error",
 };
+
+const OUTCOME_TONE: Record<JobLaunchResult["outcome"], string> = Object.fromEntries(
+  Object.entries(OUTCOME_STATUS_MAP).map(([outcome, status]) => [
+    outcome,
+    `${STATUS_BG[status]} ${STATUS_TEXT[status]}`,
+  ]),
+) as Record<JobLaunchResult["outcome"], string>;
 
 const KNOWN_VALIDATION_FAILED = "Draft validation failed before launch.";
 const KNOWN_LAUNCH_FAILED = "The runtime adapter failed while launching this Job.";
@@ -125,8 +134,8 @@ export function JobDraftSurface({
           <Target className="size-3.5 text-muted-foreground" />
         </span>
         <div className="min-w-0 flex-1">
-          <h2 className="text-[13px] font-semibold tracking-tight">{t("job.draft")}</h2>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
+          <h2 className={cn(TYPOGRAPHY_SCALE.body_sm, "font-semibold tracking-tight")}>{t("job.draft")}</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
             {t("job.activeProject")} <span className="font-medium text-foreground">{project.name}</span> · {t("job.activeProjectNote")}
           </p>
         </div>
@@ -148,9 +157,9 @@ export function JobDraftSurface({
         role={hasErrors ? "alert" : "status"}
         aria-live="polite"
         className={cn(
-          "rounded-md border px-2.5 py-1.5 text-[11px] outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
+          "rounded-md border px-2.5 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
           hasErrors
-            ? "border-red-500/40 bg-red-500/5 text-red-800 dark:text-red-200"
+            ? `${STATUS_BG.error} ${STATUS_TEXT.error}`
             : "border-border bg-muted/20 text-muted-foreground",
         )}
       >
@@ -162,7 +171,7 @@ export function JobDraftSurface({
       </div>
 
       <div className="flex flex-col gap-1">
-        <label htmlFor="job-draft-objective" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+        <label htmlFor="job-draft-objective" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           {t("job.objective")}
         </label>
         <Textarea
@@ -173,13 +182,13 @@ export function JobDraftSurface({
           placeholder={t("job.objectivePlaceholder")}
           aria-invalid={draft.issues.some((issue) => issue.field === "objective" && issue.severity === "error")}
           disabled={isLaunching}
-          className="min-h-11 text-[13px]"
+          className={cn(TYPOGRAPHY_SCALE.body_sm, "min-h-11")}
         />
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="flex flex-col gap-1">
-          <label htmlFor="job-draft-criteria" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label htmlFor="job-draft-criteria" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             {t("job.successCriteria")}
           </label>
           <Textarea
@@ -190,11 +199,11 @@ export function JobDraftSurface({
             placeholder={t("job.successCriteriaPlaceholder")}
             aria-invalid={draft.issues.some((issue) => issue.field === "successCriteria" && issue.severity === "error")}
             disabled={isLaunching}
-            className="min-h-16 text-[13px]"
+            className={cn(TYPOGRAPHY_SCALE.body_sm, "min-h-16")}
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label htmlFor="job-draft-constraints" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label htmlFor="job-draft-constraints" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             {t("job.constraints")}
           </label>
           <Textarea
@@ -204,18 +213,18 @@ export function JobDraftSurface({
             onBlur={onValidate}
             placeholder={t("job.constraintsPlaceholder")}
             disabled={isLaunching}
-            className="min-h-16 text-[13px]"
+            className={cn(TYPOGRAPHY_SCALE.body_sm, "min-h-16")}
           />
         </div>
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">
         <div className="flex flex-col gap-1">
-          <label htmlFor="job-draft-budget" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label htmlFor="job-draft-budget" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             {t("job.budget")}
           </label>
           <div className="flex items-center gap-2">
-            <span aria-hidden="true" className="text-[13px] text-muted-foreground">$</span>
+            <span aria-hidden="true" className={cn(TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground")}>$</span>
             <Input
               id="job-draft-budget"
               type="text"
@@ -225,18 +234,18 @@ export function JobDraftSurface({
               onBlur={onValidate}
               aria-invalid={draft.issues.some((issue) => issue.field === "hardBudgetMicros" && issue.severity === "error")}
               disabled={isLaunching}
-              className="h-8 text-[13px]"
+              className={cn(TYPOGRAPHY_SCALE.body_sm, "h-8")}
             />
             <Button type="button" variant="outline" size="xs" onClick={setFixtureBudget} disabled={isLaunching}>
               {t("job.useFixture")}
             </Button>
           </div>
-          <p className="text-[10px] leading-4 text-muted-foreground">
+          <p className="text-xs leading-4 text-muted-foreground">
             {t("job.budgetHelp", { value: draft.hardBudgetMicros === null ? t("job.budgetNotSet") : draft.hardBudgetMicros.toLocaleString() })}
           </p>
           <p
             className={cn(
-              "text-[10px] leading-4",
+              "text-xs leading-4",
               draft.hardBudgetSource === "fixture-recommended" ? "text-muted-foreground" : "text-foreground/70",
             )}
           >
@@ -247,7 +256,7 @@ export function JobDraftSurface({
         </div>
 
         <div className="flex flex-col gap-1">
-          <label htmlFor="job-draft-commitment" className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <label htmlFor="job-draft-commitment" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             {t("job.resourceCommitment")}
           </label>
           <input
@@ -263,8 +272,8 @@ export function JobDraftSurface({
             aria-valuetext={t("job.commitmentValue", { percent: commitmentPercent })}
             className="h-8 w-full accent-foreground"
           />
-          <p className="text-[11px] tabular-nums text-foreground/80">{t("job.commitmentValue", { percent: commitmentPercent })}</p>
-          <p className="text-[10px] leading-4 text-muted-foreground">
+          <p className="text-xs tabular-nums text-foreground/80">{t("job.commitmentValue", { percent: commitmentPercent })}</p>
+          <p className="text-xs leading-4 text-muted-foreground">
             {t("job.commitmentHelp")}
           </p>
         </div>
@@ -273,7 +282,7 @@ export function JobDraftSurface({
       {hasErrors && (
         <ul className="flex flex-col gap-1" aria-label={t("job.validationIssues")}>
           {draft.issues.filter((issue) => issue.severity === "error").map((issue) => (
-            <li key={`${issue.code}-${issue.field}`} className="flex items-start gap-1.5 text-[11px] leading-4 text-red-700 dark:text-red-300">
+            <li key={`${issue.code}-${issue.field}`} className={cn("flex items-start gap-1.5 text-xs leading-4", STATUS_TEXT['error'])}>
               <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
               <span>{localizeKnownFailureMessage(issue.message, t)}</span>
             </li>
@@ -282,20 +291,20 @@ export function JobDraftSurface({
       )}
 
       {draft.lifecycle === "launch-failed" && draft.launchMessage && (!launchResult || launchResult.message !== draft.launchMessage) && (
-        <p role="alert" className="rounded-md border border-red-500/40 bg-red-500/5 px-2.5 py-1.5 text-[11px] leading-4 text-red-800 dark:text-red-200">
+        <p role="alert" className={cn("rounded-md border px-2.5 py-1.5 text-xs leading-4", STATUS_BG['error'], STATUS_TEXT['error'])}>
           {localizeKnownFailureMessage(draft.launchMessage, t)}
         </p>
       )}
 
       {launchResult && (
-        <p className={cn("rounded-md border px-2.5 py-1.5 text-[11px] leading-4", OUTCOME_TONE[launchResult.outcome])}>
+        <p className={cn("rounded-md border px-2.5 py-1.5 text-xs leading-4", OUTCOME_TONE[launchResult.outcome])}>
           <span className="font-semibold capitalize">{launchResult.outcome}</span>
           {launchResult.duplicate ? ` ${t("job.recordedReused")}` : ""} · {localizeKnownFailureMessage(launchResult.message, t)}
         </p>
       )}
 
       <footer className="flex flex-wrap items-center gap-2 border-t border-border pt-2.5">
-        <p className="min-w-0 flex-1 text-[10px] text-muted-foreground">
+        <p className="min-w-0 flex-1 text-xs text-muted-foreground">
           {draft.hardBudgetMicros !== null && Number.isSafeInteger(draft.hardBudgetMicros) && draft.hardBudgetMicros >= HARD_BUDGET_MIN_MICROS
             ? t("job.budgetValid")
             : t("job.budgetInvalid")}

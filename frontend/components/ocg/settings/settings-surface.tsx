@@ -47,7 +47,7 @@ function OwnershipBadge({ setting }: { setting: NormalizedSetting }) {
   const backend = isBackendOwned(setting);
   const browserOnly = setting.ownership === "frontend-only";
   return (
-    <Pill tone={backend ? "sky" : browserOnly ? "violet" : "slate"} className="text-[11px] normal-case">
+    <Pill tone={backend ? "sky" : browserOnly ? "violet" : "slate"} className="text-xs normal-case">
       {backend ? <ShieldCheck className="size-2.5" /> : null}
       {backend ? t("common.runtimeOwned") : browserOnly ? t("common.browserOnly") : t("common.effective")}
     </Pill>
@@ -89,7 +89,7 @@ function LanguageSetting() {
   const { t } = useI18n();
   return (
     <div className="flex min-w-0 flex-col gap-2 border-b border-border/70 py-3 last:border-b-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-      <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-medium">{t("settings.language.label")}</h3><Pill tone="violet" className="text-[11px] normal-case">{t("common.browserOnly")}</Pill></div><p className="mt-1 max-w-2xl text-[13px] leading-5 text-muted-foreground">{t("settings.language.desc")}</p></div>
+      <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-medium">{t("settings.language.label")}</h3><Pill tone="violet" className="text-xs normal-case">{t("common.browserOnly")}</Pill></div><p className="mt-1 max-w-2xl text-[13px] leading-5 text-muted-foreground">{t("settings.language.desc")}</p></div>
       <div className="min-w-0 shrink-0 sm:max-w-[48%] sm:text-right">
         <div className="sm:flex sm:flex-col sm:items-end"><LanguageSwitcher /></div>
       </div>
@@ -125,7 +125,7 @@ function SettingRow({ setting, onReconfigure }: { setting: NormalizedSetting; on
   const isAppearance = localized.id.startsWith("appearance.");
   return (
     <div className="flex min-w-0 flex-col gap-2 border-b border-border/70 py-3 last:border-b-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-      <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-medium">{localized.label}</h3><OwnershipBadge setting={localized} />{localized.readOnly && <span className="text-[11px] text-muted-foreground">{t("common.readOnly")}</span>}</div><p className="mt-1 max-w-2xl text-[13px] leading-5 text-muted-foreground">{localized.description}</p></div>
+      <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><h3 className="text-sm font-medium">{localized.label}</h3><OwnershipBadge setting={localized} />{localized.readOnly && <span className="text-xs text-muted-foreground">{t("common.readOnly")}</span>}</div><p className="mt-1 max-w-2xl text-[13px] leading-5 text-muted-foreground">{localized.description}</p></div>
       <div className="min-w-0 shrink-0 sm:max-w-[48%] sm:text-right">
         {isAppearance ? <div className="sm:flex sm:flex-col sm:items-end"><AppearanceSetting setting={localized} /></div> : localized.action === "reconfigure" ? <Button size="sm" variant="outline" className="h-auto min-h-11 max-w-full whitespace-normal rounded-md py-2 tracking-normal normal-case" onClick={onReconfigure}>{localized.value}<ArrowRight className="size-3" /></Button> : <span className="[overflow-wrap:anywhere] text-[13px] font-medium text-foreground">{String(localized.value)}</span>}
       </div>

@@ -4,6 +4,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { Check, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { STATUS_BG, STATUS_TEXT } from "../primitives/tone";
 import { useI18n } from "../i18n";
 import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
@@ -102,8 +103,8 @@ export function AddSubscriptionPanel({ onSaved }: { onSaved?: () => void }) {
       <p className="text-sm leading-6 text-muted-foreground">{t("settings.addSubscriptionDesc")}</p>
       {error && <p role="alert" className="break-words rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{error}</p>}
       {savedCount !== null && (
-        <p role="status" className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm">
-          <Check className="mt-0.5 size-4 shrink-0 text-emerald-600" />{t("settings.addSubscriptionSaved", { count: savedCount })}
+        <p role="status" className={`flex items-start gap-2 rounded-md border p-3 text-sm ${STATUS_BG['success']}`}>
+          <Check className={`mt-0.5 size-4 shrink-0 ${STATUS_TEXT['success']}`} />{t("settings.addSubscriptionSaved", { count: savedCount })}
         </p>
       )}
       {!connected ? (

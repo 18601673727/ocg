@@ -13,6 +13,7 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -20,6 +21,7 @@ import {
   PageSurface,
   Pill,
   SegmentedTabs,
+  STATUS_TEXT,
   StatusDot,
   TEXT_TONE,
   type Tone,
@@ -220,8 +222,8 @@ function MockAttentionSurface(props: AttentionSurfaceProps) {
       {/* List column */}
       <div className={cn("flex min-h-0 w-full min-w-0 flex-1 flex-col", selected && "lg:border-r lg:border-border")}>
         <div className="shrink-0 px-4 pt-4 sm:px-6 sm:pt-6">
-          <h1 className="text-[20px] font-semibold tracking-tight">{t("attention.title")}</h1>
-          <p className="mt-0.5 text-[13px] text-muted-foreground">
+          <h1 className="text-xl font-semibold tracking-tight">{t("attention.title")}</h1>
+          <p className={cn(TYPOGRAPHY_SCALE.body_sm, "mt-0.5 text-muted-foreground")}>
             {t("attention.subtitle")}
           </p>
           <SummaryStrip summary={summary} />
@@ -248,13 +250,13 @@ function MockAttentionSurface(props: AttentionSurfaceProps) {
               />
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <label className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 {t("attention.kind")}
                 <select
                   value={filters.kind}
                   onChange={(event) => setFilters((f) => ({ ...f, kind: event.target.value as AttentionFilters["kind"] }))}
                   aria-label={t("attention.filterKind")}
-                  className="rounded-md border border-border bg-background px-1.5 py-1 text-[12px] text-foreground"
+                  className="rounded-md border border-border bg-background px-1.5 py-1 text-xs text-foreground"
                 >
                   <option value="all">{t("common.all")}</option>
                   {ATTENTION_KINDS.map((kind) => (
@@ -262,13 +264,13 @@ function MockAttentionSurface(props: AttentionSurfaceProps) {
                   ))}
                 </select>
               </label>
-              <label className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 {t("attention.severity")}
                 <select
                   value={filters.severity}
                   onChange={(event) => setFilters((f) => ({ ...f, severity: event.target.value as AttentionFilters["severity"] }))}
                   aria-label={t("attention.filterSeverity")}
-                  className="rounded-md border border-border bg-background px-1.5 py-1 text-[12px] text-foreground"
+                  className="rounded-md border border-border bg-background px-1.5 py-1 text-xs text-foreground"
                 >
                   <option value="all">{t("common.all")}</option>
                   <option value="critical">Critical</option>
@@ -277,13 +279,13 @@ function MockAttentionSurface(props: AttentionSurfaceProps) {
                   <option value="info">Info</option>
                 </select>
               </label>
-              <label className="flex items-center gap-1.5 text-[12px] text-muted-foreground">
+              <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 {t("attention.source")}
                 <select
                   value={filters.source}
                   onChange={(event) => setFilters((f) => ({ ...f, source: event.target.value as AttentionFilters["source"] }))}
                   aria-label={t("attention.filterSource")}
-                  className="rounded-md border border-border bg-background px-1.5 py-1 text-[12px] text-foreground"
+                  className="rounded-md border border-border bg-background px-1.5 py-1 text-xs text-foreground"
                 >
                   <option value="all">{t("common.all")}</option>
                   {(Object.keys(ATTENTION_SOURCE_LABELS) as AttentionSource[]).map((source) => (
@@ -321,7 +323,7 @@ function MockAttentionSurface(props: AttentionSurfaceProps) {
             </ul>
           )}
           {truncated && (
-            <p className="pb-4 text-center text-[11px] text-muted-foreground">
+            <p className="pb-4 text-center text-xs text-muted-foreground">
               Showing the first {ATTENTION_RESULT_LIMIT} matches.
             </p>
           )}
@@ -367,10 +369,10 @@ function SummaryStrip({ summary }: { summary: ReturnType<typeof selectAttentionS
     <dl className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border bg-card px-3 py-2">
       {metrics.map((metric) => (
         <div key={metric.label} className="flex items-baseline gap-1.5">
-          <dd className={cn("text-[15px] font-semibold tabular-nums", metric.alert ? "text-red-600 dark:text-red-400" : "text-foreground")}>
+          <dd className={cn(TYPOGRAPHY_SCALE.body_lg, "font-semibold tabular-nums", metric.alert ? STATUS_TEXT['error'] : "text-foreground")}>
             {metric.value}
           </dd>
-          <dt className="text-[11px] text-muted-foreground">{metric.label}</dt>
+          <dt className="text-xs text-muted-foreground">{metric.label}</dt>
         </div>
       ))}
     </dl>
@@ -394,14 +396,14 @@ function AttentionRow({ item, selected, onSelect }: { item: AttentionItem; selec
       <StatusDot tone={SEVERITY_TONE[item.severity]} size="md" className="mt-1.5" />
       <span className="min-w-0 flex-1">
         <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <span className="text-[13px] font-semibold">{item.title}</span>
+          <span className={cn(TYPOGRAPHY_SCALE.body_sm, "font-semibold")}>{item.title}</span>
           <Pill tone={KIND_TONE[item.kind]}>{ATTENTION_KIND_LABELS[item.kind]}</Pill>
-          <span className={cn("text-[10px] font-semibold uppercase", TEXT_TONE[SEVERITY_TONE[item.severity]])}>
+          <span className={cn("text-xs font-semibold uppercase", TEXT_TONE[SEVERITY_TONE[item.severity]])}>
             {ATTENTION_SEVERITY_LABELS[item.severity]}
           </span>
         </span>
-        <span className="mt-0.5 block truncate text-[12px] text-muted-foreground">{item.summary}</span>
-        <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+        <span className="mt-0.5 block truncate text-xs text-muted-foreground">{item.summary}</span>
+        <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
           <span className="inline-flex items-center gap-1">
             <Clock3 className="size-3" aria-hidden="true" />{item.createdAt}
           </span>
@@ -464,15 +466,15 @@ function AttentionInspector({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <Pill tone={KIND_TONE[item.kind]}>{ATTENTION_KIND_LABELS[item.kind]}</Pill>
-            <span className={cn("text-[10px] font-semibold uppercase", TEXT_TONE[SEVERITY_TONE[item.severity]])}>
+            <span className={cn("text-xs font-semibold uppercase", TEXT_TONE[SEVERITY_TONE[item.severity]])}>
               {ATTENTION_SEVERITY_LABELS[item.severity]}
             </span>
-            <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+            <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground">
               {ATTENTION_STATUS_LABELS[item.status]}
             </span>
           </div>
-          <h2 className="mt-1 text-[15px] font-semibold tracking-tight">{item.title}</h2>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
+          <h2 className={cn(TYPOGRAPHY_SCALE.body_lg, "mt-1 font-semibold tracking-tight")}>{item.title}</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">
             {ATTENTION_SOURCE_LABELS[item.source]} · created {item.createdAt} · updated {item.updatedAt}
           </p>
         </div>
@@ -482,7 +484,7 @@ function AttentionInspector({
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-        <div className="flex flex-col gap-3 text-[13px]">
+        <div className={cn(TYPOGRAPHY_SCALE.body_sm, "flex flex-col gap-3")}>
           <InspectorAnswer question="What happened?" answer={item.whatHappened} />
           <InspectorAnswer question="Why does OCG need me?" answer={item.whyNeeded} />
           <InspectorAffected item={item} />
@@ -491,8 +493,8 @@ function AttentionInspector({
           <InspectorAnswer question="What happens if I do nothing?" answer={item.inactionConsequence} />
           {item.resolution && (
             <section aria-label="Resolution" className="rounded-lg border border-border bg-muted/30 p-3">
-              <h3 className="text-[12px] font-semibold">Resolution</h3>
-              <p className="mt-1 text-[12px] text-muted-foreground">
+              <h3 className="text-xs font-semibold">Resolution</h3>
+              <p className="mt-1 text-xs text-muted-foreground">
                 {ATTENTION_STATUS_LABELS[item.resolution.outcome]} · {item.resolution.at}
                 {item.resolution.note ? ` — ${item.resolution.note}` : ""}
               </p>
@@ -539,7 +541,7 @@ function AttentionInspector({
               </Button>
             )}
             {!unresolved && (
-              <span className="inline-flex items-center gap-1 text-[12px] text-muted-foreground">
+              <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
                 <ShieldAlert className="size-3.5" aria-hidden="true" />
                 {ATTENTION_STATUS_LABELS[item.status]} — no further action
               </span>
@@ -547,7 +549,7 @@ function AttentionInspector({
           </div>
         )}
         {approval && approval.decision === "pending" && (
-          <p className="mt-2 text-[11px] text-muted-foreground">
+          <p className="mt-2 text-xs text-muted-foreground">
             Decision applies to this workspace view only; nothing is persisted or sent anywhere.
           </p>
         )}
@@ -559,8 +561,8 @@ function AttentionInspector({
 function InspectorAnswer({ question, answer }: { question: string; answer: string }) {
   return (
     <section aria-label={question}>
-      <h3 className="text-[12px] font-semibold">{question}</h3>
-      <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{answer}</p>
+      <h3 className="text-xs font-semibold">{question}</h3>
+      <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{answer}</p>
     </section>
   );
 }
@@ -574,10 +576,10 @@ function InspectorAffected({ item }: { item: AttentionItem }) {
   if (rows.length === 0) return null;
   return (
     <section aria-label="What is affected?">
-      <h3 className="text-[12px] font-semibold">What is affected?</h3>
+      <h3 className="text-xs font-semibold">What is affected?</h3>
       <dl className="mt-1 rounded-lg border border-border bg-muted/20 px-3 py-2">
         {rows.map(([label, value]) => (
-          <div key={label} className="flex items-baseline justify-between gap-3 py-0.5 text-[12px]">
+          <div key={label} className="flex items-baseline justify-between gap-3 py-0.5 text-xs">
             <dt className="shrink-0 text-muted-foreground">{label}</dt>
             <dd className="min-w-0 truncate text-right font-medium">{value}</dd>
           </div>
@@ -590,10 +592,10 @@ function InspectorAffected({ item }: { item: AttentionItem }) {
 function ApprovalDetail({ approval }: { approval: NonNullable<AttentionItem["approval"]> }) {
   return (
     <section aria-label="Approval request" className="rounded-lg border border-border p-3">
-      <h3 className="text-[12px] font-semibold">
+      <h3 className="text-xs font-semibold">
         Approval · {APPROVAL_TYPE_LABELS[approval.type]}
       </h3>
-      <dl className="mt-2 flex flex-col gap-1.5 text-[12px]">
+      <dl className="mt-2 flex flex-col gap-1.5 text-xs">
         <DetailRow label="Requested" value={approval.requestedAction} />
         <DetailRow label="Reason" value={approval.reason} />
         <DetailRow label="Requester" value={`${approval.requester} · ${approval.requestedAt}`} />
@@ -617,8 +619,8 @@ function BlockedDetail({ item }: { item: AttentionItem }) {
   if (!blocked) return null;
   return (
     <section aria-label="Blocked context" className="rounded-lg border border-border p-3">
-      <h3 className="text-[12px] font-semibold">Blocked — not an approval</h3>
-      <dl className="mt-2 flex flex-col gap-1.5 text-[12px]">
+      <h3 className="text-xs font-semibold">Blocked — not an approval</h3>
+      <dl className="mt-2 flex flex-col gap-1.5 text-xs">
         <DetailRow label="Reason" value={blocked.reason} />
         <DetailRow label="Unblocks when" value={blocked.unblocksWhen} />
       </dl>

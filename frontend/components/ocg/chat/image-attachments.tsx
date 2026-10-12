@@ -136,18 +136,18 @@ export function AttachmentStaging({ state, disabled }: { state: ReturnType<typeo
   if (!state.attachments.length && !state.error) return null;
   return <div className="border-t border-border px-3 py-2" aria-label={t("chat.imageStaging")}>
     {!!state.attachments.length && <>
-      <p className="mb-2 text-[11px] text-muted-foreground" role="status">{t("chat.imageStaging")} · {state.attachments.length}/8</p>
+      <p className="mb-2 text-xs text-muted-foreground" role="status">{t("chat.imageStaging")} · {state.attachments.length}/8</p>
       <ul className="flex max-h-52 flex-wrap gap-2 overflow-y-auto">
         {state.attachments.map(item => <li key={item.id} className="w-28 rounded-md border border-border bg-muted/30 p-1.5">
           <div className="relative">
             <Image src={item.preview} alt={item.file.name} width={100} height={64} unoptimized className="h-16 w-full rounded object-cover" />
             <Button type="button" variant="secondary" size="icon-xs" className="absolute -top-1 -right-1" disabled={disabled} aria-label={t("chat.removeImage", { name: item.file.name })} onClick={() => state.remove(item.id)}><X className="size-3" /></Button>
           </div>
-          <p className="mt-1 truncate text-[10px]" title={item.file.name}>{item.file.name}</p>
-          <p className="mt-1 flex items-center gap-1 text-[10px] text-muted-foreground" role="status">
+          <p className="mt-1 truncate text-xs" title={item.file.name}>{item.file.name}</p>
+          <p className="mt-1 flex items-center gap-1 text-xs text-muted-foreground" role="status">
             {item.status === "uploading" ? <><Loader2 className="size-3 animate-spin" />{t("chat.imageUploading")}</> : item.status === "ready" ? <><Check className="size-3 text-green-600" />{t("chat.imageReady")}</> : <span className="text-destructive">{t("chat.imageUploadFailed")}</span>}
           </p>
-          {item.status === "failed" && <><p role="alert" className="mt-1 line-clamp-2 break-words text-[10px] text-destructive" title={item.error}>{item.error}</p><Button type="button" variant="ghost" size="xs" disabled={disabled} onClick={() => state.retry(item.id)}><RotateCcw className="size-3" />{t("common.retry")}</Button></>}
+          {item.status === "failed" && <><p role="alert" className="mt-1 line-clamp-2 break-words text-xs text-destructive" title={item.error}>{item.error}</p><Button type="button" variant="ghost" size="xs" disabled={disabled} onClick={() => state.retry(item.id)}><RotateCcw className="size-3" />{t("common.retry")}</Button></>}
         </li>)}
       </ul>
     </>}

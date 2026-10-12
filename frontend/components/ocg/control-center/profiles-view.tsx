@@ -66,7 +66,7 @@ function ProfileListCard({
       >
         <div className="flex min-w-0 items-center gap-1.5">
           {profile.recommended && <BadgeCheck className={cn("size-3.5 shrink-0", TEXT_TONE.emerald)} aria-hidden="true" />}
-          <span className="min-w-0 flex-1 truncate text-[12px] font-medium">{profile.label}</span>
+          <span className="min-w-0 flex-1 truncate text-xs font-medium">{profile.label}</span>
           {active && <Pill tone="sky" title="Currently active profile">active</Pill>}
         </div>
         <div className="flex min-w-0 flex-wrap items-center gap-1">
@@ -74,7 +74,7 @@ function ProfileListCard({
           <Pill tone={source === "recommended" ? "sky" : "violet"}>{source}</Pill>
           <Pill tone={HEALTH_TONE[health]}>{HEALTH_LABEL[health]}</Pill>
         </div>
-        <p className="line-clamp-2 text-[10px] text-muted-foreground">{profile.rationale}</p>
+        <p className="line-clamp-2 text-xs text-muted-foreground">{profile.rationale}</p>
       </button>
     </li>
   );
@@ -93,19 +93,19 @@ function RouteRow({ resolved }: { resolved: ResolvedRoute }) {
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">
         <span className="inline-flex min-w-0 items-center gap-1">
           <GitBranch className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-          <span className="truncate text-[12px] font-medium">{route.roleLabel}</span>
+          <span className="truncate text-xs font-medium">{route.roleLabel}</span>
         </span>
         {route.tier && <Pill tone="slate" title="Lead tier">{route.tier}</Pill>}
         <span className="text-muted-foreground" aria-hidden="true">→</span>
-        <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground" title={target}>{target}</span>
+        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground" title={target}>{target}</span>
         <Pill tone={ROUTE_TONE[status]} title={`Route status: ${ROUTE_LABEL[status]}`}>{ROUTE_LABEL[status]}</Pill>
         {route.overridden && <Pill tone="violet" title="Overridden from the profile default">overridden</Pill>}
         {route.fallback && <Pill tone="amber" title="Presented as using a fallback model">fallback</Pill>}
       </div>
       {route.fallbackModelId && route.fallback && (
-        <p className="mt-1 truncate text-[10px] text-muted-foreground">Fallback model id: {route.fallbackModelId}</p>
+        <p className="mt-1 truncate text-xs text-muted-foreground">Fallback model id: {route.fallbackModelId}</p>
       )}
-      {route.warning && <p className={cn("mt-1 text-[10px]", TEXT_TONE.amber)}>{route.warning}</p>}
+      {route.warning && <p className={cn("mt-1 text-xs", TEXT_TONE.amber)}>{route.warning}</p>}
     </li>
   );
 }
@@ -133,7 +133,7 @@ function ProfileDetail({
     <div className="flex min-w-0 flex-col gap-3">
       <div className="min-w-0 rounded-md border border-border bg-muted/10 p-3">
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-          <h2 className="min-w-0 truncate text-[14px] font-semibold tracking-tight">{profile.label}</h2>
+          <h2 className="min-w-0 truncate text-sm font-semibold tracking-tight">{profile.label}</h2>
           <Pill tone={HEALTH_TONE[health]} title="Derived profile health">{HEALTH_LABEL[health]}</Pill>
           <Pill tone="slate">{profile.tier}</Pill>
           <Pill tone={source === "recommended" ? "sky" : "violet"}>
@@ -142,7 +142,7 @@ function ProfileDetail({
           {profile.advanced && <Pill tone="violet">advanced</Pill>}
           {profile.recommended && <Pill tone="emerald" title="Runtime recommendation">recommended</Pill>}
         </div>
-        <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">{profile.rationale}</p>
+        <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{profile.rationale}</p>
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <Button
             size="xs"
@@ -154,7 +154,7 @@ function ProfileDetail({
             {active ? <CheckCircle2 className="size-3" data-icon="inline-start" aria-hidden="true" /> : <Star className="size-3" data-icon="inline-start" aria-hidden="true" />}
             {active ? t("control.active") : t("control.setActive")}
           </Button>
-          <span className="text-[10px] text-muted-foreground">Frontend-only mock switch. No configuration is written.</span>
+          <span className="text-xs text-muted-foreground">Frontend-only mock switch. No configuration is written.</span>
         </div>
       </div>
 
@@ -179,7 +179,7 @@ function ProfileDetail({
           <div className="flex flex-col gap-2">
             {workerRoles.map((role) => (
               <div key={role.roleId} className="min-w-0">
-                <p className="mb-1 truncate text-[10px] font-semibold tracking-wider text-muted-foreground uppercase">
+                <p className="mb-1 truncate text-xs font-semibold tracking-wider text-muted-foreground uppercase">
                   {role.roleLabel}
                   <span className="ml-1 font-normal normal-case tracking-normal">({role.roleId})</span>
                 </p>
@@ -197,13 +197,13 @@ function ProfileDetail({
       <section aria-label="Profile warnings">
         <SectionTitle detail={warnings.length > 0 ? `${warnings.length} item(s)` : "none"}>Warnings</SectionTitle>
         {warnings.length === 0 ? (
-          <p className="rounded-md border border-border bg-muted/10 px-2.5 py-2 text-[11px] text-muted-foreground">
+          <p className="rounded-md border border-border bg-muted/10 px-2.5 py-2 text-xs text-muted-foreground">
             No fallback, override, or availability warnings for this profile.
           </p>
         ) : (
           <ul className="flex flex-col gap-1">
             {warnings.map((warning) => (
-              <li key={warning} className={cn("flex items-start gap-1.5 rounded-md border px-2.5 py-1.5 text-[11px]", TONE_CLASS.amber)}>
+              <li key={warning} className={cn("flex items-start gap-1.5 rounded-md border px-2.5 py-1.5 text-xs", TONE_CLASS.amber)}>
                 <AlertTriangle className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
                 <span className="min-w-0 break-words">{warning}</span>
               </li>

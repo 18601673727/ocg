@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Check, Loader2, RefreshCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { STATUS_BG, STATUS_TEXT } from "../primitives/tone";
 import { useI18n } from "../i18n";
 import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient, type ProfileView } from "../profile/profile-client";
@@ -123,7 +124,7 @@ export function ProviderSyncPanel({ profileRefresh = 0 }: { profileRefresh?: num
         <p className="mt-1 text-sm leading-6 text-muted-foreground">{t("settings.sync.desc")}</p>
       </div>
       {error && <p role="alert" className="break-words rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{error}</p>}
-      {notice && <p role="status" className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm"><Check className="mt-0.5 size-4 shrink-0 text-emerald-600" />{notice}</p>}
+      {notice && <p role="status" className={`flex items-start gap-2 rounded-md p-3 text-sm ${STATUS_BG['success']}`}><Check className={`mt-0.5 size-4 shrink-0 ${STATUS_TEXT['success']}`} />{notice}</p>}
       {!view && !error && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />{t("profile.loading")}</p>}
       <ul className="space-y-3">
         {providers.map(([key, provider]) => {
@@ -150,8 +151,8 @@ export function ProviderSyncPanel({ profileRefresh = 0 }: { profileRefresh?: num
                 <p role="status" className="text-sm text-muted-foreground">{t("settings.sync.upToDate")}</p>
               )}
               {result && result.unavailable.length > 0 && (
-                <div role="status" className="space-y-1 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
-                  <p className="flex items-center gap-2 font-medium"><AlertTriangle className="size-4 text-amber-600" />{t("settings.sync.unavailable", { count: result.unavailable.length })}</p>
+                <div role="status" className={`space-y-1 rounded-md p-3 text-sm ${STATUS_BG['warning']}`}>
+                  <p className={`flex items-center gap-2 font-medium ${STATUS_TEXT['warning']}`}><AlertTriangle className={`size-4 ${STATUS_TEXT['warning']}`} />{t("settings.sync.unavailable", { count: result.unavailable.length })}</p>
                   <p className="break-all font-mono text-xs text-muted-foreground">{result.unavailable.join(", ")}</p>
                   <p className="text-xs text-muted-foreground">{t("settings.sync.unavailableNote")}</p>
                 </div>

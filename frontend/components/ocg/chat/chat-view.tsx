@@ -26,7 +26,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import { BORDER_TONE, StatusDot, TEXT_TONE, TOOL_STATUS } from "@/components/ocg/primitives";
+import { BORDER_TONE, StatusDot, STATUS_TEXT, TEXT_TONE, TOOL_STATUS } from "@/components/ocg/primitives";
 import { ActivityPulse } from "../activity-pulse";
 import { useI18n, runtimeStateLabel, runtimeStatusDetail, chatFailureReason } from "../i18n";
 import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
@@ -70,7 +70,7 @@ function renderInline(text: string, keyPrefix: string): React.ReactNode[] {
       parts.push(
         <code
           key={`${keyPrefix}-c${i}`}
-          className="rounded border border-border bg-muted px-1 py-px font-mono text-[12px] text-foreground"
+          className="rounded border border-border bg-muted px-1 py-px font-mono text-xs text-foreground"
         >
           {token.slice(1, -1)}
         </code>,
@@ -89,13 +89,13 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
   return (
     <div className="overflow-hidden rounded-md border border-border bg-muted/40">
       <div className="flex items-center gap-2 border-b border-border px-2.5 py-1.5">
-        <span className="font-mono text-[11px] text-muted-foreground">
+        <span className="font-mono text-xs text-muted-foreground">
           {language || t("chat.code")}
         </span>
         <button
           type="button"
           onClick={() => copyToClipboard(code)}
-          className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           aria-label={isCopied ? t("common.copied") : t("chat.copyCodeToClipboard")}
           title={t("chat.copyCode")}
         >
@@ -103,7 +103,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
           {isCopied ? t("common.copied") : t("common.copy")}
         </button>
       </div>
-      <pre className="overflow-x-auto p-2.5 font-mono text-[12px] leading-5 text-foreground">
+      <pre className="overflow-x-auto p-2.5 font-mono text-xs leading-5 text-foreground">
         <code>{code}</code>
       </pre>
     </div>
@@ -114,7 +114,7 @@ function TableBlock({ table }: { table: MarkdownTable }) {
   const { t } = useI18n();
   return (
     <div role="region" aria-label={t("chat.markdownTable")} tabIndex={0} className="max-w-full overflow-x-auto rounded-md border border-border focus-visible:outline-ring">
-      <table className="w-full min-w-max border-collapse text-[12px] leading-5">
+      <table className="w-full min-w-max border-collapse text-xs leading-5">
         <thead className="bg-muted/50">
           <tr>
             {table.headers.map((header, index) => (
@@ -240,16 +240,16 @@ function ToolBlock({ message }: { message: ChatMessage }) {
             <Wrench className="size-3.5 text-muted-foreground" aria-hidden="true" />
           </span>
           <span className="min-w-0 flex-1">
-            <span className="block truncate font-mono text-[12px] font-medium">
+            <span className="block truncate font-mono text-xs font-medium">
               {tool.name}
             </span>
-            <span className="block truncate text-[12px] text-muted-foreground">
+            <span className="block truncate text-xs text-muted-foreground">
               {tool.summary}
             </span>
           </span>
           <span
            className={cn(
-              "flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px]",
+              "flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs",
               BORDER_TONE[tone],
               TEXT_TONE[tone],
             )}
@@ -267,7 +267,7 @@ function ToolBlock({ message }: { message: ChatMessage }) {
           />
         </CollapsibleTrigger>
         <CollapsibleContent>
-          <pre className="overflow-x-auto border-t border-border bg-background/60 p-2.5 font-mono text-[12px] leading-5 text-muted-foreground">
+          <pre className="overflow-x-auto border-t border-border bg-background/60 p-2.5 font-mono text-xs leading-5 text-muted-foreground">
             {tool.detail}
           </pre>
         </CollapsibleContent>
@@ -328,7 +328,7 @@ function BoundedMessage({ streaming, children }: { streaming: boolean; children:
         type="button"
         aria-expanded={expanded}
         onClick={() => setExpanded(value => !value)}
-        className="mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring"
+        className="mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring"
       >
         <ChevronDown className={cn("size-3 transition-transform", expanded && "rotate-180")} aria-hidden="true" />
         {t(toggle === "collapse" ? "chat.collapseMessage" : "chat.expandMessage")}
@@ -364,13 +364,13 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
         </span>
         <div className="min-w-0 flex-1">
           <div className="mb-1 flex items-center gap-2">
-            <span className="text-[12px] font-semibold">{isUser ? t("chat.you") : t("chat.assistant")}</span>
-            <span className="text-[11px] text-muted-foreground">{message.createdAt}</span>
+            <span className="text-xs font-semibold">{isUser ? t("chat.you") : t("chat.assistant")}</span>
+            <span className="text-xs text-muted-foreground">{message.createdAt}</span>
             <button
               type="button"
               onClick={() => copyToClipboard(message.content)}
               disabled={message.content.length === 0}
-              className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+              className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
               aria-label={isUser ? t("chat.copyRawUserMessage") : t("chat.copyRawAssistantMessage")}
               title={t("chat.copyRawMessage")}
             >
@@ -388,7 +388,7 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
                   <span className="flex size-6 shrink-0 items-center justify-center rounded border border-border bg-background">
                     <Brain className="size-3.5 text-muted-foreground" aria-hidden="true" />
                   </span>
-                  <span className="min-w-0 flex-1 text-[12px] font-medium text-foreground">
+                  <span className="min-w-0 flex-1 text-xs font-medium text-foreground">
                     {t("chat.thinking")}
                   </span>
                   <ChevronDown
@@ -408,7 +408,7 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
              className={cn(
                "text-sm text-foreground/90",
                isUser && "rounded-md border border-border bg-muted/30 px-3 py-2",
-               message.status === "failed" && "text-red-600 dark:text-red-400",
+               message.status === "failed" && STATUS_TEXT['error'],
                message.status === "cancelled" && "text-muted-foreground italic",
              )}
            >
@@ -416,17 +416,17 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
                <Markdown content={message.content} />
                <ImageGallery images={message.images} />
              </BoundedMessage>
-             {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-[12px]">
+             {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-xs">
                {chatFailureReason(t, message)}
              </p>}
              {/* A stop the runtime made for a recorded cause, such as the
                  execution deadline, names that cause; an operator's stop has none. */}
-             {message.status === "cancelled" && message.failureReason && <p className="mt-2 whitespace-pre-wrap break-words text-[12px]">
+             {message.status === "cancelled" && message.failureReason && <p className="mt-2 whitespace-pre-wrap break-words text-xs">
                {message.failureReason}
              </p>}
              {onRetry && <Button className="mt-2" size="xs" variant="outline" disabled={retryDisabled} onClick={onRetry}>{t("common.retry")}</Button>}
              {message.status !== "completed" && message.status !== "pending" && (
-               <span className="mt-1 block text-[11px] text-muted-foreground">
+               <span className="mt-1 block text-xs text-muted-foreground">
                  {runtimeStateLabel(t, message.status)}
                </span>
              )}
@@ -652,11 +652,11 @@ function Composer({
                             : <Command className="size-3.5" />}
                         </span>
                         <span className="min-w-0 flex-1">
-                          <span className="block text-[12px] font-medium">{suggestion.label}</span>
-                          <span className="block truncate text-[11px] text-muted-foreground">{suggestion.description}</span>
+                          <span className="block text-xs font-medium">{suggestion.label}</span>
+                          <span className="block truncate text-xs text-muted-foreground">{suggestion.description}</span>
                         </span>
                         {suggestion.command !== suggestion.label && (
-                          <span className="mt-0.5 shrink-0 font-mono text-[10px] text-muted-foreground">{suggestion.command.trim()}</span>
+                          <span className="mt-0.5 shrink-0 font-mono text-xs text-muted-foreground">{suggestion.command.trim()}</span>
                         )}
                       </button>
                     </li>
@@ -727,7 +727,7 @@ function Composer({
             />
           </div>
           {error && (
-            <p role="alert" className="border-t border-border px-3 py-1.5 text-[11px] text-red-600 dark:text-red-400">
+            <p role="alert" className={`border-t border-border px-3 py-1.5 text-xs ${STATUS_TEXT['error']}`}>
               {error}
             </p>
           )}
@@ -744,7 +744,7 @@ function Composer({
             >
               <Paperclip className="size-4" />
             </Button>
-            <span id="composer-hint" className="sr-only sm:ml-1 sm:not-sr-only sm:text-[11px] sm:text-muted-foreground">
+            <span id="composer-hint" className="sr-only sm:ml-1 sm:not-sr-only sm:text-xs sm:text-muted-foreground">
               <span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span>
               <span className="pointer-coarse:hidden">{busy ? t("chat.queueHint") : t("chat.hint")}</span>
             </span>
@@ -957,7 +957,7 @@ export function ChatView({
       </div>
       {!!queueState?.queue.length && (
         <div className="mx-auto w-full max-w-3xl shrink-0 border-t border-border px-3 py-2 sm:px-5" aria-label={t("chat.queue")}>
-          <div className="mb-1 flex items-center gap-2 text-[11px] text-muted-foreground" role="status">
+          <div className="mb-1 flex items-center gap-2 text-xs text-muted-foreground" role="status">
             <ListPlus className="size-3.5" />{t("chat.queueCount", { count: queueState.queue.length })}
             {queueState.paused && <><span>· {t("chat.queuePaused")}</span><Button type="button" size="xs" variant="ghost" disabled={runtimeStatus.state !== "connected"} onClick={onResumeQueue}>{t("chat.resumeQueue")}</Button></>}
           </div>

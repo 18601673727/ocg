@@ -58,3 +58,76 @@ export const DOT_TONE: Record<Tone, string> = {
 export const TONE_CLASS: Record<Tone, string> = Object.fromEntries(
   (Object.keys(SURFACE_TONE) as Tone[]).map((tone) => [tone, `${SURFACE_TONE[tone]} ${TEXT_TONE[tone]}`]),
 ) as Record<Tone, string>;
+
+/**
+ * Status-specific tone mappings for semantic status indication.
+ * 
+ * These represent operational states:
+ * - success: task completed, resource available
+ * - warning: attention needed, approaching limits
+ * - error: failed operation, degraded resource
+ * - info: informational, neutral status
+ * - pending: in-flight, waiting for completion
+ */
+export type StatusTone = "success" | "warning" | "error" | "info" | "pending";
+
+/**
+ * Map status semantic to tone vocabulary.
+ * 
+ * This ensures status always means the same thing across UI surfaces.
+ */
+export const STATUS_TONE_MAP: Record<StatusTone, Tone> = {
+  success: "emerald",
+  warning: "amber",
+  error: "red",
+  info: "sky",
+  pending: "violet",
+};
+
+/**
+ * Border + background for status indication (semantic equivalent of SURFACE_TONE).
+ * 
+ * Usage: className={STATUS_BG[status]}
+ */
+export const STATUS_BG: Record<StatusTone, string> = Object.fromEntries(
+  (Object.keys(STATUS_TONE_MAP) as StatusTone[]).map((status) => [
+    status,
+    SURFACE_TONE[STATUS_TONE_MAP[status]],
+  ]),
+) as Record<StatusTone, string>;
+
+/**
+ * Text color for status indication (semantic equivalent of TEXT_TONE).
+ * 
+ * Usage: className={STATUS_TEXT[status]}
+ */
+export const STATUS_TEXT: Record<StatusTone, string> = Object.fromEntries(
+  (Object.keys(STATUS_TONE_MAP) as StatusTone[]).map((status) => [
+    status,
+    TEXT_TONE[STATUS_TONE_MAP[status]],
+  ]),
+) as Record<StatusTone, string>;
+
+/**
+ * Dot fill for status indication (semantic equivalent of DOT_TONE).
+ * 
+ * Usage: className={STATUS_DOT[status]}
+ */
+export const STATUS_DOT: Record<StatusTone, string> = Object.fromEntries(
+  (Object.keys(STATUS_TONE_MAP) as StatusTone[]).map((status) => [
+    status,
+    DOT_TONE[STATUS_TONE_MAP[status]],
+  ]),
+) as Record<StatusTone, string>;
+
+/**
+ * Combined background + text for status badges/pills (semantic equivalent of TONE_CLASS).
+ * 
+ * Usage: className={STATUS_CLASS[status]}
+ */
+export const STATUS_CLASS: Record<StatusTone, string> = Object.fromEntries(
+  (Object.keys(STATUS_TONE_MAP) as StatusTone[]).map((status) => [
+    status,
+    TONE_CLASS[STATUS_TONE_MAP[status]],
+  ]),
+) as Record<StatusTone, string>;

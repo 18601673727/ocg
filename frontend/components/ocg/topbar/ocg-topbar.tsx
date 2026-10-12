@@ -87,7 +87,7 @@ export function OcgTopbar({
       {syncStatus && sync && isDegradedSyncStatus(syncStatus) && (
         <div
           className={cn(
-            "hidden shrink-0 items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] md:flex",
+            "hidden shrink-0 items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs md:flex",
             SURFACE_TONE[sync.tone],
             TEXT_TONE[sync.tone],
           )}

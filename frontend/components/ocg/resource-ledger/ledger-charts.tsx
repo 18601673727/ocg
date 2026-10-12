@@ -70,14 +70,14 @@ export function StackedCompositionBar({ traffic }: { traffic: ComponentTraffic }
           const value = traffic[component];
           const color = LEDGER_SERIES.find((series) => series.key === component)?.color ?? "var(--chart-3)";
           return (
-            <li key={component} className="flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground">
+            <li key={component} className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
               <span className="size-2 shrink-0 rounded-sm" style={{ backgroundColor: color }} aria-hidden />
               <span>{USAGE_COMPONENT_LABEL[component]}</span>
               <strong className="font-medium tabular-nums text-foreground">{formatTokens(value)}</strong>
             </li>
           );
         })}
-        <li className="flex items-center gap-1 text-[10px] text-muted-foreground">
+        <li className="flex items-center gap-1 text-xs text-muted-foreground">
           <span>Total</span>
           <strong className="font-medium tabular-nums text-foreground">{formatTokens(total)}</strong>
         </li>
@@ -102,7 +102,7 @@ export function TrafficChart({ points }: { points: LedgerTimePoint[] }) {
 
   if (points.length === 0) {
     return (
-      <p className="rounded-md border border-dashed border-border px-2 py-4 text-[11px] text-muted-foreground">
+      <p className="rounded-md border border-dashed border-border px-2 py-4 text-xs text-muted-foreground">
         No timestamped usage matches the current filters.
       </p>
     );
@@ -121,7 +121,7 @@ export function TrafficChart({ points }: { points: LedgerTimePoint[] }) {
               onClick={() => toggle(series.key)}
               title={`${on ? "Hide" : "Show"} ${series.label} series`}
               className={cn(
-                "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
+                "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
                 on ? "border-border bg-muted font-medium text-foreground" : "border-border/60 text-muted-foreground",
               )}
             >
@@ -188,7 +188,7 @@ export function TrafficChart({ points }: { points: LedgerTimePoint[] }) {
         </ResponsiveContainer>
       </div>
 
-      <p className="mt-1 text-[10px] text-muted-foreground" aria-live="polite">
+      <p className="mt-1 text-xs text-muted-foreground" aria-live="polite">
         {summary} · {active.length} of {LEDGER_SERIES.length} series shown. Missing values break the line instead
         of plotting zero.
       </p>

@@ -70,7 +70,7 @@ export function ProjectSwitcher({
           aria-label={triggerAria}
         >
           <FolderKanban className="size-3.5" data-icon="inline-start" aria-hidden="true" />
-          <span className="min-w-0 flex-1 truncate text-left text-[12px] tracking-normal normal-case">
+          <span className="min-w-0 flex-1 truncate text-left text-xs tracking-normal normal-case">
             {triggerLabel.name}
           </span>
           <ChevronsUpDown className="size-3.5 opacity-60" aria-hidden="true" />
@@ -131,7 +131,7 @@ export function ProjectSwitcher({
                 >
                   <span className="min-w-0 flex-1">
                     <span className="block truncate">{project.name}</span>
-                    <span className="block break-all text-[11px] font-normal text-muted-foreground">{project.root ?? project.id}</span>
+                    <span className="block break-all text-xs font-normal text-muted-foreground">{project.root ?? project.id}</span>
                   </span>
                   {isActive && <Check className="size-3.5 shrink-0" aria-hidden="true" />}
                 </button>

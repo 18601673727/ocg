@@ -36,6 +36,13 @@ import {
 } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import {
+  TYPOGRAPHY_SCALE,
+  CONTAINER_PADDING,
+  GAP_SCALE,
+  BORDER_RADIUS,
+  BORDER_OPACITY,
+} from "@/lib/design-tokens";
+import {
   EmptyState,
   Metric,
   Pill,
@@ -100,23 +107,23 @@ function BudgetSection({ accounting, observability }: { accounting: JobAccountin
   const { t } = useI18n();
   const budget = deriveBudgetUsage(accounting?.ceiling ?? null, observability.job.estimatedFinalSpend);
   return (
-    <section className="rounded-md border border-border bg-muted/20 p-2.5" aria-label="Job budget">
-      <div className="flex items-center gap-1.5">
+    <section className={cn(BORDER_RADIUS.container, "border", BORDER_OPACITY.primary, "bg-muted/20", CONTAINER_PADDING.panel)} aria-label="Job budget">
+      <div className={cn("flex items-center", GAP_SCALE.tight)}>
         <Wallet className="size-3.5 text-muted-foreground" aria-hidden="true" />
-        <h3 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("observability.budget")}</h3>
-        <span className="ml-auto text-[10px] text-muted-foreground">hard limit</span>
+        <h3 className={cn(TYPOGRAPHY_SCALE.caption, "font-semibold tracking-wider text-muted-foreground uppercase")}>{t("observability.budget")}</h3>
+        <span className={cn(TYPOGRAPHY_SCALE.caption, "ml-auto text-muted-foreground")}>hard limit</span>
       </div>
       {budget.limit === null ? (
-        <p className="mt-2 text-[11px] text-muted-foreground">No hard budget ceiling is recorded for this Job.</p>
+        <p className={cn("mt-2", TYPOGRAPHY_SCALE.caption, "text-muted-foreground")}>No hard budget ceiling is recorded for this Job.</p>
       ) : (
         <>
           <div className="mt-2 flex items-baseline justify-between gap-2">
-            <span className="text-[16px] font-semibold tabular-nums">{formatDollars(budget.limit)}</span>
-            <span className="text-[11px] text-muted-foreground">{budget.unit ?? "USD"} ceiling</span>
-            <span className="ml-auto text-[10px] text-muted-foreground">{budget.source}</span>
+            <span className={cn(TYPOGRAPHY_SCALE.label, "font-semibold tabular-nums")}>{formatDollars(budget.limit)}</span>
+            <span className={cn(TYPOGRAPHY_SCALE.caption, "text-muted-foreground")}>{budget.unit ?? "USD"} ceiling</span>
+            <span className={cn(TYPOGRAPHY_SCALE.caption, "ml-auto text-muted-foreground")}>{budget.source}</span>
           </div>
-          <p className="mt-1 text-[10px] text-muted-foreground">{t("usage.costSource")}</p>
-          {budget.estimatedFinalSpend && <p className="mt-1 text-[10px] text-muted-foreground">Forecast is {budget.estimatedFinalSpend.provenance}; hard budget remains authoritative.</p>}
+          <p className={cn("mt-1", TYPOGRAPHY_SCALE.caption, "text-muted-foreground")}>{t("usage.costSource")}</p>
+          {budget.estimatedFinalSpend && <p className={cn("mt-1", TYPOGRAPHY_SCALE.caption, "text-muted-foreground")}>Forecast is {budget.estimatedFinalSpend.provenance}; hard budget remains authoritative.</p>}
         </>
       )}
     </section>
@@ -129,14 +136,14 @@ function CurrentRuntimeSummary({ observability }: { observability: RuntimeObserv
     <div className="rounded-md border border-border bg-muted/30 px-2.5 py-2">
       <div className="flex items-center gap-1.5">
         <Cpu className="size-3.5 text-muted-foreground" aria-hidden="true" />
-        <span className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">Current runtime</span>
+        <span className={cn(TYPOGRAPHY_SCALE.body_sm, "font-semibold tracking-wider text-muted-foreground uppercase")}>Current runtime</span>
       </div>
       {current ? (
         <div className="mt-1.5 min-w-0">
-          <p className="text-[12px] font-medium">{current.label} · {current.variant ?? "standard"}</p>
-          <p className="break-words text-[11px] text-muted-foreground">{current.provider} · {current.model}</p>
+          <p className={cn(TYPOGRAPHY_SCALE.caption, "font-medium")}>{current.label} · {current.variant ?? "standard"}</p>
+          <p className={cn("break-words", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground")}>{current.provider} · {current.model}</p>
         </div>
-      ) : <p className="mt-1.5 text-[11px] text-muted-foreground">No participant is currently active.</p>}
+      ) : <p className={cn("mt-1.5", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground")}>No participant is currently active.</p>}
     </div>
   );
 }
@@ -158,10 +165,10 @@ function CallSummary({ execution }: { execution: JobExecution }) {
 function ActivityRow({ item }: { item: RuntimeActivityItem }) {
   return (
     <li className="flex items-start gap-2 border-b border-border/70 py-2 last:border-0">
-      <span className="mt-0.5 shrink-0 font-mono text-[10px] text-muted-foreground">{item.timestamp}</span>
+      <span className="mt-0.5 shrink-0 font-mono text-xs text-muted-foreground">{item.timestamp}</span>
       <div className="min-w-0 flex-1">
-        <p className="text-[11px] leading-4"><strong className="font-medium">{item.workerLabel ?? (item.role === "lead" ? "Lead" : "Job")}</strong> {item.summary}</p>
-        {(item.provider || item.model) && <p className="break-words text-[10px] text-muted-foreground">{item.provider}{item.provider && item.model ? " · " : ""}{item.model}</p>}
+        <p className={cn(TYPOGRAPHY_SCALE.body_sm, "leading-4")}><strong className="font-medium">{item.workerLabel ?? (item.role === "lead" ? "Lead" : "Job")}</strong> {item.summary}</p>
+        {(item.provider || item.model) && <p className={cn("break-words text-xs text-muted-foreground")}>{item.provider}{item.provider && item.model ? " · " : ""}{item.model}</p>}
       </div>
       {item.status && <Pill tone={WORKER_STATUS[item.status].tone} variant="quiet" dot pulse={WORKER_STATUS[item.status].pulse}>{humanizeStatus(item.status)}</Pill>}
     </li>
@@ -177,14 +184,14 @@ function WorkerRow({ worker, selected, onSelect }: { worker: WorkerRuntimeStats;
           <StatusDot tone={WORKER_STATUS[worker.status].tone} pulse={WORKER_STATUS[worker.status].pulse} className="mt-1" />
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-1.5">
-              <p className="truncate text-[12px] font-medium">{worker.label}</p>
-              {worker.role === "lead" && <span className="rounded border border-border px-1 text-[9px] text-muted-foreground">lead</span>}
+              <p className={cn(TYPOGRAPHY_SCALE.caption, "truncate font-medium")}>{worker.label}</p>
+              {worker.role === "lead" && <span className="rounded border border-border px-1 text-xs text-muted-foreground">lead</span>}
             </div>
-            <p className="break-words text-[10px] text-muted-foreground">{worker.provider} · {worker.model}{worker.variant ? ` · ${worker.variant}` : ""}</p>
+            <p className={cn("break-words text-xs text-muted-foreground")}>{worker.provider} · {worker.model}{worker.variant ? ` · ${worker.variant}` : ""}</p>
           </div>
           <Pill tone={WORKER_STATUS[worker.status].tone} variant="quiet" dot pulse={WORKER_STATUS[worker.status].pulse}>{humanizeStatus(worker.status)}</Pill>
         </div>
-        <div className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1 pl-3.5 text-[10px] text-muted-foreground sm:grid-cols-4 lg:grid-cols-2 2xl:grid-cols-4">
+        <div className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1 pl-3.5 text-xs text-muted-foreground sm:grid-cols-4 lg:grid-cols-2 2xl:grid-cols-4">
           <span>tokens <strong className="font-medium text-foreground" title={total ? `${total.provenance} usage` : "Unavailable"}>{formatTokenUsage(total)}</strong></span>
           <span>calls <strong className="font-medium text-foreground">{worker.invocationCount}</strong>{worker.retryCount ? ` · ${worker.retryCount} retry` : ""}</span>
           <span>elapsed <strong className="font-medium text-foreground">{formatDuration(worker.elapsedMs)}</strong></span>
@@ -200,12 +207,12 @@ function WorkerDetail({ worker }: { worker: WorkerRuntimeStats }) {
     <section className="rounded-md border border-border bg-muted/20 p-2.5" aria-label={`${worker.label} worker detail`}>
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="text-[13px] font-semibold">{worker.label}</p>
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{worker.role} participant</p>
+          <p className={cn(TYPOGRAPHY_SCALE.body_sm, "font-semibold")}>{worker.label}</p>
+          <p className="text-xs uppercase tracking-wider text-muted-foreground">{worker.role} participant</p>
         </div>
         <Pill tone={WORKER_STATUS[worker.status].tone} variant="quiet" dot pulse={WORKER_STATUS[worker.status].pulse}>{humanizeStatus(worker.status)}</Pill>
       </div>
-      <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2 text-[11px]">
+      <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-2 text-xs">
         <div className="col-span-2"><dt className="text-muted-foreground">Provider</dt><dd className="break-words font-medium">{worker.provider}</dd></div>
         <div className="col-span-2"><dt className="text-muted-foreground">Model</dt><dd className="break-words font-medium">{worker.model}</dd></div>
         <div><dt className="text-muted-foreground">Variant / effort</dt><dd className="font-medium">{worker.variant ?? UNKNOWN}</dd></div>
@@ -219,7 +226,7 @@ function WorkerDetail({ worker }: { worker: WorkerRuntimeStats }) {
         <div><dt className="text-muted-foreground">Latency / TTFT</dt><dd className="font-medium">{formatDuration(worker.latencyMs)} / {formatDuration(worker.ttftMs)}</dd></div>
         <div><dt className="text-muted-foreground">Throughput</dt><dd className="font-medium">{worker.tokensPerSecond === undefined ? "—" : `${formatNumber(worker.tokensPerSecond)}/s`}</dd></div>
       </dl>
-      <div className="mt-2 border-t border-border pt-2"><p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Token breakdown</p><TokenMetrics tokenUsage={worker.tokenUsage} /></div>
+      <div className="mt-2 border-t border-border pt-2"><p className="mb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">Token breakdown</p><TokenMetrics tokenUsage={worker.tokenUsage} /></div>
     </section>
   );
 }
@@ -247,7 +254,7 @@ function TimelineChart({ observability }: { observability: RuntimeObservability 
           </LineChart>
         </ResponsiveContainer>
       </ChartFrame>
-      <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground"><span>{data.length} bounded points · latest {formatTokenUsage(latest?.total === null || latest?.total === undefined ? undefined : { value: latest.total, provenance: latest.provenance ?? "reported" })}</span><span>— estimated · — reported</span></div>
+      <div className="mt-1 flex items-center justify-between gap-2 text-xs text-muted-foreground"><span>{data.length} bounded points · latest {formatTokenUsage(latest?.total === null || latest?.total === undefined ? undefined : { value: latest.total, provenance: latest.provenance ?? "reported" })}</span><span>— estimated · — reported</span></div>
     </>
   );
 }
@@ -270,7 +277,7 @@ function WorkerBreakdown({ workers, selectedWorkerId }: { workers: WorkerRuntime
           </BarChart>
         </ResponsiveContainer>
       </ChartFrame>
-      <p className="mt-1 text-[10px] text-muted-foreground">{data.length} participants with reported or estimated totals · select a worker in Runtime for detail.</p>
+      <p className="mt-1 text-xs text-muted-foreground">{data.length} participants with reported or estimated totals · select a worker in Runtime for detail.</p>
     </>
   );
 }
@@ -281,22 +288,22 @@ function AggregateRow({ name, detail, tokens, calls, active, cost, success, fail
   return (
     <li>
       <button type="button" onClick={onSelect} aria-pressed={selected} className={cn("flex w-full items-start gap-2 border-b border-border/70 px-1 py-2 text-left last:border-0", selected && "bg-muted/60")}>
-        <div className="min-w-0 flex-1"><p className="break-words text-[11px] font-medium">{name}</p>{detail && <p className="break-words text-[10px] text-muted-foreground">{detail}</p>}</div>
-        <span className="w-20 shrink-0 text-right text-[10px] text-muted-foreground" title={tokens ? `${tokens.provenance} usage` : "Unavailable"}>{formatTokenUsage(tokens)} · {calls} calls</span>
-        <span className="w-14 shrink-0 text-right text-[10px] text-muted-foreground">{active} active</span>
-        <span className="w-14 shrink-0 text-right text-[10px] text-muted-foreground">{formatCostUsage(cost)}</span>
+        <div className="min-w-0 flex-1"><p className="break-words text-xs font-medium">{name}</p>{detail && <p className="break-words text-xs text-muted-foreground">{detail}</p>}</div>
+        <span className="w-20 shrink-0 text-right text-xs text-muted-foreground" title={tokens ? `${tokens.provenance} usage` : "Unavailable"}>{formatTokenUsage(tokens)} · {calls} calls</span>
+        <span className="w-14 shrink-0 text-right text-xs text-muted-foreground">{active} active</span>
+        <span className="w-14 shrink-0 text-right text-xs text-muted-foreground">{formatCostUsage(cost)}</span>
       </button>
-      {selected && <div className="border-b border-border/70 bg-muted/30 px-1 pb-2 text-[10px] text-muted-foreground">{success === undefined && failure === undefined ? "Success / failure unavailable" : `${success ?? UNKNOWN} successful · ${failure ?? UNKNOWN} failed`} · {latency === undefined ? "latency unavailable" : `${formatDuration(latency)} average latency`}</div>}
+      {selected && <div className="border-b border-border/70 bg-muted/30 px-1 pb-2 text-xs text-muted-foreground">{success === undefined && failure === undefined ? "Success / failure unavailable" : `${success ?? UNKNOWN} successful · ${failure ?? UNKNOWN} failed`} · {latency === undefined ? "latency unavailable" : `${formatDuration(latency)} average latency`}</div>}
     </li>
   );
 }
 
 function AggregateDetail({ selection, providers, models }: { selection: AggregateSelection; providers: ReturnType<typeof aggregateProviderStats>; models: ModelStats[] }) {
-  if (!selection) return <p className="mt-1 text-[10px] text-muted-foreground">Select a provider or model for its complete identity and metrics.</p>;
+  if (!selection) return <p className="mt-1 text-xs text-muted-foreground">Select a provider or model for its complete identity and metrics.</p>;
   const item = selection.kind === "provider" ? providers.find((provider) => provider.provider === selection.key) : models.find((model) => `${model.provider}\u0000${model.model}` === selection.key);
   if (!item) return null;
   const name = "model" in item ? `${item.provider} · ${item.model}` : item.provider;
-  return <div className="mt-2 rounded-md border border-border bg-muted/20 p-2 text-[11px]" aria-label="Selected aggregate detail"><p className="break-words font-medium">{name}</p><div className="mt-1.5 grid grid-cols-2 gap-1.5 text-muted-foreground"><span>workers <strong className="text-foreground">{item.workerCount}</strong></span><span>active <strong className="text-foreground">{item.activeWorkers}</strong></span><span>calls <strong className="text-foreground">{item.invocationCount}</strong></span><span>retries <strong className="text-foreground">{item.retryCount}</strong></span><span>tokens <strong className="text-foreground">{formatTokenUsage(item.tokenUsage.total)}</strong></span><span>cost <strong className="text-foreground">{formatCostUsage(item.costMicros)}</strong></span><span>latency <strong className="text-foreground">{formatDuration(item.latencyMs)}</strong></span></div></div>;
+  return <div className="mt-2 rounded-md border border-border bg-muted/20 p-2 text-xs" aria-label="Selected aggregate detail"><p className="break-words font-medium">{name}</p><div className="mt-1.5 grid grid-cols-2 gap-1.5 text-muted-foreground"><span>workers <strong className="text-foreground">{item.workerCount}</strong></span><span>active <strong className="text-foreground">{item.activeWorkers}</strong></span><span>calls <strong className="text-foreground">{item.invocationCount}</strong></span><span>retries <strong className="text-foreground">{item.retryCount}</strong></span><span>tokens <strong className="text-foreground">{formatTokenUsage(item.tokenUsage.total)}</strong></span><span>cost <strong className="text-foreground">{formatCostUsage(item.costMicros)}</strong></span><span>latency <strong className="text-foreground">{formatDuration(item.latencyMs)}</strong></span></div></div>;
 }
 
 function OverviewSurface({ execution, accounting, observability }: { execution: JobExecution; accounting: JobAccounting | null; observability: RuntimeObservability }) {
@@ -306,11 +313,11 @@ function OverviewSurface({ execution, accounting, observability }: { execution: 
   return (
     <div className="flex flex-col gap-3">
       <div className="grid grid-cols-2 gap-1.5"><Metric label="Tokens" value={formatTokenUsage(observability.job.tokenUsage.total)} icon={Gauge} /><Metric label="Cost" value={formatCostUsage(observability.job.costMicros)} icon={Coins} /><Metric label="Elapsed" value={formatDuration(observability.job.elapsedMs)} icon={Clock3} /><Metric label="Active workers" value={`${observability.job.activeWorkerCount}`} icon={Users} /></div>
-      <p className="text-[12px] leading-5 text-muted-foreground"><span className="font-medium text-foreground">{execution.jobId}</span> · {execution.projectId} · {humanizeStatus(execution.state)}</p>
+      <p className="text-xs leading-5 text-muted-foreground"><span className="font-medium text-foreground">{execution.jobId}</span> · {execution.projectId} · {humanizeStatus(execution.state)}</p>
       <CurrentRuntimeSummary observability={observability} />
       <BudgetSection accounting={accounting} observability={observability} />
       <section><SectionTitle detail={execution.progress ? `${execution.progress.settled}/${execution.progress.total}` : `${execution.summary.total}`}>{t("observability.calls")}</SectionTitle><CallSummary execution={execution} /></section>
-      <section><SectionTitle>Current call</SectionTitle><p className="rounded-md border border-border bg-muted/30 px-2.5 py-2 text-[12px] font-medium">{currentCall ? `Call ${currentCall.callId} · ${currentCall.effectKind} · ${humanizeStatus(currentCall.status)}` : "No Call has been admitted for this Job yet."}</p></section>
+      <section><SectionTitle>Current call</SectionTitle><p className="rounded-md border border-border bg-muted/30 px-2.5 py-2 text-xs font-medium">{currentCall ? `Call ${currentCall.callId} · ${currentCall.effectKind} · ${humanizeStatus(currentCall.status)}` : "No Call has been admitted for this Job yet."}</p></section>
       {latestActivity && <section><SectionTitle detail="latest">Runtime activity</SectionTitle><ul className="rounded-md border border-border px-2"><ActivityRow item={latestActivity} /></ul></section>}
     </div>
   );
@@ -323,10 +330,10 @@ function RuntimeSurface({ observability }: { observability: RuntimeObservability
   const activities = boundActivities(observability.activities);
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-between"><SectionTitle detail={`${observability.workers.length} participants`}>Runtime participants</SectionTitle><span className="text-[10px] text-muted-foreground">Lead included</span></div>
+      <div className="flex items-center justify-between"><SectionTitle detail={`${observability.workers.length} participants`}>Runtime participants</SectionTitle><span className="text-xs text-muted-foreground">Lead included</span></div>
       <ul className="flex flex-col gap-1.5">{observability.workers.map((worker) => <WorkerRow key={worker.workerId} worker={worker} selected={selectedId === worker.workerId} onSelect={() => setSelectedWorkerId(worker.workerId)} />)}</ul>
       {selectedWorker && <WorkerDetail worker={selectedWorker} />}
-      <section><SectionTitle detail={`${activities.length} bounded events`}>Live activity</SectionTitle><ul className="rounded-md border border-border px-2">{activities.length > 0 ? activities.slice().reverse().map((item) => <ActivityRow key={item.id} item={item} />) : <li className="py-3 text-[11px] text-muted-foreground">No normalized runtime activity yet.</li>}</ul></section>
+      <section><SectionTitle detail={`${activities.length} bounded events`}>Live activity</SectionTitle><ul className="rounded-md border border-border px-2">{activities.length > 0 ? activities.slice().reverse().map((item) => <ActivityRow key={item.id} item={item} />) : <li className="py-3 text-xs text-muted-foreground">No normalized runtime activity yet.</li>}</ul></section>
     </div>
   );
 }

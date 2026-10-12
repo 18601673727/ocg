@@ -51,7 +51,7 @@ function LogLevelPill({ level }: { level: LogEntry["level"] }) {
 function LogLevelText({ level }: { level: LogEntry["level"] }) {
   const visual = LOG_LEVEL[level];
   return (
-    <span className={cn("inline-flex items-center gap-1 text-[10px] font-semibold uppercase", TEXT_TONE[visual.tone])}>
+    <span className={cn("inline-flex items-center gap-1 text-xs font-semibold uppercase", TEXT_TONE[visual.tone])}>
       <StatusDot tone={visual.tone} pulse={visual.pulse} />
       {level}
     </span>
@@ -61,7 +61,7 @@ function LogLevelText({ level }: { level: LogEntry["level"] }) {
 function FieldList({ fields }: { fields: NonNullable<LogEntry["fields"]> }) {
   const { t } = useI18n();
   const entries = Object.entries(fields);
-  if (entries.length === 0) return <p className="text-[11px] text-muted-foreground">{t("logs.noFields")}</p>;
+  if (entries.length === 0) return <p className="text-xs text-muted-foreground">{t("logs.noFields")}</p>;
   return (
     <KeyValueList>
       {entries.map(([key, value]) => (
@@ -86,30 +86,30 @@ function LogDetail({ entry, onClose }: { entry: LogEntry | undefined; onClose?: 
     <div className="flex min-h-0 flex-1 flex-col">
       <header className="flex shrink-0 items-start gap-2 border-b border-border px-3 py-3">
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2"><LogLevelPill level={entry.level} /><span className="text-[10px] text-muted-foreground">{entry.source}</span>{entry.redacted && <Pill tone="amber" className="text-[9px] normal-case"><ShieldCheck className="size-3" />{t("logs.redacted")}</Pill>}</div>
+          <div className="flex flex-wrap items-center gap-2"><LogLevelPill level={entry.level} /><span className="text-xs text-muted-foreground">{entry.source}</span>{entry.redacted && <Pill tone="amber" className="text-[9px] normal-case"><ShieldCheck className="size-3" />{t("logs.redacted")}</Pill>}</div>
           <h2 className="mt-1.5 break-words text-[13px] font-semibold leading-5">{entry.message}</h2>
         </div>
         {onClose && <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label={t("logs.closeDetails")} title={t("logs.closeDetails")}><X className="size-3.5" /></Button>}
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
-        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 text-[11px]">
-          <dt className="text-muted-foreground">{t("logs.timestamp")}</dt><dd className="break-all font-mono text-[10px]">{formatIsoTimestamp(entry.timestamp)}</dd>
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 text-xs">
+          <dt className="text-muted-foreground">{t("logs.timestamp")}</dt><dd className="break-all font-mono text-xs">{formatIsoTimestamp(entry.timestamp)}</dd>
           <dt className="text-muted-foreground">{t("logs.source")}</dt><dd>{entry.source}{entry.category ? ` · ${entry.category}` : ""}</dd>
-          <dt className="text-muted-foreground">{t("logs.entryId")}</dt><dd className="break-all font-mono text-[10px]">{entry.id}</dd>
+          <dt className="text-muted-foreground">{t("logs.entryId")}</dt><dd className="break-all font-mono text-xs">{entry.id}</dd>
           {entry.jobId && <><dt className="text-muted-foreground">{t("logs.job")}</dt><dd className="break-all">{entry.jobId}</dd></>}
           {entry.taskId && <><dt className="text-muted-foreground">{t("logs.task")}</dt><dd className="break-all">{entry.taskId}</dd></>}
           {entry.workerId && <><dt className="text-muted-foreground">{t("logs.worker")}</dt><dd className="break-all">{entry.workerId}{entry.workerRole ? ` · ${entry.workerRole}` : ""}</dd></>}
           {entry.provider && <><dt className="text-muted-foreground">{t("logs.provider")}</dt><dd className="break-words">{entry.provider}</dd></>}
           {entry.model && <><dt className="text-muted-foreground">{t("logs.model")}</dt><dd className="break-words">{entry.model}</dd></>}
-          {entry.correlationId && <><dt className="text-muted-foreground">{t("logs.correlation")}</dt><dd className="break-all font-mono text-[10px]">{entry.correlationId}</dd></>}
-          {entry.sessionId && <><dt className="text-muted-foreground">{t("logs.session")}</dt><dd className="break-all font-mono text-[10px]">{entry.sessionId}</dd></>}
-          {entry.invocationId && <><dt className="text-muted-foreground">{t("logs.invocation")}</dt><dd className="break-all font-mono text-[10px]">{entry.invocationId}</dd></>}
+          {entry.correlationId && <><dt className="text-muted-foreground">{t("logs.correlation")}</dt><dd className="break-all font-mono text-xs">{entry.correlationId}</dd></>}
+          {entry.sessionId && <><dt className="text-muted-foreground">{t("logs.session")}</dt><dd className="break-all font-mono text-xs">{entry.sessionId}</dd></>}
+          {entry.invocationId && <><dt className="text-muted-foreground">{t("logs.invocation")}</dt><dd className="break-all font-mono text-xs">{entry.invocationId}</dd></>}
         </dl>
         <section className="mt-5" aria-label={t("logs.fieldsLabel")}>
-          <div className="mb-1.5 flex items-center justify-between gap-2"><h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{t("logs.structuredFields")}</h3>{entry.redacted && <span className="text-[10px] text-muted-foreground">{t("logs.sensitiveRemoved")}</span>}</div>
+          <div className="mb-1.5 flex items-center justify-between gap-2"><h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("logs.structuredFields")}</h3>{entry.redacted && <span className="text-xs text-muted-foreground">{t("logs.sensitiveRemoved")}</span>}</div>
           <FieldList fields={entry.fields ?? {}} />
         </section>
-        <details className="mt-4 rounded-md border border-border px-2.5 py-2 text-[10px]">
+        <details className="mt-4 rounded-md border border-border px-2.5 py-2 text-xs">
           <summary className="cursor-pointer select-none font-medium">{t("logs.technicalView")}</summary>
           <pre className="mt-2 max-w-full overflow-x-auto whitespace-pre-wrap break-words text-muted-foreground">{JSON.stringify({ ...entry, fields: entry.fields ?? {} }, null, 2)}</pre>
         </details>
@@ -192,16 +192,16 @@ export function LogsSurface({ snapshot, projectId }: { snapshot: RuntimeSnapshot
     <div className="flex min-h-0 flex-1 flex-col bg-background">
       <header className="shrink-0 border-b border-border px-3 py-3 sm:px-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{t("logs.diagnostics")}</span>{projectId && <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{selectProject(projectId).name}</span>}{live && <span className="text-[10px] text-muted-foreground">{t("logs.liveStream")}</span>}</div><h1 className="mt-1 text-[16px] font-semibold tracking-tight">{t("logs.title")}</h1><p className="mt-0.5 text-[11px] text-muted-foreground">{t("logs.subtitle")}</p></div>
+          <div className="min-w-0"><div className="flex items-center gap-2"><span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("logs.diagnostics")}</span>{projectId && <span className="rounded border border-border bg-muted/50 px-1.5 py-0.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{selectProject(projectId).name}</span>}{live && <span className="text-xs text-muted-foreground">{t("logs.liveStream")}</span>}</div><h1 className="mt-1 text-base font-semibold tracking-tight">{t("logs.title")}</h1><p className="mt-0.5 text-xs text-muted-foreground">{t("logs.subtitle")}</p></div>
           <div className="flex shrink-0 items-center gap-2">
-            <span className="text-[10px] tabular-nums text-muted-foreground">{t("logs.count", { filtered: filteredEntries.length, total: entries.length, limit: LOG_HISTORY_LIMIT })}</span>
+            <span className="text-xs tabular-nums text-muted-foreground">{t("logs.count", { filtered: filteredEntries.length, total: entries.length, limit: LOG_HISTORY_LIMIT })}</span>
             <Button variant={following ? "secondary" : "outline"} size="xs" onClick={() => following ? setFollowing(false) : scrollToLatest()} aria-pressed={following} title={following ? t("logs.pauseFollow") : t("logs.resumeFollow")}>
               {following ? <Pause className="size-3" /> : <Play className="size-3" />}{following ? t("logs.follow") : t("logs.paused")}
             </Button>
           </div>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-10">
-          <label className="col-span-2 flex min-w-0 items-center gap-2 rounded-md border border-border bg-background px-2 sm:col-span-3 lg:col-span-2 xl:col-span-2"><Search className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" /><Input value={filters.text ?? ""} onChange={(event) => updateFilter("text", event.target.value)} placeholder={t("logs.search")} aria-label={t("logs.searchLabel")} className="h-8 border-0 px-0 text-[11px] focus-visible:border-0" /></label>
+          <label className="col-span-2 flex min-w-0 items-center gap-2 rounded-md border border-border bg-background px-2 sm:col-span-3 lg:col-span-2 xl:col-span-2"><Search className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" /><Input value={filters.text ?? ""} onChange={(event) => updateFilter("text", event.target.value)} placeholder={t("logs.search")} aria-label={t("logs.searchLabel")} className="h-8 border-0 px-0 text-xs focus-visible:border-0" /></label>
           <FilterSelect label={t("logs.level")} value={filters.level ?? "all"} onChange={(value) => updateFilter("level", value as LogFilters["level"])}><FilterOption value="all" label={t("logs.allLevels")} />{LOG_LEVELS.map((level) => <FilterOption key={level} value={level} label={level} />)}</FilterSelect>
           <FilterSelect label={t("logs.source")} value={filters.source ?? "all"} onChange={(value) => updateFilter("source", value)}><FilterOption value="all" label={t("logs.allSources")} />{sources.map((source) => <FilterOption key={source} value={source} label={source} />)}</FilterSelect>
           <FilterSelect label={t("logs.job")} value={filters.jobId ?? "all"} onChange={(value) => updateFilter("jobId", value)}><FilterOption value="all" label={t("logs.allJobs")} />{jobs.map((job) => <FilterOption key={job} value={job} label={job} />)}</FilterSelect>
@@ -216,7 +216,7 @@ export function LogsSurface({ snapshot, projectId }: { snapshot: RuntimeSnapshot
         <section className="relative min-h-0 overflow-hidden border-b border-border lg:border-r lg:border-b-0" aria-label={t("logs.streamLabel")}>
           <div className="grid grid-cols-[68px_52px_minmax(0,1fr)] gap-2 border-b border-border bg-muted/20 px-3 py-2 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground md:grid-cols-[86px_58px_110px_minmax(0,1fr)_minmax(120px,0.6fr)]"><span>{t("logs.time")}</span><span>{t("logs.level")}</span><span className="hidden md:block">{t("logs.source")}</span><span>{t("logs.message")}</span><span className="hidden md:block">{t("logs.context")}</span></div>
           <div ref={streamRef} onScroll={(event) => { const node = event.currentTarget; const bottom = node.scrollHeight - node.scrollTop - node.clientHeight < 24; setAtBottom(bottom); if (bottom) setLastSeenCount(entries.length); }} className="h-full overflow-y-auto" role="log" aria-live="polite" aria-label={t("logs.entriesLabel")}>
-            {filteredEntries.length === 0 ? <EmptyState className="m-6 text-center">{t("logs.noMatch")}</EmptyState> : <ul>{filteredEntries.map((entry) => <li key={entry.id} className="border-b border-border/60 last:border-b-0"><button type="button" onClick={() => setSelectedId(entry.id)} className={cn("grid w-full grid-cols-[68px_52px_minmax(0,1fr)] gap-2 px-3 py-2.5 text-left transition-colors hover:bg-muted/40 md:grid-cols-[86px_58px_110px_minmax(0,1fr)_minmax(120px,0.6fr)]", selected?.id === entry.id && "bg-muted/60") } aria-current={selected?.id === entry.id ? "true" : undefined}><time dateTime={entry.timestamp} className="pt-0.5 font-mono text-[10px] tabular-nums text-muted-foreground">{formatLocalClock(entry.timestamp)}</time><span className="pt-0.5"><LogLevelText level={entry.level} /></span><span className="hidden min-w-0 truncate pt-0.5 text-[10px] text-muted-foreground md:block">{entry.source}</span><span className="min-w-0"><span className="block truncate text-[11px] leading-4">{entry.message}</span><span className="mt-0.5 block truncate text-[10px] text-muted-foreground md:hidden">{entry.source}{entry.category ? ` · ${entry.category}` : ""}</span></span><span className="hidden min-w-0 truncate pt-0.5 text-[10px] text-muted-foreground md:block">{entry.workerId ?? entry.jobId ?? entry.provider ?? "—"}</span></button></li>)}</ul>}
+            {filteredEntries.length === 0 ? <EmptyState className="m-6 text-center">{t("logs.noMatch")}</EmptyState> : <ul>{filteredEntries.map((entry) => <li key={entry.id} className="border-b border-border/60 last:border-b-0"><button type="button" onClick={() => setSelectedId(entry.id)} className={cn("grid w-full grid-cols-[68px_52px_minmax(0,1fr)] gap-2 px-3 py-2.5 text-left transition-colors hover:bg-muted/40 md:grid-cols-[86px_58px_110px_minmax(0,1fr)_minmax(120px,0.6fr)]", selected?.id === entry.id && "bg-muted/60") } aria-current={selected?.id === entry.id ? "true" : undefined}><time dateTime={entry.timestamp} className="pt-0.5 font-mono text-xs tabular-nums text-muted-foreground">{formatLocalClock(entry.timestamp)}</time><span className="pt-0.5"><LogLevelText level={entry.level} /></span><span className="hidden min-w-0 truncate pt-0.5 text-xs text-muted-foreground md:block">{entry.source}</span><span className="min-w-0"><span className="block truncate text-xs leading-4">{entry.message}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground md:hidden">{entry.source}{entry.category ? ` · ${entry.category}` : ""}</span></span><span className="hidden min-w-0 truncate pt-0.5 text-xs text-muted-foreground md:block">{entry.workerId ?? entry.jobId ?? entry.provider ?? "—"}</span></button></li>)}</ul>}
           </div>
           {unseen > 0 && <Button variant="secondary" size="xs" onClick={scrollToLatest} className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-sm">{t("logs.newLogs")} <span className="tabular-nums">{unseen}</span></Button>}
         </section>

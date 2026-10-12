@@ -77,25 +77,25 @@ export function LoginView() {
       >
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <span className="flex size-7 items-center justify-center rounded-md border border-border bg-muted text-[10px] font-bold tracking-[0.16em]" aria-label="OCG">
+            <span className="flex size-7 items-center justify-center rounded-md border border-border bg-muted text-xs font-bold tracking-[0.16em]" aria-label="OCG">
               OCG
             </span>
             <div>
-              <p className="text-[10px] font-medium tracking-[0.16em] text-muted-foreground uppercase">{t("login.remoteAccess")}</p>
+              <p className="text-xs font-medium tracking-[0.16em] text-muted-foreground uppercase">{t("login.remoteAccess")}</p>
               <h1 className="text-[15px] font-semibold tracking-tight">{copyTitle}</h1>
             </div>
           </div>
-          <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">{t("login.remote")}</span>
+          <span className="rounded border border-border px-1.5 py-0.5 text-xs text-muted-foreground">{t("login.remote")}</span>
         </div>
 
-        <p className="mt-2 text-[12px] leading-5 text-muted-foreground">
+        <p className="mt-2 text-xs leading-5 text-muted-foreground">
           {access.detail ?? copyDetail}
         </p>
 
         <div
           role="status"
           className={cn(
-            "mt-4 flex items-center gap-2 rounded-md border px-2.5 py-2 text-[11px]",
+            "mt-4 flex items-center gap-2 rounded-md border px-2.5 py-2 text-xs",
             failed ? TONE_CLASS.red : "bg-background text-muted-foreground",
           )}
         >
@@ -130,7 +130,7 @@ export function LoginView() {
           </Button>
         </div>
 
-        <p className="mt-4 text-[11px] leading-4 text-muted-foreground">
+        <p className="mt-4 text-xs leading-4 text-muted-foreground">
           {t("login.mockNote")}
         </p>
       </section>

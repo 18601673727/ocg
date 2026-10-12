@@ -15,7 +15,7 @@ export function LanguageSwitcher({
 
   if (variant === "select") {
     return (
-      <label className={cn("inline-flex items-center gap-2 text-[11px]", className)}>
+      <label className={cn("inline-flex items-center gap-2 text-xs", className)}>
         <span className="sr-only">Language</span>
         <select
           value={locale}
@@ -23,7 +23,7 @@ export function LanguageSwitcher({
             const next = event.target.value as Locale;
             setLocale(next);
           }}
-          className="rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground"
+          className="rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
         >
           {LOCALES.map((option) => (
             <option key={option} value={option}>

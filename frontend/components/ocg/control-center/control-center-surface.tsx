@@ -41,13 +41,13 @@ function LedgerStrip({ ledger }: { ledger: ResourceLedger | null }) {
   const summary = useMemo(() => (ledger ? summarize(ledger.entries) : null), [ledger]);
   if (!summary) {
     return (
-      <p className="text-[10px] text-muted-foreground">
+      <p className="text-xs text-muted-foreground">
         Cost data is not reported in this summary. Detailed attribution stays in the Resource Ledger.
       </p>
     );
   }
   return (
-    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
+    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
       <span className="inline-flex items-center gap-1">
         <Coins className="size-3 shrink-0" aria-hidden="true" />
         <strong className="font-semibold tabular-nums text-foreground">{formatCostMicros(summary.costMicros)}</strong>
@@ -116,19 +116,19 @@ export function ControlCenterSurface({
           <Pill tone="sky" title="Profile reported by the runtime">
             {summary.activeProfileLabel ?? t("common.notReported")}
           </Pill>
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-xs text-muted-foreground">
             {summary.profileCount} profiles reported · {summary.providerCount === null ? t("common.notReported") : `${summary.providerCount} providers`} · {summary.modelCount} models reported
           </span>
-          <span className="ml-auto flex shrink-0 items-center gap-1 text-[10px] text-muted-foreground">
+          <span className="ml-auto flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
             <Activity className="size-3" aria-hidden="true" />
             {summary.availableModelCount} available · {summary.pendingModelCount} pending · {summary.unavailableModelCount} unavailable · {summary.unknownModelCount} unknown
           </span>
         </div>
-        {summary.stateIncomplete && <p className="mt-1 text-[10px] text-muted-foreground">{t("control.stateIncomplete")}</p>}
+        {summary.stateIncomplete && <p className="mt-1 text-xs text-muted-foreground">{t("control.stateIncomplete")}</p>}
         <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/10 px-2.5 py-2">
           <div className="min-w-0 flex-1">
-            <p className="text-[11px] font-semibold">{t("control.needsAttention")}</p>
-            <p className="text-[10px] text-muted-foreground">
+            <p className="text-xs font-semibold">{t("control.needsAttention")}</p>
+            <p className="text-xs text-muted-foreground">
               {attentionCount === 0 ? t("home.noAttentionRecorded") : t(attentionCount === 1 ? "home.attention.one" : "home.attention.other", { count: attentionCount })}
             </p>
           </div>

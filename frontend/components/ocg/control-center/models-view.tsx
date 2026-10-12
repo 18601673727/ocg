@@ -70,16 +70,16 @@ function ModelListRow({
       >
         <Cpu className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[12px] font-medium">{model.model}</span>
-          <span className="block truncate text-[10px] text-muted-foreground">{provider?.label ?? model.provider}</span>
+          <span className="block truncate text-xs font-medium">{model.model}</span>
+          <span className="block truncate text-xs text-muted-foreground">{provider?.label ?? model.provider}</span>
         </span>
-        <span className="hidden shrink-0 text-[10px] text-muted-foreground sm:inline">
+        <span className="hidden shrink-0 text-xs text-muted-foreground sm:inline">
           {model.variants === undefined ? t("control.variantsNotReported") : `${model.variants.length} variant(s)`}
         </span>
-        <span className="hidden shrink-0 text-[10px] tabular-nums text-muted-foreground md:inline">
+        <span className="hidden shrink-0 text-xs tabular-nums text-muted-foreground md:inline">
           {assignments.length ? `${assignments.length} role(s)` : "unassigned"}
         </span>
-        <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{supported}✓ / {unknown}?</span>
+        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{supported}✓ / {unknown}?</span>
         <Pill tone={MODEL_STATUS_TONE[model.status]}>{humanizeStatus(model.status)}</Pill>
       </button>
     </li>
@@ -97,42 +97,42 @@ function ModelDetail({ bootstrap, model }: { bootstrap: BootstrapState; model: B
     <div className="flex min-w-0 flex-col gap-3">
       <div className="min-w-0 rounded-md border border-border bg-muted/10 p-3">
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-           <h2 title={model.model} className="min-w-0 truncate text-[14px] font-semibold tracking-tight">{model.model}</h2>
+           <h2 title={model.model} className="min-w-0 truncate text-sm font-semibold tracking-tight">{model.model}</h2>
           <Pill tone={MODEL_STATUS_TONE[model.status]}>{humanizeStatus(model.status)}</Pill>
         </div>
         <dl className="mt-2 grid gap-1.5 sm:grid-cols-2">
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Provider</dt>
-            <dd className="truncate text-[11px] font-medium">
+            <dt className="text-xs text-muted-foreground">Provider</dt>
+            <dd className="truncate text-xs font-medium">
               {provider?.label ?? model.provider}
               {provider ? ` · ${humanizeStatus(provider.state)}` : " · state not reported"}
             </dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Model id</dt>
-             <dd title={model.id} className="truncate text-[11px] font-medium">{model.id}</dd>
+            <dt className="text-xs text-muted-foreground">Model id</dt>
+             <dd title={model.id} className="truncate text-xs font-medium">{model.id}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Provider-distinct key</dt>
-            <dd className="truncate text-[11px] font-medium" title={controlModelKey(provider?.label ?? model.provider, model.model)}>
+            <dt className="text-xs text-muted-foreground">Provider-distinct key</dt>
+            <dd className="truncate text-xs font-medium" title={controlModelKey(provider?.label ?? model.provider, model.model)}>
               {controlModelKey(provider?.label ?? model.provider, model.model)}
             </dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Provenance</dt>
-            <dd className="truncate text-[11px] font-medium">{model.provenanceNote ?? "Not reported"}</dd>
+            <dt className="text-xs text-muted-foreground">Provenance</dt>
+            <dd className="truncate text-xs font-medium">{model.provenanceNote ?? "Not reported"}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Context window</dt>
-            <dd className="truncate text-[11px] font-medium">{model.contextWindow ? `${model.contextWindow.toLocaleString()} tokens` : "Not reported"}</dd>
+            <dt className="text-xs text-muted-foreground">Context window</dt>
+            <dd className="truncate text-xs font-medium">{model.contextWindow ? `${model.contextWindow.toLocaleString()} tokens` : "Not reported"}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Economics</dt>
-            <dd className="truncate text-[11px] font-medium">{model.economics?.detail ?? "Not reported"}</dd>
+            <dt className="text-xs text-muted-foreground">Economics</dt>
+            <dd className="truncate text-xs font-medium">{model.economics?.detail ?? "Not reported"}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Latency observation</dt>
-            <dd className="truncate text-[11px] font-medium">{model.latencyObservation?.detail ?? model.latencyObservation?.status ?? "Not reported"}</dd>
+            <dt className="text-xs text-muted-foreground">Latency observation</dt>
+            <dd className="truncate text-xs font-medium">{model.latencyObservation?.detail ?? model.latencyObservation?.status ?? "Not reported"}</dd>
           </div>
         </dl>
       </div>
@@ -165,8 +165,8 @@ function ModelDetail({ bootstrap, model }: { bootstrap: BootstrapState; model: B
                   {entry.support === "supported" && <CheckCircle2 className={cn("size-3.5 shrink-0", TEXT_TONE.emerald)} aria-hidden="true" />}
                   {entry.support === "unsupported" && <Ban className={cn("size-3.5 shrink-0", TEXT_TONE.red)} aria-hidden="true" />}
                   {entry.support === "unknown" && <CircleHelp className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />}
-                  <span className="min-w-0 flex-1 truncate text-[12px]">{label}</span>
-                  <span className="shrink-0 text-[10px] text-muted-foreground">{entry.id}</span>
+                  <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
+                  <span className="shrink-0 text-xs text-muted-foreground">{entry.id}</span>
                   <Pill tone={CAPABILITY_TONE[entry.support]}>{CAPABILITY_LABEL[entry.support]}</Pill>
                 </li>
               );
@@ -252,7 +252,7 @@ export function ModelsView({
             onChange={(event) => onQueryChange(event.target.value)}
             placeholder={t("control.searchModels")}
             aria-label={t("control.searchModels")}
-            className="h-5 w-full min-w-0 bg-transparent text-[11px] outline-none placeholder:text-muted-foreground"
+            className="h-5 w-full min-w-0 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
           />
         </label>
         <div className="flex min-w-0 items-center gap-1.5">
@@ -299,7 +299,7 @@ export function ModelsView({
           {capabilities.map((capability) => <option key={capability.id} value={capability.id}>{capability.label}</option>)}
         </SelectFilter>
         </div>
-        <span className="ml-auto shrink-0 text-[10px] tabular-nums text-muted-foreground">
+        <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
           {filtered.length} / {bootstrap.models.length} models
         </span>
       </div>
@@ -334,7 +334,7 @@ export function ModelsView({
         </section>
       </div>
 
-      <p className="flex items-start gap-1.5 text-[10px] text-muted-foreground">
+      <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
         <ShieldAlert className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
         <span className="min-w-0 break-words">
           {t("control.modelProbeGap")}

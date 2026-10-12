@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { RefreshCw } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
 import { PageSurface, Pill } from "../primitives";
 import { runtimeStateLabel, useI18n, type I18nKey } from "../i18n";
@@ -34,14 +36,14 @@ function HealthRow({ entry }: { entry: HealthEntry }) {
     <li className="min-w-0 border-t border-border/70 py-3 first:border-t-0 first:pt-0">
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="break-words text-[13px] font-medium">{entry.model}</p>
-          <p className="mt-0.5 break-words text-[11px] text-muted-foreground">
+          <p className={cn(TYPOGRAPHY_SCALE.body_sm, "break-words font-medium")}>{entry.model}</p>
+          <p className="mt-0.5 break-words text-xs text-muted-foreground">
             {entry.effort ?? t("health.noEffort")}
           </p>
         </div>
         <Pill tone={STATUS_TONE[entry.status]} dot>{t(STATUS_KEY[entry.status])}</Pill>
       </div>
-      <dl className="mt-2 space-y-1 text-[11px] text-muted-foreground">
+      <dl className="mt-2 space-y-1 text-xs text-muted-foreground">
         <div className="flex min-w-0 flex-wrap gap-x-2">
           <dt>{t("health.checked")}</dt>
           <dd><time dateTime={checkedAt(entry.updatedAt)}>{checkedAt(entry.updatedAt)}</time></dd>
@@ -53,13 +55,13 @@ function HealthRow({ entry }: { entry: HealthEntry }) {
         <div className="min-w-0">
           <dt className="inline">{t("health.probeJob")}</dt>
           {" "}
-          <dd className="inline break-all font-mono text-[10px]">{entry.jobId}</dd>
+          <dd className="inline break-all font-mono text-xs">{entry.jobId}</dd>
         </div>
         {entry.failure && (
           <div className="min-w-0">
             <dt>{t("health.failure")}</dt>
             <dd className="mt-0.5 break-words">
-              <span className="font-mono text-[10px]">{entry.failure.code}</span>
+              <span className="font-mono text-xs">{entry.failure.code}</span>
               {entry.failure.message ? <span className="mt-0.5 block whitespace-pre-wrap">{entry.failure.message}</span> : null}
             </dd>
           </div>
@@ -107,7 +109,7 @@ export function HealthSurface({ baseUrl, projectId }: { baseUrl: string | null; 
         <header className="flex min-w-0 flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-lg font-semibold tracking-tight">{t("health.title")}</h1>
-            <p className="mt-1 max-w-2xl text-[12px] leading-5 text-muted-foreground">{t("health.subtitle")}</p>
+            <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">{t("health.subtitle")}</p>
           </div>
           <Button variant="outline" size="sm" disabled={!baseUrl || !projectId || loading} onClick={refresh}>
             <RefreshCw className="size-3.5" />{t("common.refresh")}
@@ -126,7 +128,7 @@ export function HealthSurface({ baseUrl, projectId }: { baseUrl: string | null; 
         ) : null}
 
         {summary && summary.total > 0 && (
-          <p className="text-[12px] text-muted-foreground">
+          <p className="text-xs text-muted-foreground">
             {t("health.summary", {
               total: summary.total,
               available: summary.available,
@@ -143,7 +145,7 @@ export function HealthSurface({ baseUrl, projectId }: { baseUrl: string | null; 
 
         {matrix && matrix.groups.map((group) => (
           <section key={group.provider} aria-label={group.provider} className="min-w-0 rounded-lg border border-border bg-card p-4">
-            <h2 className="break-words text-[13px] font-semibold">{group.provider}</h2>
+            <h2 className={cn(TYPOGRAPHY_SCALE.body_sm, "break-words font-semibold")}>{group.provider}</h2>
             <ul className="mt-3">
               {group.entries.map((entry) => (
                 <HealthRow key={`${entry.provider}:${entry.model}:${entry.effort ?? ""}:${entry.jobId}`} entry={entry} />
@@ -152,7 +154,7 @@ export function HealthSurface({ baseUrl, projectId }: { baseUrl: string | null; 
           </section>
         ))}
 
-        <p className="text-[11px] leading-5 text-muted-foreground">{t("health.note")}</p>
+        <p className="text-xs leading-5 text-muted-foreground">{t("health.note")}</p>
       </div>
     </PageSurface>
   );

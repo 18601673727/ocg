@@ -2,6 +2,7 @@
 
 import type { ComponentType } from "react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 
 export type TabItem<Id extends string> = {
   id: Id;
@@ -60,7 +61,7 @@ export function SegmentedTabs<Id extends string>({
             onClick={() => onSelect(tab.id)}
             className={cn(
               "flex min-w-0 items-center justify-center gap-1.5 truncate rounded-md px-2 font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
-              size === "sm" ? "py-1 text-[10px]" : "py-1.5 text-[11px]",
+              size === "sm" ? cn("py-1", TYPOGRAPHY_SCALE.caption) : cn("py-1.5", TYPOGRAPHY_SCALE.caption),
               selected ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
             )}
           >
@@ -69,7 +70,7 @@ export function SegmentedTabs<Id extends string>({
             {tab.count !== undefined && (
               <span
                 className={cn(
-                  "shrink-0 rounded px-1 text-[10px] tabular-nums",
+                  "shrink-0 rounded px-1", TYPOGRAPHY_SCALE.caption, "tabular-nums",
                   selected ? "bg-muted text-foreground" : "bg-muted/60 text-muted-foreground",
                 )}
               >

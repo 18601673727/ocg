@@ -60,10 +60,10 @@ function ProviderListCard({
         )}
       >
         <Server className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-        <span className="min-w-0 flex-1 truncate text-[12px] font-medium">{provider.label}</span>
+        <span className="min-w-0 flex-1 truncate text-xs font-medium">{provider.label}</span>
         {provider.authRequired && <Lock className={cn("size-3 shrink-0", TEXT_TONE.sky)} aria-label="Authentication required" />}
         <Pill tone={PROVIDER_STATE_TONE[provider.state]}>{humanizeStatus(provider.state)}</Pill>
-        <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">{modelCount} model(s)</span>
+        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{modelCount} model(s)</span>
       </button>
     </li>
   );
@@ -76,38 +76,38 @@ function ProviderDetail({ bootstrap, provider }: { bootstrap: BootstrapState; pr
     <div className="flex min-w-0 flex-col gap-3">
       <div className="min-w-0 rounded-md border border-border bg-muted/10 p-3">
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-          <h2 className="min-w-0 truncate text-[14px] font-semibold tracking-tight">{provider.label}</h2>
+          <h2 className="min-w-0 truncate text-sm font-semibold tracking-tight">{provider.label}</h2>
           <Pill tone={PROVIDER_STATE_TONE[provider.state]}>{humanizeStatus(provider.state)}</Pill>
           <Pill tone={provider.authRequired ? "sky" : "slate"}>{provider.authRequired ? "auth required" : "no auth step"}</Pill>
         </div>
-        {provider.detail && <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">{provider.detail}</p>}
+        {provider.detail && <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{provider.detail}</p>}
         <dl className="mt-2 grid gap-1.5 sm:grid-cols-2">
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Provider id</dt>
-            <dd className="truncate text-[11px] font-medium">{provider.id}</dd>
+            <dt className="text-xs text-muted-foreground">Provider id</dt>
+            <dd className="truncate text-xs font-medium">{provider.id}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Endpoint identity</dt>
-            <dd className="truncate text-[11px] font-medium">{provider.endpointLabel ?? "Not reported"} · {provider.endpointType ?? "type unknown"}</dd>
+            <dt className="text-xs text-muted-foreground">Endpoint identity</dt>
+            <dd className="truncate text-xs font-medium">{provider.endpointLabel ?? "Not reported"} · {provider.endpointType ?? "type unknown"}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Plan / subscription</dt>
-            <dd className="truncate text-[11px] font-medium">{provider.plan ?? "Not reported"}</dd>
+            <dt className="text-xs text-muted-foreground">Plan / subscription</dt>
+            <dd className="truncate text-xs font-medium">{provider.plan ?? "Not reported"}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Capacity</dt>
-            <dd className="truncate text-[11px] font-medium">{provider.capacity?.detail ?? "Not reported"}</dd>
+            <dt className="text-xs text-muted-foreground">Capacity</dt>
+            <dd className="truncate text-xs font-medium">{provider.capacity?.detail ?? "Not reported"}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Economics</dt>
-            <dd className="truncate text-[11px] font-medium">{provider.economics?.detail ?? "Not reported"}</dd>
+            <dt className="text-xs text-muted-foreground">Economics</dt>
+            <dd className="truncate text-xs font-medium">{provider.economics?.detail ?? "Not reported"}</dd>
           </div>
           <div className="min-w-0 rounded border border-border bg-background px-2 py-1.5">
-            <dt className="text-[10px] text-muted-foreground">Last checked</dt>
-            <dd className="truncate text-[11px] font-medium">{provider.lastCheckedAt ?? "Not reported"}</dd>
+            <dt className="text-xs text-muted-foreground">Last checked</dt>
+            <dd className="truncate text-xs font-medium">{provider.lastCheckedAt ?? "Not reported"}</dd>
           </div>
         </dl>
-        <p className="mt-2 flex items-start gap-1.5 text-[10px] text-muted-foreground">
+        <p className="mt-2 flex items-start gap-1.5 text-xs text-muted-foreground">
           <Lock className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
           <span className="min-w-0 break-words">
             Only reachability and authentication state are modeled. Credential contents are never stored or displayed here.
@@ -124,7 +124,7 @@ function ProviderDetail({ bootstrap, provider }: { bootstrap: BootstrapState; pr
             {models.map((model) => (
               <li key={model.id} className="flex min-w-0 items-center gap-2 rounded-md border border-border px-2.5 py-2">
                 <Cpu className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-                <span className="min-w-0 flex-1 truncate text-[12px]">{model.model}</span>
+                <span className="min-w-0 flex-1 truncate text-xs">{model.model}</span>
                 <Pill tone={MODEL_STATUS_TONE[model.status]}>{humanizeStatus(model.status)}</Pill>
               </li>
             ))}
@@ -139,7 +139,7 @@ function ProviderDetail({ bootstrap, provider }: { bootstrap: BootstrapState; pr
         ) : (
           <ul className="flex flex-col gap-1">
             {assignments.map((assignment) => (
-              <li key={`${assignment.profileId}-${assignment.roleId}`} className="flex min-w-0 flex-wrap items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-[11px]">
+              <li key={`${assignment.profileId}-${assignment.roleId}`} className="flex min-w-0 flex-wrap items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs">
                 <span className="min-w-0 flex-1 truncate">{assignment.profileLabel} · {assignment.roleLabel}</span>
                 {assignment.overridden && <Pill tone="violet">overridden</Pill>}
               </li>
@@ -148,7 +148,7 @@ function ProviderDetail({ bootstrap, provider }: { bootstrap: BootstrapState; pr
         )}
       </section>
       {provider.warnings?.map((warning) => (
-        <p key={warning} className={cn("flex items-start gap-1.5 text-[10px]", TEXT_TONE.amber)}>
+        <p key={warning} className={cn("flex items-start gap-1.5 text-xs", TEXT_TONE.amber)}>
           <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden="true" />{warning}
         </p>
       ))}
@@ -209,7 +209,7 @@ export function ProvidersView({
             onChange={(event) => onQueryChange(event.target.value)}
             placeholder={t("control.filterProviders")}
             aria-label={t("control.filterProviders")}
-            className="h-5 w-36 min-w-0 bg-transparent text-[11px] outline-none placeholder:text-muted-foreground"
+            className="h-5 w-36 min-w-0 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
           />
         </label>
         <SelectFilter
@@ -256,7 +256,7 @@ export function ProvidersView({
         </section>
       </div>
 
-      <p className="flex items-start gap-1.5 text-[10px] text-muted-foreground">
+      <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
         <ShieldQuestion className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
         <span className="min-w-0 break-words">
           Unknown means the runtime did not report a state. It is not offline or unavailable. This surface never runs discovery or network calls.

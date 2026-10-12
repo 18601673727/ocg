@@ -81,7 +81,7 @@ function EmptyProjectWorkspace({
     <main aria-label="Project workspace" className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-6">
       <section className="w-full max-w-lg space-y-4 rounded-lg border border-border bg-background p-6">
         <div>
-          <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">{t("project.emptyTitle")}</p>
+          <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">{t("project.emptyTitle")}</p>
           <h1 className="mt-1 text-lg font-semibold">{activeProjectName}</h1>
           <p className="mt-2 text-sm text-muted-foreground">
             {t("project.emptyBody")}
@@ -112,7 +112,7 @@ function EmptyProjectWorkspace({
                   )}
                 >
                   <span className="block">{project.name}</span>
-                  <span className="block break-all text-[11px] font-normal text-muted-foreground">{project.root ?? project.id}</span>
+                  <span className="block break-all text-xs font-normal text-muted-foreground">{project.root ?? project.id}</span>
                 </button>
               ))}
             </div>
@@ -126,14 +126,14 @@ function EmptyProjectWorkspace({
 function NoExecutionNotice() {
   const { t } = useI18n();
   return (
-    <div className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">{t("execution.noExecution")}</div>
+    <div className="flex flex-1 items-center justify-center p-6 text-xs text-muted-foreground">{t("execution.noExecution")}</div>
   );
 }
 
 function NoEndpointNotice() {
   const { t } = useI18n();
   return (
-    <p className="max-w-md text-center text-[12px] text-muted-foreground">
+    <p className="max-w-md text-center text-xs text-muted-foreground">
       {t("canonical.noEndpoint")}
     </p>
   );
@@ -143,8 +143,8 @@ function NoProjectNotice({ onAddProject }: { onAddProject: () => void }) {
   const { t } = useI18n();
   return (
     <div className="flex flex-col items-center gap-3 text-center">
-      <p className="text-[14px] font-medium">{t("project.noSelectionTitle")}</p>
-      <p className="max-w-sm text-[12px] text-muted-foreground">
+      <p className="text-sm font-medium">{t("project.noSelectionTitle")}</p>
+      <p className="max-w-sm text-xs text-muted-foreground">
         {t("project.noSelectionBody")}
       </p>
       <button
@@ -882,7 +882,7 @@ export function RuntimeWorkspace({
                 onOpenInspector={selectedJobSessionId ? () => openJobInspector(selectedJobSessionId) : undefined}
               />
             ) : historyStatus === "loading" ? (
-              <p role="status" className="flex flex-1 items-center justify-center p-6 text-[12px] text-muted-foreground">{t("common.loading")}</p>
+              <p role="status" className="flex flex-1 items-center justify-center p-6 text-xs text-muted-foreground">{t("common.loading")}</p>
             ) : (
               <NoExecutionNotice />
             )}

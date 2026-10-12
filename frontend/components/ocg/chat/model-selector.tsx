@@ -3,6 +3,7 @@
 import { useEffect, useId, useState } from "react";
 import { ChevronDown, LockKeyhole, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { STATUS_TEXT } from "../primitives/tone";
 import type { ChatModelSelection, Model, ProfileView } from "../contracts";
 import { useI18n } from "../i18n";
 import type { ActiveExecutionTarget, ActivityStep, ExecutionPhase } from "./execution-status";
@@ -117,12 +118,12 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
         >
           <SlidersHorizontal className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-[12px] font-medium" title={active ? t("chat.activeExecution") : undefined}>{title}</span>
-            <span className="block truncate text-[10px] text-muted-foreground">
+            <span className="block truncate text-xs font-medium" title={active ? t("chat.activeExecution") : undefined}>{title}</span>
+            <span className="block truncate text-xs text-muted-foreground">
               {subtitle ?? status}
             </span>
           </span>
-          {(busy || active) && <LockKeyhole className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden="true" />}
+          {(busy || active) && <LockKeyhole className={`size-3.5 shrink-0 ${STATUS_TEXT['warning']}`} aria-hidden="true" />}
           <ChevronDown className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", expanded && "rotate-180")} aria-hidden="true" />
         </button>
         {baseUrl && <button
@@ -139,7 +140,7 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
       {expanded && <div id={id + "-panel"} className="mt-2 max-h-[min(25dvh,12rem)] space-y-2 overflow-y-auto overscroll-contain border-t border-border pt-2 [@media(max-height:600px)]:max-h-[18dvh]">
         <fieldset disabled={disabled} aria-describedby={id + "-status"} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-12">
           <legend className="sr-only">{t("chat.executionSettings")}</legend>
-          <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground sm:col-span-3">
+          <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:col-span-3">
             {t("chat.provider")}
             <select aria-label={t("chat.provider")} value={providerKey} onChange={event => {
               const key = choices.find(key => profile?.models[key]?.provider === event.target.value);
@@ -149,14 +150,14 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
               {providers.map(key => <option key={key} value={key}>{profile?.providers[key]?.label || key}</option>)}
             </select>
           </label>
-          <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground sm:col-span-6">
+          <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:col-span-6">
             {t("chat.model")}
             <select aria-label={t("chat.model")} value={modelKey} onChange={event => selectModel(event.target.value)} className={selectClass}>
               {!options.length && <option value="">{loading ? t("chat.modelsLoading") : t("chat.noModels")}</option>}
               {options.map(key => <option key={key} value={key}>{profile?.models[key]?.label || profile?.models[key]?.id || key}</option>)}
             </select>
           </label>
-          <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground sm:col-span-3">
+          <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:col-span-3">
             {t("chat.effort")}
             <select aria-label={t("chat.effort")} value={effort} disabled={!availableEfforts.length} onChange={event => {
               if (disabled) return;
@@ -169,10 +170,10 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
             </select>
           </label>
         </fieldset>
-        {model?.label && model.label !== model.id && <p className="truncate font-mono text-[10px] text-muted-foreground" title={model.id}>{model.id}</p>}
-        {model && !availableEfforts.length && <p className="text-[10px] text-muted-foreground">{t("chat.effortUnsupportedHint")}</p>}
+        {model?.label && model.label !== model.id && <p className="truncate font-mono text-xs text-muted-foreground" title={model.id}>{model.id}</p>}
+        {model && !availableEfforts.length && <p className="text-xs text-muted-foreground">{t("chat.effortUnsupportedHint")}</p>}
       </div>}
-      {error && <p role="alert" className="mt-2 break-words text-[11px] text-destructive">{error}</p>}
+      {error && <p role="alert" className="mt-2 break-words text-xs text-destructive">{error}</p>}
     </div>
   );
 }

@@ -19,7 +19,7 @@ export function SelectFilter({ className, children, ...props }: SelectHTMLAttrib
         // `cn` concatenates classes rather than resolving conflicts, so a caller
         // that needs a different width should pass a whole class list, not an
         // override; the width below is the default the filters use.
-        "h-7 min-w-0 max-w-[10rem] truncate rounded border border-border bg-background px-1.5 text-[11px] outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
+        "h-7 min-w-0 max-w-[10rem] truncate rounded border border-border bg-background px-1.5 text-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30",
         className,
       )}
     >

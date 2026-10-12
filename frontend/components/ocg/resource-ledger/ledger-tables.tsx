@@ -16,6 +16,7 @@ import {
   UNKNOWN,
 } from "@/lib/format";
 import { EmptyState, Pill, SectionTitle, TONE_CLASS } from "@/components/ocg/primitives";
+import { STATUS_TEXT, STATUS_BG } from "@/components/ocg/primitives/tone";
 import { groupEntries, usageTotal, type LedgerGroup, type LedgerSummary } from "./selectors";
 import {
   ATTRIBUTION_TONE,
@@ -36,70 +37,70 @@ function rolePill(role: LedgerRole) {
 
 function CompactMetrics({ summary }: { summary: LedgerSummary }) {
   return (
-    <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px] sm:grid-cols-3">
+    <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs sm:grid-cols-3">
       <div>
-        <dt className="text-[10px] text-muted-foreground">Calls</dt>
+        <dt className="text-xs text-muted-foreground">Calls</dt>
         <dd className="font-medium tabular-nums">
           {summary.entryCount}
           {summary.retryCount > 0 ? ` · ${summary.retryCount} retries` : ""}
         </dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Success / failure</dt>
+        <dt className="text-xs text-muted-foreground">Success / failure</dt>
         <dd className="font-medium tabular-nums">
           {summary.successCount} / {summary.failureCount}
         </dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Workers (lead calls)</dt>
+        <dt className="text-xs text-muted-foreground">Workers (lead calls)</dt>
         <dd className="font-medium tabular-nums">
           {summary.workerCount} ({summary.leadEntryCount})
         </dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Total tokens</dt>
+        <dt className="text-xs text-muted-foreground">Total tokens</dt>
         <dd className="font-medium tabular-nums">{formatTokens(summary.totalTokens)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Fresh input</dt>
+        <dt className="text-xs text-muted-foreground">Fresh input</dt>
         <dd className="font-medium tabular-nums">{formatTokens(summary.traffic.freshInput)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Cache read</dt>
+        <dt className="text-xs text-muted-foreground">Cache read</dt>
         <dd className="font-medium tabular-nums">{formatTokens(summary.traffic.cacheRead)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Cache write</dt>
+        <dt className="text-xs text-muted-foreground">Cache write</dt>
         <dd className="font-medium tabular-nums">{formatTokens(summary.traffic.cacheWrite)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Output</dt>
+        <dt className="text-xs text-muted-foreground">Output</dt>
         <dd className="font-medium tabular-nums">{formatTokens(summary.traffic.output)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Reasoning</dt>
+        <dt className="text-xs text-muted-foreground">Reasoning</dt>
         <dd className="font-medium tabular-nums">{formatTokens(summary.traffic.reasoning)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Cost</dt>
+        <dt className="text-xs text-muted-foreground">Cost</dt>
         <dd className="font-medium tabular-nums">{formatCostMicros(summary.costMicros)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Cache share</dt>
+        <dt className="text-xs text-muted-foreground">Cache share</dt>
         <dd className="font-medium tabular-nums">{formatPercent(summary.cacheShare)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Cache leverage</dt>
+        <dt className="text-xs text-muted-foreground">Cache leverage</dt>
         <dd className="font-medium tabular-nums">{formatRatio(summary.cacheLeverage)}</dd>
       </div>
       <div>
-        <dt className="text-[10px] text-muted-foreground">Avg latency</dt>
+        <dt className="text-xs text-muted-foreground">Avg latency</dt>
         <dd className="font-medium tabular-nums">
           {summary.averageLatencyMs === null ? UNKNOWN : `${Math.round(summary.averageLatencyMs)}ms`}
         </dd>
       </div>
       <div className="col-span-2 sm:col-span-3">
-        <dt className="mb-0.5 text-[10px] text-muted-foreground">Reconciliation</dt>
+        <dt className="mb-0.5 text-xs text-muted-foreground">Reconciliation</dt>
         <dd>
           <ReconciliationIndicator counts={summary.byReconciliation} />
         </dd>
@@ -126,16 +127,16 @@ export function AggregateGroupList({
           <details className="min-w-0 rounded-md border border-border open:bg-muted/20">
             <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 px-2.5 py-2 marker:hidden">
               <div className="min-w-0 flex-1">
-                <p className="truncate text-[12px] font-medium" title={group.label}>
+                <p className="truncate text-xs font-medium" title={group.label}>
                   {group.label}
                 </p>
                 {group.detail && (
-                  <p className="truncate text-[10px] text-muted-foreground" title={group.detail}>
+                  <p className="truncate text-xs text-muted-foreground" title={group.detail}>
                     {group.detail}
                   </p>
                 )}
               </div>
-              <span className="shrink-0 text-right text-[10px] tabular-nums text-muted-foreground">
+              <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground">
                 {formatTokens(group.summary.totalTokens)} tok
                 <br />
                 {formatCostMicros(group.summary.costMicros)}
@@ -170,10 +171,10 @@ export function LedgerCallRow({
         className="flex w-full min-w-0 flex-col gap-1 rounded-md border border-border px-2.5 py-2 text-left transition-colors hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring"
       >
         <div className="flex min-w-0 items-center gap-1.5">
-          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+          <span className="shrink-0 font-mono text-xs text-muted-foreground">
             {formatTimestamp(entry.timestamp)}
           </span>
-          <span className="min-w-0 truncate text-[12px] font-medium" title={entry.workerLabel}>
+          <span className="min-w-0 truncate text-xs font-medium" title={entry.workerLabel}>
             {entry.workerLabel}
           </span>
           {entry.role === "lead" && (
@@ -188,15 +189,15 @@ export function LedgerCallRow({
             {entry.status}
           </Pill>
           {entry.attempt > 1 && (
-            <span className="shrink-0 text-[10px] text-amber-600 dark:text-amber-400" title={`Attempt ${entry.attempt}`}>
+            <span className={cn("shrink-0 text-xs", STATUS_TEXT.warning)} title={`Attempt ${entry.attempt}`}>
               ×{entry.attempt}
             </span>
           )}
-          <span className="ml-auto shrink-0 text-[11px] font-semibold tabular-nums" title="Observed tokens">
+          <span className="ml-auto shrink-0 text-xs font-semibold tabular-nums" title="Observed tokens">
             {formatTokens(total)} tok
           </span>
         </div>
-        <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[10px] text-muted-foreground">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
           <span className="min-w-0 max-w-full truncate" title={entry.jobLabel}>
             {entry.jobLabel}
           </span>
@@ -233,7 +234,7 @@ export function AttributionSummary({ summary }: { summary: LedgerSummary }) {
           <span
             key={confidence}
             className={cn(
-              "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px]",
+              "inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs",
               TONE_CLASS[ATTRIBUTION_TONE[confidence]],
               summary.byAttribution[confidence] === 0 && "opacity-50",
             )}
@@ -244,7 +245,7 @@ export function AttributionSummary({ summary }: { summary: LedgerSummary }) {
           </span>
         ))}
       </div>
-      <p className="text-[10px] text-muted-foreground">
+      <p className="text-xs text-muted-foreground">
         {summary.leadEntryCount} of {summary.entryCount} calls were made by the Lead. Unknown attribution is
         surfaced rather than dropped.
       </p>
@@ -272,10 +273,10 @@ export function AttributionBreakdown({
         <details key={job.key} className="min-w-0 rounded-md border border-border open:bg-muted/20">
           <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 px-2.5 py-2 marker:hidden">
             <div className="min-w-0 flex-1">
-              <p className="truncate text-[12px] font-medium" title={job.label}>
+              <p className="truncate text-xs font-medium" title={job.label}>
                 {job.label}
               </p>
-              <p className="truncate text-[10px] text-muted-foreground">
+              <p className="truncate text-xs text-muted-foreground">
                 {job.summary.entryCount} calls · {job.summary.workerCount} workers ·{" "}
                 {formatTokens(job.summary.totalTokens)} tokens
               </p>
@@ -304,11 +305,11 @@ export function AttributionBreakdown({
 
       {unknownEntries.length > 0 && (
         <section
-          className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-2"
+          className={cn("rounded-md border px-2.5 py-2", STATUS_BG.warning)}
           aria-label="Unknown attribution"
         >
           <SectionTitle detail={`${unknownEntries.length} calls`}>Unknown attribution</SectionTitle>
-          <p className="mb-1.5 text-[10px] text-muted-foreground">
+          <p className="mb-1.5 text-xs text-muted-foreground">
             These calls could not be assigned to a Job or task and are surfaced instead of being hidden.
           </p>
           <ul className="flex flex-col gap-1">
@@ -318,7 +319,7 @@ export function AttributionBreakdown({
                   type="button"
                   onClick={() => onSelectEntry(entry)}
                   aria-haspopup="dialog"
-                  className="flex w-full min-w-0 items-center gap-2 rounded border border-border bg-background px-2 py-1 text-left text-[10px] hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring"
+                  className="flex w-full min-w-0 items-center gap-2 rounded border border-border bg-background px-2 py-1 text-left text-xs hover:bg-muted/50 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring"
                 >
                   <span className="shrink-0 font-mono text-muted-foreground">
                     {formatTimestamp(entry.timestamp)}
@@ -350,12 +351,12 @@ function TaskBreakdown({
   return (
     <div className="flex min-w-0 flex-col gap-2">
       {job.summary.byAttribution.unknown > 0 && (
-        <p className="text-[10px] text-amber-600 dark:text-amber-400">
+        <p className={cn("text-xs", STATUS_TEXT.warning)}>
           {job.summary.byAttribution.unknown} call(s) under this Job have unknown attribution.
         </p>
       )}
       {job.summary.byReconciliation.mismatch > 0 && (
-        <p className="text-[10px] text-red-600 dark:text-red-400">
+        <p className={cn("text-xs", STATUS_TEXT.error)}>
           {job.summary.byReconciliation.mismatch} reconciliation mismatch(es) need review.
         </p>
       )}
@@ -364,16 +365,16 @@ function TaskBreakdown({
           <li key={task.key} className="min-w-0">
             <details className="min-w-0 rounded border border-border/70">
               <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 px-2 py-1.5 marker:hidden">
-                <span className="min-w-0 truncate text-[11px] font-medium" title={task.label}>
+                <span className="min-w-0 truncate text-xs font-medium" title={task.label}>
                   {task.label}
                 </span>
-                <span className="ml-auto shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                <span className="ml-auto shrink-0 text-xs tabular-nums text-muted-foreground">
                   {task.summary.entryCount} calls · {formatTokens(task.summary.totalTokens)} tok
                 </span>
               </summary>
               <ul className="border-t border-border/70 px-2 py-1.5">
                 {groupEntries(task.entries, "worker").map((worker) => (
-                  <li key={worker.key} className="min-w-0 py-1 text-[10px]">
+                  <li key={worker.key} className="min-w-0 py-1 text-xs">
                     <details>
                       <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 marker:hidden">
                         <span className="min-w-0 truncate" title={worker.label}>
@@ -399,7 +400,7 @@ function TaskBreakdown({
       <button
         type="button"
         onClick={() => onSelectEntry(job.entries[0])}
-        className="self-start rounded border border-border px-2 py-0.5 text-[10px] hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring"
+        className="self-start rounded border border-border px-2 py-0.5 text-xs hover:bg-muted focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring"
         title="Inspect the first call in this Job"
       >
         Inspect first call

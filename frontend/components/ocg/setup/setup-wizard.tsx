@@ -6,6 +6,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, ArrowRight, Check, Loader2, FolderOpen, ChevronRight, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
 import { createHttpCanonicalControlClient } from "../runtime/canonical-client";
@@ -336,7 +337,7 @@ export function SetupWizard() {
 
   if (!controlUrl || step === "checking") {
     return (
-      <main className="flex min-h-dvh flex-col items-center justify-center gap-3 bg-background p-6 text-center text-[13px] text-foreground">
+      <main className={cn("flex min-h-dvh flex-col items-center justify-center gap-3 bg-background p-6 text-center", TYPOGRAPHY_SCALE.body_sm, "text-foreground")}>
         {!controlUrl ? (
           <p role="alert" className="text-destructive">{t("setup.noEndpoint")}</p>
         ) : checkError ? (
@@ -355,7 +356,7 @@ export function SetupWizard() {
     return (
       <main className="flex min-h-dvh items-center justify-center bg-background px-4 py-8 text-foreground">
         <section className="w-full max-w-md space-y-4 rounded-lg border border-border p-6">
-          <h1 className="text-[18px] font-semibold tracking-tight">{t("setup.welcomeTitle")}</h1>
+          <h1 className={cn(TYPOGRAPHY_SCALE.heading_sm, "font-semibold tracking-tight")}>{t("setup.welcomeTitle")}</h1>
           <p className="text-[13px] leading-6 text-muted-foreground">{t("setup.welcomeBody")}</p>
           <Button onClick={() => setStep("connect")}>
             {t("setup.stepConnect")}
@@ -370,7 +371,7 @@ export function SetupWizard() {
     <main className="flex min-h-dvh justify-center bg-background px-4 py-8 text-foreground sm:py-12">
       <div className="flex w-full min-w-0 max-w-xl flex-col">
         <header>
-          <h1 className="text-[18px] font-semibold tracking-tight">{t(step !== "verified" ? "setup.stepConnect" : connectResult ? "setup.verifiedTitle" : "setup.readyTitle")}</h1>
+          <h1 className={cn(TYPOGRAPHY_SCALE.heading_sm, "font-semibold tracking-tight")}>{t(step !== "verified" ? "setup.stepConnect" : connectResult ? "setup.verifiedTitle" : "setup.readyTitle")}</h1>
           <ol className="mt-4 grid grid-cols-3 gap-1" aria-label={t("setup.steps")}>
             {PROGRESS.map((item, index) => {
               const isCurrent = index === progressIndex;
@@ -388,7 +389,7 @@ export function SetupWizard() {
                     )} aria-hidden="true">
                       {isDone ? <Check className="size-2.5" /> : index + 1}
                     </span>
-                    <span className="truncate text-[10px] text-muted-foreground">{t(item.label)}</span>
+                    <span className="truncate text-xs text-muted-foreground">{t(item.label)}</span>
                   </div>
                 </li>
               );
@@ -398,12 +399,12 @@ export function SetupWizard() {
 
         <div className="mt-5 flex flex-col gap-3">
           {repair && step === "connect" && (
-            <p className="rounded-md border border-border p-3 text-[12px] text-muted-foreground">{t("setup.repairNotice")}</p>
+            <p className="rounded-md border border-border p-3 text-xs text-muted-foreground">{t("setup.repairNotice")}</p>
           )}
           {error && (
             <div role="alert" className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden="true" />
-              <p className="min-w-0 break-words text-[12px] text-destructive">{error}</p>
+              <p className="min-w-0 break-words text-xs text-destructive">{error}</p>
             </div>
           )}
 
@@ -433,8 +434,8 @@ export function SetupWizard() {
           {step === "verified" && (
             <section className="min-w-0 rounded-lg border border-border bg-muted/10 p-4">
               {projects.length > 0 ? (
-                <dl className="text-[12px]">
-                  <dt className="text-[11px] text-muted-foreground">{t("setup.project")}</dt>
+                <dl className="text-xs">
+                  <dt className="text-xs text-muted-foreground">{t("setup.project")}</dt>
                   <dd className="mt-0.5 break-all font-medium">{projects[0].root}</dd>
                 </dl>
               ) : (
@@ -504,21 +505,21 @@ function VerifiedSummary({ verified, checkedNow }: { verified: Verified; checked
   const { t } = useI18n();
   return (
     <div className="flex min-w-0 flex-col gap-3">
-      <dl className="grid gap-2 text-[12px]">
+      <dl className="grid gap-2 text-xs">
         <div className="min-w-0">
-          <dt className="text-[11px] text-muted-foreground">{t("setup.summaryProvider")}</dt>
+          <dt className="text-xs text-muted-foreground">{t("setup.summaryProvider")}</dt>
           <dd className="mt-0.5 break-words font-medium">{verified.provider ?? t("common.notReported")}</dd>
         </div>
         <div className="min-w-0">
-          <dt className="text-[11px] text-muted-foreground">{t("setup.summaryModel")}</dt>
+          <dt className="text-xs text-muted-foreground">{t("setup.summaryModel")}</dt>
           <dd className="mt-0.5 break-all font-medium">{verified.model}</dd>
         </div>
         <div>
-          <dt className="text-[11px] text-muted-foreground">{t("setup.summaryRunnable")}</dt>
+          <dt className="text-xs text-muted-foreground">{t("setup.summaryRunnable")}</dt>
           <dd className="mt-0.5 font-medium tabular-nums">{verified.runnable}</dd>
         </div>
       </dl>
-      <p className="text-[11px] leading-5 text-muted-foreground">{t(checkedNow ? "setup.verifiedFacts" : "setup.readyFacts")}</p>
+      <p className="text-xs leading-5 text-muted-foreground">{t(checkedNow ? "setup.verifiedFacts" : "setup.readyFacts")}</p>
     </div>
   );
 }
@@ -537,14 +538,14 @@ function ConnectProviderPanel({
   const { t } = useI18n();
   return (
     <div className="flex flex-col gap-4">
-      <p className="text-[12px] text-muted-foreground">{t("setup.connectHint")}</p>
+      <p className="text-xs text-muted-foreground">{t("setup.connectHint")}</p>
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-[12px] font-medium">{t("setup.presets")}</span>
+        <span className="text-xs font-medium">{t("setup.presets")}</span>
         {PROVIDER_PRESETS.map((preset) => (
           <button
             key={preset.id}
             type="button"
-            className="rounded-md border border-border px-2.5 py-1 text-[12px] hover:bg-muted"
+            className="rounded-md border border-border px-2.5 py-1 text-xs hover:bg-muted"
             onClick={() => onChange({ name: preset.label, endpoint: preset.endpoint })}
             disabled={loading}
           >
@@ -553,7 +554,7 @@ function ConnectProviderPanel({
         ))}
       </div>
       <div className="flex flex-col gap-1.5">
-        <label htmlFor="setup-provider-name" className="text-[12px] font-medium">
+        <label htmlFor="setup-provider-name" className="text-xs font-medium">
           {t("setup.providerName")}
         </label>
         <input
@@ -567,7 +568,7 @@ function ConnectProviderPanel({
         />
       </div>
       <div className="flex flex-col gap-1.5">
-        <label htmlFor="setup-provider-endpoint" className="text-[12px] font-medium">
+        <label htmlFor="setup-provider-endpoint" className="text-xs font-medium">
           {t("setup.providerEndpoint")}
         </label>
         <input
@@ -581,7 +582,7 @@ function ConnectProviderPanel({
         />
       </div>
       <div className="flex flex-col gap-1.5">
-        <label htmlFor="setup-provider-apikey" className="text-[12px] font-medium">
+        <label htmlFor="setup-provider-apikey" className="text-xs font-medium">
           {t("setup.apiKey")}
         </label>
         <input
@@ -617,13 +618,13 @@ function ChooseModelsPanel({
 }) {
   const { t } = useI18n();
   if (models.length === 0) {
-    return <p className="text-[12px] text-muted-foreground">{t("setup.noModels")}</p>;
+    return <p className="text-xs text-muted-foreground">{t("setup.noModels")}</p>;
   }
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="min-w-0 flex-1 text-[12px] text-muted-foreground">{t("setup.modelsHint")}</p>
+        <p className="min-w-0 flex-1 text-xs text-muted-foreground">{t("setup.modelsHint")}</p>
         <Button size="xs" variant="outline" onClick={onRefresh} disabled={loading}>{t("setup.refreshModels")}</Button>
       </div>
       <ul className="max-h-[50dvh] divide-y divide-border overflow-y-auto rounded-md border border-border">
@@ -641,7 +642,7 @@ function ChooseModelsPanel({
                 aria-label={t("setup.selectNamedModel", { model: model.label })}
               />
               <div className="min-w-0 flex-1">
-                <p className="break-all text-[12px] font-medium">{model.label}</p>
+                <p className="break-all text-xs font-medium">{model.label}</p>
               </div>
               {selected && (
                 <Button
@@ -683,7 +684,7 @@ function AddProjectsPanel({
   const { t } = useI18n();
   return (
     <div className="flex flex-col gap-4">
-      <p className="text-[12px] text-muted-foreground">
+      <p className="text-xs text-muted-foreground">
         {t("setup.projectsHint")}
       </p>
 
@@ -711,12 +712,12 @@ function AddProjectsPanel({
       {/* Selected folders */}
       {selectedFolders.length > 0 && (
         <div className="flex flex-col gap-1">
-          <p className="text-[11px] font-medium text-muted-foreground">{t("setup.selected", { count: selectedFolders.length })}</p>
+          <p className="text-xs font-medium text-muted-foreground">{t("setup.selected", { count: selectedFolders.length })}</p>
           <ul className="divide-y divide-border rounded-md border border-border">
             {selectedFolders.map((folder) => (
               <li key={folder} className="flex items-center gap-2 px-3 py-2">
                 <FolderOpen className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-                <span className="min-w-0 flex-1 break-all text-[12px]">{folder}</span>
+                <span className="min-w-0 flex-1 break-all text-xs">{folder}</span>
                 <Button
                   size="xs"
                   variant="ghost"
@@ -735,7 +736,7 @@ function AddProjectsPanel({
       {browseResult && (
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2">
-            <p className="text-[11px] font-medium text-muted-foreground">{t("setup.browse")}</p>
+            <p className="text-xs font-medium text-muted-foreground">{t("setup.browse")}</p>
             {browseResult.parent && (
               <Button
                 size="xs"
@@ -747,7 +748,7 @@ function AddProjectsPanel({
               </Button>
             )}
           </div>
-          <p className="break-all text-[11px] text-muted-foreground">{browseResult.current}</p>
+          <p className="break-all text-xs text-muted-foreground">{browseResult.current}</p>
           <ul className="max-h-[200px] divide-y divide-border overflow-y-auto rounded-md border border-border">
             {browseResult.entries.map((entry) => {
               const isSelected = selectedFolders.includes(entry.path);
@@ -756,7 +757,7 @@ function AddProjectsPanel({
                   <FolderOpen className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
                   <button
                     type="button"
-                    className="min-w-0 flex-1 truncate text-left text-[12px] hover:underline"
+                    className="min-w-0 flex-1 truncate text-left text-xs hover:underline"
                     onClick={() => onBrowse(entry.path)}
                     disabled={loading}
                   >
@@ -786,7 +787,7 @@ function AddProjectsPanel({
               );
             })}
             {browseResult.entries.length === 0 && (
-              <li className="px-3 py-2 text-[11px] text-muted-foreground">
+              <li className="px-3 py-2 text-xs text-muted-foreground">
                 {t("setup.noDirectories")}
               </li>
             )}

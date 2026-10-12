@@ -53,7 +53,7 @@ export function JobInspector({
   return (
     <div className="flex h-full w-full min-w-0 flex-col">
       <header className="flex shrink-0 items-center gap-1 border-b border-border px-3 py-2">
-        <h2 className="min-w-0 flex-1 text-[12px] font-semibold">{t("execution.inspector")}</h2>
+        <h2 className="min-w-0 flex-1 text-xs font-semibold">{t("execution.inspector")}</h2>
         {onOpenJobExecution && (
           <Button variant="ghost" size="icon-xs" onClick={onOpenJobExecution} aria-label={t("execution.openJobExecution")} title={t("execution.openJobExecution")}>
             <ExternalLink className="size-3.5" />
@@ -81,7 +81,7 @@ export function JobInspector({
         <CanonicalJobOverview execution={execution} />
         {observability && (
           <section className="mt-4 border-t border-border pt-3" aria-label={t("execution.canonical.runtimeSupplement")}>
-            <h3 className="mb-1.5 text-[11px] font-semibold">{t("execution.canonical.runtimeSupplement")}</h3>
+            <h3 className="mb-1.5 text-xs font-semibold">{t("execution.canonical.runtimeSupplement")}</h3>
             <SegmentedTabs
               tabs={tabs}
               value={tab}

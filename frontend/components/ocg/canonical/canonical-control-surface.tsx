@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { Panel } from "@/components/ocg/primitives";
+import { STATUS_BG, STATUS_TEXT } from "@/components/ocg/primitives/tone";
 import {
   createHttpCanonicalControlClient,
   isCanonicalRejection,
@@ -60,7 +61,7 @@ function IssueList({ issues }: { issues: readonly DraftIssue[] }) {
   return (
     <ul className="mt-2 space-y-1">
       {issues.map((issue) => (
-        <li key={`${issue.field}:${issue.code}`} className="text-[10px] text-amber-700 dark:text-amber-300">
+        <li key={`${issue.field}:${issue.code}`} className={`text-xs ${STATUS_TEXT['warning']}`}>
           {issueText(t, issue)}
         </li>
       ))}
@@ -302,19 +303,19 @@ export function CanonicalControlSurface({
     <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-auto">
       <div className="space-y-3 p-3">
         {error ? (
-          <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+          <p className={`rounded-md border px-3 py-2 text-xs ${STATUS_BG['warning']} ${STATUS_TEXT['warning']}`}>
             {error}
           </p>
         ) : null}
-        {ack ? <p className="text-[10px] text-muted-foreground">{ack}</p> : null}
+        {ack ? <p className="text-xs text-muted-foreground">{ack}</p> : null}
 
         <div className="grid gap-3 xl:grid-cols-2">
           <Panel className="bg-background p-3" title={t("canonical.projectManager")} detail={t("canonical.backendIdentity")}>
             <div className="flex flex-wrap items-end gap-2">
-              <label className="flex-1 text-[10px] text-muted-foreground">
+              <label className="flex-1 text-xs text-muted-foreground">
                 {t("canonical.repositoryRoot")}
                 <Input
-                  className="mt-1 h-7 text-[11px]"
+                  className="mt-1 h-7 text-xs"
                   value={root}
                   placeholder="/path/to/repository"
                   onChange={(event) => setRoot(event.target.value)}
@@ -335,7 +336,7 @@ export function CanonicalControlSurface({
                       if (jobId.trim().length > 0) void refresh(project, jobId.trim());
                     }}
                     className={cn(
-                      "flex w-full items-center gap-2 rounded border px-2 py-1 text-left text-[10px]",
+                      "flex w-full items-center gap-2 rounded border px-2 py-1 text-left text-xs",
                       project.active ? "border-foreground/30 bg-muted" : "border-border hover:bg-muted/50",
                     )}
                   >
@@ -350,26 +351,26 @@ export function CanonicalControlSurface({
 
           <Panel className="bg-background p-3" title={t("canonical.globalConfigurator")} detail={t("canonical.persistedConfig")}>
             <div className="grid gap-2 sm:grid-cols-2">
-              <label className="text-[10px] text-muted-foreground">
+              <label className="text-xs text-muted-foreground">
                 {t("canonical.provider")}
                 <Input
-                  className="mt-1 h-7 text-[11px]"
+                  className="mt-1 h-7 text-xs"
                   value={draft.provider}
                   onChange={(event) => setDraft({ ...draft, provider: event.target.value })}
                 />
               </label>
-              <label className="text-[10px] text-muted-foreground">
+              <label className="text-xs text-muted-foreground">
                 {t("canonical.model")}
                 <Input
-                  className="mt-1 h-7 text-[11px]"
+                  className="mt-1 h-7 text-xs"
                   value={draft.model}
                   onChange={(event) => setDraft({ ...draft, model: event.target.value })}
                 />
               </label>
-              <label className="text-[10px] text-muted-foreground">
+              <label className="text-xs text-muted-foreground">
                 {t("canonical.profile")}
                 <select
-                  className="mt-1 h-7 w-full rounded-md border border-border bg-background px-2 text-[11px]"
+                  className="mt-1 h-7 w-full rounded-md border border-border bg-background px-2 text-xs"
                   value={draft.profile}
                   onChange={(event) =>
                     setDraft({ ...draft, profile: event.target.value as ConfigurationDraft["profile"] })
@@ -380,10 +381,10 @@ export function CanonicalControlSurface({
                   <option value="balanced">{t("canonical.option.balanced")}</option>
                 </select>
               </label>
-              <label className="text-[10px] text-muted-foreground">
+              <label className="text-xs text-muted-foreground">
                 {t("canonical.routing")}
                 <select
-                  className="mt-1 h-7 w-full rounded-md border border-border bg-background px-2 text-[11px]"
+                  className="mt-1 h-7 w-full rounded-md border border-border bg-background px-2 text-xs"
                   value={draft.routing}
                   onChange={(event) =>
                     setDraft({ ...draft, routing: event.target.value as ConfigurationDraft["routing"] })
@@ -394,10 +395,10 @@ export function CanonicalControlSurface({
                   <option value="review">{t("canonical.option.review")}</option>
                 </select>
               </label>
-              <label className="text-[10px] text-muted-foreground">
+              <label className="text-xs text-muted-foreground">
                 {t("canonical.hardBudget")}
                 <Input
-                  className="mt-1 h-7 text-[11px]"
+                  className="mt-1 h-7 text-xs"
                   type="number"
                   value={draft.hardBudget}
                   onChange={(event) => setDraft({ ...draft, hardBudget: Number(event.target.value) })}
@@ -421,10 +422,10 @@ export function CanonicalControlSurface({
             detail={preRun.jobId ? `job ${preRun.jobId}` : t("canonical.noJob")}
           >
             <div className="flex flex-wrap items-end gap-2">
-              <label className="flex-1 text-[10px] text-muted-foreground">
+              <label className="flex-1 text-xs text-muted-foreground">
                 {t("canonical.jobId")}
                 <Input
-                  className="mt-1 h-7 text-[11px]"
+                  className="mt-1 h-7 text-xs"
                   value={jobId}
                   placeholder="job-..."
                   onChange={(event) => setJobId(event.target.value)}
@@ -435,7 +436,7 @@ export function CanonicalControlSurface({
               </Button>
             </div>
             {preRun.reason ? (
-              <p className="mt-2 flex items-start gap-1 text-[10px] text-muted-foreground">
+              <p className="mt-2 flex items-start gap-1 text-xs text-muted-foreground">
                 <Lock className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
                 {preRun.reasonCode ? t(preRun.reasonCode === "not-loaded" ? "canonical.notLoaded" : preRun.reasonCode === "job-required" ? "canonical.issue.job-required" : "canonical.frozen") : null}
               </p>
@@ -449,7 +450,7 @@ export function CanonicalControlSurface({
                 <Save className="size-3.5" /> {t("canonical.savePreRun")}
               </Button>
             </div>
-            <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[10px]">
+            <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
               <dt className="text-muted-foreground">{t("execution.attempts")}</dt>
               <dd>{state.projection?.attempts.length ?? 0}</dd>
               <dt className="text-muted-foreground">{t("execution.calls")}</dt>
@@ -470,7 +471,7 @@ export function CanonicalControlSurface({
                 />
               </div>
             ) : (
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-xs text-muted-foreground">
                 {t("canonical.loadHint")}
               </p>
             )}

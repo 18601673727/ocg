@@ -18,8 +18,10 @@ import {
   Trash2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { STATUS_TEXT } from "../primitives/tone";
 import {
   Tooltip,
   TooltipContent,
@@ -163,7 +165,7 @@ export function OcgSidebar({
           onClick={() => onNavigate(item.target)}
           aria-current={active ? "page" : undefined}
           className={cn(
-            "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 transition-colors",
+            "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left", TYPOGRAPHY_SCALE.body_sm, "leading-5 transition-colors",
             active
               ? "bg-muted font-medium text-foreground"
               : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -174,7 +176,7 @@ export function OcgSidebar({
           {item.target === "attention" && attentionCount > 0 && (
             <span
               aria-label={t("sidebar.attentionBadge", { count: attentionCount })}
-              className="shrink-0 rounded-md bg-muted px-1.5 text-[10px] font-semibold tabular-nums text-muted-foreground"
+              className={cn("shrink-0 rounded-md bg-muted px-1.5", TYPOGRAPHY_SCALE.caption, "font-semibold tabular-nums text-muted-foreground")}
             >
               {attentionCount > 99 ? "99+" : attentionCount}
             </span>
@@ -293,7 +295,7 @@ export function OcgSidebar({
               {(runtimeAuthority === "canonical" ? workspaceNav : workspaceNav.slice(0, 4)).map(renderWorkspaceItem)}
             </ul>
             {runtimeAuthority === "mock" && <details open={workspaceNav.slice(4).some((item) => item.target === activeView) || undefined} className="mt-1">
-              <summary className="cursor-pointer rounded-md px-2 py-1.5 text-[12px] text-muted-foreground hover:bg-muted/60">{t("nav.tools")}</summary>
+              <summary className={cn("cursor-pointer rounded-md px-2 py-1.5", TYPOGRAPHY_SCALE.caption, "text-muted-foreground hover:bg-muted/60")}>{t("nav.tools")}</summary>
               <ul className="flex flex-col gap-px pl-2">
                 {workspaceNav.slice(4).map(renderWorkspaceItem)}
               </ul>
@@ -327,7 +329,7 @@ export function OcgSidebar({
                     onClick={() => onSelect(session.id)}
                     aria-current={active ? "true" : undefined}
                     className={cn(
-                      "group flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
+                      "group flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left", TYPOGRAPHY_SCALE.body_sm, "leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
                       active
                         ? "bg-muted font-medium text-foreground"
                         : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -366,7 +368,7 @@ export function OcgSidebar({
             <DialogTitle className="normal-case tracking-normal">{t("sidebar.deleteChatTitle")}</DialogTitle>
             <DialogDescription>{t("sidebar.deleteChatBody", { title: deleteTarget?.title || t("sidebar.newChat") })}</DialogDescription>
           </DialogHeader>
-          {targetBusy && <p role="status" className="text-xs text-amber-600 dark:text-amber-400">{t("sidebar.deleteRunning")}</p>}
+          {targetBusy && <p role="status" className={`text-xs ${STATUS_TEXT['warning']}`}>{t("sidebar.deleteRunning")}</p>}
           {deleteError && <p role="alert" className="break-words text-xs text-destructive">{t("sidebar.deleteFailed", { error: deleteError })}</p>}
           <DialogFooter>
             <Button ref={cancelDeleteRef} variant="outline" disabled={deleting} onClick={() => setDeleteTarget(null)}>{t("common.cancel")}</Button>

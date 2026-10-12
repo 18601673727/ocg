@@ -1,6 +1,7 @@
 "use client";
 
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 
 /**
  * Horizontal amount bar with the accessible name and value on the track.
@@ -31,7 +32,7 @@ export function ProgressBar({
   return (
     <div className={cn("min-w-0", className)}>
       {label && (
-        <div className="mb-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+        <div className={cn("mb-1 flex items-center justify-between gap-2", TYPOGRAPHY_SCALE.caption, "text-muted-foreground")}>
           <span className="truncate">{label}</span>
           <span className="shrink-0 tabular-nums">{Math.round(percent)}%</span>
         </div>

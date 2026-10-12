@@ -7,6 +7,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useOcgControlUrl } from "./control-url";
 import { createProfileClient, type Profile, type ProfileView } from "./profile-client";
+import { cn } from "@/lib/utils";
+import { STATUS_BG, STATUS_TEXT } from "../primitives/tone";
 
 const selectClass = "h-11 w-full min-w-0 rounded-md border border-border bg-background px-3 text-base outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 sm:text-sm";
 const actionClass = "min-h-11 rounded-md tracking-normal normal-case";
@@ -149,7 +151,7 @@ export function ProfilePanel({ onEstablished }: { onEstablished?: () => void }) 
         </Button>
       </div>
       {error && <p role="alert" className="break-words rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{error} {t("profile.errorHint")}</p>}
-      {notice && <p role="status" className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm"><Check className="mt-0.5 size-4 shrink-0 text-emerald-600" />{t(notice)}</p>}
+      {notice && <p role="status" className={cn("flex items-start gap-2 rounded-md border px-3 py-3 text-sm", STATUS_BG.success)}><Check className={cn("mt-0.5 size-4 shrink-0", STATUS_TEXT.success)} />{t(notice)}</p>}
       {!view ? !error && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />{t("profile.loading")}</p> : !draft ? (
         <div className="space-y-3">
           <p className="text-sm">{t("profile.empty")}</p>

@@ -12,6 +12,7 @@ import {
   Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import {
   Dialog,
   DialogContent,
@@ -85,8 +86,8 @@ function EmptyLedger() {
   const { t } = useI18n();
   return (
     <div className="flex h-full min-h-0 flex-col items-center justify-center gap-2 px-6 text-center">
-      <h2 className="text-[13px] font-semibold tracking-tight">{t("ledger.title")}</h2>
-      <p className="max-w-md text-[11px] text-muted-foreground">
+      <h2 className={cn(TYPOGRAPHY_SCALE.body_sm, "font-semibold tracking-tight")}>{t("ledger.title")}</h2>
+      <p className="max-w-md text-xs text-muted-foreground">
         This scenario has no normalized resource ledger. Open{" "}
         <code className="rounded border border-border bg-muted px-1">?scenario=resource-ledger</code> to inspect
         the deterministic fixture dataset.
@@ -114,7 +115,7 @@ function ProvenanceChips({
         <span
           key={key}
           className={cn(
-            "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] capitalize",
+            "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs capitalize",
             TONE_CLASS[tones[key] ?? "slate"],
             count === 0 && "opacity-50",
           )}
@@ -194,15 +195,15 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
     <div className="flex h-full min-h-0 w-full min-w-0 flex-col">
       <header className="shrink-0 border-b border-border px-3 py-2.5">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <h2 className="text-[13px] font-semibold tracking-tight">{t("ledger.title")}</h2>
+          <h2 className={cn(TYPOGRAPHY_SCALE.body_sm, "font-semibold tracking-tight")}>{t("ledger.title")}</h2>
           <Pill tone="slate" title={t("ledger.filters")}>
             {t("ledger.header.calls", { count: formatCount(summary.entryCount) })}
           </Pill>
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-xs text-muted-foreground">
             {t("ledger.header.jobsWorkers", { jobs: summary.jobCount, workers: summary.workerCount })}
           </span>
           <span
-            className="ml-auto shrink-0 text-[10px] text-muted-foreground"
+            className="ml-auto shrink-0 text-xs text-muted-foreground"
             title={ledger.generatedAt}
           >
             generated {formatTimestamp(ledger.generatedAt)}
@@ -311,7 +312,7 @@ export function ResourceLedgerSurface({ ledger }: { ledger: ResourceLedger | nul
 
         {tab === "ledger" && (
           <div className="flex min-w-0 flex-col gap-2">
-            <p className="text-[10px] text-muted-foreground">
+            <p className="text-xs text-muted-foreground">
               {filtered.length} call(s) in the filtered dataset. Select a row to open its full detail sheet; all
               tabs share this same filtered dataset.
             </p>

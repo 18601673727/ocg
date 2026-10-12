@@ -113,7 +113,7 @@ export function CostsMix({ cost }: { cost: Record<CostProvenance, number> }) {
         <span
           key={key}
           className={cn(
-            "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] capitalize",
+            "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs capitalize",
             TONE_CLASS[COST_TONE[key]],
             cost[key] === 0 && "opacity-50",
           )}
@@ -152,7 +152,7 @@ export function ReconciliationIndicator({
       {RECONCILIATION_ORDER.map((status) => (
         <span
           key={status}
-          className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] ${TONE_CLASS[RECONCILIATION_TONE[status]]}${counts[status] === 0 ? " opacity-50" : ""}`}
+          className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs ${TONE_CLASS[RECONCILIATION_TONE[status]]}${counts[status] === 0 ? " opacity-50" : ""}`}
           title={`${RECONCILIATION_LABEL[status]}: ${counts[status]} call(s). ${RECONCILIATION_DEFINITION[status]}`}
         >
           <span className="capitalize">{RECONCILIATION_LABEL[status]}</span>
@@ -166,7 +166,7 @@ export function ReconciliationIndicator({
 /** Collapsible explanation of every normalized term used by the inspector. */
 export function DefinitionsDetails() {
   return (
-    <details className="rounded-md border border-border bg-muted/20 px-2.5 py-2 text-[11px] open:bg-muted/30">
+    <details className="rounded-md border border-border bg-muted/20 px-2.5 py-2 text-xs open:bg-muted/30">
       <summary className="cursor-pointer list-none font-medium text-muted-foreground marker:hidden">
         Metric definitions
       </summary>

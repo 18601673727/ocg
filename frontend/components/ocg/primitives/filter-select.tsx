@@ -2,6 +2,7 @@
 
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE, BORDER_RADIUS } from "@/lib/design-tokens";
 
 /**
  * Labelled native select used by every filter row.
@@ -23,13 +24,13 @@ export function FilterSelect({
   className?: string;
 }) {
   return (
-    <label className={cn("flex min-w-0 flex-col gap-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground", className)}>
+    <label className={cn("flex min-w-0 flex-col gap-1", TYPOGRAPHY_SCALE.caption, "font-medium uppercase tracking-wider text-muted-foreground", className)}>
       {label}
       <select
         aria-label={label}
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="h-8 min-w-0 rounded-md border border-border bg-background px-2 text-[11px] font-normal tracking-normal text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
+        className={cn("h-8 min-w-0", BORDER_RADIUS.interactive, "border border-border bg-background px-2", TYPOGRAPHY_SCALE.caption, "font-normal tracking-normal text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30")}
       >
         {children}
       </select>

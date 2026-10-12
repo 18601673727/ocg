@@ -30,4 +30,4 @@ export {
   syncStatusLabel,
 } from "./status-tone";
 export { Pill } from "./pill";
-export { BORDER_TONE, DOT_TONE, FILL_TONE, SURFACE_TONE, TEXT_TONE, TONE_CLASS, type Tone } from "./tone";
+export { BORDER_TONE, DOT_TONE, FILL_TONE, SURFACE_TONE, TEXT_TONE, TONE_CLASS, type Tone, STATUS_BG, STATUS_TEXT, STATUS_DOT, STATUS_CLASS, type StatusTone } from "./tone";

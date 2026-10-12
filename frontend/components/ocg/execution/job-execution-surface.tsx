@@ -80,7 +80,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
       </nav>}
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
-          <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("execution.title")}</p>
+          <p className="text-xs uppercase tracking-wider text-muted-foreground">{t("execution.title")}</p>
           <ViewTransition name={`job-${execution.jobId}`} share="vt-shared" default="none">
             <h1 className="mt-1 break-all text-lg font-semibold">{execution.jobId}</h1>
           </ViewTransition>
@@ -101,12 +101,12 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
       <section aria-label={t("execution.currentActivity")} className="rounded-lg border border-border bg-card p-3">
         <SectionTitle>{t("execution.currentActivity")}</SectionTitle>
         {execution.currentCall ? (
-          <p className="mt-2 flex items-center gap-2 text-[12px]">
+          <p className="mt-2 flex items-center gap-2 text-xs">
             <Pill tone="amber" dot pulse>{t("state.running")}</Pill>
             <span>{t("execution.activityRunning")}</span>
           </p>
         ) : (
-          <p className="mt-2 text-[11px] text-muted-foreground">{t("execution.activityNotReported")}</p>
+          <p className="mt-2 text-xs text-muted-foreground">{t("execution.activityNotReported")}</p>
         )}
       </section>
 
@@ -114,25 +114,25 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
         <SectionTitle>{t("execution.overview")}</SectionTitle>
         <dl className="mt-3 grid gap-3 sm:grid-cols-2">
           <div>
-            <dt className="text-[11px] text-muted-foreground">{t("execution.createdAt")}</dt>
+            <dt className="text-xs text-muted-foreground">{t("execution.createdAt")}</dt>
             <dd><time dateTime={createdAt}>{createdAt}</time></dd>
           </div>
           <div>
-            <dt className="text-[11px] text-muted-foreground">{t("execution.updatedAt")}</dt>
+            <dt className="text-xs text-muted-foreground">{t("execution.updatedAt")}</dt>
             <dd><time dateTime={updatedAt}>{updatedAt}</time></dd>
           </div>
           <div>
-            <dt className="text-[11px] text-muted-foreground">{t("execution.elapsedAtUpdate")}</dt>
+            <dt className="text-xs text-muted-foreground">{t("execution.elapsedAtUpdate")}</dt>
             <dd>{formatDuration(elapsed)}</dd>
           </div>
         </dl>
         {execution.state === "failed" && reportedFailure && (
           <div role="alert" className="mt-4 rounded-md border border-destructive/30 bg-destructive/5 p-3">
-            <p className="text-[11px] font-semibold">{t("execution.reportedFailureDetail")}</p>
-            <p className="mt-1 whitespace-pre-wrap break-words text-[12px] text-muted-foreground">{reportedFailure}</p>
+            <p className="text-xs font-semibold">{t("execution.reportedFailureDetail")}</p>
+            <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">{reportedFailure}</p>
           </div>
         )}
-        <p className="mt-4 text-[11px] leading-5 text-muted-foreground">{t("execution.jobDetailsNotReported")}</p>
+        <p className="mt-4 text-xs leading-5 text-muted-foreground">{t("execution.jobDetailsNotReported")}</p>
       </section>
 
       <JobRelationsPanel execution={execution} executions={executions} onSelectJob={onSelectJob} />
@@ -145,7 +145,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
         <SectionTitle>{t("execution.usage")}</SectionTitle>
         <div className="mt-2"><UsageScopeNote scope="job" generatedAt={usage?.generated_at} /></div>
         {accounting?.ceiling && (
-          <p className="mt-3 text-[11px] text-muted-foreground">
+          <p className="mt-3 text-xs text-muted-foreground">
             {t("execution.budgetCeiling")}: <strong className="font-medium text-foreground">{formatNumber(accounting.ceiling.amount)} {accounting.ceiling.unit}</strong>
             <span> · {t("execution.budgetCeilingSource", { source: accounting.ceiling.source })}</span>
             <span className="block">{t("execution.budgetNotSpend")}</span>
@@ -173,21 +173,21 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
               <SectionTitle>{t("usage.context")}</SectionTitle>
               <ContextMetrics totals={usage.totals} />
             </section>
-            {usage.truncated && <p className="text-[10px] text-muted-foreground">{t("usage.limited")}</p>}
+            {usage.truncated && <p className="text-xs text-muted-foreground">{t("usage.limited")}</p>}
           </div>
         ) : (
-          <p className="mt-3 text-[11px] text-muted-foreground">{t("usage.noJobUsage")}</p>
+          <p className="mt-3 text-xs text-muted-foreground">{t("usage.noJobUsage")}</p>
         ) : (
           <div className="mt-3 space-y-3">
             {accounting?.consumption && <CostDetails cost={accounting.consumption} />}
-            {usageLoading && <p role="status" className="text-[11px] text-muted-foreground">{t("execution.usageLoading")}</p>}
+            {usageLoading && <p role="status" className="text-xs text-muted-foreground">{t("execution.usageLoading")}</p>}
             {usageError && (
-              <div role="alert" className="flex flex-wrap items-center gap-2 text-[11px] text-destructive">
+              <div role="alert" className="flex flex-wrap items-center gap-2 text-xs text-destructive">
                 <span>{t("execution.usageLoadFailed")}</span>
                 {onRetryUsage && <Button size="xs" variant="outline" onClick={onRetryUsage}>{t("execution.retryUsage")}</Button>}
               </div>
             )}
-            {!accounting?.consumption && !usageLoading && !usageError && <p className="text-[11px] text-muted-foreground">{t("execution.usageNotReported")}</p>}
+            {!accounting?.consumption && !usageLoading && !usageError && <p className="text-xs text-muted-foreground">{t("execution.usageNotReported")}</p>}
           </div>
         )}
       </section>
@@ -195,7 +195,7 @@ export function JobExecutionSurface({ execution, executions = [], onSelectJob, a
       <details className="rounded-lg border border-border bg-card p-4">
         <summary className="cursor-pointer text-[13px] font-semibold">{t("execution.diagnosticsDetails")}</summary>
         <div className="mt-3 space-y-4">
-          <p className="text-[11px] text-muted-foreground">
+          <p className="text-xs text-muted-foreground">
             {t("execution.projectMeta", { project: execution.projectId, generation: execution.generation, cursor: execution.cursor })}
           </p>
           <section className="rounded border border-border p-3">
@@ -280,17 +280,17 @@ const PLACEMENT_SITUATION_TONE = {
 function PlacementTargetFacts({ target, t }: { target: PlacementTarget; t: TranslateFn }) {
   return (
     <div className="min-w-0">
-      <p className="text-[11px] text-muted-foreground">{t("placement.attemptTarget", { generation: String(target.generation) })}</p>
+      <p className="text-xs text-muted-foreground">{t("placement.attemptTarget", { generation: String(target.generation) })}</p>
       <p className="mt-0.5 break-words text-[13px] font-medium text-foreground">{target.providerKey}</p>
-      <p className="break-words text-[12px]">{target.model}</p>
+      <p className="break-words text-xs">{target.model}</p>
       {target.upstreamModelId && (
-        <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground">
+        <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
           <span className="font-sans">{t("placement.upstreamModel")}</span>
           {" "}
           {target.upstreamModelId}
         </p>
       )}
-      <p className="mt-1 break-all font-mono text-[10px] text-muted-foreground" title={t("placement.dispatches", { count: target.dispatchIntentIds.length })}>
+      <p className="mt-1 break-all font-mono text-xs text-muted-foreground" title={t("placement.dispatches", { count: target.dispatchIntentIds.length })}>
         <span className="font-sans">{t("placement.dispatchIntent")}</span>
         {" "}
         {target.firstDispatchIntentId}
@@ -312,20 +312,20 @@ function PlacementSection({ placement, requested, jobFailureShown, jobTerminal }
       </div>
 
       <div className="mt-3 min-w-0" data-requested-target>
-        <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.requested")}</h4>
+        <h4 className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.requested")}</h4>
         {requested ? (
           <div className="mt-1">
             <p className="break-words text-[13px] font-medium text-foreground">{requested.provider ?? t("common.unknown")}</p>
-            <p className="break-words text-[12px]">{requested.model ?? t("common.unknown")}</p>
+            <p className="break-words text-xs">{requested.model ?? t("common.unknown")}</p>
           </div>
         ) : (
-          <p className="mt-1 text-[12px] text-muted-foreground">{t("placement.requestedUnknown")}</p>
+          <p className="mt-1 text-xs text-muted-foreground">{t("placement.requestedUnknown")}</p>
         )}
       </div>
 
       {selected ? (
         <div className="mt-3 min-w-0">
-          <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">
+          <h4 className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
             {t(selected.kind === "current" ? "placement.currentTarget" : "placement.executionTarget")}
           </h4>
           <div className="mt-2 min-w-0">
@@ -335,27 +335,27 @@ function PlacementSection({ placement, requested, jobFailureShown, jobTerminal }
       ) : situation === "rejected" && placement.failure ? (
         <div className="mt-3 min-w-0">
           {jobFailureShown ? (
-            <p className="text-[12px] text-muted-foreground">{t("placement.rejectedSummary")}</p>
+            <p className="text-xs text-muted-foreground">{t("placement.rejectedSummary")}</p>
           ) : (
             <>
-              <p className="break-words font-mono text-[12px] font-medium">{placement.failure.code}</p>
-              <p className="mt-1 whitespace-pre-wrap break-words text-[12px] text-muted-foreground">{placement.failure.message}</p>
+              <p className="break-words font-mono text-xs font-medium">{placement.failure.code}</p>
+              <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">{placement.failure.message}</p>
             </>
           )}
         </div>
       ) : situation === "historical" ? (
-        <p className="mt-3 text-[12px] text-muted-foreground">
+        <p className="mt-3 text-xs text-muted-foreground">
           {t(jobTerminal ? "placement.executionNotRecorded" : "placement.currentNotRecorded")}
         </p>
       ) : (
-        <p className="mt-3 text-[12px] text-muted-foreground">{t("placement.notRecorded")}</p>
+        <p className="mt-3 text-xs text-muted-foreground">{t("placement.notRecorded")}</p>
       )}
 
       {showHistory && (
         <div className="mt-4 min-w-0 border-t border-border/70 pt-3">
-          <h4 className="text-[11px] font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.history")}</h4>
+          <h4 className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">{t("placement.history")}</h4>
           {situation === "historical" && !jobTerminal && (
-            <p className="mt-1 text-[11px] text-muted-foreground">{t("placement.historyIsEarlier")}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{t("placement.historyIsEarlier")}</p>
           )}
           {/* The key carries every field the projection groups on, so two
               targets differing only by upstream model stay distinct. */}
@@ -369,7 +369,7 @@ function PlacementSection({ placement, requested, jobFailureShown, jobTerminal }
         </div>
       )}
 
-      <p className="mt-3 text-[11px] leading-5 text-muted-foreground">{t("placement.historyNote")}</p>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">{t("placement.historyNote")}</p>
     </section>
   );
 }

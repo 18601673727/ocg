@@ -1,6 +1,8 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { cn } from "@/lib/utils";
+import { STATUS_TEXT } from "../primitives/tone";
 import { formatCount, UNKNOWN } from "@/lib/format";
 import type { UsageBreakdown, UsageCompleteness, UsageCost, UsageQuantity, UsageTotals } from "../contracts";
 import { useI18n, type I18nKey } from "../i18n";
@@ -9,7 +11,7 @@ import { useI18n, type I18nKey } from "../i18n";
 export function CompletenessTag({ completeness }: { completeness: UsageCompleteness }) {
   const { t } = useI18n();
   if (completeness === "complete") return null;
-  return <span className="ml-1 text-[10px] font-normal text-muted-foreground" data-usage-completeness={completeness}>{t(completeness === "partial" ? "usage.partial" : "usage.unavailable")}</span>;
+  return <span className="ml-1 text-xs font-normal text-muted-foreground" data-usage-completeness={completeness}>{t(completeness === "partial" ? "usage.partial" : "usage.unavailable")}</span>;
 }
 
 // An unavailable quantity carries no value: it renders as the label alone, never as 0.
@@ -33,8 +35,8 @@ export function UsageMoney({ cost }: { cost: UsageCost }) {
 export function UsageMetric({ label, children, field }: { label: I18nKey; children: ReactNode; field?: string }) {
   const { t } = useI18n();
   return <div className="flex min-w-0 items-baseline justify-between gap-3 py-1.5" data-usage-field={field}>
-    <dt className="text-[11px] text-muted-foreground">{t(label)}</dt>
-    <dd className="m-0 break-words text-right text-[12px] font-medium tabular-nums">{children}</dd>
+    <dt className="text-xs text-muted-foreground">{t(label)}</dt>
+    <dd className="m-0 break-words text-right text-xs font-medium tabular-nums">{children}</dd>
   </div>;
 }
 
@@ -70,10 +72,10 @@ export function CostDetails({ cost }: { cost: UsageCost }) {
   const { t } = useI18n();
   return <>
     <dl><UsageMetric label="usage.actualSettled" field="cost.actual"><UsageMoney cost={cost} /></UsageMetric></dl>
-    {cost.settled_calls > 0 ? <p className="mt-1 text-[11px] text-muted-foreground">{t("usage.settledCalls", { count: cost.settled_calls })}</p> : null}
-    {cost.unresolved_calls > 0 ? <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">{t("usage.unresolved", { count: cost.unresolved_calls })}</p> : null}
-    {cost.unavailable_calls > 0 ? <p className="mt-1 text-[11px] text-muted-foreground">{t("usage.unavailableCost", { count: cost.unavailable_calls })}</p> : null}
-    <p className="mt-2 text-[10px] text-muted-foreground">{t("usage.costSource")}</p>
+    {cost.settled_calls > 0 ? <p className="mt-1 text-xs text-muted-foreground">{t("usage.settledCalls", { count: cost.settled_calls })}</p> : null}
+    {cost.unresolved_calls > 0 ? <p className={cn("mt-1 text-xs", STATUS_TEXT.warning)}>{t("usage.unresolved", { count: cost.unresolved_calls })}</p> : null}
+    {cost.unavailable_calls > 0 ? <p className="mt-1 text-xs text-muted-foreground">{t("usage.unavailableCost", { count: cost.unavailable_calls })}</p> : null}
+    <p className="mt-2 text-xs text-muted-foreground">{t("usage.costSource")}</p>
   </>;
 }
 
@@ -94,9 +96,9 @@ export function ActivityMetrics({ totals }: { totals: UsageTotals }) {
  */
 export function UsageBreakdownList({ rows }: { rows: UsageBreakdown[] }) {
   const { t } = useI18n();
-  if (!rows.length) return <p className="text-[11px] text-muted-foreground">{t("usage.noBreakdown")}</p>;
+  if (!rows.length) return <p className="text-xs text-muted-foreground">{t("usage.noBreakdown")}</p>;
   return <ul className="divide-y divide-border/60">{rows.map((row, index) => <li key={`${row.provider}:${row.model}:${index}`} className="py-2" data-usage-breakdown="model">
-    <p className="break-all text-[12px] font-medium">{row.provider ?? t("common.notReported")}<span className="font-normal text-muted-foreground"> / {row.model ?? t("common.notReported")}</span></p>
+    <p className="break-all text-xs font-medium">{row.provider ?? t("common.notReported")}<span className="font-normal text-muted-foreground"> / {row.model ?? t("common.notReported")}</span></p>
     <dl>
       <UsageMetric label="usage.cost"><UsageMoney cost={row.totals.cost} /></UsageMetric>
       <UsageMetric label="usage.total"><UsageNumber quantity={row.totals.tokens.total} /></UsageMetric>
@@ -117,7 +119,7 @@ const SCOPE_NOTE: Record<UsageScope, I18nKey> = {
 /** States which canonical scope the numbers below belong to, and when they were projected. */
 export function UsageScopeNote({ scope, generatedAt }: { scope: UsageScope; generatedAt?: number | null }) {
   const { t, locale } = useI18n();
-  return <p className="text-[11px] leading-5 text-muted-foreground" data-usage-scope={scope}>
+  return <p className="text-xs leading-5 text-muted-foreground" data-usage-scope={scope}>
     {t(SCOPE_NOTE[scope])}
     {generatedAt != null ? <span className="block">{t("usage.recordedAsOf", { time: usageTimestamp(generatedAt, locale) })}</span> : null}
   </p>;

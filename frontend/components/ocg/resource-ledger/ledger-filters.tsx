@@ -35,13 +35,13 @@ function FilterSelect({
   const selected = items.find((item) => item.value === value);
   return (
     <label htmlFor={id} className="flex min-w-0 flex-col gap-0.5">
-      <span className="text-[10px] font-medium tracking-wider text-muted-foreground uppercase">{label}</span>
+      <span className="text-xs font-medium tracking-wider text-muted-foreground uppercase">{label}</span>
       <select
         id={id}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         title={selected ? `${label}: ${selected.label}${selected.detail ? ` · ${selected.detail}` : ""}` : label}
-        className="h-7 w-full min-w-0 max-w-[13rem] truncate rounded border border-border bg-background px-1.5 text-[11px] text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
+        className="h-7 w-full min-w-0 max-w-[13rem] truncate rounded border border-border bg-background px-1.5 text-xs text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30"
       >
         {items.map((item) => (
           <option key={item.value} value={item.value} title={item.detail}>
@@ -127,7 +127,7 @@ export function LedgerFilters({
           <RotateCcw className="size-3" data-icon="inline-start" aria-hidden />
           {t("common.reset")}
         </Button>
-        <span className="ml-auto shrink-0 self-end pb-1 text-[10px] tabular-nums text-muted-foreground">
+        <span className="ml-auto shrink-0 self-end pb-1 text-xs tabular-nums text-muted-foreground">
           {t("ledger.filter.count", { result: resultCount, total: totalCount })}
         </span>
       </div>

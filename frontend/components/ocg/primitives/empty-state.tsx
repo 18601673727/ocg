@@ -2,6 +2,7 @@
 
 import type { ComponentType, ReactNode } from "react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE, BORDER_RADIUS } from "@/lib/design-tokens";
 
 /**
  * A surface with nothing to show yet.
@@ -22,7 +23,7 @@ export function EmptyState({
   return (
     <p
       className={cn(
-        "rounded-md border border-dashed border-border text-[11px] text-muted-foreground",
+        BORDER_RADIUS.interactive, "border border-dashed border-border", TYPOGRAPHY_SCALE.caption, "text-muted-foreground",
         compact ? "px-2 py-1.5" : "px-2.5 py-3",
         className,
       )}
@@ -55,7 +56,7 @@ export function EmptyPanel({
     >
       {Icon && <Icon className={cn("mb-2 size-6 text-muted-foreground", iconClassName)} aria-hidden />}
       <p className="text-sm font-medium">{title}</p>
-      {hint && <p className="mt-1 max-w-[36ch] text-[12px] text-muted-foreground">{hint}</p>}
+      {hint && <p className={cn("mt-1 max-w-[36ch]", TYPOGRAPHY_SCALE.caption, "text-muted-foreground")}>{hint}</p>}
     </div>
   );
 }

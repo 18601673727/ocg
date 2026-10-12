@@ -13,6 +13,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
 import {
   selectHomeAttention,
@@ -39,6 +40,7 @@ import {
   SectionHeading,
   JOB_STATE,
   Pill,
+  STATUS_TEXT,
   SURFACE_TONE,
   TEXT_TONE,
   type Tone,
@@ -126,7 +128,7 @@ export function HomeSurface(props: HomeSurfaceProps) {
       {/* Hero entry */}
       <section className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
-          <h1 className="text-[22px] font-semibold tracking-tight">{t("home.welcome")}</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("home.welcome")}</h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {attention.length > 0
               ? t(attention.length === 1 ? "home.attention.one" : "home.attention.other", { count: attention.length })
@@ -247,12 +249,12 @@ function AttentionSection({
               <span className={cn("size-2 shrink-0 rounded-full mt-1.5", DOT_TONE[tone])} aria-hidden="true" />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="text-[13px] font-semibold">{item.title}</span>
-                  <span className={cn("rounded-md px-1.5 py-0.5 text-[10px] font-medium", SURFACE_TONE[tone], TEXT_TONE[tone])}>
+                  <span className={cn(TYPOGRAPHY_SCALE.body_sm, "font-semibold")}>{item.title}</span>
+                  <span className={cn("rounded-md px-1.5 py-0.5 text-xs font-medium", SURFACE_TONE[tone], TEXT_TONE[tone])}>
                     {kindLabel(item.kind)}
                   </span>
                 </div>
-                <p className="mt-0.5 text-[12px] text-muted-foreground">{item.summary}</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">{item.summary}</p>
               </div>
             </button>
           );
@@ -320,13 +322,13 @@ function JobCard({ job, onClick }: { job: ActiveJobProjection; onClick: () => vo
       <div className="flex min-w-0 flex-1 flex-col gap-1.5">
         <div className="flex items-center gap-2">
           <ViewTransition name={`job-${job.jobId}`} share="vt-shared" default="none">
-            <span className="truncate text-[13px] font-semibold">{job.title}</span>
+            <span className={cn(TYPOGRAPHY_SCALE.body_sm, "truncate font-semibold")}>{job.title}</span>
           </ViewTransition>
           <Pill tone={status.tone} dot pulse={status.pulse}>
             {statusLabel}
           </Pill>
         </div>
-        <div className="flex items-center gap-3 text-[12px] text-muted-foreground">
+        <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span>{t("home.projectLabel", { project: job.projectId })}</span>
         </div>
       </div>
@@ -364,8 +366,8 @@ function ContinueWorkingSection({ entries, onSelectSession }: { entries: Continu
               )}
             </div>
             <div className="min-w-0 flex-1">
-              <p className="truncate text-[13px] font-medium">{entry.title}</p>
-              <p className="text-[11px] text-muted-foreground">{entry.subtitle} · {entry.timeAgo}</p>
+              <p className={cn(TYPOGRAPHY_SCALE.body_sm, "truncate font-medium")}>{entry.title}</p>
+              <p className="text-xs text-muted-foreground">{entry.subtitle} · {entry.timeAgo}</p>
             </div>
             <ArrowRight className="size-3 shrink-0 text-muted-foreground" aria-hidden="true" />
           </button>
@@ -395,60 +397,60 @@ function ResourceHealthSection({
       />
       <div className="mt-2 space-y-2.5 rounded-lg border border-border bg-card p-3">
         <div className="flex items-center justify-between">
-          <span className="text-[12px] text-muted-foreground">Providers</span>
-          <span className="text-[12px] font-medium">
+          <span className="text-xs text-muted-foreground">Providers</span>
+          <span className="text-xs font-medium">
             {health.providerCount === null ? t("common.notReported") : `${health.providerCount} reported`}
           </span>
         </div>
         {health.connectedProviders !== null && health.connectedProviders > 0 && (
           <div className="flex items-center justify-between">
-            <span className="text-[12px] text-muted-foreground">Connected</span>
-            <span className="text-[12px] font-medium">{health.connectedProviders}</span>
+            <span className="text-xs text-muted-foreground">Connected</span>
+            <span className="text-xs font-medium">{health.connectedProviders}</span>
           </div>
         )}
         {health.degradedProviders !== null && health.degradedProviders > 0 && (
           <div className="flex items-center justify-between">
-            <span className="text-[12px] text-amber-600 dark:text-amber-400">{health.degradedProviders} degraded</span>
-            <span className="text-[11px] text-muted-foreground">needs attention</span>
+            <span className={cn("text-xs", STATUS_TEXT['warning'])}>{health.degradedProviders} degraded</span>
+            <span className="text-xs text-muted-foreground">needs attention</span>
           </div>
         )}
         {health.authRequiredProviders !== null && health.authRequiredProviders > 0 && (
           <div className="flex items-center justify-between">
-            <span className="text-[12px] text-violet-600 dark:text-violet-400">{health.authRequiredProviders} auth required</span>
-            <span className="text-[11px] text-muted-foreground">action needed</span>
+            <span className={cn("text-xs", STATUS_TEXT['pending'])}>{health.authRequiredProviders} auth required</span>
+            <span className="text-xs text-muted-foreground">action needed</span>
           </div>
         )}
         {health.unavailableProviders !== null && health.unavailableProviders > 0 && (
           <div className="flex items-center justify-between">
-            <span className="text-[12px] text-red-600 dark:text-red-400">{health.unavailableProviders} unavailable</span>
-            <span className="text-[11px] text-muted-foreground">runtime reported</span>
+            <span className={cn("text-xs", STATUS_TEXT['error'])}>{health.unavailableProviders} unavailable</span>
+            <span className="text-xs text-muted-foreground">runtime reported</span>
           </div>
         )}
         {health.unknownProviders !== null && health.unknownProviders > 0 && (
           <div className="flex items-center justify-between">
-            <span className="text-[12px] text-muted-foreground">{health.unknownProviders} unknown</span>
-            <span className="text-[11px] text-muted-foreground">state not reported</span>
+            <span className="text-xs text-muted-foreground">{health.unknownProviders} unknown</span>
+            <span className="text-xs text-muted-foreground">state not reported</span>
           </div>
         )}
         <div className="mt-1 h-px bg-border" aria-hidden="true" />
         <div className="flex items-center justify-between">
-          <span className="text-[12px] text-muted-foreground">{t("home.activeProfile")}</span>
-          <span className="text-[12px] font-medium">{health.activeProfileLabel ?? t("common.notReported")}</span>
+          <span className="text-xs text-muted-foreground">{t("home.activeProfile")}</span>
+          <span className="text-xs font-medium">{health.activeProfileLabel ?? t("common.notReported")}</span>
         </div>
         <div className="flex items-center justify-between">
-          <span className="text-[12px] text-muted-foreground">{t("home.models")}</span>
-          <span className="text-[12px] font-medium">
+          <span className="text-xs text-muted-foreground">{t("home.models")}</span>
+          <span className="text-xs font-medium">
             {health.modelCount === null || health.availableModels === null
               ? t("common.notReported")
               : `${health.availableModels} available / ${health.modelCount} reported`}
           </span>
         </div>
-        {health.pendingModels !== null && health.pendingModels > 0 && <p className="text-[11px] text-muted-foreground">{health.pendingModels} pending</p>}
-        {health.unavailableModels !== null && health.unavailableModels > 0 && <p className="text-[11px] text-red-600 dark:text-red-400">{health.unavailableModels} unavailable</p>}
-        {health.unknownModels !== null && health.unknownModels > 0 && <p className="text-[11px] text-muted-foreground">{health.unknownModels} unknown</p>}
+        {health.pendingModels !== null && health.pendingModels > 0 && <p className="text-xs text-muted-foreground">{health.pendingModels} pending</p>}
+        {health.unavailableModels !== null && health.unavailableModels > 0 && <p className={cn("text-xs", STATUS_TEXT['error'])}>{health.unavailableModels} unavailable</p>}
+        {health.unknownModels !== null && health.unknownModels > 0 && <p className="text-xs text-muted-foreground">{health.unknownModels} unknown</p>}
         <div className="flex items-center justify-between">
-          <span className="text-[12px] text-muted-foreground">Runtime</span>
-          <span className="text-[12px] font-medium">{runtimeStateLabel(t, health.runtimeState)}</span>
+          <span className="text-xs text-muted-foreground">Runtime</span>
+          <span className="text-xs font-medium">{runtimeStateLabel(t, health.runtimeState)}</span>
         </div>
       </div>
     </section>
@@ -477,37 +479,37 @@ function UsageSummarySection({
         {usage.available ? (
           <>
             <div className="flex items-center justify-between">
-              <span className="text-[12px] text-muted-foreground">{t("home.cost")}</span>
-              <span className="text-[12px] font-medium">{formatCostMicros(usage.costMicros)}</span>
+              <span className="text-xs text-muted-foreground">{t("home.cost")}</span>
+              <span className="text-xs font-medium">{formatCostMicros(usage.costMicros)}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-[12px] text-muted-foreground">{t("home.tokens")}</span>
-              <span className="text-[12px] font-medium tabular-nums">{formatTokens(usage.totalTokens)}</span>
+              <span className="text-xs text-muted-foreground">{t("home.tokens")}</span>
+              <span className="text-xs font-medium tabular-nums">{formatTokens(usage.totalTokens)}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-[12px] text-muted-foreground">{t("home.cacheRead")}</span>
-              <span className="text-[12px] font-medium tabular-nums">{formatTokens(usage.cacheRead)}</span>
+              <span className="text-xs text-muted-foreground">{t("home.cacheRead")}</span>
+              <span className="text-xs font-medium tabular-nums">{formatTokens(usage.cacheRead)}</span>
             </div>
             {usage.cacheShare !== null && (
               <div className="flex items-center justify-between">
-                <span className="text-[12px] text-muted-foreground">{t("home.cacheShare")}</span>
-                <span className="text-[12px] font-medium tabular-nums">{formatPercent(usage.cacheShare)}</span>
+                <span className="text-xs text-muted-foreground">{t("home.cacheShare")}</span>
+                <span className="text-xs font-medium tabular-nums">{formatPercent(usage.cacheShare)}</span>
               </div>
             )}
             {usage.cacheLeverage !== null && (
               <div className="flex items-center justify-between">
-                <span className="text-[12px] text-muted-foreground">{t("home.cacheLeverage")}</span>
-                <span className="text-[12px] font-medium tabular-nums">{formatPercent(usage.cacheLeverage)}</span>
+                <span className="text-xs text-muted-foreground">{t("home.cacheLeverage")}</span>
+                <span className="text-xs font-medium tabular-nums">{formatPercent(usage.cacheLeverage)}</span>
               </div>
             )}
             <div className="mt-1 h-px bg-border" aria-hidden="true" />
-            <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
               <span>{usage.entryCount} entries</span>
               <span>{usage.costProvenance}</span>
             </div>
           </>
         ) : (
-          <div className="flex items-center justify-center py-2 text-[12px] text-muted-foreground">
+          <div className="flex items-center justify-center py-2 text-xs text-muted-foreground">
             <Database className="mr-1.5 size-3" /> {t("home.noLedger")}
           </div>
         )}
@@ -539,8 +541,8 @@ function RecentActivitySection({ items }: { items: RecentActivityItem[] }) {
           <div key={item.id} className="flex items-start gap-3 rounded-md px-3 py-2">
             <span className={cn("size-1.5 shrink-0 rounded-full mt-1.5", DOT_TONE[item.tone])} aria-hidden="true" />
             <div className="min-w-0 flex-1">
-              <p className="text-[12px] leading-snug text-foreground">{item.summary}</p>
-              <p className="text-[11px] text-muted-foreground">{item.timeAgo}</p>
+              <p className="text-xs leading-snug text-foreground">{item.summary}</p>
+              <p className="text-xs text-muted-foreground">{item.timeAgo}</p>
             </div>
           </div>
         ))}

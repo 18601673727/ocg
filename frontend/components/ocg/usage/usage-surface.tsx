@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { PageSurface, SegmentedTabs } from "../primitives";
+import { STATUS_TEXT } from "../primitives/tone";
 import { formatCount } from "@/lib/format";
 import type { UsageBreakdown, UsageWindow } from "../contracts";
 import { useI18n, type I18nKey } from "../i18n";
@@ -19,14 +20,14 @@ function windowFrom(value: string | null): UsageWindow { return value === "all" 
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return <section className="min-w-0 rounded-md border border-border p-3 sm:p-4">
-    <h2 className="mb-2 text-[12px] font-semibold tracking-tight">{title}</h2>{children}
+    <h2 className="mb-2 text-xs font-semibold tracking-tight">{title}</h2>{children}
   </section>;
 }
 
 function BreakdownTable({ rows, models = false }: { rows: UsageBreakdown[]; models?: boolean }) {
   const { t } = useI18n();
-  return <div className="overflow-x-auto"><table className="w-full text-left text-[12px]">
-    <thead className="text-[11px] text-muted-foreground"><tr>
+  return <div className="overflow-x-auto"><table className="w-full text-left text-xs">
+    <thead className="text-xs text-muted-foreground"><tr>
       <th className="pb-2 font-medium">{t(models ? "usage.providerModel" : "usage.providers")}</th>
       {(["usage.requests", "usage.input", "usage.output", "usage.total", "usage.cost"] as const).map(key => <th key={key} className="pb-2 pl-3 text-right font-medium">{t(key)}</th>)}
     </tr></thead>
@@ -58,15 +59,15 @@ export function UsageSurface({ baseUrl, projectId, onSelectSession }: { baseUrl:
   return <PageSurface>
     <div className="mx-auto max-w-6xl space-y-5" data-usage-surface="project">
       <header className="flex flex-wrap items-start justify-between gap-3">
-        <div><h1 className="text-lg font-semibold tracking-tight">{t("nav.usage")}</h1><p className="mt-1 text-[12px] text-muted-foreground">{t("usage.subtitle")}</p></div>
+        <div><h1 className="text-lg font-semibold tracking-tight">{t("nav.usage")}</h1><p className="mt-1 text-xs text-muted-foreground">{t("usage.subtitle")}</p></div>
         <Button variant="outline" size="sm" disabled={!baseUrl || usage.loading} onClick={usage.refresh}><RefreshCw className="size-3.5" />{t("common.refresh")}</Button>
       </header>
       <div className="max-w-md"><SegmentedTabs tabs={WINDOWS.map(value => ({ id: value.id, label: t(value.label) }))} value={window} onSelect={selectWindow} ariaLabel={t("usage.window")} className="grid-cols-4" /></div>
       {!baseUrl || !projectId ? <p className="text-sm text-muted-foreground">{t("usage.noEndpoint")}</p> : usage.error ? <div role="alert" className="text-sm text-destructive">{t("usage.failed", { error: usage.error })}</div> : usage.loading ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
       {data ? <>
         <div className="max-w-3xl"><UsageScopeNote scope="project" generatedAt={data.generated_at} /></div>
-        {data.truncated ? <p className="text-[11px] text-amber-600 dark:text-amber-400">{t("usage.limited")}</p> : null}
-        {!hasRecordedUsage(data.totals) ? <p className="text-[12px] text-muted-foreground">{t("usage.noProjectUsage")}</p> : null}
+        {data.truncated ? <p className={`text-xs ${STATUS_TEXT['warning']}`}>{t("usage.limited")}</p> : null}
+        {!hasRecordedUsage(data.totals) ? <p className="text-xs text-muted-foreground">{t("usage.noProjectUsage")}</p> : null}
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           <Section title={t("usage.cost")}><CostDetails cost={data.totals.cost} /></Section>
           <Section title={t("usage.tokens")}><TokenMetrics totals={data.totals} /></Section>
@@ -82,12 +83,12 @@ export function UsageSurface({ baseUrl, projectId, onSelectSession }: { baseUrl:
         </div>
         <Section title={t("usage.efficiency")}>
           <div className="max-w-xl"><ContextMetrics totals={data.totals} full /></div>
-          <p className="mt-3 max-w-3xl text-[11px] text-muted-foreground">{t("usage.efficiencyNote")}</p>
+          <p className="mt-3 max-w-3xl text-xs text-muted-foreground">{t("usage.efficiencyNote")}</p>
         </Section>
         <Section title={t("usage.conversations")}>
           <div className="mb-3 max-w-xs"><SegmentedTabs tabs={[{ id: "recent", label: t("usage.recent") }, { id: "tokens", label: t("usage.mostTokens") }]} value={order} onSelect={setOrder} ariaLabel={t("usage.conversationOrder")} className="grid-cols-2" /></div>
-          {rows.length ? <div className="overflow-x-auto"><table className="w-full text-left text-[12px]">
-            <thead className="text-[11px] text-muted-foreground"><tr>
+          {rows.length ? <div className="overflow-x-auto"><table className="w-full text-left text-xs">
+            <thead className="text-xs text-muted-foreground"><tr>
               <th className="pb-2 font-medium">{t("usage.conversation")}</th>
               <th className="pb-2 pl-3 font-medium">{t("usage.updated")}</th>
               <th className="pb-2 pl-3 text-right font-medium">{t("usage.turns")}</th>
@@ -98,14 +99,14 @@ export function UsageSurface({ baseUrl, projectId, onSelectSession }: { baseUrl:
             </tr></thead>
             <tbody>{rows.map(row => <tr key={row.conversation_id} className="border-t border-border/60">
               <td className="max-w-64 py-3"><button className="max-w-full truncate text-left font-medium underline-offset-4 hover:underline" onClick={() => onSelectSession(row.session_id)} title={row.title ?? row.session_id}>{row.title ?? t("usage.untitled")}</button></td>
-              <td className="whitespace-nowrap pl-3 text-[11px] text-muted-foreground">{usageTimestamp(row.updated_at, locale)}</td>
+              <td className="whitespace-nowrap pl-3 text-xs text-muted-foreground">{usageTimestamp(row.updated_at, locale)}</td>
               <td className="pl-3 text-right tabular-nums">{formatCount(row.totals.turns)}</td>
               <td className="pl-3 text-right"><UsageNumber quantity={row.totals.provider_requests} /></td>
               <td className="pl-3 text-right"><UsageNumber quantity={row.totals.tokens.total} /></td>
               <td className="pl-3 text-right"><UsageMoney cost={row.totals.cost} /></td>
-              <td className="max-w-56 break-all pl-3 text-[11px] text-muted-foreground">{row.providers.join(", ") || "—"}<br />{row.models.join(", ") || "—"}</td>
+              <td className="max-w-56 break-all pl-3 text-xs text-muted-foreground">{row.providers.join(", ") || "—"}<br />{row.models.join(", ") || "—"}</td>
             </tr>)}</tbody>
-          </table></div> : <p className="py-4 text-[12px] text-muted-foreground">{t("usage.empty")}</p>}
+          </table></div> : <p className="py-4 text-xs text-muted-foreground">{t("usage.empty")}</p>}
         </Section>
       </> : null}
     </div>

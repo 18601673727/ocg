@@ -16,13 +16,13 @@ import { jobTreeOf, type JobExecution, type JobTreeNode } from "./domain";
  */
 function JobLink({ jobId, onSelectJob, children }: { jobId: string; onSelectJob?: (jobId: string) => void; children?: ReactNode }) {
   if (!onSelectJob) {
-    return <span className="break-all font-mono text-[11px]">{children ?? jobId}</span>;
+    return <span className="break-all font-mono text-xs">{children ?? jobId}</span>;
   }
   return (
     <Button
       size="xs"
       variant="outline"
-      className="h-auto max-w-full gap-1.5 whitespace-normal break-all text-left font-mono text-[11px]"
+      className="h-auto max-w-full gap-1.5 whitespace-normal break-all text-left font-mono text-xs"
       onClick={() => onSelectJob(jobId)}
     >
       {children ?? jobId}
@@ -40,7 +40,7 @@ const FAILURE_KEY = {
 
 function ChildPolicyFacts({ policy, t }: { policy: ChildPolicy; t: TranslateFn }) {
   return (
-    <p className="text-[11px] text-muted-foreground">
+    <p className="text-xs text-muted-foreground">
       {t(JOIN_KEY[policy.join])} · {t(CANCELLATION_KEY[policy.cancellation])} · {t(FAILURE_KEY[policy.failure])}
     </p>
   );
@@ -134,7 +134,7 @@ export function JobRelationsPanel({ execution, executions, onSelectJob }: {
         ) : (
           <div className="space-y-2">
             {execution.blockedBy.length > 0 && (
-              <p className="text-[11px] text-muted-foreground">{t("relations.blockedNotice", { count: String(execution.blockedBy.length) })}</p>
+              <p className="text-xs text-muted-foreground">{t("relations.blockedNotice", { count: String(execution.blockedBy.length) })}</p>
             )}
             <ul className="flex flex-wrap gap-2">
               {execution.dependsOn.map((depId) => (
@@ -159,7 +159,7 @@ export function JobRelationsPanel({ execution, executions, onSelectJob }: {
         ) : (
           <div className="space-y-2">
             {execution.state !== "completed" && (
-              <p className="text-[11px] text-muted-foreground">{t("relations.dependentsNotice", { count: String(execution.blocks.length) })}</p>
+              <p className="text-xs text-muted-foreground">{t("relations.dependentsNotice", { count: String(execution.blocks.length) })}</p>
             )}
             <ul className="flex flex-wrap gap-2">
               {execution.blocks.map((depId) => (
@@ -187,7 +187,7 @@ function RecursionFacts({ execution, t }: { execution: JobExecution; t: Translat
         </KeyValue>
         {limits && <KeyValue label={t("recursion.maxChildren")}>{limits.max_children_per_job}</KeyValue>}
       </KeyValueList>
-      {!limits && <p className="mt-2 text-[11px] text-muted-foreground">{t("recursion.limitsNotRecorded")}</p>}
+      {!limits && <p className="mt-2 text-xs text-muted-foreground">{t("recursion.limitsNotRecorded")}</p>}
       {execution.waitingForChildren && (
         <p className="mt-2"><Pill tone="amber" dot pulse>{t("recursion.waitingForChildren")}</Pill></p>
       )}
@@ -208,7 +208,7 @@ function JobTreeRow({ node, depth, onSelectJob, t }: {
         {node.loaded ? (
           <JobLink jobId={node.jobId} onSelectJob={onSelectJob}><span className="max-w-48 truncate">{node.jobId}</span></JobLink>
         ) : (
-          <span className="break-all font-mono text-[11px] text-muted-foreground">{node.jobId}</span>
+          <span className="break-all font-mono text-xs text-muted-foreground">{node.jobId}</span>
         )}
         {node.state && <Pill tone={JOB_STATE[node.state].tone} dot pulse={JOB_STATE[node.state].pulse}>{runtimeStateLabel(t, node.state)}</Pill>}
         {!node.loaded && <Pill tone="slate">{t("relations.notLoaded")}</Pill>}
@@ -250,8 +250,8 @@ function JobTreePanel({ execution, executions, onSelectJob }: {
           ))}
         </ul>
       )}
-      {!projection.reachedRoot && <p className="mb-2 text-[11px] text-muted-foreground">{t("tree.rootNotLoaded")}</p>}
-      {projection.cyclic && <p role="alert" className="mb-2 text-[11px] text-destructive">{t("tree.cyclic")}</p>}
+      {!projection.reachedRoot && <p className="mb-2 text-xs text-muted-foreground">{t("tree.rootNotLoaded")}</p>}
+      {projection.cyclic && <p role="alert" className="mb-2 text-xs text-destructive">{t("tree.cyclic")}</p>}
       <ul>
         <JobTreeRow node={projection.root} depth={0} onSelectJob={onSelectJob} t={t} />
       </ul>
@@ -277,14 +277,14 @@ export function JobRecoveryPanel({ execution }: { execution: JobExecution }) {
             <li key={event.id} className="rounded border border-border p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="font-medium">{recoveryLabel(t, event.classification)}</span>
-                <time dateTime={new Date(event.createdAt * 1000).toISOString()} className="text-[10px] text-muted-foreground">
+                <time dateTime={new Date(event.createdAt * 1000).toISOString()} className="text-xs text-muted-foreground">
                   {formatTimestamp(new Date(event.createdAt * 1000).toISOString())}
                 </time>
               </div>
-              <p className="mt-1 text-[11px] text-muted-foreground">
+              <p className="mt-1 text-xs text-muted-foreground">
                 {recoveryLabel(t, event.action)} → {recoveryLabel(t, event.outcome)}
               </p>
-              <dl className="mt-2 space-y-0.5 text-[10px] text-muted-foreground">
+              <dl className="mt-2 space-y-0.5 text-xs text-muted-foreground">
                 {event.attemptId && (
                   <div className="break-all">
                     <span className="font-sans">{t("recovery.attempt")}: </span>
