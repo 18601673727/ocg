@@ -1,6 +1,7 @@
 pub mod data_directory;
 pub mod database;
 pub mod disk_protection;
+pub mod host;
 pub mod logger;
 pub mod log_cleanup;
 pub mod openai_compatible;

@@ -7989,8 +7989,9 @@ fn totals_that_would_leave_their_range_refuse_the_batch_without_writing() {
 // ---- the background aggregation service ------------------------------------------
 
 use crate::orchestration::aggregation_service::{
-    AggregationService, AggregationServiceConfig, EXECUTOR_NAME, JOB_NAME, RoundReport,
-    ServiceFailure, ServiceStartError, ServiceState, Stream, StreamOutcome, TestSeams,
+    AggregationService, AggregationServiceConfig, EXECUTOR_NAME, FailedStart, JOB_NAME, JobEnd,
+    RoundReport, ServiceFailure, ServiceStartError, ServiceState, StartCause, Stream,
+    StreamOutcome, TestSeams,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -8481,7 +8482,7 @@ fn contradictory_token_evidence_stops_the_service_without_skipping_or_spinning()
     let outcome = wait(service.shutdown());
     assert!(matches!(outcome.failure, Some(ServiceFailure::Evidence(_))));
     assert!(
-        outcome.finalization.is_ok(),
+        matches!(outcome.end, JobEnd::Recorded),
         "the failure is recorded once the loop has stopped"
     );
     let record = wait(handle.job(job))
@@ -8688,4 +8689,553 @@ fn a_restart_keeps_the_aggregates_and_progress_and_makes_a_new_service_job() {
         .expect("a clean stop");
     assert_eq!(service_jobs(&handle).len(), 2);
     worker.shutdown().expect("shutdown");
+}
+
+// ---- first-check failures, latched storage and the host's cleanup ------------------
+
+/// A Job's service record, read back.
+fn job_record(handle: &DatabaseHandle, job: JobId) -> JobRecord {
+    wait(handle.job(job))
+        .expect("read Job")
+        .expect("Job exists")
+}
+
+fn failed_start(result: Result<AggregationService, ServiceStartError>) -> Box<FailedStart> {
+    match result {
+        Err(ServiceStartError::Failed(failed)) => failed,
+        Err(other) => panic!("expected a failed start with a service Job, got {other:?}"),
+        Ok(_) => panic!("expected the first check to fail the start"),
+    }
+}
+
+fn is_started_only(record: &JobRecord) -> bool {
+    record.started_at.is_some()
+        && record.completed_at.is_none()
+        && record.failed_at.is_none()
+        && record.cancelled_at.is_none()
+        && record.unknown_at.is_none()
+}
+
+/// A contradictory eligibility fixture: the Excluded claim comes first.
+fn contradictory(
+    handle: &DatabaseHandle,
+    llm: ProfileId,
+) -> (JobId, crate::persistence::MetricsId) {
+    let bad = llm_job(handle, llm);
+    token_fact(
+        handle,
+        bad,
+        at_minute(30),
+        Some(TokenAnnotation::excluded()),
+        NO_COUNTERS,
+    );
+    let eligible = token_fact(
+        handle,
+        bad,
+        at_minute(30),
+        Some(ELIGIBLE),
+        io5(Some(1), Some(1)),
+    );
+    (bad, eligible)
+}
+
+#[test]
+fn a_first_check_that_fails_returns_its_cause_and_ends_the_run_as_failed() {
+    let (_root, directory) = data_directory("service-first-evidence");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let (bad, eligible) = contradictory(&handle, llm);
+
+    let failed = failed_start(wait(AggregationService::start(
+        handle.clone(),
+        AggregationServiceConfig::default(),
+    )));
+    match &failed.cause {
+        StartCause::Loop(ServiceFailure::Evidence(TokenConsumeError::Evidence {
+            metrics,
+            job,
+            ..
+        })) => assert_eq!((*metrics, *job), (eligible, bad)),
+        other => panic!("the concrete cause is kept, got {other:?}"),
+    }
+    assert!(matches!(failed.end, JobEnd::Recorded));
+    let record = job_record(&handle, failed.job);
+    assert!(
+        record.started_at.is_some() && record.failed_at.is_some() && record.completed_at.is_none(),
+        "the run is Failed, not left Started"
+    );
+    assert_eq!(
+        token_progress(&handle).consumed_through,
+        None,
+        "no record was skipped"
+    );
+    assert_eq!(
+        job_metrics(&handle, bad).len(),
+        2,
+        "the raw facts are intact"
+    );
+
+    // The loop was joined and the claim released: another attempt can run,
+    // under its own Job, and meets the same fact.
+    let again = failed_start(wait(AggregationService::start(
+        handle.clone(),
+        AggregationServiceConfig::default(),
+    )));
+    assert_ne!(again.job, failed.job);
+    assert_eq!(service_jobs(&handle).len(), 2);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_corrupted_first_check_is_reported_and_a_repaired_fixture_starts() {
+    let (_root, directory) = data_directory("service-first-corruption");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let micros = at_minute(31);
+    token_fact(&handle, job, micros, Some(ELIGIBLE), NO_COUNTERS);
+    let minute = minute_of(at(micros));
+    let full = TokenMinuteTotals {
+        requests: u64::MAX,
+        ..TokenMinuteTotals::default()
+    };
+    wait(handle.with_database(move |database| {
+        crate::storage::replace_token_minute(database, provider, "model-a", minute, &full)
+    }))
+    .expect("break the fixture");
+
+    let failed = failed_start(wait(AggregationService::start(
+        handle.clone(),
+        AggregationServiceConfig::default(),
+    )));
+    match &failed.cause {
+        StartCause::Loop(ServiceFailure::Database {
+            stream: Stream::Token,
+            error,
+        }) => assert!(
+            matches!(error, DatabaseError::Read(error) if error.kind == crate::database::StorageErrorKind::Corrupted),
+            "the corruption cause is kept: {error:?}"
+        ),
+        other => panic!("expected the corruption cause, got {other:?}"),
+    }
+    assert!(matches!(failed.end, JobEnd::Recorded));
+    assert!(job_record(&handle, failed.job).failed_at.is_some());
+    assert_eq!(token_progress(&handle).consumed_through, None);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros),
+        Some(full),
+        "the bucket is as found"
+    );
+
+    // Only the test fixture is repaired; the host starts again from the same
+    // durable state.
+    wait(handle.with_database(move |database| {
+        crate::storage::replace_token_minute(
+            database,
+            provider,
+            "model-a",
+            minute,
+            &TokenMinuteTotals::default(),
+        )
+    }))
+    .expect("repair the fixture");
+    let service = wait(AggregationService::start(
+        handle.clone(),
+        AggregationServiceConfig::default(),
+    ))
+    .expect("the repaired fixture starts");
+    assert_ne!(service.job(), failed.job);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros).map(|totals| totals.requests),
+        Some(1),
+        "the first check consumed the fact once"
+    );
+    wait(service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    worker.shutdown().expect("shutdown");
+}
+
+fn protection_reason(directory: &DataDirectory) -> crate::disk_protection::ProtectionReason {
+    use crate::disk_protection::{ProtectedArea, ProtectionReason, SpaceShortage};
+    ProtectionReason::InsufficientSpace(SpaceShortage {
+        area: ProtectedArea::Database,
+        path: directory.database_path().to_path_buf(),
+        available_bytes: 0,
+        expected_write_bytes: 0,
+        threshold_bytes: 1,
+    })
+}
+
+#[test]
+fn a_run_whose_end_is_refused_keeps_both_the_failure_and_the_refusal() {
+    let (_root, directory) = data_directory("service-end-refused");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    contradictory(&handle, llm);
+    let (hook_handle, reason) = (handle.clone(), protection_reason(&directory));
+    let failed = failed_start(wait(AggregationService::start(
+        handle.clone(),
+        AggregationServiceConfig {
+            seams: TestSeams {
+                // Protection arrives while the first check is under way.
+                before_consume: Some(Arc::new(move |stream| {
+                    if stream == Stream::Token {
+                        assert!(hook_handle.activate_filesystem_protection(reason.clone()));
+                    }
+                })),
+                ..TestSeams::default()
+            },
+            ..AggregationServiceConfig::default()
+        },
+    )));
+    assert!(matches!(
+        failed.cause,
+        StartCause::Loop(ServiceFailure::Evidence(_))
+    ));
+    assert!(
+        matches!(
+            &failed.end,
+            JobEnd::NotRecorded(DatabaseError::DiskProtected(_))
+        ),
+        "a positively refused end is not an unknown one: {:?}",
+        failed.end
+    );
+    let text = failed.to_string();
+    assert!(
+        text.contains("still started") && !text.contains("unconfirmed"),
+        "{text}"
+    );
+    assert!(
+        is_started_only(&job_record(&handle, failed.job)),
+        "nothing was committed, so the Job is still started"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_run_whose_end_has_an_unknown_outcome_is_reported_as_unconfirmed() {
+    let (_root, directory) = data_directory("service-end-unknown");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let (bad, _) = contradictory(&handle, llm);
+    let (stash, held_and_release) = flume::unbounded();
+    let hook_handle = handle.clone();
+    let config = AggregationServiceConfig {
+        seams: TestSeams {
+            // The Job's end is the worker's next command: hold it so a second
+            // command joins its group, and make the group's flush fail.
+            before_consume: Some(Arc::new(move |stream| {
+                if stream == Stream::Token {
+                    stash.send(hook_handle.group_probe().hold_next_group()).ok();
+                }
+            })),
+            ..TestSeams::default()
+        },
+        ..AggregationServiceConfig::default()
+    };
+    let starter = {
+        let handle = handle.clone();
+        std::thread::spawn(move || wait(AggregationService::start(handle, config)))
+    };
+    let (held, release) = held_and_release
+        .recv_timeout(crate::test_support::WAIT)
+        .expect("the first check armed the hold");
+    held.recv_timeout(crate::test_support::WAIT)
+        .expect("the worker holds the Job's end");
+    let companion = admit(handle.record_metrics(NewMetrics {
+        job: bad,
+        observed_at: at(at_minute(32)),
+        measurements: TokenMeasurements {
+            ttfb_ms: Some(1),
+            ..TokenMeasurements::default()
+        },
+        token: None,
+    }));
+    handle
+        .group_probe()
+        .fail_next_flush
+        .store(true, AtomicOrdering::SeqCst);
+    release.send(()).expect("release the group");
+    let failed = failed_start(starter.join().expect("starter thread"));
+    assert!(matches!(
+        companion(),
+        Err(DatabaseError::OutcomeUnknown { .. })
+    ));
+    assert!(matches!(
+        failed.cause,
+        StartCause::Loop(ServiceFailure::Evidence(_))
+    ));
+    assert!(
+        matches!(
+            &failed.end,
+            JobEnd::Unconfirmed(DatabaseError::OutcomeUnknown { .. })
+        ),
+        "{:?}",
+        failed.end
+    );
+    let text = failed.to_string();
+    assert!(
+        text.contains("unconfirmed") && !text.contains("still started"),
+        "{text}"
+    );
+    worker.shutdown().ok();
+}
+
+fn recovering_worker(directory: &DataDirectory) -> DatabaseWorker {
+    DatabaseWorker::start_with_config(
+        directory,
+        crate::disk_protection::FilesystemConfig {
+            disk_lock_threshold_bytes: 1,
+            disk_resume_threshold_bytes: 2,
+            ..crate::disk_protection::FilesystemConfig::default()
+        },
+    )
+    .expect("start database")
+}
+
+/// Pauses are not repeated attempts: further checks neither consume nor write.
+fn assert_paused_without_attempts(rig: &Rig, handle: &DatabaseHandle) {
+    let calls = rig.calls();
+    assert_ne!(handle.status(), crate::database::DatabaseStatus::Open);
+    assert_eq!(rig.service.state(), ServiceState::Paused);
+    for _ in 0..3 {
+        let report = rig.tick();
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].1, StreamOutcome::Paused);
+    }
+    assert_eq!(
+        rig.calls(),
+        calls,
+        "no consume call, and so no write, was repeated"
+    );
+}
+
+#[test]
+fn a_rolled_back_commit_pauses_the_live_service_and_recovery_lets_it_resume() {
+    let (_root, directory) = data_directory("service-rolled-back");
+    let worker = recovering_worker(&directory);
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let micros = at_minute(33);
+    token_fact(
+        &handle,
+        job,
+        micros,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(2), Some(3)),
+    );
+    let rig = Rig::start(&handle, |_| {});
+    let service_job = rig.service.job();
+
+    // A real failed commit of the service's own batch: storage latches.
+    handle
+        .group_probe()
+        .fail_next_plan
+        .store(true, AtomicOrdering::SeqCst);
+    let report = rig.tick();
+    assert_eq!(
+        outcomes(&report),
+        [
+            (Stream::Availability, StreamOutcome::Idle),
+            (Stream::Token, StreamOutcome::Paused),
+        ]
+    );
+    assert_paused_without_attempts(&rig, &handle);
+
+    // An external actor runs the existing recovery. A rollback is not an
+    // uncertain commit, so nothing needs reconciling.
+    let recovery = wait(handle.recover_storage()).expect("recover storage");
+    assert!(recovery.reconciled.is_empty());
+    assert_eq!(
+        token_progress(&handle).consumed_through,
+        None,
+        "nothing was committed"
+    );
+    assert!(
+        is_started_only(&job_record(&handle, service_job)),
+        "the service Job is still running"
+    );
+    let resumed = rig.tick();
+    assert!(
+        resumed
+            .outcomes
+            .iter()
+            .any(|outcome| outcome == &(Stream::Token, StreamOutcome::Consumed(1))),
+        "{resumed:?}"
+    );
+    assert_eq!(rig.service.state(), ServiceState::Running);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros).map(|totals| totals.requests),
+        Some(1),
+        "the fact is counted once, and was not skipped"
+    );
+    assert_matches_reducer(&handle, &[job]);
+    wait(rig.service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn an_uncertain_commit_pauses_the_live_service_and_resumes_from_what_was_committed() {
+    use crate::database::OperationStatus;
+    let (_root, directory) = data_directory("service-unknown");
+    let worker = recovering_worker(&directory);
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let micros = at_minute(34);
+    token_fact(
+        &handle,
+        job,
+        micros,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(2), Some(3)),
+    );
+    let rig = Rig::start(&handle, |_| {});
+    let service_job = rig.service.job();
+
+    // The service's commit is the first command of a group whose durable
+    // flush then really fails, so the commit's outcome is unknown.
+    let probe = handle.group_probe();
+    let (held, release) = probe.hold_next_group();
+    assert!(rig.service.tick());
+    held.recv_timeout(crate::test_support::WAIT)
+        .expect("the service's commit is the group's first command");
+    let companion = admit(handle.record_availability_stat(NewAvailabilityStat {
+        job,
+        observed_at: at(micros),
+        observation: response(200),
+    }));
+    probe.fail_next_flush.store(true, AtomicOrdering::SeqCst);
+    release.send(()).expect("release the group");
+    let report = rig
+        .rounds
+        .recv_timeout(crate::test_support::WAIT)
+        .expect("the check finished");
+    assert_eq!(
+        outcomes(&report),
+        [
+            (Stream::Availability, StreamOutcome::Idle),
+            (Stream::Token, StreamOutcome::Paused),
+        ]
+    );
+    assert!(matches!(
+        companion(),
+        Err(DatabaseError::OutcomeUnknown { .. })
+    ));
+    assert_paused_without_attempts(&rig, &handle);
+
+    // Recovery reconciles what really committed; the service retries nothing.
+    let recovery = wait(handle.recover_storage()).expect("recover storage");
+    assert_eq!(
+        recovery.reconciled.len(),
+        2,
+        "the batch and the companion write were uncertain"
+    );
+    let batch_committed = recovery.reconciled.iter().any(|(_, status)| {
+        matches!(status, OperationStatus::Committed(marker) if marker.kind == crate::persistence::OperationKind::ConsumeTokenUsage)
+    });
+    assert_eq!(
+        token_progress(&handle).consumed_through.is_some(),
+        batch_committed
+    );
+    assert!(is_started_only(&job_record(&handle, service_job)));
+
+    // The still-live service rereads the committed state and finishes the work.
+    for _ in 0..2 {
+        rig.tick();
+    }
+    assert_eq!(rig.service.state(), ServiceState::Running);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros).map(|totals| totals.requests),
+        Some(1),
+        "counted once whether or not the uncertain batch had committed"
+    );
+    assert_eq!(
+        token_progress(&handle).consumed_through,
+        job_metrics(&handle, job).last().map(|record| record.id),
+        "no raw fact was skipped"
+    );
+    assert_matches_reducer(&handle, &[job]);
+    let availability =
+        wait(handle.job_availability(job, None, 10)).expect("read AvailabilityStats");
+    assert_eq!(
+        wait(handle.availability_progress())
+            .expect("progress")
+            .consumed_through,
+        availability.last().map(|record| record.id)
+    );
+    wait(rig.service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_host_run_keeps_stopping_after_a_failed_step_and_reports_every_failure() {
+    use crate::host::{Phase, run_reporting};
+    let (_root, directory) = data_directory("host-cleanup");
+    // The host opens the database with its system policy, so seed the same way.
+    let policy = crate::system_policy::SystemPolicy::load_for_startup(&directory).expect("policy");
+    let worker = DatabaseWorker::start_with_policy(&directory, policy).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    worker.shutdown().expect("shutdown");
+
+    let report = run_reporting(&directory, false, move |database| async move {
+        // A Token fact arrives and the commit that consumes it really fails,
+        // which latches storage under the running host.
+        database
+            .record_metrics(NewMetrics {
+                job,
+                observed_at: at(at_minute(35)),
+                measurements: TokenMeasurements::default(),
+                token: Some(ELIGIBLE),
+            })
+            .await
+            .expect("record Metrics");
+        let mut plan = database
+            .prepare_token(10)
+            .await
+            .expect("prepare")
+            .expect("no contradiction");
+        plan.inject_failure = true;
+        let error = database
+            .commit_token(plan)
+            .await
+            .expect_err("the commit fails");
+        assert!(matches!(error, DatabaseError::RolledBack(_)), "{error:?}");
+    });
+
+    assert_eq!(
+        report.attempted,
+        [
+            Phase::AggregationService,
+            Phase::Logger,
+            Phase::ExecutionRuntime,
+            Phase::Database,
+        ],
+        "every stop step ran, in order, database last"
+    );
+    let phases: Vec<Phase> = report
+        .failures
+        .iter()
+        .map(|failure| failure.phase)
+        .collect();
+    assert!(phases.contains(&Phase::AggregationService), "{phases:?}");
+    assert!(phases.contains(&Phase::Database), "{phases:?}");
+    let error = report.into_result().expect_err("the run failed");
+    let text = error.to_string();
+    assert!(
+        text.contains("aggregation service") && text.contains("database"),
+        "one report carries every component's failure: {text}"
+    );
 }

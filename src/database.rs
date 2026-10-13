@@ -990,6 +990,10 @@ pub(crate) struct GroupProbe {
     pub(crate) flushes: AtomicUsize,
     /// Makes the next flush fail instead of running.
     pub(crate) fail_next_flush: AtomicBool,
+    /// Makes the next aggregation plan prepared through this handle fail its
+    /// commit before the progress is written, so storage latches as it does
+    /// for any failed commit.
+    pub(crate) fail_next_plan: AtomicBool,
 }
 
 #[cfg(test)]
@@ -3261,8 +3265,21 @@ impl DatabaseHandle {
         &self,
         limit: usize,
     ) -> Result<storage::AvailabilityPlan, DatabaseError> {
-        self.read(move |database| storage::prepare_availability_aggregation(database, limit))
-            .await
+        #[allow(unused_mut)]
+        let mut plan = self
+            .read(move |database| storage::prepare_availability_aggregation(database, limit))
+            .await?;
+        #[cfg(test)]
+        if plan.report(1).is_some()
+            && self
+                .shared
+                .probe
+                .fail_next_plan
+                .swap(false, Ordering::SeqCst)
+        {
+            plan.inject_failure = true;
+        }
+        Ok(plan)
     }
 
     /// Commits a prepared batch if the rows it read still hold. `None` means
@@ -3344,11 +3361,24 @@ impl DatabaseHandle {
         let prepared = self
             .read(move |database| storage::prepare_token_aggregation(database, limit))
             .await?;
-        Ok(prepared.map_err(|refusal| TokenConsumeError::Evidence {
+        #[allow(unused_mut)]
+        let mut prepared = prepared.map_err(|refusal| TokenConsumeError::Evidence {
             metrics: refusal.metrics,
             job: refusal.job,
             error: refusal.error,
-        }))
+        });
+        #[cfg(test)]
+        if let Ok(plan) = &mut prepared
+            && plan.report(1).is_some()
+            && self
+                .shared
+                .probe
+                .fail_next_plan
+                .swap(false, Ordering::SeqCst)
+        {
+            plan.inject_failure = true;
+        }
+        Ok(prepared)
     }
 
     /// Commits a prepared Token batch if the rows it read still hold. `None`

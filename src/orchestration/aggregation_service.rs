@@ -98,6 +98,9 @@ pub enum ServiceFailure {
     Evidence(#[source] TokenConsumeError),
     #[error("the aggregation loop panicked")]
     Panicked,
+    /// The loop ended without being asked to and without a failure of its own.
+    #[error("the aggregation loop ended before it was asked to stop")]
+    Exited,
 }
 
 /// What a running service is doing.
@@ -159,17 +162,87 @@ struct Shared {
     failure: Mutex<Option<String>>,
 }
 
-/// Why the service could not start.
+/// What is known of an attempt to end a service Job.
+#[derive(Debug)]
+pub enum JobEnd {
+    /// The end was committed.
+    Recorded,
+    /// The write was refused or rolled back, so nothing was committed and the
+    /// Job is still started.
+    NotRecorded(DatabaseError),
+    /// The write was accepted but its outcome is unknown, so the Job may or
+    /// may not have ended. It is not retried.
+    Unconfirmed(DatabaseError),
+}
+
+impl JobEnd {
+    fn of(result: Result<(), DatabaseError>) -> Self {
+        match result {
+            Ok(()) => Self::Recorded,
+            Err(error @ DatabaseError::OutcomeUnknown { .. }) => Self::Unconfirmed(error),
+            Err(error) => Self::NotRecorded(error),
+        }
+    }
+}
+
+impl std::fmt::Display for JobEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Recorded => f.write_str("its Job's end was recorded"),
+            Self::NotRecorded(error) => write!(
+                f,
+                "its Job's end was refused and nothing was committed, so the Job is still started: {error}"
+            ),
+            Self::Unconfirmed(error) => write!(
+                f,
+                "whether its Job's end was committed is unconfirmed: {error}"
+            ),
+        }
+    }
+}
+
+/// Why a service Job that was created did not become a running service.
+#[derive(Debug)]
+pub enum StartCause {
+    /// The Job could not be started.
+    Database(DatabaseError),
+    Thread(std::io::Error),
+    /// The loop failed or stopped before it was ready, in its first check.
+    Loop(ServiceFailure),
+}
+
+impl std::fmt::Display for StartCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(f, "the Job could not be started: {error}"),
+            Self::Thread(error) => write!(f, "the loop could not be spawned: {error}"),
+            Self::Loop(failure) => write!(f, "{failure}"),
+        }
+    }
+}
+
+/// A start that reached a service Job but not a running service. The loop, if
+/// there was one, has been joined, and ending the Job as Failed was attempted.
+#[derive(Debug, thiserror::Error)]
+#[error("aggregation service {job} did not start: {cause}; {end}")]
+pub struct FailedStart {
+    pub job: JobId,
+    pub cause: StartCause,
+    pub end: JobEnd,
+}
+
+/// Why the service did not start, by how far it got.
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceStartError {
+    /// Another host holds this opening's aggregation loop. Nothing was written.
     #[error("an aggregation service is already running on this database")]
     AlreadyRunning,
+    /// A database call failed before any service Job existed.
     #[error("database operation failed: {0}")]
     Database(#[from] DatabaseError),
-    #[error("failed to start the aggregation loop: {0}")]
-    Thread(#[source] std::io::Error),
-    #[error("the aggregation loop stopped before it was ready")]
-    LoopLost,
+    /// A service Job was created and the run failed before it was ready.
+    #[error("{0}")]
+    Failed(Box<FailedStart>),
 }
 
 /// How a service run ended.
@@ -177,43 +250,35 @@ pub struct ServiceOutcome {
     pub job: JobId,
     /// The loop's own failure, if it stopped by itself.
     pub failure: Option<ServiceFailure>,
-    /// Whether the service Job's end could be stored.
-    pub finalization: Result<(), DatabaseError>,
+    /// What is known of ending the service Job.
+    pub end: JobEnd,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("{}", describe(.job, .failure, .unfinalized))]
+#[error("{}", describe(.job, .failure, .end))]
 pub struct ServiceShutdownError {
     pub job: JobId,
     pub failure: Option<ServiceFailure>,
-    pub unfinalized: Option<DatabaseError>,
+    pub end: JobEnd,
 }
 
-fn describe(
-    job: &JobId,
-    failure: &Option<ServiceFailure>,
-    unfinalized: &Option<DatabaseError>,
-) -> String {
+fn describe(job: &JobId, failure: &Option<ServiceFailure>, end: &JobEnd) -> String {
     let mut text = format!("aggregation service {job}");
     if let Some(failure) = failure {
         text.push_str(&format!(" failed: {failure}"));
     }
-    if let Some(error) = unfinalized {
-        text.push_str(&format!(
-            "; its Job was left unfinished because its end could not be stored: {error}"
-        ));
-    }
+    text.push_str(&format!("; {end}"));
     text
 }
 
 impl ServiceOutcome {
     pub fn into_result(self) -> Result<(), Box<ServiceShutdownError>> {
-        match (self.failure, self.finalization) {
-            (None, Ok(())) => Ok(()),
-            (failure, finalization) => Err(Box::new(ServiceShutdownError {
+        match (self.failure, self.end) {
+            (None, JobEnd::Recorded) => Ok(()),
+            (failure, end) => Err(Box::new(ServiceShutdownError {
                 job: self.job,
                 failure,
-                unfinalized: finalization.err(),
+                end,
             })),
         }
     }
@@ -273,7 +338,10 @@ impl AggregationService {
                 input,
             )
             .await?;
-        database.start_job(job).await?;
+        if let Err(error) = database.start_job(job).await {
+            let end = end_failed(&database, job, "the Job could not be started").await;
+            return Err(failed_start(job, StartCause::Database(error), end));
+        }
 
         let shared = Arc::new(Shared::default());
         let (control, control_receiver) = flume::unbounded();
@@ -291,14 +359,9 @@ impl AggregationService {
         let thread = match thread {
             Ok(thread) => thread,
             Err(error) => {
-                end_job(
-                    &database,
-                    job,
-                    JobFinalization::Failed(summary("the aggregation loop could not start")),
-                )
-                .await
-                .ok();
-                return Err(ServiceStartError::Thread(error));
+                let end =
+                    end_failed(&database, job, "the aggregation loop could not be spawned").await;
+                return Err(failed_start(job, StartCause::Thread(error), end));
             }
         };
         let mut service = Self {
@@ -310,8 +373,22 @@ impl AggregationService {
             _claim: claim,
         };
         if ready.recv_async().await.is_err() {
-            service.stop_loop();
-            return Err(ServiceStartError::LoopLost);
+            // The loop ended before it was ready. Its own result says why, and
+            // it is joined before the Job is ended and before the claim goes.
+            let failure = match service.stop_loop() {
+                Some(Err(failure)) => failure,
+                Some(Ok(())) | None => ServiceFailure::Exited,
+            };
+            let reason = format!("the aggregation service failed to start: {failure}");
+            let end = JobEnd::of(
+                end_job(
+                    &service.database,
+                    job,
+                    JobFinalization::Failed(summary(&reason)),
+                )
+                .await,
+            );
+            return Err(failed_start(job, StartCause::Loop(failure), end));
         }
         Ok(service)
     }
@@ -360,7 +437,8 @@ impl AggregationService {
 
     /// Stops the loop, and only after it has really stopped ends the service
     /// Job: Completed for a normal stop, Failed when the loop had failed. If
-    /// the end cannot be stored the Job stays started, which is what it was.
+    /// the end is refused the Job stays started; if its outcome is unknown,
+    /// that is reported as unconfirmed.
     pub async fn shutdown(mut self) -> ServiceOutcome {
         let loop_result = self.stop_loop().unwrap_or(Ok(()));
         let (failure, finalization) = match loop_result {
@@ -373,11 +451,11 @@ impl AggregationService {
                 (Some(failure), JobFinalization::Failed(summary(&text)))
             }
         };
-        let finalization = end_job(&self.database, self.job, finalization).await;
+        let end = JobEnd::of(end_job(&self.database, self.job, finalization).await);
         ServiceOutcome {
             job: self.job,
             failure,
-            finalization,
+            end,
         }
     }
 }
@@ -397,6 +475,16 @@ fn summary(text: &str) -> FinalResult {
         goal_reached: None,
         value: None,
     }
+}
+
+fn failed_start(job: JobId, cause: StartCause, end: JobEnd) -> ServiceStartError {
+    ServiceStartError::Failed(Box::new(FailedStart { job, cause, end }))
+}
+
+/// Ends a Job that never became a running service as Failed.
+async fn end_failed(database: &DatabaseHandle, job: JobId, reason: &str) -> JobEnd {
+    let text = format!("the aggregation service failed to start: {reason}");
+    JobEnd::of(end_job(database, job, JobFinalization::Failed(summary(&text))).await)
 }
 
 async fn end_job(
