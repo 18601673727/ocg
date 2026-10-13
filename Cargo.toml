@@ -27,6 +27,8 @@ aws-lc-rs = "1"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 serde_json = "1"
+# Tool-call argument admission; no remote or file schema resolution.
+jsonschema = { version = "=0.58.6", default-features = false }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 log = { version = "=0.4.34", default-features = false, features = ["std"] }

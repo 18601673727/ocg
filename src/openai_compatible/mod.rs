@@ -18,6 +18,7 @@
 //! OpenAI-compatible endpoint
 //! ```
 
+mod admission;
 pub mod error;
 pub mod normalize;
 pub mod request;
@@ -36,5 +37,5 @@ pub use request::{
 pub use response::ChatCompletionChunk;
 pub use stream::{
     ChatFinishReason, ChatStreamEvent, ChatStreamSummary, CompletedToolCall, InvalidToolCall,
-    NormalizedUsage, ToolCallAssembler,
+    NormalizedUsage, ToolCallAssembler, ToolCallRefusal,
 };

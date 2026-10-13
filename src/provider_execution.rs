@@ -194,9 +194,10 @@ impl CancellationToken {
 }
 
 /// One finished Provider exchange. It may be assistant text, tool calls, or
-/// both. Tool calls are requests the Provider made, complete and checked
-/// against what the request allowed; none of them has been run, and a result
-/// that carries them is not a finished answer.
+/// both. Tool calls are requests the Provider made, complete and admitted by
+/// the request that produced them, see [`ChatConversation::admit_tool_calls`];
+/// none of them has been run, and a result that carries them is not a
+/// finished answer. Admission is not permission to execute a call.
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionResult {
     pub text: String,
@@ -3022,17 +3023,19 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_names_and_late_metadata_reconstruct_one_call() {
+    fn late_metadata_reconstructs_one_call_named_in_one_field() {
         let result = read(
             vec![
                 // Arguments arrive before the call's id and name.
                 Step::Chunk(tool_delta(r#"[{"index":0,"function":{"arguments":"{\"q\":"}}]"#)),
                 Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"call_9","function":{"name":"web_"}}]"#,
+                    r#"[{"index":0,"id":"call_9","type":"function","function":{"name":"web_search"}}]"#,
                 )),
+                // Continuations repeat the id, and carry an empty name or none.
                 Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"call_9","function":{"name":"search","arguments":"\"世界\"}"}}]"#,
+                    r#"[{"index":0,"id":"call_9","function":{"name":"","arguments":"\"世界\""}}]"#,
                 )),
+                Step::Chunk(tool_delta(r#"[{"index":0,"function":{"name":null,"arguments":"}"}}]"#)),
                 Step::Chunk(TOOL_CALLS),
             ],
             &offering(&["web_search"]),
@@ -3046,187 +3049,566 @@ mod tests {
     }
 
     #[test]
-    fn repeated_complete_names_are_echoes_not_fragments() {
-        let echoed = |arguments: &str| {
+    fn a_second_name_field_is_an_ambiguous_identity_and_admits_nothing() {
+        let named = |name: &str, arguments: &str| {
             tool_delta(leaked(format!(
-                r#"[{{"index":0,"id":"call_1","type":"function","function":{{"name":"get_weather","arguments":{}}}}}]"#,
+                r#"[{{"index":0,"id":"call_1","function":{{"name":"{name}","arguments":{}}}}}]"#,
                 serde_json::to_string(arguments).expect("JSON string")
             )))
         };
-        let result = read(
-            vec![
-                Step::Chunk(echoed("")),
-                Step::Chunk(echoed("{\"city\":")),
-                Step::Chunk(echoed("\"Paris\"}")),
-                Step::Chunk(TOOL_CALLS),
-            ],
-            &offering(&["get_weather"]),
-            None,
-        )
-        .expect("a complete tool call");
-        assert_eq!(
-            result.tool_calls,
-            [call(0, "call_1", "get_weather", "{\"city\":\"Paris\"}")],
-            "metadata repeated beside each argument fragment"
-        );
+        let cases: [(&str, Vec<Step>, &[&str]); 5] = [
+            (
+                "`ab` then `ab`, with `ab` and `abab` both offered",
+                vec![Step::Chunk(named("ab", "")), Step::Chunk(named("ab", "{}"))],
+                &["ab", "abab"],
+            ),
+            (
+                "a complete name echoed beside every argument fragment",
+                vec![
+                    Step::Chunk(named("get_weather", "")),
+                    Step::Chunk(named("get_weather", "{\"city\":")),
+                    Step::Chunk(named("get_weather", "\"Paris\"}")),
+                ],
+                &["get_weather"],
+            ),
+            (
+                "a name sent in two fragments",
+                vec![
+                    Step::Chunk(named("web_", "")),
+                    Step::Chunk(named("search", "{}")),
+                ],
+                &["web_", "search", "web_search"],
+            ),
+            (
+                "another complete name",
+                vec![
+                    Step::Chunk(named("get_weather", "{}")),
+                    Step::Chunk(named("get_time", "")),
+                ],
+                &["get_weather", "get_time"],
+            ),
+            (
+                "two name fields for one index in one delta",
+                vec![Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}},{"index":0,"function":{"name":"f"}}]"#,
+                ))],
+                &["f"],
+            ),
+        ];
+        for (case, mut steps, offered) in cases {
+            steps.push(Step::Chunk(TOOL_CALLS));
+            let message = incomplete_message(read(steps, &offering(offered), None));
+            assert!(
+                message.contains("(ambiguous identity)") && message.contains("tool call 0"),
+                "{case}: {message}"
+            );
+        }
 
+        // Each index names its function once; interleaved calls stay apart.
         let result = read(
             vec![
                 Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"call_9","function":{"name":"web_"}}]"#,
-                )),
-                Step::Chunk(tool_delta(r#"[{"index":0,"function":{"name":"search"}}]"#)),
-                Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"call_9","function":{"name":"web_search","arguments":"{\"q\":"}}]"#,
+                    r#"[{"index":1,"id":"b","function":{"name":"abab","arguments":"{"}},{"index":0,"id":"a","function":{"name":"ab","arguments":"{"}}]"#,
                 )),
                 Step::Chunk(tool_delta(
-                    r#"[{"index":0,"function":{"name":"web_search","arguments":"1}"}}]"#,
+                    r#"[{"index":0,"id":"a","function":{"arguments":"}"}},{"index":1,"id":"b","function":{"arguments":"}"}}]"#,
                 )),
                 Step::Chunk(TOOL_CALLS),
             ],
-            &offering(&["web_search"]),
+            &offering(&["ab", "abab"]),
             None,
         )
-        .expect("a complete tool call");
+        .expect("two unambiguous calls");
         assert_eq!(
             result.tool_calls,
-            [call(0, "call_9", "web_search", "{\"q\":1}")],
-            "a fragmented name, then echoed whole"
-        );
-
-        let result = read(
-            vec![
-                Step::Chunk(tool_delta(
-                    r#"[{"index":1,"id":"call_b","function":{"name":"get_time","arguments":"{\"tz\""}},{"index":0,"id":"call_a","function":{"name":"get_weather","arguments":"{\"city\""}}]"#,
-                )),
-                Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"call_a","function":{"name":"get_weather","arguments":":\"Oslo\"}"}},{"index":1,"id":"call_b","function":{"name":"get_time","arguments":":\"UTC\"}"}}]"#,
-                )),
-                Step::Chunk(TOOL_CALLS),
-            ],
-            &offering(&["get_weather", "get_time"]),
-            None,
-        )
-        .expect("two complete tool calls");
-        assert_eq!(
-            result.tool_calls,
-            [
-                call(0, "call_a", "get_weather", "{\"city\":\"Oslo\"}"),
-                call(1, "call_b", "get_time", "{\"tz\":\"UTC\"}"),
-            ],
-            "interleaved calls each repeating their own metadata"
+            [call(0, "a", "ab", "{}"), call(1, "b", "abab", "{}")]
         );
     }
 
     #[test]
-    fn an_echo_neither_hides_a_conflict_nor_counts_against_a_limit() {
-        // Another complete name is no echo: it continues the name, and the
-        // result is no tool that was offered.
-        let message = incomplete_message(read(
-            vec![
-                Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"c","function":{"name":"get_weather","arguments":"{}"}}]"#,
-                )),
-                Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"c","function":{"name":"get_time"}}]"#,
-                )),
-                Step::Chunk(TOOL_CALLS),
-            ],
-            &offering(&["get_weather", "get_time"]),
-            None,
-        ));
-        assert!(message.contains("invalid provider tool call"), "{message}");
-        // An echoed name beside another id is still a changed id.
-        let message = incomplete_message(read(
-            vec![
-                Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]"#,
-                )),
-                Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"call_2","function":{"name":"f"}}]"#,
-                )),
-                Step::Chunk(TOOL_CALLS),
-            ],
-            &offering(&["f"]),
-            None,
-        ));
-        assert!(message.contains("changed its id"), "{message}");
-
-        let name = |name: &str| {
-            tool_delta(leaked(format!(
-                r#"[{{"index":0,"id":"c","function":{{"name":"{name}"}}}}]"#
-            )))
-        };
+    fn malformed_and_boundary_names_fail_closed() {
         let longest = "n".repeat(64);
-        let arguments = tool_delta(r#"[{"index":0,"function":{"arguments":"{}"}}]"#);
         let result = read(
             vec![
-                Step::Chunk(name(&longest)),
-                Step::Chunk(name(&longest)),
-                Step::Chunk(arguments),
-                Step::Chunk(name(&longest)),
+                Step::Chunk(tool_delta(leaked(format!(
+                    r#"[{{"index":0,"id":"c","function":{{"name":"{longest}","arguments":"{{}}"}}}}]"#
+                )))),
                 Step::Chunk(TOOL_CALLS),
             ],
             &offering(&[&longest]),
             None,
         )
-        .expect("a name at the limit, echoed");
+        .expect("a name at the limit");
         assert_eq!(result.tool_calls, [call(0, "c", &longest, "{}")]);
-        let half = "n".repeat(32);
-        let result = read(
-            vec![
-                Step::Chunk(name(&half)),
-                Step::Chunk(name(&half)),
-                Step::Chunk(arguments),
-                Step::Chunk(TOOL_CALLS),
-            ],
-            &offering(&[&half]),
+
+        let cases = [
+            (
+                "a name that is not a string",
+                r#"[{"index":0,"id":"c","function":{"name":7,"arguments":"{}"}}]"#,
+                "(malformed)",
+            ),
+            (
+                "a name outside the function-name alphabet",
+                r#"[{"index":0,"id":"c","function":{"name":"get weather","arguments":"{}"}}]"#,
+                "(malformed)",
+            ),
+            (
+                "a name longer than the limit",
+                r#"[{"index":0,"id":"c","function":{"name":"nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn","arguments":"{}"}}]"#,
+                "(limit exceeded)",
+            ),
+            (
+                "no name at all",
+                r#"[{"index":0,"id":"c","function":{"arguments":"{}"}}]"#,
+                "(incomplete)",
+            ),
+            (
+                "a name that was not offered",
+                r#"[{"index":0,"id":"c","function":{"name":"get_time","arguments":"{}"}}]"#,
+                "(unauthorized)",
+            ),
+            (
+                "an offered name with different case",
+                r#"[{"index":0,"id":"c","function":{"name":"Get_Weather","arguments":"{}"}}]"#,
+                "(unauthorized)",
+            ),
+        ];
+        for (case, calls, expected) in cases {
+            let message = incomplete_message(read(
+                vec![Step::Chunk(tool_delta(calls)), Step::Chunk(TOOL_CALLS)],
+                &offering(&["get_weather"]),
+                None,
+            ));
+            assert!(message.contains(expected), "{case}: {message}");
+            assert!(!message.contains("get weather"), "{case}: {message}");
+        }
+    }
+
+    /// A conversation offering one function `name` with `parameters`.
+    fn offering_schema(name: &str, parameters: Option<Value>) -> ChatConversation {
+        ChatConversation {
+            tools: vec![ToolWire {
+                function: FunctionDefinitionWire {
+                    parameters,
+                    ..tool(name).function
+                },
+                ..tool(name)
+            }],
+            ..offering(&[])
+        }
+    }
+
+    /// One complete call to `name` with `arguments`, finished with `tool_calls`.
+    fn calling(name: &str, arguments: &str) -> Vec<Step> {
+        vec![
+            Step::Chunk(tool_delta(leaked(format!(
+                r#"[{{"index":0,"id":"c","function":{{"name":"{name}","arguments":{}}}}}]"#,
+                serde_json::to_string(arguments).expect("JSON string")
+            )))),
+            Step::Chunk(TOOL_CALLS),
+        ]
+    }
+
+    #[test]
+    fn arguments_must_satisfy_the_offered_parameter_schema() {
+        let booking = offering_schema(
+            "book",
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "minLength": 1},
+                    "nights": {"type": "integer", "minimum": 1, "maximum": 30},
+                    "class": {"enum": ["economy", "business"]},
+                    "guests": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "age": {"type": "integer", "minimum": 0}
+                            },
+                            "required": ["name"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["city", "nights"],
+                "additionalProperties": false
+            })),
+        );
+        // Kept exactly as sent: spacing and key order included.
+        let valid = r#"{ "nights": 2, "city": "Oslo", "class": "economy", "guests": [{"name": "Ada", "age": 36}] }"#;
+        let result = read(calling("book", valid), &booking, None).expect("valid arguments");
+        assert_eq!(result.tool_calls, [call(0, "c", "book", valid)]);
+
+        let secret = "sk-live-not-to-be-echoed";
+        let cases = [
+            (
+                "a missing required property",
+                r#"{"city":"Oslo"}"#,
+                "/required",
+            ),
+            (
+                "a wrong type",
+                r#"{"city":"Oslo","nights":"2"}"#,
+                "/properties/nights/type",
+            ),
+            (
+                "a string where a number is required",
+                r#"{"city":"Oslo","nights":"two"}"#,
+                "/type",
+            ),
+            (
+                "a value out of range",
+                r#"{"city":"Oslo","nights":31}"#,
+                "/maximum",
+            ),
+            (
+                "a value outside an enum",
+                r#"{"city":"Oslo","nights":2,"class":"first"}"#,
+                "/enum",
+            ),
+            (
+                "an unexpected property",
+                leaked(format!(
+                    r#"{{"city":"Oslo","nights":2,"token":"{secret}"}}"#
+                )),
+                "/additionalProperties",
+            ),
+            (
+                "a nested object missing its required property",
+                r#"{"city":"Oslo","nights":2,"guests":[{"age":3}]}"#,
+                "/guests/items/required",
+            ),
+            (
+                "a nested unexpected property",
+                leaked(format!(
+                    r#"{{"city":"Oslo","nights":2,"guests":[{{"name":"Ada","pin":"{secret}"}}]}}"#
+                )),
+                "/guests/items/additionalProperties",
+            ),
+            (
+                "a nested wrong type",
+                r#"{"city":"Oslo","nights":2,"guests":[{"name":"Ada","age":-1}]}"#,
+                "/age/minimum",
+            ),
+            (
+                "too many array items",
+                r#"{"city":"Oslo","nights":2,"guests":[{"name":"a"},{"name":"b"},{"name":"c"},{"name":"d"},{"name":"e"}]}"#,
+                "/maxItems",
+            ),
+            ("an array, not an object", "[1]", "not one JSON object"),
+            ("malformed JSON", r#"{"city":"#, "not one JSON object"),
+        ];
+        for (case, arguments, expected) in cases {
+            let error = read(calling("book", arguments), &booking, None)
+                .expect_err("invalid arguments are refused");
+            let ProviderExecutionError::Incomplete {
+                message,
+                facts: seen,
+            } = &error
+            else {
+                panic!("{case}: expected an incomplete stream, got {error:?}");
+            };
+            assert!(
+                message.contains("(invalid arguments)") && message.contains("tool call 0"),
+                "{case}: {message}"
+            );
+            assert!(message.contains(expected), "{case}: {message}");
+            assert!(
+                !message.contains(secret),
+                "{case}: an argument value is echoed: {message}"
+            );
+            assert_eq!(
+                *seen,
+                facts(Some(ChatFinishReason::ToolCalls), Some("tool_calls")),
+                "{case}: the response facts are kept"
+            );
+            let observations = error_observations(&error);
+            assert_eq!(observations.len(), 1, "{case}");
+            assert_eq!(
+                observations[0].classification(),
+                AvailabilityClassification::Unconfirmed,
+                "{case}: a refused call is neither available evidence nor a Provider failure"
+            );
+        }
+    }
+
+    #[test]
+    fn arguments_are_admitted_only_as_strict_i_json() {
+        let open = offering_schema("f", Some(json!({"type": "object"})));
+        for arguments in [
+            "{}",
+            r#"{"a":0.1,"b":-0,"c":1e2,"d":2.50,"e":-1.5E-7,"f":9007199254740992}"#,
+            r#"{"a":18446744073709551615,"b":-9223372036854775808,"c":1e300}"#,
+            r#"{"s":"\"}{\\","n":[1,{"m":2}]}"#,
+        ] {
+            let result = read(calling("f", arguments), &open, None)
+                .unwrap_or_else(|error| panic!("{arguments}: {error:?}"));
+            assert_eq!(result.tool_calls[0].arguments, arguments);
+        }
+        let cases = [
+            ("a duplicate key", r#"{"a":1,"a":2}"#, "key twice"),
+            (
+                "a nested duplicate key",
+                r#"{"a":{"b":1,"b":1}}"#,
+                "key twice",
+            ),
+            (
+                "an integer beyond u64",
+                r#"{"a":18446744073709551616}"#,
+                "not exactly",
+            ),
+            (
+                "an integer beyond 2^53 read as a double",
+                r#"{"a":9007199254740993.0}"#,
+                "not exactly",
+            ),
+            (
+                "more digits than a double keeps",
+                r#"{"a":100.00000000000000001}"#,
+                "not exactly",
+            ),
+            (
+                "a number underflowing to zero",
+                r#"{"a":1e-400}"#,
+                "not exactly",
+            ),
+            (
+                "a number overflowing a double",
+                r#"{"a":1e400}"#,
+                "not valid JSON",
+            ),
+        ];
+        for (case, arguments, expected) in cases {
+            let message = incomplete_message(read(calling("f", arguments), &open, None));
+            assert!(
+                message.contains("(invalid arguments)") && message.contains(expected),
+                "{case}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_enforceable_parameter_schema_admits_a_call() {
+        let parameterless =
+            json!({"type": "object", "properties": {}, "additionalProperties": false});
+        let conversation = offering_schema("ping", Some(parameterless));
+        read(calling("ping", "{}"), &conversation, None).expect("no arguments");
+        assert!(
+            incomplete_message(read(calling("ping", r#"{"x":1}"#), &conversation, None))
+                .contains("/additionalProperties")
+        );
+        let local = offering_schema(
+            "f",
+            Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$defs": {"city": {"type": "string", "pattern": "^[A-Z][a-z]+$"}},
+                "type": "object",
+                "properties": {"city": {"$ref": "#/$defs/city"}, "on": {"type": "string", "format": "date"}}
+            })),
+        );
+        read(
+            calling("f", r#"{"city":"Oslo","on":"2026-10-14"}"#),
+            &local,
             None,
         )
-        .expect("an echo of the name so far");
-        assert_eq!(
-            result.tool_calls,
-            [call(0, "c", &half, "{}")],
-            "the wire cannot tell a repeat of the whole name so far from an echo"
+        .expect("a local reference, a pattern and a format");
+        for (case, arguments) in [
+            ("a referenced pattern", r#"{"city":"oslo"}"#),
+            ("an asserted format", r#"{"on":"14 October"}"#),
+        ] {
+            assert!(
+                incomplete_message(read(calling("f", arguments), &local, None))
+                    .contains("(invalid arguments)"),
+                "{case}"
+            );
+        }
+
+        let cases: [(&str, Option<Value>, &str); 13] = [
+            ("no schema", None, "(missing parameter schema)"),
+            (
+                "a remote reference",
+                Some(json!({"$ref": "https://example.com/s.json"})),
+                "leaves the schema",
+            ),
+            (
+                "a file reference",
+                Some(json!({"properties": {"a": {"$ref": "file:///etc/passwd"}}})),
+                "leaves the schema",
+            ),
+            (
+                "a relative reference",
+                Some(json!({"$ref": "other.json#/a"})),
+                "leaves the schema",
+            ),
+            (
+                "a base URI",
+                Some(json!({"$id": "https://example.com/s"})),
+                "`/$id`",
+            ),
+            (
+                "an unknown keyword",
+                Some(json!({"type": "object", "requird": ["a"]})),
+                "`/requird`",
+            ),
+            (
+                "a draft-07 container",
+                Some(json!({"definitions": {"a": true}})),
+                "`/definitions`",
+            ),
+            (
+                "a content annotation",
+                Some(json!({"properties": {"a": {"contentMediaType": "application/json"}}})),
+                "contentMediaType",
+            ),
+            (
+                "another dialect",
+                Some(json!({"$schema": "http://json-schema.org/draft-07/schema#"})),
+                "dialect",
+            ),
+            (
+                "an unknown format",
+                Some(json!({"properties": {"a": {"format": "bogus"}}})),
+                "cannot be enforced",
+            ),
+            (
+                "an unenforced IDN format",
+                Some(json!({"properties": {"a": {"format": "idn-hostname"}}})),
+                "cannot be enforced",
+            ),
+            (
+                "a backtracking pattern",
+                Some(json!({"properties": {"a": {"pattern": "(a)\\1"}}})),
+                "cannot be enforced",
+            ),
+            (
+                "a schema that is no schema",
+                Some(json!({"properties": {"a": 7}})),
+                "not one",
+            ),
+        ];
+        for (case, parameters, expected) in cases {
+            let message = incomplete_message(read(
+                calling("f", "{}"),
+                &offering_schema("f", parameters),
+                None,
+            ));
+            assert!(
+                (message.contains("(unsupported parameter schema)")
+                    || message.contains("(missing parameter schema)"))
+                    && message.contains(expected),
+                "{case}: {message}"
+            );
+        }
+        let mut deep = json!({"type": "object"});
+        for _ in 0..40 {
+            deep = json!({"not": deep});
+        }
+        assert!(
+            incomplete_message(read(
+                calling("f", "{}"),
+                &offering_schema("f", Some(deep)),
+                None
+            ))
+            .contains("nests deeper")
         );
+    }
+
+    #[test]
+    fn admission_follows_only_the_request_that_produced_the_response() {
+        let two = || offering(&["f", "g"]);
+        let forced = ChatConversation {
+            tool_choice: Some(ToolChoiceWire::Named(NamedToolChoiceWire {
+                kind: "function".to_owned(),
+                function: NamedFunctionWire {
+                    name: "f".to_owned(),
+                },
+            })),
+            ..two()
+        };
+        read(calling("f", "{}"), &forced, None).expect("the forced function");
+        let required = ChatConversation {
+            tool_choice: Some(ToolChoiceWire::Mode("required".to_owned())),
+            ..two()
+        };
+        read(calling("g", "{}"), &required, None).expect("any offered function");
+        let serial = ChatConversation {
+            parallel_tool_calls: Some(false),
+            ..two()
+        };
+        read(calling("g", "{}"), &serial, None).expect("one call");
+
+        // Conversations admission never trusts to have been validated.
+        let mut duplicated = offering(&["f"]);
+        duplicated.tools.push(ToolWire {
+            function: FunctionDefinitionWire {
+                parameters: Some(json!(true)),
+                ..tool("f").function
+            },
+            ..tool("f")
+        });
+        let named_unoffered = ChatConversation {
+            tool_choice: Some(ToolChoiceWire::Named(NamedToolChoiceWire {
+                kind: "function".to_owned(),
+                function: NamedFunctionWire {
+                    name: "h".to_owned(),
+                },
+            })),
+            ..two()
+        };
+        let unknown_mode = ChatConversation {
+            tool_choice: Some(ToolChoiceWire::Mode("anything".to_owned())),
+            ..two()
+        };
+        let not_a_function = ChatConversation {
+            tools: vec![ToolWire {
+                tool_type: "code_interpreter".to_owned(),
+                ..tool("f")
+            }],
+            ..offering(&[])
+        };
+        let cases: [(&str, ChatConversation, &str); 6] = [
+            ("another function than the forced one", forced, "g"),
+            (
+                "tool_choice none",
+                ChatConversation {
+                    tool_choice: Some(ToolChoiceWire::Mode("none".to_owned())),
+                    ..two()
+                },
+                "f",
+            ),
+            ("a function offered twice", duplicated, "f"),
+            (
+                "a forced function that was never offered",
+                named_unoffered,
+                "h",
+            ),
+            ("an unknown tool_choice mode", unknown_mode, "f"),
+            ("a tool that is not a function", not_a_function, "f"),
+        ];
+        for (case, conversation, name) in cases {
+            let message = incomplete_message(read(calling(name, "{}"), &conversation, None));
+            assert!(message.contains("(unauthorized)"), "{case}: {message}");
+        }
         let message = incomplete_message(read(
             vec![
-                Step::Chunk(name(&longest)),
-                Step::Chunk(name("n")),
-                Step::Chunk(arguments),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"a","function":{"name":"f","arguments":"{}"}},{"index":1,"id":"b","function":{"name":"g","arguments":"{}"}}]"#,
+                )),
                 Step::Chunk(TOOL_CALLS),
             ],
-            &offering(&[&longest]),
+            &ChatConversation {
+                parallel_tool_calls: Some(false),
+                ..two()
+            },
             None,
         ));
-        assert!(message.contains("function name longer"), "{message}");
-
-        // Id, name and arguments are four bytes; echoes add none.
-        let config = ProviderExecutionConfig {
-            max_output_bytes: 4,
-            ..ProviderExecutionConfig::default()
-        };
-        let echoed = tool_delta(r#"[{"index":0,"id":"c","function":{"name":"f"}}]"#);
-        let result = wait(read_response(
-            payload(
-                vec![
-                    Step::Chunk(echoed),
-                    Step::Chunk(echoed),
-                    Step::Chunk(arguments),
-                    Step::Chunk(echoed),
-                    Step::Chunk(TOOL_CALLS),
-                ],
-                config.cancellation.clone(),
-            ),
-            200,
-            Instant::now(),
-            None,
-            &config,
-            None,
-            &offering(&["f"]),
-        ))
-        .expect("echoes stay within the response limit");
-        assert_eq!(result.tool_calls, [call(0, "c", "f", "{}")]);
+        assert!(
+            message.contains("(unauthorized)") && message.contains("parallel"),
+            "{message}"
+        );
     }
 
     #[test]

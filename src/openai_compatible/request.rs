@@ -3,12 +3,14 @@
 //! Strict request validation for the OpenAI Chat Completions wire format.
 //! Unknown fields are rejected on deserialization.
 
+use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
+use super::admission;
 use super::error::TransportError;
-use super::stream::{CompletedToolCall, InvalidToolCall};
+use super::stream::{CompletedToolCall, InvalidToolCall, ToolCallRefusal};
 
 /// An OpenAI Chat Completions request, restricted to the fields this transport
 /// explicitly forwards. Unknown fields are rejected on deserialization.
@@ -284,33 +286,75 @@ impl ChatConversation {
         self.tools.iter().any(|tool| tool.function.name == name)
     }
 
-    /// Checks the completed tool calls a Provider returned for this
-    /// conversation against what it allowed: only offered tools, only the
-    /// named one when a function was forced, none with `tool_choice: none`,
-    /// and one at most when parallel calls were turned off.
+    /// Admits the completed tool calls a Provider returned for this
+    /// conversation only as far as this request allowed them. Each call must
+    /// name exactly one function tool offered here, under that exact name;
+    /// none is admitted with `tool_choice: none`, only the named function
+    /// when one was forced, and one call at most when parallel calls were
+    /// turned off. Its arguments must then be one strict JSON object that
+    /// satisfies the parameter schema offered for that function; a function
+    /// offered without one admits no call. Nothing the Provider sent, not a
+    /// name, a definition or an argument, widens what is admitted, and no
+    /// call is changed to fit.
+    ///
+    /// Admission is scoped to this request and is not permission to execute
+    /// a call: whatever executes one must still check it against OCG's own
+    /// tool registry, policies and effective permissions.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidToolCall`] for the first call that was not allowed.
+    /// Returns [`InvalidToolCall`] for the first call that is not admitted.
     pub fn admit_tool_calls(&self, calls: &[CompletedToolCall]) -> Result<(), InvalidToolCall> {
         if self.parallel_tool_calls == Some(false) && calls.len() > 1 {
-            return Err(InvalidToolCall::new(format!(
-                "{} tool calls were returned with parallel_tool_calls off",
-                calls.len()
-            )));
+            return Err(InvalidToolCall::new(
+                ToolCallRefusal::Unauthorized,
+                format!(
+                    "{} tool calls were returned with parallel_tool_calls off",
+                    calls.len()
+                ),
+            ));
         }
+        // Each offered function's schema is compiled once, when a call first
+        // names it.
+        let mut validators: Vec<Option<Validator>> = self.tools.iter().map(|_| None).collect();
         for call in calls {
-            let allowed = match &self.tool_choice {
-                Some(ToolChoiceWire::Mode(mode)) if mode == "none" => false,
-                Some(ToolChoiceWire::Named(named)) => named.function.name == call.name,
-                _ => self.offers(&call.name),
+            let index = call.index;
+            let unauthorized = || {
+                InvalidToolCall::at(
+                    ToolCallRefusal::Unauthorized,
+                    index,
+                    format!(
+                        "tool call {index} names `{}`, which this request did not allow",
+                        call.name
+                    ),
+                )
             };
-            if !allowed {
-                return Err(InvalidToolCall::new(format!(
-                    "tool call {} names `{}`, which this request did not allow",
-                    call.index, call.name
-                )));
+            let chosen = match &self.tool_choice {
+                Some(ToolChoiceWire::Mode(mode)) => matches!(mode.as_str(), "auto" | "required"),
+                Some(ToolChoiceWire::Named(named)) => named.function.name == call.name,
+                None => true,
+            };
+            if !chosen {
+                return Err(unauthorized());
             }
+            let mut offered = self
+                .tools
+                .iter()
+                .enumerate()
+                .filter(|(_, tool)| tool.function.name == call.name);
+            let (position, tool) = match (offered.next(), offered.next()) {
+                (Some(offered), None) if offered.1.tool_type == "function" => offered,
+                _ => return Err(unauthorized()),
+            };
+            let validator = match &mut validators[position] {
+                Some(validator) => validator,
+                slot => slot.insert(admission::parameter_validator(
+                    index,
+                    &tool.function.name,
+                    tool.function.parameters.as_ref(),
+                )?),
+            };
+            admission::admit_arguments(index, &call.name, &call.arguments, validator)?;
         }
         Ok(())
     }
