@@ -175,6 +175,8 @@ pub(crate) use availability_aggregation::{
     prepare_availability_aggregation, read_availability_minute, read_availability_progress,
     read_request_sample,
 };
+#[cfg(test)]
+pub(crate) use availability_aggregation::{WriteProbe, replace_minute};
 
 // ---- storage errors -------------------------------------------------------------
 

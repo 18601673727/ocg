@@ -495,7 +495,10 @@ impl Command {
             Self::CommitAvailabilityAggregation { plan, reply } => {
                 let outcome =
                     storage::commit_availability_aggregation(database, operation, commit, *plan);
-                settle(operation, commit, reply, outcome)
+                // Only this command can decline: `Ok(None)` is its explicit
+                // statement that nothing was committed, not a reply value.
+                let declined = matches!(outcome.result, Ok(None));
+                settle(operation, commit, reply, outcome, declined)
             }
         }
     }
@@ -617,15 +620,21 @@ fn run<T: Send + 'static>(
     body: impl FnOnce(&mut storage::Batch) -> Result<(T, MarkerSubjects), BatchError>,
 ) -> Executed {
     let outcome = storage::run_batch_with(database, operation, kind, commit, body);
-    settle(operation, commit, reply, outcome)
+    settle(operation, commit, reply, outcome, false)
 }
 
 /// Answers a command from its batch outcome and says how it must be waited on.
+/// `declined` is set only by a command that deliberately ended without
+/// committing and replied `Ok`. It leaves nothing staged for the group's
+/// durable commit to cover, so a lost group commit did not lose it: its answer
+/// then reports that nothing of it was committed, like a refusal, because the
+/// decline may rest on state that the lost commit had written.
 fn settle<T: Send + 'static>(
     operation: OperationId,
     commit: Commit,
     reply: Reply<T>,
     outcome: storage::BatchOutcome<T>,
+    declined: bool,
 ) -> Executed {
     let result = outcome.result.map_err(|failure| match failure {
         BatchFailure::Rejected(violation) => DatabaseError::Rejected(violation),
@@ -636,9 +645,10 @@ fn settle<T: Send + 'static>(
         },
     });
     let outcome_unknown = matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
-    let staged = commit == Commit::Staged && result.is_ok();
+    let staged = commit == Commit::Staged && result.is_ok() && !declined;
     let answer: Answer = Box::new(move |lost| {
         let result = match (result, lost) {
+            (Ok(_), Some(error)) if declined => Err(DatabaseError::RolledBack(error.clone())),
             (Ok(_), Some(error)) => Err(DatabaseError::OutcomeUnknown {
                 operation,
                 cause: UnknownCause::Commit(error.clone()),
@@ -724,6 +734,53 @@ struct Shared {
     /// `None` answers a check that the stopping worker will never run.
     space_check: SharedRequest<Option<DiskProtectionStatus>>,
     recovery: SharedRequest<Result<RecoveryReport, RecoveryError>>,
+    #[cfg(test)]
+    probe: GroupProbe,
+}
+
+/// Test seams of the write worker's group commit.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct GroupProbe {
+    /// Armed once: the worker reports it holds a first command, then waits for
+    /// the release before it collects the rest of the group from the queue.
+    gate: std::sync::Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
+    /// The durable group flushes the worker attempted.
+    pub(crate) flushes: AtomicUsize,
+    /// Makes the next flush fail instead of running.
+    pub(crate) fail_next_flush: AtomicBool,
+}
+
+#[cfg(test)]
+impl GroupProbe {
+    /// Holds the next group's worker after its first command. Returns the
+    /// signal that the worker is holding and the release that lets it go.
+    pub(crate) fn hold_next_group(&self) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (entered, held) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        *self.gate.lock().unwrap_or_else(PoisonError::into_inner) = Some((entered, released));
+        (held, release)
+    }
+
+    fn hold_if_armed(&self) {
+        let gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some((entered, released)) = gate {
+            entered.send(()).ok();
+            released.recv_timeout(crate::test_support::WAIT).ok();
+        }
+    }
+}
+
+/// Makes the staged commits of a group durable.
+fn flush_staged(_shared: &Shared, database: &Database) -> Result<(), StorageError> {
+    #[cfg(test)]
+    {
+        _shared.probe.flushes.fetch_add(1, Ordering::SeqCst);
+        if _shared.probe.fail_next_flush.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::corrupted("injected failure of the group's durable commit"));
+        }
+    }
+    storage::persist_staged(database)
 }
 
 impl Shared {
@@ -932,6 +989,8 @@ impl DatabaseWorker {
                     protection: ProtectionCell::new(),
                     space_check: SharedRequest::new(),
                     recovery: SharedRequest::new(),
+                    #[cfg(test)]
+                    probe: GroupProbe::default(),
                 });
                 let _release = ReleaseOnPanic {
                     shared: shared.clone(),
@@ -1413,7 +1472,9 @@ impl WriteWorker {
     /// refused or failed command rolls back only itself, then makes all of
     /// them durable with one empty durable transaction. The separate
     /// transactions are not one atomic batch: a failure of the durable commit
-    /// leaves every staged command's outcome unknown.
+    /// leaves every staged command's outcome unknown. A command that declined
+    /// to commit staged nothing, so it neither needs that durable commit nor
+    /// stays unknown when it fails.
     ///
     /// No command is answered before that durable commit, so no caller acts
     /// on a change that can still be lost, and readers are held back by
@@ -1421,6 +1482,8 @@ impl WriteWorker {
     /// commands not yet run are refused like queued ones, and the staged
     /// commands are still made durable if the database allows it.
     fn execute_group(&mut self, first: Envelope) {
+        #[cfg(test)]
+        self.shared.probe.hold_if_armed();
         let mut group = vec![first];
         while group.len() < GROUP_LIMIT {
             match self.receiver.try_recv() {
@@ -1461,7 +1524,7 @@ impl WriteWorker {
             if executed.iter().any(|(ran, _)| ran.staged)
                 && let Some(opened) = guard.as_ref()
             {
-                lost = storage::persist_staged(&opened.database).err();
+                lost = flush_staged(&shared, &opened.database).err();
             }
         }
         if let Some(error) = &lost {
@@ -2286,6 +2349,12 @@ impl DatabaseHandle {
         limit: usize,
     ) -> Result<ObservedModelPage, DatabaseError> {
         self.read(move |database| storage::read_observed_models(database, &filter, after.as_ref(), limit, MAX_OBSERVED_MODEL_SCAN)).await
+    }
+
+    /// The seams of the write worker's group commit.
+    #[cfg(test)]
+    pub(crate) fn group_probe(&self) -> &GroupProbe {
+        &self.shared.probe
     }
 
     /// Runs `f` on a read worker with the open database, for tests that

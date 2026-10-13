@@ -256,6 +256,8 @@ struct SampleWrite {
     job: JobId,
     expected: Option<Vec<u8>>,
     row: Vec<u8>,
+    /// Whether the row differs from `expected`. An unchanged row is still
+    /// guarded by `expected` at the commit but is not written.
     changed: bool,
 }
 
@@ -264,7 +266,18 @@ struct BucketWrite {
     expected: Option<Vec<u8>>,
     /// `None` removes the bucket, which holds no requests.
     value: Option<Vec<u8>>,
+    /// Whether `value` differs from `expected`. An unchanged bucket is still
+    /// guarded by `expected` at the commit but is neither written nor removed.
     changed: bool,
+}
+
+/// Test probe: the derived-row writes a commit really performed.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct WriteProbe {
+    pub(crate) sample_inserts: std::sync::atomic::AtomicUsize,
+    pub(crate) bucket_inserts: std::sync::atomic::AtomicUsize,
+    pub(crate) bucket_removes: std::sync::atomic::AtomicUsize,
 }
 
 /// One batch, prepared from one snapshot and ready to commit. The commit
@@ -281,6 +294,9 @@ pub(crate) struct AvailabilityPlan {
     /// and before its progress is, so the rollback can be observed.
     #[cfg(test)]
     pub(crate) inject_failure: bool,
+    /// Test probe: counts the sample and bucket writes the commit performs.
+    #[cfg(test)]
+    pub(crate) probe: Option<std::sync::Arc<WriteProbe>>,
 }
 
 impl AvailabilityPlan {
@@ -302,15 +318,19 @@ impl AvailabilityPlan {
         })
     }
 
+    /// The sample rows the commit inserts or replaces: those whose bytes change.
     pub(crate) fn samples_written(&self) -> usize {
         self.samples.iter().filter(|write| write.changed).count()
     }
 
+    /// The bucket rows the commit inserts, replaces or removes: those whose
+    /// bytes change.
     pub(crate) fn buckets_written(&self) -> usize {
         self.buckets.iter().filter(|write| write.changed).count()
     }
 
-    /// The bytes this plan writes, for the write-space check.
+    /// The bytes this plan writes, for the write-space check. It counts every
+    /// guarded row, changed or not, so the allowance stays an upper bound.
     pub(crate) fn encoded_bytes(&self) -> u64 {
         let samples = self
             .samples
@@ -346,6 +366,8 @@ pub(crate) fn prepare_availability_aggregation(
             buckets: Vec::new(),
             #[cfg(test)]
             inject_failure: false,
+            #[cfg(test)]
+            probe: None,
         });
     };
 
@@ -420,6 +442,8 @@ pub(crate) fn prepare_availability_aggregation(
         buckets,
         #[cfg(test)]
         inject_failure: false,
+        #[cfg(test)]
+        probe: None,
     })
 }
 
@@ -455,19 +479,25 @@ fn bucket_mut<'b>(
 
 /// Commits a prepared batch with its operation marker, which names the last
 /// record consumed. Returns the update time when it committed; `None` when
-/// the snapshot is stale or the plan has nothing to apply, and then nothing
-/// is written and no marker is made.
+/// the snapshot is stale or the plan consumed no record, and then nothing is
+/// written and no marker is made. Rows the batch leaves unchanged are checked
+/// but not rewritten; the progress is always written with a non-empty batch.
 pub(crate) fn commit_availability_aggregation(
     database: &Database,
     operation: OperationId,
     commit: Commit,
     plan: AvailabilityPlan,
 ) -> BatchOutcome<Option<Timestamp>> {
-    let Some(last) = plan.consumed_through() else {
-        return BatchOutcome {
-            result: Ok(None),
-            storage_failure: None,
-        };
+    // A plan that consumed no record has nothing to apply, whatever progress
+    // it carries: it must not move the update time or make a marker.
+    let last = match plan.consumed_through() {
+        Some(last) if plan.consumed_records > 0 => last,
+        _ => {
+            return BatchOutcome {
+                result: Ok(None),
+                storage_failure: None,
+            };
+        }
     };
     let subjects = MarkerSubjects::addressed(RecordRef::AvailabilityStat(last));
     run_batch_declinable(
@@ -517,19 +547,37 @@ fn apply(batch: &mut Batch, plan: AvailabilityPlan) -> Result<Option<Timestamp>,
 
     {
         let mut samples = tx.open_table(AVAILABILITY_SAMPLES)?;
-        for write in &plan.samples {
+        for write in plan.samples.iter().filter(|write| write.changed) {
             samples.insert(write.job.get(), write.row.as_slice())?;
+            #[cfg(test)]
+            if let Some(probe) = &plan.probe {
+                probe
+                    .sample_inserts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
     {
         let mut buckets = tx.open_table(AVAILABILITY_MINUTES)?;
-        for write in &plan.buckets {
+        for write in plan.buckets.iter().filter(|write| write.changed) {
             match &write.value {
                 Some(value) => {
                     buckets.insert(write.key.as_slice(), value.as_slice())?;
+                    #[cfg(test)]
+                    if let Some(probe) = &plan.probe {
+                        probe
+                            .bucket_inserts
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
                 None => {
                     buckets.remove(write.key.as_slice())?;
+                    #[cfg(test)]
+                    if let Some(probe) = &plan.probe {
+                        probe
+                            .bucket_removes
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             }
         }
@@ -546,6 +594,25 @@ fn apply(batch: &mut Batch, plan: AvailabilityPlan) -> Result<Option<Timestamp>,
         encode_progress(plan.consumed_through, updated_at).as_slice(),
     )?;
     Ok(Some(updated_at))
+}
+
+/// Test fault: replaces one bucket's counts without touching progress, so a
+/// prepared plan's guard on that bucket is the only thing that can notice.
+#[cfg(test)]
+pub(crate) fn replace_minute(
+    database: &Database,
+    provider: LlmProviderId,
+    model: &str,
+    minute: i64,
+    counts: &AvailabilityCounts,
+) -> Result<(), StorageError> {
+    let tx = database.begin_write()?;
+    tx.open_table(AVAILABILITY_MINUTES)?.insert(
+        minute_key(provider, model, minute).as_slice(),
+        encode_counts(counts).as_slice(),
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// The aggregation progress, as of one read snapshot.

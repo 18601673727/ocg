@@ -5122,6 +5122,512 @@ fn consumption_reads_no_project_associations() {
     worker.shutdown().expect("shutdown");
 }
 
+/// Every operation marker, in order.
+fn markers(handle: &DatabaseHandle) -> Vec<crate::persistence::OperationMarker> {
+    wait(handle.operation_markers(None, 1_000)).expect("read markers")
+}
+
+/// Commits the next batch through a plan that counts the writes it performs.
+/// Returns the report the plan gave before it committed and the sample
+/// inserts, bucket inserts and bucket removals the commit made.
+fn commit_probed(handle: &DatabaseHandle, limit: usize) -> (AvailabilityBatchReport, [usize; 3]) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut plan = wait(handle.prepare_availability(limit)).expect("prepare");
+    let probe = std::sync::Arc::new(crate::storage::WriteProbe::default());
+    plan.probe = Some(probe.clone());
+    let report = plan.report(1).expect("the plan consumes records");
+    assert!(
+        wait(handle.commit_availability(plan))
+            .expect("commit")
+            .is_some()
+    );
+    let writes = [
+        probe.sample_inserts.load(SeqCst),
+        probe.bucket_inserts.load(SeqCst),
+        probe.bucket_removes.load(SeqCst),
+    ];
+    (report, writes)
+}
+
+#[test]
+fn an_empty_prepared_plan_commits_nothing_with_or_without_earlier_progress() {
+    let (_root, directory) = data_directory("aggregation-empty-plan");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(21);
+
+    let empty = wait(handle.prepare_availability(10)).expect("prepare");
+    assert_eq!(empty.consumed_through(), None);
+    let before = markers(&handle);
+    assert_eq!(
+        wait(handle.commit_availability(empty)).expect("commit an empty plan"),
+        None
+    );
+    assert_eq!(
+        wait(handle.availability_progress()).expect("read progress"),
+        AvailabilityAggregationProgress::default()
+    );
+    assert_eq!(markers(&handle), before, "an empty plan makes no marker");
+
+    let job = llm_job(&handle, llm);
+    observe(&handle, job, micros, response(200));
+    consume_batch(&handle, 10);
+    let progress = wait(handle.availability_progress()).expect("read progress");
+    let before = markers(&handle);
+    let empty = wait(handle.prepare_availability(10)).expect("prepare");
+    assert_eq!(
+        empty.consumed_through(),
+        progress.consumed_through,
+        "the empty plan still names the earlier progress"
+    );
+    assert_eq!(
+        wait(handle.commit_availability(empty)).expect("commit an empty plan"),
+        None
+    );
+    assert_eq!(
+        wait(handle.availability_progress()).expect("read progress"),
+        progress,
+        "progress and its update time are unchanged"
+    );
+    assert_eq!(markers(&handle), before, "an empty plan makes no marker");
+    assert_eq!(
+        counts(&handle, provider, "model-a", micros).available,
+        1,
+        "the counts are unchanged"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn unchanged_derived_rows_are_not_rewritten_but_progress_still_advances() {
+    let (_root, directory) = data_directory("aggregation-unchanged-rows");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(23);
+
+    // Duplicate evidence: the request stays Available in the same minute.
+    let duplicated = llm_job(&handle, llm);
+    observe(&handle, duplicated, micros, response(200));
+    consume_batch(&handle, 10);
+    let sample = wait(handle.request_sample(duplicated)).expect("read sample");
+    observe(&handle, duplicated, micros + 1, response(200));
+    let markers_before = markers(&handle).len();
+    let (report, writes) = commit_probed(&handle, 10);
+    assert_eq!(
+        (
+            report.consumed_records,
+            report.samples_written,
+            report.buckets_written
+        ),
+        (1, 0, 0),
+        "the report counts only rows that change"
+    );
+    assert_eq!(writes, [0, 0, 0], "no derived row is rewritten");
+    let progress = wait(handle.availability_progress()).expect("read progress");
+    assert_eq!(
+        progress.consumed_through,
+        Some(report.consumed_through),
+        "progress advances past the real record"
+    );
+    assert_eq!(
+        markers(&handle).len(),
+        markers_before + 1,
+        "with its marker"
+    );
+    assert_eq!(
+        wait(handle.request_sample(duplicated))
+            .expect("read sample")
+            .value,
+        sample.value
+    );
+    assert_eq!(requests(counts(&handle, provider, "model-a", micros)), 1);
+
+    // A batch of one unchanged and one new request writes only the new one.
+    let fresh = llm_job(&handle, llm);
+    observe(&handle, duplicated, micros + 2, response(200));
+    observe(&handle, fresh, micros + 3, response(200));
+    let (report, writes) = commit_probed(&handle, 10);
+    assert_eq!(
+        (report.samples_written, report.buckets_written),
+        (1, 1),
+        "the new request's sample and its bucket"
+    );
+    assert_eq!(writes, [1, 1, 0]);
+    assert_eq!(counts(&handle, provider, "model-a", micros).available, 2);
+
+    // A changed sample whose class and minute stay the same leaves its bucket.
+    let contradicted = llm_job(&handle, llm);
+    observe(&handle, contradicted, micros + 4, bare(200));
+    consume_batch(&handle, 10);
+    observe(
+        &handle,
+        contradicted,
+        micros + 5,
+        failure(provider_failure("overloaded", Some(503), true)),
+    );
+    let (report, writes) = commit_probed(&handle, 10);
+    assert_eq!(
+        (report.samples_written, report.buckets_written),
+        (1, 0),
+        "the contradiction changes the sample row but not its bucket"
+    );
+    assert_eq!(writes, [1, 0, 0]);
+    assert_eq!(counts(&handle, provider, "model-a", micros).unconfirmed, 1);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn counts_that_net_to_the_same_bytes_leave_their_bucket_alone() {
+    let (_root, directory) = data_directory("aggregation-net-unchanged");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(25);
+    let (leaving, arriving) = (llm_job(&handle, llm), llm_job(&handle, llm));
+    observe(&handle, leaving, micros, response(200));
+    observe(&handle, arriving, micros + 1, bare(200));
+    consume_batch(&handle, 10);
+    let before = counts(&handle, provider, "model-a", micros);
+    assert_eq!((before.available, before.unconfirmed), (1, 1));
+
+    // One request leaves Available and one arrives, within one bucket.
+    observe(
+        &handle,
+        leaving,
+        micros + 2,
+        failure(provider_failure("overloaded", Some(503), true)),
+    );
+    observe(
+        &handle,
+        arriving,
+        micros + 3,
+        AvailabilityObservation {
+            status_code: None,
+            finish_reason: Some(ChatFinishReason::Stop),
+            raw_finish_reason: Some("stop".into()),
+            failure: None,
+        },
+    );
+    let (report, writes) = commit_probed(&handle, 10);
+    assert_eq!(
+        (report.samples_written, report.buckets_written),
+        (2, 0),
+        "two samples change and their bucket nets to the same bytes"
+    );
+    assert_eq!(writes, [2, 0, 0]);
+    assert_eq!(counts(&handle, provider, "model-a", micros), before);
+    let class = |job| {
+        wait(handle.request_sample(job))
+            .expect("read sample")
+            .value
+            .expect("sample exists")
+            .sample
+            .classification
+    };
+    assert_eq!(class(leaving), AvailabilityClassification::Unconfirmed);
+    assert_eq!(class(arriving), AvailabilityClassification::Available);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn an_unchanged_bucket_still_guards_the_commit() {
+    let (_root, directory) = data_directory("aggregation-unchanged-guard");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(27);
+    let (leaving, arriving) = (llm_job(&handle, llm), llm_job(&handle, llm));
+    observe(&handle, leaving, micros, response(200));
+    observe(&handle, arriving, micros + 1, bare(200));
+    consume_batch(&handle, 10);
+    observe(
+        &handle,
+        leaving,
+        micros + 2,
+        failure(provider_failure("overloaded", Some(503), true)),
+    );
+    observe(
+        &handle,
+        arriving,
+        micros + 3,
+        AvailabilityObservation {
+            status_code: None,
+            finish_reason: Some(ChatFinishReason::Stop),
+            raw_finish_reason: Some("stop".into()),
+            failure: None,
+        },
+    );
+    let plan = wait(handle.prepare_availability(10)).expect("prepare");
+    assert_eq!(
+        plan.buckets_written(),
+        0,
+        "the bucket is guarded, not written"
+    );
+
+    // Something else changes the guarded bucket without moving the progress.
+    let moved = AvailabilityCounts {
+        rate_limited: 7,
+        ..AvailabilityCounts::default()
+    };
+    let minute = minute_of(at(micros));
+    wait(handle.with_database(move |database| {
+        crate::storage::replace_minute(database, provider, "model-a", minute, &moved)
+    }))
+    .expect("change the bucket");
+    let progress = wait(handle.availability_progress()).expect("read progress");
+    assert_eq!(
+        wait(handle.commit_availability(plan)).expect("commit"),
+        None,
+        "a changed unchanged-bucket makes the preparation stale"
+    );
+    assert_eq!(
+        wait(handle.availability_progress()).expect("read progress"),
+        progress
+    );
+    assert_eq!(counts(&handle, provider, "model-a", micros), moved);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn the_batch_maximum_splits_one_requests_records_and_counts_it_once() {
+    const MAXIMUM: usize = 1_000;
+    let (_root, directory) = data_directory("aggregation-maximum");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(29);
+    let job = llm_job(&handle, llm);
+
+    // The queued records commit in groups; the last one completes the request.
+    let total = MAXIMUM + 1;
+    let mut recorded = 0;
+    while recorded < total {
+        let chunk = (total - recorded).min(200);
+        let pending: Vec<_> = (recorded..recorded + chunk)
+            .map(|index| {
+                let observation = if index + 1 == total {
+                    response(200)
+                } else {
+                    bare(200)
+                };
+                admit(handle.record_availability_stat(NewAvailabilityStat {
+                    job,
+                    observed_at: at(micros + index as i64),
+                    observation,
+                }))
+            })
+            .collect();
+        for wait_for in pending {
+            wait_for().expect("record AvailabilityStat");
+        }
+        recorded += chunk;
+    }
+
+    let first = consume_batch(&handle, usize::MAX);
+    assert_eq!(first.consumed_records, MAXIMUM, "the batch maximum");
+    assert_eq!((first.samples_written, first.buckets_written), (1, 1));
+    let partial = counts(&handle, provider, "model-a", micros);
+    assert_eq!((partial.unconfirmed, requests(partial)), (1, 1));
+
+    let rest = consume_batch(&handle, usize::MAX);
+    assert_eq!(rest.consumed_records, 1, "the remainder");
+    assert_eq!((rest.samples_written, rest.buckets_written), (1, 1));
+    let whole = counts(&handle, provider, "model-a", micros);
+    assert_eq!(
+        (whole.available, whole.unconfirmed, requests(whole)),
+        (1, 0, 1),
+        "the request is counted once, in its final class"
+    );
+    assert_eq!(
+        wait(handle.consume_availability(usize::MAX)).expect("consume"),
+        AvailabilityBatch::Idle {
+            consumed_through: Some(rest.consumed_through)
+        }
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+/// Two plans from one snapshot: committing the first makes the second stale.
+/// Returns the stale plan.
+fn stale_plan(handle: &DatabaseHandle) -> crate::storage::AvailabilityPlan {
+    let first = wait(handle.prepare_availability(1)).expect("prepare");
+    let stale = wait(handle.prepare_availability(1)).expect("prepare");
+    assert!(
+        wait(handle.commit_availability(first))
+            .expect("commit")
+            .is_some()
+    );
+    stale
+}
+
+/// A worker whose recovery does not depend on the free space of the machine.
+fn grouping_worker(directory: &DataDirectory) -> DatabaseWorker {
+    DatabaseWorker::start_with_config(
+        directory,
+        crate::disk_protection::FilesystemConfig {
+            disk_lock_threshold_bytes: 1,
+            disk_resume_threshold_bytes: 2,
+            ..crate::disk_protection::FilesystemConfig::default()
+        },
+    )
+    .expect("start database")
+}
+
+fn one_record(job: JobId, micros: i64) -> NewAvailabilityStat {
+    NewAvailabilityStat {
+        job,
+        observed_at: at(micros),
+        observation: response(200),
+    }
+}
+
+#[test]
+fn a_group_of_declines_makes_no_durable_commit() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_root, directory) = data_directory("aggregation-declined-group");
+    let worker = grouping_worker(&directory);
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(31);
+    let (job, drained) = (llm_job(&handle, llm), llm_job(&handle, llm));
+    observe(&handle, drained, micros, response(200));
+    consume_batch(&handle, 10);
+    let empty = wait(handle.prepare_availability(10)).expect("prepare");
+    assert!(empty.consumed_through().is_some());
+    observe(&handle, job, micros + 1, response(200));
+    observe(&handle, job, micros + 2, response(200));
+    let stale = stale_plan(&handle);
+    let progress = wait(handle.availability_progress()).expect("read progress");
+    let before = markers(&handle);
+
+    let probe = handle.group_probe();
+    let (held, release) = probe.hold_next_group();
+    let flushes = probe.flushes.load(SeqCst);
+    let first = admit(handle.commit_availability(stale));
+    held.recv_timeout(crate::test_support::WAIT)
+        .expect("the worker holds the group's first command");
+    let second = admit(handle.commit_availability(empty));
+    release.send(()).expect("release the group");
+    assert_eq!(first().expect("a stale commit declines"), None);
+    assert_eq!(second().expect("an empty commit declines"), None);
+
+    assert_eq!(
+        probe.flushes.load(SeqCst),
+        flushes,
+        "a group that wrote nothing makes no durable commit"
+    );
+    assert_eq!(
+        wait(handle.availability_progress()).expect("read progress"),
+        progress
+    );
+    assert_eq!(markers(&handle), before);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_decline_beside_writes_is_not_flushed_or_acknowledged_early() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_root, directory) = data_directory("aggregation-mixed-group");
+    let worker = grouping_worker(&directory);
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(33);
+    let (job, first_write, second_write) = (
+        llm_job(&handle, llm),
+        llm_job(&handle, llm),
+        llm_job(&handle, llm),
+    );
+    observe(&handle, job, micros, response(200));
+    observe(&handle, job, micros + 1, response(200));
+    let stale = stale_plan(&handle);
+
+    let probe = handle.group_probe();
+    let (held, release) = probe.hold_next_group();
+    let flushes = probe.flushes.load(SeqCst);
+    let declined = admit(handle.commit_availability(stale));
+    held.recv_timeout(crate::test_support::WAIT)
+        .expect("the worker holds the group's first command");
+    let first = admit(handle.record_availability_stat(one_record(first_write, micros + 2)));
+    let second = admit(handle.record_availability_stat(one_record(second_write, micros + 3)));
+    release.send(()).expect("release the group");
+    assert_eq!(declined().expect("the stale commit declines"), None);
+    first().expect("the first write is acknowledged");
+    second().expect("the second write is acknowledged");
+    assert_eq!(
+        probe.flushes.load(SeqCst),
+        flushes + 1,
+        "the writes get one durable commit"
+    );
+    worker.shutdown().expect("shutdown");
+
+    let worker = DatabaseWorker::start(&directory).expect("reopen database");
+    let handle = worker.handle();
+    for job in [first_write, second_write] {
+        assert_eq!(
+            stats(&handle, job).len(),
+            1,
+            "the acknowledged write is durable"
+        );
+    }
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_lost_group_commit_does_not_make_a_decline_an_uncertain_commit() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_root, directory) = data_directory("aggregation-lost-group");
+    let worker = grouping_worker(&directory);
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(35);
+    let (job, first_write, second_write) = (
+        llm_job(&handle, llm),
+        llm_job(&handle, llm),
+        llm_job(&handle, llm),
+    );
+    observe(&handle, job, micros, response(200));
+    observe(&handle, job, micros + 1, response(200));
+    let stale = stale_plan(&handle);
+
+    let probe = handle.group_probe();
+    let (held, release) = probe.hold_next_group();
+    let flushes = probe.flushes.load(SeqCst);
+    let declined = admit(handle.commit_availability(stale));
+    held.recv_timeout(crate::test_support::WAIT)
+        .expect("the worker holds the group's first command");
+    let first = admit(handle.record_availability_stat(one_record(first_write, micros + 2)));
+    let second = admit(handle.record_availability_stat(one_record(second_write, micros + 3)));
+    probe.fail_next_flush.store(true, SeqCst);
+    release.send(()).expect("release the group");
+
+    let unknown = |result: Result<AvailabilityStatId, DatabaseError>| match result {
+        Err(DatabaseError::OutcomeUnknown { operation, .. }) => operation,
+        other => panic!("a write in a lost group is unknown, got {other:?}"),
+    };
+    let mut written = vec![unknown(first()), unknown(second())];
+    assert!(
+        matches!(declined(), Err(DatabaseError::RolledBack(_))),
+        "the declined command committed nothing, so it is rolled back and not unknown"
+    );
+    assert_eq!(probe.flushes.load(SeqCst), flushes + 1);
+
+    let report = wait(handle.recover_storage()).expect("recover storage");
+    let mut reconciled: Vec<_> = report
+        .reconciled
+        .iter()
+        .map(|(operation, _)| *operation)
+        .collect();
+    written.sort();
+    reconciled.sort();
+    assert_eq!(
+        reconciled, written,
+        "only the writes of the lost group are reconciled"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
 #[test]
 fn a_retry_shares_a_frozen_input_only_with_the_same_configuration() {
     let (_root, directory) = data_directory("configured-retry");
