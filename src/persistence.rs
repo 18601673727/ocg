@@ -792,26 +792,29 @@ impl AvailabilityObservation {
     #[must_use]
     pub fn classification(&self) -> AvailabilityClassification {
         match self.status_code {
-            Some(200) if self.terminates_normally() => AvailabilityClassification::Available,
+            Some(200) if self.normal_termination().is_some() => {
+                AvailabilityClassification::Available
+            }
             status => classify_status(status),
         }
     }
 
-    /// Whether the response ended with a normal terminal finish reason that
-    /// no other fact contradicts. Missing usage is not a contradiction.
-    fn terminates_normally(&self) -> bool {
-        let Some(finish) = self.finish_reason else {
-            return false;
-        };
+    /// The normal terminal finish reason this observation witnesses by
+    /// itself, whatever its HTTP status: Stop or Length, with no failure
+    /// beside it and no raw reason that names another finish reason. Missing
+    /// usage is not a contradiction.
+    fn normal_termination(&self) -> Option<ChatFinishReason> {
+        let finish = self.finish_reason?;
         let normal = matches!(finish, ChatFinishReason::Stop | ChatFinishReason::Length);
         // A failure beside a finish reason is conflicting evidence, and a raw
         // reason that names a different finish reason contradicts the typed one.
-        normal
+        (normal
             && self.failure.is_none()
             && self
                 .raw_finish_reason
                 .as_deref()
-                .is_none_or(|raw| raw == finish.as_openai_str())
+                .is_none_or(|raw| raw == finish.as_openai_str()))
+        .then_some(finish)
     }
 }
 
@@ -857,18 +860,21 @@ impl AvailabilityRequestSample {
     /// input is no sample.
     ///
     /// Explicit contradictions always make the sample Unconfirmed. They are:
-    /// two records observed different HTTP statuses; two records, or one
-    /// record, observed different finish reasons; a record whose raw finish
-    /// reason names a different finish reason than its typed one; and a record
-    /// whose failure carries an HTTP status that differs from the observation's
-    /// status, including when the observation has none. A failure without a
-    /// status, a missing field, or an Unconfirmed record alone is not a
-    /// contradiction.
+    /// two different supplied HTTP statuses, where a failure's status counts
+    /// as supplied, so that an absent status conflicts with nothing; two
+    /// records, or one record, observed different finish reasons; a record
+    /// whose raw finish reason names a different finish reason than its typed
+    /// one; and a record whose failure carries an HTTP status that differs
+    /// from its own observation's status.
     ///
-    /// Otherwise a record that is Available on its own makes the sample
-    /// Available, and absent that the HTTP status decides, as
-    /// [`AvailabilityObservation::classification`] does. A raw finish reason
-    /// without a typed one is not evidence and is not a contradiction.
+    /// Otherwise the sample is Available when its observed HTTP status is 200
+    /// and some record witnesses a normal termination on its own. The status
+    /// and the termination may come from different records; a record with no
+    /// status, or no finish, does not erase the other. A failure without a
+    /// status, a missing field, or an Unconfirmed record is not a contradiction
+    /// and is never a witness. Without that combination the observed HTTP
+    /// status decides, as for a single observation. A failure status never
+    /// classifies, and neither does a raw finish reason without a typed one.
     pub fn from_records<'a>(
         records: impl IntoIterator<Item = &'a AvailabilityStatRecord>,
     ) -> Result<Option<Self>, MixedJobs> {
@@ -887,12 +893,15 @@ struct RequestEvidence {
     job: Option<JobId>,
     /// The lowest record ID seen, with its observed time.
     first: Option<(AvailabilityStatId, Timestamp)>,
-    /// The first HTTP status observed.
-    status: Option<u16>,
+    /// The first HTTP status a record observed. Only an observed status
+    /// classifies the request.
+    observed_status: Option<u16>,
+    /// The first HTTP status any record supplied, observed or on a failure.
+    supplied_status: Option<u16>,
     /// The first finish reason observed.
     finish: Option<ChatFinishReason>,
-    /// Some record is an Available observation on its own.
-    terminal: bool,
+    /// Some record witnesses a normal termination by itself.
+    witness: bool,
     /// An explicit contradiction has been seen; see `from_records`.
     contradictory: bool,
 }
@@ -914,11 +923,19 @@ impl RequestEvidence {
         };
 
         let observation = &record.observation;
-        self.terminal |= observation.classification() == AvailabilityClassification::Available;
+        self.witness |= observation.normal_termination().is_some();
         if let Some(status) = observation.status_code {
-            match self.status {
+            self.observed_status.get_or_insert(status);
+        }
+        // A missing status is absence, so only supplied statuses are compared.
+        let failure_status = observation
+            .failure
+            .as_ref()
+            .and_then(|failure| failure.status_code);
+        for status in observation.status_code.into_iter().chain(failure_status) {
+            match self.supplied_status {
                 Some(first) => self.contradictory |= first != status,
-                None => self.status = Some(status),
+                None => self.supplied_status = Some(status),
             }
         }
         if let Some(finish) = observation.finish_reason {
@@ -930,13 +947,6 @@ impl RequestEvidence {
                 self.contradictory |= ChatFinishReason::from_openai_str(raw) != finish;
             }
         }
-        let failure_status = observation
-            .failure
-            .as_ref()
-            .and_then(|failure| failure.status_code);
-        if let Some(failure_status) = failure_status {
-            self.contradictory |= observation.status_code != Some(failure_status);
-        }
         Ok(())
     }
 
@@ -944,10 +954,10 @@ impl RequestEvidence {
         let (job, (first_record, observed_at)) = (self.job?, self.first?);
         let classification = if self.contradictory {
             AvailabilityClassification::Unconfirmed
-        } else if self.terminal {
+        } else if self.witness && self.observed_status == Some(200) {
             AvailabilityClassification::Available
         } else {
-            classify_status(self.status)
+            classify_status(self.observed_status)
         };
         Some(AvailabilityRequestSample {
             job,

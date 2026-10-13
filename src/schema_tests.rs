@@ -4130,7 +4130,7 @@ fn explicit_contradictions_make_a_request_unconfirmed_and_keep_its_history() {
             ],
         ),
         (
-            "a failure status that the observed status does not carry",
+            "a failure status that differs from a supplied 200",
             vec![
                 response(200),
                 AvailabilityObservation {
@@ -4291,6 +4291,195 @@ fn a_retry_is_its_own_request_sample_even_with_a_shared_input() {
         (retry_sample.job, retry_sample.classification),
         (retry, AvailabilityClassification::Available),
         "the retry is a separate sample"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+/// The sample of records given in recording order, which must be the same
+/// sample when they are replayed in reverse.
+fn sample_in_either_order(records: &[AvailabilityStatRecord]) -> AvailabilityRequestSample {
+    let forward = sample_of(records);
+    assert_eq!(
+        sample_of(records.iter().rev()),
+        forward,
+        "replay in reverse order reaches the same sample"
+    );
+    forward
+}
+
+#[test]
+fn compatible_facts_split_across_records_make_a_request_available_in_either_order() {
+    let (_root, directory) = data_directory("request-sample-split");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let transport = failure(ProviderFailure {
+        message: "connection reset".into(),
+        ..ProviderFailure::default()
+    });
+    for (finish, raw) in [
+        (ChatFinishReason::Stop, "stop"),
+        (ChatFinishReason::Length, "length"),
+    ] {
+        let job = configured_child(&handle, agent, targeted);
+        observe(&handle, job, 100, bare(200));
+        observe(
+            &handle,
+            job,
+            200,
+            AvailabilityObservation {
+                status_code: None,
+                finish_reason: Some(finish),
+                raw_finish_reason: Some(raw.into()),
+                failure: None,
+            },
+        );
+        observe(&handle, job, 300, transport.clone());
+
+        let records = stats(&handle, job);
+        for record in &records {
+            assert_eq!(
+                sample_of(std::slice::from_ref(record)).classification,
+                AvailabilityClassification::Unconfirmed,
+                "each record is Unconfirmed on its own"
+            );
+        }
+        let sample = sample_in_either_order(&records);
+        assert_eq!(
+            (
+                sample.first_record,
+                sample.observed_at,
+                sample.classification
+            ),
+            (
+                records[0].id,
+                at(100),
+                AvailabilityClassification::Available
+            ),
+            "a 200 and a normal {raw} finish in separate records are one completion"
+        );
+        assert_eq!(
+            sample_of(records.iter().chain(&records)),
+            sample,
+            "duplicate evidence adds no request"
+        );
+    }
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn an_invalid_terminal_observation_is_no_witness_even_when_combined() {
+    let (_root, directory) = data_directory("request-sample-invalid-terminal");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let stream_reset = || {
+        Some(ProviderFailure {
+            message: "stream reset".into(),
+            ..ProviderFailure::default()
+        })
+    };
+    let invalid = [
+        (
+            "a normal finish beside a failure",
+            AvailabilityObservation {
+                status_code: Some(200),
+                finish_reason: Some(ChatFinishReason::Stop),
+                raw_finish_reason: Some("stop".into()),
+                failure: stream_reset(),
+            },
+        ),
+        (
+            "a normal finish without status beside a failure",
+            AvailabilityObservation {
+                status_code: None,
+                finish_reason: Some(ChatFinishReason::Stop),
+                raw_finish_reason: Some("stop".into()),
+                failure: stream_reset(),
+            },
+        ),
+    ];
+    for (case, terminal) in invalid {
+        let job = configured_child(&handle, agent, targeted);
+        observe(&handle, job, 100, terminal);
+        observe(&handle, job, 200, bare(200));
+        let records = stats(&handle, job);
+        assert_eq!(
+            sample_of(&records[..1]).classification,
+            AvailabilityClassification::Unconfirmed,
+            "{case} is Unconfirmed alone"
+        );
+        assert_eq!(
+            sample_in_either_order(&records).classification,
+            AvailabilityClassification::Unconfirmed,
+            "{case} does not become a witness when a 200 is combined with it"
+        );
+    }
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_failure_status_conflicts_only_with_a_different_supplied_status() {
+    let (_root, directory) = data_directory("request-sample-failure-status");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        targeted, agent, ..
+    } = configured(&handle);
+    let failure_only = || AvailabilityObservation {
+        status_code: None,
+        finish_reason: None,
+        raw_finish_reason: None,
+        failure: Some(provider_failure("overloaded", Some(503), true)),
+    };
+
+    let alone = configured_child(&handle, agent, targeted);
+    observe(&handle, alone, 100, failure_only());
+    assert_eq!(
+        sample_in_either_order(&stats(&handle, alone)).classification,
+        AvailabilityClassification::Unconfirmed,
+        "a failure status without an observed status is not classified"
+    );
+
+    let compatible = configured_child(&handle, agent, targeted);
+    observe(&handle, compatible, 100, failure_only());
+    observe(&handle, compatible, 200, bare(503));
+    assert_eq!(
+        sample_in_either_order(&stats(&handle, compatible)).classification,
+        AvailabilityClassification::Unavailable(UnavailableCause::ProviderServerError),
+        "a later observed 503 is compatible with an earlier failure that omitted its status"
+    );
+
+    let different = configured_child(&handle, agent, targeted);
+    observe(&handle, different, 100, failure_only());
+    observe(&handle, different, 200, bare(200));
+    assert_eq!(
+        sample_in_either_order(&stats(&handle, different)).classification,
+        AvailabilityClassification::Unconfirmed,
+        "a supplied 200 differs from the failure's 503"
+    );
+
+    let finish_only = configured_child(&handle, agent, targeted);
+    observe(&handle, finish_only, 100, failure_only());
+    observe(
+        &handle,
+        finish_only,
+        200,
+        AvailabilityObservation {
+            status_code: None,
+            finish_reason: Some(ChatFinishReason::Stop),
+            raw_finish_reason: Some("stop".into()),
+            failure: None,
+        },
+    );
+    assert_eq!(
+        sample_in_either_order(&stats(&handle, finish_only)).classification,
+        AvailabilityClassification::Unconfirmed,
+        "a finish without an observed response status is not a completion"
     );
     worker.shutdown().expect("shutdown");
 }
