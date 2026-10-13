@@ -5765,6 +5765,7 @@ fn a_retry_shares_a_frozen_input_only_with_the_same_configuration() {
 
 // ---- Token annotations and capture ------------------------------------------------
 
+use crate::database::TokenConsumeError;
 use crate::orchestration::execution_runtime::{finish_provider_job, output_sink};
 use crate::persistence::{Measurements as TokenMeasurements, NewLlmProvider as TokenProvider};
 use crate::provider_execution::scripted::{Step, payload};
@@ -5773,9 +5774,10 @@ use crate::provider_execution::{
     execute_chat_with_sink, read_response,
 };
 use crate::token_usage::{
-    RequestEligibility, TokenAnnotation, TokenCount, TokenRequestSample, TokenUsageState,
-    UsageFinality,
+    RequestEligibility, TokenAggregationProgress, TokenAnnotation, TokenBatch, TokenBatchReport,
+    TokenCount, TokenMinuteTotals, TokenRequestSample, TokenUsageState, UsageFinality,
 };
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// Metrics with the given counters, annotated or not.
@@ -5801,7 +5803,16 @@ fn token_metrics(
 }
 
 fn job_metrics(handle: &DatabaseHandle, job: JobId) -> Vec<crate::persistence::MetricsRecord> {
-    wait(handle.job_metrics(job, None, 1_000)).expect("read Metrics")
+    let mut all: Vec<crate::persistence::MetricsRecord> = Vec::new();
+    loop {
+        let page = wait(handle.job_metrics(job, all.last().map(|record| record.id), 1_000))
+            .expect("read Metrics");
+        let done = page.len() < 1_000;
+        all.extend(page);
+        if done {
+            return all;
+        }
+    }
 }
 
 fn stored_sample(handle: &DatabaseHandle, job: JobId) -> Option<TokenRequestSample> {
@@ -6733,6 +6744,1244 @@ fn a_failed_observation_write_is_local_and_changes_nothing_that_settled() {
             .failed_at
             .is_some(),
         "the Job stays failed"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+// ---- Token aggregation ----------------------------------------------------------
+
+type Counters5 = [Option<u32>; 5];
+const NO_COUNTERS: Counters5 = [None; 5];
+const ELIGIBLE: TokenAnnotation = TokenAnnotation::eligible(UsageFinality::Cumulative);
+const ELIGIBLE_FINAL: TokenAnnotation = TokenAnnotation::eligible(UsageFinality::Final);
+
+/// [input, output, cache read, cache write, reasoning] with only input and output.
+fn io5(input: Option<u32>, output: Option<u32>) -> Counters5 {
+    [input, output, None, None, None]
+}
+
+fn token_fact(
+    handle: &DatabaseHandle,
+    job: JobId,
+    micros: i64,
+    token: Option<TokenAnnotation>,
+    counters: Counters5,
+) -> crate::persistence::MetricsId {
+    wait(handle.record_metrics(NewMetrics {
+        job,
+        observed_at: at(micros),
+        measurements: TokenMeasurements {
+            usage: NormalizedUsage {
+                input_tokens: counters[0],
+                output_tokens: counters[1],
+                cache_read_tokens: counters[2],
+                cache_write_tokens: counters[3],
+                reasoning_tokens: counters[4],
+                raw: None,
+            },
+            ..TokenMeasurements::default()
+        },
+        token,
+    }))
+    .expect("record Metrics")
+}
+
+fn consume_tokens(handle: &DatabaseHandle, limit: usize) -> TokenBatchReport {
+    match wait(handle.consume_token_usage(limit)).expect("consume a Token batch") {
+        TokenBatch::Consumed(report) => report,
+        other => panic!("expected a committed Token batch, got {other:?}"),
+    }
+}
+
+/// Consumes until the Token stream is idle; returns the records it took.
+fn drain_tokens(handle: &DatabaseHandle) -> usize {
+    let mut consumed = 0;
+    loop {
+        match wait(handle.consume_token_usage(usize::MAX)).expect("consume a Token batch") {
+            TokenBatch::Consumed(report) => consumed += report.consumed_records,
+            TokenBatch::Idle { .. } => return consumed,
+            other => panic!("Token aggregation must not contend in a test, got {other:?}"),
+        }
+    }
+}
+
+fn token_progress(handle: &DatabaseHandle) -> TokenAggregationProgress {
+    wait(handle.token_progress()).expect("read Token progress")
+}
+
+fn token_bucket(
+    handle: &DatabaseHandle,
+    provider: LlmProviderId,
+    model: &str,
+    micros: i64,
+) -> Option<TokenMinuteTotals> {
+    wait(handle.token_minutes(provider, model.to_owned(), minute_of(at(micros)), 1))
+        .expect("read the Token minute")
+        .value
+        .pop()
+        .map(|(_, totals)| totals)
+}
+
+fn token_sample(handle: &DatabaseHandle, job: JobId) -> Option<TokenRequestSample> {
+    wait(handle.token_request(job))
+        .expect("read the Token request")
+        .value
+        .and_then(|record| record.sample)
+}
+
+/// The stored state equals the pure reducer applied to each Job's records up to
+/// the consumed prefix: per-request samples and every minute bucket.
+fn assert_matches_reducer(handle: &DatabaseHandle, jobs: &[JobId]) {
+    let through = token_progress(handle)
+        .consumed_through
+        .map_or(0, |id| id.get());
+    let mut expected: BTreeMap<(LlmProviderId, String, i64), TokenMinuteTotals> = BTreeMap::new();
+    for job in jobs {
+        let records = job_metrics(handle, *job);
+        let Some(target) = records.first().and_then(|record| record.target.clone()) else {
+            continue;
+        };
+        let prefix: Vec<_> = records
+            .into_iter()
+            .filter(|record| record.id.get() <= through)
+            .collect();
+        let sample = TokenRequestSample::from_metrics(&prefix).expect("one Job");
+        assert_eq!(
+            token_sample(handle, *job),
+            sample,
+            "{job}: the stored request equals the reducer over the consumed prefix"
+        );
+        if let Some(sample) = sample {
+            expected
+                .entry((
+                    target.frozen.provider.id,
+                    target.frozen.config.model.clone(),
+                    minute_of(sample.observed_at),
+                ))
+                .or_default()
+                .step(&sample, true)
+                .expect("the expected totals fit");
+        }
+    }
+    for ((provider, model, minute), totals) in &expected {
+        let stored = wait(handle.token_minutes(*provider, model.clone(), *minute, 1))
+            .expect("read the Token minute")
+            .value;
+        assert_eq!(
+            stored,
+            [(*minute, *totals)],
+            "{model} at minute {minute}: the bucket equals the reducer's totals"
+        );
+    }
+}
+
+fn token_markers(handle: &DatabaseHandle) -> Vec<crate::persistence::OperationMarker> {
+    markers(handle)
+        .into_iter()
+        .filter(|marker| marker.kind == crate::persistence::OperationKind::ConsumeTokenUsage)
+        .collect()
+}
+
+#[test]
+fn an_empty_token_step_writes_nothing_and_a_skipped_batch_still_advances() {
+    let (_root, directory) = data_directory("token-skipped");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let plain = create_job(&handle, new_job("plain", handle.genesis(), Vec::new()));
+    assert_eq!(
+        wait(handle.consume_token_usage(10)).expect("consume"),
+        TokenBatch::Idle {
+            consumed_through: None
+        }
+    );
+    assert_eq!(token_progress(&handle), TokenAggregationProgress::default());
+    assert!(
+        token_markers(&handle).is_empty(),
+        "an idle step makes no marker"
+    );
+
+    // Generic, non-LLM and Excluded records are not request contributions.
+    token_fact(&handle, job, at_minute(1), None, io5(Some(3), None));
+    token_fact(&handle, plain, at_minute(1), None, io5(Some(4), None));
+    let excluded = token_fact(
+        &handle,
+        job,
+        at_minute(1),
+        Some(TokenAnnotation::excluded()),
+        NO_COUNTERS,
+    );
+    // The availability stream has its own progress.
+    observe(&handle, job, at_minute(1), response(200));
+    consume_batch(&handle, 10);
+    let availability = wait(handle.availability_progress()).expect("read progress");
+    assert_eq!(token_progress(&handle), TokenAggregationProgress::default());
+
+    let report = consume_tokens(&handle, 10);
+    assert_eq!(
+        (
+            report.consumed_records,
+            report.unannotated_records,
+            report.requests_written,
+            report.buckets_written,
+            report.consumed_through
+        ),
+        (3, 2, 1, 0, excluded),
+        "every record counts, and only the Excluded one leaves evidence"
+    );
+    assert_eq!(token_progress(&handle).consumed_through, Some(excluded));
+    assert_eq!(
+        wait(handle.availability_progress()).expect("read progress"),
+        availability,
+        "the Token stream did not move the availability stream"
+    );
+    let batch_markers = token_markers(&handle);
+    assert_eq!(
+        batch_markers.len(),
+        1,
+        "a skipped batch still has its marker"
+    );
+    assert_eq!(batch_markers[0].subject, RecordRef::Metrics(excluded));
+    assert_eq!(
+        token_sample(&handle, job),
+        None,
+        "excluded work has no sample"
+    );
+    assert_eq!(
+        wait(handle.token_request(job))
+            .expect("read")
+            .value
+            .map(|r| r.provider),
+        Some(provider),
+        "but its evidence and target are kept"
+    );
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", at_minute(1)),
+        None
+    );
+
+    let progress = token_progress(&handle);
+    assert_eq!(
+        wait(handle.consume_token_usage(10)).expect("consume"),
+        TokenBatch::Idle {
+            consumed_through: Some(excluded)
+        }
+    );
+    assert_eq!(
+        token_progress(&handle),
+        progress,
+        "an idle step writes no update time"
+    );
+    assert_eq!(token_markers(&handle).len(), 1);
+
+    // The reverse independence: availability does not move Token progress.
+    observe(&handle, job, at_minute(2), response(200));
+    consume_batch(&handle, 10);
+    assert_eq!(token_progress(&handle), progress);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_token_batch_takes_one_thousand_records_whatever_they_are() {
+    let (_root, directory) = data_directory("token-boundary");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let mut last = None;
+    for chunk in 0..6 {
+        let pending: Vec<_> = (0..200)
+            .map(|offset| {
+                let index = chunk * 200 + offset;
+                // 1,000 generic records, then the one eligible anchor.
+                let (token, counters) = if index < 1_000 {
+                    (None, io5(Some(1), None))
+                } else {
+                    (Some(ELIGIBLE), NO_COUNTERS)
+                };
+                if index > 1_000 {
+                    return None;
+                }
+                Some(admit(handle.record_metrics(NewMetrics {
+                    job,
+                    observed_at: at(at_minute(3)),
+                    measurements: TokenMeasurements {
+                        usage: NormalizedUsage {
+                            input_tokens: counters[0],
+                            ..NormalizedUsage::default()
+                        },
+                        ..TokenMeasurements::default()
+                    },
+                    token,
+                })))
+            })
+            .collect();
+        for wait_for in pending.into_iter().flatten() {
+            last = Some(wait_for().expect("record Metrics"));
+        }
+    }
+    let last = last.expect("the eligible anchor");
+
+    let first = consume_tokens(&handle, usize::MAX);
+    assert_eq!(first.consumed_records, 1_000, "the batch maximum");
+    assert_eq!(
+        (
+            first.unannotated_records,
+            first.requests_written,
+            first.buckets_written
+        ),
+        (1_000, 0, 0)
+    );
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", at_minute(3)),
+        None,
+        "generic records anchor nothing"
+    );
+    let rest = consume_tokens(&handle, usize::MAX);
+    assert_eq!((rest.consumed_records, rest.consumed_through), (1, last));
+    let bucket = token_bucket(&handle, provider, "model-a", at_minute(3)).expect("a bucket");
+    assert_eq!((bucket.requests, bucket.missing_requests), (1, 1));
+    assert_eq!(
+        wait(handle.consume_token_usage(usize::MAX)).expect("consume"),
+        TokenBatch::Idle {
+            consumed_through: Some(last)
+        }
+    );
+    assert_matches_reducer(&handle, &[job]);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_request_split_across_batches_and_reopens_replaces_its_contribution() {
+    let (_root, directory) = data_directory("token-split");
+    let mut worker = DatabaseWorker::start(&directory).expect("start database");
+    let mut handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let micros = at_minute(7);
+    let reopen = |worker: DatabaseWorker| {
+        worker.shutdown().expect("shutdown");
+        let worker = DatabaseWorker::start(&directory).expect("reopen database");
+        let handle = worker.handle();
+        (worker, handle)
+    };
+
+    // Missing: an eligible anchor with no usage.
+    token_fact(&handle, job, micros, Some(ELIGIBLE), NO_COUNTERS);
+    consume_tokens(&handle, 1);
+    let bucket = token_bucket(&handle, provider, "model-a", micros).expect("a bucket");
+    assert_eq!(
+        (
+            bucket.requests,
+            bucket.missing_requests,
+            bucket.input.missing_requests,
+            bucket.total.unknown_requests
+        ),
+        (1, 1, 1, 1)
+    );
+    assert_eq!(
+        (bucket.input.provisional_sum, bucket.input.final_sum),
+        (0, 0)
+    );
+    assert_matches_reducer(&handle, &[job]);
+
+    // Provisional, after a reopen: the old contribution is replaced, not added to.
+    (worker, handle) = reopen(worker);
+    token_fact(
+        &handle,
+        job,
+        micros + 1,
+        Some(ELIGIBLE),
+        io5(Some(25), Some(5)),
+    );
+    consume_tokens(&handle, 1);
+    let bucket = token_bucket(&handle, provider, "model-a", micros).expect("a bucket");
+    assert_eq!(
+        (
+            bucket.requests,
+            bucket.missing_requests,
+            bucket.incomplete_requests,
+            bucket.input.provisional_requests,
+            bucket.input.provisional_sum,
+            bucket.output.provisional_sum,
+            bucket.total.provisional_sum,
+            bucket.total.unknown_requests,
+        ),
+        (1, 0, 1, 1, 25, 5, 30, 0)
+    );
+    assert_matches_reducer(&handle, &[job]);
+
+    // A duplicate changes nothing physical, but the progress and marker advance.
+    let markers_before = token_markers(&handle).len();
+    token_fact(
+        &handle,
+        job,
+        micros + 2,
+        Some(ELIGIBLE),
+        io5(Some(25), Some(5)),
+    );
+    let report = consume_tokens(&handle, 1);
+    assert_eq!((report.requests_written, report.buckets_written), (0, 0));
+    assert_eq!(token_markers(&handle).len(), markers_before + 1);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros)
+            .expect("a bucket")
+            .input
+            .provisional_sum,
+        25,
+        "a duplicate counts once"
+    );
+
+    // A final below the provisional maximum replaces it; output stays provisional.
+    (worker, handle) = reopen(worker);
+    token_fact(
+        &handle,
+        job,
+        micros + 3,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(10), None),
+    );
+    consume_tokens(&handle, 1);
+    let bucket = token_bucket(&handle, provider, "model-a", micros).expect("a bucket");
+    assert_eq!(
+        (
+            bucket.input.final_requests,
+            bucket.input.final_sum,
+            bucket.input.provisional_sum,
+            bucket.output.provisional_sum,
+            bucket.total.provisional_sum,
+            bucket.complete_requests,
+        ),
+        (1, 10, 0, 5, 15, 0),
+        "the final 10 wins over the provisional 25, and the total is still provisional"
+    );
+    assert_matches_reducer(&handle, &[job]);
+
+    // Output becomes final in a separate record: Complete.
+    token_fact(
+        &handle,
+        job,
+        micros + 4,
+        Some(ELIGIBLE_FINAL),
+        io5(None, Some(7)),
+    );
+    consume_tokens(&handle, 1);
+    let bucket = token_bucket(&handle, provider, "model-a", micros).expect("a bucket");
+    assert_eq!(
+        (
+            bucket.complete_requests,
+            bucket.incomplete_requests,
+            bucket.total.final_requests,
+            bucket.total.final_sum,
+            bucket.total.provisional_sum,
+            bucket.output.provisional_requests,
+        ),
+        (1, 0, 1, 17, 0, 0)
+    );
+    assert_matches_reducer(&handle, &[job]);
+
+    // A conflicting final removes the output's known contribution, keeps input.
+    (worker, handle) = reopen(worker);
+    token_fact(
+        &handle,
+        job,
+        micros + 5,
+        Some(ELIGIBLE_FINAL),
+        io5(None, Some(8)),
+    );
+    consume_tokens(&handle, 1);
+    let bucket = token_bucket(&handle, provider, "model-a", micros).expect("a bucket");
+    assert_eq!(
+        (
+            bucket.output.conflicted_requests,
+            bucket.output.final_sum,
+            bucket.output.final_requests,
+            bucket.input.final_sum,
+            bucket.total.unknown_requests,
+            bucket.total.final_sum,
+            bucket.incomplete_requests,
+        ),
+        (1, 0, 0, 10, 1, 0, 1),
+        "the old known output and total are subtracted, not kept"
+    );
+    assert_matches_reducer(&handle, &[job]);
+    assert_eq!(drain_tokens(&handle), 0);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn fields_zero_detail_and_totals_have_their_own_coverage_and_exact_sums() {
+    let (_root, directory) = data_directory("token-values");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(9);
+    let jobs: Vec<JobId> = (0..5).map(|_| llm_job(&handle, llm)).collect();
+    // A: real zeros. B: the widest counts. C: input only. D: nothing reported.
+    // E: valid core with conflicting optional detail.
+    token_fact(
+        &handle,
+        jobs[0],
+        micros,
+        Some(ELIGIBLE_FINAL),
+        [Some(0), Some(0), Some(0), None, None],
+    );
+    token_fact(
+        &handle,
+        jobs[1],
+        micros,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(u32::MAX), Some(u32::MAX)),
+    );
+    token_fact(
+        &handle,
+        jobs[2],
+        micros,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(5), None),
+    );
+    token_fact(&handle, jobs[3], micros, Some(ELIGIBLE), NO_COUNTERS);
+    token_fact(
+        &handle,
+        jobs[4],
+        micros,
+        Some(ELIGIBLE_FINAL),
+        [Some(2), Some(3), Some(1), None, None],
+    );
+    token_fact(
+        &handle,
+        jobs[4],
+        micros + 1,
+        Some(ELIGIBLE_FINAL),
+        [None, None, Some(2), None, None],
+    );
+    assert_eq!(drain_tokens(&handle), 6);
+
+    let bucket = token_bucket(&handle, provider, "model-a", micros).expect("a bucket");
+    assert_eq!(
+        (
+            bucket.requests,
+            bucket.complete_requests,
+            bucket.incomplete_requests,
+            bucket.missing_requests
+        ),
+        (5, 3, 1, 1),
+        "optional detail never makes final core usage incomplete"
+    );
+    let wide = u128::from(u32::MAX);
+    assert_eq!(
+        (
+            bucket.input.final_requests,
+            bucket.input.final_sum,
+            bucket.input.missing_requests
+        ),
+        (4, wide + 5 + 2, 1),
+        "a reported zero is a known value; a missing one is coverage only"
+    );
+    assert_eq!(
+        (
+            bucket.output.final_requests,
+            bucket.output.final_sum,
+            bucket.output.missing_requests
+        ),
+        (3, wide + 3, 2)
+    );
+    assert_eq!(
+        (
+            bucket.total.final_requests,
+            bucket.total.final_sum,
+            bucket.total.unknown_requests
+        ),
+        (3, 2 * wide + 5, 2),
+        "totals come from requests with both parts: C and D have none, and the sum passes u32::MAX"
+    );
+    assert_eq!(
+        (
+            bucket.cache_read.final_requests,
+            bucket.cache_read.final_sum,
+            bucket.cache_read.conflicted_requests,
+            bucket.cache_read.missing_requests
+        ),
+        (1, 0, 1, 3)
+    );
+    assert_eq!(bucket.cache_write.missing_requests, 5);
+    assert_matches_reducer(&handle, &jobs);
+
+    // An all-missing cohort is not measured zero.
+    let silent = llm_job(&handle, llm);
+    token_fact(&handle, silent, at_minute(10), Some(ELIGIBLE), NO_COUNTERS);
+    drain_tokens(&handle);
+    let empty = token_bucket(&handle, provider, "model-a", at_minute(10)).expect("a bucket");
+    assert_eq!((empty.requests, empty.input.missing_requests), (1, 1));
+    assert_eq!(
+        (
+            empty.input.final_requests,
+            empty.input.provisional_requests,
+            empty.input.final_sum
+        ),
+        (0, 0, 0)
+    );
+    let zero = llm_job(&handle, llm);
+    token_fact(
+        &handle,
+        zero,
+        at_minute(11),
+        Some(ELIGIBLE_FINAL),
+        io5(Some(0), Some(0)),
+    );
+    drain_tokens(&handle);
+    let measured = token_bucket(&handle, provider, "model-a", at_minute(11)).expect("a bucket");
+    assert_eq!(
+        (
+            measured.input.final_requests,
+            measured.input.missing_requests,
+            measured.total.final_requests,
+            measured.total.final_sum
+        ),
+        (1, 0, 1, 0),
+        "a measured zero has coverage where an all-missing cohort has none"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn the_sample_minute_is_the_first_eligible_record_and_no_empty_bucket_is_made() {
+    let (_root, directory) = data_directory("token-time");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    // An earlier unannotated record anchors nothing; the lowest eligible ID does.
+    token_fact(&handle, job, at_minute(1), None, io5(Some(1), None));
+    token_fact(&handle, job, at_minute(5), Some(ELIGIBLE), NO_COUNTERS);
+    assert_eq!(consume_tokens(&handle, 2).consumed_records, 2);
+    // A later, backdated, higher-ID record does not move the bucket.
+    token_fact(
+        &handle,
+        job,
+        at_minute(2),
+        Some(ELIGIBLE_FINAL),
+        io5(Some(8), Some(9)),
+    );
+    token_fact(
+        &handle,
+        job,
+        at_minute(8),
+        Some(ELIGIBLE_FINAL),
+        io5(Some(8), Some(9)),
+    );
+    assert_eq!(drain_tokens(&handle), 2);
+    let bucket = token_bucket(&handle, provider, "model-a", at_minute(5)).expect("a bucket");
+    assert_eq!((bucket.requests, bucket.complete_requests), (1, 1));
+    for minute in [1, 2, 8] {
+        assert_eq!(
+            token_bucket(&handle, provider, "model-a", at_minute(minute)),
+            None
+        );
+    }
+    assert_eq!(
+        token_sample(&handle, job).map(|sample| sample.observed_at),
+        Some(at(at_minute(5)))
+    );
+
+    // Minute edges and negative time use the existing signed minute.
+    let edge = [-60_000_001, -60_000_000, -1, 0, 59_999_999, 60_000_000];
+    let jobs: Vec<JobId> = edge.iter().map(|_| llm_job(&handle, llm)).collect();
+    for (job, micros) in jobs.iter().zip(edge) {
+        token_fact(&handle, *job, micros, Some(ELIGIBLE), NO_COUNTERS);
+    }
+    drain_tokens(&handle);
+    let window = wait(handle.token_minutes(provider, "model-a".into(), -3, 6))
+        .expect("read the window")
+        .value;
+    assert_eq!(
+        window
+            .iter()
+            .map(|(minute, totals)| (*minute, totals.requests))
+            .collect::<Vec<_>>(),
+        [(-2, 1), (-1, 2), (0, 2), (1, 1)],
+        "each edge falls in its own signed minute and empty minutes have no row"
+    );
+    assert_matches_reducer(&handle, &jobs);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn targets_merge_by_provider_and_exact_model_and_retries_stay_separate() {
+    let (_root, directory) = data_directory("token-targets");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let first = provider(&handle, "first");
+    let second = provider(&handle, "second");
+    let profile = |provider, model: &str| {
+        llm_profile(
+            &handle,
+            provider,
+            llm_config(model, &[ModelCapability::Chat]),
+        )
+    };
+    let (a, b) = (profile(first, "m"), profile(first, "m"));
+    let (other_provider, other_case) = (profile(second, "m"), profile(first, "M"));
+    let micros = at_minute(12);
+    let jobs: Vec<(JobId, LlmProviderId, &str)> = vec![
+        (llm_job(&handle, a), first, "m"),
+        (llm_job(&handle, b), first, "m"),
+        (llm_job(&handle, other_provider), second, "m"),
+        (llm_job(&handle, other_case), first, "M"),
+    ];
+    for (job, ..) in &jobs {
+        token_fact(&handle, *job, micros, Some(ELIGIBLE), NO_COUNTERS);
+    }
+    drain_tokens(&handle);
+    for (provider, model, expected) in [(first, "m", 2), (second, "m", 1), (first, "M", 1)] {
+        assert_eq!(
+            token_bucket(&handle, provider, model, micros).map(|totals| totals.requests),
+            Some(expected),
+            "{model} at {provider}"
+        );
+    }
+
+    // An edited Profile keeps the historical target of its earlier Job.
+    let edited = profile(first, "old");
+    let before = llm_job(&handle, edited);
+    wait(handle.start_job(before)).expect("start job");
+    token_fact(&handle, before, micros, Some(ELIGIBLE), NO_COUNTERS);
+    wait(handle.finalize_job(before, JobFinalization::Completed(result("done")))).expect("finish");
+    wait(handle.update_profile(edited, llm_edit(first, "new"))).expect("edit the Profile");
+    let after = llm_job(&handle, edited);
+    token_fact(&handle, after, micros, Some(ELIGIBLE), NO_COUNTERS);
+    drain_tokens(&handle);
+    assert_eq!(
+        token_bucket(&handle, first, "old", micros).map(|t| t.requests),
+        Some(1)
+    );
+    assert_eq!(
+        token_bucket(&handle, first, "new", micros).map(|t| t.requests),
+        Some(1)
+    );
+
+    // A retry is a separate request even when the input is shared.
+    let configured_set = configured(&handle);
+    let original = configured_child(&handle, configured_set.agent, configured_set.targeted);
+    let input = wait(handle.job(original))
+        .expect("read job")
+        .expect("job exists")
+        .input;
+    wait(handle.finalize_job(
+        original,
+        JobFinalization::Failed(result("first try failed")),
+    ))
+    .expect("finish");
+    let retry = wait(handle.retry_job(JobRetry {
+        original,
+        input: RetryInput::Unchanged,
+        name: None,
+        execution_mode: ExecutionMode::Once,
+        eligible_at: None,
+        scheduled_at: None,
+        next_due_at: None,
+        next_iteration_no: None,
+        iteration_no: None,
+        projects: Vec::new(),
+        dependencies: Vec::new(),
+        configuration: configuration(configured_set.agent, configured_set.targeted),
+        assigned_executor: None,
+    }))
+    .expect("retry");
+    assert_eq!(
+        wait(handle.job(retry))
+            .expect("read job")
+            .expect("job exists")
+            .input,
+        input,
+        "the retry shares the input"
+    );
+    token_fact(
+        &handle,
+        original,
+        micros,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(3), Some(4)),
+    );
+    token_fact(
+        &handle,
+        retry,
+        micros,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(3), Some(4)),
+    );
+    drain_tokens(&handle);
+    let model = frozen_model(&handle, original);
+    let bucket = token_bucket(&handle, configured_set.provider, &model, micros).expect("a bucket");
+    assert_eq!(
+        (bucket.requests, bucket.input.final_sum),
+        (2, 6),
+        "two requests, not one request counted twice"
+    );
+    let all: Vec<JobId> = jobs
+        .iter()
+        .map(|(job, ..)| *job)
+        .chain([before, after, original, retry])
+        .collect();
+    assert_matches_reducer(&handle, &all);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn contradictory_eligibility_refuses_the_whole_batch_and_keeps_excluded_evidence() {
+    let (_root, directory) = data_directory("token-contradiction");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let (bad, good) = (llm_job(&handle, llm), llm_job(&handle, llm));
+    let micros = at_minute(14);
+    let excluded = token_fact(
+        &handle,
+        bad,
+        micros,
+        Some(TokenAnnotation::excluded()),
+        NO_COUNTERS,
+    );
+    // Batch one consumes only the Excluded claim: its evidence is stored.
+    assert_eq!(consume_tokens(&handle, 1).consumed_through, excluded);
+    let progress = token_progress(&handle);
+    let state = wait(handle.token_request(bad)).expect("read").value;
+    assert!(state.is_some() && state.expect("state").sample.is_none());
+
+    // A later eligible claim about the same request is a contradiction, and a
+    // valid request in the same batch is not applied either.
+    token_fact(&handle, good, micros, Some(ELIGIBLE), NO_COUNTERS);
+    let eligible = token_fact(&handle, bad, micros, Some(ELIGIBLE), io5(Some(1), Some(1)));
+    let markers_before = token_markers(&handle).len();
+    match wait(handle.consume_token_usage(10)) {
+        Err(TokenConsumeError::Evidence {
+            metrics,
+            job,
+            error,
+        }) => {
+            assert_eq!((metrics, job), (eligible, bad));
+            assert_eq!(
+                error,
+                crate::token_usage::TokenEvidenceError::ContradictoryEligibility(bad)
+            );
+        }
+        other => panic!("expected the contradiction to refuse the batch, got {other:?}"),
+    }
+    assert_eq!(token_progress(&handle), progress, "no progress");
+    assert_eq!(token_markers(&handle).len(), markers_before, "no marker");
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros),
+        None,
+        "no counts"
+    );
+    assert_eq!(token_sample(&handle, good), None, "no partial state");
+    assert_eq!(token_sample(&handle, bad), None);
+    // The refusal repeats until the facts are dealt with; nothing guesses.
+    assert!(matches!(
+        wait(handle.consume_token_usage(10)),
+        Err(TokenConsumeError::Evidence { .. })
+    ));
+    worker.shutdown().expect("shutdown");
+}
+
+fn token_plan(handle: &DatabaseHandle, limit: usize) -> crate::storage::TokenPlan {
+    wait(handle.prepare_token(limit))
+        .expect("prepare")
+        .expect("no contradiction")
+}
+
+/// Commits the next Token batch through a plan that counts its writes.
+fn commit_token_probed(handle: &DatabaseHandle, limit: usize) -> (TokenBatchReport, [usize; 3]) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut plan = token_plan(handle, limit);
+    let probe = std::sync::Arc::new(crate::storage::WriteProbe::default());
+    plan.probe = Some(probe.clone());
+    let report = plan.report(1).expect("the plan consumes records");
+    assert!(wait(handle.commit_token(plan)).expect("commit").is_some());
+    (
+        report,
+        [
+            probe.sample_inserts.load(SeqCst),
+            probe.bucket_inserts.load(SeqCst),
+            probe.bucket_removes.load(SeqCst),
+        ],
+    )
+}
+
+#[test]
+fn token_plans_commit_only_physical_changes_and_decline_when_stale() {
+    let (_root, directory) = data_directory("token-plans");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let micros = at_minute(16);
+
+    // Empty plans commit nothing, before and after progress exists.
+    let before = markers(&handle);
+    let empty = token_plan(&handle, 10);
+    assert_eq!(empty.consumed_through(), None);
+    assert_eq!(wait(handle.commit_token(empty)).expect("commit"), None);
+    token_fact(&handle, job, micros, Some(ELIGIBLE), io5(Some(4), Some(4)));
+    consume_tokens(&handle, 10);
+    let progress = token_progress(&handle);
+    let marker_count = markers(&handle).len();
+    let empty = token_plan(&handle, 10);
+    assert_eq!(empty.consumed_through(), progress.consumed_through);
+    assert_eq!(wait(handle.commit_token(empty)).expect("commit"), None);
+    assert_eq!(token_progress(&handle), progress, "no new update time");
+    assert_eq!(markers(&handle).len(), marker_count, "and no marker");
+    assert!(before.len() < marker_count);
+
+    // Duplicate evidence: no physical write, but progress and marker advance.
+    token_fact(
+        &handle,
+        job,
+        micros + 1,
+        Some(ELIGIBLE),
+        io5(Some(4), Some(4)),
+    );
+    let marker_count = markers(&handle).len();
+    let (report, writes) = commit_token_probed(&handle, 10);
+    assert_eq!((report.requests_written, report.buckets_written), (0, 0));
+    assert_eq!(writes, [0, 0, 0], "reports and physical writes agree");
+    assert_eq!(markers(&handle).len(), marker_count + 1);
+    assert_ne!(token_progress(&handle), progress);
+
+    // A new final changes the request row and its bucket, exactly once each.
+    token_fact(
+        &handle,
+        job,
+        micros + 2,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(4), Some(4)),
+    );
+    let (report, writes) = commit_token_probed(&handle, 10);
+    assert_eq!((report.requests_written, report.buckets_written), (1, 1));
+    assert_eq!(writes, [1, 1, 0]);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros).map(|t| t.total.final_sum),
+        Some(8)
+    );
+
+    // Two plans from one snapshot: the second is stale and applies nothing.
+    token_fact(
+        &handle,
+        job,
+        micros + 3,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(5), None),
+    );
+    token_fact(
+        &handle,
+        job,
+        micros + 4,
+        Some(ELIGIBLE_FINAL),
+        [None, None, Some(1), None, None],
+    );
+    let first = token_plan(&handle, 1);
+    let stale = token_plan(&handle, 2);
+    assert!(wait(handle.commit_token(first)).expect("commit").is_some());
+    let after_first = (
+        token_progress(&handle),
+        token_bucket(&handle, provider, "model-a", micros),
+    );
+    assert_eq!(wait(handle.commit_token(stale)).expect("commit"), None);
+    assert_eq!(
+        (
+            token_progress(&handle),
+            token_bucket(&handle, provider, "model-a", micros)
+        ),
+        after_first
+    );
+    assert_eq!(
+        drain_tokens(&handle),
+        1,
+        "the stale batch's record is consumed once"
+    );
+    assert_matches_reducer(&handle, &[job]);
+
+    // A guarded row that changed since preparation makes a plan stale even
+    // when it would not have rewritten that row.
+    token_fact(
+        &handle,
+        job,
+        micros + 5,
+        Some(ELIGIBLE),
+        io5(Some(4), Some(4)),
+    );
+    let duplicate = token_plan(&handle, 10);
+    assert_eq!(duplicate.requests_written(), 0);
+    wait(
+        handle.with_database(move |database| crate::storage::replace_token_request(database, job)),
+    )
+    .expect("change the guarded request row");
+    let progress = token_progress(&handle);
+    assert_eq!(wait(handle.commit_token(duplicate)).expect("commit"), None);
+    assert_eq!(token_progress(&handle), progress);
+
+    // A bucket changed behind a plan's back makes it stale too.
+    let moved = TokenMinuteTotals {
+        requests: 3,
+        ..TokenMinuteTotals::default()
+    };
+    let minute = minute_of(at(micros));
+    let other = llm_job(&handle, llm);
+    token_fact(&handle, other, micros, Some(ELIGIBLE), NO_COUNTERS);
+    // Skip the duplicate record first, so the next plan covers the new Job.
+    consume_tokens(&handle, 1);
+    let plan = token_plan(&handle, 10);
+    wait(handle.with_database(move |database| {
+        crate::storage::replace_token_minute(database, provider, "model-a", minute, &moved)
+    }))
+    .expect("change the bucket");
+    assert_eq!(wait(handle.commit_token(plan)).expect("commit"), None);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros),
+        Some(moved)
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_failed_token_commit_leaves_state_counts_and_progress_unchanged() {
+    let (_root, directory) = data_directory("token-failed");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let micros = at_minute(18);
+    token_fact(&handle, job, micros, Some(ELIGIBLE), io5(Some(2), Some(3)));
+    token_fact(
+        &handle,
+        job,
+        micros + 1,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(2), Some(3)),
+    );
+
+    let mut plan = token_plan(&handle, 10);
+    plan.inject_failure = true;
+    let error = wait(handle.commit_token(plan)).expect_err("the injected failure rolls back");
+    assert!(
+        matches!(error, DatabaseError::RolledBack(_)),
+        "got {error:?}"
+    );
+    assert!(matches!(
+        wait(handle.token_progress()),
+        Err(DatabaseError::ReadsStorageFailed(_))
+    ));
+    assert!(matches!(
+        worker.shutdown(),
+        Err(DatabaseError::StorageUnavailable(_))
+    ));
+
+    let worker = DatabaseWorker::start(&directory).expect("reopen database");
+    let handle = worker.handle();
+    assert_eq!(token_progress(&handle), TokenAggregationProgress::default());
+    assert_eq!(token_bucket(&handle, provider, "model-a", micros), None);
+    assert!(
+        wait(handle.token_request(job))
+            .expect("read")
+            .value
+            .is_none()
+    );
+    assert_eq!(drain_tokens(&handle), 2, "the records are still unconsumed");
+    assert_matches_reducer(&handle, &[job]);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn stale_token_declines_in_a_group_are_not_flushed_or_uncertain() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (_root, directory) = data_directory("token-group");
+    let worker = DatabaseWorker::start_with_config(
+        &directory,
+        crate::disk_protection::FilesystemConfig {
+            disk_lock_threshold_bytes: 1,
+            disk_resume_threshold_bytes: 2,
+            ..crate::disk_protection::FilesystemConfig::default()
+        },
+    )
+    .expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(20);
+    let (job, first_write, second_write) = (
+        llm_job(&handle, llm),
+        llm_job(&handle, llm),
+        llm_job(&handle, llm),
+    );
+    token_fact(&handle, job, micros, Some(ELIGIBLE), NO_COUNTERS);
+    assert_eq!(drain_tokens(&handle), 1);
+    // Prepared while nothing is unconsumed: an empty plan.
+    let empty = token_plan(&handle, 10);
+    token_fact(
+        &handle,
+        job,
+        micros + 1,
+        Some(ELIGIBLE),
+        io5(Some(1), Some(1)),
+    );
+    token_fact(
+        &handle,
+        job,
+        micros + 2,
+        Some(ELIGIBLE),
+        io5(Some(2), Some(2)),
+    );
+    let stale_plan = || {
+        let first = token_plan(&handle, 1);
+        let stale = token_plan(&handle, 1);
+        assert!(wait(handle.commit_token(first)).expect("commit").is_some());
+        stale
+    };
+
+    // A group of declines makes no durable commit.
+    let stale = stale_plan();
+    let probe = handle.group_probe();
+    let (held, release) = probe.hold_next_group();
+    let flushes = probe.flushes.load(SeqCst);
+    let markers_before = markers(&handle);
+    let first = admit(handle.commit_token(stale));
+    held.recv_timeout(crate::test_support::WAIT)
+        .expect("the worker holds the group's first command");
+    let second = admit(handle.commit_token(empty));
+    release.send(()).expect("release the group");
+    assert_eq!(first().expect("a stale commit declines"), None);
+    assert_eq!(second().expect("an empty commit declines"), None);
+    assert_eq!(
+        probe.flushes.load(SeqCst),
+        flushes,
+        "a group that wrote nothing makes no durable commit"
+    );
+    assert_eq!(markers(&handle), markers_before);
+
+    // A decline beside writes whose group commit is lost is rolled back, and
+    // only the writes are reconciled as uncertain.
+    token_fact(
+        &handle,
+        first_write,
+        micros + 2,
+        Some(ELIGIBLE),
+        NO_COUNTERS,
+    );
+    token_fact(
+        &handle,
+        second_write,
+        micros + 3,
+        Some(ELIGIBLE),
+        NO_COUNTERS,
+    );
+    let stale = stale_plan();
+    let (held, release) = probe.hold_next_group();
+    let declined = admit(handle.commit_token(stale));
+    held.recv_timeout(crate::test_support::WAIT)
+        .expect("the worker holds the group's first command");
+    let write_one = admit(handle.record_availability_stat(NewAvailabilityStat {
+        job: first_write,
+        observed_at: at(micros + 4),
+        observation: response(200),
+    }));
+    let write_two = admit(handle.record_availability_stat(NewAvailabilityStat {
+        job: second_write,
+        observed_at: at(micros + 5),
+        observation: response(200),
+    }));
+    probe.fail_next_flush.store(true, SeqCst);
+    release.send(()).expect("release the group");
+    let unknown = |result: Result<AvailabilityStatId, DatabaseError>| match result {
+        Err(DatabaseError::OutcomeUnknown { operation, .. }) => operation,
+        other => panic!("a write in a lost group is unknown, got {other:?}"),
+    };
+    let mut written = vec![unknown(write_one()), unknown(write_two())];
+    assert!(
+        matches!(declined(), Err(DatabaseError::RolledBack(_))),
+        "the declined Token commit committed nothing"
+    );
+    let report = wait(handle.recover_storage()).expect("recover storage");
+    let mut reconciled: Vec<_> = report
+        .reconciled
+        .iter()
+        .map(|(operation, _)| *operation)
+        .collect();
+    written.sort();
+    reconciled.sort();
+    assert_eq!(reconciled, written, "only the writes are uncertain");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn totals_that_would_leave_their_range_refuse_the_batch_without_writing() {
+    let (_root, directory) = data_directory("token-range");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(22);
+    let minute = minute_of(at(micros));
+    let (job, other) = (llm_job(&handle, llm), llm_job(&handle, llm));
+    token_fact(&handle, job, micros, Some(ELIGIBLE), NO_COUNTERS);
+    consume_tokens(&handle, 10);
+
+    // Overflow: a stored count at its maximum cannot take another request.
+    let full = TokenMinuteTotals {
+        requests: u64::MAX,
+        ..TokenMinuteTotals::default()
+    };
+    wait(handle.with_database(move |database| {
+        crate::storage::replace_token_minute(database, provider, "model-a", minute, &full)
+    }))
+    .expect("set the bucket");
+    token_fact(&handle, other, micros, Some(ELIGIBLE), NO_COUNTERS);
+    let progress = token_progress(&handle);
+    assert!(
+        wait(handle.consume_token_usage(10)).is_err(),
+        "overflow is refused"
+    );
+    assert_eq!(token_progress(&handle), progress);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros),
+        Some(full)
+    );
+    assert!(
+        wait(handle.token_request(other))
+            .expect("read")
+            .value
+            .is_none()
+    );
+
+    // Underflow: a bucket that no longer holds the request cannot give it up.
+    wait(handle.with_database(move |database| {
+        crate::storage::replace_token_minute(
+            database,
+            provider,
+            "model-a",
+            minute,
+            &TokenMinuteTotals::default(),
+        )
+    }))
+    .expect("empty the bucket");
+    // `job` gives up its stored request first, from a bucket that has none.
+    token_fact(
+        &handle,
+        job,
+        micros + 1,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(1), Some(1)),
+    );
+    let progress = token_progress(&handle);
+    assert!(
+        matches!(
+            wait(handle.consume_token_usage(10)),
+            Err(TokenConsumeError::Database(DatabaseError::Read(_)))
+        ),
+        "underflow is refused"
+    );
+    assert_eq!(token_progress(&handle), progress);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros),
+        Some(TokenMinuteTotals::default())
     );
     worker.shutdown().expect("shutdown");
 }

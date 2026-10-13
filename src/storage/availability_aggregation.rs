@@ -109,7 +109,7 @@ impl SampleRow {
 
 /// The bucket key: the Provider, then the minute with its sign bit flipped so
 /// negative minutes sort first, then the exact, case-sensitive model name.
-fn minute_key(provider: LlmProviderId, model: &str, minute: i64) -> Vec<u8> {
+pub(super) fn minute_key(provider: LlmProviderId, model: &str, minute: i64) -> Vec<u8> {
     let mut key = Vec::with_capacity(16 + model.len());
     key.extend_from_slice(&provider.get().to_be_bytes());
     key.extend_from_slice(&((minute as u64) ^ (1 << 63)).to_be_bytes());
@@ -148,7 +148,7 @@ fn decode_counts(bytes: &[u8]) -> DecodeResult<AvailabilityCounts> {
 
 /// The stored progress as (last consumed ID or 0, update time). Nothing stored
 /// means nothing consumed.
-fn decode_progress(bytes: Option<&[u8]>) -> DecodeResult<(u64, Option<Timestamp>)> {
+pub(super) fn decode_progress(bytes: Option<&[u8]>) -> DecodeResult<(u64, Option<Timestamp>)> {
     let Some(bytes) = bytes else {
         return Ok((0, None));
     };
@@ -159,7 +159,7 @@ fn decode_progress(bytes: Option<&[u8]>) -> DecodeResult<(u64, Option<Timestamp>
     Ok((consumed, Some(updated_at)))
 }
 
-fn encode_progress(consumed_through: u64, updated_at: Timestamp) -> Vec<u8> {
+pub(super) fn encode_progress(consumed_through: u64, updated_at: Timestamp) -> Vec<u8> {
     let mut e = Enc::new(TAG_AGGREGATION_PROGRESS);
     e.u64(consumed_through);
     e.ts(updated_at);

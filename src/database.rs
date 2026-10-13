@@ -31,6 +31,10 @@ pub use crate::storage::{StorageError, StorageErrorKind};
 use crate::system_policy::{
     self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError,
 };
+use crate::token_usage::{
+    TokenAggregationProgress, TokenBatch, TokenEvidenceError, TokenMinuteTotals,
+    TokenRequestRecord, TokenSnapshot,
+};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
 /// The most queued commands one group commit covers. Commands that queue up
@@ -79,6 +83,22 @@ const TRANSACTION_ALLOWANCE_BYTES: u64 = 1024 * 1024;
 ///   storage with [`DatabaseHandle::recover_storage`], which reconciles it,
 ///   or call [`DatabaseHandle::reconcile_operation`] after reopening.
 ///
+/// Why a Token aggregation step did not finish.
+#[derive(Debug, thiserror::Error)]
+pub enum TokenConsumeError {
+    #[error(transparent)]
+    Database(#[from] DatabaseError),
+    /// The records of one Job contradict each other. The whole batch was
+    /// refused: nothing was written, the progress did not move, and the raw
+    /// records are unchanged.
+    #[error("Token evidence of {job} (at {metrics}) cannot be reduced: {error}")]
+    Evidence {
+        metrics: MetricsId,
+        job: JobId,
+        error: TokenEvidenceError,
+    },
+}
+
 /// Read errors are separate and say nothing about any command.
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
@@ -476,6 +496,12 @@ enum Command {
         plan: Box<storage::AvailabilityPlan>,
         reply: Reply<Option<Timestamp>>,
     },
+    /// Commits one prepared Token aggregation batch, like
+    /// [`Self::CommitAvailabilityAggregation`].
+    CommitTokenAggregation {
+        plan: Box<storage::TokenPlan>,
+        reply: Reply<Option<Timestamp>>,
+    },
 }
 
 impl Command {
@@ -659,6 +685,12 @@ impl Command {
                 let declined = matches!(outcome.result, Ok(None));
                 settle(operation, commit, reply, outcome, declined)
             }
+            Self::CommitTokenAggregation { plan, reply } => {
+                let outcome = storage::commit_token_aggregation(database, operation, commit, *plan);
+                // The same explicit decline as the availability commit.
+                let declined = matches!(outcome.result, Ok(None));
+                settle(operation, commit, reply, outcome, declined)
+            }
         }
     }
 
@@ -706,6 +738,7 @@ impl Command {
             Self::CreateAgent { agent, .. } => byte_count(agent.name.len()),
             Self::RecordMetrics { metrics, .. } => json_bytes(&metrics.measurements.usage.raw),
             Self::CommitAvailabilityAggregation { plan, .. } => plan.encoded_bytes(),
+            Self::CommitTokenAggregation { plan, .. } => plan.encoded_bytes(),
             Self::RecordAvailabilityStat { stat, .. } => {
                 let observation = &stat.observation;
                 let failure = observation.failure.as_ref().map_or(0, |failure| {
@@ -746,6 +779,7 @@ impl Command {
             Self::RecordMetrics { reply, .. } => refuse(reply, error),
             Self::RecordAvailabilityStat { reply, .. } => refuse(reply, error),
             Self::CommitAvailabilityAggregation { reply, .. } => refuse(reply, error),
+            Self::CommitTokenAggregation { reply, .. } => refuse(reply, error),
         }
     }
 }
@@ -3211,6 +3245,92 @@ impl DatabaseHandle {
         plan: storage::AvailabilityPlan,
     ) -> Result<Option<Timestamp>, DatabaseError> {
         self.submit(|reply| Command::CommitAvailabilityAggregation {
+            plan: Box::new(plan),
+            reply,
+        })
+        .await
+    }
+
+    /// Token aggregation progress: the last Metrics ID consumed by the Token
+    /// stream, which is independent of the availability stream, and the
+    /// wall-clock time of its last batch, as of one read snapshot.
+    pub async fn token_progress(&self) -> Result<TokenAggregationProgress, DatabaseError> {
+        self.read(storage::read_token_progress).await
+    }
+
+    /// The Token request state of a Job, with the progress of the same
+    /// snapshot. A Job with no annotated record has none.
+    pub async fn token_request(
+        &self,
+        job: JobId,
+    ) -> Result<TokenSnapshot<Option<TokenRequestRecord>>, DatabaseError> {
+        self.read(move |database| storage::read_token_request(database, job))
+            .await
+    }
+
+    /// The (Provider, model) buckets that exist in the `count` minutes from
+    /// `from_minute` (a value of [`minute_of`]), in minute order, with the
+    /// progress of the same snapshot. `count` is clamped to 1..=1,000 and the
+    /// read does one lookup per minute, so its cost never depends on history.
+    pub async fn token_minutes(
+        &self,
+        provider: LlmProviderId,
+        model: String,
+        from_minute: i64,
+        count: usize,
+    ) -> Result<TokenSnapshot<Vec<(i64, TokenMinuteTotals)>>, DatabaseError> {
+        self.read(move |database| {
+            storage::read_token_minute_window(database, provider, &model, from_minute, count)
+        })
+        .await
+    }
+
+    /// Consumes at most `limit` of the next committed Metrics records (never
+    /// more than the batch maximum), in ID order, annotated or not. Like
+    /// [`Self::consume_availability`] it prepares from one snapshot, commits
+    /// only if the rows it read are unchanged, and prepares again at most the
+    /// attempt bound. Records that contradict each other refuse the batch
+    /// with nothing written. It is an internal operation: nothing here
+    /// schedules it.
+    pub async fn consume_token_usage(&self, limit: usize) -> Result<TokenBatch, TokenConsumeError> {
+        for attempt in 1..=storage::MAX_AGGREGATION_ATTEMPTS {
+            let plan = self.prepare_token(limit).await??;
+            let Some(report) = plan.report(attempt) else {
+                return Ok(TokenBatch::Idle {
+                    consumed_through: plan.consumed_through(),
+                });
+            };
+            if self.commit_token(plan).await?.is_some() {
+                return Ok(TokenBatch::Consumed(report));
+            }
+        }
+        Ok(TokenBatch::Contended {
+            attempts: storage::MAX_AGGREGATION_ATTEMPTS,
+        })
+    }
+
+    /// Prepares the next Token batch from one read snapshot. Nothing is written.
+    pub(crate) async fn prepare_token(
+        &self,
+        limit: usize,
+    ) -> Result<Result<storage::TokenPlan, TokenConsumeError>, DatabaseError> {
+        let prepared = self
+            .read(move |database| storage::prepare_token_aggregation(database, limit))
+            .await?;
+        Ok(prepared.map_err(|refusal| TokenConsumeError::Evidence {
+            metrics: refusal.metrics,
+            job: refusal.job,
+            error: refusal.error,
+        }))
+    }
+
+    /// Commits a prepared Token batch if the rows it read still hold. `None`
+    /// means the preparation was stale, and nothing was applied.
+    pub(crate) async fn commit_token(
+        &self,
+        plan: storage::TokenPlan,
+    ) -> Result<Option<Timestamp>, DatabaseError> {
+        self.submit(|reply| Command::CommitTokenAggregation {
             plan: Box::new(plan),
             reply,
         })

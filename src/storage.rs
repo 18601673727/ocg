@@ -71,9 +71,12 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// counts and consumption progress. A version 6 file lacks those tables, so
 /// it is refused rather than initialized in place. Version 8 added the
 /// optional Token annotation to Metrics records; a version 7 build would
-/// not decode it, and no annotation is invented for an older file. Files of
-/// any other version are refused on open, before anything is written to them.
-pub(crate) const FORMAT_VERSION: u32 = 8;
+/// not decode it, and no annotation is invented for an older file. Version 9
+/// added the Token aggregation state: per-Job request evidence, sparse minute
+/// totals and the Token stream's progress. A version 8 file lacks those
+/// tables, so it is refused rather than initialized in place. Files of any
+/// other version are refused on open, before anything is written to them.
+pub(crate) const FORMAT_VERSION: u32 = 9;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -173,7 +176,15 @@ const AVAILABILITY_MINUTES: TableDefinition<&[u8], &[u8]> =
 const AGGREGATION_PROGRESS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("aggregation_progress");
 
+/// Job -> its Token request state: the frozen target and the finite evidence
+/// the request has so far. Rebuildable from the raw annotated Metrics.
+const TOKEN_REQUESTS: Records = TableDefinition::new("token_request");
+/// (provider, minute, model) -> Token totals of the buckets that hold at
+/// least one eligible request. Rebuildable like the requests.
+const TOKEN_MINUTES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("token_minute");
+
 mod availability_aggregation;
+mod token_aggregation;
 pub(crate) use availability_aggregation::{
     AvailabilityPlan, MAX_AGGREGATION_ATTEMPTS, commit_availability_aggregation,
     prepare_availability_aggregation, read_availability_minute, read_availability_progress,
@@ -181,6 +192,12 @@ pub(crate) use availability_aggregation::{
 };
 #[cfg(test)]
 pub(crate) use availability_aggregation::{WriteProbe, replace_minute};
+pub(crate) use token_aggregation::{
+    TokenPlan, commit_token_aggregation, prepare_token_aggregation, read_token_minute_window,
+    read_token_progress, read_token_request,
+};
+#[cfg(test)]
+pub(crate) use token_aggregation::{replace_token_minute, replace_token_request};
 
 // ---- storage errors -------------------------------------------------------------
 
@@ -271,6 +288,8 @@ const TAG_AVAILABILITY_STAT: u8 = 14;
 const TAG_REQUEST_SAMPLE: u8 = 15;
 const TAG_MINUTE_COUNTS: u8 = 16;
 const TAG_AGGREGATION_PROGRESS: u8 = 17;
+const TAG_TOKEN_REQUEST: u8 = 18;
+const TAG_TOKEN_MINUTE: u8 = 19;
 
 struct Enc(Vec<u8>);
 
@@ -673,7 +692,7 @@ codes!(OperationKind {
     OperationKind::AssociateJobProject = 13, OperationKind::CreateProject = 14, OperationKind::CreateLlmProvider = 15,
     OperationKind::CreateProfile = 16, OperationKind::CreateAgent = 17, OperationKind::UpdateProfile = 19,
     OperationKind::ConfirmJobStopped = 20, OperationKind::RecordMetrics = 21, OperationKind::RecordAvailabilityStat = 22,
-    OperationKind::ConsumeAvailability = 23,
+    OperationKind::ConsumeAvailability = 23, OperationKind::ConsumeTokenUsage = 24,
 });
 
 // ---- rows ------------------------------------------------------------------------
@@ -1504,6 +1523,8 @@ fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(AVAILABILITY_SAMPLES)?;
     tx.open_table(AVAILABILITY_MINUTES)?;
     tx.open_table(AGGREGATION_PROGRESS)?;
+    tx.open_table(TOKEN_REQUESTS)?;
+    tx.open_table(TOKEN_MINUTES)?;
     tx.open_table(TRANSPORT_EXECUTORS)?;
     tx.open_table(HAS_OUTPUT)?;
     tx.open_table(DEPENDS_ON)?;

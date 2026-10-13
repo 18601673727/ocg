@@ -1235,6 +1235,9 @@ pub enum OperationKind {
     /// One bounded batch of AvailabilityStat aggregation. Its marker's
     /// subject is the last record the batch consumed.
     ConsumeAvailability,
+    /// One bounded batch of Token aggregation. Its marker's subject is the
+    /// last Metrics record the batch consumed.
+    ConsumeTokenUsage,
 }
 
 /// Written in the same transaction as every accepted mutation, so its
