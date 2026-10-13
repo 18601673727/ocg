@@ -819,7 +819,7 @@ async fn parse_stream_body(
     let mut first_byte = None;
     let mut idle_waited = Duration::ZERO;
 
-    loop {
+    'stream: loop {
         if idle_waited >= config.timeout {
             return Err(response.unknown(
                 "provider stream was idle after it may have been delivered",
@@ -895,8 +895,10 @@ async fn parse_stream_body(
                 continue;
             };
             let data = trim_ascii(data);
+            // `[DONE]` ends the response whether or not the connection
+            // closes; whatever follows it is not part of the response.
             if data == b"[DONE]" {
-                continue;
+                break 'stream;
             }
             let event: Value = serde_json::from_slice(data).map_err(|error| {
                 response.incomplete(
@@ -2615,6 +2617,170 @@ mod tests {
         assert_eq!(sink.deltas.concat(), "hihi");
     }
 
+    /// Reads a scripted body with the real reader, a short idle timeout and
+    /// timers running, so a stream that is never ended is reported as idle.
+    fn read_with_timers(
+        steps: Vec<Step>,
+        conversation: ChatConversation,
+    ) -> (
+        Result<ProviderExecutionResult, ProviderExecutionError>,
+        RecordingSink,
+    ) {
+        ntex::rt::System::new("done-test", ntex::rt::DefaultRuntime).block_on(async move {
+            let config = ProviderExecutionConfig {
+                timeout: Duration::from_millis(100),
+                ..ProviderExecutionConfig::default()
+            };
+            let mut sink = RecordingSink::default();
+            let result = read_response(
+                payload(steps, config.cancellation.clone()),
+                200,
+                Instant::now(),
+                None,
+                &config,
+                Some(&mut sink),
+                &conversation,
+            )
+            .await;
+            (result, sink)
+        })
+    }
+
+    #[test]
+    fn done_ends_the_response_though_the_connection_stays_open() {
+        let (result, sink) = read_with_timers(
+            vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk(STOP),
+                Step::Chunk(FINAL_40_60),
+                Step::Chunk(DONE),
+                Step::Stall,
+            ],
+            ChatConversation::default(),
+        );
+        let result = result.expect("the response ended at [DONE]");
+        assert_eq!(result.text, "hi");
+        assert_eq!(result.finish_reason, Some(ChatFinishReason::Stop));
+        assert_eq!(result.usage.input_tokens, Some(40));
+        assert_eq!(sink.deltas, ["hi"], "the output is flushed");
+        assert_eq!(
+            sink.usages()
+                .iter()
+                .map(|(finality, _)| *finality)
+                .collect::<Vec<_>>(),
+            [UsageFinality::Final]
+        );
+
+        // `[DONE]` inside a transport chunk, and split across two; nothing
+        // after it is read.
+        for steps in [
+            vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk(leaked(format!("{STOP}{DONE}data: {{nope}}\n\n"))),
+                Step::Stall,
+            ],
+            vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk(STOP),
+                Step::Chunk("data: [DO"),
+                Step::Chunk("NE]\n\ndata: {nope}\n\n"),
+                Step::Stall,
+            ],
+        ] {
+            let (result, sink) = read_with_timers(steps, ChatConversation::default());
+            let result = result.expect("the response ended at [DONE]");
+            assert_eq!(result.text, "hi");
+            assert_eq!(sink.deltas, ["hi"]);
+        }
+
+        let (result, _) = read_with_timers(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+                Step::Chunk(DONE),
+                Step::Stall,
+            ],
+            offering(&["f"]),
+        );
+        assert_eq!(
+            result.expect("tool calls ended at [DONE]").tool_calls,
+            [call(0, "c", "f", "{}")]
+        );
+
+        // Without `[DONE]` the end of the stream still ends the response.
+        let (result, _) = read_with_timers(
+            vec![Step::Chunk(CONTENT), Step::Chunk(STOP)],
+            ChatConversation::default(),
+        );
+        assert_eq!(result.expect("a finished stream").text, "hi");
+    }
+
+    #[test]
+    fn done_completes_nothing_the_response_did_not() {
+        let partial =
+            tool_delta(r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{\"a\":"}}]"#);
+        let cases: [(&str, Vec<Step>, &str); 3] = [
+            (
+                "no finish event",
+                vec![Step::Chunk(CONTENT), Step::Chunk(DONE), Step::Stall],
+                "without a finish event",
+            ),
+            (
+                "an incomplete tool call",
+                vec![
+                    Step::Chunk(partial),
+                    Step::Chunk(TOOL_CALLS),
+                    Step::Chunk(DONE),
+                    Step::Stall,
+                ],
+                "not one JSON object",
+            ),
+            (
+                "a tool that was not offered",
+                vec![
+                    Step::Chunk(tool_delta(
+                        r#"[{"index":0,"id":"c","function":{"name":"g","arguments":"{}"}}]"#,
+                    )),
+                    Step::Chunk(TOOL_CALLS),
+                    Step::Chunk(DONE),
+                    Step::Stall,
+                ],
+                "invalid provider tool call",
+            ),
+        ];
+        for (case, steps, expected) in cases {
+            let (result, _) = read_with_timers(steps, offering(&["f"]));
+            let message = incomplete_message(result);
+            assert!(message.contains(expected), "{case}: {message}");
+        }
+
+        let (result, sink) = read_with_timers(
+            vec![Step::Chunk(CONTENT), Step::Fail, Step::Chunk(DONE)],
+            ChatConversation::default(),
+        );
+        assert!(
+            matches!(result, Err(ProviderExecutionError::Unknown { .. })),
+            "a transport failure before [DONE] stays unknown, got {result:?}"
+        );
+        assert_eq!(sink.deltas, ["hi"]);
+
+        let (result, _) = read_with_timers(
+            vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk(STOP),
+                Step::Cancel,
+                Step::Chunk(DONE),
+            ],
+            ChatConversation::default(),
+        );
+        assert!(
+            matches!(&result, Err(ProviderExecutionError::Stopped { facts: seen, .. }) if *seen == facts(Some(ChatFinishReason::Stop), Some("stop"))),
+            "a cancellation before [DONE] is a local stop, got {result:?}"
+        );
+    }
+
     #[test]
     fn a_cancellation_wakes_every_waiter_at_once() {
         let token = CancellationToken::default();
@@ -2877,6 +3043,190 @@ mod tests {
             result.tool_calls,
             [call(0, "call_9", "web_search", "{\"q\":\"世界\"}")]
         );
+    }
+
+    #[test]
+    fn repeated_complete_names_are_echoes_not_fragments() {
+        let echoed = |arguments: &str| {
+            tool_delta(leaked(format!(
+                r#"[{{"index":0,"id":"call_1","type":"function","function":{{"name":"get_weather","arguments":{}}}}}]"#,
+                serde_json::to_string(arguments).expect("JSON string")
+            )))
+        };
+        let result = read(
+            vec![
+                Step::Chunk(echoed("")),
+                Step::Chunk(echoed("{\"city\":")),
+                Step::Chunk(echoed("\"Paris\"}")),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["get_weather"]),
+            None,
+        )
+        .expect("a complete tool call");
+        assert_eq!(
+            result.tool_calls,
+            [call(0, "call_1", "get_weather", "{\"city\":\"Paris\"}")],
+            "metadata repeated beside each argument fragment"
+        );
+
+        let result = read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_9","function":{"name":"web_"}}]"#,
+                )),
+                Step::Chunk(tool_delta(r#"[{"index":0,"function":{"name":"search"}}]"#)),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_9","function":{"name":"web_search","arguments":"{\"q\":"}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"function":{"name":"web_search","arguments":"1}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["web_search"]),
+            None,
+        )
+        .expect("a complete tool call");
+        assert_eq!(
+            result.tool_calls,
+            [call(0, "call_9", "web_search", "{\"q\":1}")],
+            "a fragmented name, then echoed whole"
+        );
+
+        let result = read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":1,"id":"call_b","function":{"name":"get_time","arguments":"{\"tz\""}},{"index":0,"id":"call_a","function":{"name":"get_weather","arguments":"{\"city\""}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_a","function":{"name":"get_weather","arguments":":\"Oslo\"}"}},{"index":1,"id":"call_b","function":{"name":"get_time","arguments":":\"UTC\"}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["get_weather", "get_time"]),
+            None,
+        )
+        .expect("two complete tool calls");
+        assert_eq!(
+            result.tool_calls,
+            [
+                call(0, "call_a", "get_weather", "{\"city\":\"Oslo\"}"),
+                call(1, "call_b", "get_time", "{\"tz\":\"UTC\"}"),
+            ],
+            "interleaved calls each repeating their own metadata"
+        );
+    }
+
+    #[test]
+    fn an_echo_neither_hides_a_conflict_nor_counts_against_a_limit() {
+        // Another complete name is no echo: it continues the name, and the
+        // result is no tool that was offered.
+        let message = incomplete_message(read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c","function":{"name":"get_weather","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c","function":{"name":"get_time"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["get_weather", "get_time"]),
+            None,
+        ));
+        assert!(message.contains("invalid provider tool call"), "{message}");
+        // An echoed name beside another id is still a changed id.
+        let message = incomplete_message(read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_1","function":{"name":"f","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_2","function":{"name":"f"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["f"]),
+            None,
+        ));
+        assert!(message.contains("changed its id"), "{message}");
+
+        let name = |name: &str| {
+            tool_delta(leaked(format!(
+                r#"[{{"index":0,"id":"c","function":{{"name":"{name}"}}}}]"#
+            )))
+        };
+        let longest = "n".repeat(64);
+        let arguments = tool_delta(r#"[{"index":0,"function":{"arguments":"{}"}}]"#);
+        let result = read(
+            vec![
+                Step::Chunk(name(&longest)),
+                Step::Chunk(name(&longest)),
+                Step::Chunk(arguments),
+                Step::Chunk(name(&longest)),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&[&longest]),
+            None,
+        )
+        .expect("a name at the limit, echoed");
+        assert_eq!(result.tool_calls, [call(0, "c", &longest, "{}")]);
+        let half = "n".repeat(32);
+        let result = read(
+            vec![
+                Step::Chunk(name(&half)),
+                Step::Chunk(name(&half)),
+                Step::Chunk(arguments),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&[&half]),
+            None,
+        )
+        .expect("an echo of the name so far");
+        assert_eq!(
+            result.tool_calls,
+            [call(0, "c", &half, "{}")],
+            "the wire cannot tell a repeat of the whole name so far from an echo"
+        );
+        let message = incomplete_message(read(
+            vec![
+                Step::Chunk(name(&longest)),
+                Step::Chunk(name("n")),
+                Step::Chunk(arguments),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&[&longest]),
+            None,
+        ));
+        assert!(message.contains("function name longer"), "{message}");
+
+        // Id, name and arguments are four bytes; echoes add none.
+        let config = ProviderExecutionConfig {
+            max_output_bytes: 4,
+            ..ProviderExecutionConfig::default()
+        };
+        let echoed = tool_delta(r#"[{"index":0,"id":"c","function":{"name":"f"}}]"#);
+        let result = wait(read_response(
+            payload(
+                vec![
+                    Step::Chunk(echoed),
+                    Step::Chunk(echoed),
+                    Step::Chunk(arguments),
+                    Step::Chunk(echoed),
+                    Step::Chunk(TOOL_CALLS),
+                ],
+                config.cancellation.clone(),
+            ),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            None,
+            &offering(&["f"]),
+        ))
+        .expect("echoes stay within the response limit");
+        assert_eq!(result.tool_calls, [call(0, "c", "f", "{}")]);
     }
 
     #[test]

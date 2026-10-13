@@ -7255,6 +7255,268 @@ fn a_failed_observation_write_is_local_and_changes_nothing_that_settled() {
     worker.shutdown().expect("shutdown");
 }
 
+/// A started local Job that runs `llm` directly and may complete only once
+/// `prerequisite` meets `condition`.
+fn dependent_run(
+    handle: &DatabaseHandle,
+    llm: ProfileId,
+    prerequisite: JobId,
+    condition: DependencyCondition,
+) -> TokenRun {
+    let executor =
+        executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register Executor");
+    let job = create_job(
+        handle,
+        NewJob {
+            configuration: llm_only(llm),
+            dependencies: vec![(prerequisite, condition)],
+            ..new_job("dependent request", handle.genesis(), Vec::new())
+        },
+    );
+    wait(handle.start_local_job(job)).expect("start the Job locally");
+    let input = wait(handle.job(job))
+        .expect("read job")
+        .expect("job exists")
+        .input;
+    TokenRun {
+        executor,
+        job,
+        input,
+    }
+}
+
+/// A successful answer: text, running and final usage, a stop finish.
+fn answered() -> Vec<Step> {
+    vec![
+        Step::Chunk(CUM_10),
+        Step::Chunk(STOP_CHUNK),
+        Step::Chunk(FINAL_INPUT_ONLY),
+        Step::Chunk(DONE_CHUNK),
+    ]
+}
+
+/// The final observations of one successful execution are recorded exactly
+/// once, as the Provider answered.
+fn assert_answer_recorded(handle: &DatabaseHandle, job: JobId, case: &str) {
+    let availability =
+        wait(handle.job_availability(job, None, 10)).expect("read AvailabilityStats");
+    assert_eq!(
+        availability.len(),
+        1,
+        "{case}: one availability observation"
+    );
+    let observation = &availability[0].observation;
+    assert_eq!(
+        (observation.status_code, observation.finish_reason),
+        (Some(200), Some(ChatFinishReason::Stop)),
+        "{case}"
+    );
+    assert!(
+        observation.failure.is_none(),
+        "{case}: no Provider failure is made up"
+    );
+    assert_eq!(
+        observation.classification(),
+        AvailabilityClassification::Available,
+        "{case}"
+    );
+    let metrics = job_metrics(handle, job);
+    let timing: Vec<_> = metrics
+        .iter()
+        .filter(|record| record.token.is_none())
+        .collect();
+    assert_eq!(timing.len(), 1, "{case}: one timing record");
+    assert!(
+        timing[0].measurements.ttfb_ms.is_some()
+            && timing[0].measurements.request_finished_in_ms.is_some(),
+        "{case}"
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|record| record.measurements.usage.input_tokens == Some(40)),
+        "{case}: the final usage is kept"
+    );
+}
+
+#[test]
+fn provider_evidence_is_kept_whether_or_not_the_job_may_complete() {
+    let (_root, directory) = data_directory("refused-completion-evidence");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let settled = |name: &str, finalization: JobFinalization| {
+        let job = create_job(&handle, new_job(name, handle.genesis(), Vec::new()));
+        wait(handle.start_job(job)).expect("start");
+        wait(handle.finalize_job(job, finalization)).expect("settle");
+        job
+    };
+    let succeeded = settled("succeeded", JobFinalization::Completed(result("done")));
+    let failed = settled("failed", JobFinalization::Failed(result("failed")));
+    let waiting = create_job(&handle, new_job("waiting", handle.genesis(), Vec::new()));
+    let cases = [
+        (
+            "a satisfied dependency",
+            succeeded,
+            DependencyCondition::Success,
+            None,
+        ),
+        (
+            "an unsatisfied Success dependency",
+            failed,
+            DependencyCondition::Success,
+            Some(DependencyState::Impossible),
+        ),
+        (
+            "a dependency still waiting",
+            waiting,
+            DependencyCondition::Settled,
+            Some(DependencyState::Waiting),
+        ),
+    ];
+    let mut refused = Vec::new();
+    for (case, prerequisite, condition, refusal) in cases {
+        let run = dependent_run(&handle, llm, prerequisite, condition);
+        let settlement = drive(&handle, run, answered(), BOUND);
+        let job = wait(handle.job(run.job))
+            .expect("read job")
+            .expect("job exists");
+        match (refusal, settlement) {
+            (None, Ok(receipt)) => {
+                assert_eq!(receipt.job, run.job);
+                assert!(job.completed_at.is_some(), "{case}");
+            }
+            (
+                Some(expected),
+                Err(ExecutionRuntimeError::NotSettled {
+                    source,
+                    observations,
+                }),
+            ) => {
+                assert!(
+                    matches!(
+                        &source,
+                        DatabaseError::Rejected(Violation::UnsatisfiedDependency {
+                            job,
+                            prerequisite: named,
+                            state,
+                        }) if *job == run.job && *named == prerequisite && *state == expected
+                    ),
+                    "{case}: {source:?}"
+                );
+                assert!(
+                    observations.is_none(),
+                    "{case}: every observation was recorded"
+                );
+                assert_eq!(
+                    (
+                        job.completed_at,
+                        job.failed_at,
+                        job.cancelled_at,
+                        job.unknown_at
+                    ),
+                    (None, None, None, None),
+                    "{case}: no outcome is claimed"
+                );
+                refused.push(run.job);
+            }
+            (refusal, other) => panic!("{case}: expected the refusal {refusal:?}, got {other:?}"),
+        }
+        assert_answer_recorded(&handle, run.job, case);
+    }
+    refused.sort();
+    let mut blocked = blocking(&handle, llm);
+    blocked.sort();
+    assert_eq!(blocked, refused, "only the unsettled Jobs hold the Profile");
+    worker.shutdown().expect("shutdown");
+
+    let worker = DatabaseWorker::start(&directory).expect("restart");
+    let handle = worker.handle();
+    let mut abandoned = handle.abandoned_at_open().to_vec();
+    abandoned.sort();
+    assert_eq!(
+        abandoned, refused,
+        "their local claims are still reconciled"
+    );
+    assert!(blocking(&handle, llm).is_empty());
+    for job in refused {
+        assert_answer_recorded(&handle, job, "after reconciliation");
+    }
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_refused_completion_reports_the_observations_it_could_not_record() {
+    let (_root, directory) = data_directory("refused-completion-gap");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let failed = create_job(&handle, new_job("failed", handle.genesis(), Vec::new()));
+    wait(handle.start_job(failed)).expect("start");
+    wait(handle.finalize_job(failed, JobFinalization::Failed(result("failed")))).expect("fail");
+    let run = dependent_run(&handle, llm, failed, DependencyCondition::Success);
+    let missing_job = JobId::new(9_999_999);
+    let settlement = {
+        let handle = handle.clone();
+        on_ntex(async move {
+            let config = ProviderExecutionConfig::default();
+            // Streamed observations go to a Job that does not exist, so each
+            // of those writes is refused; no text is streamed to fail.
+            let mut sink = output_sink(handle.clone(), missing_job);
+            announce(Some(&mut sink), ProviderFact::Delivered).await;
+            let execution = read_response(
+                payload(
+                    vec![
+                        Step::Chunk(STOP_CHUNK),
+                        Step::Chunk(FINAL_INPUT_ONLY),
+                        Step::Chunk(DONE_CHUNK),
+                    ],
+                    config.cancellation.clone(),
+                ),
+                200,
+                Instant::now(),
+                None,
+                &config,
+                Some(&mut sink),
+                &ChatConversation::default(),
+            )
+            .await;
+            finish_provider_job(handle, run.executor, run.input, run.job, sink, execution).await
+        })
+    };
+    match settlement {
+        Err(ExecutionRuntimeError::NotSettled {
+            source,
+            observations,
+        }) => {
+            assert!(
+                matches!(
+                    source,
+                    DatabaseError::Rejected(Violation::UnsatisfiedDependency { .. })
+                ),
+                "{source:?}"
+            );
+            assert!(
+                matches!(observations.as_deref(), Some(DatabaseError::Rejected(_))),
+                "the unrecorded observation is reported: {observations:?}"
+            );
+        }
+        other => panic!("expected the refused settlement, got {other:?}"),
+    }
+    let job = wait(handle.job(run.job))
+        .expect("read job")
+        .expect("job exists");
+    assert!(job.completed_at.is_none() && job.failed_at.is_none() && job.unknown_at.is_none());
+    assert_eq!(
+        wait(handle.job_availability(run.job, None, 10))
+            .expect("read AvailabilityStats")
+            .len(),
+        1,
+        "the observation that could be written is still recorded"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
 // ---- Token aggregation ----------------------------------------------------------
 
 type Counters5 = [Option<u32>; 5];
@@ -10440,6 +10702,181 @@ mod lifecycle_closure {
 
         let worker = DatabaseWorker::start(&directory).expect("restart");
         assert!(worker.handle().abandoned_at_open().is_empty());
+        worker.shutdown().expect("shutdown");
+    }
+
+    fn submitted(handle: &DatabaseHandle, input: crate::persistence::JobInputId) -> bool {
+        wait(handle.job_input(input))
+            .expect("read input")
+            .expect("input exists")
+            .submitted_at
+            .is_some()
+    }
+
+    /// The kinds of the committed operations that addressed or created `job`.
+    fn operations_on(handle: &DatabaseHandle, job: JobId) -> Vec<OperationKind> {
+        wait(handle.operation_markers(None, 1_000))
+            .expect("read markers")
+            .into_iter()
+            .filter(|marker| {
+                marker.subject == RecordRef::Job(job) || marker.created == Some(RecordRef::Job(job))
+            })
+            .map(|marker| marker.kind)
+            .collect()
+    }
+
+    #[test]
+    fn a_local_job_is_created_and_claimed_in_one_transaction_or_not_at_all() {
+        let (_root, directory) = data_directory("create-and-claim");
+        let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+        let handle = worker.handle();
+        let Configured {
+            targeted, agent, ..
+        } = configured(&handle);
+        let no_adapter =
+            executor(&handle, "no adapter", ExecutorType::Llm, &[]).expect("register Executor");
+        let parent = create_job(&handle, new_job("parent", handle.genesis(), Vec::new()));
+        let child = || NewJob {
+            configuration: configuration(agent, targeted),
+            ..new_job("local child", parent, Vec::new())
+        };
+        let input = wait(handle.save_job_input(
+            None,
+            JobInputDraft {
+                objective: Some("answer".into()),
+                ..JobInputDraft::default()
+            },
+        ))
+        .expect("save input");
+        let jobs_before = job_count(&handle);
+        let nothing_created = |handle: &DatabaseHandle, case: &str| {
+            assert_eq!(job_count(handle), jobs_before, "{case}: no Job exists");
+            assert!(
+                !submitted(handle, input),
+                "{case}: the input stays unsubmitted"
+            );
+            for profile in [agent, targeted] {
+                assert!(
+                    blocking(handle, profile).is_empty(),
+                    "{case}: no Profile is held"
+                );
+            }
+        };
+
+        // Refused inside the transaction, by the creation's own rules.
+        assert_eq!(
+            violation(wait(handle.create_local_job_with_input(
+                NewJob {
+                    assigned_executor: Some(no_adapter),
+                    ..child()
+                },
+                input
+            ))),
+            Violation::ExecutorLacksTransport {
+                executor: no_adapter,
+                transport: OPENAI
+            }
+        );
+        nothing_created(&handle, "a rejected creation");
+        // Refused before the transaction could commit.
+        assert!(handle.activate_filesystem_protection(space_only(&directory)));
+        let error = wait(handle.create_local_job_with_input(child(), input))
+            .expect_err("protection refuses the creation");
+        assert!(
+            error
+                .command_outcome()
+                .is_some_and(|outcome| outcome != crate::database::CommandOutcome::Unknown),
+            "the creation was known not to commit: {error}"
+        );
+        wait(handle.recover_storage()).expect("recover");
+        nothing_created(&handle, "an uncommitted creation");
+
+        let job = wait(handle.create_local_job_with_input(child(), input))
+            .expect("create and claim the Job");
+        assert_eq!(
+            operations_on(&handle, job),
+            [OperationKind::CreateJobWithInput],
+            "the creation and the start are one committed operation"
+        );
+        assert!(record(&handle, job).started_at.is_some());
+        assert!(submitted(&handle, input));
+        for profile in [agent, targeted] {
+            assert_eq!(blocking(&handle, profile), [job]);
+        }
+        // The process ends before the Provider is ever called.
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        let handle = worker.handle();
+        assert_eq!(
+            handle.abandoned_at_open(),
+            [job],
+            "the claim committed with the Job"
+        );
+        let job_record = record(&handle, job);
+        assert!(job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_some());
+        assert_eq!(
+            (
+                job_record.completed_at,
+                job_record.failed_at,
+                job_record.cancelled_at
+            ),
+            (None, None, None)
+        );
+        for profile in [agent, targeted] {
+            assert!(
+                blocking(&handle, profile).is_empty(),
+                "the Profiles are released"
+            );
+        }
+        wait(handle.finalize_job(parent, JobFinalization::Completed(result("done"))))
+            .expect("the parent settles once its settled child no longer holds it");
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("restart again");
+        assert!(worker.handle().abandoned_at_open().is_empty());
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn the_runtime_never_commits_a_job_without_its_local_claim() {
+        let (_root, directory) = data_directory("runtime-create-and-claim");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (endpoint, _accepted) = silent_provider(1);
+        let setup = silent_setup(&handle, endpoint);
+        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let plain = wait(runtime.scheduler().schedule(ExecutionPlan {
+            executor_id: setup.executor,
+            input: JobInputDraft::default(),
+            job: NewJob {
+                configuration: llm_only(setup.llm),
+                ..new_job("plain plan", handle.genesis(), Vec::new())
+            },
+            outcome: JobOutcome::Completed,
+            result: result("answered"),
+        }))
+        .expect("run the plan");
+        let provider = match wait(runtime.scheduler().schedule_provider(provider_plan(
+            &handle,
+            &setup,
+            Duration::from_millis(300),
+        ))) {
+            Ok(receipt) => receipt,
+            Err(error) => panic!("the request must settle, got {error}"),
+        };
+        runtime.shutdown().expect("shutdown runtime");
+        for job in [plain.job, provider.job] {
+            let operations = operations_on(&handle, job);
+            assert_eq!(operations.first(), Some(&OperationKind::CreateJobWithInput));
+            assert!(
+                !operations.contains(&OperationKind::StartLocalJob),
+                "the start was not a later, separate commit: {operations:?}"
+            );
+            assert!(record(&handle, job).started_at.is_some());
+        }
+        assert!(blocking(&handle, setup.llm).is_empty());
         worker.shutdown().expect("shutdown");
     }
 }

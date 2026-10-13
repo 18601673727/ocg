@@ -1590,6 +1590,21 @@ pub(crate) fn create_job_with_input(batch: &mut Batch, job: NewJob, input: JobIn
     Ok((id, MarkerSubjects::created(RecordRef::JobInput(input), RecordRef::Job(id))))
 }
 
+/// Submits the input, creates its Job and starts it as a local execution of
+/// the opening of `epoch`, all in one transaction. No committed Job of this
+/// process's own execution is ever left holding its Profiles without the
+/// claim by which a later opening settles it; see [`start_local_job`].
+pub(crate) fn create_local_job_with_input(
+    batch: &mut Batch,
+    job: NewJob,
+    input: JobInputId,
+    epoch: u64,
+) -> OpResult<JobId> {
+    let (id, subjects) = create_job_with_input(batch, job, input)?;
+    start_local_job(batch, id, epoch)?;
+    Ok((id, subjects))
+}
+
 /// Creates a new Job that retries `retry.original` under the original's
 /// parent. The original Job, its input and its outputs are not touched.
 ///

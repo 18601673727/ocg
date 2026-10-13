@@ -438,6 +438,11 @@ enum Command {
         input: JobInputId,
         reply: Reply<JobId>,
     },
+    CreateLocalJobWithInput {
+        job: NewJob,
+        input: JobInputId,
+        reply: Reply<JobId>,
+    },
     RetryJob {
         retry: JobRetry,
         reply: Reply<JobId>,
@@ -570,6 +575,17 @@ impl Command {
                 Kind::CreateJobWithInput,
                 reply,
                 |batch| persistence::create_job_with_input(batch, job, input),
+            ),
+            // Its marker is that of the creation; the start is part of it.
+            Self::CreateLocalJobWithInput { job, input, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateJobWithInput,
+                reply,
+                |batch| {
+                    persistence::create_local_job_with_input(batch, job, input, operation.epoch)
+                },
             ),
             Self::RetryJob { retry, reply } => run(
                 database,
@@ -739,7 +755,9 @@ impl Command {
             Self::SaveJobInput { draft, .. } => {
                 text_bytes(&draft.submission_id).saturating_add(text_bytes(&draft.objective))
             }
-            Self::CreateJobWithInput { job, .. } => text_bytes(&job.name),
+            Self::CreateJobWithInput { job, .. } | Self::CreateLocalJobWithInput { job, .. } => {
+                text_bytes(&job.name)
+            }
             Self::RetryJob { retry, .. } => text_bytes(&retry.name),
             Self::StartJob { .. }
             | Self::StartLocalJob { .. }
@@ -796,9 +814,9 @@ impl Command {
         match self {
             Self::BeginCoreLogCleanup { reply, .. } => refuse(reply, error),
             Self::SaveJobInput { reply, .. } => refuse(reply, error),
-            Self::CreateJobWithInput { reply, .. } | Self::RetryJob { reply, .. } => {
-                refuse(reply, error)
-            }
+            Self::CreateJobWithInput { reply, .. }
+            | Self::CreateLocalJobWithInput { reply, .. }
+            | Self::RetryJob { reply, .. } => refuse(reply, error),
             Self::StartJob { reply, .. }
             | Self::StartLocalJob { reply, .. }
             | Self::AssignJobExecutor { reply, .. }
@@ -3243,6 +3261,19 @@ impl DatabaseHandle {
         input: JobInputId,
     ) -> Result<JobId, DatabaseError> {
         self.submit(|reply| Command::CreateJobWithInput { job, input, reply })
+            .await
+    }
+
+    /// Like [`DatabaseHandle::create_job_with_input`], and starts the Job
+    /// like [`DatabaseHandle::start_local_job`] in the same transaction, so
+    /// the Job exists only with its local execution claimed. Either both
+    /// commit or neither does.
+    pub async fn create_local_job_with_input(
+        &self,
+        job: NewJob,
+        input: JobInputId,
+    ) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateLocalJobWithInput { job, input, reply })
             .await
     }
 

@@ -158,9 +158,10 @@ impl InvalidToolCall {
 
 /// Reconstructs the streamed `delta.tool_calls` of one choice. Fragments are
 /// keyed by their wire `index`, never by arrival order, so interleaved calls
-/// stay apart. Name and argument fragments are concatenated exactly as sent;
-/// an id may repeat, but a different id at one index, or one id at two
-/// indexes, is a conflict and is refused rather than merged.
+/// stay apart. Argument fragments are concatenated exactly as sent, and so
+/// are name fragments, except that a repeat of the whole name taken so far is
+/// an echo; an id may repeat, but a different id at one index, or one id at
+/// two indexes, is a conflict and is refused rather than merged.
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallAssembler {
     /// Ordered by `index`. An empty id or name has not been sent yet.
@@ -250,7 +251,15 @@ impl ToolCallAssembler {
                 )));
             }
         }
-        if let Some(name) = name {
+        // Some Providers repeat a call's complete name beside each later
+        // fragment. A name fragment identical to the whole name taken so far
+        // is that echo and changes nothing; any other fragment continues the
+        // name. The wire cannot tell an echo from a genuine fragment that
+        // happens to repeat the whole name so far, so `ab` then `ab` stays
+        // `ab`, never `abab`.
+        if let Some(name) = name
+            && name != call.name
+        {
             if call.name.len().saturating_add(name.len()) > MAX_FUNCTION_NAME_BYTES {
                 return Err(InvalidToolCall::new(format!(
                     "tool call {index} has a function name longer than {MAX_FUNCTION_NAME_BYTES} bytes"

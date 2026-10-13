@@ -29,9 +29,9 @@ pub const EXECUTOR_QUEUE_CAPACITY: usize = 64;
 /// Executor registration is a process or installation concern and must happen
 /// through [`DatabaseHandle::create_executor`] before a plan is submitted. The
 /// executor allocates only the Job lifecycle here: it creates the Job, starts
-/// it, and finalizes it with its published result as one ordered lifecycle.
-/// Provider-specific execution can be inserted between `start_job` and
-/// `finalize_job` without changing the worker ownership model.
+/// it as its own local execution in one transaction, and finalizes it with
+/// its published result. Provider-specific execution can be inserted between
+/// the start and `finalize_job` without changing the worker ownership model.
 #[derive(Debug)]
 pub struct ExecutionPlan {
     /// An existing durable Executor record. This is never registered as part
@@ -117,6 +117,18 @@ pub enum ExecutionRuntimeError {
         receipt: Box<ExecutionReceipt>,
         source: DatabaseError,
     },
+    /// The Provider answered, but the Job's outcome could not be recorded,
+    /// for instance because a dependency does not allow its completion. The
+    /// Job is left as it was, started and unsettled, and keeps its Profiles
+    /// and its local execution claim until it is settled, at the latest by a
+    /// later start of the database; see [`DatabaseHandle::start_local_job`].
+    /// What the Provider was observed to do is still recorded, apart from
+    /// `observations`, the first observation that could not be written.
+    #[error("the Provider answered but the Job was not settled: {source}")]
+    NotSettled {
+        source: DatabaseError,
+        observations: Option<Box<DatabaseError>>,
+    },
     /// The Job's outcome was recorded as unknown, as the receipt shows, but
     /// the stop of its local execution could not be recorded. The Job keeps
     /// its Profiles until a later start of the database settles it as
@@ -162,13 +174,17 @@ enum ExecutorMessage {
     Shutdown,
 }
 
-/// What submitters, the workers and shutdown share. One lock covers both
-/// fields, so a plan either starts before shutdown begins, and then has its
-/// cancellation registered for shutdown to cancel, or never starts.
+/// What submitters, the workers and shutdown share. One lock covers every
+/// field, so a plan either starts before shutdown begins, and then has its
+/// cancellation registered for shutdown to cancel, or never starts; and a
+/// plan is queued only while the scheduler will still take it from the queue.
 #[derive(Default)]
 struct RuntimeState {
-    /// Set once shutdown begins. No plan starts after it.
+    /// Set once shutdown begins. No plan starts or is queued after it.
     stopping: bool,
+    /// Set once the scheduler stops taking plans, before it answers the
+    /// plans still queued. No plan is queued after it.
+    closed: bool,
     /// The cancellation of the provider execution in flight, if any.
     current: Option<CancellationToken>,
 }
@@ -208,20 +224,31 @@ impl SchedulerHandle {
     }
 
     /// Once shutdown has begun, a plan is refused here without being queued.
+    /// The check and the queueing happen under the state lock, which never
+    /// waits for queue space, so a plan is either queued ahead of the
+    /// scheduler's last drain or refused.
     async fn submit(&self, work: Work) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-        if lock(&self.state).stopping {
-            return Err(ExecutionRuntimeError::ShuttingDown);
-        }
         let (reply, response) = flume::bounded(1);
-        self.sender
-            .try_send(SchedulerMessage::Schedule(Box::new(Submission {
-                work,
-                reply,
-            })))
-            .map_err(|error| match error {
-                flume::TrySendError::Full(_) => ExecutionRuntimeError::SchedulerQueueFull,
-                flume::TrySendError::Disconnected(_) => ExecutionRuntimeError::SchedulerStopped,
-            })?;
+        {
+            let state = lock(&self.state);
+            if state.stopping {
+                return Err(ExecutionRuntimeError::ShuttingDown);
+            }
+            if state.closed {
+                return Err(ExecutionRuntimeError::SchedulerStopped);
+            }
+            #[cfg(test)]
+            tests::admitted();
+            self.sender
+                .try_send(SchedulerMessage::Schedule(Box::new(Submission {
+                    work,
+                    reply,
+                })))
+                .map_err(|error| match error {
+                    flume::TrySendError::Full(_) => ExecutionRuntimeError::SchedulerQueueFull,
+                    flume::TrySendError::Disconnected(_) => ExecutionRuntimeError::SchedulerStopped,
+                })?;
+        }
         response
             .recv_async()
             .await
@@ -317,8 +344,12 @@ impl ExecutionRuntime {
         self.executor_sender.send(ExecutorMessage::Shutdown).ok();
         let executor_result = join_worker(self.executor_thread.take());
 
-        scheduler_result?;
-        executor_result
+        match (scheduler_result, executor_result) {
+            // The scheduler stops because the executor did; report the cause.
+            (Err(ExecutionRuntimeError::ExecutorStopped), Err(error)) => Err(error),
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 }
 
@@ -339,17 +370,44 @@ impl Drop for ExecutionRuntime {
     }
 }
 
+/// Hands plans to the executor until shutdown or until the executor stops.
+/// Either way, it then closes admission and answers every plan still queued,
+/// none of which started.
 fn scheduler_loop(
     receiver: flume::Receiver<SchedulerMessage>,
     executor_sender: flume::Sender<ExecutorMessage>,
     state: SharedState,
+) -> Result<(), ExecutionRuntimeError> {
+    let result = schedule(&receiver, &executor_sender, &state);
+    // Nothing is queued once this is set, so the drain below leaves nothing.
+    lock(&state).closed = true;
+    for message in receiver.drain() {
+        if let SchedulerMessage::Schedule(submission) = message {
+            match result {
+                Ok(()) => submission.refuse(),
+                Err(_) => {
+                    submission
+                        .reply
+                        .send(Err(ExecutionRuntimeError::ExecutorStopped))
+                        .ok();
+                }
+            }
+        }
+    }
+    result
+}
+
+fn schedule(
+    receiver: &flume::Receiver<SchedulerMessage>,
+    executor_sender: &flume::Sender<ExecutorMessage>,
+    state: &SharedState,
 ) -> Result<(), ExecutionRuntimeError> {
     while let Ok(message) = receiver.recv() {
         let submission = match message {
             SchedulerMessage::Schedule(submission) => submission,
             SchedulerMessage::Shutdown => break,
         };
-        if lock(&state).stopping {
+        if lock(state).stopping {
             submission.refuse();
             continue;
         }
@@ -374,12 +432,6 @@ fn scheduler_loop(
             ) => {
                 unreachable!("the scheduler sends only executions")
             }
-        }
-    }
-    // Plans queued behind the shutdown marker never start.
-    for message in receiver.drain() {
-        if let SchedulerMessage::Schedule(submission) = message {
-            submission.refuse();
         }
     }
     Ok(())
@@ -432,9 +484,11 @@ async fn execute_plan(
     }
     plan.job.assigned_executor = Some(executor);
 
+    // An input left unsubmitted by a refused creation holds nothing.
     let input = database.save_job_input(None, plan.input).await?;
-    let job = database.create_job_with_input(plan.job, input).await?;
-    database.start_local_job(job).await?;
+    let job = database
+        .create_local_job_with_input(plan.job, input)
+        .await?;
     let result = database
         .finalize_job(job, plan.outcome.finalization(plan.result))
         .await?;
@@ -483,8 +537,9 @@ async fn execute_provider_plan(
     }
     plan.job.assigned_executor = Some(executor);
     let input = database.save_job_input(None, plan.input).await?;
-    let job = database.create_job_with_input(plan.job, input).await?;
-    database.start_local_job(job).await?;
+    let job = database
+        .create_local_job_with_input(plan.job, input)
+        .await?;
 
     let configuration = match database.job_configuration(job).await? {
         Some(configuration) => configuration,
@@ -548,7 +603,9 @@ async fn execute_provider_plan(
 /// observed. Settlement comes first and is authoritative: a later write that
 /// fails is reported as [`ExecutionRuntimeError::ObservationsNotRecorded`]
 /// and undoes nothing. Every observation is still attempted, so one failed
-/// write does not cost the others.
+/// write does not cost the others, and a successful execution's
+/// observations are attempted even when its Job cannot be completed, see
+/// [`ExecutionRuntimeError::NotSettled`].
 pub(crate) async fn finish_provider_job(
     database: DatabaseHandle,
     executor: ExecutorId,
@@ -560,7 +617,7 @@ pub(crate) async fn finish_provider_job(
     let mut gap = sink.gap;
     let receipt = match execution {
         Ok(result) => {
-            let final_output = database
+            let settled = database
                 .finalize_job(
                     job,
                     JobFinalization::Completed(FinalResult {
@@ -570,7 +627,7 @@ pub(crate) async fn finish_provider_job(
                         value: Some(provider_execution::result_value(&result)),
                     }),
                 )
-                .await?;
+                .await;
             let timing = database
                 .record_metrics(NewMetrics {
                     job,
@@ -591,6 +648,15 @@ pub(crate) async fn finish_provider_job(
             for error in [timing, availability].into_iter().filter_map(Result::err) {
                 gap.get_or_insert(error);
             }
+            let final_output = match settled {
+                Ok(final_output) => final_output,
+                Err(source) => {
+                    return Err(ExecutionRuntimeError::NotSettled {
+                        source,
+                        observations: gap.map(Box::new),
+                    });
+                }
+            };
             ExecutionReceipt {
                 executor,
                 input,
@@ -782,5 +848,276 @@ pub(crate) async fn settle_provider_error(
             source,
         }),
         (None, None) => Ok(receipt),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::persistence::ExecutionMode;
+    use crate::test_support::{WAIT, wait};
+
+    thread_local! {
+        /// Runs on a submitting thread once its plan has passed the shutdown
+        /// check, just before the plan is queued.
+        static ADMITTED: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn admitted() {
+        if let Some(hook) = ADMITTED.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    fn on_admission(hook: impl FnOnce() + 'static) {
+        ADMITTED.with(|admitted| *admitted.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Waits for `condition`, which is checked rather than timed, within [`WAIT`].
+    fn until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + WAIT;
+        while !condition() {
+            assert!(Instant::now() < deadline, "not reached within {WAIT:?}");
+            thread::yield_now();
+        }
+    }
+
+    /// Joins a thread that must finish within [`WAIT`].
+    fn finished<T>(thread: JoinHandle<T>) -> T {
+        until(|| thread.is_finished());
+        thread.join().expect("the thread did not panic")
+    }
+
+    /// A plan that is never executed by these tests.
+    fn plan() -> ExecutionPlan {
+        ExecutionPlan {
+            executor_id: ExecutorId::new(1),
+            input: JobInputDraft::default(),
+            job: NewJob {
+                name: None,
+                execution_mode: ExecutionMode::Once,
+                eligible_at: None,
+                scheduled_at: None,
+                next_due_at: None,
+                next_iteration_no: None,
+                iteration_no: None,
+                parent: JobId::new(1),
+                projects: Vec::new(),
+                dependencies: Vec::new(),
+                configuration: None,
+                assigned_executor: None,
+                previous: None,
+                replaces: None,
+            },
+            outcome: JobOutcome::Completed,
+            result: FinalResult {
+                summary: None,
+                code: None,
+                goal_reached: None,
+                value: None,
+            },
+        }
+    }
+
+    fn queues() -> (
+        SchedulerHandle,
+        flume::Receiver<SchedulerMessage>,
+        flume::Sender<ExecutorMessage>,
+        flume::Receiver<ExecutorMessage>,
+    ) {
+        let (sender, receiver) = flume::bounded(SCHEDULER_QUEUE_CAPACITY);
+        let (executor_sender, executor_receiver) = flume::bounded(EXECUTOR_QUEUE_CAPACITY);
+        let scheduler = SchedulerHandle {
+            sender,
+            state: SharedState::default(),
+        };
+        (scheduler, receiver, executor_sender, executor_receiver)
+    }
+
+    /// The real scheduler, started only once shutdown has begun, so that
+    /// every plan it finds was queued before and none is handed on.
+    fn scheduler_after_stopping(
+        receiver: flume::Receiver<SchedulerMessage>,
+        executor_sender: flume::Sender<ExecutorMessage>,
+        state: SharedState,
+    ) -> JoinHandle<Result<(), ExecutionRuntimeError>> {
+        thread::spawn(move || {
+            until(|| lock(&state).stopping);
+            scheduler_loop(receiver, executor_sender, state)
+        })
+    }
+
+    /// Stands in for the executor: it answers what reaches it without
+    /// running it, and stops at the shutdown marker.
+    fn answering_executor(
+        receiver: flume::Receiver<ExecutorMessage>,
+    ) -> JoinHandle<Result<(), ExecutionRuntimeError>> {
+        thread::spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                match message {
+                    ExecutorMessage::Execute(submission) => {
+                        submission
+                            .reply
+                            .send(Err(ExecutionRuntimeError::Provider(
+                                "the plan reached the executor".to_owned(),
+                            )))
+                            .ok();
+                    }
+                    ExecutorMessage::Shutdown => break,
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_plan_queued_as_shutdown_begins_is_refused_not_stranded() {
+        let (scheduler, receiver, executor_sender, executor_receiver) = queues();
+        // Keeps the queue connected after the scheduler's last drain, as it
+        // is until the scheduler's receiver is dropped.
+        let _connected = receiver.clone();
+        let state = scheduler.state.clone();
+        let runtime = ExecutionRuntime {
+            scheduler: scheduler.clone(),
+            scheduler_thread: Some(scheduler_after_stopping(
+                receiver,
+                executor_sender.clone(),
+                state.clone(),
+            )),
+            executor_sender,
+            executor_thread: Some(answering_executor(executor_receiver)),
+        };
+        let (stopper_sender, stopper) = flume::bounded(1);
+        on_admission(move || {
+            let (ran_sender, ran) = flume::bounded(1);
+            let stopping = thread::spawn(move || {
+                // Unless the check and the queueing are one step, shutdown
+                // runs to its end between them.
+                if state.try_lock().is_ok() {
+                    let stopped = runtime.shutdown();
+                    ran_sender.send(()).ok();
+                    stopped
+                } else {
+                    ran_sender.send(()).ok();
+                    runtime.shutdown()
+                }
+            });
+            ran.recv_timeout(WAIT)
+                .expect("shutdown either ran or waits for the plan to be queued");
+            stopper_sender.send(stopping).ok();
+        });
+
+        let refused = wait(scheduler.schedule(plan()));
+        assert!(
+            matches!(refused, Err(ExecutionRuntimeError::ShuttingDown)),
+            "a plan admitted before shutdown began is refused unstarted, got {refused:?}"
+        );
+        let stopping = stopper
+            .try_recv()
+            .expect("the plan passed the shutdown check");
+        finished(stopping).expect("shutdown");
+        assert!(
+            matches!(
+                wait(scheduler.schedule(plan())),
+                Err(ExecutionRuntimeError::ShuttingDown)
+            ),
+            "a long-lived handle refuses once shutdown began"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_refuses_at_once_and_shutdown_answers_every_queued_plan() {
+        let (scheduler, receiver, executor_sender, executor_receiver) = queues();
+        let state = scheduler.state.clone();
+        let runtime = ExecutionRuntime {
+            scheduler: scheduler.clone(),
+            scheduler_thread: Some(scheduler_after_stopping(
+                receiver,
+                executor_sender.clone(),
+                state.clone(),
+            )),
+            executor_sender,
+            executor_thread: Some(answering_executor(executor_receiver)),
+        };
+        let submitters: Vec<_> = (0..SCHEDULER_QUEUE_CAPACITY)
+            .map(|_| {
+                let scheduler = scheduler.clone();
+                thread::spawn(move || wait(scheduler.schedule(plan())))
+            })
+            .collect();
+        until(|| scheduler.sender.len() == SCHEDULER_QUEUE_CAPACITY);
+        assert!(matches!(
+            wait(scheduler.schedule(plan())),
+            Err(ExecutionRuntimeError::SchedulerQueueFull)
+        ));
+
+        let stopping = thread::spawn(move || runtime.shutdown());
+        until(|| lock(&state).stopping);
+        assert!(
+            matches!(
+                wait(scheduler.schedule(plan())),
+                Err(ExecutionRuntimeError::ShuttingDown)
+            ),
+            "a plan submitted once shutdown began is refused"
+        );
+        finished(stopping).expect("shutdown");
+        for submitter in submitters {
+            let refused = finished(submitter);
+            assert!(
+                matches!(refused, Err(ExecutionRuntimeError::ShuttingDown)),
+                "every queued plan is answered unstarted, got {refused:?}"
+            );
+        }
+        assert!(scheduler.sender.is_empty());
+    }
+
+    #[test]
+    fn plans_queued_when_the_executor_is_gone_are_answered_and_its_failure_reported() {
+        let (scheduler, receiver, executor_sender, executor_receiver) = queues();
+        // The executor failed before any plan reached it.
+        drop(executor_receiver);
+        let executor_thread = thread::spawn(|| -> Result<(), ExecutionRuntimeError> {
+            std::panic::resume_unwind(Box::new("the executor failed"))
+        });
+        let submitters: Vec<_> = (0..3)
+            .map(|_| {
+                let scheduler = scheduler.clone();
+                thread::spawn(move || wait(scheduler.schedule(plan())))
+            })
+            .collect();
+        until(|| scheduler.sender.len() == 3);
+        let state = scheduler.state.clone();
+        let scheduler_executor_sender = executor_sender.clone();
+        let runtime = ExecutionRuntime {
+            scheduler: scheduler.clone(),
+            scheduler_thread: Some(thread::spawn(move || {
+                scheduler_loop(receiver, scheduler_executor_sender, state)
+            })),
+            executor_sender,
+            executor_thread: Some(executor_thread),
+        };
+
+        for submitter in submitters {
+            let answer = finished(submitter);
+            assert!(
+                matches!(answer, Err(ExecutionRuntimeError::ExecutorStopped)),
+                "a queued plan is answered while handles live on, got {answer:?}"
+            );
+        }
+        assert!(
+            matches!(
+                wait(scheduler.schedule(plan())),
+                Err(ExecutionRuntimeError::SchedulerStopped)
+            ),
+            "a stopped scheduler refuses at once"
+        );
+        let stopped = runtime.shutdown();
+        assert!(
+            matches!(stopped, Err(ExecutionRuntimeError::WorkerPanicked)),
+            "the executor's failure is reported, not its consequence: {stopped:?}"
+        );
     }
 }
