@@ -117,9 +117,19 @@ pub enum ExecutionRuntimeError {
         receipt: Box<ExecutionReceipt>,
         source: DatabaseError,
     },
-    /// The Provider answered, but the Job's outcome could not be recorded,
-    /// for instance because a dependency does not allow its completion. The
-    /// Job is left as it was, started and unsettled, and keeps its Profiles
+    /// The Provider answered successfully, but the Job could not complete
+    /// because `source` refused it, so it was settled Failed, as the receipt
+    /// shows. That is a local orchestration failure, not the Provider's: the
+    /// answer is recorded as observed, apart from `observations`, the first
+    /// observation that could not be written.
+    #[error("the Provider answered, but the Job was settled failed: {source}")]
+    CompletionRefused {
+        receipt: Box<ExecutionReceipt>,
+        source: Violation,
+        observations: Option<Box<DatabaseError>>,
+    },
+    /// The Provider answered, but the Job's outcome could not be recorded.
+    /// The Job is left as it was, started and unsettled, and keeps its Profiles
     /// and its local execution claim until it is settled, at the latest by a
     /// later start of the database; see [`DatabaseHandle::start_local_job`].
     /// What the Provider was observed to do is still recorded, apart from
@@ -604,8 +614,11 @@ async fn execute_provider_plan(
 /// fails is reported as [`ExecutionRuntimeError::ObservationsNotRecorded`]
 /// and undoes nothing. Every observation is still attempted, so one failed
 /// write does not cost the others, and a successful execution's
-/// observations are attempted even when its Job cannot be completed, see
-/// [`ExecutionRuntimeError::NotSettled`].
+/// observations are attempted even when its Job cannot be completed. A
+/// completion refused for an unsatisfied dependency settles the Job Failed
+/// instead, keeping the Provider's result, see
+/// [`ExecutionRuntimeError::CompletionRefused`]; any other refusal or failure
+/// leaves it unsettled, see [`ExecutionRuntimeError::NotSettled`].
 pub(crate) async fn finish_provider_job(
     database: DatabaseHandle,
     executor: ExecutorId,
@@ -617,7 +630,8 @@ pub(crate) async fn finish_provider_job(
     let mut gap = sink.gap;
     let receipt = match execution {
         Ok(result) => {
-            let settled = database
+            let mut refused = None;
+            let settled = match database
                 .finalize_job(
                     job,
                     JobFinalization::Completed(FinalResult {
@@ -627,7 +641,29 @@ pub(crate) async fn finish_provider_job(
                         value: Some(provider_execution::result_value(&result)),
                     }),
                 )
-                .await;
+                .await
+            {
+                Err(DatabaseError::Rejected(
+                    violation @ Violation::UnsatisfiedDependency { .. },
+                )) => {
+                    let settled = database
+                        .finalize_job(
+                            job,
+                            JobFinalization::Failed(FinalResult {
+                                summary: Some(format!(
+                                    "the Provider answered, but the Job cannot complete: {violation}"
+                                )),
+                                code: None,
+                                goal_reached: Some(false),
+                                value: Some(provider_execution::result_value(&result)),
+                            }),
+                        )
+                        .await;
+                    refused = Some(violation);
+                    settled
+                }
+                settled => settled,
+            };
             let timing = database
                 .record_metrics(NewMetrics {
                     job,
@@ -657,12 +693,20 @@ pub(crate) async fn finish_provider_job(
                     });
                 }
             };
-            ExecutionReceipt {
+            let receipt = ExecutionReceipt {
                 executor,
                 input,
                 job,
                 result: final_output,
+            };
+            if let Some(source) = refused {
+                return Err(ExecutionRuntimeError::CompletionRefused {
+                    receipt: Box::new(receipt),
+                    source,
+                    observations: gap.map(Box::new),
+                });
             }
+            receipt
         }
         Err(error) => match settle_provider_error(database, executor, input, job, error).await {
             Ok(receipt) => receipt,

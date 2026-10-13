@@ -1288,7 +1288,9 @@ pub enum Violation {
     ExecutorChangeAfterStart(JobId),
     #[error("cannot finalize {0}: a child Job is not settled")]
     UnfinishedChild(JobId),
-    #[error("cannot complete {job}: its dependency on {prerequisite} is {state:?}, not satisfied")]
+    #[error(
+        "{job} cannot start or complete: its dependency on {prerequisite} is {state:?}, not satisfied"
+    )]
     UnsatisfiedDependency {
         job: JobId,
         prerequisite: JobId,
@@ -1671,7 +1673,10 @@ pub(crate) fn retry_job(batch: &mut Batch, retry: JobRetry) -> OpResult<JobId> {
     Ok((id, MarkerSubjects::created(RecordRef::Job(original), RecordRef::Job(id))))
 }
 
-/// Records that the Job's execution began.
+/// Records that the Job's execution began, which requires every explicit
+/// dependency of the Job to be satisfied. A refused start changes nothing: a
+/// Job still waiting may start later, and one whose dependency became
+/// impossible stays as it is until it is finalized explicitly.
 pub(crate) fn start_job(batch: &mut Batch, job: JobId) -> OpResult<()> {
     let now = batch.now();
     let mut row = batch.require_job(job)?;
@@ -1681,6 +1686,7 @@ pub(crate) fn start_job(batch: &mut Batch, job: JobId) -> OpResult<()> {
     if row.started_at.is_some() {
         return batch.reject(Violation::JobAlreadyStarted(job));
     }
+    require_satisfied_dependencies(batch, job)?;
     row.started_at = Some(now);
     row.updated_at = now;
     batch.put_job(&row)?;
@@ -1699,6 +1705,23 @@ pub(crate) fn start_local_job(batch: &mut Batch, job: JobId, epoch: u64) -> OpRe
     let started = start_job(batch, job)?;
     batch.claim_local_execution(job, epoch)?;
     Ok(started)
+}
+
+/// Starts a Job locally as a database written before dependencies were
+/// checked at the start could hold it: without that check.
+#[cfg(test)]
+pub(crate) fn start_preexisting_local_job(
+    batch: &mut Batch,
+    job: JobId,
+    epoch: u64,
+) -> OpResult<()> {
+    let now = batch.now();
+    let mut row = batch.require_job(job)?;
+    row.started_at = Some(now);
+    row.updated_at = now;
+    batch.put_job(&row)?;
+    batch.claim_local_execution(job, epoch)?;
+    Ok(((), MarkerSubjects::addressed(RecordRef::Job(job))))
 }
 
 /// Settles a Job that the opening of `epoch` started as its own local
@@ -1841,16 +1864,7 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
         }
     }
     if completes {
-        for (prerequisite, condition) in batch.dependencies(job)? {
-            let state = dependency_state(condition, &batch.require_job(prerequisite)?);
-            if state != DependencyState::Satisfied {
-                return batch.reject(Violation::UnsatisfiedDependency {
-                    job,
-                    prerequisite,
-                    state,
-                });
-            }
-        }
+        require_satisfied_dependencies(batch, job)?;
     }
     row.sterilized_at.get_or_insert(now);
     let appended = publish_output(batch, job, OutputKind::Result, result.summary, result.code, result.goal_reached, result.value)?;
@@ -1861,6 +1875,21 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
     batch.release_local_execution(job)?;
     let output_id = appended.output;
     Ok((Some(appended), MarkerSubjects::created(RecordRef::Job(job), RecordRef::JobOutput(output_id))))
+}
+
+/// Refuses unless every explicit dependency of the Job is satisfied.
+fn require_satisfied_dependencies(batch: &mut Batch, job: JobId) -> Result<(), BatchError> {
+    for (prerequisite, condition) in batch.dependencies(job)? {
+        let state = dependency_state(condition, &batch.require_job(prerequisite)?);
+        if state != DependencyState::Satisfied {
+            return batch.reject(Violation::UnsatisfiedDependency {
+                job,
+                prerequisite,
+                state,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Registers an Executor with the LLM transports its adapter implements. It

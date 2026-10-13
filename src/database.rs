@@ -3204,6 +3204,27 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Starts a Job locally as a database written before dependencies were
+    /// checked at the start could hold it, claimed by the current opening.
+    /// Its marker uses epoch 0, which no opening has.
+    #[cfg(test)]
+    pub(crate) async fn start_preexisting_local_job(
+        &self,
+        job: JobId,
+    ) -> Result<(), DatabaseError> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let epoch = self.epoch();
+        self.with_database(move |database| {
+            let operation = OperationId::new(0, NEXT.fetch_add(1, Ordering::SeqCst));
+            storage::run_batch(database, operation, OperationKind::StartLocalJob, |batch| {
+                persistence::start_preexisting_local_job(batch, job, epoch)
+            })
+            .result
+            .map_err(|failure| StorageError::corrupted(format!("{failure:?}")))
+        })
+        .await
+    }
+
     /// Runs `f` on a read worker with the open database, for tests that
     /// inject a storage fault into the database the worker is using.
     #[cfg(test)]
