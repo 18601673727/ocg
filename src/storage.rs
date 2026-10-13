@@ -2416,6 +2416,31 @@ impl Batch {
         Ok(())
     }
 
+    /// The Token eligibility the Job's committed Metrics state: that of its
+    /// first annotated record, which every later annotated record shares.
+    /// Reads only the Job's own Metrics, in ID order, up to that record.
+    pub(crate) fn job_token_eligibility(
+        &mut self,
+        job: JobId,
+    ) -> Result<Option<RequestEligibility>, BatchError> {
+        self.step(|tx| {
+            let index = tx.open_table(JOB_METRICS)?;
+            let records = tx.open_table(METRICS)?;
+            for entry in index.range((job.get(), 0)..=(job.get(), u64::MAX))? {
+                let metrics = entry?.0.value().1;
+                let bytes = records.get(metrics)?.ok_or_else(|| {
+                    StorageError::corrupted(format!(
+                        "{job} is measured by missing metrics {metrics}"
+                    ))
+                })?;
+                if let Some(token) = MetricsRow::decode(bytes.value())?.token {
+                    return Ok(Some(token.eligibility));
+                }
+            }
+            Ok(None)
+        })
+    }
+
     /// Inserts the AvailabilityStat with its OBSERVES edge, the edge's
     /// incoming index and its scope index entries. The caller has checked
     /// that the Job ran an LLM.

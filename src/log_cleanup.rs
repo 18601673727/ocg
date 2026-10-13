@@ -6,16 +6,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::disk_protection::{ProtectedArea, ProtectionReason};
 use crate::logger::is_runtime_file_name;
 use crate::persistence::{
-    ExecutorId, FinalResult, IntermediateOutputKind, JobId, JobOutcome, NewJobOutput,
+    ExecutorId, ExecutorType, FinalResult, IntermediateOutputKind, JobId, JobOutcome, NewExecutor,
+    NewJobOutput,
 };
 
 pub const CLEANUP_QUEUE_CAPACITY: usize = 8;
+/// How often a scheduled worker looks for expired runtime logs. Retention is
+/// counted in days, so an hour keeps a log at most an hour past it.
+pub const RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// The name of the System Executor that runs cleanup Jobs.
+pub const CORE_EXECUTOR_NAME: &str = "__CORE__";
 pub const CLEANUP_FAILURE_DETAIL_LIMIT: usize = 16;
 const FAILURE_MESSAGE_BYTES: usize = 256;
 
@@ -176,8 +182,89 @@ pub struct CoreLogCleanup {
     thread: Option<JoinHandle<()>>,
 }
 
+/// Retention a worker runs by itself: once when it starts, then every
+/// `interval`, each time as one cleanup Job of `owner` on the `__CORE__`
+/// `executor`. A check that finds no expired runtime log creates no Job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetentionSchedule {
+    pub owner: JobId,
+    pub executor: ExecutorId,
+    pub interval: Duration,
+}
+
+/// What wakes the worker.
+enum WorkerWake {
+    Request(Result<Request, flume::RecvError>),
+    Stop,
+    Due,
+}
+
+/// The `__CORE__` System Executor: an existing one, or a newly registered one.
+/// Restarts reuse it, so the Executor table does not grow with them.
+pub async fn core_executor(database: &DatabaseHandle) -> Result<ExecutorId, DatabaseError> {
+    let mut before = None;
+    loop {
+        let page = database.executors(before, 100).await?;
+        if let Some(found) = page.iter().find(|executor| {
+            executor.name == CORE_EXECUTOR_NAME && executor.executor_type == ExecutorType::System
+        }) {
+            return Ok(found.id);
+        }
+        match page.last() {
+            Some(last) if page.len() == 100 => before = Some(last.id),
+            _ => break,
+        }
+    }
+    database
+        .create_executor(NewExecutor {
+            name: CORE_EXECUTOR_NAME.into(),
+            executor_type: ExecutorType::System,
+            concurrency_limit: std::num::NonZeroU32::MIN,
+            llm_transports: Default::default(),
+        })
+        .await
+}
+
+/// Starts the retention a host runs: a scheduled worker whose cleanup Jobs
+/// are children of the Genesis Job, on the `__CORE__` System Executor, and
+/// which follows the active system policy's retention.
+pub async fn start_retention(database: &DatabaseHandle) -> Result<CoreLogCleanup, CleanupError> {
+    let executor = core_executor(database)
+        .await
+        .map_err(|source| CleanupError::Persistence {
+            stage: "core executor registration",
+            records: None,
+            summary: None,
+            source,
+        })?;
+    CoreLogCleanup::start_scheduled(
+        database.clone(),
+        RetentionSchedule {
+            owner: database.genesis(),
+            executor,
+            interval: RETENTION_CHECK_INTERVAL,
+        },
+    )
+}
+
 impl CoreLogCleanup {
+    /// Starts a worker that runs cleanup only when invoked.
     pub fn start(database: DatabaseHandle) -> Result<Self, CleanupError> {
+        Self::start_with(database, None)
+    }
+
+    /// Starts a worker that also runs `schedule` by itself, until shutdown.
+    pub fn start_scheduled(
+        database: DatabaseHandle,
+        schedule: RetentionSchedule,
+    ) -> Result<Self, CleanupError> {
+        Self::start_with(database, Some(schedule))
+    }
+
+    fn start_with(
+        database: DatabaseHandle,
+        schedule: Option<RetentionSchedule>,
+    ) -> Result<Self, CleanupError> {
         check_database(&database).map_err(|source| CleanupError::Persistence {
             stage: "worker startup",
             records: None,
@@ -208,20 +295,36 @@ impl CoreLogCleanup {
                     receiver: receiver.clone(),
                     claimed: worker_claimed,
                 };
+                // A schedule runs once at start, then waits its interval.
+                let mut due = schedule.map(|_| Instant::now());
                 loop {
                     if worker_shared.stopping.load(Ordering::SeqCst) {
                         break;
                     }
-                    let request = flume::Selector::new()
-                        .recv(&receiver, Some)
-                        .recv(&stopping, |_| None)
-                        .wait();
-                    let Some(Ok(request)) = request else {
-                        break;
+                    let selector = flume::Selector::new()
+                        .recv(&receiver, WorkerWake::Request)
+                        .recv(&stopping, |_| WorkerWake::Stop);
+                    let wake = match due {
+                        Some(at) => selector.wait_deadline(at).unwrap_or(WorkerWake::Due),
+                        None => selector.wait(),
                     };
-                    let result = execute(&worker_shared, request.owner, request.executor);
-                    // Losing an observer never cancels recorded work or triggers a retry.
-                    request.reply.send(result).ok();
+                    match wake {
+                        WorkerWake::Request(Ok(request)) => {
+                            let result = execute(&worker_shared, request.owner, request.executor);
+                            // Losing an observer never cancels recorded work or triggers a retry.
+                            request.reply.send(result).ok();
+                        }
+                        WorkerWake::Due => {
+                            let Some(schedule) = schedule else { break };
+                            let again = if run_scheduled(&worker_shared, schedule) {
+                                Duration::ZERO
+                            } else {
+                                schedule.interval
+                            };
+                            due = Instant::now().checked_add(again);
+                        }
+                        WorkerWake::Request(Err(_)) | WorkerWake::Stop => break,
+                    }
                 }
             }) {
             Ok(thread) => thread,
@@ -439,6 +542,64 @@ fn execute(
         outcome,
         summary,
     })
+}
+
+/// One scheduled cleanup. Returns whether to run again at once: only after a
+/// run that deleted logs and stopped at its batch limit, so every repeat
+/// makes progress.
+fn run_scheduled(shared: &Shared, schedule: RetentionSchedule) -> bool {
+    if !expired_logs_may_exist(shared) {
+        return false;
+    }
+    match execute(shared, schedule.owner, schedule.executor) {
+        Ok(result) => {
+            let summary = &result.summary;
+            log::info!(
+                "log cleanup {} deleted {} expired runtime log(s), {} failure(s)",
+                result.records.job,
+                summary.deleted_count,
+                summary.failure_count
+            );
+            summary.additional_candidates_remain == Some(true) && summary.deleted_count > 0
+        }
+        // Disk protection and shutdown refuse it before any Job exists; the
+        // next interval tries again.
+        Err(error) => {
+            log::warn!("scheduled log cleanup did not complete: {error}");
+            false
+        }
+    }
+}
+
+/// Whether the log directory may hold a runtime log older than the retention
+/// period. Reads metadata only and stops at the first one; anything it cannot
+/// read counts as possibly expired, so the cleanup records the failure.
+fn expired_logs_may_exist(shared: &Shared) -> bool {
+    let retention_days = shared
+        .database
+        .active_system_policy()
+        .logger_config
+        .retention_days;
+    let Some(cutoff) =
+        SystemTime::now().checked_sub(Duration::from_secs(u64::from(retention_days) * 86400))
+    else {
+        return true;
+    };
+    let entries = match fs::read_dir(shared.database.log_directory()) {
+        Ok(entries) => entries,
+        Err(_) => return true,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { return true };
+        if !is_runtime_file_name(&entry.file_name()) {
+            continue;
+        }
+        match fs::symlink_metadata(entry.path()).and_then(|metadata| eligible(&metadata, cutoff)) {
+            Ok(false) => {}
+            Ok(true) | Err(_) => return true,
+        }
+    }
+    false
 }
 
 fn interrupted(shared: &Shared, epoch: u64) -> Option<&'static str> {
@@ -780,6 +941,279 @@ mod tests {
         assert_eq!(published["failure_details_truncated"], false);
         cleanup.shutdown().expect("shutdown cleanup worker");
         assert_eq!(database.status(), DatabaseStatus::Open);
+        worker.shutdown().expect("shutdown database");
+    }
+
+    /// Writes a runtime log whose modification time is `age` in the past.
+    fn runtime_log(directory: &DataDirectory, sequence: u64, age: Duration) -> std::path::PathBuf {
+        let written = SystemTime::now() - age;
+        let name = crate::logger::runtime_file_name(time::OffsetDateTime::from(written), sequence);
+        let path = directory.logs_path().join(name);
+        let file = std::fs::File::create(&path).expect("create runtime log");
+        file.set_modified(written).expect("age the runtime log");
+        path
+    }
+
+    fn cleanup_jobs(database: &DatabaseHandle) -> Vec<crate::persistence::JobRecord> {
+        wait(database.jobs(None, 1_000))
+            .expect("read jobs")
+            .into_iter()
+            .filter(|job| job.name.as_deref() == Some("__CORE__ log cleanup"))
+            .collect()
+    }
+
+    fn await_removed(path: &Path) {
+        let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} was not removed",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn settled(jobs: &[crate::persistence::JobRecord]) -> bool {
+        jobs.iter().any(|job| {
+            job.completed_at.is_some() || job.failed_at.is_some() || job.cancelled_at.is_some()
+        })
+    }
+
+    /// Waits until a cleanup Job exists and has settled. A stop requested
+    /// before then interrupts the run, which then ends as Cancelled.
+    fn await_settled_cleanup(database: &DatabaseHandle) {
+        let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+        while !settled(&cleanup_jobs(database)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no cleanup Job settled"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    async fn host_cleanup_jobs(database: &DatabaseHandle) -> Vec<crate::persistence::JobRecord> {
+        database
+            .jobs(None, 1_000)
+            .await
+            .expect("read jobs")
+            .into_iter()
+            .filter(|job| job.name.as_deref() == Some("__CORE__ log cleanup"))
+            .collect()
+    }
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    #[test]
+    fn scheduled_retention_removes_only_expired_logs_under_one_settled_job() {
+        let (_root, directory) = data_directory("scheduled");
+        let worker =
+            DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
+        let database = worker.handle();
+        let expired = runtime_log(&directory, 1, 3 * DAY);
+        let current = runtime_log(&directory, 2, Duration::from_secs(60));
+        let unrelated = directory.logs_path().join("notes.txt");
+        std::fs::write(&unrelated, "kept").expect("write unrelated file");
+        std::fs::File::open(&unrelated)
+            .and_then(|file| file.set_modified(SystemTime::now() - 3 * DAY))
+            .expect("age unrelated file");
+
+        // The first run happens when the worker starts, not after an interval.
+        let cleanup = wait(start_retention(&database)).expect("start retention");
+        await_removed(&expired);
+        await_settled_cleanup(&database);
+        cleanup.shutdown().expect("shutdown cleanup worker");
+        assert!(current.exists(), "a log within retention is kept");
+        assert!(unrelated.exists(), "only runtime logs are retention's");
+
+        let jobs = cleanup_jobs(&database);
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.parent, database.genesis());
+        assert!(job.started_at.is_some() && job.completed_at.is_some());
+        let executors = wait(database.executors(None, 100)).expect("read executors");
+        assert_eq!(
+            executors
+                .iter()
+                .filter(|executor| executor.name == CORE_EXECUTOR_NAME)
+                .count(),
+            1
+        );
+        assert_eq!(
+            job.assigned_executor,
+            executors
+                .iter()
+                .find(|e| e.name == CORE_EXECUTOR_NAME)
+                .map(|e| e.id)
+        );
+        worker.shutdown().expect("shutdown database");
+
+        // The settled Job left no local execution claim behind.
+        let worker = DatabaseWorker::start_with_policy(&directory, policy()).expect("restart");
+        assert!(worker.handle().abandoned_at_open().is_empty());
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn a_check_without_expired_logs_creates_no_job_and_restarts_reuse_the_executor() {
+        let (_root, directory) = data_directory("scheduled-idle");
+        let worker =
+            DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
+        let database = worker.handle();
+        let current = runtime_log(&directory, 1, Duration::from_secs(60));
+        for _ in 0..2 {
+            // Whether its first run came before the stop or not, nothing
+            // has expired, so no run creates a Job.
+            let cleanup = wait(start_retention(&database)).expect("start retention");
+            assert!(matches!(
+                CoreLogCleanup::start(database.clone()),
+                Err(CleanupError::AlreadyRunning)
+            ));
+            cleanup.shutdown().expect("shutdown cleanup worker");
+        }
+        assert!(
+            cleanup_jobs(&database).is_empty(),
+            "nothing expired, so no Job"
+        );
+        assert!(current.exists());
+        let executors = wait(database.executors(None, 100)).expect("read executors");
+        assert_eq!(
+            executors
+                .iter()
+                .filter(|executor| executor.name == CORE_EXECUTOR_NAME)
+                .count(),
+            1,
+            "the __CORE__ Executor is registered once"
+        );
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn cleanup_under_disk_protection_writes_nothing_deletes_nothing_and_stops_promptly() {
+        use crate::disk_protection::SpaceShortage;
+        let (_root, directory) = data_directory("protected");
+        let worker =
+            DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
+        let database = worker.handle();
+        let cleanup = wait(start_retention(&database)).expect("start retention");
+        let executor = wait(core_executor(&database)).expect("core executor");
+        assert!(
+            database.activate_filesystem_protection(ProtectionReason::InsufficientSpace(
+                SpaceShortage {
+                    area: ProtectedArea::Database,
+                    path: directory.database_path().to_path_buf(),
+                    available_bytes: 0,
+                    expected_write_bytes: 0,
+                    threshold_bytes: 1,
+                }
+            ))
+        );
+        let expired = runtime_log(&directory, 1, 3 * DAY);
+        let refused = wait(cleanup.handle().invoke(database.genesis(), executor));
+        assert!(
+            matches!(
+                &refused,
+                Err(CleanupError::Persistence {
+                    records: None,
+                    source: crate::database::DatabaseError::DiskProtected(_),
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            expired.exists(),
+            "nothing is deleted while storage is protected"
+        );
+        assert!(cleanup_jobs(&database).is_empty(), "and no Job is created");
+
+        let started = std::time::Instant::now();
+        cleanup.shutdown().expect("shutdown cleanup worker");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            !database
+                .cleanup_worker()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the worker released its claim"
+        );
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn a_cleanup_job_left_running_is_settled_by_the_next_start() {
+        let (_root, directory) = data_directory("abandoned");
+        let worker =
+            DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
+        let database = worker.handle();
+        let executor = wait(core_executor(&database)).expect("core executor");
+        let records = wait(database.begin_core_log_cleanup(
+            database.genesis(),
+            executor,
+            NewJobOutput {
+                kind: IntermediateOutputKind::Progress,
+                summary: Some("{}".into()),
+                code: None,
+                goal_reached: None,
+                value: None,
+            },
+        ))
+        .expect("begin cleanup");
+        // The process ends before the cleanup Job is finalized.
+        worker.shutdown().expect("shutdown database");
+
+        let worker = DatabaseWorker::start_with_policy(&directory, policy()).expect("restart");
+        let database = worker.handle();
+        assert_eq!(database.abandoned_at_open(), [records.job]);
+        let job = wait(database.job(records.job))
+            .expect("read job")
+            .expect("job exists");
+        assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+        assert!(job.completed_at.is_none() && job.failed_at.is_none());
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn the_host_runs_retention_for_its_lifetime_and_joins_it_before_closing() {
+        let (_root, directory) = data_directory("host");
+        let expired = runtime_log(&directory, 1, 8 * DAY);
+        let current = runtime_log(&directory, 2, DAY);
+        let watched = expired.clone();
+        let report = crate::host::run_reporting(&directory, false, move |database| async move {
+            // The default policy keeps seven days of logs.
+            assert_eq!(
+                database.active_system_policy().logger_config.retention_days,
+                7
+            );
+            let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+            // Stopping before the run settles would interrupt it.
+            while watched.exists() || !settled(&host_cleanup_jobs(&database).await) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "retention did not run"
+                );
+                ntex::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(
+            report.attempted.contains(&crate::host::Phase::LogCleanup),
+            "{:?}",
+            report.attempted
+        );
+        assert!(!expired.exists());
+        assert!(
+            current.exists(),
+            "a one-day-old log is within the default retention"
+        );
+
+        // Every cleanup Job the run created was settled.
+        let worker = DatabaseWorker::start(&directory).expect("reopen");
+        let database = worker.handle();
+        assert!(database.abandoned_at_open().is_empty());
+        let jobs = cleanup_jobs(&database);
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].completed_at.is_some());
         worker.shutdown().expect("shutdown database");
     }
 }

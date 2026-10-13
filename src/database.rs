@@ -541,7 +541,15 @@ impl Command {
                 commit,
                 Kind::BeginCoreLogCleanup,
                 reply,
-                |batch| persistence::begin_core_log_cleanup(batch, owner, executor, started),
+                |batch| {
+                    persistence::begin_core_log_cleanup(
+                        batch,
+                        owner,
+                        executor,
+                        started,
+                        operation.epoch,
+                    )
+                },
             ),
             Self::SaveJobInput {
                 existing,
@@ -3156,6 +3164,26 @@ impl DatabaseHandle {
     #[cfg(test)]
     pub(crate) fn group_probe(&self) -> &GroupProbe {
         &self.shared.probe
+    }
+
+    /// Writes Metrics as a database written before Token eligibility was
+    /// checked at ingest could hold them, contradictions included. Its
+    /// marker uses epoch 0, which no opening has.
+    #[cfg(test)]
+    pub(crate) async fn record_preexisting_metrics(
+        &self,
+        metrics: NewMetrics,
+    ) -> Result<MetricsId, DatabaseError> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        self.with_database(move |database| {
+            let operation = OperationId::new(0, NEXT.fetch_add(1, Ordering::SeqCst));
+            storage::run_batch(database, operation, OperationKind::RecordMetrics, |batch| {
+                persistence::record_preexisting_metrics(batch, metrics)
+            })
+            .result
+            .map_err(|failure| StorageError::corrupted(format!("{failure:?}")))
+        })
+        .await
     }
 
     /// Runs `f` on a read worker with the open database, for tests that

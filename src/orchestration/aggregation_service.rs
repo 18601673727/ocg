@@ -12,9 +12,11 @@
 //! The loop never repairs storage. While the database is not open it makes no
 //! write attempt, and it resumes through the same consume methods, which read
 //! the progress that is actually committed, so no plan or delta survives a
-//! fault. Evidence contradictions and corruption are not contention: the loop
+//! fault. A commit whose outcome is unknown is never replayed: its marker is
+//! read before that stream runs again. Corruption is not contention: the loop
 //! stops, leaves the consumed prefix intact, and the failure is reported when
-//! the service is shut down.
+//! the service is shut down. Token evidence that cannot be reduced stops the
+//! Token stream alone, the same way, while Availability goes on.
 //!
 //! Stopping is cooperative. [`AggregationService::shutdown`] wakes a waiting
 //! timer at once, waits for a batch already in flight to reach its actual
@@ -28,11 +30,12 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::database::{
-    AggregationClaim, DatabaseError, DatabaseHandle, DatabaseStatus, TokenConsumeError,
+    AggregationClaim, DatabaseError, DatabaseHandle, DatabaseStatus, OperationStatus,
+    TokenConsumeError,
 };
 use crate::persistence::{
     AvailabilityBatch, ExecutionMode, ExecutorId, ExecutorType, FinalResult, JobFinalization,
-    JobId, JobInputDraft, NewExecutor, NewJob,
+    JobId, JobInputDraft, NewExecutor, NewJob, OperationId,
 };
 use crate::token_usage::TokenBatch;
 
@@ -74,6 +77,15 @@ pub(crate) enum StreamOutcome {
     Busy,
     /// Database protection or a storage failure refuses work.
     Paused,
+    /// The commit was known not to happen while the database stayed open.
+    /// Ordinary: a later check prepares again from the committed progress.
+    Retry,
+    /// A commit of this stream has an unknown outcome that is not resolved
+    /// yet. The stream does not run until its marker says what committed.
+    Uncertain,
+    /// The Token stream stopped on evidence it cannot reduce; see
+    /// [`ServiceState::Degraded`].
+    Halted,
 }
 
 /// What one check did, in the order its streams were tried.
@@ -110,6 +122,9 @@ pub enum ServiceState {
     /// The database refused work at the last check; no write is attempted
     /// until it is open again.
     Paused,
+    /// The Token stream stopped on evidence it cannot reduce, without
+    /// skipping it; the Availability stream goes on. The run ends as Failed.
+    Degraded(String),
     /// The loop stopped by itself, with the reason.
     Failed(String),
 }
@@ -143,6 +158,9 @@ pub(crate) struct TestSeams {
     pub(crate) before_consume: Option<Arc<dyn Fn(Stream) + Send + Sync>>,
     /// Returns `Some` to stand in for the consume call of a stream.
     pub(crate) outcome_override: Option<Arc<dyn Fn(Stream) -> Option<StreamOutcome> + Send + Sync>>,
+    /// Returns `Some` to stand in for the consume call of a stream with a
+    /// database error, which is then handled like a real one.
+    pub(crate) error_override: Option<Arc<dyn Fn(Stream) -> Option<DatabaseError> + Send + Sync>>,
     /// Receives every check's report.
     pub(crate) rounds: Option<flume::Sender<RoundReport>>,
 }
@@ -158,8 +176,21 @@ enum Control {
 struct Shared {
     stop: AtomicBool,
     paused: AtomicBool,
+    /// Set when the loop's thread has finished, however it finished.
+    exited: AtomicBool,
     checks: AtomicU64,
     failure: Mutex<Option<String>>,
+    /// Why the Token stream stopped, while Availability goes on.
+    token_halted: Mutex<Option<String>>,
+}
+
+impl Shared {
+    fn record_failure(&self, reason: String) {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(reason);
+    }
 }
 
 /// What is known of an attempt to end a service Job.
@@ -351,9 +382,29 @@ impl AggregationService {
             std::thread::Builder::new()
                 .name("ocg-aggregation".to_owned())
                 .spawn(move || {
-                    ntex::rt::System::new("ocg-aggregation", ntex::rt::DefaultRuntime).block_on(
-                        serve(database, control_receiver, shared, config, ready_sender),
-                    )
+                    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        ntex::rt::System::new("ocg-aggregation", ntex::rt::DefaultRuntime).block_on(
+                            serve(
+                                database,
+                                control_receiver,
+                                shared.clone(),
+                                config,
+                                ready_sender,
+                            ),
+                        )
+                    }));
+                    // A panic is kept with its message, so the state reports
+                    // it before anyone joins the thread.
+                    let result = served.unwrap_or_else(|payload| {
+                        shared.record_failure(format!(
+                            "{}: {}",
+                            ServiceFailure::Panicked,
+                            panic_message(payload.as_ref())
+                        ));
+                        Err(ServiceFailure::Panicked)
+                    });
+                    shared.exited.store(true, Ordering::SeqCst);
+                    result
                 })
         };
         let thread = match thread {
@@ -398,6 +449,8 @@ impl AggregationService {
         self.job
     }
 
+    /// Never `Running` once the loop's thread has finished: a loop that
+    /// panicked or ended without being asked to is `Failed`.
     pub fn state(&self) -> ServiceState {
         if let Some(failure) = self
             .shared
@@ -407,6 +460,18 @@ impl AggregationService {
             .clone()
         {
             return ServiceState::Failed(failure);
+        }
+        if self.shared.exited.load(Ordering::SeqCst) {
+            return ServiceState::Failed(ServiceFailure::Exited.to_string());
+        }
+        if let Some(reason) = self
+            .shared
+            .token_halted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            return ServiceState::Degraded(reason);
         }
         if self.shared.paused.load(Ordering::SeqCst) {
             ServiceState::Paused
@@ -522,6 +587,14 @@ async fn service_executor(database: &DatabaseHandle) -> Result<ExecutorId, Datab
         .await
 }
 
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".to_owned())
+}
+
 /// Gives the other waiting tasks a turn: pending once, then ready.
 async fn yield_now() {
     let mut yielded = false;
@@ -562,6 +635,7 @@ async fn serve(
     let mut first = Stream::Availability;
     let mut due = config.check_immediately;
     let mut ready = Some(ready);
+    let mut streams = Streams::default();
     let result = loop {
         if shared.stop.load(Ordering::SeqCst) {
             break Ok(());
@@ -578,7 +652,7 @@ async fn serve(
         if shared.stop.load(Ordering::SeqCst) {
             break Ok(());
         }
-        match check(&database, &shared, &config, first).await {
+        match check(&database, &shared, &config, &mut streams, first).await {
             Ok(_report) =>
             {
                 #[cfg(test)]
@@ -597,12 +671,34 @@ async fn serve(
     if let Err(failure) = &result {
         // Best effort: the logger may itself be protected.
         log::error!("the aggregation service stopped: {failure}");
-        *shared
-            .failure
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(failure.to_string());
+        shared.record_failure(failure.to_string());
     }
-    result
+    // A halted Token stream fails the run once the loop has stopped, so its
+    // Job ends as Failed with the evidence that halted it.
+    match (result, streams.token_halted) {
+        (Ok(()), Some(error)) => Err(ServiceFailure::Evidence(error)),
+        (result, _) => result,
+    }
+}
+
+/// What the loop knows about its streams between checks.
+#[derive(Default)]
+struct Streams {
+    /// Set once Token evidence cannot be reduced; the Token stream then stays
+    /// stopped for this run, with its progress where it was.
+    token_halted: Option<TokenConsumeError>,
+    /// A commit of each stream whose outcome is unknown, resolved by its
+    /// marker before that stream runs again.
+    uncertain: [Option<OperationId>; 2],
+}
+
+impl Streams {
+    fn uncertain(&mut self, stream: Stream) -> &mut Option<OperationId> {
+        &mut self.uncertain[match stream {
+            Stream::Availability => 0,
+            Stream::Token => 1,
+        }]
+    }
 }
 
 /// What a check reports.
@@ -618,6 +714,7 @@ async fn check(
     database: &DatabaseHandle,
     shared: &Shared,
     config: &AggregationServiceConfig,
+    streams: &mut Streams,
     first: Stream,
 ) -> Result<Report, ServiceFailure> {
     #[cfg(test)]
@@ -632,7 +729,7 @@ async fn check(
             outcomes.push((stream, StreamOutcome::Paused));
             break;
         }
-        let outcome = consume(database, config, stream).await?;
+        let outcome = consume(database, shared, config, streams, stream).await?;
         #[cfg(test)]
         outcomes.push((stream, outcome));
         if outcome == StreamOutcome::Paused {
@@ -650,9 +747,26 @@ async fn check(
 
 async fn consume(
     database: &DatabaseHandle,
+    shared: &Shared,
     config: &AggregationServiceConfig,
+    streams: &mut Streams,
     stream: Stream,
 ) -> Result<StreamOutcome, ServiceFailure> {
+    if stream == Stream::Token && streams.token_halted.is_some() {
+        return Ok(StreamOutcome::Halted);
+    }
+    // An unknown commit is never replayed: its marker says whether it
+    // committed, and only then does the stream prepare again, from the
+    // progress that is actually committed.
+    if let Some(operation) = *streams.uncertain(stream) {
+        match database.reconcile_operation(operation).await {
+            Ok(OperationStatus::NotCommittedYet) => return Ok(StreamOutcome::Uncertain),
+            Ok(OperationStatus::Committed(_) | OperationStatus::NotCommitted) => {
+                *streams.uncertain(stream) = None;
+            }
+            Err(error) => return classify(database, streams, stream, error),
+        }
+    }
     #[cfg(test)]
     {
         if let Some(hold) = &config.seams.before_consume {
@@ -666,6 +780,14 @@ async fn consume(
         {
             return Ok(outcome);
         }
+        if let Some(error) = config
+            .seams
+            .error_override
+            .as_ref()
+            .and_then(|stand_in| stand_in(stream))
+        {
+            return classify(database, streams, stream, error);
+        }
     }
     #[cfg(not(test))]
     let _ = config;
@@ -676,7 +798,7 @@ async fn consume(
             }
             Ok(AvailabilityBatch::Idle { .. }) => Ok(StreamOutcome::Idle),
             Ok(AvailabilityBatch::Contended { .. }) => Ok(StreamOutcome::Contended),
-            Err(error) => classify(database, stream, error),
+            Err(error) => classify(database, streams, stream, error),
         },
         Stream::Token => match database.consume_token_usage(BATCH_LIMIT).await {
             Ok(TokenBatch::Consumed(report)) => {
@@ -684,20 +806,36 @@ async fn consume(
             }
             Ok(TokenBatch::Idle { .. }) => Ok(StreamOutcome::Idle),
             Ok(TokenBatch::Contended { .. }) => Ok(StreamOutcome::Contended),
-            Err(TokenConsumeError::Database(error)) => classify(database, stream, error),
-            Err(error @ TokenConsumeError::Evidence { .. }) => Err(ServiceFailure::Evidence(error)),
+            Err(TokenConsumeError::Database(error)) => classify(database, streams, stream, error),
+            // The refused batch committed nothing and the progress stays
+            // before the evidence, so nothing is skipped. Only the Token
+            // stream stops; the Availability progress is its own.
+            Err(error @ TokenConsumeError::Evidence { .. }) => {
+                let reason = format!("the Token aggregation cannot proceed safely: {error}");
+                log::error!("the Token aggregation stopped: {reason}");
+                *shared
+                    .token_halted
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(reason);
+                streams.token_halted = Some(error);
+                Ok(StreamOutcome::Halted)
+            }
         },
     }
 }
 
 /// Sorts a database error into an ordinary outcome or a stop. Only errors
-/// that say the database is busy, protected or failed are ordinary; anything
-/// else, corruption included, stops the loop rather than being retried.
+/// that say the database is busy, protected or failed, or that a commit is
+/// known not to have happened, are ordinary; anything else, corruption
+/// included, stops the loop rather than being retried. An unknown commit
+/// outcome is kept, so the stream resolves it before it runs again.
 fn classify(
     database: &DatabaseHandle,
+    streams: &mut Streams,
     stream: Stream,
     error: DatabaseError,
 ) -> Result<StreamOutcome, ServiceFailure> {
+    let open = database.status() == DatabaseStatus::Open;
     match &error {
         DatabaseError::QueueFull
         | DatabaseError::ReadQueueFull
@@ -706,14 +844,19 @@ fn classify(
         DatabaseError::DiskProtected(_)
         | DatabaseError::RefusedByDiskProtection { .. }
         | DatabaseError::ReadsStorageFailed(_) => Ok(StreamOutcome::Paused),
-        // A failed commit latches the database, which then is not open. The
-        // unknown outcome is not retried: the next consume reads what was
-        // really committed.
-        DatabaseError::OutcomeUnknown { .. } | DatabaseError::RolledBack(_)
-            if database.status() != DatabaseStatus::Open =>
-        {
-            Ok(StreamOutcome::Paused)
+        DatabaseError::OutcomeUnknown { operation, .. } => {
+            *streams.uncertain(stream) = Some(*operation);
+            // A failed commit latches the database, which then is not open.
+            Ok(if open {
+                StreamOutcome::Uncertain
+            } else {
+                StreamOutcome::Paused
+            })
         }
+        // Nothing was committed. While storage is latched the stream waits
+        // for recovery; otherwise the next check simply prepares again.
+        DatabaseError::RolledBack(_) if !open => Ok(StreamOutcome::Paused),
+        DatabaseError::RolledBack(_) => Ok(StreamOutcome::Retry),
         _ => Err(ServiceFailure::Database { stream, error }),
     }
 }

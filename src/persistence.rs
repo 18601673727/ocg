@@ -1327,15 +1327,30 @@ pub enum Violation {
     StopAlreadyConfirmed(JobId),
     #[error("{0} was submitted without an LLM configuration")]
     NotAnLlmExecution(JobId),
+    /// Every Token annotation of one Job states the same eligibility: its
+    /// request was either issued or not. The committed records keep theirs.
+    #[error(
+        "the Metrics of {job} already state that its request is {committed:?}; an annotation stating {refused:?} contradicts them"
+    )]
+    ContradictoryTokenEligibility {
+        job: JobId,
+        committed: RequestEligibility,
+        refused: RequestEligibility,
+    },
 }
 
 pub(crate) type OpResult<T> = Result<(T, MarkerSubjects), BatchError>;
 
+/// Creates and starts one cleanup Job under `owner`. The cleanup runs in this
+/// process, so the Job is started as a local execution of the opening of
+/// `epoch`; if the process ends before the Job is finalized, the next start
+/// of the database settles it like any abandoned local work.
 pub(crate) fn begin_core_log_cleanup(
     batch: &mut Batch,
     owner: JobId,
     executor: ExecutorId,
     started: NewJobOutput,
+    epoch: u64,
 ) -> OpResult<crate::log_cleanup::CleanupRecords> {
     batch.require_core_executor(executor)?;
     let (input, _) = save_job_input(batch, None, JobInputDraft {
@@ -1358,7 +1373,7 @@ pub(crate) fn begin_core_log_cleanup(
         previous: None,
         replaces: None,
     }, input)?;
-    start_job(batch, job)?;
+    start_local_job(batch, job, epoch)?;
     publish_output(batch, job, started.kind.into(), started.summary, started.code, started.goal_reached, started.value)?;
     Ok((crate::log_cleanup::CleanupRecords { job },
         MarkerSubjects::created(RecordRef::Job(owner), RecordRef::Job(job))))
@@ -1948,7 +1963,29 @@ pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId) -> OpResult<()>
 
 /// Appends measurements for a Job. Their LLM, if any, is the one the Job
 /// froze; the Job itself is not changed.
+///
+/// A Token annotation must agree with the eligibility the Job's committed
+/// annotations state, so contradictory evidence is refused here, in the
+/// transaction that would write it, rather than met later by aggregation.
 pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult<MetricsId> {
+    record_metrics_checked(batch, metrics, true)
+}
+
+/// Writes Metrics without comparing their eligibility with the Job's, as a
+/// database written before that check could hold them.
+#[cfg(test)]
+pub(crate) fn record_preexisting_metrics(
+    batch: &mut Batch,
+    metrics: NewMetrics,
+) -> OpResult<MetricsId> {
+    record_metrics_checked(batch, metrics, false)
+}
+
+fn record_metrics_checked(
+    batch: &mut Batch,
+    metrics: NewMetrics,
+    consistent: bool,
+) -> OpResult<MetricsId> {
     batch.require_job(metrics.job)?;
     if metrics.measurements.is_empty() && metrics.token.is_none() {
         return batch.reject(Violation::InvalidValue("measurements", "records no measurement"));
@@ -1961,6 +1998,16 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
             && (token.finality != UsageFinality::Cumulative || metrics.measurements.usage != NormalizedUsage::default())
         {
             return batch.reject(Violation::InvalidValue("token", "a request that was never sent reports no usage"));
+        }
+        if consistent
+            && let Some(committed) = batch.job_token_eligibility(metrics.job)?
+            && committed != token.eligibility
+        {
+            return batch.reject(Violation::ContradictoryTokenEligibility {
+                job: metrics.job,
+                committed,
+                refused: token.eligibility,
+            });
         }
     }
     let id = MetricsId(batch.next_id(crate::storage::Sequence::Metrics)?);

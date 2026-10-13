@@ -5845,12 +5845,15 @@ fn token_annotations_are_validated_stored_and_survive_reopening() {
         Violation::InvalidValue("measurements", _)
     ));
 
-    // An eligible or excluded fact needs no measurement.
+    // An eligible or excluded fact needs no measurement. One Job's facts
+    // agree on whether its request was sent, so the excluded fact belongs to
+    // a request that never was.
     let anchor =
         wait(handle.record_metrics(token_metrics(llm_job, 20, Some(eligible), [None, None])))
             .expect("an eligible fact-only record");
+    let unsent = self::llm_job(&handle, llm);
     let excluded = wait(handle.record_metrics(token_metrics(
-        llm_job,
+        unsent,
         21,
         Some(TokenAnnotation::excluded()),
         [None, None],
@@ -5930,15 +5933,22 @@ fn token_annotations_are_validated_stored_and_survive_reopening() {
         [
             None,
             Some(eligible),
-            Some(TokenAnnotation::excluded()),
             Some(TokenAnnotation::eligible(UsageFinality::Final)),
         ]
     );
-    assert_eq!((records[1].id, records[2].id), (anchor, excluded));
+    assert_eq!(records[1].id, anchor);
+    assert_eq!(
+        job_metrics(&handle, unsent)
+            .iter()
+            .map(|record| (record.id, record.token))
+            .collect::<Vec<_>>(),
+        [(excluded, Some(TokenAnnotation::excluded()))]
+    );
     let page = wait(handle.metrics(of_profile(llm), None, 100)).expect("scope read");
     assert_eq!(
         page.records
             .iter()
+            .filter(|record| record.job == llm_job)
             .map(|record| record.token)
             .collect::<Vec<_>>(),
         records
@@ -6786,6 +6796,34 @@ fn token_fact(
     .expect("record Metrics")
 }
 
+/// Like [`token_fact`], but written as a database from before ingest
+/// validation could hold it: even a fact that contradicts the Job's others.
+fn preexisting_fact(
+    handle: &DatabaseHandle,
+    job: JobId,
+    micros: i64,
+    token: Option<TokenAnnotation>,
+    counters: Counters5,
+) -> crate::persistence::MetricsId {
+    wait(handle.record_preexisting_metrics(NewMetrics {
+        job,
+        observed_at: at(micros),
+        measurements: TokenMeasurements {
+            usage: NormalizedUsage {
+                input_tokens: counters[0],
+                output_tokens: counters[1],
+                cache_read_tokens: counters[2],
+                cache_write_tokens: counters[3],
+                reasoning_tokens: counters[4],
+                raw: None,
+            },
+            ..TokenMeasurements::default()
+        },
+        token,
+    }))
+    .expect("record pre-existing Metrics")
+}
+
 fn consume_tokens(handle: &DatabaseHandle, limit: usize) -> TokenBatchReport {
     match wait(handle.consume_token_usage(limit)).expect("consume a Token batch") {
         TokenBatch::Consumed(report) => report,
@@ -7552,7 +7590,8 @@ fn contradictory_eligibility_refuses_the_whole_batch_and_keeps_excluded_evidence
     // A later eligible claim about the same request is a contradiction, and a
     // valid request in the same batch is not applied either.
     token_fact(&handle, good, micros, Some(ELIGIBLE), NO_COUNTERS);
-    let eligible = token_fact(&handle, bad, micros, Some(ELIGIBLE), io5(Some(1), Some(1)));
+    // Ingest refuses it now; a database from before that check may hold it.
+    let eligible = preexisting_fact(&handle, bad, micros, Some(ELIGIBLE), io5(Some(1), Some(1)));
     let markers_before = token_markers(&handle).len();
     match wait(handle.consume_token_usage(10)) {
         Err(TokenConsumeError::Evidence {
@@ -8435,7 +8474,7 @@ fn protected_storage_pauses_the_service_and_recovery_resumes_from_committed_prog
 }
 
 #[test]
-fn contradictory_token_evidence_stops_the_service_without_skipping_or_spinning() {
+fn contradictory_token_evidence_halts_only_the_token_stream_without_skipping_or_spinning() {
     let (_root, directory) = data_directory("service-evidence");
     let worker = DatabaseWorker::start(&directory).expect("start database");
     let handle = worker.handle();
@@ -8454,18 +8493,43 @@ fn contradictory_token_evidence_stops_the_service_without_skipping_or_spinning()
     assert_eq!(progress.consumed_through, Some(excluded));
 
     token_fact(&handle, good, at_minute(8), Some(ELIGIBLE), NO_COUNTERS);
-    token_fact(
+    // Ingest refuses the contradiction now; an older database may hold it.
+    preexisting_fact(
         &handle,
         bad,
         at_minute(8),
         Some(ELIGIBLE),
         io5(Some(1), Some(1)),
     );
-    assert!(rig.service.tick());
-    eventually(|| matches!(rig.service.state(), ServiceState::Failed(_)));
+    let report = rig.tick();
+    assert!(
+        outcomes(&report).contains(&(Stream::Token, StreamOutcome::Halted)),
+        "{report:?}"
+    );
+    assert!(matches!(rig.service.state(), ServiceState::Degraded(_)));
+
+    // Later checks never retry the Token stream, and Availability goes on.
     let calls = rig.calls();
-    eventually(|| !rig.service.tick());
-    assert_eq!(rig.calls(), calls, "a stopped loop is not retried");
+    observe(&handle, good, at_minute(8), response(200));
+    let mut consumed = 0;
+    for _ in 0..3 {
+        for (stream, outcome) in outcomes(&rig.tick()) {
+            match stream {
+                Stream::Token => assert_eq!(outcome, StreamOutcome::Halted),
+                Stream::Availability => {
+                    if let StreamOutcome::Consumed(records) = outcome {
+                        consumed += records;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(consumed, 1, "the observation was consumed once");
+    assert_eq!(
+        rig.calls(),
+        calls + 3,
+        "only Availability was attempted, once per check"
+    );
     assert_eq!(
         token_progress(&handle),
         progress,
@@ -8716,7 +8780,8 @@ fn is_started_only(record: &JobRecord) -> bool {
         && record.unknown_at.is_none()
 }
 
-/// A contradictory eligibility fixture: the Excluded claim comes first.
+/// A contradictory eligibility fixture: the Excluded claim comes first. Ingest
+/// refuses the second claim now, so it is written as an older database held it.
 fn contradictory(
     handle: &DatabaseHandle,
     llm: ProfileId,
@@ -8729,7 +8794,7 @@ fn contradictory(
         Some(TokenAnnotation::excluded()),
         NO_COUNTERS,
     );
-    let eligible = token_fact(
+    let eligible = preexisting_fact(
         handle,
         bad,
         at_minute(30),
@@ -8739,36 +8804,61 @@ fn contradictory(
     (bad, eligible)
 }
 
+/// A first check that fails the whole loop: one Token fact whose minute
+/// bucket cannot take another request.
+fn corrupted_token_bucket(
+    handle: &DatabaseHandle,
+    provider: LlmProviderId,
+    llm: ProfileId,
+) -> JobId {
+    let job = llm_job(handle, llm);
+    let micros = at_minute(30);
+    token_fact(handle, job, micros, Some(ELIGIBLE), NO_COUNTERS);
+    let minute = minute_of(at(micros));
+    let full = TokenMinuteTotals {
+        requests: u64::MAX,
+        ..TokenMinuteTotals::default()
+    };
+    wait(handle.with_database(move |database| {
+        crate::storage::replace_token_minute(database, provider, "model-a", minute, &full)
+    }))
+    .expect("break the fixture");
+    job
+}
+
 #[test]
-fn a_first_check_that_fails_returns_its_cause_and_ends_the_run_as_failed() {
+fn a_first_check_on_invalid_token_evidence_halts_only_token_and_ends_the_run_as_failed() {
     let (_root, directory) = data_directory("service-first-evidence");
     let worker = DatabaseWorker::start(&directory).expect("start database");
     let handle = worker.handle();
     let (_provider, llm) = llm_setup(&handle, "model-a");
     let (bad, eligible) = contradictory(&handle, llm);
+    let observed = llm_job(&handle, llm);
+    observe(&handle, observed, at_minute(30), response(200));
 
-    let failed = failed_start(wait(AggregationService::start(
+    // The service starts, and its first check still consumes Availability.
+    let service = wait(AggregationService::start(
         handle.clone(),
         AggregationServiceConfig::default(),
-    )));
-    match &failed.cause {
-        StartCause::Loop(ServiceFailure::Evidence(TokenConsumeError::Evidence {
-            metrics,
-            job,
-            ..
-        })) => assert_eq!((*metrics, *job), (eligible, bad)),
-        other => panic!("the concrete cause is kept, got {other:?}"),
-    }
-    assert!(matches!(failed.end, JobEnd::Recorded));
-    let record = job_record(&handle, failed.job);
+    ))
+    .expect("invalid Token evidence does not stop the service");
     assert!(
-        record.started_at.is_some() && record.failed_at.is_some() && record.completed_at.is_none(),
-        "the run is Failed, not left Started"
+        matches!(service.state(), ServiceState::Degraded(reason) if reason.contains(&bad.to_string())),
+        "{:?}",
+        service.state()
+    );
+    let availability = wait(handle.job_availability(observed, None, 10)).expect("read");
+    assert_eq!(
+        wait(handle.availability_progress())
+            .expect("progress")
+            .consumed_through,
+        availability.last().map(|record| record.id),
+        "Availability went on"
     );
     assert_eq!(
         token_progress(&handle).consumed_through,
         None,
-        "no record was skipped"
+        "no Token record was skipped"
     );
     assert_eq!(
         job_metrics(&handle, bad).len(),
@@ -8776,14 +8866,33 @@ fn a_first_check_that_fails_returns_its_cause_and_ends_the_run_as_failed() {
         "the raw facts are intact"
     );
 
-    // The loop was joined and the claim released: another attempt can run,
-    // under its own Job, and meets the same fact.
-    let again = failed_start(wait(AggregationService::start(
+    // Stopping reports the concrete cause and ends the run as Failed.
+    let job = service.job();
+    let outcome = wait(service.shutdown());
+    match &outcome.failure {
+        Some(ServiceFailure::Evidence(TokenConsumeError::Evidence { metrics, job, .. })) => {
+            assert_eq!((*metrics, *job), (eligible, bad))
+        }
+        other => panic!("the concrete cause is kept, got {other:?}"),
+    }
+    assert!(matches!(outcome.end, JobEnd::Recorded));
+    let record = job_record(&handle, job);
+    assert!(
+        record.started_at.is_some() && record.failed_at.is_some() && record.completed_at.is_none(),
+        "the run is Failed, not left Started"
+    );
+
+    // Another run, under its own Job, meets the same fact the same way.
+    let again = wait(AggregationService::start(
         handle.clone(),
         AggregationServiceConfig::default(),
-    )));
-    assert_ne!(again.job, failed.job);
+    ))
+    .expect("start again");
+    assert_ne!(again.job(), job);
+    assert!(matches!(again.state(), ServiceState::Degraded(_)));
+    assert!(wait(again.shutdown()).failure.is_some());
     assert_eq!(service_jobs(&handle).len(), 2);
+    assert_eq!(token_progress(&handle).consumed_through, None);
     worker.shutdown().expect("shutdown");
 }
 
@@ -8874,8 +8983,8 @@ fn a_run_whose_end_is_refused_keeps_both_the_failure_and_the_refusal() {
     let (_root, directory) = data_directory("service-end-refused");
     let worker = DatabaseWorker::start(&directory).expect("start database");
     let handle = worker.handle();
-    let (_provider, llm) = llm_setup(&handle, "model-a");
-    contradictory(&handle, llm);
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    corrupted_token_bucket(&handle, provider, llm);
     let (hook_handle, reason) = (handle.clone(), protection_reason(&directory));
     let failed = failed_start(wait(AggregationService::start(
         handle.clone(),
@@ -8894,7 +9003,10 @@ fn a_run_whose_end_is_refused_keeps_both_the_failure_and_the_refusal() {
     )));
     assert!(matches!(
         failed.cause,
-        StartCause::Loop(ServiceFailure::Evidence(_))
+        StartCause::Loop(ServiceFailure::Database {
+            stream: Stream::Token,
+            ..
+        })
     ));
     assert!(
         matches!(
@@ -8921,8 +9033,8 @@ fn a_run_whose_end_has_an_unknown_outcome_is_reported_as_unconfirmed() {
     let (_root, directory) = data_directory("service-end-unknown");
     let worker = DatabaseWorker::start(&directory).expect("start database");
     let handle = worker.handle();
-    let (_provider, llm) = llm_setup(&handle, "model-a");
-    let (bad, _) = contradictory(&handle, llm);
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let bad = corrupted_token_bucket(&handle, provider, llm);
     let (stash, held_and_release) = flume::unbounded();
     let hook_handle = handle.clone();
     let config = AggregationServiceConfig {
@@ -8968,7 +9080,10 @@ fn a_run_whose_end_has_an_unknown_outcome_is_reported_as_unconfirmed() {
     ));
     assert!(matches!(
         failed.cause,
-        StartCause::Loop(ServiceFailure::Evidence(_))
+        StartCause::Loop(ServiceFailure::Database {
+            stream: Stream::Token,
+            ..
+        })
     ));
     assert!(
         matches!(
@@ -9219,8 +9334,9 @@ fn a_host_run_keeps_stopping_after_a_failed_step_and_reports_every_failure() {
         report.attempted,
         [
             Phase::AggregationService,
-            Phase::Logger,
+            Phase::LogCleanup,
             Phase::ExecutionRuntime,
+            Phase::Logger,
             Phase::Database,
         ],
         "every stop step ran, in order, database last"
@@ -9820,6 +9936,391 @@ mod lifecycle_closure {
 
         let worker = DatabaseWorker::start(&directory).expect("restart");
         assert!(worker.handle().abandoned_at_open().is_empty());
+        worker.shutdown().expect("shutdown");
+    }
+}
+
+// ---- Token eligibility at ingest -------------------------------------------------
+
+/// One Job's Token annotations agree on whether its request was sent; a
+/// contradicting annotation is refused in the transaction that would write it.
+mod token_eligibility_at_ingest {
+    use super::*;
+    use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
+
+    fn fact(job: JobId, micros: i64, token: Option<TokenAnnotation>) -> NewMetrics {
+        NewMetrics {
+            job,
+            observed_at: at(micros),
+            measurements: Measurements {
+                ttfb_ms: token.is_none().then_some(5),
+                ..Measurements::default()
+            },
+            token,
+        }
+    }
+
+    fn eligible() -> Option<TokenAnnotation> {
+        Some(TokenAnnotation::eligible(UsageFinality::Cumulative))
+    }
+
+    fn excluded() -> Option<TokenAnnotation> {
+        Some(TokenAnnotation::excluded())
+    }
+
+    fn contradiction(job: JobId, committed: RequestEligibility) -> Violation {
+        let refused = match committed {
+            RequestEligibility::Eligible => RequestEligibility::Excluded,
+            RequestEligibility::Excluded => RequestEligibility::Eligible,
+        };
+        Violation::ContradictoryTokenEligibility {
+            job,
+            committed,
+            refused,
+        }
+    }
+
+    #[test]
+    fn consistent_evidence_is_accepted_and_a_contradiction_is_refused_atomically() {
+        let (_root, directory) = data_directory("ingest-eligibility");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+
+        for (first, committed) in [
+            (eligible(), RequestEligibility::Eligible),
+            (excluded(), RequestEligibility::Excluded),
+        ] {
+            let job = llm_job(&handle, llm);
+            // Generic Metrics carry no eligibility and never conflict.
+            wait(handle.record_metrics(fact(job, 1, None))).expect("generic Metrics");
+            wait(handle.record_metrics(fact(job, 2, first))).expect("the first annotation");
+            wait(handle.record_metrics(fact(job, 3, first))).expect("a consistent repeat");
+            wait(handle.record_metrics(fact(job, 4, None))).expect("generic Metrics after");
+
+            let records = job_metrics(&handle, job);
+            let markers = wait(handle.operation_markers(None, 1_000))
+                .expect("read markers")
+                .len();
+            let progress = token_progress(&handle);
+            let contradicting = match committed {
+                RequestEligibility::Eligible => excluded(),
+                RequestEligibility::Excluded => eligible(),
+            };
+            assert_eq!(
+                violation(wait(handle.record_metrics(fact(job, 5, contradicting)))),
+                contradiction(job, committed)
+            );
+            assert_eq!(job_metrics(&handle, job), records, "nothing was written");
+            assert_eq!(
+                wait(handle.operation_markers(None, 1_000))
+                    .expect("read markers")
+                    .len(),
+                markers,
+                "no marker, so nothing committed"
+            );
+            assert_eq!(token_progress(&handle), progress);
+        }
+
+        // Aggregation goes on: every Job's evidence reduces.
+        let consumed = wait(handle.consume_token_usage(1_000)).expect("aggregate");
+        assert!(matches!(consumed, TokenBatch::Consumed(_)), "{consumed:?}");
+        assert!(matches!(
+            wait(handle.consume_token_usage(1_000)).expect("aggregate"),
+            TokenBatch::Idle { .. }
+        ));
+        worker.shutdown().expect("shutdown");
+
+        // The check holds for evidence committed by an earlier opening.
+        let worker = DatabaseWorker::start(&directory).expect("reopen");
+        let handle = worker.handle();
+        let job = wait(handle.jobs(None, 1_000))
+            .expect("read jobs")
+            .into_iter()
+            .find(|job| {
+                job_metrics(&handle, job.id)
+                    .iter()
+                    .any(|record| record.token == excluded())
+            })
+            .expect("the excluded Job")
+            .id;
+        assert_eq!(
+            violation(wait(handle.record_metrics(fact(job, 6, eligible())))),
+            contradiction(job, RequestEligibility::Excluded)
+        );
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn concurrent_conflicting_submissions_commit_one_eligibility() {
+        let (_root, directory) = data_directory("ingest-concurrent");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+
+        // Both queued before either runs: admission order decides.
+        let job = llm_job(&handle, llm);
+        let first = admit(handle.record_metrics(fact(job, 1, excluded())));
+        let second = admit(handle.record_metrics(fact(job, 2, eligible())));
+        first().expect("the first in admission order is accepted");
+        assert_eq!(
+            violation(second()),
+            contradiction(job, RequestEligibility::Excluded)
+        );
+
+        // Many callers on many threads, through the one writer.
+        let job = llm_job(&handle, llm);
+        let submitters: Vec<_> = (0..16)
+            .map(|index| {
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    let token = if index % 2 == 0 {
+                        eligible()
+                    } else {
+                        excluded()
+                    };
+                    (token, wait(handle.record_metrics(fact(job, index, token))))
+                })
+            })
+            .collect();
+        let results: Vec<_> = submitters
+            .into_iter()
+            .map(|submitter| submitter.join().expect("submitter"))
+            .collect();
+        let accepted: Vec<_> = results
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .map(|(token, _)| *token)
+            .collect();
+        assert!(!accepted.is_empty());
+        assert!(
+            accepted.iter().all(|token| *token == accepted[0]),
+            "every accepted annotation states one eligibility"
+        );
+        for (token, result) in &results {
+            if *token != accepted[0] {
+                assert!(matches!(
+                    result,
+                    Err(DatabaseError::Rejected(
+                        Violation::ContradictoryTokenEligibility { .. }
+                    ))
+                ));
+            }
+        }
+        let stored: Vec<_> = job_metrics(&handle, job)
+            .into_iter()
+            .map(|record| record.token)
+            .collect();
+        assert_eq!(stored.len(), accepted.len());
+        assert!(stored.iter().all(|token| *token == accepted[0]));
+        let consumed = wait(handle.consume_token_usage(1_000)).expect("aggregate");
+        assert!(matches!(consumed, TokenBatch::Consumed(_)), "{consumed:?}");
+        worker.shutdown().expect("shutdown");
+    }
+}
+
+// ---- aggregation liveness ----------------------------------------------------------
+
+/// A loop that exits is never reported running, a known rollback is retried
+/// from committed progress, and an unknown commit is resolved, not replayed.
+mod aggregation_liveness {
+    use super::*;
+    use crate::database::{StorageError, UnknownCause};
+    use crate::persistence::OperationId;
+
+    const PANIC: &str = "injected aggregation fault";
+
+    #[test]
+    fn a_panicking_loop_is_reported_failed_with_its_message_and_ends_the_run() {
+        let (_root, directory) = data_directory("liveness-panic");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let job = llm_job(&handle, llm);
+        let panic_now = Arc::new(AtomicBool::new(false));
+        let armed = panic_now.clone();
+        let rig = Rig::start(&handle, move |seams| {
+            seams.before_consume = Some(Arc::new(move |_| {
+                if armed.load(AtomicOrdering::SeqCst) {
+                    panic!("{PANIC}");
+                }
+            }));
+        });
+        rig.tick();
+        assert_eq!(rig.service.state(), ServiceState::Running);
+
+        observe(&handle, job, at_minute(40), response(200));
+        let availability = wait(handle.availability_progress()).expect("progress");
+        panic_now.store(true, AtomicOrdering::SeqCst);
+        assert!(rig.service.tick());
+        eventually(|| rig.service.state() != ServiceState::Running);
+        match rig.service.state() {
+            ServiceState::Failed(reason) => {
+                assert!(
+                    reason.contains("panicked") && reason.contains(PANIC),
+                    "{reason}"
+                )
+            }
+            other => panic!("a panicked loop is Failed, got {other:?}"),
+        }
+        eventually(|| !rig.service.tick());
+        assert!(matches!(rig.service.state(), ServiceState::Failed(_)));
+        assert_eq!(
+            wait(handle.availability_progress()).expect("progress"),
+            availability,
+            "nothing was committed by the interrupted check"
+        );
+
+        let service = rig.service;
+        let service_job = service.job();
+        let outcome = wait(service.shutdown());
+        assert!(matches!(outcome.failure, Some(ServiceFailure::Panicked)));
+        assert!(matches!(outcome.end, JobEnd::Recorded));
+        assert!(job_record(&handle, service_job).failed_at.is_some());
+        worker.shutdown().expect("shutdown");
+    }
+
+    /// Makes the next consume call of `stream` meet `error` once.
+    fn fail_once(
+        seams: &mut TestSeams,
+        stream: Stream,
+        error: impl Fn() -> DatabaseError + Send + Sync + 'static,
+    ) {
+        let armed = AtomicBool::new(true);
+        seams.error_override = Some(Arc::new(move |seen| {
+            (seen == stream && armed.swap(false, AtomicOrdering::SeqCst)).then(&error)
+        }));
+    }
+
+    #[test]
+    fn a_rollback_on_an_open_database_is_retried_from_committed_progress() {
+        let (_root, directory) = data_directory("liveness-rollback");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (provider, llm) = llm_setup(&handle, "model-a");
+        let job = llm_job(&handle, llm);
+        let micros = at_minute(41);
+        let fact = token_fact(
+            &handle,
+            job,
+            micros,
+            Some(ELIGIBLE_FINAL),
+            io5(Some(2), Some(3)),
+        );
+        let rig = Rig::start(&handle, |seams| {
+            fail_once(seams, Stream::Token, || {
+                DatabaseError::RolledBack(StorageError::corrupted("injected rollback"))
+            })
+        });
+
+        let report = rig.tick();
+        assert!(
+            outcomes(&report).contains(&(Stream::Token, StreamOutcome::Retry)),
+            "{report:?}"
+        );
+        assert_eq!(rig.service.state(), ServiceState::Running);
+        assert_eq!(
+            token_progress(&handle).consumed_through,
+            None,
+            "nothing moved"
+        );
+
+        let report = rig.tick();
+        assert!(
+            outcomes(&report).contains(&(Stream::Token, StreamOutcome::Consumed(1))),
+            "{report:?}"
+        );
+        assert_eq!(token_progress(&handle).consumed_through, Some(fact));
+        assert_eq!(
+            token_bucket(&handle, provider, "model-a", micros).map(|totals| totals.requests),
+            Some(1),
+            "counted once"
+        );
+        wait(rig.service.shutdown())
+            .into_result()
+            .expect("a clean stop");
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn an_unknown_commit_on_an_open_database_is_resolved_before_its_stream_runs_again() {
+        let (_root, directory) = data_directory("liveness-unknown");
+        let worker = recovering_worker(&directory);
+        let handle = worker.handle();
+        let (provider, llm) = llm_setup(&handle, "model-a");
+        let job = llm_job(&handle, llm);
+        let micros = at_minute(42);
+        let fact = token_fact(
+            &handle,
+            job,
+            micros,
+            Some(ELIGIBLE_FINAL),
+            io5(Some(2), Some(3)),
+        );
+        // An operation of this opening that has no marker yet.
+        let uncertain = OperationId::new(handle.epoch(), u64::MAX);
+        let rig = Rig::start(&handle, move |seams| {
+            fail_once(seams, Stream::Token, move || {
+                DatabaseError::OutcomeUnknown {
+                    operation: uncertain,
+                    cause: UnknownCause::Commit(StorageError::corrupted("injected unknown commit")),
+                }
+            })
+        });
+
+        let report = rig.tick();
+        assert!(
+            outcomes(&report).contains(&(Stream::Token, StreamOutcome::Uncertain)),
+            "{report:?}"
+        );
+        // While its marker cannot say, the Token stream is not attempted;
+        // Availability goes on.
+        observe(&handle, job, micros, response(200));
+        let calls = rig.calls();
+        let mut availability = 0;
+        for _ in 0..3 {
+            for (stream, outcome) in outcomes(&rig.tick()) {
+                match stream {
+                    Stream::Token => assert_eq!(outcome, StreamOutcome::Uncertain),
+                    Stream::Availability => {
+                        if let StreamOutcome::Consumed(records) = outcome {
+                            availability += records;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(availability, 1);
+        assert_eq!(rig.calls(), calls + 3, "only Availability was attempted");
+        assert_eq!(
+            token_progress(&handle).consumed_through,
+            None,
+            "the cursor did not move on an unconfirmed commit"
+        );
+
+        // A reopen settles that the operation never committed; the stream
+        // then prepares again from what is committed.
+        assert!(handle.activate_filesystem_protection(
+            crate::disk_protection::ProtectionReason::StorageUnavailable(StorageError::corrupted(
+                "injected storage failure"
+            ))
+        ));
+        wait(handle.recover_storage()).expect("recover storage");
+        let report = rig.tick();
+        assert!(
+            outcomes(&report).contains(&(Stream::Token, StreamOutcome::Consumed(1))),
+            "{report:?}"
+        );
+        assert_eq!(token_progress(&handle).consumed_through, Some(fact));
+        assert_eq!(
+            token_bucket(&handle, provider, "model-a", micros).map(|totals| totals.requests),
+            Some(1),
+            "counted once"
+        );
+        assert_eq!(rig.service.state(), ServiceState::Running);
+        wait(rig.service.shutdown())
+            .into_result()
+            .expect("a clean stop");
         worker.shutdown().expect("shutdown");
     }
 }
