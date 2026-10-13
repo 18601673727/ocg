@@ -8,6 +8,7 @@ pub mod orchestration;
 pub mod persistence;
 pub mod provider_execution;
 pub mod system_policy;
+pub mod token_usage;
 mod storage;
 #[cfg(test)]
 mod schema_tests;
