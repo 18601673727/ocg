@@ -799,7 +799,37 @@ fn text_bytes(text: &Option<String>) -> u64 {
 fn json_bytes(value: &Option<serde_json::Value>) -> u64 {
     value
         .as_ref()
-        .map_or(0, |value| byte_count(value.to_string().len()))
+        .map_or(0, |value| counted_json_bytes(value, ByteCounter::default()))
+}
+
+/// Measures the compact serialization of `value` on top of what `counter`
+/// already holds, without retaining the serialized bytes. An overflow or an
+/// unexpected serialization failure answers `u64::MAX`, never a short count.
+fn counted_json_bytes(value: &serde_json::Value, mut counter: ByteCounter) -> u64 {
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.bytes,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// A write sink that only counts the bytes written to it.
+#[derive(Default)]
+struct ByteCounter {
+    bytes: u64,
+}
+
+impl Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(byte_count(buf.len()))
+            .ok_or_else(|| std::io::Error::other("serialized byte count overflowed"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn output_bytes(
@@ -3609,5 +3639,105 @@ mod read_pool_tests {
         );
         shutdown.join().unwrap();
         reopen_and_read(&directory);
+    }
+}
+
+#[cfg(test)]
+mod json_bytes_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::persistence::IntermediateOutputKind;
+
+    fn reference(value: &serde_json::Value) -> u64 {
+        byte_count(serde_json::to_vec(value).expect("a Value serializes").len())
+    }
+
+    #[test]
+    fn matches_compact_serialization() {
+        let large = serde_json::Value::Array(
+            (0..5_000)
+                .map(|index| {
+                    json!({
+                        "index": index,
+                        "text": format!("line \"{index}\"\n\t\\ \u{1F600} \u{e9}"),
+                        "nested": [null, true, 1.5, {"deep": ["a", "b"]}],
+                    })
+                })
+                .collect(),
+        );
+        let values = [
+            json!(null),
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(-12345),
+            json!(u64::MAX),
+            json!(3.25),
+            json!(""),
+            json!("plain"),
+            json!("héllo 世界 😀"),
+            json!("quote \" backslash \\ newline \n tab \t control \u{1} slash /"),
+            json!([]),
+            json!({}),
+            json!({"a": [1, {"b": null}], "ключ": "значение", "k\"ey": ["x\ny"]}),
+            large,
+        ];
+        for value in values {
+            assert_eq!(
+                json_bytes(&Some(value.clone())),
+                reference(&value),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_is_zero_and_null_is_four() {
+        assert_eq!(json_bytes(&None), 0);
+        assert_eq!(json_bytes(&Some(serde_json::Value::Null)), 4);
+    }
+
+    #[test]
+    fn counter_overflow_is_never_a_short_count() {
+        let mut counter = ByteCounter {
+            bytes: u64::MAX - 1,
+        };
+        assert!(counter.write(b"ab").is_err());
+
+        let value = json!("abc");
+        let near_limit = ByteCounter {
+            bytes: u64::MAX - 2,
+        };
+        assert_eq!(counted_json_bytes(&value, near_limit), u64::MAX);
+        let fits = ByteCounter { bytes: 10 };
+        assert_eq!(counted_json_bytes(&value, fits), 10 + reference(&value));
+    }
+
+    #[test]
+    fn json_bearing_command_allowance_uses_the_reference_formula() {
+        let value = json!({"tokens": [1, 2, 3], "note": "héllo \"x\""});
+        let output = NewJobOutput {
+            kind: IntermediateOutputKind::Progress,
+            summary: Some("summary".to_owned()),
+            code: Some("code".to_owned()),
+            goal_reached: None,
+            value: Some(value.clone()),
+        };
+        let (reply, _answer) = flume::bounded(1);
+        let command = Command::AppendJobOutput {
+            job: JobId::new(1),
+            output,
+            reply,
+        };
+        let payload = byte_count("summary".len())
+            .saturating_add(byte_count("code".len()))
+            .saturating_add(reference(&value));
+        assert_eq!(
+            command.expected_write_bytes(),
+            payload
+                .saturating_mul(2)
+                .saturating_add(TRANSACTION_ALLOWANCE_BYTES)
+        );
     }
 }
