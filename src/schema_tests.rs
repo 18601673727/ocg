@@ -6042,6 +6042,70 @@ const FINAL_ZERO_OUTPUT: &str =
     "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n";
 const DONE_CHUNK: &str = "data: [DONE]\n\n";
 
+#[test]
+fn streamed_text_is_coalesced_into_fewer_durable_outputs_without_changing_reconstruction() {
+    const DELTAS: usize = 128;
+    let (_root, directory) = data_directory("provider-output-coalescing");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let run = token_run(&handle, llm);
+    let mut steps = (0..DELTAS)
+        .map(|_| {
+            Step::Chunk(leaked_chunk(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n".to_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    steps.push(Step::Chunk(STOP_CHUNK));
+    let started = Instant::now();
+    drive(&handle, run, steps, BOUND).expect("settle the run");
+    let elapsed = started.elapsed();
+
+    let outputs = wait(handle.job_outputs(run.job, None, 10)).expect("read outputs");
+    let progress = outputs
+        .iter()
+        .filter(|output| output.kind == OutputKind::Progress)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        progress.len(),
+        1,
+        "128 deltas require one durable Progress write"
+    );
+    assert_eq!(
+        progress
+            .iter()
+            .filter_map(|output| output.summary.as_deref())
+            .collect::<String>(),
+        "x".repeat(DELTAS),
+        "durable Progress records reconstruct the provider text exactly"
+    );
+    assert_eq!(
+        outputs.iter().map(|output| output.kind).collect::<Vec<_>>(),
+        [OutputKind::Progress, OutputKind::Result],
+        "the final Result follows all durable Progress output"
+    );
+    assert_eq!(
+        outputs[1].summary.as_deref(),
+        Some("x".repeat(DELTAS).as_str()),
+        "the public final summary contract remains unchanged"
+    );
+    assert_eq!(
+        outputs[1]
+            .value
+            .as_ref()
+            .and_then(|value| value.get("text"))
+            .and_then(serde_json::Value::as_str),
+        Some("x".repeat(DELTAS).as_str()),
+        "the structured final-result contract remains unchanged"
+    );
+    println!(
+        "provider stream measurement: deltas={DELTAS} progress_writes={} elapsed={elapsed:?}",
+        progress.len()
+    );
+    worker.shutdown().expect("shutdown");
+}
+
 /// Runs a scripted body, then reopens the database and reduces what was
 /// stored, with no eligibility or finality supplied by the test.
 fn run_and_reduce(

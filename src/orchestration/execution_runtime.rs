@@ -727,6 +727,7 @@ pub(crate) async fn settle_provider_error(
             | ProviderExecutionError::Incomplete { .. }
             | ProviderExecutionError::Interrupted { .. }
             | ProviderExecutionError::Stopped { .. }
+            | ProviderExecutionError::OutputPersistence { .. }
     );
     let result = if unknown {
         database.finalize_job(job, JobFinalization::Unknown).await?

@@ -24,6 +24,8 @@ const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_ERROR_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+const STREAM_OUTPUT_BUFFER_BYTES: usize = 4 * 1024;
+const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The temporary bootstrap credential boundary. The name is persisted, while
 /// this resolver returns the secret only to the request builder.
@@ -237,12 +239,18 @@ pub enum ProviderExecutionError {
         message: String,
         facts: ResponseFacts,
     },
+    #[error("{stream}; additionally, streamed output could not be persisted: {message}")]
+    OutputPersistence {
+        message: String,
+        stream: Box<ProviderExecutionError>,
+    },
 }
 
 impl ProviderExecutionError {
     pub fn failure(&self) -> Option<&ProviderFailure> {
         match self {
             Self::Rejected { failure } => Some(failure),
+            Self::OutputPersistence { stream, .. } => stream.failure(),
             _ => None,
         }
     }
@@ -262,7 +270,7 @@ async fn execute_chat_inner(
     objective: Option<&str>,
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
-    mut sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+    mut sink: Option<&mut dyn ProviderOutputSink>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut announced = false;
     let result = exchange(
@@ -270,7 +278,7 @@ async fn execute_chat_inner(
         objective,
         resolver,
         config,
-        sink.as_deref_mut(),
+        &mut sink,
         &mut announced,
     )
     .await;
@@ -279,7 +287,7 @@ async fn execute_chat_inner(
     if let Err(error) = &result
         && !announced
     {
-        announce(sink, unannounced_fact(error)).await;
+        announce(borrow_output_sink(&mut sink), unannounced_fact(error)).await;
     }
     result
 }
@@ -298,6 +306,7 @@ fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
         | ProviderExecutionError::Incomplete { .. }
         | ProviderExecutionError::Interrupted { .. }
         | ProviderExecutionError::Stopped { .. } => ProviderFact::Delivered,
+        ProviderExecutionError::OutputPersistence { stream, .. } => unannounced_fact(stream),
     }
 }
 
@@ -319,12 +328,21 @@ async fn announce_at(
     }
 }
 
+fn borrow_output_sink<'a>(
+    sink: &'a mut Option<&mut dyn ProviderOutputSink>,
+) -> Option<&'a mut dyn ProviderOutputSink> {
+    match sink {
+        Some(sink) => Some(&mut **sink),
+        None => None,
+    }
+}
+
 async fn exchange(
     frozen: &FrozenExecutionConfig,
     objective: Option<&str>,
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
-    mut sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+    sink: &mut Option<&mut dyn ProviderOutputSink>,
     announced: &mut bool,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let provider = &frozen.llm.provider;
@@ -362,9 +380,9 @@ async fn exchange(
         .response_timeout(Millis(
             config.timeout.as_millis().min(u128::from(u32::MAX)) as u32
         ))
-        .response_payload_timeout(Millis(
-            config.timeout.as_millis().min(u128::from(u32::MAX)) as u32
-        ))
+        // The pinned client's payload timeout covers the whole body, not an
+        // idle interval. Streaming applies its own timeout to each chunk wait.
+        .response_payload_timeout(Millis::ZERO)
         .build(ntex::SharedCfg::default())
         .await
         .map_err(|error| ProviderExecutionError::Build {
@@ -401,7 +419,7 @@ async fn exchange(
     .map_err(classify_client_error)?;
     // A response head proves the request reached a Provider, whatever it says.
     *announced = true;
-    announce(sink.as_deref_mut(), ProviderFact::Delivered).await;
+    announce(borrow_output_sink(sink), ProviderFact::Delivered).await;
     let status = response.status().as_u16();
     let request_id = response
         .header("x-request-id")
@@ -411,12 +429,16 @@ async fn exchange(
         // A cancelled read keeps the status the Provider answered with.
         let body = match select(
             config.cancellation.cancelled(),
-            bounded_body(response, MAX_PROVIDER_ERROR_BYTES),
+            ntex::time::timeout(
+                config.timeout,
+                bounded_body(response, MAX_PROVIDER_ERROR_BYTES),
+            ),
         )
         .await
         {
             Either::Left(()) => None,
-            Either::Right(body) => body,
+            Either::Right(Ok(body)) => body,
+            Either::Right(Err(())) => None,
         };
         return Err(ProviderExecutionError::Rejected {
             failure: provider_failure(status, request_id, body),
@@ -424,41 +446,39 @@ async fn exchange(
     }
 
     let payload = response.take_payload();
-    read_response(payload, status, started, request_id, config, sink).await
+    read_response(
+        payload,
+        status,
+        started,
+        request_id,
+        config,
+        borrow_output_sink(sink),
+    )
+    .await
 }
 
-/// Reads one response stream under the outer timeout. Every usage object is
-/// handed to the sink, awaited, when it is parsed, so the timeout drops
-/// nothing that was handed over. The one object being awaited when the
-/// timeout fires may or may not be stored: its write was started and is
-/// neither retried nor reported.
+/// Reads one response stream. The configured timeout applies only while
+/// waiting for the next provider chunk; parsing and persistence are outside
+/// that interval.
 pub(crate) async fn read_response(
     payload: Payload,
     status_code: u16,
     started: Instant,
     request_id: Option<String>,
     config: &ProviderExecutionConfig,
-    sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+    sink: Option<&mut dyn ProviderOutputSink>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut capture = UsageCapture::default();
-    let outcome = ntex::time::timeout(
-        config.timeout,
-        parse_stream(
-            payload,
-            status_code,
-            started,
-            request_id,
-            config,
-            sink,
-            &mut capture,
-        ),
+    parse_stream(
+        payload,
+        status_code,
+        started,
+        request_id,
+        config,
+        sink,
+        &mut capture,
     )
-    .await;
-    outcome.unwrap_or_else(|_| {
-        Err(ProviderExecutionError::Unknown {
-            message: "provider stream timed out after it may have been delivered".to_owned(),
-        })
-    })
+    .await
 }
 
 pub async fn execute_chat_with_sink(
@@ -519,13 +539,181 @@ fn request_body(
 }
 
 async fn parse_stream(
+    payload: Payload,
+    status_code: u16,
+    started: Instant,
+    request_id: Option<String>,
+    config: &ProviderExecutionConfig,
+    sink: Option<&mut dyn ProviderOutputSink>,
+    capture: &mut UsageCapture,
+) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+    let mut output = StreamOutput::new(sink);
+    let result = parse_stream_body(
+        payload,
+        status_code,
+        started,
+        request_id,
+        config,
+        capture,
+        &mut output,
+    )
+    .await;
+    let flushed = output.flush().await;
+    match (result, flushed) {
+        (result, Ok(())) => result,
+        (Ok(result), Err(error)) => Err(local_stop(
+            &error.message,
+            status_code,
+            result.finish_reason,
+            result.raw_finish_reason.as_deref(),
+        )),
+        (Err(stream), Err(error)) => Err(ProviderExecutionError::OutputPersistence {
+            message: error.message,
+            stream: Box::new(stream),
+        }),
+    }
+}
+
+struct StreamOutput<'a> {
+    sink: Option<&'a mut dyn ProviderOutputSink>,
+    text: String,
+    started: Option<Instant>,
+}
+
+impl<'a> StreamOutput<'a> {
+    fn new(sink: Option<&'a mut dyn ProviderOutputSink>) -> Self {
+        Self {
+            sink,
+            text: String::with_capacity(STREAM_OUTPUT_BUFFER_BYTES),
+            started: None,
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        !self.text.is_empty()
+    }
+
+    fn flush_delay(&self) -> Duration {
+        self.started
+            .map_or(STREAM_OUTPUT_FLUSH_INTERVAL, |started| {
+                STREAM_OUTPUT_FLUSH_INTERVAL.saturating_sub(started.elapsed())
+            })
+    }
+
+    async fn buffer(&mut self, mut delta: &str) -> Result<(), OutputSinkError> {
+        if self.sink.is_none() {
+            return Ok(());
+        }
+        while !delta.is_empty() {
+            if self.text.is_empty() {
+                self.started = Some(Instant::now());
+            }
+            let available = STREAM_OUTPUT_BUFFER_BYTES - self.text.len();
+            let split = floor_char_boundary(delta, available);
+            if split == 0 {
+                self.flush().await?;
+                continue;
+            }
+            self.text.push_str(&delta[..split]);
+            delta = &delta[split..];
+            if self.text.len() == STREAM_OUTPUT_BUFFER_BYTES || !delta.is_empty() {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<(), OutputSinkError> {
+        if self.text.is_empty() {
+            return Ok(());
+        }
+        let text = std::mem::take(&mut self.text);
+        self.started = None;
+        let Some(sink) = self.sink.as_deref_mut() else {
+            return Ok(());
+        };
+        sink.append(&text).await
+    }
+}
+
+impl ProviderOutputSink for StreamOutput<'_> {
+    fn append<'a>(
+        &'a mut self,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+        Box::pin(async move { self.buffer(text).await })
+    }
+
+    fn observe<'a>(
+        &'a mut self,
+        observation: ProviderObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            if let Some(sink) = self.sink.as_deref_mut() {
+                sink.observe(observation).await;
+            }
+        })
+    }
+}
+
+fn floor_char_boundary(text: &str, maximum: usize) -> usize {
+    let mut split = text.len().min(maximum);
+    while split > 0 && !text.is_char_boundary(split) {
+        split -= 1;
+    }
+    split
+}
+
+enum StreamWait {
+    Cancelled,
+    Flush,
+    Idle,
+    Chunk(Option<Result<ntex::util::Bytes, ntex::http::error::PayloadError>>),
+}
+
+async fn next_stream_event(
+    payload: &mut Payload,
+    config: &ProviderExecutionConfig,
+    output: &StreamOutput<'_>,
+    idle_remaining: Duration,
+) -> StreamWait {
+    #[cfg(test)]
+    if ntex::rt::System::try_current().is_none() {
+        return match select(config.cancellation.cancelled(), payload.recv()).await {
+            Either::Left(()) => StreamWait::Cancelled,
+            Either::Right(chunk) => StreamWait::Chunk(chunk),
+        };
+    }
+    let chunk = ntex::time::timeout(idle_remaining, payload.recv());
+    if output.is_pending() {
+        match select(
+            config.cancellation.cancelled(),
+            select(ntex::time::sleep(output.flush_delay()), chunk),
+        )
+        .await
+        {
+            Either::Left(()) => StreamWait::Cancelled,
+            Either::Right(Either::Left(())) => StreamWait::Flush,
+            Either::Right(Either::Right(Ok(chunk))) => StreamWait::Chunk(chunk),
+            Either::Right(Either::Right(Err(()))) => StreamWait::Idle,
+        }
+    } else {
+        match select(config.cancellation.cancelled(), chunk).await {
+            Either::Left(()) => StreamWait::Cancelled,
+            Either::Right(Ok(chunk)) => StreamWait::Chunk(chunk),
+            Either::Right(Err(())) => StreamWait::Idle,
+        }
+    }
+}
+
+async fn parse_stream_body(
     mut payload: Payload,
     status_code: u16,
     started: Instant,
     request_id: Option<String>,
     config: &ProviderExecutionConfig,
-    mut sink: Option<&mut (dyn ProviderOutputSink + '_)>,
     capture: &mut UsageCapture,
+    output: &mut StreamOutput<'_>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut buffer = Vec::with_capacity(MAX_SSE_LINE_BYTES);
     let mut text = String::new();
@@ -534,23 +722,59 @@ async fn parse_stream(
     let mut raw_finish_reason = None;
     let mut saw_event = false;
     let mut first_byte = None;
+    let mut idle_waited = Duration::ZERO;
 
     loop {
-        // A stalled stream is raced against cancellation, so a cancelled
-        // execution stops now rather than at its timeout.
-        let chunk = match select(config.cancellation.cancelled(), payload.recv()).await {
-            Either::Left(()) => None,
-            Either::Right(None) => break,
-            Either::Right(Some(chunk)) => Some(chunk),
-        };
-        let Some(chunk) = chunk.filter(|_| !config.cancellation.is_cancelled()) else {
+        if idle_waited >= config.timeout {
+            return Err(ProviderExecutionError::Unknown {
+                message: "provider stream was idle after it may have been delivered".to_owned(),
+            });
+        }
+        let wait_started = Instant::now();
+        let chunk =
+            match next_stream_event(&mut payload, config, output, config.timeout - idle_waited)
+                .await
+            {
+                StreamWait::Cancelled => {
+                    return Err(local_stop(
+                        "provider execution was cancelled while streaming",
+                        status_code,
+                        finish_reason,
+                        raw_finish_reason.as_deref(),
+                    ));
+                }
+                StreamWait::Flush => {
+                    idle_waited = idle_waited.saturating_add(wait_started.elapsed());
+                    output.flush().await.map_err(|error| {
+                        local_stop(
+                            &error.message,
+                            status_code,
+                            finish_reason,
+                            raw_finish_reason.as_deref(),
+                        )
+                    })?;
+                    continue;
+                }
+                StreamWait::Idle => {
+                    return Err(ProviderExecutionError::Unknown {
+                        message: "provider stream was idle after it may have been delivered"
+                            .to_owned(),
+                    });
+                }
+                StreamWait::Chunk(None) => break,
+                StreamWait::Chunk(Some(chunk)) => {
+                    idle_waited = Duration::ZERO;
+                    chunk
+                }
+            };
+        if config.cancellation.is_cancelled() {
             return Err(local_stop(
                 "provider execution was cancelled while streaming",
                 status_code,
                 finish_reason,
                 raw_finish_reason.as_deref(),
             ));
-        };
+        }
         let chunk = chunk.map_err(|error| ProviderExecutionError::Unknown {
             message: error.to_string(),
         })?;
@@ -597,13 +821,10 @@ async fn parse_stream(
             // The usage is taken before the delta, so a failed delta write
             // loses none of the event's counters.
             if let Some(reported) = consumed.usage {
-                capture.record(sink.as_deref_mut(), reported).await;
+                capture.record(Some(output), reported).await;
             }
-            if let Some(delta) = consumed.delta.as_deref()
-                && let Some(sink) = sink.as_deref_mut()
-            {
-                // The failed delta's event is already applied, so its finish reason is kept.
-                sink.append(delta).await.map_err(|error| {
+            if let Some(delta) = consumed.delta.as_deref() {
+                output.buffer(delta).await.map_err(|error| {
                     local_stop(
                         &error.message,
                         status_code,
@@ -939,6 +1160,7 @@ pub fn error_observation(
                 }),
             })
         }
+        ProviderExecutionError::OutputPersistence { stream, .. } => error_observation(stream),
     }
 }
 
@@ -967,6 +1189,8 @@ pub fn result_value(result: &ProviderExecutionResult) -> Value {
 pub(crate) mod scripted {
     use std::collections::VecDeque;
     use std::io;
+    use std::pin::Pin;
+    use std::time::Duration;
 
     use ntex::http::Payload;
     use ntex::http::error::PayloadError;
@@ -980,6 +1204,8 @@ pub(crate) mod scripted {
         Fail,
         /// Cancels the execution, then yields the next chunk so the parser sees it.
         Cancel,
+        /// Waits before yielding the next scripted step.
+        Quiet(Duration),
         /// Yields nothing, ever: only a timeout ends the read.
         Stall,
     }
@@ -987,6 +1213,7 @@ pub(crate) mod scripted {
     struct Body {
         steps: VecDeque<Step>,
         cancellation: CancellationToken,
+        quiet: Option<Pin<Box<dyn Future<Output = ()>>>>,
     }
 
     impl Stream for Body {
@@ -994,9 +1221,15 @@ pub(crate) mod scripted {
 
         fn poll_next(
             mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
+            cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Self::Item>> {
             use std::task::Poll;
+            if let Some(quiet) = &mut self.quiet {
+                if quiet.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.quiet = None;
+            }
             while let Some(step) = self.steps.pop_front() {
                 match step {
                     Step::Cancel => self.cancellation.cancel(),
@@ -1007,6 +1240,15 @@ pub(crate) mod scripted {
                         return Poll::Ready(Some(Err(PayloadError::Incomplete(Some(
                             io::Error::other("connection reset"),
                         )))));
+                    }
+                    Step::Quiet(duration) => {
+                        self.quiet = Some(Box::pin(ntex::time::sleep(duration)));
+                        if let Some(quiet) = &mut self.quiet
+                            && quiet.as_mut().poll(cx).is_pending()
+                        {
+                            return Poll::Pending;
+                        }
+                        self.quiet = None;
                     }
                     Step::Stall => {
                         // Stays at the front, so every poll stalls again.
@@ -1023,6 +1265,7 @@ pub(crate) mod scripted {
         Payload::from_stream(Body {
             steps: steps.into(),
             cancellation,
+            quiet: None,
         })
     }
 }
@@ -1109,14 +1352,95 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_stream_streams_each_delta_to_the_sink() {
+    fn a_complete_stream_coalesces_deltas_and_reconstructs_exact_text() {
         let mut sink = RecordingSink::default();
         let result = parse(
-            vec![Step::Chunk(CONTENT), Step::Chunk(STOP)],
+            vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk("data: {\"choices\":[{\"delta\":{\"content\":\" 世界\"}}]}\n\n"),
+                Step::Chunk(STOP),
+            ],
             Some(&mut sink),
         )
         .expect("a finished stream succeeds");
-        assert_eq!(result.text, "hi");
+        assert_eq!(result.text, "hi 世界");
+        assert_eq!(sink.deltas, ["hi 世界"]);
+    }
+
+    #[test]
+    fn a_large_delta_is_split_at_utf8_boundaries_with_a_strict_bound() {
+        let content = "世".repeat(STREAM_OUTPUT_BUFFER_BYTES);
+        let event = leaked(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+            serde_json::to_string(&content).expect("JSON string")
+        ));
+        let mut sink = RecordingSink::default();
+        let result = parse(vec![Step::Chunk(event), Step::Chunk(STOP)], Some(&mut sink))
+            .expect("a finished stream succeeds");
+        assert_eq!(sink.deltas.concat(), content);
+        assert_eq!(result.text, content);
+        assert!(
+            sink.deltas
+                .iter()
+                .all(|delta| delta.len() <= STREAM_OUTPUT_BUFFER_BYTES)
+        );
+        assert!(sink.deltas.len() > 1);
+    }
+
+    #[test]
+    fn flush_boundaries_preserve_order() {
+        let first = "a".repeat(STREAM_OUTPUT_BUFFER_BYTES - 1);
+        let event = |text: &str| {
+            leaked(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+                serde_json::to_string(text).expect("JSON string")
+            ))
+        };
+        let mut sink = RecordingSink::default();
+        let result = parse(
+            vec![
+                Step::Chunk(event(&first)),
+                Step::Chunk(event("世界")),
+                Step::Chunk(event("z")),
+                Step::Chunk(STOP),
+            ],
+            Some(&mut sink),
+        )
+        .expect("a finished stream succeeds");
+        assert_eq!(sink.deltas.concat(), result.text);
+        assert_eq!(result.text, format!("{first}世界z"));
+        assert!(sink.deltas.len() >= 2);
+    }
+
+    #[test]
+    fn a_quiet_stream_flushes_pending_output_before_the_next_chunk() {
+        let sink =
+            ntex::rt::System::new("quiet-flush-test", ntex::rt::DefaultRuntime).block_on(async {
+                let config = ProviderExecutionConfig {
+                    timeout: Duration::from_secs(2),
+                    ..ProviderExecutionConfig::default()
+                };
+                let mut sink = RecordingSink::default();
+                parse_stream(
+                    payload(
+                        vec![
+                            Step::Chunk(CONTENT),
+                            Step::Quiet(STREAM_OUTPUT_FLUSH_INTERVAL + Duration::from_millis(100)),
+                            Step::Cancel,
+                        ],
+                        config.cancellation.clone(),
+                    ),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    Some(&mut sink),
+                    &mut UsageCapture::default(),
+                )
+                .await
+                .expect_err("the scripted cancellation stops the stream");
+                sink
+            });
         assert_eq!(sink.deltas, ["hi"]);
     }
 
@@ -1197,18 +1521,83 @@ mod tests {
 
     #[test]
     fn a_transport_failure_mid_stream_stays_an_unknown_provider_outcome() {
-        let error =
-            parse(vec![Step::Chunk(CONTENT), Step::Fail], None).expect_err("a broken body fails");
+        let mut sink = RecordingSink::default();
+        let error = parse(vec![Step::Chunk(CONTENT), Step::Fail], Some(&mut sink))
+            .expect_err("a broken body fails");
         assert!(
             matches!(error, ProviderExecutionError::Unknown { .. }),
             "a transport failure is reported as it occurred, got {error:?}"
         );
+        assert_eq!(sink.deltas, ["hi"], "parsed output is flushed on failure");
     }
 
     #[test]
     fn a_stream_without_a_finish_event_stays_incomplete() {
-        let error = parse(vec![Step::Chunk(CONTENT)], None).expect_err("no finish event");
+        let mut sink = RecordingSink::default();
+        let error =
+            parse(vec![Step::Chunk(CONTENT)], Some(&mut sink)).expect_err("no finish event");
         assert!(matches!(error, ProviderExecutionError::Incomplete { .. }));
+        assert_eq!(sink.deltas, ["hi"]);
+    }
+
+    #[test]
+    fn malformed_sse_flushes_valid_prior_output_without_changing_the_outcome() {
+        let mut sink = RecordingSink::default();
+        let error = parse(
+            vec![Step::Chunk(CONTENT), Step::Chunk("data: {nope}\n\n")],
+            Some(&mut sink),
+        )
+        .expect_err("malformed SSE is incomplete");
+        assert!(matches!(error, ProviderExecutionError::Incomplete { .. }));
+        assert_eq!(sink.deltas, ["hi"]);
+    }
+
+    #[test]
+    fn a_flush_failure_reports_both_the_stream_outcome_and_local_persistence_gap() {
+        let mut sink = RecordingSink {
+            fail: Some("unknown durable outcome"),
+            ..RecordingSink::default()
+        };
+        let error = parse(vec![Step::Chunk(CONTENT), Step::Fail], Some(&mut sink))
+            .expect_err("transport and persistence both fail");
+        match error {
+            ProviderExecutionError::OutputPersistence { message, stream } => {
+                assert_eq!(message, "unknown durable outcome");
+                assert!(matches!(*stream, ProviderExecutionError::Unknown { .. }));
+            }
+            other => panic!("both outcomes remain visible, got {other:?}"),
+        }
+        assert!(
+            sink.deltas.is_empty(),
+            "the uncertain write is never retried"
+        );
+    }
+
+    #[test]
+    fn output_limit_termination_flushes_only_the_accepted_prefix() {
+        let config = ProviderExecutionConfig {
+            max_output_bytes: 2,
+            ..ProviderExecutionConfig::default()
+        };
+        let mut sink = RecordingSink::default();
+        let error = wait(parse_stream(
+            payload(
+                vec![
+                    Step::Chunk(CONTENT),
+                    Step::Chunk("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"),
+                ],
+                config.cancellation.clone(),
+            ),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            Some(&mut sink),
+            &mut UsageCapture::default(),
+        ))
+        .expect_err("the output limit stops the stream");
+        assert!(matches!(error, ProviderExecutionError::Incomplete { .. }));
+        assert_eq!(sink.deltas, ["hi"]);
     }
 
     #[test]
@@ -1421,7 +1810,13 @@ mod tests {
         };
         let error = parse(vec![Step::Chunk(CUMULATIVE_25)], Some(&mut sink))
             .expect_err("a sink failure stops the stream");
-        assert!(matches!(error, ProviderExecutionError::Stopped { .. }));
+        assert!(matches!(
+            error,
+            ProviderExecutionError::OutputPersistence {
+                stream,
+                ..
+            } if matches!(*stream, ProviderExecutionError::Incomplete { .. })
+        ));
         assert_eq!(sink.usages().len(), 1);
     }
 
@@ -1620,58 +2015,81 @@ mod tests {
         );
     }
 
-    /// Keeps observations, but its `stall`th never completes.
-    struct StallingSink {
-        kept: Vec<ProviderObservation>,
-        stall: usize,
+    struct SlowOutputSink {
+        deltas: Vec<String>,
     }
 
-    impl ProviderOutputSink for StallingSink {
+    impl ProviderOutputSink for SlowOutputSink {
         fn append<'a>(
             &'a mut self,
-            _text: &'a str,
+            text: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                ntex::time::sleep(Duration::from_millis(250)).await;
+                self.deltas.push(text.to_owned());
+                Ok(())
+            })
         }
 
         fn observe<'a>(
             &'a mut self,
-            observation: ProviderObservation,
+            _observation: ProviderObservation,
         ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
-            Box::pin(async move {
-                self.kept.push(observation);
-                if self.kept.len() == self.stall {
-                    std::future::pending::<()>().await;
-                }
-            })
+            Box::pin(async {})
         }
     }
 
     #[test]
-    fn the_outer_timeout_keeps_what_was_handed_over_and_invents_no_flush() {
-        let steps = vec![
-            Step::Chunk(running_total("{\"prompt_tokens\":1}")),
-            Step::Chunk(running_total("{\"prompt_tokens\":2}")),
-            Step::Chunk(running_total("{\"prompt_tokens\":3}")),
-            Step::Stall,
-        ];
+    fn local_persistence_time_is_not_provider_idle_time() {
+        let steps = vec![Step::Chunk(CONTENT), Step::Chunk(STOP)];
         let config = ProviderExecutionConfig {
             timeout: Duration::from_millis(100),
             ..ProviderExecutionConfig::default()
         };
+        let started = Instant::now();
         let (result, sink) = ntex::rt::System::new("timeout-test", ntex::rt::DefaultRuntime)
             .block_on(async move {
-                let mut sink = StallingSink {
-                    kept: Vec::new(),
-                    stall: 2,
-                };
-                let result = read_response(
+                let mut sink = SlowOutputSink { deltas: Vec::new() };
+                let result = parse_stream(
                     payload(steps, config.cancellation.clone()),
                     200,
                     Instant::now(),
                     None,
                     &config,
                     Some(&mut sink),
+                    &mut UsageCapture::default(),
+                )
+                .await;
+                (result, sink)
+            });
+        assert!(
+            result.is_ok(),
+            "local persistence does not trip provider idle"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert_eq!(sink.deltas, ["hi"]);
+    }
+
+    #[test]
+    fn a_silent_stream_exceeding_the_idle_timeout_is_unknown_and_flushes_pending_output() {
+        let (result, sink) = ntex::rt::System::new("idle-timeout-test", ntex::rt::DefaultRuntime)
+            .block_on(async {
+                let config = ProviderExecutionConfig {
+                    timeout: Duration::from_millis(100),
+                    ..ProviderExecutionConfig::default()
+                };
+                let mut sink = RecordingSink::default();
+                let result = parse_stream(
+                    payload(
+                        vec![Step::Chunk(CONTENT), Step::Stall],
+                        config.cancellation.clone(),
+                    ),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    Some(&mut sink),
+                    &mut UsageCapture::default(),
                 )
                 .await;
                 (result, sink)
@@ -1680,19 +2098,42 @@ mod tests {
             result,
             Err(ProviderExecutionError::Unknown { .. })
         ));
-        let inputs: Vec<_> = sink
-            .kept
-            .iter()
-            .map(|observation| match &observation.fact {
-                ProviderFact::Usage { usage, .. } => usage.input_tokens,
-                other => panic!("only usage was observed, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            inputs,
-            [Some(1), Some(2)],
-            "the second write was interrupted and nothing was resent or merged; the third was never read"
-        );
+        assert_eq!(sink.deltas, ["hi"]);
+    }
+
+    #[test]
+    fn repeated_chunks_within_the_idle_limit_can_exceed_the_old_total_deadline() {
+        let (result, sink) = ntex::rt::System::new("long-stream-test", ntex::rt::DefaultRuntime)
+            .block_on(async {
+                let config = ProviderExecutionConfig {
+                    timeout: Duration::from_millis(100),
+                    ..ProviderExecutionConfig::default()
+                };
+                let mut sink = RecordingSink::default();
+                let result = parse_stream(
+                    payload(
+                        vec![
+                            Step::Chunk(CONTENT),
+                            Step::Quiet(Duration::from_millis(70)),
+                            Step::Chunk(CONTENT),
+                            Step::Quiet(Duration::from_millis(70)),
+                            Step::Chunk(STOP),
+                        ],
+                        config.cancellation.clone(),
+                    ),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    Some(&mut sink),
+                    &mut UsageCapture::default(),
+                )
+                .await;
+                (result, sink)
+            });
+        let result = result.expect("each provider interval stayed within the idle limit");
+        assert_eq!(result.text, "hihi");
+        assert_eq!(sink.deltas.concat(), "hihi");
     }
 
     #[test]
