@@ -7985,3 +7985,707 @@ fn totals_that_would_leave_their_range_refuse_the_batch_without_writing() {
     );
     worker.shutdown().expect("shutdown");
 }
+
+// ---- the background aggregation service ------------------------------------------
+
+use crate::orchestration::aggregation_service::{
+    AggregationService, AggregationServiceConfig, EXECUTOR_NAME, JOB_NAME, RoundReport,
+    ServiceFailure, ServiceStartError, ServiceState, Stream, StreamOutcome, TestSeams,
+};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+/// Polls `condition` until it holds, within the shared bound.
+fn eventually(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + crate::test_support::WAIT;
+    while !condition() {
+        assert!(
+            Instant::now() < deadline,
+            "the condition did not hold in time"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A running service whose checks the test steps by hand.
+struct Rig {
+    service: AggregationService,
+    rounds: flume::Receiver<RoundReport>,
+    consume_calls: Arc<AtomicUsize>,
+}
+
+impl Rig {
+    fn start(handle: &DatabaseHandle, tweak: impl FnOnce(&mut TestSeams)) -> Self {
+        let (sender, rounds) = flume::unbounded();
+        let consume_calls = Arc::new(AtomicUsize::new(0));
+        let mut seams = TestSeams {
+            rounds: Some(sender),
+            ..TestSeams::default()
+        };
+        tweak(&mut seams);
+        let counted = seams.before_consume.take();
+        let calls = consume_calls.clone();
+        seams.before_consume = Some(Arc::new(move |stream| {
+            calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if let Some(counted) = &counted {
+                counted(stream);
+            }
+        }));
+        let service = wait(AggregationService::start(
+            handle.clone(),
+            AggregationServiceConfig {
+                interval: Duration::from_secs(3_600),
+                check_immediately: false,
+                seams,
+            },
+        ))
+        .expect("start the service");
+        Self {
+            service,
+            rounds,
+            consume_calls,
+        }
+    }
+
+    /// One check, run now, and what it did.
+    fn tick(&self) -> RoundReport {
+        assert!(self.service.tick(), "the loop is running");
+        self.rounds
+            .recv_timeout(crate::test_support::WAIT)
+            .expect("the check finished")
+    }
+
+    fn calls(&self) -> usize {
+        self.consume_calls.load(AtomicOrdering::SeqCst)
+    }
+}
+
+fn outcomes(report: &RoundReport) -> Vec<(Stream, StreamOutcome)> {
+    report.outcomes.clone()
+}
+
+fn service_jobs(handle: &DatabaseHandle) -> Vec<JobRecord> {
+    wait(handle.jobs(None, 1_000))
+        .expect("read Jobs")
+        .into_iter()
+        .filter(|job| job.name.as_deref() == Some(JOB_NAME))
+        .collect()
+}
+
+fn aggregation_markers(handle: &DatabaseHandle) -> usize {
+    markers(handle)
+        .into_iter()
+        .filter(|marker| {
+            matches!(
+                marker.kind,
+                crate::persistence::OperationKind::ConsumeAvailability
+                    | crate::persistence::OperationKind::ConsumeTokenUsage
+            )
+        })
+        .count()
+}
+
+#[test]
+fn startup_makes_one_started_unconfigured_service_job_and_batches_make_none() {
+    let (_root, directory) = data_directory("service-startup");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    observe(&handle, job, at_minute(1), response(200));
+    token_fact(&handle, job, at_minute(1), Some(ELIGIBLE), NO_COUNTERS);
+    let jobs_before = wait(handle.jobs(None, 1_000)).expect("read Jobs").len();
+
+    let rig = Rig::start(&handle, |_| {});
+    let services = service_jobs(&handle);
+    assert_eq!(services.len(), 1, "exactly one service Job for this run");
+    let service = &services[0];
+    assert_eq!(service.id, rig.service.job());
+    assert_eq!(service.execution_mode, ExecutionMode::Continuous);
+    assert!(service.started_at.is_some());
+    assert!(
+        service.completed_at.is_none()
+            && service.failed_at.is_none()
+            && service.unknown_at.is_none(),
+        "it is running"
+    );
+    assert_eq!(
+        (service.parent, service.configuration),
+        (handle.genesis(), None)
+    );
+    assert!(service.projects.is_empty(), "no special Project");
+    let executor = wait(handle.executor(service.assigned_executor.expect("assigned")))
+        .expect("read Executor")
+        .expect("Executor exists");
+    assert_eq!(
+        (executor.name.as_str(), executor.executor_type),
+        (EXECUTOR_NAME, ExecutorType::System)
+    );
+    assert_eq!(
+        blocking(&handle, llm),
+        [job],
+        "the service holds no LLM Profile; only the fixture Job does"
+    );
+
+    // Both streams are consumed by the service, and no Job comes of a batch.
+    assert_eq!(rig.tick().outcomes.len(), 2);
+    assert!(token_progress(&handle).consumed_through.is_some());
+    assert!(
+        wait(handle.availability_progress())
+            .expect("progress")
+            .consumed_through
+            .is_some()
+    );
+    assert_eq!(
+        wait(handle.jobs(None, 1_000)).expect("read Jobs").len(),
+        jobs_before + 1,
+        "batches are not Jobs"
+    );
+    assert!(
+        wait(handle.job_outputs(service.id, None, 10))
+            .expect("read outputs")
+            .is_empty(),
+        "no heartbeat or per-check output"
+    );
+
+    // A second host over the same opening is refused while this one runs.
+    assert!(matches!(
+        wait(AggregationService::start(
+            handle.clone(),
+            AggregationServiceConfig::default()
+        )),
+        Err(ServiceStartError::AlreadyRunning)
+    ));
+    wait(rig.service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn the_service_consumes_both_streams_without_anyone_calling_a_consume_method() {
+    let (_root, directory) = data_directory("service-automatic");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let micros = at_minute(4);
+    observe(&handle, job, micros, response(200));
+    token_fact(
+        &handle,
+        job,
+        micros,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(3), Some(4)),
+    );
+
+    let (sender, rounds) = flume::unbounded();
+    let service = wait(AggregationService::start(
+        handle.clone(),
+        AggregationServiceConfig {
+            interval: Duration::from_millis(20),
+            check_immediately: true,
+            seams: TestSeams {
+                rounds: Some(sender),
+                ..TestSeams::default()
+            },
+        },
+    ))
+    .expect("start the service");
+    // The first check ran before the start returned; later ones come by timer.
+    assert!(service.checks() >= 1);
+    eventually(|| rounds.try_iter().count() > 0 || service.checks() >= 2);
+    assert_eq!(counts(&handle, provider, "model-a", micros).available, 1);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros).map(|totals| totals.total.final_sum),
+        Some(7)
+    );
+    assert_eq!(service.state(), ServiceState::Running);
+    wait(service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_backlog_is_taken_a_batch_at_a_time_and_the_streams_take_turns() {
+    let (_root, directory) = data_directory("service-backlog");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    // 1,200 generic Token records and 1,200 availability observations.
+    for chunk in 0..12 {
+        let tokens: Vec<_> = (0..100)
+            .map(|offset| {
+                admit(handle.record_metrics(NewMetrics {
+                    job,
+                    observed_at: at(at_minute(2) + chunk * 100 + offset),
+                    measurements: TokenMeasurements {
+                        usage: NormalizedUsage {
+                            input_tokens: Some(1),
+                            ..NormalizedUsage::default()
+                        },
+                        ..TokenMeasurements::default()
+                    },
+                    token: None,
+                }))
+            })
+            .collect();
+        let stats: Vec<_> = (0..100)
+            .map(|offset| {
+                admit(handle.record_availability_stat(NewAvailabilityStat {
+                    job,
+                    observed_at: at(at_minute(2) + chunk * 100 + offset),
+                    observation: bare(200),
+                }))
+            })
+            .collect();
+        for wait_for in tokens {
+            wait_for().expect("record Metrics");
+        }
+        for wait_for in stats {
+            wait_for().expect("record AvailabilityStat");
+        }
+    }
+
+    let rig = Rig::start(&handle, |_| {});
+    let first = rig.tick();
+    assert_eq!(
+        outcomes(&first),
+        [
+            (Stream::Availability, StreamOutcome::Consumed(1_000)),
+            (Stream::Token, StreamOutcome::Consumed(1_000)),
+        ],
+        "each stream gets one bounded batch"
+    );
+    assert_eq!(
+        token_progress(&handle).consumed_through.map(|id| id.get()),
+        Some(1_000)
+    );
+    assert_eq!(rig.calls(), 2, "one consume call per stream");
+    let second = rig.tick();
+    assert_eq!(
+        outcomes(&second),
+        [
+            (Stream::Token, StreamOutcome::Consumed(200)),
+            (Stream::Availability, StreamOutcome::Consumed(200)),
+        ],
+        "the first opportunity alternates, and skipped Token records still advance"
+    );
+    assert_eq!(
+        token_progress(&handle).consumed_through.map(|id| id.get()),
+        Some(1_200)
+    );
+    let third = rig.tick();
+    assert_eq!(
+        outcomes(&third),
+        [
+            (Stream::Availability, StreamOutcome::Idle),
+            (Stream::Token, StreamOutcome::Idle),
+        ]
+    );
+
+    // Idle checks write nothing: no marker, progress, update time or row.
+    let idle_markers = aggregation_markers(&handle);
+    let progress = (
+        token_progress(&handle),
+        wait(handle.availability_progress()).expect("progress"),
+    );
+    for _ in 0..5 {
+        rig.tick();
+    }
+    assert_eq!(aggregation_markers(&handle), idle_markers);
+    assert_eq!(
+        (
+            token_progress(&handle),
+            wait(handle.availability_progress()).expect("progress")
+        ),
+        progress
+    );
+    assert_eq!(
+        wait(handle.job_outputs(rig.service.job(), None, 10))
+            .expect("outputs")
+            .len(),
+        0
+    );
+    wait(rig.service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn contention_defers_to_a_later_check_and_never_starves_the_other_stream() {
+    let (_root, directory) = data_directory("service-contended");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    observe(&handle, job, at_minute(3), response(200));
+    token_fact(&handle, job, at_minute(3), Some(ELIGIBLE), NO_COUNTERS);
+
+    let contend_once = Arc::new(AtomicBool::new(true));
+    let rig = Rig::start(&handle, |seams| {
+        let contend_once = contend_once.clone();
+        seams.outcome_override = Some(Arc::new(move |stream| {
+            (stream == Stream::Availability && contend_once.swap(false, AtomicOrdering::SeqCst))
+                .then_some(StreamOutcome::Contended)
+        }));
+    });
+    assert_eq!(
+        outcomes(&rig.tick()),
+        [
+            (Stream::Availability, StreamOutcome::Contended),
+            (Stream::Token, StreamOutcome::Consumed(1)),
+        ],
+        "a contended stream does not cost the other its turn"
+    );
+    assert_eq!(
+        counts(&handle, provider, "model-a", at_minute(3)).available,
+        0
+    );
+    assert_eq!(
+        outcomes(&rig.tick()),
+        [
+            (Stream::Token, StreamOutcome::Idle),
+            (Stream::Availability, StreamOutcome::Consumed(1)),
+        ],
+        "and it is tried again on the next check"
+    );
+    assert_eq!(
+        counts(&handle, provider, "model-a", at_minute(3)).available,
+        1
+    );
+    assert_eq!(rig.service.state(), ServiceState::Running);
+    wait(rig.service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn protected_storage_pauses_the_service_and_recovery_resumes_from_committed_progress() {
+    use crate::disk_protection::{ProtectedArea, ProtectionReason, SpaceShortage};
+    let (_root, directory) = data_directory("service-protected");
+    let worker = DatabaseWorker::start_with_config(
+        &directory,
+        crate::disk_protection::FilesystemConfig {
+            disk_lock_threshold_bytes: 1,
+            disk_resume_threshold_bytes: 2,
+            ..crate::disk_protection::FilesystemConfig::default()
+        },
+    )
+    .expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    let micros = at_minute(6);
+    observe(&handle, job, micros, response(200));
+    token_fact(
+        &handle,
+        job,
+        micros,
+        Some(ELIGIBLE_FINAL),
+        io5(Some(2), Some(3)),
+    );
+    let rig = Rig::start(&handle, |_| {});
+
+    let reason = ProtectionReason::InsufficientSpace(SpaceShortage {
+        area: ProtectedArea::Database,
+        path: directory.database_path().to_path_buf(),
+        available_bytes: 0,
+        expected_write_bytes: 0,
+        threshold_bytes: 1,
+    });
+    assert!(handle.activate_filesystem_protection(reason));
+    let before = aggregation_markers(&handle);
+    for _ in 0..3 {
+        let report = rig.tick();
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].1, StreamOutcome::Paused);
+    }
+    assert_eq!(rig.calls(), 0, "no consume, and so no write, was attempted");
+    assert_eq!(rig.service.state(), ServiceState::Paused);
+    assert_eq!(aggregation_markers(&handle), before);
+
+    // Existing recovery, run by its own actor, reopens the database; the
+    // service then resumes through the ordinary consume methods.
+    wait(handle.recover_storage()).expect("recover storage");
+    let report = rig.tick();
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .all(|(_, outcome)| matches!(outcome, StreamOutcome::Consumed(1)))
+    );
+    assert_eq!(rig.service.state(), ServiceState::Running);
+    assert_eq!(counts(&handle, provider, "model-a", micros).available, 1);
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", micros).map(|totals| totals.requests),
+        Some(1),
+        "nothing was applied twice"
+    );
+    assert_matches_reducer(&handle, &[job]);
+    wait(rig.service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn contradictory_token_evidence_stops_the_service_without_skipping_or_spinning() {
+    let (_root, directory) = data_directory("service-evidence");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let (bad, good) = (llm_job(&handle, llm), llm_job(&handle, llm));
+    let excluded = token_fact(
+        &handle,
+        bad,
+        at_minute(8),
+        Some(TokenAnnotation::excluded()),
+        NO_COUNTERS,
+    );
+    let rig = Rig::start(&handle, |_| {});
+    rig.tick();
+    let progress = token_progress(&handle);
+    assert_eq!(progress.consumed_through, Some(excluded));
+
+    token_fact(&handle, good, at_minute(8), Some(ELIGIBLE), NO_COUNTERS);
+    token_fact(
+        &handle,
+        bad,
+        at_minute(8),
+        Some(ELIGIBLE),
+        io5(Some(1), Some(1)),
+    );
+    assert!(rig.service.tick());
+    eventually(|| matches!(rig.service.state(), ServiceState::Failed(_)));
+    let calls = rig.calls();
+    eventually(|| !rig.service.tick());
+    assert_eq!(rig.calls(), calls, "a stopped loop is not retried");
+    assert_eq!(
+        token_progress(&handle),
+        progress,
+        "the consumed prefix is intact"
+    );
+    assert_eq!(
+        token_sample(&handle, good),
+        None,
+        "and nothing from the refused batch"
+    );
+
+    let service = rig.service;
+    let job = service.job();
+    let outcome = wait(service.shutdown());
+    assert!(matches!(outcome.failure, Some(ServiceFailure::Evidence(_))));
+    assert!(
+        outcome.finalization.is_ok(),
+        "the failure is recorded once the loop has stopped"
+    );
+    let record = wait(handle.job(job))
+        .expect("read Job")
+        .expect("Job exists");
+    assert!(record.failed_at.is_some() && record.completed_at.is_none());
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn corruption_stops_the_service_and_is_reported() {
+    let (_root, directory) = data_directory("service-corruption");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    token_fact(&handle, job, at_minute(9), Some(ELIGIBLE), NO_COUNTERS);
+    let rig = Rig::start(&handle, |_| {});
+    wait(handle.with_database(move |database| crate::storage::remove_job_row(database, job)))
+        .expect("corrupt the Job row");
+    assert!(rig.service.tick());
+    eventually(|| matches!(rig.service.state(), ServiceState::Failed(_)));
+    assert_eq!(
+        token_progress(&handle).consumed_through,
+        None,
+        "no record was skipped"
+    );
+    let outcome = wait(rig.service.shutdown());
+    assert!(matches!(
+        outcome.failure,
+        Some(ServiceFailure::Database {
+            stream: Stream::Token,
+            ..
+        }) | Some(ServiceFailure::Database {
+            stream: Stream::Availability,
+            ..
+        })
+    ));
+    worker.shutdown().ok();
+}
+
+#[test]
+fn stopping_wakes_the_timer_waits_for_a_batch_in_flight_and_only_then_ends_the_job() {
+    let (_root, directory) = data_directory("service-stop");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+
+    // An idle loop waiting on an hour-long timer stops at once.
+    let idle = Rig::start(&handle, |_| {});
+    let started = Instant::now();
+    let service_job = idle.service.job();
+    wait(idle.service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the waiting timer was woken"
+    );
+    let record = wait(handle.job(service_job))
+        .expect("read Job")
+        .expect("Job exists");
+    assert!(record.completed_at.is_some());
+
+    // A batch held in flight is waited for, and its Job ends after it.
+    token_fact(&handle, job, at_minute(11), Some(ELIGIBLE), NO_COUNTERS);
+    let (entered_sender, entered) = flume::unbounded();
+    let (release, released) = flume::unbounded::<()>();
+    let rig = Rig::start(&handle, |seams| {
+        seams.before_consume = Some(Arc::new(move |stream| {
+            if stream == Stream::Token {
+                entered_sender.send(()).ok();
+                released.recv_timeout(crate::test_support::WAIT).ok();
+            }
+        }));
+    });
+    let service_job = rig.service.job();
+    assert!(rig.service.tick());
+    entered
+        .recv_timeout(crate::test_support::WAIT)
+        .expect("the Token batch is in flight");
+    let finished = Arc::new(AtomicBool::new(false));
+    let stopper = {
+        let finished = finished.clone();
+        let service = rig.service;
+        std::thread::spawn(move || {
+            let outcome = wait(service.shutdown());
+            finished.store(true, AtomicOrdering::SeqCst);
+            outcome
+        })
+    };
+    assert!(
+        !finished.load(AtomicOrdering::SeqCst),
+        "the stop does not finish while a batch is in flight"
+    );
+    release.send(()).expect("release the batch");
+    let outcome = stopper.join().expect("the stopper thread");
+    outcome.into_result().expect("a clean stop");
+
+    assert!(
+        token_progress(&handle).consumed_through.is_some(),
+        "the held batch completed"
+    );
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", at_minute(11)).map(|totals| totals.requests),
+        Some(1)
+    );
+    let record = wait(handle.job(service_job))
+        .expect("read Job")
+        .expect("Job exists");
+    assert!(record.completed_at.is_some());
+    let all = markers(&handle);
+    let last_batch = all
+        .iter()
+        .rposition(|marker| marker.kind == crate::persistence::OperationKind::ConsumeTokenUsage)
+        .expect("a Token batch marker");
+    let end = all
+        .iter()
+        .rposition(|marker| {
+            marker.subject == RecordRef::Job(service_job)
+                && marker.kind == crate::persistence::OperationKind::FinalizeJob
+        })
+        .expect("the Job's end marker");
+    assert!(
+        last_batch < end,
+        "the Job ends after the batch, and nothing is written after"
+    );
+    assert_eq!(end, all.len() - 1);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_restart_keeps_the_aggregates_and_progress_and_makes_a_new_service_job() {
+    let (_root, directory) = data_directory("service-restart");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    observe(&handle, job, at_minute(12), response(200));
+    token_fact(&handle, job, at_minute(12), Some(ELIGIBLE), NO_COUNTERS);
+
+    // A run that ended without a record of its end: its Job stays started.
+    let crashed = Rig::start(&handle, |_| {});
+    crashed.tick();
+    let crashed_job = crashed.service.job();
+    drop(crashed);
+    let progress = (
+        token_progress(&handle),
+        wait(handle.availability_progress()).expect("progress"),
+    );
+    let bucket = token_bucket(&handle, provider, "model-a", at_minute(12));
+
+    let other = llm_job(&handle, llm);
+    observe(&handle, other, at_minute(13), response(200));
+    token_fact(&handle, other, at_minute(13), Some(ELIGIBLE), NO_COUNTERS);
+    let rig = Rig::start(&handle, |_| {});
+    assert_ne!(
+        rig.service.job(),
+        crashed_job,
+        "each run has its own service Job"
+    );
+    assert_eq!(
+        (
+            token_progress(&handle),
+            wait(handle.availability_progress()).expect("progress")
+        ),
+        progress,
+        "starting resets neither progress"
+    );
+    assert_eq!(
+        token_bucket(&handle, provider, "model-a", at_minute(12)),
+        bucket
+    );
+    assert_eq!(
+        outcomes(&rig.tick()),
+        [
+            (Stream::Availability, StreamOutcome::Consumed(1)),
+            (Stream::Token, StreamOutcome::Consumed(1)),
+        ],
+        "only the new raw records are processed"
+    );
+    let older = wait(handle.job(crashed_job))
+        .expect("read Job")
+        .expect("Job exists");
+    assert!(
+        older.started_at.is_some()
+            && older.completed_at.is_none()
+            && older.failed_at.is_none()
+            && older.unknown_at.is_none(),
+        "an unconfirmed older run is not marked anything"
+    );
+    let executors = wait(handle.executors(None, 100)).expect("read Executors");
+    assert_eq!(
+        executors
+            .iter()
+            .filter(|executor| executor.name == EXECUTOR_NAME)
+            .count(),
+        1,
+        "the System Executor is reused, not registered again"
+    );
+    wait(rig.service.shutdown())
+        .into_result()
+        .expect("a clean stop");
+    assert_eq!(service_jobs(&handle).len(), 2);
+    worker.shutdown().expect("shutdown");
+}

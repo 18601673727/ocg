@@ -961,8 +961,22 @@ struct Shared {
     /// `None` answers a check that the stopping worker will never run.
     space_check: SharedRequest<Option<DiskProtectionStatus>>,
     recovery: SharedRequest<Result<RecoveryReport, RecoveryError>>,
+    /// Set while a host owns the background aggregation loop of this opening,
+    /// so one process run never has two.
+    aggregation_host: AtomicBool,
     #[cfg(test)]
     probe: GroupProbe,
+}
+
+/// Ownership of the one background aggregation loop. Dropping it releases it.
+pub(crate) struct AggregationClaim {
+    shared: Arc<Shared>,
+}
+
+impl Drop for AggregationClaim {
+    fn drop(&mut self) {
+        self.shared.aggregation_host.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Test seams of the write worker's group commit.
@@ -1254,6 +1268,7 @@ impl DatabaseWorker {
                     protection: ProtectionCell::new(),
                     space_check: SharedRequest::new(),
                     recovery: SharedRequest::new(),
+                    aggregation_host: AtomicBool::new(false),
                     #[cfg(test)]
                     probe: GroupProbe::default(),
                 });
@@ -2965,6 +2980,18 @@ impl DatabaseHandle {
             )
         })
         .await
+    }
+
+    /// Claims the background aggregation loop for one host, or `None` when
+    /// another host holds it.
+    pub(crate) fn claim_aggregation_host(&self) -> Option<AggregationClaim> {
+        self.shared
+            .aggregation_host
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()?;
+        Some(AggregationClaim {
+            shared: self.shared.clone(),
+        })
     }
 
     /// The seams of the write worker's group commit.
