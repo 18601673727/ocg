@@ -14,14 +14,15 @@ use crate::disk_protection::{
     RecoveryReport, ReopenFailure, SharedRequest, SpaceMeasurement, SpaceShortage,
 };
 use crate::persistence::{
-    self, AgentId, AgentRecord, AppendedOutput, AvailabilityStatId, AvailabilityStatRecord,
-    ExecutorId, JobFinalization, JobId, JobInputDraft, JobInputId, JobOutputRecord, JobRecord,
-    JobRetry, LlmProviderId, LlmProviderRecord, MetricsId, MetricsRecord, NewAgent,
-    NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput, NewLlmProvider, NewMetrics,
-    NewProfile, NewProfileConfig, NewProject, ObservationCursor, ObservationFilter,
-    ObservationPage, ObservedModel, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile, ProfileId,
-    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, Timestamp, Violation,
-    WrongProfileKind,
+    self, AgentId, AgentRecord, AppendedOutput, AvailabilityAggregationProgress, AvailabilityBatch,
+    AvailabilityCounts, AvailabilityStatId, AvailabilityStatRecord, ExecutorId, JobFinalization,
+    JobId, JobInputDraft, JobInputId, JobOutputRecord, JobRecord, JobRetry, LlmProviderId,
+    LlmProviderRecord, MetricsId, MetricsRecord, NewAgent, NewAvailabilityStat, NewExecutor,
+    NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
+    ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelFilter,
+    ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile, ProfileId,
+    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, ReadSnapshot, RequestSampleRecord,
+    Timestamp, Violation, WrongProfileKind,
 };
 use crate::storage::{self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile};
 use crate::system_policy::{self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError};
@@ -421,6 +422,12 @@ enum Command {
         stat: Box<NewAvailabilityStat>,
         reply: Reply<AvailabilityStatId>,
     },
+    /// Commits one prepared AvailabilityStat aggregation batch. Its reply is
+    /// `None` when the preparation was stale and nothing was applied.
+    CommitAvailabilityAggregation {
+        plan: Box<storage::AvailabilityPlan>,
+        reply: Reply<Option<Timestamp>>,
+    },
 }
 
 impl Command {
@@ -485,6 +492,11 @@ impl Command {
             Self::RecordAvailabilityStat { stat, reply } => run(database, operation, commit, Kind::RecordAvailabilityStat, reply, |batch| {
                 persistence::record_availability_stat(batch, *stat)
             }),
+            Self::CommitAvailabilityAggregation { plan, reply } => {
+                let outcome =
+                    storage::commit_availability_aggregation(database, operation, commit, *plan);
+                settle(operation, commit, reply, outcome)
+            }
         }
     }
 
@@ -516,6 +528,7 @@ impl Command {
             }),
             Self::CreateAgent { agent, .. } => byte_count(agent.name.len()),
             Self::RecordMetrics { metrics, .. } => json_bytes(&metrics.measurements.usage.raw),
+            Self::CommitAvailabilityAggregation { plan, .. } => plan.encoded_bytes(),
             Self::RecordAvailabilityStat { stat, .. } => {
                 let observation = &stat.observation;
                 let failure = observation.failure.as_ref().map_or(0, |failure| {
@@ -549,6 +562,7 @@ impl Command {
             Self::ConfirmJobStopped { reply, .. } => refuse(reply, error),
             Self::RecordMetrics { reply, .. } => refuse(reply, error),
             Self::RecordAvailabilityStat { reply, .. } => refuse(reply, error),
+            Self::CommitAvailabilityAggregation { reply, .. } => refuse(reply, error),
         }
     }
 }
@@ -603,6 +617,16 @@ fn run<T: Send + 'static>(
     body: impl FnOnce(&mut storage::Batch) -> Result<(T, MarkerSubjects), BatchError>,
 ) -> Executed {
     let outcome = storage::run_batch_with(database, operation, kind, commit, body);
+    settle(operation, commit, reply, outcome)
+}
+
+/// Answers a command from its batch outcome and says how it must be waited on.
+fn settle<T: Send + 'static>(
+    operation: OperationId,
+    commit: Commit,
+    reply: Reply<T>,
+    outcome: storage::BatchOutcome<T>,
+) -> Executed {
     let result = outcome.result.map_err(|failure| match failure {
         BatchFailure::Rejected(violation) => DatabaseError::Rejected(violation),
         BatchFailure::NotCommitted(error) => DatabaseError::RolledBack(error),
@@ -2375,6 +2399,85 @@ impl DatabaseHandle {
     /// Job sent. Its LLM is the one the Job froze.
     pub async fn record_availability_stat(&self, stat: NewAvailabilityStat) -> Result<AvailabilityStatId, DatabaseError> {
         self.submit(|reply| Command::RecordAvailabilityStat { stat: Box::new(stat), reply }).await
+    }
+
+    /// Aggregation progress: the last AvailabilityStat ID consumed and the
+    /// wall-clock time of the last batch, as of one read snapshot.
+    pub async fn availability_progress(
+        &self,
+    ) -> Result<AvailabilityAggregationProgress, DatabaseError> {
+        self.read(storage::read_availability_progress).await
+    }
+
+    /// The request sample of a Job, with the progress of the same snapshot.
+    pub async fn request_sample(
+        &self,
+        job: JobId,
+    ) -> Result<ReadSnapshot<Option<RequestSampleRecord>>, DatabaseError> {
+        self.read(move |database| storage::read_request_sample(database, job))
+            .await
+    }
+
+    /// The counts of one (Provider, model, minute) bucket, with the progress
+    /// of the same snapshot. `minute` is a value of [`minute_of`].
+    pub async fn availability_minute(
+        &self,
+        provider: LlmProviderId,
+        model: String,
+        minute: i64,
+    ) -> Result<ReadSnapshot<Option<AvailabilityCounts>>, DatabaseError> {
+        self.read(move |database| {
+            storage::read_availability_minute(database, provider, &model, minute)
+        })
+        .await
+    }
+
+    /// Consumes at most `limit` records (and never more than the batch
+    /// maximum) of the next committed AvailabilityStat records, in ID order.
+    /// One call prepares a batch from one snapshot and commits it only if the
+    /// rows it read are unchanged. A stale preparation is prepared again, at
+    /// most the attempt bound. It is an internal operation: nothing here
+    /// schedules it.
+    pub async fn consume_availability(
+        &self,
+        limit: usize,
+    ) -> Result<AvailabilityBatch, DatabaseError> {
+        for attempt in 1..=storage::MAX_AGGREGATION_ATTEMPTS {
+            let plan = self.prepare_availability(limit).await?;
+            let Some(report) = plan.report(attempt) else {
+                return Ok(AvailabilityBatch::Idle {
+                    consumed_through: plan.consumed_through(),
+                });
+            };
+            if self.commit_availability(plan).await?.is_some() {
+                return Ok(AvailabilityBatch::Consumed(report));
+            }
+        }
+        Ok(AvailabilityBatch::Contended {
+            attempts: storage::MAX_AGGREGATION_ATTEMPTS,
+        })
+    }
+
+    /// Prepares the next batch from one read snapshot. Nothing is written.
+    pub(crate) async fn prepare_availability(
+        &self,
+        limit: usize,
+    ) -> Result<storage::AvailabilityPlan, DatabaseError> {
+        self.read(move |database| storage::prepare_availability_aggregation(database, limit))
+            .await
+    }
+
+    /// Commits a prepared batch if the rows it read still hold. `None` means
+    /// the preparation was stale, and nothing was applied.
+    pub(crate) async fn commit_availability(
+        &self,
+        plan: storage::AvailabilityPlan,
+    ) -> Result<Option<Timestamp>, DatabaseError> {
+        self.submit(|reply| Command::CommitAvailabilityAggregation {
+            plan: Box::new(plan),
+            reply,
+        })
+        .await
     }
 }
 

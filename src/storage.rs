@@ -65,9 +65,12 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// an Agent Profile, Jobs record a confirmed stop, outputs carry a JSON
 /// value, and Metrics and AvailabilityStats are recorded per Job. Version 6
 /// replaced the per-LLM-Profile observation indexes with indexes by
-/// observation scope; a version 5 file lacks their entries. Files of any
-/// other version are refused on open, before anything is written to them.
-pub(crate) const FORMAT_VERSION: u32 = 6;
+/// observation scope; a version 5 file lacks their entries. Version 7 added
+/// the AvailabilityStat aggregation state: request samples, sparse minute
+/// counts and consumption progress. A version 6 file lacks those tables, so
+/// it is refused rather than initialized in place. Files of any other
+/// version are refused on open, before anything is written to them.
+pub(crate) const FORMAT_VERSION: u32 = 7;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -153,6 +156,25 @@ const JOB_AVAILABILITY: PairSet = TableDefinition::new("observes_in");
 const AVAILABILITY_BY_SCOPE: ScopeIndex = TableDefinition::new("availability_stat_by_scope");
 /// (epoch, seq) -> operation marker.
 const OPERATIONS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("operation");
+/// Job -> its request sample as materialized. Rebuildable from the raw
+/// AvailabilityStat records; the sample is fixed by its lowest record.
+const AVAILABILITY_SAMPLES: Records = TableDefinition::new("availability_request_sample");
+/// (provider, minute, model) -> requests per classification, for the
+/// buckets that hold at least one request. Rebuildable like the samples.
+const AVAILABILITY_MINUTES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("availability_minute");
+/// The aggregation stream's progress: its last consumed AvailabilityStat ID
+/// and the wall-clock time of its last batch. It is written only with the
+/// batch it describes.
+const AGGREGATION_PROGRESS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("aggregation_progress");
+
+mod availability_aggregation;
+pub(crate) use availability_aggregation::{
+    AvailabilityPlan, MAX_AGGREGATION_ATTEMPTS, commit_availability_aggregation,
+    prepare_availability_aggregation, read_availability_minute, read_availability_progress,
+    read_request_sample,
+};
 
 // ---- storage errors -------------------------------------------------------------
 
@@ -225,6 +247,9 @@ const TAG_LLM_PROVIDER: u8 = 10;
 // Tags 11 and 12 were the retired HealthCheck and SERVES records.
 const TAG_METRICS: u8 = 13;
 const TAG_AVAILABILITY_STAT: u8 = 14;
+const TAG_REQUEST_SAMPLE: u8 = 15;
+const TAG_MINUTE_COUNTS: u8 = 16;
+const TAG_AGGREGATION_PROGRESS: u8 = 17;
 
 struct Enc(Vec<u8>);
 
@@ -587,6 +612,7 @@ codes!(OperationKind {
     OperationKind::AssociateJobProject = 13, OperationKind::CreateProject = 14, OperationKind::CreateLlmProvider = 15,
     OperationKind::CreateProfile = 16, OperationKind::CreateAgent = 17, OperationKind::UpdateProfile = 19,
     OperationKind::ConfirmJobStopped = 20, OperationKind::RecordMetrics = 21, OperationKind::RecordAvailabilityStat = 22,
+    OperationKind::ConsumeAvailability = 23,
 });
 
 // ---- rows ------------------------------------------------------------------------
@@ -1277,6 +1303,9 @@ fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     for table in [METRICS_BY_SCOPE, AVAILABILITY_BY_SCOPE] {
         tx.open_table(table)?;
     }
+    tx.open_table(AVAILABILITY_SAMPLES)?;
+    tx.open_table(AVAILABILITY_MINUTES)?;
+    tx.open_table(AGGREGATION_PROGRESS)?;
     tx.open_table(TRANSPORT_EXECUTORS)?;
     tx.open_table(HAS_OUTPUT)?;
     tx.open_table(DEPENDS_ON)?;
@@ -1479,12 +1508,91 @@ pub(crate) fn run_batch_with<T>(
     if let Err(BatchError(failure)) = batch.write_marker(&marker) {
         return finish_abort(batch.tx, failure);
     }
-    match batch.tx.commit() {
+    commit_transaction(batch.tx, value)
+}
+
+/// Like [`run_batch_with`], but the body may decline: `Ok(None)` aborts the
+/// transaction, so nothing is committed and no operation marker is written.
+/// Work uses it when it finds, after reading, that it must not apply.
+pub(crate) fn run_batch_declinable<T>(
+    database: &Database,
+    operation: OperationId,
+    kind: OperationKind,
+    commit: Commit,
+    body: impl FnOnce(&mut Batch) -> Result<Option<(T, MarkerSubjects)>, BatchError>,
+) -> BatchOutcome<Option<T>> {
+    let mut tx = match database.begin_write() {
+        Ok(tx) => tx,
+        Err(error) => {
+            let error = StorageError::from(error);
+            return BatchOutcome {
+                result: Err(BatchFailure::NotCommitted(error.clone())),
+                storage_failure: Some(error),
+            };
+        }
+    };
+    let durability = match commit {
+        Commit::Durable => Durability::Immediate,
+        Commit::Staged => Durability::None,
+    };
+    if let Err(error) = tx.set_durability(durability) {
+        return finish_abort(tx, Failure::Storage(error.into()));
+    }
+    let mut batch = Batch {
+        tx,
+        failed: None,
+        now: Timestamp::now(),
+    };
+    let body_result = body(&mut batch);
+    let (value, subjects) = match (body_result, batch.failed.take()) {
+        (_, Some(failure)) | (Err(BatchError(failure)), None) => {
+            return finish_abort(batch.tx, failure);
+        }
+        (Ok(None), None) => {
+            return match batch.tx.abort() {
+                Ok(()) => BatchOutcome {
+                    result: Ok(None),
+                    storage_failure: None,
+                },
+                Err(error) => {
+                    let error = StorageError::from(error);
+                    BatchOutcome {
+                        result: Err(BatchFailure::NotCommitted(error.clone())),
+                        storage_failure: Some(error),
+                    }
+                }
+            };
+        }
+        (Ok(Some(value)), None) => value,
+    };
+    let marker = OperationMarker {
+        operation,
+        kind,
+        subject: subjects.subject,
+        created: subjects.created,
+        committed_at: batch.now,
+    };
+    if let Err(BatchError(failure)) = batch.write_marker(&marker) {
+        return finish_abort(batch.tx, failure);
+    }
+    let outcome = commit_transaction(batch.tx, value);
+    BatchOutcome {
+        result: outcome.result.map(Some),
+        storage_failure: outcome.storage_failure,
+    }
+}
+
+/// Commits a batch's transaction and reports how the commit ended.
+fn commit_transaction<T>(tx: WriteTransaction, value: T) -> BatchOutcome<T> {
+    match tx.commit() {
         Ok(()) => BatchOutcome { result: Ok(value), storage_failure: None },
         // redb documents a poisoned commit as rolled back.
         Err(CommitError::TransactionPoisoned) => {
             let error = StorageError::from(CommitError::TransactionPoisoned);
-            not_committed(error)
+            BatchOutcome {
+                result: Err(BatchFailure::NotCommitted(error.clone())),
+                storage_failure: Some(error),
+            }
         }
         Err(error) => {
             let error = StorageError::from(error);

@@ -15,15 +15,16 @@ use crate::orchestration::execution_runtime::{
     ExecutionPlan, ExecutionRuntime, ExecutionRuntimeError, settle_provider_error,
 };
 use crate::persistence::{
-    AgentConfig, AvailabilityClassification, AvailabilityObservation, AvailabilityRequestSample,
-    AvailabilityStatId, AvailabilityStatRecord, DependencyCondition, ExecutionConfiguration,
-    ExecutionMode, ExecutorId, ExecutorType, FinalResult, IntermediateOutputKind, JobFinalization,
-    JobId, JobInputDraft, JobOutcome, JobRecord, JobRetry, LlmConfig, LlmParameters, LlmProviderId,
-    LlmTarget, LlmTransport, Measurements, MetricsRecord, MixedJobs, ModelCapability, NewAgent,
-    NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile,
-    NewProfileConfig, NewProject, ObservationCursor, ObservationFilter, OutputKind, ProfileId,
-    ProfileKind, ProjectId, RecordRef, RejectionCause, RetryInput, TimeRange, Timestamp,
-    UnavailableCause, Violation, WrongProfileKind,
+    AgentConfig, AvailabilityAggregationProgress, AvailabilityBatch, AvailabilityBatchReport,
+    AvailabilityClassification, AvailabilityCounts, AvailabilityObservation,
+    AvailabilityRequestSample, AvailabilityStatId, AvailabilityStatRecord, DependencyCondition,
+    ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, FinalResult,
+    IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobOutcome, JobRecord, JobRetry,
+    LlmConfig, LlmParameters, LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsRecord,
+    MixedJobs, ModelCapability, NewAgent, NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput,
+    NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject, ObservationCursor,
+    ObservationFilter, OutputKind, ProfileId, ProfileKind, ProjectId, RecordRef, RejectionCause,
+    RetryInput, TimeRange, Timestamp, UnavailableCause, Violation, WrongProfileKind, minute_of,
 };
 use crate::provider_execution::{ProviderExecutionError, ResponseFacts};
 use crate::test_support::{TestRoot, data_directory as test_data_directory, poll_once, wait};
@@ -4480,6 +4481,643 @@ fn a_failure_status_conflicts_only_with_a_different_supplied_status() {
         sample_in_either_order(&stats(&handle, finish_only)).classification,
         AvailabilityClassification::Unconfirmed,
         "a finish without an observed response status is not a completion"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+/// One LLM Provider and one LLM Profile on it, for jobs that run an LLM directly.
+fn llm_setup(handle: &DatabaseHandle, model: &str) -> (LlmProviderId, ProfileId) {
+    let provider = provider(handle, "provider");
+    (
+        provider,
+        llm_profile(
+            handle,
+            provider,
+            llm_config(model, &[ModelCapability::Chat]),
+        ),
+    )
+}
+
+/// A configured Job that runs `llm` directly, with no Agent Profile.
+fn llm_job(handle: &DatabaseHandle, llm: ProfileId) -> JobId {
+    create_job(
+        handle,
+        NewJob {
+            configuration: llm_only(llm),
+            ..new_job("request", handle.genesis(), Vec::new())
+        },
+    )
+}
+
+/// The micros of a time inside minute `minute`, a little after its start.
+fn at_minute(minute: i64) -> i64 {
+    minute * 60_000_000 + 1_000
+}
+
+/// One committed batch, which must not be idle.
+fn consume_batch(handle: &DatabaseHandle, limit: usize) -> AvailabilityBatchReport {
+    match wait(handle.consume_availability(limit)).expect("consume a batch") {
+        AvailabilityBatch::Consumed(report) => report,
+        other => panic!("expected a committed batch, got {other:?}"),
+    }
+}
+
+/// Consumes until nothing is left, and returns how many records that took.
+fn drain(handle: &DatabaseHandle) -> usize {
+    let mut consumed = 0;
+    loop {
+        match wait(handle.consume_availability(usize::MAX)).expect("consume a batch") {
+            AvailabilityBatch::Consumed(report) => consumed += report.consumed_records,
+            AvailabilityBatch::Idle { .. } => return consumed,
+            other => panic!("aggregation must not contend in a test, got {other:?}"),
+        }
+    }
+}
+
+/// The counts of one bucket as stored, or `None` when it holds no requests.
+fn bucket(
+    handle: &DatabaseHandle,
+    provider: LlmProviderId,
+    model: &str,
+    micros: i64,
+) -> Option<AvailabilityCounts> {
+    wait(handle.availability_minute(provider, model.to_owned(), minute_of(at(micros))))
+        .expect("read the minute")
+        .value
+}
+
+fn counts(
+    handle: &DatabaseHandle,
+    provider: LlmProviderId,
+    model: &str,
+    micros: i64,
+) -> AvailabilityCounts {
+    bucket(handle, provider, model, micros).unwrap_or_default()
+}
+
+fn requests(counts: AvailabilityCounts) -> u64 {
+    counts.available
+        + counts.provider_server_error
+        + counts.rate_limited
+        + counts.auth_or_permission
+        + counts.request_or_target
+        + counts.unconfirmed
+}
+
+#[test]
+fn aggregation_with_nothing_to_consume_writes_nothing() {
+    let (_root, directory) = data_directory("aggregation-empty");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    assert_eq!(
+        wait(handle.consume_availability(10)).expect("consume"),
+        AvailabilityBatch::Idle {
+            consumed_through: None
+        },
+        "no record means no batch"
+    );
+    assert_eq!(
+        wait(handle.availability_progress()).expect("read progress"),
+        AvailabilityAggregationProgress::default(),
+        "an empty step commits no progress"
+    );
+
+    let job = llm_job(&handle, llm);
+    observe(&handle, job, at_minute(1), response(200));
+    let report = consume_batch(&handle, 10);
+    let progress = wait(handle.availability_progress()).expect("read progress");
+    assert_eq!(
+        (progress.consumed_through, report.consumed_records),
+        (Some(report.consumed_through), 1)
+    );
+    assert_eq!(
+        wait(handle.consume_availability(10)).expect("consume"),
+        AvailabilityBatch::Idle {
+            consumed_through: Some(report.consumed_through)
+        },
+        "an idle step after a batch is idle"
+    );
+    assert_eq!(
+        wait(handle.availability_progress())
+            .expect("read progress")
+            .updated_at,
+        progress.updated_at,
+        "an idle step writes no update time"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn batches_consume_committed_records_in_id_order_within_the_limit() {
+    let (_root, directory) = data_directory("aggregation-bounds");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let jobs: Vec<JobId> = (0..5).map(|_| llm_job(&handle, llm)).collect();
+    for (index, job) in jobs.iter().enumerate() {
+        observe(&handle, *job, at_minute(1) + index as i64, bare(200));
+    }
+
+    let sizes: Vec<usize> = (0..3)
+        .map(|_| consume_batch(&handle, 2).consumed_records)
+        .collect();
+    assert_eq!(
+        sizes,
+        [2, 2, 1],
+        "each batch takes at most its limit, in order"
+    );
+    let last = stats(&handle, jobs[4])[0].id;
+    assert_eq!(
+        wait(handle.consume_availability(2)).expect("consume"),
+        AvailabilityBatch::Idle {
+            consumed_through: Some(last)
+        },
+        "progress ends at the last committed record"
+    );
+    assert_eq!(
+        counts(&handle, provider, "model-a", at_minute(1)).unconfirmed,
+        5
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_request_split_across_batches_moves_only_its_own_contribution() {
+    let (_root, directory) = data_directory("aggregation-split");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let split = llm_job(&handle, llm);
+    let other = llm_job(&handle, llm);
+    let micros = at_minute(2);
+
+    observe(&handle, split, micros, bare(200));
+    observe(&handle, other, micros + 1, response(200));
+    observe(
+        &handle,
+        split,
+        micros + 2,
+        AvailabilityObservation {
+            status_code: None,
+            finish_reason: Some(ChatFinishReason::Stop),
+            raw_finish_reason: Some("stop".into()),
+            failure: None,
+        },
+    );
+    assert_eq!(consume_batch(&handle, 2).consumed_records, 2);
+    let first = counts(&handle, provider, "model-a", micros);
+    assert_eq!(
+        (first.available, first.unconfirmed, requests(first)),
+        (1, 1, 2)
+    );
+
+    let report = consume_batch(&handle, 1);
+    assert_eq!(
+        (report.samples_written, report.buckets_written),
+        (1, 1),
+        "one request changes; its minute is rewritten once"
+    );
+    let completed = counts(&handle, provider, "model-a", micros);
+    assert_eq!(
+        (
+            completed.available,
+            completed.unconfirmed,
+            requests(completed)
+        ),
+        (2, 0, 2)
+    );
+
+    observe(
+        &handle,
+        split,
+        micros + 3,
+        failure(provider_failure("overloaded", Some(503), true)),
+    );
+    consume_batch(&handle, 10);
+    let contradicted = counts(&handle, provider, "model-a", micros);
+    assert_eq!(
+        (
+            contradicted.available,
+            contradicted.unconfirmed,
+            requests(contradicted)
+        ),
+        (1, 1, 2),
+        "a contradiction moves the same request back to Unconfirmed"
+    );
+    assert_eq!(
+        stats(&handle, split).len(),
+        3,
+        "the raw history is kept as recorded"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn each_request_counts_once_in_its_class_and_duplicates_add_nothing() {
+    let (_root, directory) = data_directory("aggregation-classes");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(3);
+    let duplicated = llm_job(&handle, llm);
+    for offset in 0..3 {
+        observe(&handle, duplicated, micros + offset, response(200));
+    }
+    let rejected = |status, message: &str| failure(provider_failure(message, Some(status), false));
+    for observation in [
+        rejected(429, "rate limited"),
+        rejected(401, "bad key"),
+        rejected(400, "bad body"),
+        rejected(503, "overloaded"),
+        failure(ProviderFailure {
+            message: "connection reset".into(),
+            ..ProviderFailure::default()
+        }),
+        AvailabilityObservation {
+            status_code: Some(200),
+            finish_reason: Some(ChatFinishReason::Stop),
+            raw_finish_reason: Some("stop".into()),
+            failure: Some(ProviderFailure {
+                message: "stream reset".into(),
+                ..ProviderFailure::default()
+            }),
+        },
+    ] {
+        let job = llm_job(&handle, llm);
+        observe(&handle, job, micros, observation);
+    }
+
+    let report = consume_batch(&handle, usize::MAX);
+    assert_eq!(report.consumed_records, 9);
+    assert_eq!(report.samples_written, 7, "one sample per Job");
+    let total = counts(&handle, provider, "model-a", micros);
+    assert_eq!(
+        total,
+        AvailabilityCounts {
+            available: 1,
+            provider_server_error: 1,
+            rate_limited: 1,
+            auth_or_permission: 1,
+            request_or_target: 1,
+            unconfirmed: 2,
+        },
+        "each request counts once in its class"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn the_first_record_fixes_the_minute_and_a_late_first_record_counts_in_its_older_minute() {
+    let (_root, directory) = data_directory("aggregation-minutes");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let job = llm_job(&handle, llm);
+    observe(&handle, job, at_minute(5), response(200));
+    consume_batch(&handle, 10);
+
+    // A backdated later record moves no bucket: the sample stays in minute 5.
+    observe(
+        &handle,
+        job,
+        at_minute(4),
+        failure(provider_failure("overloaded", Some(503), true)),
+    );
+    consume_batch(&handle, 10);
+    assert_eq!(
+        counts(&handle, provider, "model-a", at_minute(5)),
+        AvailabilityCounts {
+            unconfirmed: 1,
+            ..AvailabilityCounts::default()
+        },
+        "the sample is counted once, in its first record's minute"
+    );
+    assert_eq!(
+        bucket(&handle, provider, "model-a", at_minute(4)),
+        None,
+        "no empty minute is created"
+    );
+
+    // A Job whose first record was recorded after a later minute's records counts in its own older minute.
+    let late = llm_job(&handle, llm);
+    observe(&handle, late, at_minute(3), response(200));
+    consume_batch(&handle, 10);
+    assert_eq!(
+        counts(&handle, provider, "model-a", at_minute(3)).available,
+        1
+    );
+    assert_eq!(
+        counts(&handle, provider, "model-a", at_minute(5)).unconfirmed,
+        1,
+        "the later minute is untouched"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn grouping_follows_the_frozen_provider_and_exact_model_across_profile_edits() {
+    let (_root, directory) = data_directory("aggregation-grouping");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (first, a) = llm_setup(&handle, "model-a");
+    let b = llm_profile(
+        &handle,
+        first,
+        llm_config("model-a", &[ModelCapability::Chat]),
+    );
+    let other = provider(&handle, "other");
+    let c = llm_profile(
+        &handle,
+        other,
+        llm_config("model-a", &[ModelCapability::Chat]),
+    );
+    let d = llm_profile(
+        &handle,
+        first,
+        llm_config("Model-A", &[ModelCapability::Chat]),
+    );
+    let micros = at_minute(7);
+
+    let before_edit = llm_job(&handle, a);
+    observe(&handle, before_edit, micros, response(200));
+    wait(handle.start_job(before_edit)).expect("start job");
+    wait(handle.finalize_job(before_edit, JobFinalization::Completed(result("done"))))
+        .expect("finish job");
+    wait(handle.update_profile(
+        a,
+        NewProfile {
+            name: "a".into(),
+            config: NewProfileConfig::Llm {
+                provider: first,
+                config: llm_config("model-b", &[ModelCapability::Chat]),
+            },
+        },
+    ))
+    .expect("edit the profile");
+    let after_edit = llm_job(&handle, a);
+    observe(&handle, after_edit, micros, response(200));
+    for llm in [b, c, d] {
+        let job = llm_job(&handle, llm);
+        observe(&handle, job, micros, response(200));
+    }
+    drain(&handle);
+
+    assert_eq!(
+        counts(&handle, first, "model-a", micros).available,
+        2,
+        "the edited Profile's earlier Job keeps its frozen model, and a second Profile shares the pair"
+    );
+    assert_eq!(
+        counts(&handle, first, "model-b", micros).available,
+        1,
+        "the Job after the edit uses the new model"
+    );
+    assert_eq!(
+        counts(&handle, other, "model-a", micros).available,
+        1,
+        "the same model at another Provider is another bucket"
+    );
+    assert_eq!(
+        counts(&handle, first, "Model-A", micros).available,
+        1,
+        "model names are compared exactly"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_retry_is_a_separate_request_in_the_counts() {
+    let (_root, directory) = data_directory("aggregation-retry");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let Configured {
+        provider,
+        targeted,
+        agent,
+        ..
+    } = configured(&handle);
+    let micros = at_minute(9);
+    let original = configured_child(&handle, agent, targeted);
+    observe(
+        &handle,
+        original,
+        micros,
+        failure(provider_failure("overloaded", Some(503), true)),
+    );
+    wait(handle.finalize_job(
+        original,
+        JobFinalization::Failed(result("first try failed")),
+    ))
+    .expect("finish");
+    let input = wait(handle.job(original))
+        .expect("read job")
+        .expect("job exists")
+        .input;
+    let retry = wait(handle.retry_job(JobRetry {
+        original,
+        input: RetryInput::Unchanged,
+        name: None,
+        execution_mode: ExecutionMode::Once,
+        eligible_at: None,
+        scheduled_at: None,
+        next_due_at: None,
+        next_iteration_no: None,
+        iteration_no: None,
+        projects: Vec::new(),
+        dependencies: Vec::new(),
+        configuration: configuration(agent, targeted),
+        assigned_executor: None,
+    }))
+    .expect("retry with the same configuration");
+    observe(&handle, retry, micros + 1, response(200));
+    drain(&handle);
+
+    let minute = counts(&handle, provider, "model-a", micros);
+    assert_eq!(
+        (
+            minute.provider_server_error,
+            minute.available,
+            requests(minute)
+        ),
+        (1, 1, 2),
+        "the failed attempt and its retry are two requests"
+    );
+    assert_eq!(
+        input,
+        wait(handle.job(retry))
+            .expect("read job")
+            .expect("job exists")
+            .input
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn reopening_keeps_counts_and_progress_and_consumes_only_new_records() {
+    let (_root, directory) = data_directory("aggregation-reopen");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(11);
+    let completed = llm_job(&handle, llm);
+    observe(&handle, completed, micros, response(200));
+    let unconfirmed = llm_job(&handle, llm);
+    observe(&handle, unconfirmed, micros, bare(200));
+    assert_eq!(drain(&handle), 2);
+    let before = (
+        counts(&handle, provider, "model-a", micros),
+        wait(handle.availability_progress()).expect("read progress"),
+    );
+    worker.shutdown().expect("shutdown");
+
+    let worker = DatabaseWorker::start(&directory).expect("reopen database");
+    let handle = worker.handle();
+    assert_eq!(
+        (
+            counts(&handle, provider, "model-a", micros),
+            wait(handle.availability_progress()).expect("read progress")
+        ),
+        before,
+        "counts and progress survive reopening"
+    );
+    let later = llm_job(&handle, llm);
+    observe(&handle, later, micros, response(200));
+    let report = consume_batch(&handle, 10);
+    assert_eq!(
+        report.consumed_records, 1,
+        "only the record recorded after the reopen is consumed"
+    );
+    let total = counts(&handle, provider, "model-a", micros);
+    assert_eq!((total.available, total.unconfirmed), (2, 1));
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_stale_preparation_applies_nothing_and_its_records_still_count_once() {
+    let (_root, directory) = data_directory("aggregation-stale");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(13);
+    for _ in 0..2 {
+        let job = llm_job(&handle, llm);
+        observe(&handle, job, micros, response(200));
+    }
+    // Both preparations read the same snapshot, before either commits.
+    let first = wait(handle.prepare_availability(1)).expect("prepare the first record");
+    let second = wait(handle.prepare_availability(2)).expect("prepare both records");
+    assert!(
+        wait(handle.commit_availability(first))
+            .expect("commit")
+            .is_some()
+    );
+    let after_first = (
+        counts(&handle, provider, "model-a", micros),
+        wait(handle.availability_progress()).expect("read progress"),
+    );
+    assert_eq!(
+        wait(handle.commit_availability(second)).expect("commit the stale preparation"),
+        None,
+        "a preparation overtaken by a commit is refused"
+    );
+    assert_eq!(
+        (
+            counts(&handle, provider, "model-a", micros),
+            wait(handle.availability_progress()).expect("read progress")
+        ),
+        after_first,
+        "a refused preparation changes no count and no progress"
+    );
+    assert_eq!(
+        drain(&handle),
+        1,
+        "the record the stale batch named is consumed once"
+    );
+    assert_eq!(requests(counts(&handle, provider, "model-a", micros)), 2);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_failed_commit_leaves_samples_counts_and_progress_unchanged() {
+    let (_root, directory) = data_directory("aggregation-failed");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let micros = at_minute(15);
+    let job = llm_job(&handle, llm);
+    observe(&handle, job, micros, response(200));
+    observe(&handle, job, micros + 1, bare(200));
+
+    let mut plan = wait(handle.prepare_availability(10)).expect("prepare");
+    plan.inject_failure = true;
+    let error = wait(handle.commit_availability(plan))
+        .expect_err("the injected failure rolls the commit back");
+    assert!(
+        matches!(error, DatabaseError::RolledBack(_)),
+        "got {error:?}"
+    );
+    // A storage failure latches the database, as every storage failure does:
+    // reads are refused until it is reopened.
+    assert!(
+        matches!(
+            wait(handle.availability_progress()),
+            Err(DatabaseError::ReadsStorageFailed(_))
+        ),
+        "the latched database refuses reads"
+    );
+    assert!(
+        matches!(worker.shutdown(), Err(DatabaseError::StorageUnavailable(_))),
+        "shutdown reports the storage failure that latched the database"
+    );
+
+    let worker = DatabaseWorker::start(&directory).expect("reopen database");
+    let handle = worker.handle();
+    assert_eq!(
+        wait(handle.availability_progress()).expect("read progress"),
+        AvailabilityAggregationProgress::default()
+    );
+    assert_eq!(bucket(&handle, provider, "model-a", micros), None);
+    assert!(
+        wait(handle.request_sample(job))
+            .expect("read sample")
+            .value
+            .is_none()
+    );
+    assert_eq!(drain(&handle), 2, "the records are still unconsumed");
+    assert_eq!(
+        counts(&handle, provider, "model-a", micros).available,
+        1,
+        "the request counts once after the retry"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn consumption_reads_no_project_associations() {
+    let (_root, directory) = data_directory("aggregation-projects");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let project = project(&handle, "project");
+    let job = create_job(
+        &handle,
+        NewJob {
+            configuration: llm_only(llm),
+            ..new_job("request", handle.genesis(), vec![project])
+        },
+    );
+    observe(&handle, job, at_minute(17), response(200));
+    wait(handle.with_database(crate::storage::break_project_links)).expect("arm the probe");
+    assert!(
+        matches!(wait(handle.job(job)), Err(DatabaseError::Read(_))),
+        "the probe is armed"
+    );
+
+    assert_eq!(consume_batch(&handle, 10).consumed_records, 1);
+    assert_eq!(
+        counts(&handle, provider, "model-a", at_minute(17)).available,
+        1
     );
     worker.shutdown().expect("shutdown");
 }

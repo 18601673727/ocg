@@ -888,26 +888,28 @@ impl AvailabilityRequestSample {
 
 /// The structured claims that the records of one request have made so far.
 /// It keeps claims, not records, so replay in any order reaches the same state.
-#[derive(Default)]
-struct RequestEvidence {
-    job: Option<JobId>,
+#[derive(Clone, Default)]
+pub(crate) struct RequestEvidence {
+    pub(crate) job: Option<JobId>,
     /// The lowest record ID seen, with its observed time.
-    first: Option<(AvailabilityStatId, Timestamp)>,
+    pub(crate) first: Option<(AvailabilityStatId, Timestamp)>,
     /// The first HTTP status a record observed. Only an observed status
     /// classifies the request.
-    observed_status: Option<u16>,
+    pub(crate) observed_status: Option<u16>,
     /// The first HTTP status any record supplied, observed or on a failure.
-    supplied_status: Option<u16>,
+    pub(crate) supplied_status: Option<u16>,
     /// The first finish reason observed.
-    finish: Option<ChatFinishReason>,
+    pub(crate) finish: Option<ChatFinishReason>,
     /// Some record witnesses a normal termination by itself.
-    witness: bool,
+    pub(crate) witness: bool,
     /// An explicit contradiction has been seen; see `from_records`.
-    contradictory: bool,
+    pub(crate) contradictory: bool,
 }
 
 impl RequestEvidence {
-    fn add(&mut self, record: &AvailabilityStatRecord) -> Result<(), MixedJobs> {
+    /// Adds one record's facts. The reducer and incremental aggregation both
+    /// use it, so their classifications cannot differ.
+    pub(crate) fn add(&mut self, record: &AvailabilityStatRecord) -> Result<(), MixedJobs> {
         match self.job {
             Some(first) if first != record.job => {
                 return Err(MixedJobs {
@@ -950,7 +952,7 @@ impl RequestEvidence {
         Ok(())
     }
 
-    fn sample(&self) -> Option<AvailabilityRequestSample> {
+    pub(crate) fn sample(&self) -> Option<AvailabilityRequestSample> {
         let (job, (first_record, observed_at)) = (self.job?, self.first?);
         let classification = if self.contradictory {
             AvailabilityClassification::Unconfirmed
@@ -966,6 +968,99 @@ impl RequestEvidence {
             classification,
         })
     }
+}
+
+/// Microseconds in one aggregation minute.
+const MICROS_PER_MINUTE: i64 = 60_000_000;
+
+/// The one-minute bucket `at` falls in: whole minutes since the Unix epoch,
+/// so a negative time has a negative bucket. A sample's bucket is fixed by
+/// its first record's `observed_at`.
+#[must_use]
+pub fn minute_of(at: Timestamp) -> i64 {
+    at.as_unix_micros().div_euclid(MICROS_PER_MINUTE)
+}
+
+/// Requests per classification in one (Provider, model, minute) bucket.
+/// Every count is of requests, one per Job, never of raw observations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AvailabilityCounts {
+    pub available: u64,
+    pub provider_server_error: u64,
+    pub rate_limited: u64,
+    pub auth_or_permission: u64,
+    pub request_or_target: u64,
+    pub unconfirmed: u64,
+}
+
+impl AvailabilityCounts {
+    /// The counter a classification is counted in.
+    pub(crate) fn counter(&mut self, class: AvailabilityClassification) -> &mut u64 {
+        use AvailabilityClassification::{Available, Rejected, Unavailable, Unconfirmed};
+        match class {
+            Available => &mut self.available,
+            Unavailable(UnavailableCause::ProviderServerError) => &mut self.provider_server_error,
+            Rejected(RejectionCause::RateLimited) => &mut self.rate_limited,
+            Rejected(RejectionCause::AuthOrPermission) => &mut self.auth_or_permission,
+            Rejected(RejectionCause::RequestOrTarget) => &mut self.request_or_target,
+            Unconfirmed => &mut self.unconfirmed,
+        }
+    }
+}
+
+/// One request sample as materialized: its Job's frozen target and the
+/// sample it reduces to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestSampleRecord {
+    pub job: JobId,
+    pub llm_profile: ProfileId,
+    pub provider: LlmProviderId,
+    pub model: String,
+    pub sample: AvailabilityRequestSample,
+}
+
+/// How far aggregation has consumed AvailabilityStat records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AvailabilityAggregationProgress {
+    /// The last committed AvailabilityStat ID consumed. `None` before any.
+    pub consumed_through: Option<AvailabilityStatId>,
+    /// Wall-clock time of the last committed batch. It is activity metadata,
+    /// not progress, and it covers no observed time.
+    pub updated_at: Option<Timestamp>,
+}
+
+/// A read together with the aggregation progress of the same snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadSnapshot<T> {
+    pub progress: AvailabilityAggregationProgress,
+    pub value: T,
+}
+
+/// What one committed aggregation batch consumed and wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AvailabilityBatchReport {
+    pub consumed_records: usize,
+    pub consumed_through: AvailabilityStatId,
+    /// Request samples whose stored state changed.
+    pub samples_written: usize,
+    /// Minute buckets whose stored counts changed.
+    pub buckets_written: usize,
+    /// Preparations this call made, including the one that committed.
+    pub attempts: u8,
+}
+
+/// The result of one bounded aggregation step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvailabilityBatch {
+    /// No committed record was unconsumed, so nothing was written.
+    Idle {
+        consumed_through: Option<AvailabilityStatId>,
+    },
+    Consumed(AvailabilityBatchReport),
+    /// Every preparation was overtaken by another commit, so none was applied.
+    Contended {
+        attempts: u8,
+    },
 }
 
 /// One availability observation of an LLM request made by a Job. The LLM it
@@ -1127,6 +1222,9 @@ pub enum OperationKind {
     ConfirmJobStopped,
     RecordMetrics,
     RecordAvailabilityStat,
+    /// One bounded batch of AvailabilityStat aggregation. Its marker's
+    /// subject is the last record the batch consumed.
+    ConsumeAvailability,
 }
 
 /// Written in the same transaction as every accepted mutation, so its
