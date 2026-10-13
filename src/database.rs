@@ -24,9 +24,13 @@ use crate::persistence::{
     ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, ReadSnapshot, RequestSampleRecord,
     Timestamp, Violation, WrongProfileKind,
 };
-use crate::storage::{self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile};
-use crate::system_policy::{self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError};
+use crate::storage::{
+    self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile,
+};
 pub use crate::storage::{StorageError, StorageErrorKind};
+use crate::system_policy::{
+    self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError,
+};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
 /// The most queued commands one group commit covers. Commands that queue up
@@ -82,7 +86,9 @@ pub enum DatabaseError {
     StartupPolicy(#[source] SystemPolicyError),
     #[error("the control queue is full; the space check was not accepted")]
     ControlQueueFull,
-    #[error("database command queue is full ({COMMAND_QUEUE_CAPACITY} pending commands); the command was not accepted")]
+    #[error(
+        "database command queue is full ({COMMAND_QUEUE_CAPACITY} pending commands); the command was not accepted"
+    )]
     QueueFull,
     #[error("the database is shutting down; the command was not accepted")]
     ShuttingDown,
@@ -96,10 +102,17 @@ pub enum DatabaseError {
     Rejected(Violation),
     #[error("storage failed before the commit; nothing was committed: {0}")]
     RolledBack(StorageError),
-    #[error("{operation} was accepted but the worker stopped before executing it; nothing was committed")]
+    #[error(
+        "{operation} was accepted but the worker stopped before executing it; nothing was committed"
+    )]
     NeverExecuted { operation: OperationId },
-    #[error("{operation} was accepted but disk protection activated before it could run; nothing was committed: {lock}")]
-    RefusedByDiskProtection { operation: OperationId, lock: ProtectionLock },
+    #[error(
+        "{operation} was accepted but disk protection activated before it could run; nothing was committed: {lock}"
+    )]
+    RefusedByDiskProtection {
+        operation: OperationId,
+        lock: ProtectionLock,
+    },
     /// Space is above the lock threshold, but this command's allowance would
     /// take it below; only this command is refused, without locking.
     #[error(
@@ -107,16 +120,26 @@ pub enum DatabaseError {
          and the command's {} byte allowance would leave less than {}",
         shortage.path.display(), shortage.available_bytes, shortage.expected_write_bytes, shortage.threshold_bytes
     )]
-    InsufficientSpace { operation: OperationId, shortage: SpaceShortage },
+    InsufficientSpace {
+        operation: OperationId,
+        shortage: SpaceShortage,
+    },
     #[error("the outcome of {operation} is unknown: {cause}")]
-    OutcomeUnknown { operation: OperationId, cause: UnknownCause },
+    OutcomeUnknown {
+        operation: OperationId,
+        cause: UnknownCause,
+    },
     #[error("{0} was not issued by this database")]
     UnknownOperation(OperationId),
-    #[error("database read queue is full ({READ_QUEUE_CAPACITY} pending reads); the read was not started")]
+    #[error(
+        "database read queue is full ({READ_QUEUE_CAPACITY} pending reads); the read was not started"
+    )]
     ReadQueueFull,
     #[error("the database is shutting down or closed; the read was not performed")]
     ReadsClosed,
-    #[error("the database stopped after a storage failure and must be reopened; the read was not performed: {0}")]
+    #[error(
+        "the database stopped after a storage failure and must be reopened; the read was not performed: {0}"
+    )]
     ReadsStorageFailed(StorageError),
     #[error("the read worker stopped without answering the read")]
     ReadInterrupted,
@@ -141,7 +164,9 @@ pub enum DatabaseError {
     Open(StorageError),
     #[error("{0} is not an OCG database")]
     ForeignDatabase(PathBuf),
-    #[error("the database uses storage format {found}; this build supports only format {supported}")]
+    #[error(
+        "the database uses storage format {found}; this build supports only format {supported}"
+    )]
     UnsupportedFormat { found: u32, supported: u32 },
     #[error("database worker panicked")]
     WorkerPanicked,
@@ -170,7 +195,9 @@ impl DatabaseError {
     /// are not command results.
     pub fn command_outcome(&self) -> Option<CommandOutcome> {
         match self {
-            Self::QueueFull | Self::ShuttingDown | Self::DiskProtected(_) => Some(CommandOutcome::NotAccepted),
+            Self::QueueFull | Self::ShuttingDown | Self::DiskProtected(_) => {
+                Some(CommandOutcome::NotAccepted)
+            }
             Self::Rejected(_)
             | Self::RolledBack(_)
             | Self::NeverExecuted { .. }
@@ -196,13 +223,20 @@ pub enum OperationStatus {
 /// Why [`DatabaseHandle::compact_storage`] left the file alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionSkip {
-    FileTooSmall { file_bytes: u64 },
+    FileTooSmall {
+        file_bytes: u64,
+    },
     /// The file's length minus redb's live pages is the most compaction could
     /// return. It is an estimate: fragmentation inside pages is not counted.
-    LittleReclaimable { file_bytes: u64, reclaimable_bytes: u64 },
+    LittleReclaimable {
+        file_bytes: u64,
+        reclaimable_bytes: u64,
+    },
     /// An earlier successful attempt was too recent. Failed attempts do not
     /// start the cooldown.
-    CoolingDown { remaining: Duration },
+    CoolingDown {
+        remaining: Duration,
+    },
 }
 
 /// What a compaction attempt did to the file. The sizes are measured after
@@ -252,10 +286,18 @@ pub enum MaintenanceError {
 }
 
 fn describe_reasons(reasons: &[ProtectionReason]) -> String {
-    reasons.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+    reasons
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
-fn operation_status(marker: Option<OperationMarker>, operation: OperationId, epoch: u64) -> OperationStatus {
+fn operation_status(
+    marker: Option<OperationMarker>,
+    operation: OperationId,
+    epoch: u64,
+) -> OperationStatus {
     match marker {
         Some(marker) => OperationStatus::Committed(marker),
         None if operation.epoch() < epoch => OperationStatus::NotCommitted,
@@ -319,7 +361,13 @@ impl Control {
                 reply.send(Err(error)).ok();
             }
             Self::CompactStorage(reply) => {
-                reply.send(Err(if stopped { MaintenanceError::WorkerStopped } else { MaintenanceError::ShuttingDown })).ok();
+                reply
+                    .send(Err(if stopped {
+                        MaintenanceError::WorkerStopped
+                    } else {
+                        MaintenanceError::ShuttingDown
+                    }))
+                    .ok();
             }
             Self::CheckSpace | Self::Recover => {}
             Self::FilesystemFailure { reply, .. } => {
@@ -438,60 +486,171 @@ impl Command {
     fn execute(self, database: &Database, operation: OperationId, commit: Commit) -> Executed {
         use OperationKind as Kind;
         match self {
-            Self::BeginCoreLogCleanup { owner, executor, started, reply } => run(database, operation, commit, Kind::BeginCoreLogCleanup, reply, |batch| {
-                persistence::begin_core_log_cleanup(batch, owner, executor, started)
-            }),
-            Self::SaveJobInput { existing, draft, reply } => run(database, operation, commit, Kind::SaveJobInput, reply, |batch| {
-                persistence::save_job_input(batch, existing, draft)
-            }),
-            Self::CreateJobWithInput { job, input, reply } => run(database, operation, commit, Kind::CreateJobWithInput, reply, |batch| {
-                persistence::create_job_with_input(batch, job, input)
-            }),
-            Self::RetryJob { retry, reply } => run(database, operation, commit, Kind::RetryJob, reply, |batch| {
-                persistence::retry_job(batch, retry)
-            }),
-            Self::StartJob { job, reply } => run(database, operation, commit, Kind::StartJob, reply, |batch| {
-                persistence::start_job(batch, job)
-            }),
-            Self::AssignJobExecutor { job, executor, reply } => run(database, operation, commit, Kind::AssignJobExecutor, reply, |batch| {
-                persistence::assign_job_executor(batch, job, executor)
-            }),
-            Self::AssociateJobProject { job, project, reply } => run(database, operation, commit, Kind::AssociateJobProject, reply, |batch| {
-                persistence::associate_job_project(batch, job, project)
-            }),
-            Self::AppendJobOutput { job, output, reply } => run(database, operation, commit, Kind::AppendJobOutput, reply, |batch| {
-                persistence::append_job_output(batch, job, output)
-            }),
-            Self::FinalizeJob { job, finalization, reply } => run(database, operation, commit, Kind::FinalizeJob, reply, |batch| {
-                persistence::finalize_job(batch, job, finalization)
-            }),
-            Self::CreateExecutor { executor, reply } => run(database, operation, commit, Kind::CreateExecutor, reply, |batch| {
-                persistence::create_executor(batch, executor)
-            }),
-            Self::CreateProject { project, reply } => run(database, operation, commit, Kind::CreateProject, reply, |batch| {
-                persistence::create_project(batch, project)
-            }),
-            Self::CreateLlmProvider { provider, reply } => run(database, operation, commit, Kind::CreateLlmProvider, reply, |batch| {
-                persistence::create_llm_provider(batch, provider)
-            }),
-            Self::CreateProfile { profile, reply } => run(database, operation, commit, Kind::CreateProfile, reply, |batch| {
-                persistence::create_profile(batch, profile)
-            }),
-            Self::UpdateProfile { id, profile, reply } => run(database, operation, commit, Kind::UpdateProfile, reply, |batch| {
-                persistence::update_profile(batch, id, profile)
-            }),
-            Self::CreateAgent { agent, reply } => run(database, operation, commit, Kind::CreateAgent, reply, |batch| {
-                persistence::create_agent(batch, agent)
-            }),
-            Self::ConfirmJobStopped { job, reply } => run(database, operation, commit, Kind::ConfirmJobStopped, reply, |batch| {
-                persistence::confirm_job_stopped(batch, job)
-            }),
-            Self::RecordMetrics { metrics, reply } => run(database, operation, commit, Kind::RecordMetrics, reply, |batch| {
-                persistence::record_metrics(batch, *metrics)
-            }),
-            Self::RecordAvailabilityStat { stat, reply } => run(database, operation, commit, Kind::RecordAvailabilityStat, reply, |batch| {
-                persistence::record_availability_stat(batch, *stat)
-            }),
+            Self::BeginCoreLogCleanup {
+                owner,
+                executor,
+                started,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::BeginCoreLogCleanup,
+                reply,
+                |batch| persistence::begin_core_log_cleanup(batch, owner, executor, started),
+            ),
+            Self::SaveJobInput {
+                existing,
+                draft,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::SaveJobInput,
+                reply,
+                |batch| persistence::save_job_input(batch, existing, draft),
+            ),
+            Self::CreateJobWithInput { job, input, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateJobWithInput,
+                reply,
+                |batch| persistence::create_job_with_input(batch, job, input),
+            ),
+            Self::RetryJob { retry, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::RetryJob,
+                reply,
+                |batch| persistence::retry_job(batch, retry),
+            ),
+            Self::StartJob { job, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::StartJob,
+                reply,
+                |batch| persistence::start_job(batch, job),
+            ),
+            Self::AssignJobExecutor {
+                job,
+                executor,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::AssignJobExecutor,
+                reply,
+                |batch| persistence::assign_job_executor(batch, job, executor),
+            ),
+            Self::AssociateJobProject {
+                job,
+                project,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::AssociateJobProject,
+                reply,
+                |batch| persistence::associate_job_project(batch, job, project),
+            ),
+            Self::AppendJobOutput { job, output, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::AppendJobOutput,
+                reply,
+                |batch| persistence::append_job_output(batch, job, output),
+            ),
+            Self::FinalizeJob {
+                job,
+                finalization,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::FinalizeJob,
+                reply,
+                |batch| persistence::finalize_job(batch, job, finalization),
+            ),
+            Self::CreateExecutor { executor, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateExecutor,
+                reply,
+                |batch| persistence::create_executor(batch, executor),
+            ),
+            Self::CreateProject { project, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateProject,
+                reply,
+                |batch| persistence::create_project(batch, project),
+            ),
+            Self::CreateLlmProvider { provider, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateLlmProvider,
+                reply,
+                |batch| persistence::create_llm_provider(batch, provider),
+            ),
+            Self::CreateProfile { profile, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateProfile,
+                reply,
+                |batch| persistence::create_profile(batch, profile),
+            ),
+            Self::UpdateProfile { id, profile, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::UpdateProfile,
+                reply,
+                |batch| persistence::update_profile(batch, id, profile),
+            ),
+            Self::CreateAgent { agent, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateAgent,
+                reply,
+                |batch| persistence::create_agent(batch, agent),
+            ),
+            Self::ConfirmJobStopped { job, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::ConfirmJobStopped,
+                reply,
+                |batch| persistence::confirm_job_stopped(batch, job),
+            ),
+            Self::RecordMetrics { metrics, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::RecordMetrics,
+                reply,
+                |batch| persistence::record_metrics(batch, *metrics),
+            ),
+            Self::RecordAvailabilityStat { stat, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::RecordAvailabilityStat,
+                reply,
+                |batch| persistence::record_availability_stat(batch, *stat),
+            ),
             Self::CommitAvailabilityAggregation { plan, reply } => {
                 let outcome =
                     storage::commit_availability_aggregation(database, operation, commit, *plan);
@@ -508,27 +667,42 @@ impl Command {
     /// rather than wraps, so an absurd payload fails the space check.
     fn expected_write_bytes(&self) -> u64 {
         let payload = match self {
-            Self::BeginCoreLogCleanup { started, .. } => output_bytes(&started.summary, &started.code, &started.value).saturating_add(256),
-            Self::SaveJobInput { draft, .. } => text_bytes(&draft.submission_id).saturating_add(text_bytes(&draft.objective)),
+            Self::BeginCoreLogCleanup { started, .. } => {
+                output_bytes(&started.summary, &started.code, &started.value).saturating_add(256)
+            }
+            Self::SaveJobInput { draft, .. } => {
+                text_bytes(&draft.submission_id).saturating_add(text_bytes(&draft.objective))
+            }
             Self::CreateJobWithInput { job, .. } => text_bytes(&job.name),
             Self::RetryJob { retry, .. } => text_bytes(&retry.name),
-            Self::StartJob { .. } | Self::AssignJobExecutor { .. } | Self::AssociateJobProject { .. } | Self::ConfirmJobStopped { .. } => 0,
-            Self::AppendJobOutput { output, .. } => output_bytes(&output.summary, &output.code, &output.value),
+            Self::StartJob { .. }
+            | Self::AssignJobExecutor { .. }
+            | Self::AssociateJobProject { .. }
+            | Self::ConfirmJobStopped { .. } => 0,
+            Self::AppendJobOutput { output, .. } => {
+                output_bytes(&output.summary, &output.code, &output.value)
+            }
             Self::FinalizeJob { finalization, .. } => match finalization {
-                JobFinalization::Completed(result) | JobFinalization::Failed(result) | JobFinalization::Cancelled(result) => {
+                JobFinalization::Completed(result)
+                | JobFinalization::Failed(result)
+                | JobFinalization::Cancelled(result) => {
                     output_bytes(&result.summary, &result.code, &result.value)
                 }
                 JobFinalization::Unknown => 0,
             },
             Self::CreateExecutor { executor, .. } => byte_count(executor.name.len()),
-            Self::CreateProject { project, .. } => byte_count(project.name.len()).saturating_add(text_bytes(&project.description)),
+            Self::CreateProject { project, .. } => {
+                byte_count(project.name.len()).saturating_add(text_bytes(&project.description))
+            }
             Self::CreateLlmProvider { provider, .. } => byte_count(provider.name.len())
                 .saturating_add(text_bytes(&provider.endpoint))
                 .saturating_add(text_bytes(&provider.credential_ref)),
-            Self::CreateProfile { profile, .. } | Self::UpdateProfile { profile, .. } => byte_count(profile.name.len()).saturating_add(match &profile.config {
-                NewProfileConfig::Agent { config, .. } => text_bytes(&config.instructions),
-                NewProfileConfig::Llm { config, .. } => byte_count(config.model.len()),
-            }),
+            Self::CreateProfile { profile, .. } | Self::UpdateProfile { profile, .. } => {
+                byte_count(profile.name.len()).saturating_add(match &profile.config {
+                    NewProfileConfig::Agent { config, .. } => text_bytes(&config.instructions),
+                    NewProfileConfig::Llm { config, .. } => byte_count(config.model.len()),
+                })
+            }
             Self::CreateAgent { agent, .. } => byte_count(agent.name.len()),
             Self::RecordMetrics { metrics, .. } => json_bytes(&metrics.measurements.usage.raw),
             Self::CommitAvailabilityAggregation { plan, .. } => plan.encoded_bytes(),
@@ -543,7 +717,9 @@ impl Command {
                 failure.saturating_add(text_bytes(&observation.raw_finish_reason))
             }
         };
-        payload.saturating_mul(2).saturating_add(TRANSACTION_ALLOWANCE_BYTES)
+        payload
+            .saturating_mul(2)
+            .saturating_add(TRANSACTION_ALLOWANCE_BYTES)
     }
 
     /// Answers a command that will never run, so its caller is not left
@@ -552,8 +728,12 @@ impl Command {
         match self {
             Self::BeginCoreLogCleanup { reply, .. } => refuse(reply, error),
             Self::SaveJobInput { reply, .. } => refuse(reply, error),
-            Self::CreateJobWithInput { reply, .. } | Self::RetryJob { reply, .. } => refuse(reply, error),
-            Self::StartJob { reply, .. } | Self::AssignJobExecutor { reply, .. } | Self::AssociateJobProject { reply, .. } => refuse(reply, error),
+            Self::CreateJobWithInput { reply, .. } | Self::RetryJob { reply, .. } => {
+                refuse(reply, error)
+            }
+            Self::StartJob { reply, .. }
+            | Self::AssignJobExecutor { reply, .. }
+            | Self::AssociateJobProject { reply, .. } => refuse(reply, error),
             Self::AppendJobOutput { reply, .. } => refuse(reply, error),
             Self::FinalizeJob { reply, .. } => refuse(reply, error),
             Self::CreateExecutor { reply, .. } => refuse(reply, error),
@@ -583,11 +763,19 @@ fn text_bytes(text: &Option<String>) -> u64 {
 }
 
 fn json_bytes(value: &Option<serde_json::Value>) -> u64 {
-    value.as_ref().map_or(0, |value| byte_count(value.to_string().len()))
+    value
+        .as_ref()
+        .map_or(0, |value| byte_count(value.to_string().len()))
 }
 
-fn output_bytes(summary: &Option<String>, code: &Option<String>, value: &Option<serde_json::Value>) -> u64 {
-    text_bytes(summary).saturating_add(text_bytes(code)).saturating_add(json_bytes(value))
+fn output_bytes(
+    summary: &Option<String>,
+    code: &Option<String>,
+    value: &Option<serde_json::Value>,
+) -> u64 {
+    text_bytes(summary)
+        .saturating_add(text_bytes(code))
+        .saturating_add(json_bytes(value))
 }
 
 /// A storage failure that ends this opening of the database.
@@ -655,7 +843,9 @@ fn settle<T: Send + 'static>(
             }),
             // The refusal may rest on state that a lost commit of the same
             // group had written. Nothing of this command was committed.
-            (Err(DatabaseError::Rejected(_)), Some(error)) => Err(DatabaseError::RolledBack(error.clone())),
+            (Err(DatabaseError::Rejected(_)), Some(error)) => {
+                Err(DatabaseError::RolledBack(error.clone()))
+            }
             (result, _) => result,
         };
         reply.send(result).ok();
@@ -664,7 +854,10 @@ fn settle<T: Send + 'static>(
         operation,
         staged,
         answer,
-        failure: outcome.storage_failure.map(|error| StorageFailure { error, outcome_unknown }),
+        failure: outcome.storage_failure.map(|error| StorageFailure {
+            error,
+            outcome_unknown,
+        }),
     }
 }
 
@@ -763,7 +956,11 @@ impl GroupProbe {
     }
 
     fn hold_if_armed(&self) {
-        let gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some((entered, released)) = gate {
             entered.send(()).ok();
             released.recv_timeout(crate::test_support::WAIT).ok();
@@ -777,7 +974,9 @@ fn flush_staged(_shared: &Shared, database: &Database) -> Result<(), StorageErro
     {
         _shared.probe.flushes.fetch_add(1, Ordering::SeqCst);
         if _shared.probe.fail_next_flush.swap(false, Ordering::SeqCst) {
-            return Err(StorageError::corrupted("injected failure of the group's durable commit"));
+            return Err(StorageError::corrupted(
+                "injected failure of the group's durable commit",
+            ));
         }
     }
     storage::persist_staged(database)
@@ -785,7 +984,10 @@ fn flush_staged(_shared: &Shared, database: &Database) -> Result<(), StorageErro
 
 impl Shared {
     fn admission(&self) -> Admission {
-        self.admission.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.admission
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn read_refusal(&self) -> DatabaseError {
@@ -799,7 +1001,11 @@ impl Shared {
     }
 
     fn release_database(&self) {
-        let database = self.database.write().unwrap_or_else(PoisonError::into_inner).take();
+        let database = self
+            .database
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         drop(database);
         self.released.store(true, Ordering::SeqCst);
     }
@@ -816,7 +1022,13 @@ struct StagingBarrier<'a> {
 
 impl<'a> StagingBarrier<'a> {
     fn raise(shared: &'a Shared) -> Self {
-        Self { shared, _held: shared.staging.write().unwrap_or_else(PoisonError::into_inner) }
+        Self {
+            shared,
+            _held: shared
+                .staging
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
     }
 }
 
@@ -847,14 +1059,20 @@ impl Drop for ReleaseOnPanic {
     fn drop(&mut self) {
         if std::thread::panicking() {
             {
-                let mut admission = self.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+                let mut admission = self
+                    .shared
+                    .admission
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
                 *admission = Admission::WorkerStopped;
             }
             for message in self.receiver.drain() {
                 if let Message::Run(envelope) = message {
                     let envelope = *envelope;
                     let operation = envelope.operation;
-                    envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
+                    envelope
+                        .command
+                        .refuse(|| DatabaseError::NeverExecuted { operation });
                 }
             }
             self.shared.space_check.abandon();
@@ -883,7 +1101,11 @@ impl Drop for ReadWorkerExit {
         if self.shared.live_readers.fetch_sub(1, Ordering::SeqCst) != 1 {
             return;
         }
-        let mut stopped = self.shared.reads_stopped.write().unwrap_or_else(PoisonError::into_inner);
+        let mut stopped = self
+            .shared
+            .reads_stopped
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         *stopped = true;
         for message in self.receiver.drain() {
             if let ReadMessage::Run(read) = message {
@@ -929,7 +1151,10 @@ impl DatabaseWorker {
     /// opening's operation epoch and checks every protected filesystem
     /// before returning, so a returned worker is ready to accept commands and
     /// reads, or already refuses commands under disk protection.
-    pub fn start_with_config(data_directory: &DataDirectory, config: FilesystemConfig) -> Result<Self, DatabaseError> {
+    pub fn start_with_config(
+        data_directory: &DataDirectory,
+        config: FilesystemConfig,
+    ) -> Result<Self, DatabaseError> {
         config.validate().map_err(DatabaseError::Configuration)?;
         Self::start_with_policy(
             data_directory,
@@ -962,10 +1187,16 @@ impl DatabaseWorker {
                 // is written.
                 let shortfalls = space_shortfalls(&paths, config.disk_lock_threshold_bytes);
                 if !shortfalls.is_empty() {
-                    ready_sender.send(Err(DatabaseError::InsufficientStartupSpace(shortfalls))).ok();
+                    ready_sender
+                        .send(Err(DatabaseError::InsufficientStartupSpace(shortfalls)))
+                        .ok();
                     return Ok(());
                 }
-                let OpenedFile { database, epoch, genesis } = match storage::open(&directory) {
+                let OpenedFile {
+                    database,
+                    epoch,
+                    genesis,
+                } = match storage::open(&directory) {
                     Ok(opened) => opened,
                     Err(error) => {
                         ready_sender.send(Err(open_error(error, &directory))).ok();
@@ -1031,14 +1262,22 @@ impl DatabaseWorker {
         };
         let (read_sender, read_receiver) = flume::bounded(READ_QUEUE_CAPACITY);
         let mut worker = Self {
-            handle: DatabaseHandle { sender, read_sender, control_sender, shared },
+            handle: DatabaseHandle {
+                sender,
+                read_sender,
+                control_sender,
+                shared,
+            },
             thread,
             readers: Vec::with_capacity(READ_WORKERS),
         };
         for index in 0..READ_WORKERS {
             let shared = worker.handle.shared.clone();
             shared.live_readers.fetch_add(1, Ordering::SeqCst);
-            let exit = ReadWorkerExit { shared, receiver: read_receiver.clone() };
+            let exit = ReadWorkerExit {
+                shared,
+                receiver: read_receiver.clone(),
+            };
             match std::thread::Builder::new()
                 .name(format!("ocg-database-read-{index}"))
                 .spawn(move || serve_reads(&exit.shared, &exit.receiver))
@@ -1074,7 +1313,12 @@ impl DatabaseWorker {
     /// not from inside an async task.
     pub fn shutdown(self) -> Result<(), DatabaseError> {
         {
-            let mut admission = self.handle.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+            let mut admission = self
+                .handle
+                .shared
+                .admission
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             if matches!(*admission, Admission::Open | Admission::Protected(_)) {
                 *admission = Admission::ShuttingDown;
             }
@@ -1093,18 +1337,24 @@ impl DatabaseWorker {
             readers_ok &= reader.join().is_ok();
         }
         written?;
-        if readers_ok { Ok(()) } else { Err(DatabaseError::WorkerPanicked) }
+        if readers_ok {
+            Ok(())
+        } else {
+            Err(DatabaseError::WorkerPanicked)
+        }
     }
 }
 
 fn file_length(path: &std::path::Path) -> Result<u64, MaintenanceError> {
-    std::fs::metadata(path).map(|metadata| metadata.len()).map_err(|error| {
-        MaintenanceError::Storage(StorageError {
-            kind: StorageErrorKind::Io(error.kind()),
-            os_error: error.raw_os_error(),
-            detail: format!("cannot measure {}: {error}", path.display()),
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| {
+            MaintenanceError::Storage(StorageError {
+                kind: StorageErrorKind::Io(error.kind()),
+                os_error: error.raw_os_error(),
+                detail: format!("cannot measure {}: {error}", path.display()),
+            })
         })
-    })
 }
 
 fn database_not_open() -> StorageError {
@@ -1132,10 +1382,15 @@ fn join(thread: JoinHandle<Result<(), DatabaseError>>) -> Result<(), DatabaseErr
 
 /// Every protected filesystem that is below `threshold_bytes` or cannot be
 /// measured.
-fn space_shortfalls(paths: &[(ProtectedArea, PathBuf)], threshold_bytes: u64) -> Vec<ProtectionReason> {
+fn space_shortfalls(
+    paths: &[(ProtectedArea, PathBuf)],
+    threshold_bytes: u64,
+) -> Vec<ProtectionReason> {
     paths
         .iter()
-        .filter_map(|(area, path)| disk_protection::check_space(*area, path, 0, threshold_bytes).err())
+        .filter_map(|(area, path)| {
+            disk_protection::check_space(*area, path, 0, threshold_bytes).err()
+        })
         .collect()
 }
 
@@ -1212,7 +1467,9 @@ impl WriteWorker {
                 Event::Message(Ok(Message::Run(envelope))) => self.execute_group(*envelope),
                 Event::CheckDue => {}
                 // Without senders, no handle and therefore no caller remains.
-                Event::Message(Ok(Message::Shutdown)) | Event::Message(Err(_)) | Event::Control(Err(_)) => return,
+                Event::Message(Ok(Message::Shutdown))
+                | Event::Message(Err(_))
+                | Event::Control(Err(_)) => return,
             }
         }
     }
@@ -1231,7 +1488,9 @@ impl WriteWorker {
             }
             Control::CheckSpace => {
                 self.check_all_paths();
-                self.shared.space_check.complete(Some(self.shared.protection.status()));
+                self.shared
+                    .space_check
+                    .complete(Some(self.shared.protection.status()));
             }
             Control::Recover => {
                 let result = self.recover();
@@ -1430,17 +1689,32 @@ impl WriteWorker {
         // Activation drains the queue, so no command should arrive while
         // locked; refusing here keeps that true even if one did.
         if let Some(lock) = self.shared.protection.status().lock {
-            envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+            envelope
+                .command
+                .refuse(|| DatabaseError::RefusedByDiskProtection {
+                    operation,
+                    lock: lock.clone(),
+                });
             return None;
         }
         match self.check_database_space(envelope.command.expected_write_bytes()) {
             Ok(()) => Some(envelope),
             Err(SpaceRefusal::Short(shortage)) => {
-                envelope.command.refuse(|| DatabaseError::InsufficientSpace { operation, shortage: shortage.clone() });
+                envelope
+                    .command
+                    .refuse(|| DatabaseError::InsufficientSpace {
+                        operation,
+                        shortage: shortage.clone(),
+                    });
                 None
             }
             Err(SpaceRefusal::Locked(lock)) => {
-                envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+                envelope
+                    .command
+                    .refuse(|| DatabaseError::RefusedByDiskProtection {
+                        operation,
+                        lock: lock.clone(),
+                    });
                 None
             }
         }
@@ -1457,7 +1731,9 @@ impl WriteWorker {
             self.config.disk_lock_threshold_bytes,
         ) {
             Ok(_) => Ok(()),
-            Err(ProtectionReason::InsufficientSpace(shortage)) if shortage.available_bytes >= shortage.threshold_bytes => {
+            Err(ProtectionReason::InsufficientSpace(shortage))
+                if shortage.available_bytes >= shortage.threshold_bytes =>
+            {
                 Err(SpaceRefusal::Short(shortage))
             }
             Err(reason) => Err(SpaceRefusal::Locked(self.activate(vec![reason]))),
@@ -1495,7 +1771,11 @@ impl WriteWorker {
                 Err(_) => break,
             }
         }
-        let commit = if group.len() > 1 { Commit::Staged } else { Commit::Durable };
+        let commit = if group.len() > 1 {
+            Commit::Staged
+        } else {
+            Commit::Durable
+        };
         let shared = self.shared.clone();
         let staging = (commit == Commit::Staged).then(|| StagingBarrier::raise(&shared));
 
@@ -1504,22 +1784,36 @@ impl WriteWorker {
         let mut failure: Option<StorageFailure> = None;
         let mut lost: Option<StorageError> = None;
         {
-            let guard = shared.database.read().unwrap_or_else(PoisonError::into_inner);
+            let guard = shared
+                .database
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             for envelope in group {
                 if failure.is_some() {
                     unrun.push(envelope);
                     continue;
                 }
-                let Some(envelope) = self.admit(envelope) else { continue };
+                let Some(envelope) = self.admit(envelope) else {
+                    continue;
+                };
                 let operation = envelope.operation;
                 let Some(opened) = guard.as_ref() else {
-                    envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
+                    envelope
+                        .command
+                        .refuse(|| DatabaseError::NeverExecuted { operation });
                     continue;
                 };
                 envelope.started.store(true, Ordering::SeqCst);
-                let mut ran = envelope.command.execute(&opened.database, operation, commit);
+                let mut ran = envelope
+                    .command
+                    .execute(&opened.database, operation, commit);
                 failure = ran.failure.take();
-                executed.push((ran, failure.as_ref().is_some_and(|failure| failure.outcome_unknown)));
+                executed.push((
+                    ran,
+                    failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.outcome_unknown),
+                ));
             }
             if executed.iter().any(|(ran, _)| ran.staged)
                 && let Some(opened) = guard.as_ref()
@@ -1533,7 +1827,10 @@ impl WriteWorker {
                     self.uncertain.push(ran.operation);
                 }
             }
-            failure.get_or_insert(StorageFailure { error: error.clone(), outcome_unknown: false });
+            failure.get_or_insert(StorageFailure {
+                error: error.clone(),
+                outcome_unknown: false,
+            });
         }
         for (ran, outcome_unknown) in &executed {
             if *outcome_unknown {
@@ -1554,7 +1851,12 @@ impl WriteWorker {
         if let Some(lock) = lock {
             for envelope in unrun {
                 let operation = envelope.operation;
-                envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+                envelope
+                    .command
+                    .refuse(|| DatabaseError::RefusedByDiskProtection {
+                        operation,
+                        lock: lock.clone(),
+                    });
             }
         }
     }
@@ -1580,16 +1882,23 @@ impl WriteWorker {
             .last_compaction
             .and_then(|last| COMPACTION_COOLDOWN.checked_sub(last.elapsed()))
         {
-            return Ok(CompactionOutcome::Skipped(CompactionSkip::CoolingDown { remaining }));
+            return Ok(CompactionOutcome::Skipped(CompactionSkip::CoolingDown {
+                remaining,
+            }));
         }
         let file = storage::database_file(&self.directory);
         let file_bytes = file_length(&file)?;
         if file_bytes < COMPACTION_MIN_FILE_BYTES {
-            return Ok(CompactionOutcome::Skipped(CompactionSkip::FileTooSmall { file_bytes }));
+            return Ok(CompactionOutcome::Skipped(CompactionSkip::FileTooSmall {
+                file_bytes,
+            }));
         }
         let shared = self.shared.clone();
         let allocated = {
-            let guard = shared.database.read().unwrap_or_else(PoisonError::into_inner);
+            let guard = shared
+                .database
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             match guard.as_ref() {
                 Some(opened) => storage::allocated_bytes(&opened.database),
                 None => Err(database_not_open()),
@@ -1600,11 +1909,18 @@ impl WriteWorker {
         if reclaimable_bytes < COMPACTION_MIN_RECLAIMABLE_BYTES
             || reclaimable_bytes < file_bytes / COMPACTION_MIN_RECLAIMABLE_DIVISOR
         {
-            return Ok(CompactionOutcome::Skipped(CompactionSkip::LittleReclaimable { file_bytes, reclaimable_bytes }));
+            return Ok(CompactionOutcome::Skipped(
+                CompactionSkip::LittleReclaimable {
+                    file_bytes,
+                    reclaimable_bytes,
+                },
+            ));
         }
         match self.check_database_space(TRANSACTION_ALLOWANCE_BYTES) {
             Ok(()) => {}
-            Err(SpaceRefusal::Short(shortage)) => return Err(MaintenanceError::InsufficientSpace(shortage)),
+            Err(SpaceRefusal::Short(shortage)) => {
+                return Err(MaintenanceError::InsufficientSpace(shortage));
+            }
             Err(SpaceRefusal::Locked(lock)) => return Err(MaintenanceError::DiskProtected(lock)),
         }
 
@@ -1612,7 +1928,10 @@ impl WriteWorker {
         // The guard ends before any failure is handled, which takes the same
         // lock to release the database.
         let compacted = {
-            let mut guard = shared.database.write().unwrap_or_else(PoisonError::into_inner);
+            let mut guard = shared
+                .database
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             match guard.as_mut() {
                 Some(opened) => storage::compact(&mut opened.database),
                 None => Err(CompactFailure::Storage(database_not_open())),
@@ -1635,7 +1954,9 @@ impl WriteWorker {
                     CompactionOutcome::NoProgress(report)
                 })
             }
-            Err(CompactFailure::TransactionInProgress) => Err(MaintenanceError::TransactionInProgress),
+            Err(CompactFailure::TransactionInProgress) => {
+                Err(MaintenanceError::TransactionInProgress)
+            }
             Err(CompactFailure::SavepointExists) => Err(MaintenanceError::SavepointExists),
             Err(CompactFailure::Storage(error)) => Err(self.fail_storage(error)),
         }
@@ -1657,7 +1978,11 @@ impl WriteWorker {
             .iter()
             .any(|reason| matches!(reason, ProtectionReason::StorageUnavailable(_)));
         let lock = {
-            let mut admission = self.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+            let mut admission = self
+                .shared
+                .admission
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             let lock = self.shared.protection.lock(reasons);
             if matches!(*admission, Admission::Open | Admission::Protected(_)) {
                 *admission = Admission::Protected(lock.clone());
@@ -1669,7 +1994,12 @@ impl WriteWorker {
                 Message::Run(envelope) => {
                     let envelope = *envelope;
                     let operation = envelope.operation;
-                    envelope.command.refuse(|| DatabaseError::RefusedByDiskProtection { operation, lock: lock.clone() });
+                    envelope
+                        .command
+                        .refuse(|| DatabaseError::RefusedByDiskProtection {
+                            operation,
+                            lock: lock.clone(),
+                        });
                 }
                 Message::Shutdown => self.shutdown_requested = true,
             }
@@ -1708,7 +2038,11 @@ impl WriteWorker {
             status.recovery_attempts += 1;
         });
         let result = self.attempt_recovery().and_then(|report| {
-            let mut admission = self.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+            let mut admission = self
+                .shared
+                .admission
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             // Shutdown began during the attempt; it keeps the lock.
             if !matches!(*admission, Admission::Protected(_)) {
                 return Err(RecoveryError::ShuttingDown);
@@ -1721,7 +2055,9 @@ impl WriteWorker {
             Ok(report)
         });
         if result.is_err() {
-            self.shared.protection.update(|status| status.recovering = false);
+            self.shared
+                .protection
+                .update(|status| status.recovering = false);
         }
         result
     }
@@ -1743,7 +2079,12 @@ impl WriteWorker {
         if !shortages.is_empty() {
             return Err(RecoveryError::Space(shortages));
         }
-        let released = self.shared.database.read().unwrap_or_else(PoisonError::into_inner).is_none();
+        let released = self
+            .shared
+            .database
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none();
         let reopened_epoch = if self.storage_failure.is_some() || released {
             Some(self.reopen()?)
         } else {
@@ -1751,7 +2092,11 @@ impl WriteWorker {
         };
         let reconciled = self.reconcile_uncertain()?;
         self.uncertain.clear();
-        Ok(RecoveryReport { reopened_epoch, reconciled, available })
+        Ok(RecoveryReport {
+            reopened_epoch,
+            reconciled,
+            available,
+        })
     }
 
     /// Releases the failed handle completely, waiting for executing reads,
@@ -1759,15 +2104,25 @@ impl WriteWorker {
     /// so no identifier is allocated while the epoch changes.
     fn reopen(&mut self) -> Result<u64, RecoveryError> {
         self.shared.release_database();
-        let OpenedFile { database, epoch, genesis } = storage::open(&self.directory)
+        let OpenedFile {
+            database,
+            epoch,
+            genesis,
+        } = storage::open(&self.directory)
             .map_err(|error| RecoveryError::Reopen(reopen_failure(error, &self.directory)))?;
         if genesis != self.shared.genesis {
-            return Err(RecoveryError::Reopen(ReopenFailure::Storage(StorageError::corrupted(format!(
-                "the reopened database names {genesis} as its Genesis Job, not {}",
-                self.shared.genesis
-            )))));
+            return Err(RecoveryError::Reopen(ReopenFailure::Storage(
+                StorageError::corrupted(format!(
+                    "the reopened database names {genesis} as its Genesis Job, not {}",
+                    self.shared.genesis
+                )),
+            )));
         }
-        *self.shared.database.write().unwrap_or_else(PoisonError::into_inner) = Some(Opened { database, epoch });
+        *self
+            .shared
+            .database
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Opened { database, epoch });
         self.shared.epoch.store(epoch, Ordering::SeqCst);
         self.shared.next_operation.store(1, Ordering::SeqCst);
         self.shared.released.store(false, Ordering::SeqCst);
@@ -1777,21 +2132,33 @@ impl WriteWorker {
 
     /// Reads the marker of every operation whose outcome was unknown. A
     /// failed read is a storage failure, so the handle is released again.
-    fn reconcile_uncertain(&mut self) -> Result<Vec<(OperationId, OperationStatus)>, RecoveryError> {
+    fn reconcile_uncertain(
+        &mut self,
+    ) -> Result<Vec<(OperationId, OperationStatus)>, RecoveryError> {
         let reconciled = {
-            let guard = self.shared.database.read().unwrap_or_else(PoisonError::into_inner);
+            let guard = self
+                .shared
+                .database
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             match guard.as_ref() {
                 Some(opened) => self
                     .uncertain
                     .iter()
                     .map(|&operation| {
                         storage::read_marker(&opened.database, operation)
-                            .map(|marker| (operation, operation_status(marker, operation, opened.epoch)))
+                            .map(|marker| {
+                                (operation, operation_status(marker, operation, opened.epoch))
+                            })
                             .map_err(|error| (operation, error))
                     })
                     .collect::<Result<Vec<_>, _>>(),
                 None if self.uncertain.is_empty() => Ok(Vec::new()),
-                None => return Err(RecoveryError::Reopen(ReopenFailure::Storage(database_not_open()))),
+                None => {
+                    return Err(RecoveryError::Reopen(ReopenFailure::Storage(
+                        database_not_open(),
+                    )));
+                }
             }
         };
         reconciled.map_err(|(operation, error)| {
@@ -1805,7 +2172,11 @@ impl WriteWorker {
     /// queued command and pending request, so no caller is left waiting.
     fn exit(self) -> Result<(), DatabaseError> {
         {
-            let mut admission = self.shared.admission.write().unwrap_or_else(PoisonError::into_inner);
+            let mut admission = self
+                .shared
+                .admission
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             *admission = Admission::ShuttingDown;
         }
         self.shared.release_database();
@@ -1815,11 +2186,15 @@ impl WriteWorker {
             if let Message::Run(envelope) = message {
                 let envelope = *envelope;
                 let operation = envelope.operation;
-                envelope.command.refuse(|| DatabaseError::NeverExecuted { operation });
+                envelope
+                    .command
+                    .refuse(|| DatabaseError::NeverExecuted { operation });
             }
         }
         self.shared.space_check.complete(None);
-        self.shared.recovery.complete(Err(RecoveryError::ShuttingDown));
+        self.shared
+            .recovery
+            .complete(Err(RecoveryError::ShuttingDown));
         for control in self.control.drain() {
             control.refuse_policy(false);
         }
@@ -1837,8 +2212,14 @@ impl WriteWorker {
 /// left on it.
 fn serve_reads(shared: &Shared, receiver: &flume::Receiver<ReadMessage>) {
     while let Ok(ReadMessage::Run(read)) = receiver.recv() {
-        let _staging = shared.staging.read().unwrap_or_else(PoisonError::into_inner);
-        let guard = shared.database.read().unwrap_or_else(PoisonError::into_inner);
+        let _staging = shared
+            .staging
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let guard = shared
+            .database
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         match guard.as_ref() {
             Some(opened) => read(Ok(opened)),
             None => read(Err(shared.read_refusal())),
@@ -1861,7 +2242,13 @@ impl DatabaseHandle {
         executor: ExecutorId,
         started: NewJobOutput,
     ) -> Result<crate::log_cleanup::CleanupRecords, DatabaseError> {
-        self.submit(|reply| Command::BeginCoreLogCleanup { owner, executor, started, reply }).await
+        self.submit(|reply| Command::BeginCoreLogCleanup {
+            owner,
+            executor,
+            started,
+            reply,
+        })
+        .await
     }
 
     pub(crate) fn log_directory(&self) -> &std::path::Path {
@@ -1945,23 +2332,43 @@ impl DatabaseHandle {
             })
     }
 
-    async fn submit<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, DatabaseError> {
+    async fn submit<T>(
+        &self,
+        command: impl FnOnce(Reply<T>) -> Command,
+    ) -> Result<T, DatabaseError> {
         let (reply, response) = flume::bounded(1);
         let started = Arc::new(AtomicBool::new(false));
         let operation = {
-            let admission = self.shared.admission.read().unwrap_or_else(PoisonError::into_inner);
+            let admission = self
+                .shared
+                .admission
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             match &*admission {
                 Admission::Open => {}
-                Admission::Protected(lock) => return Err(DatabaseError::DiskProtected(lock.clone())),
-                Admission::ShuttingDown | Admission::WorkerStopped => return Err(DatabaseError::ShuttingDown),
+                Admission::Protected(lock) => {
+                    return Err(DatabaseError::DiskProtected(lock.clone()));
+                }
+                Admission::ShuttingDown | Admission::WorkerStopped => {
+                    return Err(DatabaseError::ShuttingDown);
+                }
             }
             let epoch = self.shared.epoch.load(Ordering::SeqCst);
-            let operation = OperationId::new(epoch, self.shared.next_operation.fetch_add(1, Ordering::Relaxed));
-            let envelope = Envelope { operation, started: started.clone(), command: command(reply) };
-            self.sender.try_send(Message::Run(Box::new(envelope))).map_err(|error| match error {
-                flume::TrySendError::Full(_) => DatabaseError::QueueFull,
-                flume::TrySendError::Disconnected(_) => DatabaseError::ShuttingDown,
-            })?;
+            let operation = OperationId::new(
+                epoch,
+                self.shared.next_operation.fetch_add(1, Ordering::Relaxed),
+            );
+            let envelope = Envelope {
+                operation,
+                started: started.clone(),
+                command: command(reply),
+            };
+            self.sender
+                .try_send(Message::Run(Box::new(envelope)))
+                .map_err(|error| match error {
+                    flume::TrySendError::Full(_) => DatabaseError::QueueFull,
+                    flume::TrySendError::Disconnected(_) => DatabaseError::ShuttingDown,
+                })?;
             operation
         };
         // Every command that reaches the worker is answered, so a closed
@@ -1970,7 +2377,10 @@ impl DatabaseHandle {
         // about a begun command's commit.
         response.recv_async().await.map_err(|_| {
             if started.load(Ordering::SeqCst) {
-                DatabaseError::OutcomeUnknown { operation, cause: UnknownCause::WorkerStopped }
+                DatabaseError::OutcomeUnknown {
+                    operation,
+                    cause: UnknownCause::WorkerStopped,
+                }
             } else {
                 DatabaseError::NeverExecuted { operation }
             }
@@ -1991,7 +2401,11 @@ impl DatabaseHandle {
     ) -> Result<T, DatabaseError> {
         let (reply, response) = flume::bounded(1);
         {
-            let admission = self.shared.admission.read().unwrap_or_else(PoisonError::into_inner);
+            let admission = self
+                .shared
+                .admission
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             match &*admission {
                 Admission::Open => {}
                 Admission::Protected(lock) => {
@@ -1999,9 +2413,15 @@ impl DatabaseHandle {
                         return Err(DatabaseError::ReadsStorageFailed(error.clone()));
                     }
                 }
-                Admission::ShuttingDown | Admission::WorkerStopped => return Err(DatabaseError::ReadsClosed),
+                Admission::ShuttingDown | Admission::WorkerStopped => {
+                    return Err(DatabaseError::ReadsClosed);
+                }
             }
-            let stopped = self.shared.reads_stopped.read().unwrap_or_else(PoisonError::into_inner);
+            let stopped = self
+                .shared
+                .reads_stopped
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             if *stopped {
                 return Err(DatabaseError::ReadPoolStopped);
             }
@@ -2009,12 +2429,17 @@ impl DatabaseHandle {
                 let result = opened.and_then(|opened| read(opened).map_err(DatabaseError::Read));
                 reply.send(result).ok();
             });
-            self.read_sender.try_send(ReadMessage::Run(job)).map_err(|error| match error {
-                flume::TrySendError::Full(_) => DatabaseError::ReadQueueFull,
-                flume::TrySendError::Disconnected(_) => DatabaseError::ReadPoolStopped,
-            })?;
+            self.read_sender
+                .try_send(ReadMessage::Run(job))
+                .map_err(|error| match error {
+                    flume::TrySendError::Full(_) => DatabaseError::ReadQueueFull,
+                    flume::TrySendError::Disconnected(_) => DatabaseError::ReadPoolStopped,
+                })?;
         }
-        response.recv_async().await.map_err(|_| DatabaseError::ReadInterrupted)?
+        response
+            .recv_async()
+            .await
+            .map_err(|_| DatabaseError::ReadInterrupted)?
     }
 
     pub fn status(&self) -> DatabaseStatus {
@@ -2053,13 +2478,13 @@ impl DatabaseHandle {
     /// returns the status after the check. Concurrent requests share one
     /// check.
     pub async fn check_disk_space(&self) -> Result<DiskProtectionStatus, DatabaseError> {
-        let response = self
-            .shared
-            .space_check
-            .join(|| self.request(Control::CheckSpace).map_err(|error| match error {
-                RecoveryError::ControlQueueFull => DatabaseError::ControlQueueFull,
-                _ => DatabaseError::ShuttingDown,
-            }))?;
+        let response = self.shared.space_check.join(|| {
+            self.request(Control::CheckSpace)
+                .map_err(|error| match error {
+                    RecoveryError::ControlQueueFull => DatabaseError::ControlQueueFull,
+                    _ => DatabaseError::ShuttingDown,
+                })
+        })?;
         match response.recv_async().await {
             Ok(Some(status)) => Ok(status),
             Ok(None) => Err(DatabaseError::ShuttingDown),
@@ -2081,19 +2506,30 @@ impl DatabaseHandle {
     pub async fn compact_storage(&self) -> Result<CompactionOutcome, MaintenanceError> {
         let (reply, response) = flume::bounded(1);
         {
-            let admission = self.shared.admission.read().unwrap_or_else(PoisonError::into_inner);
+            let admission = self
+                .shared
+                .admission
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
             match &*admission {
                 Admission::Open => {}
-                Admission::Protected(lock) => return Err(MaintenanceError::DiskProtected(lock.clone())),
+                Admission::Protected(lock) => {
+                    return Err(MaintenanceError::DiskProtected(lock.clone()));
+                }
                 Admission::ShuttingDown => return Err(MaintenanceError::ShuttingDown),
                 Admission::WorkerStopped => return Err(MaintenanceError::WorkerStopped),
             }
-            self.control_sender.try_send(Control::CompactStorage(reply)).map_err(|error| match error {
-                flume::TrySendError::Full(_) => MaintenanceError::ControlQueueFull,
-                flume::TrySendError::Disconnected(_) => MaintenanceError::WorkerStopped,
-            })?;
+            self.control_sender
+                .try_send(Control::CompactStorage(reply))
+                .map_err(|error| match error {
+                    flume::TrySendError::Full(_) => MaintenanceError::ControlQueueFull,
+                    flume::TrySendError::Disconnected(_) => MaintenanceError::WorkerStopped,
+                })?;
         }
-        response.recv_async().await.unwrap_or(Err(MaintenanceError::WorkerStopped))
+        response
+            .recv_async()
+            .await
+            .unwrap_or(Err(MaintenanceError::WorkerStopped))
     }
 
     /// Clears disk protection once every protected filesystem has the resume
@@ -2105,24 +2541,36 @@ impl DatabaseHandle {
     /// Commands refused while locked are not replayed, operations with an
     /// unknown outcome are not retried, and no Job is resumed.
     pub async fn recover_storage(&self) -> Result<RecoveryReport, RecoveryError> {
-        let response = self.shared.recovery.join(|| self.request(Control::Recover))?;
-        response.recv_async().await.unwrap_or(Err(RecoveryError::WorkerStopped))
+        let response = self
+            .shared
+            .recovery
+            .join(|| self.request(Control::Recover))?;
+        response
+            .recv_async()
+            .await
+            .unwrap_or(Err(RecoveryError::WorkerStopped))
     }
 
     /// Queues a control request unless the worker is stopping or stopped.
     /// Callers hold the request's lock, and the worker closes admission
     /// before answering pending requests on exit, so none is left unanswered.
     fn request(&self, control: Control) -> Result<(), RecoveryError> {
-        let admission = self.shared.admission.read().unwrap_or_else(PoisonError::into_inner);
+        let admission = self
+            .shared
+            .admission
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         match &*admission {
             Admission::Open | Admission::Protected(_) => {}
             Admission::ShuttingDown => return Err(RecoveryError::ShuttingDown),
             Admission::WorkerStopped => return Err(RecoveryError::WorkerStopped),
         }
-        self.control_sender.try_send(control).map_err(|error| match error {
-            flume::TrySendError::Full(_) => RecoveryError::ControlQueueFull,
-            flume::TrySendError::Disconnected(_) => RecoveryError::WorkerStopped,
-        })
+        self.control_sender
+            .try_send(control)
+            .map_err(|error| match error {
+                flume::TrySendError::Full(_) => RecoveryError::ControlQueueFull,
+                flume::TrySendError::Disconnected(_) => RecoveryError::WorkerStopped,
+            })
     }
 
     /// The instance's Genesis Job: the root of every parent chain, and the
@@ -2132,173 +2580,292 @@ impl DatabaseHandle {
     }
 
     pub async fn job(&self, job: JobId) -> Result<Option<JobRecord>, DatabaseError> {
-        self.read(move |database| storage::read_job(database, job)).await
+        self.read(move |database| storage::read_job(database, job))
+            .await
     }
 
     /// Newest Jobs first, strictly before `before` when given; at most
     /// 1,000 per call.
-    pub async fn jobs(&self, before: Option<JobId>, limit: usize) -> Result<Vec<JobRecord>, DatabaseError> {
-        self.read(move |database| storage::read_jobs(database, before, limit)).await
+    pub async fn jobs(
+        &self,
+        before: Option<JobId>,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, DatabaseError> {
+        self.read(move |database| storage::read_jobs(database, before, limit))
+            .await
     }
 
     /// A Job's ordinary children in ID order, strictly after `after` when
     /// given; at most 1,000 per call. The Genesis Job is not its own child.
-    pub async fn children(&self, parent: JobId, after: Option<JobId>, limit: usize) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| storage::read_children(database, parent, after, limit)).await
+    pub async fn children(
+        &self,
+        parent: JobId,
+        after: Option<JobId>,
+        limit: usize,
+    ) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::read_children(database, parent, after, limit))
+            .await
     }
 
     /// What a submitted LLM execution child was configured to execute, as
     /// frozen in its input, with the Profiles it was submitted with as
     /// provenance. Later Profile edits do not change it. `None` for a Job
     /// submitted without a configuration.
-    pub async fn job_configuration(&self, job: JobId) -> Result<Option<persistence::SubmittedConfiguration>, DatabaseError> {
-        self.read(move |database| storage::read_job_configuration(database, job)).await
+    pub async fn job_configuration(
+        &self,
+        job: JobId,
+    ) -> Result<Option<persistence::SubmittedConfiguration>, DatabaseError> {
+        self.read(move |database| storage::read_job_configuration(database, job))
+            .await
     }
 
     /// The Executors that support the transport of an LLM Profile's Provider
     /// as configured now, oldest first, at most 1,000. This lists candidates
     /// for new work only; it neither ranks nor reserves them, and running on
     /// any of them never changes the Provider, model or parameters.
-    pub async fn compatible_executors(&self, llm_profile: ProfileId) -> Result<Vec<ExecutorId>, DatabaseError> {
-        self.read(move |database| storage::read_compatible_executors(database, llm_profile)).await
+    pub async fn compatible_executors(
+        &self,
+        llm_profile: ProfileId,
+    ) -> Result<Vec<ExecutorId>, DatabaseError> {
+        self.read(move |database| storage::read_compatible_executors(database, llm_profile))
+            .await
     }
 
     /// The Executors that support the transport of the LLM configuration a
     /// submitted Job froze, oldest first, at most 1,000; empty for an
     /// unconfigured Job.
-    pub async fn job_compatible_executors(&self, job: JobId) -> Result<Vec<ExecutorId>, DatabaseError> {
-        self.read(move |database| storage::read_job_compatible_executors(database, job)).await
+    pub async fn job_compatible_executors(
+        &self,
+        job: JobId,
+    ) -> Result<Vec<ExecutorId>, DatabaseError> {
+        self.read(move |database| storage::read_job_compatible_executors(database, job))
+            .await
     }
 
     /// Whether a Profile can be edited now, with the unfinished Jobs that
     /// hold it. `None` for a missing Profile.
-    pub async fn profile_editability(&self, profile: ProfileId) -> Result<Option<persistence::ProfileEditability>, DatabaseError> {
-        self.read(move |database| storage::read_profile_editability(database, profile)).await
+    pub async fn profile_editability(
+        &self,
+        profile: ProfileId,
+    ) -> Result<Option<persistence::ProfileEditability>, DatabaseError> {
+        self.read(move |database| storage::read_profile_editability(database, profile))
+            .await
     }
 
     /// The Jobs submitted with a Profile in ID order, strictly after `after`
     /// when given; at most 1,000 per call.
-    pub async fn profile_jobs(&self, profile: ProfileId, after: Option<JobId>, limit: usize) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| storage::read_profile_jobs(database, profile, after, limit)).await
+    pub async fn profile_jobs(
+        &self,
+        profile: ProfileId,
+        after: Option<JobId>,
+        limit: usize,
+    ) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::read_profile_jobs(database, profile, after, limit))
+            .await
     }
 
     /// The Jobs submitted with an input, oldest first: the Job that froze it
     /// and every retry that reused it.
     pub async fn input_jobs(&self, input: JobInputId) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| storage::read_input_jobs(database, input)).await
+        self.read(move |database| storage::read_input_jobs(database, input))
+            .await
     }
 
     /// The Jobs that explicitly retry `original`, oldest first.
     pub async fn retries(&self, original: JobId) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| storage::read_retries(database, original)).await
+        self.read(move |database| storage::read_retries(database, original))
+            .await
     }
 
     /// A Job's outputs in seq order, strictly after `after_seq` when given;
     /// at most 1,000 per call.
-    pub async fn job_outputs(&self, job: JobId, after_seq: Option<i64>, limit: usize) -> Result<Vec<JobOutputRecord>, DatabaseError> {
-        self.read(move |database| storage::read_outputs(database, job, after_seq, limit)).await
+    pub async fn job_outputs(
+        &self,
+        job: JobId,
+        after_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<JobOutputRecord>, DatabaseError> {
+        self.read(move |database| storage::read_outputs(database, job, after_seq, limit))
+            .await
     }
 
-    pub async fn latest_output(&self, job: JobId) -> Result<Option<JobOutputRecord>, DatabaseError> {
-        self.read(move |database| storage::read_latest_output(database, job)).await
+    pub async fn latest_output(
+        &self,
+        job: JobId,
+    ) -> Result<Option<JobOutputRecord>, DatabaseError> {
+        self.read(move |database| storage::read_latest_output(database, job))
+            .await
     }
 
-    pub async fn job_input(&self, id: JobInputId) -> Result<Option<persistence::JobInputRecord>, DatabaseError> {
+    pub async fn job_input(
+        &self,
+        id: JobInputId,
+    ) -> Result<Option<persistence::JobInputRecord>, DatabaseError> {
         self.read(move |database| {
             storage::read_job_input(database, id).map(|opt| opt.map(storage::job_input_record))
-        }).await
+        })
+        .await
     }
 
-    pub async fn job_input_for_job(&self, job: JobId) -> Result<Option<persistence::JobInputRecord>, DatabaseError> {
+    pub async fn job_input_for_job(
+        &self,
+        job: JobId,
+    ) -> Result<Option<persistence::JobInputRecord>, DatabaseError> {
         self.read(move |database| {
-            storage::read_job_input_for_job(database, job).map(|opt| opt.map(storage::job_input_record))
-        }).await
+            storage::read_job_input_for_job(database, job)
+                .map(|opt| opt.map(storage::job_input_record))
+        })
+        .await
     }
 
-    pub async fn executor(&self, id: ExecutorId) -> Result<Option<persistence::ExecutorRecord>, DatabaseError> {
-        self.read(move |database| storage::read_executor(database, id)).await
+    pub async fn executor(
+        &self,
+        id: ExecutorId,
+    ) -> Result<Option<persistence::ExecutorRecord>, DatabaseError> {
+        self.read(move |database| storage::read_executor(database, id))
+            .await
     }
 
     /// Executors in reverse ID order, newest first. Strictly before `before` when given;
     /// at most 1,000 per call.
-    pub async fn executors(&self, before: Option<ExecutorId>, limit: usize) -> Result<Vec<persistence::ExecutorRecord>, DatabaseError> {
-        self.read(move |database| storage::read_executors(database, before, limit)).await
+    pub async fn executors(
+        &self,
+        before: Option<ExecutorId>,
+        limit: usize,
+    ) -> Result<Vec<persistence::ExecutorRecord>, DatabaseError> {
+        self.read(move |database| storage::read_executors(database, before, limit))
+            .await
     }
 
     pub async fn project(&self, id: ProjectId) -> Result<Option<ProjectRecord>, DatabaseError> {
-        self.read(move |database| storage::read_project(database, id)).await
+        self.read(move |database| storage::read_project(database, id))
+            .await
     }
 
     /// Projects newest first, strictly before `before` when given; at most
     /// 1,000 per call.
-    pub async fn projects(&self, before: Option<ProjectId>, limit: usize) -> Result<Vec<ProjectRecord>, DatabaseError> {
-        self.read(move |database| storage::read_projects(database, before, limit)).await
+    pub async fn projects(
+        &self,
+        before: Option<ProjectId>,
+        limit: usize,
+    ) -> Result<Vec<ProjectRecord>, DatabaseError> {
+        self.read(move |database| storage::read_projects(database, before, limit))
+            .await
     }
 
     /// The Jobs associated with a Project in ID order, strictly after
     /// `after` when given; at most 1,000 per call.
-    pub async fn project_jobs(&self, project: ProjectId, after: Option<JobId>, limit: usize) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| storage::read_project_jobs(database, project, after, limit)).await
+    pub async fn project_jobs(
+        &self,
+        project: ProjectId,
+        after: Option<JobId>,
+        limit: usize,
+    ) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::read_project_jobs(database, project, after, limit))
+            .await
     }
 
-    pub async fn llm_provider(&self, id: LlmProviderId) -> Result<Option<LlmProviderRecord>, DatabaseError> {
-        self.read(move |database| storage::read_llm_provider(database, id)).await
+    pub async fn llm_provider(
+        &self,
+        id: LlmProviderId,
+    ) -> Result<Option<LlmProviderRecord>, DatabaseError> {
+        self.read(move |database| storage::read_llm_provider(database, id))
+            .await
     }
 
     /// LLM Providers newest first, strictly before `before` when given; at
     /// most 1,000 per call.
-    pub async fn llm_providers(&self, before: Option<LlmProviderId>, limit: usize) -> Result<Vec<LlmProviderRecord>, DatabaseError> {
-        self.read(move |database| storage::read_llm_providers(database, before, limit)).await
+    pub async fn llm_providers(
+        &self,
+        before: Option<LlmProviderId>,
+        limit: usize,
+    ) -> Result<Vec<LlmProviderRecord>, DatabaseError> {
+        self.read(move |database| storage::read_llm_providers(database, before, limit))
+            .await
     }
 
     /// The LLM Profiles that use a Provider, oldest first.
-    pub async fn provider_profiles(&self, provider: LlmProviderId) -> Result<Vec<ProfileId>, DatabaseError> {
-        self.read(move |database| storage::read_provider_profiles(database, provider)).await
+    pub async fn provider_profiles(
+        &self,
+        provider: LlmProviderId,
+    ) -> Result<Vec<ProfileId>, DatabaseError> {
+        self.read(move |database| storage::read_provider_profiles(database, provider))
+            .await
     }
 
     /// A Profile of either kind.
     pub async fn profile(&self, id: ProfileId) -> Result<Option<ProfileRecord>, DatabaseError> {
-        self.read(move |database| storage::read_profile(database, id)).await
+        self.read(move |database| storage::read_profile(database, id))
+            .await
     }
 
     /// Profiles of both kinds newest first, strictly before `before` when
     /// given; at most 1,000 per call.
-    pub async fn profiles(&self, before: Option<ProfileId>, limit: usize) -> Result<Vec<ProfileRecord>, DatabaseError> {
-        self.read(move |database| storage::read_profiles(database, before, limit)).await
+    pub async fn profiles(
+        &self,
+        before: Option<ProfileId>,
+        limit: usize,
+    ) -> Result<Vec<ProfileRecord>, DatabaseError> {
+        self.read(move |database| storage::read_profiles(database, before, limit))
+            .await
     }
 
     /// A Profile in its typed form, such as `typed_profile::<AgentConfig>`
     /// for an Agent Profile. A Profile of the other kind is refused with
     /// [`DatabaseError::WrongProfileKind`].
-    pub async fn typed_profile<C: ProfileVariant>(&self, id: ProfileId) -> Result<Option<Profile<C>>, DatabaseError> {
+    pub async fn typed_profile<C: ProfileVariant>(
+        &self,
+        id: ProfileId,
+    ) -> Result<Option<Profile<C>>, DatabaseError> {
         let Some(record) = self.profile(id).await? else {
             return Ok(None);
         };
-        Profile::try_from(record).map(Some).map_err(DatabaseError::WrongProfileKind)
+        Profile::try_from(record)
+            .map(Some)
+            .map_err(DatabaseError::WrongProfileKind)
     }
 
-    pub async fn agent_profile(&self, id: ProfileId) -> Result<Option<persistence::AgentProfile>, DatabaseError> {
+    pub async fn agent_profile(
+        &self,
+        id: ProfileId,
+    ) -> Result<Option<persistence::AgentProfile>, DatabaseError> {
         self.typed_profile(id).await
     }
 
-    pub async fn llm_profile(&self, id: ProfileId) -> Result<Option<persistence::LlmProfile>, DatabaseError> {
+    pub async fn llm_profile(
+        &self,
+        id: ProfileId,
+    ) -> Result<Option<persistence::LlmProfile>, DatabaseError> {
         self.typed_profile(id).await
     }
 
     pub async fn agent(&self, id: AgentId) -> Result<Option<AgentRecord>, DatabaseError> {
-        self.read(move |database| storage::read_agent(database, id)).await
+        self.read(move |database| storage::read_agent(database, id))
+            .await
     }
 
     /// A Job's Metrics in recording order, strictly after `after` when
     /// given; at most 1,000 per call.
-    pub async fn job_metrics(&self, job: JobId, after: Option<MetricsId>, limit: usize) -> Result<Vec<MetricsRecord>, DatabaseError> {
-        self.read(move |database| storage::read_job_metrics(database, job, after, limit)).await
+    pub async fn job_metrics(
+        &self,
+        job: JobId,
+        after: Option<MetricsId>,
+        limit: usize,
+    ) -> Result<Vec<MetricsRecord>, DatabaseError> {
+        self.read(move |database| storage::read_job_metrics(database, job, after, limit))
+            .await
     }
 
     /// A Job's AvailabilityStats in recording order, strictly after `after`
     /// when given; at most 1,000 per call.
-    pub async fn job_availability(&self, job: JobId, after: Option<AvailabilityStatId>, limit: usize) -> Result<Vec<AvailabilityStatRecord>, DatabaseError> {
-        self.read(move |database| storage::read_job_availability(database, job, after, limit)).await
+    pub async fn job_availability(
+        &self,
+        job: JobId,
+        after: Option<AvailabilityStatId>,
+        limit: usize,
+    ) -> Result<Vec<AvailabilityStatRecord>, DatabaseError> {
+        self.read(move |database| storage::read_job_availability(database, job, after, limit))
+            .await
     }
 
     /// One page of the Metrics `filter` selects, in observation order
@@ -2314,7 +2881,10 @@ impl DatabaseHandle {
         after: Option<ObservationCursor<MetricsId>>,
         limit: usize,
     ) -> Result<ObservationPage<MetricsRecord, MetricsId>, DatabaseError> {
-        self.read(move |database| storage::read_metrics(database, &filter, after, limit, MAX_OBSERVATION_SCAN)).await
+        self.read(move |database| {
+            storage::read_metrics(database, &filter, after, limit, MAX_OBSERVATION_SCAN)
+        })
+        .await
     }
 
     /// One page of the AvailabilityStats `filter` selects, paged like
@@ -2326,7 +2896,10 @@ impl DatabaseHandle {
         after: Option<ObservationCursor<AvailabilityStatId>>,
         limit: usize,
     ) -> Result<ObservationPage<AvailabilityStatRecord, AvailabilityStatId>, DatabaseError> {
-        self.read(move |database| storage::read_availability_stats(database, &filter, after, limit, MAX_OBSERVATION_SCAN)).await
+        self.read(move |database| {
+            storage::read_availability_stats(database, &filter, after, limit, MAX_OBSERVATION_SCAN)
+        })
+        .await
     }
 
     /// One page of the distinct (Provider, model) pairs that LLM Metrics or
@@ -2348,7 +2921,16 @@ impl DatabaseHandle {
         after: Option<ObservedModel>,
         limit: usize,
     ) -> Result<ObservedModelPage, DatabaseError> {
-        self.read(move |database| storage::read_observed_models(database, &filter, after.as_ref(), limit, MAX_OBSERVED_MODEL_SCAN)).await
+        self.read(move |database| {
+            storage::read_observed_models(
+                database,
+                &filter,
+                after.as_ref(),
+                limit,
+                MAX_OBSERVED_MODEL_SCAN,
+            )
+        })
+        .await
     }
 
     /// The seams of the write worker's group commit.
@@ -2369,14 +2951,22 @@ impl DatabaseHandle {
 
     /// Operation markers in identifier order, strictly after `after` when
     /// given; at most 1,000 per call.
-    pub async fn operation_markers(&self, after: Option<OperationId>, limit: usize) -> Result<Vec<OperationMarker>, DatabaseError> {
-        self.read(move |database| storage::read_markers(database, after, limit)).await
+    pub async fn operation_markers(
+        &self,
+        after: Option<OperationId>,
+        limit: usize,
+    ) -> Result<Vec<OperationMarker>, DatabaseError> {
+        self.read(move |database| storage::read_markers(database, after, limit))
+            .await
     }
 
     /// Resolves a command reported as [`DatabaseError::OutcomeUnknown`]. Call
     /// it after reopening: for an operation of an earlier opening, a missing
     /// marker proves the command did not commit.
-    pub async fn reconcile_operation(&self, operation: OperationId) -> Result<OperationStatus, DatabaseError> {
+    pub async fn reconcile_operation(
+        &self,
+        operation: OperationId,
+    ) -> Result<OperationStatus, DatabaseError> {
         if operation.epoch() > self.epoch() {
             return Err(DatabaseError::UnknownOperation(operation));
         }
@@ -2387,64 +2977,127 @@ impl DatabaseHandle {
         .await
     }
 
-    pub async fn save_job_input(&self, existing: Option<JobInputId>, draft: JobInputDraft) -> Result<JobInputId, DatabaseError> {
-        self.submit(|reply| Command::SaveJobInput { existing, draft, reply }).await
+    pub async fn save_job_input(
+        &self,
+        existing: Option<JobInputId>,
+        draft: JobInputDraft,
+    ) -> Result<JobInputId, DatabaseError> {
+        self.submit(|reply| Command::SaveJobInput {
+            existing,
+            draft,
+            reply,
+        })
+        .await
     }
 
-    pub async fn create_job_with_input(&self, job: NewJob, input: JobInputId) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateJobWithInput { job, input, reply }).await
+    pub async fn create_job_with_input(
+        &self,
+        job: NewJob,
+        input: JobInputId,
+    ) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateJobWithInput { job, input, reply })
+            .await
     }
 
     /// Creates a new Job that retries `retry.original`; see [`JobRetry`].
     pub async fn retry_job(&self, retry: JobRetry) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::RetryJob { retry, reply }).await
+        self.submit(|reply| Command::RetryJob { retry, reply })
+            .await
     }
 
     pub async fn start_job(&self, job: JobId) -> Result<(), DatabaseError> {
         self.submit(|reply| Command::StartJob { job, reply }).await
     }
 
-    pub async fn assign_job_executor(&self, job: JobId, executor: ExecutorId) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::AssignJobExecutor { job, executor, reply }).await
+    pub async fn assign_job_executor(
+        &self,
+        job: JobId,
+        executor: ExecutorId,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::AssignJobExecutor {
+            job,
+            executor,
+            reply,
+        })
+        .await
     }
 
-    pub async fn associate_job_project(&self, job: JobId, project: ProjectId) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::AssociateJobProject { job, project, reply }).await
+    pub async fn associate_job_project(
+        &self,
+        job: JobId,
+        project: ProjectId,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::AssociateJobProject {
+            job,
+            project,
+            reply,
+        })
+        .await
     }
 
-    pub async fn append_job_output(&self, job: JobId, output: NewJobOutput) -> Result<AppendedOutput, DatabaseError> {
-        self.submit(|reply| Command::AppendJobOutput { job, output, reply }).await
+    pub async fn append_job_output(
+        &self,
+        job: JobId,
+        output: NewJobOutput,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        self.submit(|reply| Command::AppendJobOutput { job, output, reply })
+            .await
     }
 
-    pub async fn finalize_job(&self, job: JobId, finalization: JobFinalization) -> Result<Option<AppendedOutput>, DatabaseError> {
-        self.submit(|reply| Command::FinalizeJob { job, finalization, reply }).await
+    pub async fn finalize_job(
+        &self,
+        job: JobId,
+        finalization: JobFinalization,
+    ) -> Result<Option<AppendedOutput>, DatabaseError> {
+        self.submit(|reply| Command::FinalizeJob {
+            job,
+            finalization,
+            reply,
+        })
+        .await
     }
 
-    pub async fn create_executor(&self, executor: NewExecutor) -> Result<ExecutorId, DatabaseError> {
-        self.submit(|reply| Command::CreateExecutor { executor, reply }).await
+    pub async fn create_executor(
+        &self,
+        executor: NewExecutor,
+    ) -> Result<ExecutorId, DatabaseError> {
+        self.submit(|reply| Command::CreateExecutor { executor, reply })
+            .await
     }
 
     pub async fn create_project(&self, project: NewProject) -> Result<ProjectId, DatabaseError> {
-        self.submit(|reply| Command::CreateProject { project, reply }).await
+        self.submit(|reply| Command::CreateProject { project, reply })
+            .await
     }
 
-    pub async fn create_llm_provider(&self, provider: NewLlmProvider) -> Result<LlmProviderId, DatabaseError> {
-        self.submit(|reply| Command::CreateLlmProvider { provider, reply }).await
+    pub async fn create_llm_provider(
+        &self,
+        provider: NewLlmProvider,
+    ) -> Result<LlmProviderId, DatabaseError> {
+        self.submit(|reply| Command::CreateLlmProvider { provider, reply })
+            .await
     }
 
     pub async fn create_profile(&self, profile: NewProfile) -> Result<ProfileId, DatabaseError> {
-        self.submit(|reply| Command::CreateProfile { profile, reply }).await
+        self.submit(|reply| Command::CreateProfile { profile, reply })
+            .await
     }
 
     /// Replaces a Profile's name, payload and defining references, keeping
     /// its identity and kind. Refused with [`Violation::ProfileLocked`] while
     /// unfinished work holds it; see [`Self::profile_editability`].
-    pub async fn update_profile(&self, id: ProfileId, profile: NewProfile) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::UpdateProfile { id, profile, reply }).await
+    pub async fn update_profile(
+        &self,
+        id: ProfileId,
+        profile: NewProfile,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::UpdateProfile { id, profile, reply })
+            .await
     }
 
     pub async fn create_agent(&self, agent: NewAgent) -> Result<AgentId, DatabaseError> {
-        self.submit(|reply| Command::CreateAgent { agent, reply }).await
+        self.submit(|reply| Command::CreateAgent { agent, reply })
+            .await
     }
 
     /// Records that an unknown-outcome Job's execution has actually stopped,
@@ -2453,21 +3106,36 @@ impl DatabaseHandle {
     /// so it is not part of the public API.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the runtime runs no provider execution yet whose termination it could observe")
+        expect(
+            dead_code,
+            reason = "the runtime runs no provider execution yet whose termination it could observe"
+        )
     )]
     pub(crate) async fn confirm_job_stopped(&self, job: JobId) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::ConfirmJobStopped { job, reply }).await
+        self.submit(|reply| Command::ConfirmJobStopped { job, reply })
+            .await
     }
 
     /// Appends measurements for a Job. Their LLM is the one the Job froze.
     pub async fn record_metrics(&self, metrics: NewMetrics) -> Result<MetricsId, DatabaseError> {
-        self.submit(|reply| Command::RecordMetrics { metrics: Box::new(metrics), reply }).await
+        self.submit(|reply| Command::RecordMetrics {
+            metrics: Box::new(metrics),
+            reply,
+        })
+        .await
     }
 
     /// Appends one availability observation of an LLM request a configured
     /// Job sent. Its LLM is the one the Job froze.
-    pub async fn record_availability_stat(&self, stat: NewAvailabilityStat) -> Result<AvailabilityStatId, DatabaseError> {
-        self.submit(|reply| Command::RecordAvailabilityStat { stat: Box::new(stat), reply }).await
+    pub async fn record_availability_stat(
+        &self,
+        stat: NewAvailabilityStat,
+    ) -> Result<AvailabilityStatId, DatabaseError> {
+        self.submit(|reply| Command::RecordAvailabilityStat {
+            stat: Box::new(stat),
+            reply,
+        })
+        .await
     }
 
     /// Aggregation progress: the last AvailabilityStat ID consumed and the
@@ -2591,11 +3259,16 @@ mod read_pool_tests {
                 released.recv_timeout(WAIT).expect("test release");
                 panic!("test: read worker exits unexpectedly");
             }));
-            assert!(poll_once(read.as_mut()).is_none(), "a held read must be admitted, not answered");
+            assert!(
+                poll_once(read.as_mut()).is_none(),
+                "a held read must be admitted, not answered"
+            );
             reads.push(read);
         }
         for _ in 0..READ_WORKERS {
-            entered.recv_timeout(WAIT).expect("every read worker picked up a held read");
+            entered
+                .recv_timeout(WAIT)
+                .expect("every read worker picked up a held read");
         }
         (HeldWorkers { release }, reads)
     }
@@ -2612,7 +3285,10 @@ mod read_pool_tests {
         (0..QUEUED)
             .map(|_| {
                 let mut read: PendingRead<'_, Vec<JobRecord>> = Box::pin(handle.jobs(None, 1));
-                assert!(poll_once(read.as_mut()).is_none(), "a queued read must be admitted, not answered");
+                assert!(
+                    poll_once(read.as_mut()).is_none(),
+                    "a queued read must be admitted, not answered"
+                );
                 read
             })
             .collect()
@@ -2625,7 +3301,10 @@ mod read_pool_tests {
     fn reopen_and_read(directory: &DataDirectory) {
         let worker = DatabaseWorker::start(directory).expect("immediate reopen");
         let handle = worker.handle();
-        assert!(wait(handle.jobs(None, 1)).is_ok(), "reads work after reopening");
+        assert!(
+            wait(handle.jobs(None, 1)).is_ok(),
+            "reads work after reopening"
+        );
         worker.shutdown().expect("clean shutdown after reopening");
     }
 
@@ -2639,14 +3318,23 @@ mod read_pool_tests {
 
         held.release();
         for read in executing {
-            assert!(matches!(wait(read), Err(DatabaseError::ReadInterrupted)), "an executing read stays ReadInterrupted");
+            assert!(
+                matches!(wait(read), Err(DatabaseError::ReadInterrupted)),
+                "an executing read stays ReadInterrupted"
+            );
         }
         for read in queued {
             let result = wait(read);
-            assert!(pool_stopped(&result), "a queued read is answered explicitly, got {result:?}");
+            assert!(
+                pool_stopped(&result),
+                "a queued read is answered explicitly, got {result:?}"
+            );
         }
 
-        assert!(matches!(worker.shutdown(), Err(DatabaseError::WorkerPanicked)));
+        assert!(matches!(
+            worker.shutdown(),
+            Err(DatabaseError::WorkerPanicked)
+        ));
         reopen_and_read(&directory);
     }
 
@@ -2665,21 +3353,31 @@ mod read_pool_tests {
         // in between is admitted and then answered by that exit.
         let deadline = Instant::now() + WAIT;
         while !*handle.shared.reads_stopped.read().unwrap() {
-            assert!(Instant::now() < deadline, "the read pool did not stop in time");
+            assert!(
+                Instant::now() < deadline,
+                "the read pool did not stop in time"
+            );
             let result = wait(handle.jobs(None, 1));
-            assert!(pool_stopped(&result), "a read during pool exit is answered explicitly, got {result:?}");
+            assert!(
+                pool_stopped(&result),
+                "a read during pool exit is answered explicitly, got {result:?}"
+            );
         }
 
         for _ in 0..3 {
             let mut read = Box::pin(handle.job(JobId::new(1)));
-            let result = poll_once(read.as_mut()).expect("a read is refused at admission once the pool has stopped");
+            let result = poll_once(read.as_mut())
+                .expect("a read is refused at admission once the pool has stopped");
             assert!(pool_stopped(&result), "got {result:?}");
         }
         // A read-worker panic is not a storage failure: commands still run.
         assert_eq!(handle.status(), DatabaseStatus::Open);
         assert!(wait(handle.save_job_input(None, JobInputDraft::default())).is_ok());
 
-        assert!(matches!(worker.shutdown(), Err(DatabaseError::WorkerPanicked)));
+        assert!(matches!(
+            worker.shutdown(),
+            Err(DatabaseError::WorkerPanicked)
+        ));
         reopen_and_read(&directory);
     }
 
@@ -2697,12 +3395,24 @@ mod read_pool_tests {
         let shutdown = std::thread::spawn(move || finished_sender.send(worker.shutdown()).ok());
         let deadline = Instant::now() + WAIT;
         while handle.status() == DatabaseStatus::Open {
-            assert!(Instant::now() < deadline, "shutdown did not close admission in time");
+            assert!(
+                Instant::now() < deadline,
+                "shutdown did not close admission in time"
+            );
             std::thread::yield_now();
         }
-        assert!(finished.try_recv().is_err(), "shutdown cannot finish while reads hold the database");
-        assert!(matches!(wait(handle.jobs(None, 1)), Err(DatabaseError::ReadsClosed)));
-        assert!(matches!(wait(handle.save_job_input(None, JobInputDraft::default())), Err(DatabaseError::ShuttingDown)));
+        assert!(
+            finished.try_recv().is_err(),
+            "shutdown cannot finish while reads hold the database"
+        );
+        assert!(matches!(
+            wait(handle.jobs(None, 1)),
+            Err(DatabaseError::ReadsClosed)
+        ));
+        assert!(matches!(
+            wait(handle.save_job_input(None, JobInputDraft::default())),
+            Err(DatabaseError::ShuttingDown)
+        ));
 
         held.release();
         for read in executing {
@@ -2716,7 +3426,10 @@ mod read_pool_tests {
             );
         }
         let result = finished.recv_timeout(WAIT).expect("shutdown finished");
-        assert!(matches!(result, Err(DatabaseError::WorkerPanicked)), "got {result:?}");
+        assert!(
+            matches!(result, Err(DatabaseError::WorkerPanicked)),
+            "got {result:?}"
+        );
         shutdown.join().unwrap();
         reopen_and_read(&directory);
     }
