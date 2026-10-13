@@ -6032,6 +6032,21 @@ fn run_and_reduce(
     JobRecord,
     Vec<crate::persistence::MetricsRecord>,
 ) {
+    let (sample, job, records, _) = run_and_inspect(name, steps, timeout);
+    (sample, job, records)
+}
+
+/// Like [`run_and_reduce`], and also reads the Job's availability records.
+fn run_and_inspect(
+    name: &str,
+    steps: Vec<Step>,
+    timeout: Duration,
+) -> (
+    Option<TokenRequestSample>,
+    JobRecord,
+    Vec<crate::persistence::MetricsRecord>,
+    Vec<AvailabilityStatRecord>,
+) {
     let (_root, directory) = data_directory(name);
     let worker = DatabaseWorker::start(&directory).expect("start database");
     let handle = worker.handle();
@@ -6047,8 +6062,10 @@ fn run_and_reduce(
         .expect("read job")
         .expect("job exists");
     let sample = TokenRequestSample::from_metrics(&records).expect("one Job");
+    let availability =
+        wait(handle.job_availability(run.job, None, 100)).expect("read AvailabilityStats");
     worker.shutdown().expect("shutdown");
-    (sample, job, records)
+    (sample, job, records, availability)
 }
 
 #[test]
@@ -6094,10 +6111,159 @@ fn streamed_usage_reduces_after_reopening_to_one_complete_request() {
         (annotated[0].id, annotated[0].observed_at),
         "the sample is fixed by the lowest Metrics ID, the eligible anchor"
     );
+    let generic: Vec<_> = records
+        .iter()
+        .filter(|record| record.token.is_none())
+        .collect();
+    assert_eq!(generic.len(), 1, "one generic timing record");
+    let timing = &generic[0].measurements;
     assert!(
-        records.iter().any(|record| record.token.is_none()),
-        "the generic timing record stays unannotated"
+        timing.ttfb_ms.is_some() && timing.request_finished_in_ms.is_some(),
+        "it keeps the request's timing"
     );
+    assert_eq!(
+        timing.usage,
+        NormalizedUsage::default(),
+        "and no second copy of the usage counters or the raw object"
+    );
+    let annotated_only: Vec<_> = records
+        .iter()
+        .filter(|record| record.token.is_some())
+        .cloned()
+        .collect();
+    assert_eq!(
+        TokenRequestSample::from_metrics(&annotated_only).expect("one Job"),
+        Some(sample),
+        "the annotated records alone give the same request-level result"
+    );
+}
+
+/// A distinct, non-monotonic usage object for the nth chunk, as JSON text.
+fn varied_usage(n: u32) -> String {
+    let input = (n * 7) % 13 + 1;
+    let output = (n * 5) % 11;
+    match n % 3 {
+        0 => format!("{{\"prompt_tokens\":{input},\"completion_tokens\":{output}}}"),
+        1 => format!("{{\"completion_tokens\":{output},\"extra\":{n}}}"),
+        _ => format!(
+            "{{\"prompt_tokens\":{input},\"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}",
+            n % 4
+        ),
+    }
+}
+
+fn leaked_chunk(chunk: String) -> &'static str {
+    Box::leak(chunk.into_boxed_str())
+}
+
+#[test]
+fn every_source_usage_object_survives_reopening_unmerged_with_its_own_fields() {
+    const OBJECTS: u32 = 34;
+    let sources: Vec<String> = (0..OBJECTS).map(varied_usage).collect();
+    let mut steps: Vec<Step> = sources
+        .iter()
+        .map(|usage| {
+            Step::Chunk(leaked_chunk(format!(
+                "data: {{\"choices\":[{{\"delta\":{{}}}}],\"usage\":{usage}}}\n\n"
+            )))
+        })
+        .collect();
+    steps.push(Step::Chunk(STOP_CHUNK));
+    let (sample, job, records, availability) =
+        run_and_inspect("token-source-objects", steps, BOUND);
+    assert!(job.completed_at.is_some());
+    assert_eq!(availability.len(), 1);
+
+    let usages: Vec<_> = records
+        .iter()
+        .filter(|record| record.token.is_some() && record.measurements.usage.raw.is_some())
+        .collect();
+    assert_eq!(
+        usages.len(),
+        OBJECTS as usize,
+        "no synthetic or missing row"
+    );
+    for (record, source) in usages.iter().zip(&sources) {
+        let raw: serde_json::Value = serde_json::from_str(source).expect("source object");
+        let usage = &record.measurements.usage;
+        assert_eq!(usage.raw.as_ref(), Some(&raw), "the source object is kept");
+        let count = |value: Option<&serde_json::Value>| {
+            value.and_then(serde_json::Value::as_u64).map(|v| v as u32)
+        };
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens
+            ),
+            (
+                count(raw.get("prompt_tokens")),
+                count(raw.get("completion_tokens")),
+                count(raw.pointer("/prompt_tokens_details/cached_tokens"))
+            ),
+            "the record's counters are its own object's"
+        );
+        assert_eq!(
+            record.token,
+            Some(TokenAnnotation::eligible(UsageFinality::Cumulative))
+        );
+    }
+    let times: Vec<_> = usages.iter().map(|record| record.observed_at).collect();
+    assert!(
+        times.windows(2).all(|pair| pair[0] <= pair[1]),
+        "observation times follow the order the objects were parsed"
+    );
+    let sample = sample.expect("one request sample");
+    let maximum = |field: fn(&NormalizedUsage) -> Option<u32>| {
+        usages
+            .iter()
+            .filter_map(|record| field(&record.measurements.usage))
+            .max()
+    };
+    assert_eq!(
+        (sample.input.value(), sample.output.value()),
+        (
+            maximum(|usage| usage.input_tokens),
+            maximum(|usage| usage.output_tokens)
+        ),
+        "per-field maxima come from the reducer over the source objects"
+    );
+    assert_eq!(sample.usage, TokenUsageState::Incomplete);
+}
+
+#[test]
+fn more_than_sixteen_finals_complete_the_job_and_leave_the_conflict_to_the_reducer() {
+    let mut steps: Vec<Step> = (0..20).map(|_| Step::Chunk(FINAL_40_60)).collect();
+    steps.extend((0..20u32).map(|n| {
+        Step::Chunk(leaked_chunk(format!(
+            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":4000000000,\"completion_tokens\":{}}}}}\n\n",
+            2_000_000_001 + n
+        )))
+    }));
+    steps.push(Step::Chunk(STOP_CHUNK));
+    steps.push(Step::Chunk(DONE_CHUNK));
+    let (sample, job, records, availability) = run_and_inspect("token-many-finals", steps, BOUND);
+    assert!(
+        job.completed_at.is_some() && job.unknown_at.is_none(),
+        "the Job completes: a Token conflict is not an execution error"
+    );
+    assert_eq!(
+        availability
+            .iter()
+            .map(|record| record.observation.classification())
+            .collect::<Vec<_>>(),
+        [AvailabilityClassification::Available],
+        "and no availability fault is recorded"
+    );
+    let finals = records
+        .iter()
+        .filter(|record| record.token == Some(TokenAnnotation::eligible(UsageFinality::Final)))
+        .count();
+    assert_eq!(finals, 40, "identical and distinct finals are all stored");
+    let sample = sample.expect("one request sample");
+    assert_eq!(sample.input, TokenCount::Final(4_000_000_000));
+    assert_eq!(sample.output, TokenCount::Conflicted);
+    assert_eq!(sample.total, None);
 }
 
 #[test]

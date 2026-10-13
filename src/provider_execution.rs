@@ -248,12 +248,19 @@ fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
 
 /// Hands one fact to the sink with the current time.
 pub(crate) async fn announce(sink: Option<&mut (dyn ProviderOutputSink + '_)>, fact: ProviderFact) {
+    announce_at(sink, Timestamp::now(), fact).await;
+}
+
+/// Hands one fact to the sink with the time the producer learned it. The time
+/// is fixed by the caller before this awaits, so a slow sink cannot move it.
+async fn announce_at(
+    sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+    observed_at: Timestamp,
+    fact: ProviderFact,
+) {
     if let Some(sink) = sink {
-        sink.observe(ProviderObservation {
-            observed_at: Timestamp::now(),
-            fact,
-        })
-        .await;
+        sink.observe(ProviderObservation { observed_at, fact })
+            .await;
     }
 }
 
@@ -343,16 +350,18 @@ async fn exchange(
     read_response(payload, status, started, request_id, config, sink).await
 }
 
-/// Reads one response stream under the outer timeout. The usage capture lives
-/// here, outside the parser, so a timeout that drops the parser still finds
-/// the capture and writes what it holds.
+/// Reads one response stream under the outer timeout. Every usage object is
+/// handed to the sink, awaited, when it is parsed, so the timeout drops
+/// nothing that was handed over. The one object being awaited when the
+/// timeout fires may or may not be stored: its write was started and is
+/// neither retried nor reported.
 pub(crate) async fn read_response(
     payload: Payload,
     status_code: u16,
     started: Instant,
     request_id: Option<String>,
     config: &ProviderExecutionConfig,
-    mut sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+    sink: Option<&mut (dyn ProviderOutputSink + '_)>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut capture = UsageCapture::default();
     let outcome = ntex::time::timeout(
@@ -363,12 +372,11 @@ pub(crate) async fn read_response(
             started,
             request_id,
             config,
-            sink.as_deref_mut(),
+            sink,
             &mut capture,
         ),
     )
     .await;
-    capture.flush(sink).await;
     outcome.unwrap_or_else(|_| {
         Err(ProviderExecutionError::Unknown {
             message: "provider stream timed out after it may have been delivered".to_owned(),
@@ -491,7 +499,7 @@ async fn parse_stream(
             // The usage is taken before the delta, so a failed delta write
             // loses none of the event's counters.
             if let Some(reported) = consumed.usage {
-                capture.record(sink.as_deref_mut(), reported).await?;
+                capture.record(sink.as_deref_mut(), reported).await;
             }
             if let Some(delta) = consumed.delta.as_deref()
                 && let Some(sink) = sink.as_deref_mut()
@@ -658,103 +666,59 @@ fn consume_event(
     Ok(consumed)
 }
 
-/// The most distinct cumulative usage objects written as they arrive. A
-/// provider that reports a running total on every chunk would otherwise cost
-/// one record per chunk; later totals are merged and written once at the end.
-const MAX_STREAMED_CUMULATIVE: usize = 16;
-/// The most final usage objects written for one request. Final usage is
-/// expected once; a stream with more is refused rather than recorded without
-/// bound.
-const MAX_FINAL_USAGE: usize = 16;
-
-/// The usage a stream has reported and not yet handed to the sink. It is
-/// bounded: a count per kind and one merged cumulative object, never the
-/// history. It is owned outside the parser so that every way the parser can
-/// stop, including its timeout, still leaves it to be flushed.
-#[derive(Default)]
+/// Hands each usage object a stream reports to the sink as it is parsed. It
+/// keeps no history, no count and no merged total: the only state is the last
+/// cumulative object, to skip an identical repeat, and the clock. Memory is
+/// one bounded SSE object plus that one, whatever the stream reports, and each
+/// object is awaited before the next is read, so a slow sink slows the read.
 pub(crate) struct UsageCapture {
-    cumulative_written: usize,
-    finals_written: usize,
     last_cumulative: Option<NormalizedUsage>,
-    pending: Option<NormalizedUsage>,
+    /// When the producer observes an object. It is read when the object is
+    /// parsed, before the sink is awaited.
+    clock: fn() -> Timestamp,
+}
+
+impl Default for UsageCapture {
+    fn default() -> Self {
+        Self::with_clock(Timestamp::now)
+    }
 }
 
 impl UsageCapture {
+    pub(crate) fn with_clock(clock: fn() -> Timestamp) -> Self {
+        Self {
+            last_cumulative: None,
+            clock,
+        }
+    }
+
+    /// Hands one reported object over as it is, with its own normalization,
+    /// its finality and the time it was parsed. Distinct objects are never
+    /// merged or dropped, however many there are; per-field maxima belong to
+    /// the reducer. Only an identical consecutive cumulative repeat, which
+    /// carries nothing new, is skipped.
     async fn record(
         &mut self,
         sink: Option<&mut (dyn ProviderOutputSink + '_)>,
         reported: ReportedUsage,
-    ) -> Result<(), ProviderExecutionError> {
-        if sink.is_none() {
-            return Ok(());
-        }
-        match reported.finality {
-            UsageFinality::Final => {
-                if self.finals_written >= MAX_FINAL_USAGE {
-                    return Err(ProviderExecutionError::Incomplete {
-                        message: "provider reported too many final usage objects".to_owned(),
-                    });
-                }
-                self.finals_written += 1;
-                announce(
-                    sink,
-                    ProviderFact::Usage {
-                        usage: reported.usage,
-                        finality: UsageFinality::Final,
-                    },
-                )
-                .await;
+    ) {
+        let Some(sink) = sink else { return };
+        let observed_at = (self.clock)();
+        if reported.finality == UsageFinality::Cumulative {
+            if self.last_cumulative.as_ref() == Some(&reported.usage) {
+                return;
             }
-            UsageFinality::Cumulative => {
-                if self.last_cumulative.as_ref() == Some(&reported.usage) {
-                    return Ok(());
-                }
-                self.last_cumulative = Some(reported.usage.clone());
-                if self.cumulative_written < MAX_STREAMED_CUMULATIVE {
-                    self.cumulative_written += 1;
-                    announce(
-                        sink,
-                        ProviderFact::Usage {
-                            usage: reported.usage,
-                            finality: UsageFinality::Cumulative,
-                        },
-                    )
-                    .await;
-                } else {
-                    self.merge(reported.usage);
-                }
-            }
+            self.last_cumulative = Some(reported.usage.clone());
         }
-        Ok(())
-    }
-
-    /// Folds a cumulative object into the pending one: each counter keeps its
-    /// maximum, as the reducer does, and the raw object is the latest.
-    fn merge(&mut self, usage: NormalizedUsage) {
-        let Some(pending) = self.pending.as_mut() else {
-            self.pending = Some(usage);
-            return;
-        };
-        pending.input_tokens = pending.input_tokens.max(usage.input_tokens);
-        pending.output_tokens = pending.output_tokens.max(usage.output_tokens);
-        pending.cache_read_tokens = pending.cache_read_tokens.max(usage.cache_read_tokens);
-        pending.cache_write_tokens = pending.cache_write_tokens.max(usage.cache_write_tokens);
-        pending.reasoning_tokens = pending.reasoning_tokens.max(usage.reasoning_tokens);
-        pending.raw = usage.raw;
-    }
-
-    /// Hands over what is still pending.
-    async fn flush(&mut self, sink: Option<&mut (dyn ProviderOutputSink + '_)>) {
-        if let Some(usage) = self.pending.take() {
-            announce(
-                sink,
-                ProviderFact::Usage {
-                    usage,
-                    finality: UsageFinality::Cumulative,
-                },
-            )
-            .await;
-        }
+        announce_at(
+            Some(sink),
+            observed_at,
+            ProviderFact::Usage {
+                usage: reported.usage,
+                finality: reported.finality,
+            },
+        )
+        .await;
     }
 }
 
@@ -828,13 +792,14 @@ fn trim_ascii(value: &[u8]) -> &[u8] {
     &value[start..end]
 }
 
+/// The timing of a finished request, and nothing else. Its usage is in the
+/// result and in the annotated Metrics records captured while it streamed.
 pub fn metrics(result: &ProviderExecutionResult) -> crate::persistence::Measurements {
     crate::persistence::Measurements {
         ttfb_ms: Some(result.ttfb.as_millis().min(u128::from(u64::MAX)) as u64),
         request_finished_in_ms: Some(
             result.finished_in.as_millis().min(u128::from(u64::MAX)) as u64
         ),
-        usage: result.usage.clone(),
         ..crate::persistence::Measurements::default()
     }
 }
@@ -1316,58 +1281,6 @@ mod tests {
     }
 
     #[test]
-    fn final_usage_beyond_its_bound_is_refused_after_the_bound_is_kept() {
-        let mut steps: Vec<Step> = (0..=MAX_FINAL_USAGE)
-            .map(|_| Step::Chunk(FINAL_40_60))
-            .collect();
-        steps.push(Step::Chunk(STOP));
-        let (result, sink) = recorded(steps);
-        assert!(matches!(
-            result,
-            Err(ProviderExecutionError::Incomplete { .. })
-        ));
-        assert_eq!(sink.usages().len(), MAX_FINAL_USAGE);
-    }
-
-    #[test]
-    fn running_totals_are_bounded_merged_and_flushed_once() {
-        const TOTALS: [&str; 20] = [
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":4}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":5}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":6}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":7}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":8}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":9}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":10}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":11}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":12}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":13}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":14}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":15}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":16}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":17}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":18}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":19}}\n\n",
-            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":20}}\n\n",
-        ];
-        let mut steps: Vec<Step> = TOTALS.iter().map(|chunk| Step::Chunk(chunk)).collect();
-        // A repeat of the last total is not a new object.
-        steps.push(Step::Chunk(TOTALS[19]));
-        steps.push(Step::Fail);
-        let (result, sink) = recorded(steps);
-        assert!(matches!(
-            result,
-            Err(ProviderExecutionError::Unknown { .. })
-        ));
-        // The stream failed, so nothing flushed it: the capture is flushed by
-        // `read_response`, tested with the timeout below.
-        assert_eq!(sink.usages().len(), MAX_STREAMED_CUMULATIVE);
-    }
-
-    #[test]
     fn a_usage_reported_before_each_kind_of_stop_is_not_lost_with_the_parser() {
         let cases: [(&str, Vec<Step>); 3] = [
             (
@@ -1411,55 +1324,6 @@ mod tests {
     }
 
     #[test]
-    fn the_outer_timeout_still_flushes_the_usage_the_dropped_parser_had_pending() {
-        // Twenty running totals fill the immediate bound and leave the rest
-        // pending inside the capture; then the stream stalls until the timeout
-        // drops the parser. The capture is not the parser's, so it flushes.
-        let chunks: Vec<String> = (1..=20)
-            .map(|n| {
-                format!(
-                    "data: {{\"choices\":[{{\"delta\":{{}}}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":{n}}}}}\n\n"
-                )
-            })
-            .collect();
-        let leaked: Vec<&'static str> = chunks
-            .into_iter()
-            .map(|chunk| &*Box::leak(chunk.into_boxed_str()))
-            .collect();
-        let mut steps: Vec<Step> = leaked.into_iter().map(Step::Chunk).collect();
-        steps.push(Step::Stall);
-        let config = ProviderExecutionConfig {
-            timeout: Duration::from_millis(100),
-            ..ProviderExecutionConfig::default()
-        };
-        let (result, sink) = ntex::rt::System::new("timeout-test", ntex::rt::DefaultRuntime)
-            .block_on(async move {
-                let mut sink = RecordingSink::default();
-                let result = read_response(
-                    payload(steps, config.cancellation.clone()),
-                    200,
-                    Instant::now(),
-                    None,
-                    &config,
-                    Some(&mut sink),
-                )
-                .await;
-                (result, sink)
-            });
-        assert!(matches!(
-            result,
-            Err(ProviderExecutionError::Unknown { .. })
-        ));
-        let usages = sink.usages();
-        assert_eq!(usages.len(), MAX_STREAMED_CUMULATIVE + 1);
-        assert_eq!(
-            counters(&usages.last().expect("the flushed total").1),
-            [Some(1), Some(20), None],
-            "the merged pending total is written when the timeout ends the read"
-        );
-    }
-
-    #[test]
     fn only_a_failure_before_the_request_could_leave_is_not_delivered() {
         let message = || "x".to_owned();
         assert_eq!(
@@ -1479,5 +1343,253 @@ mod tests {
         ] {
             assert_eq!(unannounced_fact(&error), ProviderFact::Delivered, "{error}");
         }
+    }
+
+    fn leaked(chunk: String) -> &'static str {
+        Box::leak(chunk.into_boxed_str())
+    }
+
+    /// One content-free chunk reporting `usage` beside choices.
+    fn running_total(usage: &str) -> &'static str {
+        leaked(format!(
+            "data: {{\"choices\":[{{\"delta\":{{}}}}],\"usage\":{usage}}}\n\n"
+        ))
+    }
+
+    /// One usage-only chunk, the protocol's final position.
+    fn usage_only(usage: &str) -> &'static str {
+        leaked(format!("data: {{\"choices\":[],\"usage\":{usage}}}\n\n"))
+    }
+
+    #[test]
+    fn every_distinct_usage_object_is_handed_over_as_reported_however_many_there_are() {
+        // Non-monotonic fields, so no maximum or latest object can stand in for them.
+        let objects: Vec<String> = (0..40u32)
+            .map(|n| {
+                let input = (n * 7) % 13 + 1;
+                let output = (n * 5) % 11;
+                match n % 3 {
+                    0 => format!("{{\"prompt_tokens\":{input},\"completion_tokens\":{output}}}"),
+                    1 => format!("{{\"completion_tokens\":{output},\"extra\":{n}}}"),
+                    _ => format!(
+                        "{{\"prompt_tokens\":{input},\"prompt_tokens_details\":{{\"cached_tokens\":{}}}}}",
+                        n % 4
+                    ),
+                }
+            })
+            .collect();
+        let mut steps: Vec<Step> = Vec::new();
+        for object in &objects {
+            steps.push(Step::Chunk(running_total(object)));
+        }
+        // An identical consecutive repeat carries nothing new.
+        steps.push(Step::Chunk(running_total(&objects[39])));
+        steps.push(Step::Chunk(STOP));
+        let (result, sink) = recorded(steps);
+        result.expect("a finished stream");
+        let usages = sink.usages();
+        assert_eq!(
+            usages.len(),
+            40,
+            "no object was merged, dropped or repeated"
+        );
+        for ((finality, usage), source) in usages.iter().zip(&objects) {
+            assert_eq!(*finality, UsageFinality::Cumulative);
+            let raw: Value = serde_json::from_str(source).expect("source object");
+            assert_eq!(usage.raw.as_ref(), Some(&raw), "the source object is kept");
+            assert_eq!(
+                counters(usage),
+                [
+                    raw.get("prompt_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32),
+                    raw.get("completion_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32),
+                    raw.pointer("/prompt_tokens_details/cached_tokens")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32),
+                ],
+                "its normalization matches that object alone"
+            );
+        }
+    }
+
+    #[test]
+    fn many_final_objects_neither_stop_the_stream_nor_get_dropped() {
+        let mut steps: Vec<Step> = (0..20)
+            .map(|_| {
+                Step::Chunk(usage_only(
+                    "{\"prompt_tokens\":40,\"completion_tokens\":60}",
+                ))
+            })
+            .collect();
+        for n in 0..20 {
+            steps.push(Step::Chunk(usage_only(&format!(
+                "{{\"prompt_tokens\":40,\"completion_tokens\":{}}}",
+                100 + n
+            ))));
+        }
+        steps.push(Step::Chunk(STOP));
+        steps.push(Step::Chunk(CONTENT));
+        let (result, sink) = recorded(steps);
+        let result = result.expect("a stream with many finals still completes");
+        assert_eq!(result.text, "hi", "the response was read to its end");
+        let usages = sink.usages();
+        assert_eq!(usages.len(), 40);
+        assert!(
+            usages
+                .iter()
+                .all(|(finality, _)| *finality == UsageFinality::Final)
+        );
+        assert_eq!(
+            usages
+                .iter()
+                .map(|(_, usage)| usage.output_tokens)
+                .collect::<Vec<_>>()[18..22],
+            [Some(60), Some(60), Some(100), Some(101)],
+            "identical and distinct finals are all kept, in order"
+        );
+    }
+
+    static TICKS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    fn tick() -> Timestamp {
+        Timestamp::from_unix_micros(TICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1)
+    }
+
+    /// A sink that takes its own turn on the clock before it keeps an
+    /// observation, as a slow sink would let time pass.
+    struct SlowSink {
+        kept: Vec<(Timestamp, Timestamp)>,
+    }
+
+    impl ProviderOutputSink for SlowSink {
+        fn append<'a>(
+            &'a mut self,
+            _text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn observe<'a>(
+            &'a mut self,
+            observation: ProviderObservation,
+        ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+            Box::pin(async move {
+                let late = tick();
+                self.kept.push((observation.observed_at, late));
+            })
+        }
+    }
+
+    #[test]
+    fn an_observation_keeps_the_time_it_was_parsed_not_the_time_the_sink_took_it() {
+        let config = ProviderExecutionConfig::default();
+        let mut sink = SlowSink { kept: Vec::new() };
+        let steps = vec![
+            Step::Chunk(running_total("{\"prompt_tokens\":1}")),
+            Step::Chunk(running_total("{\"prompt_tokens\":2}")),
+            Step::Chunk(usage_only("{\"prompt_tokens\":3}")),
+            Step::Chunk(STOP),
+        ];
+        wait(parse_stream(
+            payload(steps, config.cancellation.clone()),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            Some(&mut sink),
+            &mut UsageCapture::with_clock(tick),
+        ))
+        .expect("a finished stream");
+        assert_eq!(sink.kept.len(), 3);
+        for (observed, taken) in &sink.kept {
+            assert_eq!(
+                observed.as_unix_micros() + 1,
+                taken.as_unix_micros(),
+                "the object was timed on the clock just before the sink took its turn"
+            );
+        }
+        let times: Vec<_> = sink.kept.iter().map(|(observed, _)| *observed).collect();
+        assert!(
+            times.windows(2).all(|pair| pair[0] < pair[1]),
+            "each later object is timed after the earlier sink wait"
+        );
+    }
+
+    /// Keeps observations, but its `stall`th never completes.
+    struct StallingSink {
+        kept: Vec<ProviderObservation>,
+        stall: usize,
+    }
+
+    impl ProviderOutputSink for StallingSink {
+        fn append<'a>(
+            &'a mut self,
+            _text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn observe<'a>(
+            &'a mut self,
+            observation: ProviderObservation,
+        ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+            Box::pin(async move {
+                self.kept.push(observation);
+                if self.kept.len() == self.stall {
+                    std::future::pending::<()>().await;
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn the_outer_timeout_keeps_what_was_handed_over_and_invents_no_flush() {
+        let steps = vec![
+            Step::Chunk(running_total("{\"prompt_tokens\":1}")),
+            Step::Chunk(running_total("{\"prompt_tokens\":2}")),
+            Step::Chunk(running_total("{\"prompt_tokens\":3}")),
+            Step::Stall,
+        ];
+        let config = ProviderExecutionConfig {
+            timeout: Duration::from_millis(100),
+            ..ProviderExecutionConfig::default()
+        };
+        let (result, sink) = ntex::rt::System::new("timeout-test", ntex::rt::DefaultRuntime)
+            .block_on(async move {
+                let mut sink = StallingSink {
+                    kept: Vec::new(),
+                    stall: 2,
+                };
+                let result = read_response(
+                    payload(steps, config.cancellation.clone()),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    Some(&mut sink),
+                )
+                .await;
+                (result, sink)
+            });
+        assert!(matches!(
+            result,
+            Err(ProviderExecutionError::Unknown { .. })
+        ));
+        let inputs: Vec<_> = sink
+            .kept
+            .iter()
+            .map(|observation| match &observation.fact {
+                ProviderFact::Usage { usage, .. } => usage.input_tokens,
+                other => panic!("only usage was observed, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            [Some(1), Some(2)],
+            "the second write was interrupted and nothing was resent or merged; the third was never read"
+        );
     }
 }
