@@ -737,6 +737,13 @@ impl JobRow {
         self.confirmed_terminal() || self.unknown_at.is_some()
     }
 
+    /// Whether the Job is settled: it has a confirmed outcome, or an unknown
+    /// outcome whose execution the trusted path confirmed stopped. An unknown
+    /// outcome without that confirmation may still be executing.
+    pub(crate) fn settled(&self) -> bool {
+        self.confirmed_terminal() || (self.unknown_at.is_some() && self.stop_confirmed_at.is_some())
+    }
+
     /// Whether this Job holds the Profiles it was submitted with: until a
     /// confirmed outcome, or, for an unknown outcome, until its execution is
     /// confirmed stopped.
@@ -2654,6 +2661,38 @@ impl Batch {
         })
     }
 
+    /// The Job's explicit prerequisites with their conditions, in Job order.
+    pub(crate) fn dependencies(
+        &mut self,
+        job: JobId,
+    ) -> Result<Vec<(JobId, DependencyCondition)>, BatchError> {
+        self.step(|tx| {
+            let mut dependencies = Vec::new();
+            for entry in tx
+                .open_table(DEPENDS_ON)?
+                .range((job.get(), 0)..=(job.get(), u64::MAX))?
+            {
+                let (key, condition) = entry?;
+                let condition = DependencyCondition::from_code(condition.value())
+                    .ok_or_else(|| StorageError::corrupted("invalid dependency condition"))?;
+                dependencies.push((JobId::new(key.value().1), condition));
+            }
+            Ok(dependencies)
+        })
+    }
+
+    /// The Jobs that directly retry `original`, in creation order.
+    pub(crate) fn retries(&mut self, original: JobId) -> Result<Vec<JobId>, BatchError> {
+        self.step(|tx| {
+            Ok(
+                pair_targets(&tx.open_table(RETRIES)?, original.get(), None, usize::MAX)?
+                    .into_iter()
+                    .map(JobId::new)
+                    .collect(),
+            )
+        })
+    }
+
     pub(crate) fn link_dependency(
         &mut self,
         job: JobId,
@@ -3044,7 +3083,7 @@ pub(crate) fn dependency_state(
 ) -> DependencyState {
     if prerequisite.completed_at.is_some() {
         DependencyState::Satisfied
-    } else if prerequisite.failed_at.is_some() || prerequisite.cancelled_at.is_some() {
+    } else if prerequisite.settled() {
         match condition {
             DependencyCondition::Settled => DependencyState::Satisfied,
             DependencyCondition::Success => DependencyState::Impossible,
@@ -3080,14 +3119,14 @@ where
     }
 
     /// Active waiting edges out of `id`: dependencies still waiting on an
-    /// unsettled prerequisite and children without a confirmed outcome. A Job
-    /// with a confirmed outcome waits for nothing. The Genesis root marker is
-    /// not in the children index, so the Genesis Job never waits for itself.
+    /// unsettled prerequisite and unsettled children. A settled Job waits
+    /// for nothing. The Genesis root marker is not in the children index, so
+    /// the Genesis Job never waits for itself.
     fn waits_for(&self, id: u64) -> Result<Vec<u64>, StorageError> {
         let Some(job) = self.job(id)? else {
             return Ok(Vec::new());
         };
-        if job.confirmed_terminal() {
+        if job.settled() {
             return Ok(Vec::new());
         }
         let mut targets = Vec::new();
@@ -3105,7 +3144,7 @@ where
         for entry in self.children.range((id, 0)..=(id, u64::MAX))? {
             let child = entry?.0.value().1;
             if let Some(row) = self.job(child)?
-                && !row.confirmed_terminal()
+                && !row.settled()
             {
                 targets.push(child);
             }

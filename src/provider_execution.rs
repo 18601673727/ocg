@@ -214,9 +214,11 @@ pub struct ProviderExecutionResult {
     pub finished_in: Duration,
 }
 
-/// The facts of a provider response observed before execution stopped on
-/// this side. The status is always present: a stop happens only after the
-/// response head arrived.
+/// The facts of a provider response observed before execution ended
+/// abnormally. The status is always present: these facts exist only once
+/// the response head arrived. A finish reason is the one an accepted event
+/// reported; it is a raw observation, and whether it witnesses a normal
+/// termination is decided only where it is classified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseFacts {
     pub status_code: u16,
@@ -230,12 +232,29 @@ pub enum ProviderExecutionError {
     Build { message: String },
     #[error("provider request failed before delivery: {message}")]
     NotDelivered { message: String },
+    /// The transport failed, or the Provider fell silent, after the request
+    /// may have been delivered.
     #[error("provider response failed after possible delivery: {message}")]
-    Unknown { message: String },
+    Unknown {
+        message: String,
+        /// What the response had shown before the failure; `None` when no
+        /// response head arrived.
+        facts: Option<ResponseFacts>,
+        /// Whether the response had already finished before the failure: its
+        /// finish reason was accepted and no tool call of it is left
+        /// unchecked. Its facts then stand apart from the later failure.
+        finished: bool,
+    },
     #[error("provider rejected the request: {failure}")]
     Rejected { failure: ProviderFailure },
+    /// The response broke the protocol, or what it sent was refused, such
+    /// as a malformed or unadmitted tool call. The refusal is about the
+    /// response itself, so its facts never stand apart from it.
     #[error("provider stream was incomplete: {message}")]
-    Incomplete { message: String },
+    Incomplete {
+        message: String,
+        facts: ResponseFacts,
+    },
     /// Execution was cancelled on this side before any response head
     /// arrived, after the request may have been sent. Delivery cannot be
     /// ruled out, and nothing about the Provider was observed: it is neither
@@ -243,9 +262,9 @@ pub enum ProviderExecutionError {
     #[error("provider execution was interrupted locally: {message}")]
     Interrupted { message: String },
     /// Execution stopped on this side after the provider had answered: the
-    /// caller cancelled, or the runtime could not persist streamed output.
-    /// Neither is a provider or transport fault, so only the response facts
-    /// already observed are kept.
+    /// caller cancelled, the response reached the local output limit, or the
+    /// runtime could not persist streamed output. None is a provider or
+    /// transport fault, so only the response facts already observed are kept.
     #[error("provider execution stopped locally: {message}")]
     Stopped {
         message: String,
@@ -466,6 +485,8 @@ async fn exchange(
     }
     .map_err(|_| ProviderExecutionError::Unknown {
         message: "provider request timed out after it may have been delivered".to_owned(),
+        facts: None,
+        finished: false,
     })?
     .map_err(classify_client_error)?;
     // A response head proves the request reached a Provider, whatever it says.
@@ -533,15 +554,23 @@ pub(crate) async fn read_response(
         &mut capture,
     )
     .await?;
-    conversation
-        .admit_tool_calls(&result.tool_calls)
-        .map_err(incomplete_tool_calls)?;
+    if let Err(error) = conversation.admit_tool_calls(&result.tool_calls) {
+        return Err(incomplete_tool_calls(
+            error,
+            ResponseFacts {
+                status_code: result.status_code,
+                finish_reason: result.finish_reason,
+                raw_finish_reason: result.raw_finish_reason,
+            },
+        ));
+    }
     Ok(result)
 }
 
-fn incomplete_tool_calls(error: InvalidToolCall) -> ProviderExecutionError {
+fn incomplete_tool_calls(error: InvalidToolCall, facts: ResponseFacts) -> ProviderExecutionError {
     ProviderExecutionError::Incomplete {
         message: error.to_string(),
+        facts,
     }
 }
 
@@ -792,9 +821,10 @@ async fn parse_stream_body(
 
     loop {
         if idle_waited >= config.timeout {
-            return Err(ProviderExecutionError::Unknown {
-                message: "provider stream was idle after it may have been delivered".to_owned(),
-            });
+            return Err(response.unknown(
+                "provider stream was idle after it may have been delivered",
+                status_code,
+            ));
         }
         let wait_started = Instant::now();
         let chunk =
@@ -822,10 +852,10 @@ async fn parse_stream_body(
                     continue;
                 }
                 StreamWait::Idle => {
-                    return Err(ProviderExecutionError::Unknown {
-                        message: "provider stream was idle after it may have been delivered"
-                            .to_owned(),
-                    });
+                    return Err(response.unknown(
+                        "provider stream was idle after it may have been delivered",
+                        status_code,
+                    ));
                 }
                 StreamWait::Chunk(None) => break,
                 StreamWait::Chunk(Some(chunk)) => {
@@ -841,16 +871,14 @@ async fn parse_stream_body(
                 response.raw_finish_reason.as_deref(),
             ));
         }
-        let chunk = chunk.map_err(|error| ProviderExecutionError::Unknown {
-            message: error.to_string(),
-        })?;
+        let chunk = chunk.map_err(|error| response.unknown(error.to_string(), status_code))?;
         first_byte.get_or_insert_with(Instant::now);
         for byte in chunk {
             buffer.push(byte);
             if buffer.len() > MAX_SSE_LINE_BYTES {
-                return Err(ProviderExecutionError::Incomplete {
-                    message: "provider SSE line exceeded its limit".to_owned(),
-                });
+                return Err(
+                    response.incomplete("provider SSE line exceeded its limit", status_code)
+                );
             }
             if byte != b'\n' {
                 continue;
@@ -859,9 +887,9 @@ async fn parse_stream_body(
             let line = line.strip_suffix(b"\n").unwrap_or(&line);
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.len() > MAX_SSE_LINE_BYTES {
-                return Err(ProviderExecutionError::Incomplete {
-                    message: "provider SSE line exceeded its limit".to_owned(),
-                });
+                return Err(
+                    response.incomplete("provider SSE line exceeded its limit", status_code)
+                );
             }
             let Some(data) = line.strip_prefix(b"data:") else {
                 continue;
@@ -871,18 +899,33 @@ async fn parse_stream_body(
                 continue;
             }
             let event: Value = serde_json::from_slice(data).map_err(|error| {
-                ProviderExecutionError::Incomplete {
-                    message: format!("malformed provider SSE event: {error}"),
-                }
+                response.incomplete(
+                    format!("malformed provider SSE event: {error}"),
+                    status_code,
+                )
             })?;
             saw_event = true;
-            let consumed = consume_event(&event, &mut response, config.max_output_bytes)?;
-            // The usage is taken before the delta, so a failed delta write
-            // loses none of the event's counters.
-            if let Some(reported) = consumed.usage {
+            // The usage is taken before anything else of the event, so
+            // neither a refused part of the event nor a failed delta write
+            // loses its counters.
+            if let Some(reported) = reported_usage(&event) {
+                response.usage = reported.usage.clone();
                 capture.record(Some(output), reported).await;
             }
-            if let Some(delta) = consumed.delta.as_deref() {
+            let delta = consume_event(&event, &mut response, config.max_output_bytes).map_err(
+                |refused| match refused {
+                    Refused::ToolCall(error) => {
+                        incomplete_tool_calls(error, response.facts(status_code))
+                    }
+                    Refused::OutputLimit => local_stop(
+                        "provider output exceeded its limit",
+                        status_code,
+                        response.finish_reason,
+                        response.raw_finish_reason.as_deref(),
+                    ),
+                },
+            )?;
+            if let Some(delta) = delta.as_deref() {
                 output.buffer(delta).await.map_err(|error| {
                     local_stop(
                         &error.message,
@@ -905,19 +948,27 @@ async fn parse_stream_body(
         ));
     }
     if !buffer.is_empty() {
-        return Err(ProviderExecutionError::Incomplete {
-            message: "provider stream ended with an incomplete SSE frame".to_owned(),
-        });
+        return Err(response.incomplete(
+            "provider stream ended with an incomplete SSE frame",
+            status_code,
+        ));
     }
     if !saw_event || response.finish_reason.is_none() {
-        return Err(ProviderExecutionError::Incomplete {
-            message: "provider stream ended without a finish event".to_owned(),
-        });
+        return Err(
+            response.incomplete("provider stream ended without a finish event", status_code)
+        );
     }
     let tool_calls = response
         .tool_calls
         .finish(response.finish_reason)
-        .map_err(incomplete_tool_calls)?;
+        .map_err(|error| {
+            let facts = ResponseFacts {
+                status_code,
+                finish_reason: response.finish_reason,
+                raw_finish_reason: response.raw_finish_reason.clone(),
+            };
+            incomplete_tool_calls(error, facts)
+        })?;
     let finished_in = started.elapsed();
     Ok(ProviderExecutionResult {
         text: response.text,
@@ -970,18 +1021,42 @@ impl StreamedResponse {
             .saturating_add(self.reasoning.len())
             .saturating_add(self.tool_calls.bytes())
     }
-}
 
-fn output_limit_exceeded() -> ProviderExecutionError {
-    ProviderExecutionError::Incomplete {
-        message: "provider output exceeded its limit".to_owned(),
+    /// The facts accepted so far, under the status of the response head.
+    fn facts(&self, status_code: u16) -> ResponseFacts {
+        ResponseFacts {
+            status_code,
+            finish_reason: self.finish_reason,
+            raw_finish_reason: self.raw_finish_reason.clone(),
+        }
+    }
+
+    /// A protocol fault of the response, with the facts accepted before it.
+    fn incomplete(&self, message: impl Into<String>, status_code: u16) -> ProviderExecutionError {
+        ProviderExecutionError::Incomplete {
+            message: message.into(),
+            facts: self.facts(status_code),
+        }
+    }
+
+    /// A transport failure or Provider silence after the response head,
+    /// with the facts accepted before it.
+    fn unknown(&self, message: impl Into<String>, status_code: u16) -> ProviderExecutionError {
+        ProviderExecutionError::Unknown {
+            message: message.into(),
+            facts: Some(self.facts(status_code)),
+            finished: self.finish_reason.is_some() && self.tool_calls.is_empty(),
+        }
     }
 }
 
-/// What one stream event contributed.
-struct Consumed {
-    delta: Option<String>,
-    usage: Option<ReportedUsage>,
+/// Why one stream event was refused.
+enum Refused {
+    /// A tool call fragment the Provider sent is malformed or conflicting.
+    ToolCall(InvalidToolCall),
+    /// Taking the event would exceed the configured output limit, a local
+    /// protection rather than a fault of the Provider.
+    OutputLimit,
 }
 
 /// A valid, non-null usage object of one event, and what its position says
@@ -1037,57 +1112,52 @@ fn reported_usage(event: &Value) -> Option<ReportedUsage> {
     })
 }
 
-/// Folds one event into `response`. An invalid tool-call fragment rejects
-/// the whole event, so none of its text is taken either.
+/// Folds the choice of one event into `response` and returns its text delta.
+/// The event's usage is not read here, see [`reported_usage`]. An invalid
+/// tool-call fragment rejects the whole choice, so none of its text and no
+/// finish reason of it is taken either.
 fn consume_event(
     event: &Value,
     response: &mut StreamedResponse,
     max_output_bytes: usize,
-) -> Result<Consumed, ProviderExecutionError> {
-    let reported = reported_usage(event);
-    if let Some(reported) = &reported {
-        response.usage = reported.usage.clone();
-    }
-    let mut consumed = Consumed {
-        delta: None,
-        usage: reported,
-    };
+) -> Result<Option<String>, Refused> {
     let Some(choice) = event
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
     else {
-        return Ok(consumed);
+        return Ok(None);
     };
+    let mut text = None;
     if let Some(delta) = choice.get("delta") {
         if let Some(deltas) = delta.get("tool_calls") {
             response
                 .tool_calls
                 .apply(deltas)
-                .map_err(incomplete_tool_calls)?;
+                .map_err(Refused::ToolCall)?;
             if response.output_bytes() > max_output_bytes {
-                return Err(output_limit_exceeded());
+                return Err(Refused::OutputLimit);
             }
         }
         if let Some(value) = delta.get("reasoning_content").and_then(Value::as_str) {
             if response.output_bytes().saturating_add(value.len()) > max_output_bytes {
-                return Err(output_limit_exceeded());
+                return Err(Refused::OutputLimit);
             }
             response.reasoning.push_str(value);
         }
         if let Some(value) = delta.get("content").and_then(Value::as_str) {
             if response.output_bytes().saturating_add(value.len()) > max_output_bytes {
-                return Err(output_limit_exceeded());
+                return Err(Refused::OutputLimit);
             }
             response.text.push_str(value);
-            consumed.delta = Some(value.to_owned());
+            text = Some(value.to_owned());
         }
     }
     if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
         response.raw_finish_reason = Some(raw.to_owned());
         response.finish_reason = Some(ChatFinishReason::from_openai_str(raw));
     }
-    Ok(consumed)
+    Ok(text)
 }
 
 /// Hands each usage object a stream reports to the sink as it is parsed. It
@@ -1187,6 +1257,7 @@ fn parse_provider_error(body: &str) -> Option<(String, Option<String>)> {
     Some((message, code))
 }
 
+/// A failure before any response head: it observed no response fact.
 fn classify_client_error(error: ClientError) -> ProviderExecutionError {
     let message = error.to_string();
     match error {
@@ -1194,13 +1265,17 @@ fn classify_client_error(error: ClientError) -> ProviderExecutionError {
             ProviderExecutionError::NotDelivered { message }
         }
         ClientError::Request(_) => ProviderExecutionError::NotDelivered { message },
-        ClientError::Send(_) => ProviderExecutionError::Unknown { message },
-        ClientError::Timeout
+        ClientError::Send(_)
+        | ClientError::Timeout
         | ClientError::Response(_)
         | ClientError::Http(_)
         | ClientError::H2(_)
         | ClientError::TunnelNotSupported
-        | ClientError::Error(_) => ProviderExecutionError::Unknown { message },
+        | ClientError::Error(_) => ProviderExecutionError::Unknown {
+            message,
+            facts: None,
+            finished: false,
+        },
     }
 }
 
@@ -1228,44 +1303,64 @@ pub fn metrics(result: &ProviderExecutionResult) -> crate::persistence::Measurem
     }
 }
 
-/// The availability observation an error proves, if it proves one. Only what
-/// the provider or transport actually reported becomes a failure: a refusal
-/// before delivery proves nothing, and a local stop keeps just the response
-/// facts it already had. Nothing is inferred from an unknown outcome.
-pub fn error_observation(
+/// The availability observations an error proves, in the order they were
+/// observed; at most two. Only what the provider or transport actually
+/// reported becomes a failure: a refusal before delivery proves nothing, and
+/// a local stop keeps just the response facts it already had. A failure keeps
+/// the response facts observed before it. When the response had finished
+/// before an independent transport failure, its facts and the failure are
+/// two observations, so the failure is not recorded as part of the finish.
+/// Nothing is inferred from an unknown outcome.
+pub fn error_observations(
     error: &ProviderExecutionError,
-) -> Option<crate::persistence::AvailabilityObservation> {
+) -> Vec<crate::persistence::AvailabilityObservation> {
     use crate::persistence::AvailabilityObservation;
+    let observed =
+        |facts: &ResponseFacts, failure: Option<ProviderFailure>| AvailabilityObservation {
+            status_code: Some(facts.status_code),
+            finish_reason: facts.finish_reason,
+            raw_finish_reason: facts.raw_finish_reason.clone(),
+            failure,
+        };
+    let failure = || ProviderFailure {
+        message: error.to_string(),
+        ..ProviderFailure::default()
+    };
+    // A failure without any response fact beside it.
+    let failure_only = || AvailabilityObservation {
+        status_code: None,
+        finish_reason: None,
+        raw_finish_reason: None,
+        failure: Some(failure()),
+    };
     match error {
         // A local interruption before any response head observed nothing
         // about the Provider.
         ProviderExecutionError::Build { .. }
         | ProviderExecutionError::NotDelivered { .. }
-        | ProviderExecutionError::Interrupted { .. } => None,
-        ProviderExecutionError::Stopped { facts, .. } => Some(AvailabilityObservation {
-            status_code: Some(facts.status_code),
-            finish_reason: facts.finish_reason,
-            raw_finish_reason: facts.raw_finish_reason.clone(),
-            failure: None,
-        }),
-        ProviderExecutionError::Rejected { failure } => Some(AvailabilityObservation {
+        | ProviderExecutionError::Interrupted { .. } => Vec::new(),
+        ProviderExecutionError::Stopped { facts, .. } => vec![observed(facts, None)],
+        ProviderExecutionError::Rejected { failure } => vec![AvailabilityObservation {
             status_code: failure.status_code,
             finish_reason: None,
             raw_finish_reason: None,
             failure: Some(failure.clone()),
-        }),
-        ProviderExecutionError::Unknown { .. } | ProviderExecutionError::Incomplete { .. } => {
-            Some(AvailabilityObservation {
-                status_code: None,
-                finish_reason: None,
-                raw_finish_reason: None,
-                failure: Some(ProviderFailure {
-                    message: error.to_string(),
-                    ..ProviderFailure::default()
-                }),
-            })
+        }],
+        ProviderExecutionError::Unknown { facts: None, .. } => vec![failure_only()],
+        ProviderExecutionError::Unknown {
+            facts: Some(facts),
+            finished: true,
+            ..
+        } => vec![observed(facts, None), failure_only()],
+        ProviderExecutionError::Unknown {
+            facts: Some(facts),
+            finished: false,
+            ..
         }
-        ProviderExecutionError::OutputPersistence { stream, .. } => error_observation(stream),
+        | ProviderExecutionError::Incomplete { facts, .. } => {
+            vec![observed(facts, Some(failure()))]
+        }
+        ProviderExecutionError::OutputPersistence { stream, .. } => error_observations(stream),
     }
 }
 
@@ -1381,6 +1476,7 @@ mod tests {
 
     use super::scripted::{Step, payload};
     use super::*;
+    use crate::persistence::{AvailabilityClassification, AvailabilityObservation};
     use crate::test_support::wait;
 
     const CONTENT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
@@ -1701,8 +1797,207 @@ mod tests {
             &mut UsageCapture::default(),
         ))
         .expect_err("the output limit stops the stream");
-        assert!(matches!(error, ProviderExecutionError::Incomplete { .. }));
+        assert!(
+            matches!(&error, ProviderExecutionError::Stopped { message, facts: seen } if message.contains("exceeded its limit") && *seen == facts(None, None)),
+            "the output limit is a local stop, got {error:?}"
+        );
         assert_eq!(sink.deltas, ["hi"]);
+    }
+
+    #[test]
+    fn usage_in_the_event_that_reaches_the_output_limit_is_still_observed() {
+        let usage = "{\"prompt_tokens\":9,\"completion_tokens\":3,\"extra\":[1,\"a\"]}";
+        let cases = [
+            ("text", r#"{"content":"x"}"#),
+            ("reasoning", r#"{"reasoning_content":"x"}"#),
+            ("tool call", r#"{"tool_calls":[{"index":0,"id":"c"}]}"#),
+        ];
+        for (case, delta) in cases {
+            let config = ProviderExecutionConfig {
+                max_output_bytes: 2,
+                ..ProviderExecutionConfig::default()
+            };
+            let mut sink = RecordingSink::default();
+            let trigger = leaked(format!(
+                "data: {{\"choices\":[{{\"delta\":{delta}}}],\"usage\":{usage}}}\n\n"
+            ));
+            let error = wait(parse_stream(
+                payload(
+                    vec![
+                        Step::Chunk(CONTENT),
+                        Step::Chunk(trigger),
+                        Step::Chunk(STOP),
+                    ],
+                    config.cancellation.clone(),
+                ),
+                200,
+                Instant::now(),
+                None,
+                &config,
+                Some(&mut sink),
+                &mut UsageCapture::default(),
+            ))
+            .expect_err("the output limit stops the stream");
+            assert!(
+                matches!(&error, ProviderExecutionError::Stopped { facts: seen, .. } if *seen == facts(None, None)),
+                "{case}: a local stop that invents no finish, got {error:?}"
+            );
+            assert_eq!(sink.deltas, ["hi"], "{case}: the accepted prefix is kept");
+            let raw: Value = serde_json::from_str(usage).expect("usage object");
+            assert_eq!(
+                sink.usages(),
+                [(
+                    UsageFinality::Cumulative,
+                    NormalizedUsage {
+                        input_tokens: Some(9),
+                        output_tokens: Some(3),
+                        raw: Some(raw),
+                        ..NormalizedUsage::default()
+                    }
+                )],
+                "{case}: the usage of the refused event is observed as reported"
+            );
+            assert_eq!(
+                error_observations(&error)
+                    .iter()
+                    .map(|observation| observation.failure.is_some())
+                    .collect::<Vec<_>>(),
+                [false],
+                "{case}: a local stop is no Provider failure"
+            );
+        }
+    }
+
+    #[test]
+    fn failures_after_the_head_keep_the_facts_they_observed() {
+        let tool_call =
+            tool_delta(r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}}]"#);
+        let length = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n";
+        let stop_facts = || Some(facts(Some(ChatFinishReason::Stop), Some("stop")));
+        let unknown = |result: Result<ProviderExecutionResult, ProviderExecutionError>| match result
+        {
+            Err(ProviderExecutionError::Unknown {
+                facts, finished, ..
+            }) => (facts, finished),
+            other => panic!("expected an unknown outcome, got {other:?}"),
+        };
+        assert_eq!(
+            unknown(parse(
+                vec![Step::Chunk(CONTENT), Step::Chunk(STOP), Step::Fail],
+                None
+            )),
+            (stop_facts(), true),
+            "a reset after the finish keeps the finish, which stands apart"
+        );
+        assert_eq!(
+            unknown(parse(vec![Step::Chunk(CONTENT), Step::Fail], None)),
+            (Some(facts(None, None)), false),
+            "a reset before the finish keeps only the status"
+        );
+        assert_eq!(
+            unknown(parse(
+                vec![Step::Chunk(tool_call), Step::Chunk(STOP), Step::Fail],
+                None
+            )),
+            (stop_facts(), false),
+            "a finish beside unchecked tool calls does not stand apart"
+        );
+
+        let incomplete =
+            |result: Result<ProviderExecutionResult, ProviderExecutionError>| match result {
+                Err(ProviderExecutionError::Incomplete { facts, .. }) => facts,
+                other => panic!("expected an incomplete stream, got {other:?}"),
+            };
+        assert_eq!(
+            incomplete(parse(
+                vec![
+                    Step::Chunk(CONTENT),
+                    Step::Chunk(STOP),
+                    Step::Chunk("data: {nope}\n\n")
+                ],
+                None
+            )),
+            facts(Some(ChatFinishReason::Stop), Some("stop")),
+            "malformed SSE after the finish keeps the finish"
+        );
+        assert_eq!(
+            incomplete(parse(
+                vec![
+                    Step::Chunk(CONTENT),
+                    Step::Chunk(length),
+                    Step::Chunk("data: {")
+                ],
+                None
+            )),
+            facts(Some(ChatFinishReason::Length), Some("length")),
+            "a cut frame keeps the facts accepted before it"
+        );
+        assert_eq!(
+            incomplete(parse(vec![Step::Chunk(CONTENT)], None)),
+            facts(None, None),
+            "a stream without a finish invents none"
+        );
+    }
+
+    #[test]
+    fn an_idle_stream_after_its_finish_keeps_the_finish_apart_from_the_silence() {
+        let result = ntex::rt::System::new("finished-idle-test", ntex::rt::DefaultRuntime)
+            .block_on(async {
+                let config = ProviderExecutionConfig {
+                    timeout: Duration::from_millis(100),
+                    ..ProviderExecutionConfig::default()
+                };
+                parse_stream(
+                    payload(
+                        vec![Step::Chunk(CONTENT), Step::Chunk(STOP), Step::Stall],
+                        config.cancellation.clone(),
+                    ),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    None,
+                    &mut UsageCapture::default(),
+                )
+                .await
+            });
+        assert!(
+            matches!(
+                &result,
+                Err(ProviderExecutionError::Unknown { facts: Some(seen), finished: true, .. })
+                    if *seen == facts(Some(ChatFinishReason::Stop), Some("stop"))
+            ),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_failure_before_any_response_head_observes_no_response_fact() {
+        for error in [ClientError::Timeout, ClientError::TunnelNotSupported] {
+            let error = classify_client_error(error);
+            assert!(
+                matches!(
+                    error,
+                    ProviderExecutionError::Unknown {
+                        facts: None,
+                        finished: false,
+                        ..
+                    }
+                ),
+                "got {error:?}"
+            );
+            assert_eq!(
+                error_observations(&error)
+                    .iter()
+                    .map(|observation| (
+                        observation.status_code,
+                        observation.finish_reason,
+                        observation.raw_finish_reason.clone()
+                    ))
+                    .collect::<Vec<_>>(),
+                [(None, None, None)]
+            );
+        }
     }
 
     #[test]
@@ -1712,36 +2007,108 @@ mod tests {
             facts: facts(Some(ChatFinishReason::Stop), Some("stop")),
         };
         assert_eq!(
-            error_observation(&stopped),
-            Some(crate::persistence::AvailabilityObservation {
+            error_observations(&stopped),
+            [AvailabilityObservation {
                 status_code: Some(200),
                 finish_reason: Some(ChatFinishReason::Stop),
                 raw_finish_reason: Some("stop".to_owned()),
                 failure: None,
-            }),
+            }],
             "a local stop keeps the response facts and no failure"
         );
         assert_eq!(
-            error_observation(&ProviderExecutionError::Build {
+            error_observations(&ProviderExecutionError::Build {
                 message: "bad".to_owned()
             }),
-            None
+            []
         );
         assert_eq!(
-            error_observation(&ProviderExecutionError::NotDelivered {
+            error_observations(&ProviderExecutionError::NotDelivered {
                 message: "refused".to_owned()
             }),
-            None
+            []
         );
 
-        let unknown = ProviderExecutionError::Unknown {
-            message: "reset".to_owned(),
+        let failed = |error: &ProviderExecutionError| ProviderFailure {
+            message: error.to_string(),
+            ..ProviderFailure::default()
         };
-        let observation = error_observation(&unknown).expect("a transport fact");
-        assert_eq!(observation.status_code, None);
+        let before_head = ProviderExecutionError::Unknown {
+            message: "reset".to_owned(),
+            facts: None,
+            finished: false,
+        };
         assert_eq!(
-            observation.failure.map(|failure| failure.message),
-            Some(unknown.to_string())
+            error_observations(&before_head),
+            [AvailabilityObservation {
+                status_code: None,
+                finish_reason: None,
+                raw_finish_reason: None,
+                failure: Some(failed(&before_head)),
+            }],
+            "a failure before any response head invents no response fact"
+        );
+
+        let unfinished = ProviderExecutionError::Unknown {
+            message: "reset".to_owned(),
+            facts: Some(facts(None, None)),
+            finished: false,
+        };
+        assert_eq!(
+            error_observations(&unfinished),
+            [AvailabilityObservation {
+                status_code: Some(200),
+                finish_reason: None,
+                raw_finish_reason: None,
+                failure: Some(failed(&unfinished)),
+            }],
+            "a failure after the head keeps the status it observed"
+        );
+
+        let after_finish = ProviderExecutionError::Unknown {
+            message: "reset".to_owned(),
+            facts: Some(facts(Some(ChatFinishReason::Stop), Some("stop"))),
+            finished: true,
+        };
+        let observations = error_observations(&after_finish);
+        assert_eq!(
+            observations,
+            [
+                AvailabilityObservation {
+                    status_code: Some(200),
+                    finish_reason: Some(ChatFinishReason::Stop),
+                    raw_finish_reason: Some("stop".to_owned()),
+                    failure: None,
+                },
+                AvailabilityObservation {
+                    status_code: None,
+                    finish_reason: None,
+                    raw_finish_reason: None,
+                    failure: Some(failed(&after_finish)),
+                },
+            ],
+            "a finish observed before a later transport failure is not rewritten to contain it"
+        );
+
+        let refused = ProviderExecutionError::Incomplete {
+            message: "invalid provider tool call: tool call 0 has no id".to_owned(),
+            facts: facts(Some(ChatFinishReason::Stop), Some("stop")),
+        };
+        let observations = error_observations(&refused);
+        assert_eq!(
+            observations,
+            [AvailabilityObservation {
+                status_code: Some(200),
+                finish_reason: Some(ChatFinishReason::Stop),
+                raw_finish_reason: Some("stop".to_owned()),
+                failure: Some(failed(&refused)),
+            }],
+            "a refused response keeps its facts beside the refusal"
+        );
+        assert_eq!(
+            observations[0].classification(),
+            AvailabilityClassification::Unconfirmed,
+            "and is never a normal-termination witness"
         );
     }
 
@@ -1937,8 +2304,15 @@ mod tests {
             ProviderFact::NotDelivered
         );
         for error in [
-            ProviderExecutionError::Unknown { message: message() },
-            ProviderExecutionError::Incomplete { message: message() },
+            ProviderExecutionError::Unknown {
+                message: message(),
+                facts: None,
+                finished: false,
+            },
+            ProviderExecutionError::Incomplete {
+                message: message(),
+                facts: facts(None, None),
+            },
             ProviderExecutionError::Rejected {
                 failure: ProviderFailure::default(),
             },
@@ -2298,7 +2672,7 @@ mod tests {
         let interrupted = ProviderExecutionError::Interrupted {
             message: "provider execution was cancelled before a response arrived".into(),
         };
-        assert_eq!(error_observation(&interrupted), None);
+        assert_eq!(error_observations(&interrupted), []);
         assert_eq!(unannounced_fact(&interrupted), ProviderFact::Delivered);
     }
 
@@ -2392,7 +2766,7 @@ mod tests {
         result: Result<ProviderExecutionResult, ProviderExecutionError>,
     ) -> String {
         match result {
-            Err(ProviderExecutionError::Incomplete { message }) => message,
+            Err(ProviderExecutionError::Incomplete { message, .. }) => message,
             other => panic!("expected an incomplete stream, got {other:?}"),
         }
     }
@@ -2832,6 +3206,110 @@ mod tests {
     }
 
     #[test]
+    fn usage_beside_a_refused_tool_fragment_is_observed_and_the_call_is_not() {
+        let usage = r#"{"prompt_tokens":7,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":1},"vendor":{"n":1}}"#;
+        let refused = leaked(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"lost\",\"tool_calls\":[{{\"index\":0,\"id\":\"c\",\"type\":\"code_interpreter\"}}]}}}}],\"usage\":{usage}}}\n\n"
+        ));
+        let mut sink = RecordingSink::default();
+        let error = read(
+            vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk(refused),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["f"]),
+            Some(&mut sink),
+        )
+        .expect_err("a malformed tool call is refused");
+        match &error {
+            ProviderExecutionError::Incomplete {
+                message,
+                facts: seen,
+            } => {
+                assert!(message.contains("unsupported type"), "{message}");
+                assert_eq!(*seen, facts(None, None));
+            }
+            other => panic!("expected an incomplete stream, got {other:?}"),
+        }
+        assert_eq!(
+            sink.deltas,
+            ["hi"],
+            "no text of the refused event is published"
+        );
+        let raw: Value = serde_json::from_str(usage).expect("usage object");
+        assert_eq!(
+            sink.usages(),
+            [(
+                UsageFinality::Cumulative,
+                NormalizedUsage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(2),
+                    cache_read_tokens: Some(1),
+                    raw: Some(raw),
+                    ..NormalizedUsage::default()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn refused_tool_calls_keep_the_facts_they_observed_and_stay_unconfirmed() {
+        let call_g =
+            tool_delta(r#"[{"index":0,"id":"c","function":{"name":"g","arguments":"{}"}}]"#);
+        let no_id = tool_delta(r#"[{"index":0,"function":{"name":"f","arguments":"{}"}}]"#);
+        let forced = ChatConversation {
+            tool_choice: Some(ToolChoiceWire::Named(NamedToolChoiceWire {
+                kind: "function".to_owned(),
+                function: NamedFunctionWire {
+                    name: "f".to_owned(),
+                },
+            })),
+            ..offering(&["f"])
+        };
+        let cases: [(&str, Vec<Step>, ChatConversation, ResponseFacts); 3] = [
+            (
+                "an undeclared tool",
+                vec![Step::Chunk(call_g), Step::Chunk(TOOL_CALLS)],
+                offering(&["f"]),
+                facts(Some(ChatFinishReason::ToolCalls), Some("tool_calls")),
+            ),
+            (
+                "a forced call to another tool, finished with stop",
+                vec![Step::Chunk(call_g), Step::Chunk(STOP)],
+                forced,
+                facts(Some(ChatFinishReason::Stop), Some("stop")),
+            ),
+            (
+                "a call without an id, finished with stop",
+                vec![Step::Chunk(no_id), Step::Chunk(STOP)],
+                offering(&["f"]),
+                facts(Some(ChatFinishReason::Stop), Some("stop")),
+            ),
+        ];
+        for (case, steps, conversation, expected) in cases {
+            let error = read(steps, &conversation, None).expect_err(case);
+            assert!(
+                matches!(&error, ProviderExecutionError::Incomplete { facts: seen, .. } if *seen == expected),
+                "{case}: got {error:?}"
+            );
+            let observations = error_observations(&error);
+            assert_eq!(observations.len(), 1, "{case}");
+            assert_eq!(observations[0].status_code, Some(200), "{case}");
+            assert_eq!(
+                observations[0].finish_reason, expected.finish_reason,
+                "{case}"
+            );
+            assert!(observations[0].failure.is_some(), "{case}");
+            assert_eq!(
+                observations[0].classification(),
+                AvailabilityClassification::Unconfirmed,
+                "{case}: a refused tool response is never available evidence"
+            );
+        }
+    }
+
+    #[test]
     fn streamed_tool_calls_are_bounded_per_call_and_per_response() {
         let oversized = leaked(format!(
             "[{{\"index\":0,\"id\":\"c\",\"function\":{{\"name\":\"f\",\"arguments\":\"{}\"}}}}]",
@@ -2900,7 +3378,7 @@ mod tests {
         ))
         .expect_err("the response limit stops the stream");
         assert!(
-            matches!(&error, ProviderExecutionError::Incomplete { message } if message.contains("exceeded its limit")),
+            matches!(&error, ProviderExecutionError::Stopped { message, .. } if message.contains("exceeded its limit")),
             "got {error:?}"
         );
         assert_eq!(sink.deltas, ["hi"]);
@@ -3283,7 +3761,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ProviderFact::NotDelivered]
         );
-        assert_eq!(error_observation(&error), None);
+        assert_eq!(error_observations(&error), []);
 
         let objective = objective_conversation(
             &FrozenExecutionConfig {

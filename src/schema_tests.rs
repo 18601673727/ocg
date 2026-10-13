@@ -18,7 +18,7 @@ use crate::persistence::{
     AgentConfig, AvailabilityAggregationProgress, AvailabilityBatch, AvailabilityBatchReport,
     AvailabilityClassification, AvailabilityCounts, AvailabilityObservation,
     AvailabilityRequestSample, AvailabilityStatId, AvailabilityStatRecord, DependencyCondition,
-    ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, FinalResult,
+    DependencyState, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, FinalResult,
     IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobOutcome, JobRecord, JobRetry,
     LlmConfig, LlmParameters, LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsRecord,
     MixedJobs, ModelCapability, NewAgent, NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput,
@@ -1107,6 +1107,11 @@ fn frozen_inputs_stay_immutable_and_a_retry_is_a_new_job() {
     };
     let unchanged = wait(handle.retry_job(retry(RetryInput::Unchanged, vec![beta])))
         .expect("retry with the frozen input");
+    wait(handle.finalize_job(
+        unchanged,
+        JobFinalization::Failed(result("second try failed")),
+    ))
+    .expect("settle the retry before another one");
     let unchanged_record = wait(handle.job(unchanged))
         .expect("read retry")
         .expect("retry exists");
@@ -2023,7 +2028,13 @@ fn retries_share_one_frozen_input_without_overwriting_it() {
         configuration: None,
         assigned_executor: None,
     };
+    let fail = |job| {
+        wait(handle.finalize_job(job, JobFinalization::Failed(result("failed"))))
+            .expect("settle before retrying");
+    };
+    fail(original);
     let first = wait(handle.retry_job(retry(original))).expect("retry");
+    fail(first);
     let of_retry = wait(handle.retry_job(retry(first))).expect("retry the retry");
     let second = wait(handle.retry_job(retry(original))).expect("retry again");
 
@@ -2550,8 +2561,9 @@ fn an_unknown_outcome_holds_its_profiles_until_its_stop_is_confirmed() {
         "no result is published"
     );
 
-    // A success dependency on the stopped Job still waits: the waiting
-    // graph refuses the edge that would close a cycle through it.
+    // The stopped Job is settled: a success dependency on it can never be
+    // met, so it is no wait, and the stopped Job waits for nothing. No cycle
+    // closes through it, and the dependent can fail but never complete.
     let dependent = create_job(
         &handle,
         NewJob {
@@ -2560,16 +2572,31 @@ fn an_unknown_outcome_holds_its_profiles_until_its_stop_is_confirmed() {
         },
     );
     let input = wait(handle.save_job_input(None, JobInputDraft::default())).expect("save input");
-    assert!(matches!(
-        violation(wait(handle.create_job_with_input(
-            NewJob {
-                dependencies: vec![(dependent, DependencyCondition::Success)],
-                ..new_job("closes a cycle", child, Vec::new())
-            },
-            input
+    wait(handle.create_job_with_input(
+        NewJob {
+            dependencies: vec![(dependent, DependencyCondition::Success)],
+            ..new_job(
+                "closed a cycle while the stop was unconfirmed",
+                child,
+                Vec::new(),
+            )
+        },
+        input,
+    ))
+    .expect("no waiting edge runs through a stopped Job");
+    assert_eq!(
+        violation(wait(handle.finalize_job(
+            dependent,
+            JobFinalization::Completed(result("done"))
         ))),
-        Violation::WaitingCycle(_)
-    ));
+        Violation::UnsatisfiedDependency {
+            job: dependent,
+            prerequisite: unknown,
+            state: DependencyState::Impossible
+        }
+    );
+    wait(handle.finalize_job(dependent, JobFinalization::Failed(result("cannot proceed"))))
+        .expect("an impossible prerequisite does not block failure");
     worker.shutdown().expect("shutdown");
 
     let worker = DatabaseWorker::start(&directory).expect("reopen database");
@@ -3833,6 +3860,8 @@ fn provider_and_transport_failures_are_observed_and_refused_requests_are_not() {
 
     let transport = ProviderExecutionError::Unknown {
         message: "connection reset".into(),
+        facts: None,
+        finished: false,
     };
     let transport_message = transport.to_string();
     let (job, observations) = settled(&handle, agent, targeted, executor, transport);
@@ -5678,6 +5707,11 @@ fn a_retry_shares_a_frozen_input_only_with_the_same_configuration() {
         configuration(agent, targeted),
     )))
     .expect("retry with the same configuration");
+    let cancel = |job| {
+        wait(handle.finalize_job(job, JobFinalization::Cancelled(result("stopped"))))
+            .expect("finish");
+    };
+    cancel(same);
     let of_retry = wait(handle.retry_job(retry(
         same,
         RetryInput::Unchanged,
@@ -5706,10 +5740,7 @@ fn a_retry_shares_a_frozen_input_only_with_the_same_configuration() {
         Violation::ConfigurationMismatch(input),
         "dropping only the Agent Profile changes it too"
     );
-    for job in [same, of_retry] {
-        wait(handle.finalize_job(job, JobFinalization::Cancelled(result("stopped"))))
-            .expect("finish");
-    }
+    cancel(of_retry);
 
     wait(handle.update_profile(targeted, llm_edit(provider, "model-b")))
         .expect("edit after every holder finished");
@@ -6010,13 +6041,26 @@ fn drive(
     steps: Vec<Step>,
     timeout: Duration,
 ) -> Result<crate::orchestration::execution_runtime::ExecutionReceipt, ExecutionRuntimeError> {
+    let config = ProviderExecutionConfig {
+        timeout,
+        cancellation: CancellationToken::default(),
+        ..ProviderExecutionConfig::default()
+    };
+    // A Job objective offers no tools.
+    drive_with(handle, run, steps, config, ChatConversation::default())
+}
+
+/// Like [`drive`], with the execution's configuration and the conversation
+/// whose tools the response may call given.
+fn drive_with(
+    handle: &DatabaseHandle,
+    run: TokenRun,
+    steps: Vec<Step>,
+    config: ProviderExecutionConfig,
+    conversation: ChatConversation,
+) -> Result<crate::orchestration::execution_runtime::ExecutionReceipt, ExecutionRuntimeError> {
     let handle = handle.clone();
     on_ntex(async move {
-        let config = ProviderExecutionConfig {
-            timeout,
-            cancellation: CancellationToken::default(),
-            ..ProviderExecutionConfig::default()
-        };
         let mut sink = output_sink(handle.clone(), run.job);
         announce(Some(&mut sink), ProviderFact::Delivered).await;
         let execution = read_response(
@@ -6026,8 +6070,7 @@ fn drive(
             None,
             &config,
             Some(&mut sink),
-            // A Job objective offers no tools.
-            &ChatConversation::default(),
+            &conversation,
         )
         .await;
         finish_provider_job(handle, run.executor, run.input, run.job, sink, execution).await
@@ -6601,6 +6644,297 @@ fn usage_reported_before_the_outer_timeout_is_stored() {
         "token-timeout",
         vec![Step::Chunk(CUM_25), Step::Stall],
         Duration::from_millis(150),
+    );
+}
+
+/// What a driven run left durable, read after reopening the database.
+struct Reopened {
+    job: JobRecord,
+    outputs: Vec<(OutputKind, Option<String>)>,
+    /// The Metrics records carrying a reported usage object.
+    usages: Vec<(Option<TokenAnnotation>, NormalizedUsage)>,
+    availability: Vec<AvailabilityStatRecord>,
+}
+
+/// Drives `steps` through the real parser into the real sink, settles the
+/// run, and reads what it left after reopening the database.
+fn run_reopened(
+    name: &str,
+    steps: Vec<Step>,
+    config: ProviderExecutionConfig,
+    conversation: ChatConversation,
+) -> Reopened {
+    let (_root, directory) = data_directory(name);
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let run = token_run(&handle, llm);
+    drive_with(&handle, run, steps, config, conversation).expect("settle the run");
+    worker.shutdown().expect("shutdown");
+
+    let worker = DatabaseWorker::start(&directory).expect("reopen database");
+    let handle = worker.handle();
+    let reopened = Reopened {
+        job: wait(handle.job(run.job))
+            .expect("read job")
+            .expect("job exists"),
+        outputs: wait(handle.job_outputs(run.job, None, 100))
+            .expect("read outputs")
+            .into_iter()
+            .map(|output| (output.kind, output.summary))
+            .collect(),
+        usages: job_metrics(&handle, run.job)
+            .into_iter()
+            .filter(|record| record.measurements.usage.raw.is_some())
+            .map(|record| (record.token, record.measurements.usage))
+            .collect(),
+        availability: wait(handle.job_availability(run.job, None, 100))
+            .expect("read AvailabilityStats"),
+    };
+    worker.shutdown().expect("shutdown");
+    assert_relationships_consistent(&directory);
+    reopened
+}
+
+/// The outcome stays unknown, no result is claimed, and the trusted path
+/// confirmed the local stop.
+fn assert_unknown_and_stopped(case: &str, job: &JobRecord) {
+    assert!(
+        job.unknown_at.is_some() && job.stop_confirmed_at.is_some(),
+        "{case}: the outcome is unknown and the local stop is confirmed"
+    );
+    assert_eq!(
+        (job.completed_at, job.failed_at, job.cancelled_at),
+        (None, None, None),
+        "{case}: no outcome is claimed"
+    );
+}
+
+const HI_CHUNK: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+
+/// A conversation offering the one tool `f`.
+fn offering_f() -> ChatConversation {
+    ChatConversation {
+        messages: vec![crate::openai_compatible::ChatMessage::user("weather?")],
+        tools: vec![crate::openai_compatible::ToolWire {
+            tool_type: "function".into(),
+            function: crate::openai_compatible::FunctionDefinitionWire {
+                name: "f".into(),
+                description: None,
+                parameters: Some(json!({"type": "object"})),
+                strict: None,
+            },
+        }],
+        ..ChatConversation::default()
+    }
+}
+
+#[test]
+fn usage_beside_a_refused_tool_call_is_stored_with_its_own_fields() {
+    let usage = r#"{"prompt_tokens":7,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":1},"vendor":{"n":1}}"#;
+    let refused = leaked_chunk(format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"lost\",\"tool_calls\":[{{\"index\":0,\"id\":\"c\",\"type\":\"code_interpreter\"}}]}}}}],\"usage\":{usage}}}\n\n"
+    ));
+    let run = run_reopened(
+        "refused-tool-usage",
+        vec![
+            Step::Chunk(HI_CHUNK),
+            Step::Chunk(refused),
+            Step::Chunk(STOP_CHUNK),
+        ],
+        ProviderExecutionConfig::default(),
+        offering_f(),
+    );
+    assert_unknown_and_stopped("a refused tool call", &run.job);
+    assert_eq!(
+        run.outputs,
+        [(OutputKind::Progress, Some("hi".to_owned()))],
+        "the accepted text is kept and nothing of the refused event is published"
+    );
+    let raw: serde_json::Value = serde_json::from_str(usage).expect("usage object");
+    assert_eq!(
+        run.usages,
+        [(
+            Some(TokenAnnotation::eligible(UsageFinality::Cumulative)),
+            NormalizedUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(2),
+                cache_read_tokens: Some(1),
+                raw: Some(raw),
+                ..NormalizedUsage::default()
+            }
+        )],
+        "the usage beside the refused call is stored as reported"
+    );
+    let [record] = run.availability.as_slice() else {
+        panic!("one observation, got {:?}", run.availability);
+    };
+    assert_eq!(
+        (
+            record.observation.status_code,
+            record.observation.finish_reason
+        ),
+        (Some(200), None)
+    );
+    assert!(
+        record
+            .observation
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.message.contains("unsupported type"))
+    );
+    assert_eq!(
+        record.observation.classification(),
+        AvailabilityClassification::Unconfirmed
+    );
+}
+
+/// Drives a response whose last event, with its usage, reaches the output
+/// limit through `delta`.
+fn assert_output_limit_is_a_local_stop(name: &str, delta: &str) {
+    let usage = r#"{"prompt_tokens":9,"completion_tokens":3,"extra":true}"#;
+    let trigger = leaked_chunk(format!(
+        "data: {{\"choices\":[{{\"delta\":{delta}}}],\"usage\":{usage}}}\n\n"
+    ));
+    let run = run_reopened(
+        name,
+        vec![
+            Step::Chunk(HI_CHUNK),
+            Step::Chunk(trigger),
+            Step::Chunk(STOP_CHUNK),
+        ],
+        ProviderExecutionConfig {
+            max_output_bytes: 2,
+            ..ProviderExecutionConfig::default()
+        },
+        offering_f(),
+    );
+    assert_unknown_and_stopped(name, &run.job);
+    assert_eq!(
+        run.outputs,
+        [(OutputKind::Progress, Some("hi".to_owned()))],
+        "{name}: the accepted prefix is kept"
+    );
+    let raw: serde_json::Value = serde_json::from_str(usage).expect("usage object");
+    assert_eq!(
+        run.usages,
+        [(
+            Some(TokenAnnotation::eligible(UsageFinality::Cumulative)),
+            NormalizedUsage {
+                input_tokens: Some(9),
+                output_tokens: Some(3),
+                raw: Some(raw),
+                ..NormalizedUsage::default()
+            }
+        )],
+        "{name}: the usage of the event that reached the limit is stored"
+    );
+    assert_eq!(
+        run.availability
+            .iter()
+            .map(|record| record.observation.clone())
+            .collect::<Vec<_>>(),
+        [AvailabilityObservation {
+            status_code: Some(200),
+            finish_reason: None,
+            raw_finish_reason: None,
+            failure: None,
+        }],
+        "{name}: a local stop records no Provider failure and invents no finish"
+    );
+}
+
+#[test]
+fn text_reaching_the_output_limit_is_a_local_stop_that_keeps_its_usage() {
+    assert_output_limit_is_a_local_stop("limit-text", r#"{"content":"x"}"#);
+}
+
+#[test]
+fn reasoning_reaching_the_output_limit_is_a_local_stop_that_keeps_its_usage() {
+    assert_output_limit_is_a_local_stop("limit-reasoning", r#"{"reasoning_content":"x"}"#);
+}
+
+#[test]
+fn a_tool_call_reaching_the_output_limit_is_a_local_stop_that_keeps_its_usage() {
+    assert_output_limit_is_a_local_stop("limit-tool", r#"{"tool_calls":[{"index":0,"id":"c"}]}"#);
+}
+
+#[test]
+fn a_refused_tool_call_keeps_its_response_facts_and_stays_unconfirmed() {
+    let no_id = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n";
+    let run = run_reopened(
+        "refused-tool-facts",
+        vec![
+            Step::Chunk(no_id),
+            Step::Chunk(STOP_CHUNK),
+            Step::Chunk(FINAL_INPUT_ONLY),
+        ],
+        ProviderExecutionConfig::default(),
+        offering_f(),
+    );
+    assert_unknown_and_stopped("a refused tool call", &run.job);
+    let [record] = run.availability.as_slice() else {
+        panic!("one observation, got {:?}", run.availability);
+    };
+    assert_eq!(
+        (
+            record.observation.status_code,
+            record.observation.finish_reason,
+            record.observation.raw_finish_reason.as_deref()
+        ),
+        (Some(200), Some(ChatFinishReason::Stop), Some("stop")),
+        "the observed status and finish are kept"
+    );
+    assert!(record.observation.failure.is_some());
+    assert_eq!(
+        sample_of(&run.availability).classification,
+        AvailabilityClassification::Unconfirmed,
+        "a refused tool response is not made available by its stop finish"
+    );
+    assert_eq!(
+        run.usages
+            .iter()
+            .map(|(token, _)| *token)
+            .collect::<Vec<_>>(),
+        [Some(TokenAnnotation::eligible(UsageFinality::Final))],
+        "the final usage read before the refusal is stored"
+    );
+}
+
+#[test]
+fn a_transport_failure_after_a_finish_keeps_the_finish_apart_from_the_failure() {
+    let run = run_reopened(
+        "finish-then-reset",
+        vec![Step::Chunk(HI_CHUNK), Step::Chunk(STOP_CHUNK), Step::Fail],
+        ProviderExecutionConfig::default(),
+        ChatConversation::default(),
+    );
+    assert_unknown_and_stopped("a reset after the finish", &run.job);
+    assert_eq!(run.outputs, [(OutputKind::Progress, Some("hi".to_owned()))]);
+    let observations: Vec<_> = run
+        .availability
+        .iter()
+        .map(|record| record.observation.clone())
+        .collect();
+    assert_eq!(observations.len(), 2, "{observations:?}");
+    assert_eq!(
+        observations[0],
+        response(200),
+        "the observed finish is kept as observed, without the later failure"
+    );
+    assert_eq!(
+        (
+            observations[1].status_code,
+            observations[1].finish_reason,
+            observations[1].failure.is_some()
+        ),
+        (None, None, true),
+        "the transport failure is its own observation"
+    );
+    assert_eq!(
+        sample_of(&run.availability).classification,
+        AvailabilityClassification::Available,
+        "the reducer reads the witness and the status-less failure by its existing rules"
     );
 }
 
@@ -9598,12 +9932,21 @@ mod lifecycle_closure {
         let endings = [
             ProviderExecutionError::Unknown {
                 message: "provider request timed out after it may have been delivered".into(),
+                facts: None,
+                finished: false,
             },
             ProviderExecutionError::Unknown {
                 message: "connection reset".into(),
+                facts: Some(facts.clone()),
+                finished: false,
             },
             ProviderExecutionError::Incomplete {
+                message: "provider stream ended without a finish event".into(),
+                facts: facts.clone(),
+            },
+            ProviderExecutionError::Stopped {
                 message: "provider output exceeded its limit".into(),
+                facts: facts.clone(),
             },
             ProviderExecutionError::Stopped {
                 message: "provider execution was cancelled while streaming".into(),
@@ -9701,6 +10044,8 @@ mod lifecycle_closure {
             job,
             ProviderExecutionError::Unknown {
                 message: "connection reset".into(),
+                facts: None,
+                finished: false,
             },
         )) {
             Err(ExecutionRuntimeError::Database(error)) => assert!(
@@ -9801,13 +10146,9 @@ mod lifecycle_closure {
         for profile in [agent, targeted] {
             assert_eq!(blocking(&handle, profile), [external]);
         }
-        // The parent still needs a confirmed outcome from its child.
-        assert_eq!(
-            violation(wait(
-                handle.finalize_job(parent, JobFinalization::Completed(result("done")))
-            )),
-            Violation::UnfinishedChild(parent)
-        );
+        // The abandoned child is settled, so it no longer holds its parent open.
+        wait(handle.finalize_job(parent, JobFinalization::Completed(result("done"))))
+            .expect("the parent closes once its child is settled");
         let markers = reconciliations(&handle);
         assert_eq!(markers.len(), 2);
         assert!(
@@ -10485,5 +10826,810 @@ mod aggregation_liveness {
             .into_result()
             .expect("a clean stop");
         worker.shutdown().expect("shutdown");
+    }
+}
+
+// ---- settlement, dependencies and retries --------------------------------------
+
+mod settlement {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+    use crate::persistence::{JobInputId, OperationKind};
+    use crate::storage::{JobRow, dependency_state};
+    use DependencyCondition::{Settled, Success};
+    use DependencyState::{Impossible, Satisfied, Waiting};
+
+    /// Brings a new Job into the state one table row names.
+    type Settle<'a> = &'a dyn Fn(JobId);
+
+    fn record(handle: &DatabaseHandle, job: JobId) -> JobRecord {
+        wait(handle.job(job))
+            .expect("read job")
+            .expect("job exists")
+    }
+
+    fn job(handle: &DatabaseHandle, name: &str) -> JobId {
+        create_job(handle, new_job(name, handle.genesis(), Vec::new()))
+    }
+
+    fn finalize(handle: &DatabaseHandle, job: JobId, finalization: JobFinalization) {
+        wait(handle.finalize_job(job, finalization)).expect("finalize");
+    }
+
+    /// Records an unknown outcome, without confirming any stop.
+    fn unknown(handle: &DatabaseHandle, job: JobId) {
+        finalize(handle, job, JobFinalization::Unknown);
+    }
+
+    fn stopped(handle: &DatabaseHandle, job: JobId) {
+        wait(handle.confirm_job_stopped(job)).expect("the trusted path confirms the stop");
+    }
+
+    /// A Job whose explicit prerequisite is `prerequisite`.
+    fn dependent(
+        handle: &DatabaseHandle,
+        prerequisite: JobId,
+        condition: DependencyCondition,
+    ) -> JobId {
+        create_job(
+            handle,
+            NewJob {
+                dependencies: vec![(prerequisite, condition)],
+                ..new_job("dependent", handle.genesis(), Vec::new())
+            },
+        )
+    }
+
+    /// The state a Completed finalization finds the dependency in. A
+    /// satisfied dependency lets the Job complete; any other refuses it,
+    /// and then the Job still fails, so the probe leaves it settled.
+    fn completion_probe(
+        handle: &DatabaseHandle,
+        job: JobId,
+        prerequisite: JobId,
+    ) -> DependencyState {
+        match wait(handle.finalize_job(job, JobFinalization::Completed(result("done")))) {
+            Ok(_) => Satisfied,
+            Err(DatabaseError::Rejected(Violation::UnsatisfiedDependency {
+                job: refused,
+                prerequisite: named,
+                state,
+            })) => {
+                assert_eq!((refused, named), (job, prerequisite));
+                assert_ne!(state, Satisfied);
+                assert!(
+                    record(handle, job).completed_at.is_none(),
+                    "a refused completion changes nothing"
+                );
+                finalize(
+                    handle,
+                    job,
+                    JobFinalization::Failed(result("prerequisite unmet")),
+                );
+                state
+            }
+            other => panic!("expected a completion or its refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_dependency_table_follows_settlement() {
+        let at = Some(Timestamp::from_unix_micros(1));
+        let queued = JobRow {
+            id: JobId::new(1),
+            name: None,
+            execution_mode: ExecutionMode::Once,
+            eligible_at: None,
+            started_at: None,
+            paused_at: None,
+            sterilized_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            unknown_at: None,
+            stop_confirmed_at: None,
+            next_due_at: None,
+            next_iteration_no: None,
+            iteration_no: None,
+            scheduled_at: None,
+            created_at: Timestamp::from_unix_micros(0),
+            updated_at: Timestamp::from_unix_micros(0),
+        };
+        let started = JobRow {
+            started_at: at,
+            ..queued.clone()
+        };
+        let rows = [
+            (
+                "completed",
+                JobRow {
+                    completed_at: at,
+                    ..started.clone()
+                },
+                Satisfied,
+                Satisfied,
+            ),
+            (
+                "failed",
+                JobRow {
+                    failed_at: at,
+                    ..started.clone()
+                },
+                Impossible,
+                Satisfied,
+            ),
+            (
+                "cancelled",
+                JobRow {
+                    cancelled_at: at,
+                    ..started.clone()
+                },
+                Impossible,
+                Satisfied,
+            ),
+            (
+                "unknown, stop confirmed",
+                JobRow {
+                    unknown_at: at,
+                    stop_confirmed_at: at,
+                    ..started.clone()
+                },
+                Impossible,
+                Satisfied,
+            ),
+            (
+                "unknown, stop unconfirmed",
+                JobRow {
+                    unknown_at: at,
+                    ..started.clone()
+                },
+                Waiting,
+                Waiting,
+            ),
+            ("queued", queued.clone(), Waiting, Waiting),
+            ("running", started.clone(), Waiting, Waiting),
+            (
+                "paused",
+                JobRow {
+                    paused_at: at,
+                    ..started.clone()
+                },
+                Waiting,
+                Waiting,
+            ),
+        ];
+        for (case, row, success, settled) in rows {
+            assert_eq!(dependency_state(Success, &row), success, "{case}: Success");
+            assert_eq!(dependency_state(Settled, &row), settled, "{case}: Settled");
+            assert_eq!(row.settled(), settled == Satisfied, "{case}: settled");
+        }
+    }
+
+    #[test]
+    fn completion_finds_every_dependency_as_the_table_states() {
+        let (_root, directory) = data_directory("dependency-table");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let state = |name: &str, settle: &dyn Fn(JobId)| {
+            let prerequisite = job(&handle, name);
+            settle(prerequisite);
+            let success = dependent(&handle, prerequisite, Success);
+            let settled = dependent(&handle, prerequisite, Settled);
+            (
+                completion_probe(&handle, success, prerequisite),
+                completion_probe(&handle, settled, prerequisite),
+            )
+        };
+        let rows: [(&str, Settle, (DependencyState, DependencyState)); 7] = [
+            (
+                "completed",
+                &|job| finalize(&handle, job, JobFinalization::Completed(result("done"))),
+                (Satisfied, Satisfied),
+            ),
+            (
+                "failed",
+                &|job| finalize(&handle, job, JobFinalization::Failed(result("broken"))),
+                (Impossible, Satisfied),
+            ),
+            (
+                "cancelled",
+                &|job| finalize(&handle, job, JobFinalization::Cancelled(result("stopped"))),
+                (Impossible, Satisfied),
+            ),
+            (
+                "unknown, stop confirmed",
+                &|job| {
+                    unknown(&handle, job);
+                    stopped(&handle, job);
+                },
+                (Impossible, Satisfied),
+            ),
+            (
+                "unknown, stop unconfirmed",
+                &|job| unknown(&handle, job),
+                (Waiting, Waiting),
+            ),
+            ("queued", &|_| {}, (Waiting, Waiting)),
+            (
+                "running",
+                &|job| wait(handle.start_job(job)).expect("start"),
+                (Waiting, Waiting),
+            ),
+        ];
+        for (case, settle, expected) in rows {
+            assert_eq!(state(case, settle), expected, "{case}: (Success, Settled)");
+        }
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_confirmed_stop_settles_dependencies_without_changing_the_outcome() {
+        let (_root, directory) = data_directory("stop-settles");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let prerequisite = job(&handle, "prerequisite");
+        wait(handle.start_job(prerequisite)).expect("start");
+        wait(handle.append_job_output(
+            prerequisite,
+            NewJobOutput {
+                kind: IntermediateOutputKind::Progress,
+                summary: Some("partial".into()),
+                code: None,
+                goal_reached: None,
+                value: None,
+            },
+        ))
+        .expect("publish progress");
+        unknown(&handle, prerequisite);
+        let before = record(&handle, prerequisite);
+        let outputs = wait(handle.job_outputs(prerequisite, None, 10)).expect("read outputs");
+        let needs_success = dependent(&handle, prerequisite, Success);
+        let needs_settled = dependent(&handle, prerequisite, Settled);
+        for job in [needs_success, needs_settled] {
+            assert_eq!(
+                violation(wait(
+                    handle.finalize_job(job, JobFinalization::Completed(result("done")))
+                )),
+                Violation::UnsatisfiedDependency {
+                    job,
+                    prerequisite,
+                    state: Waiting
+                },
+                "an unconfirmed unknown outcome is still a wait"
+            );
+        }
+
+        stopped(&handle, prerequisite);
+        wait(handle.finalize_job(needs_settled, JobFinalization::Completed(result("done"))))
+            .expect("a settled dependency is satisfied by the confirmed stop");
+        assert_eq!(
+            violation(wait(handle.finalize_job(
+                needs_success,
+                JobFinalization::Completed(result("done"))
+            ))),
+            Violation::UnsatisfiedDependency {
+                job: needs_success,
+                prerequisite,
+                state: Impossible
+            },
+            "a stopped unknown outcome never satisfies a success dependency"
+        );
+        let after = record(&handle, prerequisite);
+        assert!(after.stop_confirmed_at.is_some());
+        assert_eq!(
+            JobRecord {
+                stop_confirmed_at: None,
+                updated_at: before.updated_at,
+                ..after.clone()
+            },
+            before,
+            "only the stop confirmation changed"
+        );
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("reopen database");
+        let handle = worker.handle();
+        assert_eq!(
+            record(&handle, prerequisite),
+            after,
+            "the unknown outcome is kept"
+        );
+        assert_eq!(
+            wait(handle.job_outputs(prerequisite, None, 10)).expect("read outputs"),
+            outputs,
+            "its outputs are kept and no result is published"
+        );
+        assert!(record(&handle, needs_settled).completed_at.is_some());
+        assert!(record(&handle, needs_success).completed_at.is_none());
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_parent_closes_once_its_unknown_child_is_confirmed_stopped() {
+        let (_root, directory) = data_directory("parent-closes");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let mut closed = Vec::new();
+        for finalization in [
+            JobFinalization::Completed(result("done with an auxiliary child")),
+            JobFinalization::Failed(result("broken")),
+            JobFinalization::Cancelled(result("stopped")),
+        ] {
+            let parent = job(&handle, "parent");
+            let child = create_job(&handle, new_job("auxiliary child", parent, Vec::new()));
+            wait(handle.start_job(child)).expect("start");
+            unknown(&handle, child);
+            assert_eq!(
+                violation(wait(handle.finalize_job(parent, finalization.clone()))),
+                Violation::UnfinishedChild(parent),
+                "an unknown child that may still execute keeps its parent open"
+            );
+            stopped(&handle, child);
+            let appended = wait(handle.finalize_job(parent, finalization))
+                .expect("the parent closes once its child is settled");
+            assert!(appended.is_some(), "the parent publishes its own result");
+            let child_record = record(&handle, child);
+            assert!(child_record.unknown_at.is_some() && child_record.stop_confirmed_at.is_some());
+            assert_eq!(
+                (
+                    child_record.completed_at,
+                    child_record.failed_at,
+                    child_record.cancelled_at
+                ),
+                (None, None, None),
+                "the child stays unknown"
+            );
+            assert!(
+                wait(handle.job_outputs(child, None, 10))
+                    .expect("read outputs")
+                    .is_empty(),
+                "no result is fabricated for the child"
+            );
+            closed.push((parent, child));
+        }
+
+        // A Job that requires the child's success says so with an explicit
+        // Success dependency, and a stopped unknown outcome does not meet it.
+        let parent = job(&handle, "parent with a required child");
+        let worker_child = create_job(&handle, new_job("worker", parent, Vec::new()));
+        let finisher = create_job(
+            &handle,
+            NewJob {
+                dependencies: vec![(worker_child, Success)],
+                ..new_job("finisher needs the worker", parent, Vec::new())
+            },
+        );
+        unknown(&handle, worker_child);
+        stopped(&handle, worker_child);
+        assert_eq!(
+            violation(wait(handle.finalize_job(
+                finisher,
+                JobFinalization::Completed(result("done"))
+            ))),
+            Violation::UnsatisfiedDependency {
+                job: finisher,
+                prerequisite: worker_child,
+                state: Impossible
+            }
+        );
+        finalize(
+            &handle,
+            finisher,
+            JobFinalization::Failed(result("the worker did not succeed")),
+        );
+        let records: Vec<_> = closed
+            .iter()
+            .flat_map(|(parent, child)| [record(&handle, *parent), record(&handle, *child)])
+            .collect();
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("reopen database");
+        let handle = worker.handle();
+        assert_eq!(
+            closed
+                .iter()
+                .flat_map(|(parent, child)| [record(&handle, *parent), record(&handle, *child)])
+                .collect::<Vec<_>>(),
+            records
+        );
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn completion_needs_satisfied_prerequisites_while_failure_and_cancellation_do_not() {
+        let (_root, directory) = data_directory("completion-prerequisites");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let waiting = job(&handle, "still queued");
+        let impossible = job(&handle, "failed");
+        finalize(
+            &handle,
+            impossible,
+            JobFinalization::Failed(result("broken")),
+        );
+        for (prerequisite, state) in [(waiting, Waiting), (impossible, Impossible)] {
+            let parent = dependent(&handle, prerequisite, Success);
+            let child = create_job(&handle, new_job("child", parent, Vec::new()));
+            finalize(
+                &handle,
+                child,
+                JobFinalization::Completed(result("child done")),
+            );
+            assert_eq!(
+                violation(wait(
+                    handle.finalize_job(parent, JobFinalization::Completed(result("done")))
+                )),
+                Violation::UnsatisfiedDependency {
+                    job: parent,
+                    prerequisite,
+                    state
+                }
+            );
+            let refused = record(&handle, parent);
+            assert!(refused.completed_at.is_none() && refused.sterilized_at.is_none());
+            let closing = match state {
+                Waiting => JobFinalization::Cancelled(result("no longer needed")),
+                _ => JobFinalization::Failed(result("prerequisite failed")),
+            };
+            wait(handle.finalize_job(parent, closing))
+                .expect("failure and cancellation close once the children settled");
+        }
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn the_waiting_graph_drops_a_stopped_unknown_job_and_keeps_real_cycles() {
+        let (_root, directory) = data_directory("waiting-stopped");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let anchor = job(&handle, "anchor");
+        let parent = job(&handle, "parent");
+        // The child waits for the anchor, and its parent waits for it.
+        let child = create_job(
+            &handle,
+            NewJob {
+                dependencies: vec![(anchor, Settled)],
+                ..new_job("child", parent, Vec::new())
+            },
+        );
+        wait(handle.start_job(child)).expect("start");
+        unknown(&handle, child);
+        // anchor -> new -> parent -> child -> anchor: the child may still be
+        // executing, so the cycle is real.
+        let closing = || NewJob {
+            dependencies: vec![(parent, Settled)],
+            ..new_job("waits for the parent", anchor, Vec::new())
+        };
+        let input =
+            wait(handle.save_job_input(None, JobInputDraft::default())).expect("save input");
+        assert!(matches!(
+            violation(wait(handle.create_job_with_input(closing(), input))),
+            Violation::WaitingCycle(_)
+        ));
+        assert!(
+            wait(handle.input_jobs(input))
+                .expect("read input Jobs")
+                .is_empty(),
+            "the refused submission left nothing"
+        );
+
+        stopped(&handle, child);
+        let admitted = wait(handle.create_job_with_input(closing(), input))
+            .expect("a stopped unknown child neither holds its parent nor waits");
+        assert_eq!(record(&handle, admitted).parent, anchor);
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    fn retry(
+        original: JobId,
+        input: RetryInput,
+        configuration: Option<ExecutionConfiguration>,
+    ) -> JobRetry {
+        JobRetry {
+            original,
+            input,
+            name: Some("retry".into()),
+            execution_mode: ExecutionMode::Once,
+            eligible_at: None,
+            scheduled_at: None,
+            next_due_at: None,
+            next_iteration_no: None,
+            iteration_no: None,
+            projects: Vec::new(),
+            dependencies: Vec::new(),
+            configuration,
+            assigned_executor: None,
+        }
+    }
+
+    fn fresh_input(handle: &DatabaseHandle) -> JobInputId {
+        wait(handle.save_job_input(
+            None,
+            JobInputDraft {
+                objective: Some("again".into()),
+                ..JobInputDraft::default()
+            },
+        ))
+        .expect("save input")
+    }
+
+    fn retry_markers(handle: &DatabaseHandle) -> usize {
+        wait(handle.operation_markers(None, 1_000))
+            .expect("read markers")
+            .into_iter()
+            .filter(|marker| marker.kind == OperationKind::RetryJob)
+            .count()
+    }
+
+    /// A refused retry submitted nothing, linked nothing and marked nothing.
+    fn assert_refused_retry_left_nothing(
+        handle: &DatabaseHandle,
+        original: JobId,
+        input: JobInputId,
+        markers: usize,
+        retries: &[JobId],
+    ) {
+        let input_record = wait(handle.job_input(input))
+            .expect("read input")
+            .expect("input exists");
+        assert!(input_record.submitted_at.is_none() && input_record.configuration.is_none());
+        assert!(
+            wait(handle.input_jobs(input))
+                .expect("read input Jobs")
+                .is_empty()
+        );
+        assert_eq!(
+            wait(handle.retries(original)).expect("read retries"),
+            retries
+        );
+        assert_eq!(retry_markers(handle), markers);
+    }
+
+    #[test]
+    fn only_a_settled_original_can_be_retried() {
+        let (_root, directory) = data_directory("retry-eligibility");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let rows: [(&str, Settle, bool); 7] = [
+            ("queued", &|_| {}, false),
+            (
+                "running",
+                &|job| wait(handle.start_job(job)).expect("start"),
+                false,
+            ),
+            (
+                "completed",
+                &|job| finalize(&handle, job, JobFinalization::Completed(result("done"))),
+                true,
+            ),
+            (
+                "failed",
+                &|job| finalize(&handle, job, JobFinalization::Failed(result("broken"))),
+                true,
+            ),
+            (
+                "cancelled",
+                &|job| finalize(&handle, job, JobFinalization::Cancelled(result("stopped"))),
+                true,
+            ),
+            (
+                "unknown, stop unconfirmed",
+                &|job| unknown(&handle, job),
+                false,
+            ),
+            (
+                "unknown, stop confirmed",
+                &|job| {
+                    unknown(&handle, job);
+                    stopped(&handle, job);
+                },
+                true,
+            ),
+        ];
+        for (case, settle, eligible) in rows {
+            let original = job(&handle, case);
+            settle(original);
+            let before = record(&handle, original);
+            let input = fresh_input(&handle);
+            let markers = retry_markers(&handle);
+            match wait(handle.retry_job(retry(original, RetryInput::Changed(input), None))) {
+                Ok(created) => {
+                    assert!(eligible, "{case}: must be refused");
+                    let created = record(&handle, created);
+                    assert_eq!(
+                        (created.retry_of, created.input),
+                        (Some(original), input),
+                        "{case}"
+                    );
+                }
+                Err(DatabaseError::Rejected(violation)) => {
+                    assert!(!eligible, "{case}: must be eligible, got {violation:?}");
+                    assert_eq!(
+                        violation,
+                        Violation::RetryOfUnsettledJob(original),
+                        "{case}"
+                    );
+                    assert_refused_retry_left_nothing(&handle, original, input, markers, &[]);
+                }
+                Err(other) => panic!("{case}: {other:?}"),
+            }
+            assert_eq!(
+                record(&handle, original),
+                before,
+                "{case}: the original is untouched"
+            );
+        }
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn concurrent_retries_leave_at_most_one_active_direct_retry() {
+        const SUBMITTERS: usize = 8;
+        let (_root, directory) = data_directory("retry-concurrent");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let Configured {
+            targeted, agent, ..
+        } = configured(&handle);
+        let original = configured_child(&handle, agent, targeted);
+        wait(handle.start_job(original)).expect("start");
+        wait(handle.append_job_output(
+            original,
+            NewJobOutput {
+                kind: IntermediateOutputKind::Progress,
+                summary: Some("first attempt".into()),
+                code: None,
+                goal_reached: None,
+                value: None,
+            },
+        ))
+        .expect("publish progress");
+        finalize(
+            &handle,
+            original,
+            JobFinalization::Failed(result("first try failed")),
+        );
+        let original_input = record(&handle, original).input;
+        let frozen = wait(handle.job_input(original_input))
+            .expect("read input")
+            .expect("input exists")
+            .configuration
+            .expect("a frozen configuration");
+        let inputs: Vec<JobInputId> = (0..SUBMITTERS).map(|_| fresh_input(&handle)).collect();
+        let markers = retry_markers(&handle);
+
+        let barrier = Arc::new(Barrier::new(SUBMITTERS));
+        let submitters: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                let (handle, barrier, input) = (handle.clone(), barrier.clone(), *input);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = wait(handle.retry_job(retry(
+                        original,
+                        RetryInput::Changed(input),
+                        configuration(agent, targeted),
+                    )));
+                    (input, result)
+                })
+            })
+            .collect();
+        let results: Vec<_> = submitters
+            .into_iter()
+            .map(|submitter| submitter.join().expect("submitter"))
+            .collect();
+        let created: Vec<_> = results
+            .iter()
+            .filter_map(|(input, result)| result.as_ref().ok().map(|job| (*input, *job)))
+            .collect();
+        let [(winning_input, active)] = created.as_slice() else {
+            panic!("exactly one retry is created, got {results:?}");
+        };
+        let active = *active;
+        for (input, result) in results {
+            if input == *winning_input {
+                continue;
+            }
+            assert_eq!(
+                violation(result),
+                Violation::ActiveRetry {
+                    original,
+                    retry: active
+                },
+                "every other submission is refused"
+            );
+            assert_refused_retry_left_nothing(&handle, original, input, markers + 1, &[active]);
+        }
+        assert_eq!(
+            wait(handle.job_input(*winning_input))
+                .expect("read input")
+                .expect("input exists")
+                .configuration,
+            Some(frozen.clone()),
+            "the retry froze the same configuration"
+        );
+
+        // An unknown retry that may still execute is unsettled too.
+        wait(handle.start_job(active)).expect("start");
+        unknown(&handle, active);
+        let blocked = fresh_input(&handle);
+        assert_eq!(
+            violation(wait(handle.retry_job(retry(
+                original,
+                RetryInput::Changed(blocked),
+                configuration(agent, targeted)
+            )))),
+            Violation::ActiveRetry {
+                original,
+                retry: active
+            }
+        );
+        assert_refused_retry_left_nothing(&handle, original, blocked, markers + 1, &[active]);
+        stopped(&handle, active);
+        let next = wait(handle.retry_job(retry(
+            original,
+            RetryInput::Unchanged,
+            configuration(agent, targeted),
+        )))
+        .expect("once the direct retry settled, another one is allowed");
+        assert_eq!(
+            violation(wait(handle.retry_job(retry(
+                original,
+                RetryInput::Unchanged,
+                configuration(agent, targeted)
+            )))),
+            Violation::ActiveRetry {
+                original,
+                retry: next
+            }
+        );
+        let jobs = [original, active, next].map(|job| record(&handle, job));
+        let outputs = wait(handle.job_outputs(original, None, 10)).expect("read outputs");
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("reopen database");
+        let handle = worker.handle();
+        assert_eq!(
+            [original, active, next].map(|job| record(&handle, job)),
+            jobs
+        );
+        let [original_record, active_record, next_record] = &jobs;
+        assert!(original_record.failed_at.is_some());
+        assert!(active_record.unknown_at.is_some() && active_record.stop_confirmed_at.is_some());
+        assert_eq!(
+            (
+                active_record.retry_of,
+                next_record.retry_of,
+                next_record.input
+            ),
+            (Some(original), Some(original), original_input)
+        );
+        assert_eq!(
+            wait(handle.retries(original)).expect("read retries"),
+            [active, next]
+        );
+        assert_eq!(
+            wait(handle.job_outputs(original, None, 10)).expect("read outputs"),
+            outputs
+        );
+        for input in [original_input, *winning_input] {
+            assert_eq!(
+                wait(handle.job_input(input))
+                    .expect("read input")
+                    .expect("input exists")
+                    .configuration,
+                Some(frozen.clone()),
+                "the frozen configuration survives reopening"
+            );
+        }
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
     }
 }

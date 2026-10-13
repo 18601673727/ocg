@@ -710,10 +710,12 @@ impl ProviderOutputSink for DatabaseOutputSink {
 }
 
 /// Settles a failed provider execution. Its Job outcome follows the error
-/// alone; its availability observation records only the facts the error
-/// carries, see [`provider_execution::error_observation`]. The execution has
-/// returned, so an unknown outcome also has its local stop confirmed, but
-/// only once that outcome is committed: a failed settlement confirms nothing.
+/// alone; its availability observations record only the facts the error
+/// carries, see [`provider_execution::error_observations`]. Each is
+/// attempted, and the first that could not be written is reported. The
+/// execution has returned, so an unknown outcome also has its local stop
+/// confirmed, but only once that outcome is committed: a failed settlement
+/// confirms nothing.
 pub(crate) async fn settle_provider_error(
     database: DatabaseHandle,
     executor: ExecutorId,
@@ -756,15 +758,18 @@ pub(crate) async fn settle_provider_error(
         None
     };
     let mut gap = None;
-    if let Some(observation) = provider_execution::error_observation(&error) {
-        gap = database
+    let observed_at = Timestamp::now();
+    for observation in provider_execution::error_observations(&error) {
+        let recorded = database
             .record_availability_stat(NewAvailabilityStat {
                 job,
-                observed_at: Timestamp::now(),
+                observed_at,
                 observation,
             })
-            .await
-            .err();
+            .await;
+        if let Err(error) = recorded {
+            gap.get_or_insert(error);
+        }
     }
     match (stop, gap) {
         (Some(source), observations) => Err(ExecutionRuntimeError::StopNotConfirmed {

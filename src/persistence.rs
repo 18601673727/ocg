@@ -148,9 +148,12 @@ pub enum DependencyCondition {
     Settled,
 }
 
-/// How a dependency currently stands. An unknown prerequisite outcome is not
-/// settled, so it keeps the dependency waiting; a success dependency on a
-/// failed or cancelled prerequisite can never be met and is not a wait.
+/// How a dependency currently stands. A prerequisite is settled once it has
+/// a confirmed outcome, or an unknown outcome whose execution is confirmed
+/// stopped; until then the dependency waits. A completed prerequisite
+/// satisfies either condition. Any other settled prerequisite satisfies a
+/// settled dependency, while a success dependency on it can never be met and
+/// is not a wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DependencyState {
     Waiting,
@@ -1283,8 +1286,18 @@ pub enum Violation {
     ParentClosed(JobId),
     #[error("ASSIGNED_TO cannot change after {0} starts")]
     ExecutorChangeAfterStart(JobId),
-    #[error("cannot finalize {0}: a child Job is unfinished or has an unknown outcome")]
+    #[error("cannot finalize {0}: a child Job is not settled")]
     UnfinishedChild(JobId),
+    #[error("cannot complete {job}: its dependency on {prerequisite} is {state:?}, not satisfied")]
+    UnsatisfiedDependency {
+        job: JobId,
+        prerequisite: JobId,
+        state: DependencyState,
+    },
+    #[error("{0} is not settled, so it cannot be retried yet")]
+    RetryOfUnsettledJob(JobId),
+    #[error("{original} already has the unsettled direct retry {retry}")]
+    ActiveRetry { original: JobId, retry: JobId },
     #[error("the dependency on {0} is listed more than once")]
     DuplicateDependency(JobId),
     #[error("the relationship would create a cycle in the waiting graph through {0:?}")]
@@ -1580,14 +1593,29 @@ pub(crate) fn create_job_with_input(batch: &mut Batch, job: NewJob, input: JobIn
 /// Creates a new Job that retries `retry.original` under the original's
 /// parent. The original Job, its input and its outputs are not touched.
 ///
+/// Only a settled original may be retried, and only while none of its
+/// direct retries is unsettled; both are checked in the transaction that
+/// creates the retry, so concurrent retries cannot both become active.
+///
 /// The retry's configuration is frozen from its Profiles as they are now. It
 /// may share the original's input only when that equals what the input
 /// froze; Profile IDs alone prove nothing once a Profile has been edited.
 pub(crate) fn retry_job(batch: &mut Batch, retry: JobRetry) -> OpResult<JobId> {
     let original = retry.original;
-    batch.require_job(original)?;
+    let original_row = batch.require_job(original)?;
     if batch.genesis()? == original {
         return batch.reject(Violation::GenesisProtected(original));
+    }
+    if !original_row.settled() {
+        return batch.reject(Violation::RetryOfUnsettledJob(original));
+    }
+    for existing in batch.retries(original)? {
+        if !batch.require_job(existing)?.settled() {
+            return batch.reject(Violation::ActiveRetry {
+                original,
+                retry: existing,
+            });
+        }
     }
     let parent = batch.parent_of(original)?;
     let frozen = match retry.configuration {
@@ -1662,9 +1690,9 @@ pub(crate) fn start_local_job(batch: &mut Batch, job: JobId, epoch: u64) -> OpRe
 /// execution and left unsettled. Runs only when the database is opened, so
 /// that opening is closed: nothing it ran can still execute or settle the
 /// Job. An unsettled Job's outcome becomes unknown, never a claimed result,
-/// and its stop is confirmed, which releases the Profiles it holds. An
-/// unknown outcome only has its stop confirmed. Children are not touched: a
-/// parent still needs a confirmed outcome from each of them.
+/// and its stop is confirmed, which releases the Profiles it holds and
+/// settles it. An unknown outcome only has its stop confirmed. Children are
+/// not touched: a parent still needs each of them to be settled.
 ///
 /// Declines when the Job no longer has that claim, so running it again
 /// changes nothing.
@@ -1758,9 +1786,13 @@ fn publish_output(
     Ok(AppendedOutput { output: id, seq: record.seq })
 }
 
-/// A confirmed outcome requires every child Job to have a confirmed outcome;
-/// the Job is then sterilized, its final result published, and the terminal
-/// timestamp set in one transaction.
+/// A confirmed outcome requires every child Job to be settled: a child with
+/// an unknown outcome counts once its execution is confirmed stopped. A
+/// child's own outcome does not decide the parent's; a required success is
+/// an explicit Success dependency. Completion also requires every explicit
+/// dependency of the Job to be satisfied, while failure and cancellation do
+/// not. The Job is then sterilized, its final result published, and the
+/// terminal timestamp set in one transaction.
 ///
 /// An unknown outcome publishes no result and claims nothing about children;
 /// it stops further child creation.
@@ -1776,6 +1808,7 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
     if row.any_terminal() {
         return batch.reject(Violation::JobAlreadyFinalized(job));
     }
+    let completes = matches!(finalization, JobFinalization::Completed(_));
     let (outcome, result): (fn(&mut JobRow) -> &mut Option<Timestamp>, FinalResult) = match finalization {
         JobFinalization::Unknown => {
             row.unknown_at = Some(now);
@@ -1788,8 +1821,20 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
         JobFinalization::Cancelled(result) => (|row| &mut row.cancelled_at, result),
     };
     for child in batch.children(job)? {
-        if !batch.require_job(child)?.confirmed_terminal() {
+        if !batch.require_job(child)?.settled() {
             return batch.reject(Violation::UnfinishedChild(job));
+        }
+    }
+    if completes {
+        for (prerequisite, condition) in batch.dependencies(job)? {
+            let state = dependency_state(condition, &batch.require_job(prerequisite)?);
+            if state != DependencyState::Satisfied {
+                return batch.reject(Violation::UnsatisfiedDependency {
+                    job,
+                    prerequisite,
+                    state,
+                });
+            }
         }
     }
     row.sterilized_at.get_or_insert(now);

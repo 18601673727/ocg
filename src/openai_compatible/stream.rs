@@ -300,6 +300,12 @@ impl ToolCallAssembler {
         self.bytes
     }
 
+    /// Whether no tool call fragment has been taken.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.calls.is_empty()
+    }
+
     /// The completed tool calls of a stream that ended with `finish`, ordered
     /// by their wire index. A call is complete only with an id, a valid
     /// function name and arguments that are one JSON object; the arguments
