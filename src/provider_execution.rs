@@ -15,7 +15,10 @@ use ntex::time::Millis;
 use ntex::util::{Either, select};
 use serde_json::{Value, json};
 
-use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure};
+use crate::openai_compatible::{
+    ChatConversation, ChatFinishReason, ChatMessage, CompletedToolCall, InvalidToolCall,
+    NormalizedUsage, ProviderFailure, ToolCallAssembler,
+};
 use crate::persistence::{FrozenExecutionConfig, LlmParameters, Timestamp};
 use crate::token_usage::UsageFinality;
 
@@ -190,9 +193,18 @@ impl CancellationToken {
     }
 }
 
+/// One finished Provider exchange. It may be assistant text, tool calls, or
+/// both. Tool calls are requests the Provider made, complete and checked
+/// against what the request allowed; none of them has been run, and a result
+/// that carries them is not a finished answer.
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionResult {
     pub text: String,
+    /// The streamed `reasoning_content`, kept apart from the text and never
+    /// published as output.
+    pub reasoning: String,
+    /// Ordered by their wire index, with ids, names and arguments as sent.
+    pub tool_calls: Vec<CompletedToolCall>,
     pub usage: NormalizedUsage,
     pub finish_reason: Option<ChatFinishReason>,
     pub raw_finish_reason: Option<String>,
@@ -246,6 +258,14 @@ pub enum ProviderExecutionError {
     },
 }
 
+impl ProviderExecutionResult {
+    /// Whether the Provider asked for tools to be run before it can answer.
+    #[must_use]
+    pub fn requests_tools(&self) -> bool {
+        !self.tool_calls.is_empty()
+    }
+}
+
 impl ProviderExecutionError {
     pub fn failure(&self) -> Option<&ProviderFailure> {
         match self {
@@ -262,12 +282,42 @@ pub async fn execute_chat(
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-    execute_chat_inner(frozen, objective, resolver, config, None).await
+    let conversation = objective_conversation(frozen, objective);
+    execute_conversation(frozen, &conversation, resolver, config, None).await
 }
 
-async fn execute_chat_inner(
+/// The conversation a Job's objective is sent as: the frozen Agent
+/// instructions, when there are any, then the objective. It offers no tools.
+#[must_use]
+pub fn objective_conversation(
     frozen: &FrozenExecutionConfig,
     objective: Option<&str>,
+) -> ChatConversation {
+    let mut messages = Vec::new();
+    if let Some(instructions) = frozen
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.instructions.as_deref())
+        .filter(|instructions| !instructions.is_empty())
+    {
+        messages.push(ChatMessage::system(instructions));
+    }
+    messages.push(ChatMessage::user(objective.unwrap_or("")));
+    ChatConversation {
+        messages,
+        ..ChatConversation::default()
+    }
+}
+
+/// Sends one validated conversation, with the tools it offers, to the
+/// frozen Provider and model with the frozen parameters, and reads the
+/// streamed response. The conversation is the whole message list sent.
+/// Tool calls in the response come back typed in the result once they are
+/// complete and allowed; anything else about them is an incomplete stream.
+/// No tool is ever run here.
+pub async fn execute_conversation(
+    frozen: &FrozenExecutionConfig,
+    conversation: &ChatConversation,
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
     mut sink: Option<&mut dyn ProviderOutputSink>,
@@ -275,7 +325,7 @@ async fn execute_chat_inner(
     let mut announced = false;
     let result = exchange(
         frozen,
-        objective,
+        conversation,
         resolver,
         config,
         &mut sink,
@@ -339,12 +389,17 @@ fn borrow_output_sink<'a>(
 
 async fn exchange(
     frozen: &FrozenExecutionConfig,
-    objective: Option<&str>,
+    conversation: &ChatConversation,
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
     sink: &mut Option<&mut dyn ProviderOutputSink>,
     announced: &mut bool,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+    conversation
+        .validate()
+        .map_err(|error| ProviderExecutionError::Build {
+            message: error.to_string(),
+        })?;
     let provider = &frozen.llm.provider;
     let endpoint = provider.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT);
     let endpoint = endpoint.trim_end_matches('/');
@@ -369,12 +424,8 @@ async fn exchange(
     let body = request_body(
         &frozen.llm.config.model,
         &frozen.llm.config.parameters,
-        frozen
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.instructions.as_deref()),
-        objective,
-    );
+        conversation,
+    )?;
     let client = Client::builder()
         .disable_redirects()
         .response_timeout(Millis(
@@ -453,11 +504,13 @@ async fn exchange(
         request_id,
         config,
         borrow_output_sink(sink),
+        conversation,
     )
     .await
 }
 
-/// Reads one response stream. The configured timeout applies only while
+/// Reads one response stream, then admits its tool calls only as far as
+/// `conversation` allowed them. The configured timeout applies only while
 /// waiting for the next provider chunk; parsing and persistence are outside
 /// that interval.
 pub(crate) async fn read_response(
@@ -467,9 +520,10 @@ pub(crate) async fn read_response(
     request_id: Option<String>,
     config: &ProviderExecutionConfig,
     sink: Option<&mut dyn ProviderOutputSink>,
+    conversation: &ChatConversation,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut capture = UsageCapture::default();
-    parse_stream(
+    let result = parse_stream(
         payload,
         status_code,
         started,
@@ -478,7 +532,17 @@ pub(crate) async fn read_response(
         sink,
         &mut capture,
     )
-    .await
+    .await?;
+    conversation
+        .admit_tool_calls(&result.tool_calls)
+        .map_err(incomplete_tool_calls)?;
+    Ok(result)
+}
+
+fn incomplete_tool_calls(error: InvalidToolCall) -> ProviderExecutionError {
+    ProviderExecutionError::Incomplete {
+        message: error.to_string(),
+    }
 }
 
 pub async fn execute_chat_with_sink(
@@ -488,7 +552,8 @@ pub async fn execute_chat_with_sink(
     config: &ProviderExecutionConfig,
     sink: &mut dyn ProviderOutputSink,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-    execute_chat_inner(frozen, objective, resolver, config, Some(sink)).await
+    let conversation = objective_conversation(frozen, objective);
+    execute_conversation(frozen, &conversation, resolver, config, Some(sink)).await
 }
 
 /// The Authorization header of a request. It is marked sensitive, so no
@@ -505,21 +570,25 @@ fn authorization(credential: &str) -> Result<HeaderValue, ProviderExecutionError
     Ok(value)
 }
 
+/// The request body: the conversation as given, with the frozen model and
+/// parameters. Streaming with usage is always requested.
 fn request_body(
     model: &str,
     parameters: &LlmParameters,
-    instructions: Option<&str>,
-    objective: Option<&str>,
-) -> Value {
-    let mut messages = Vec::new();
-    if let Some(instructions) = instructions.filter(|value| !value.is_empty()) {
-        messages.push(json!({"role": "system", "content": instructions}));
-    }
-    messages.push(json!({"role": "user", "content": objective.unwrap_or("")}));
-    let mut body = json!({"model": model, "messages": messages, "stream": true, "stream_options": {"include_usage": true}});
+    conversation: &ChatConversation,
+) -> Result<Value, ProviderExecutionError> {
+    let mut body =
+        serde_json::to_value(conversation).map_err(|error| ProviderExecutionError::Build {
+            message: format!("could not encode the chat request: {error}"),
+        })?;
     let Some(object) = body.as_object_mut() else {
-        return json!({"model": model, "messages": messages, "stream": true});
+        return Err(ProviderExecutionError::Build {
+            message: "the chat request did not encode as a JSON object".to_owned(),
+        });
     };
+    object.insert("model".to_owned(), json!(model));
+    object.insert("stream".to_owned(), json!(true));
+    object.insert("stream_options".to_owned(), json!({"include_usage": true}));
     if let Some(value) = parameters.temperature {
         object.insert("temperature".to_owned(), json!(value));
     }
@@ -535,7 +604,7 @@ fn request_body(
     if let Some(value) = parameters.frequency_penalty {
         object.insert("frequency_penalty".to_owned(), json!(value));
     }
-    body
+    Ok(body)
 }
 
 async fn parse_stream(
@@ -716,10 +785,7 @@ async fn parse_stream_body(
     output: &mut StreamOutput<'_>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut buffer = Vec::with_capacity(MAX_SSE_LINE_BYTES);
-    let mut text = String::new();
-    let mut usage = NormalizedUsage::default();
-    let mut finish_reason = None;
-    let mut raw_finish_reason = None;
+    let mut response = StreamedResponse::default();
     let mut saw_event = false;
     let mut first_byte = None;
     let mut idle_waited = Duration::ZERO;
@@ -739,8 +805,8 @@ async fn parse_stream_body(
                     return Err(local_stop(
                         "provider execution was cancelled while streaming",
                         status_code,
-                        finish_reason,
-                        raw_finish_reason.as_deref(),
+                        response.finish_reason,
+                        response.raw_finish_reason.as_deref(),
                     ));
                 }
                 StreamWait::Flush => {
@@ -749,8 +815,8 @@ async fn parse_stream_body(
                         local_stop(
                             &error.message,
                             status_code,
-                            finish_reason,
-                            raw_finish_reason.as_deref(),
+                            response.finish_reason,
+                            response.raw_finish_reason.as_deref(),
                         )
                     })?;
                     continue;
@@ -771,8 +837,8 @@ async fn parse_stream_body(
             return Err(local_stop(
                 "provider execution was cancelled while streaming",
                 status_code,
-                finish_reason,
-                raw_finish_reason.as_deref(),
+                response.finish_reason,
+                response.raw_finish_reason.as_deref(),
             ));
         }
         let chunk = chunk.map_err(|error| ProviderExecutionError::Unknown {
@@ -810,14 +876,7 @@ async fn parse_stream_body(
                 }
             })?;
             saw_event = true;
-            let consumed = consume_event(
-                &event,
-                &mut text,
-                &mut usage,
-                &mut finish_reason,
-                &mut raw_finish_reason,
-                config.max_output_bytes,
-            )?;
+            let consumed = consume_event(&event, &mut response, config.max_output_bytes)?;
             // The usage is taken before the delta, so a failed delta write
             // loses none of the event's counters.
             if let Some(reported) = consumed.usage {
@@ -828,21 +887,21 @@ async fn parse_stream_body(
                     local_stop(
                         &error.message,
                         status_code,
-                        finish_reason,
-                        raw_finish_reason.as_deref(),
+                        response.finish_reason,
+                        response.raw_finish_reason.as_deref(),
                     )
                 })?;
             }
         }
     }
     // A stream cut short after cancellation is the local stop, not the provider's incomplete stream.
-    let cut_short = !buffer.is_empty() || !saw_event || finish_reason.is_none();
+    let cut_short = !buffer.is_empty() || !saw_event || response.finish_reason.is_none();
     if cut_short && config.cancellation.is_cancelled() {
         return Err(local_stop(
             "provider execution was cancelled before the stream finished",
             status_code,
-            finish_reason,
-            raw_finish_reason.as_deref(),
+            response.finish_reason,
+            response.raw_finish_reason.as_deref(),
         ));
     }
     if !buffer.is_empty() {
@@ -850,17 +909,23 @@ async fn parse_stream_body(
             message: "provider stream ended with an incomplete SSE frame".to_owned(),
         });
     }
-    if !saw_event || finish_reason.is_none() {
+    if !saw_event || response.finish_reason.is_none() {
         return Err(ProviderExecutionError::Incomplete {
             message: "provider stream ended without a finish event".to_owned(),
         });
     }
+    let tool_calls = response
+        .tool_calls
+        .finish(response.finish_reason)
+        .map_err(incomplete_tool_calls)?;
     let finished_in = started.elapsed();
     Ok(ProviderExecutionResult {
-        text,
-        usage,
-        finish_reason,
-        raw_finish_reason,
+        text: response.text,
+        reasoning: response.reasoning,
+        tool_calls,
+        usage: response.usage,
+        finish_reason: response.finish_reason,
+        raw_finish_reason: response.raw_finish_reason,
         status_code,
         request_id,
         ttfb: first_byte.map_or(finished_in, |first| first.duration_since(started)),
@@ -882,6 +947,34 @@ fn local_stop(
             finish_reason,
             raw_finish_reason: raw_finish_reason.map(str::to_owned),
         },
+    }
+}
+
+/// What a response stream has produced so far. Only the text is streamed
+/// out; reasoning and tool-call fragments wait for the end of the stream.
+#[derive(Default)]
+struct StreamedResponse {
+    text: String,
+    reasoning: String,
+    tool_calls: ToolCallAssembler,
+    usage: NormalizedUsage,
+    finish_reason: Option<ChatFinishReason>,
+    raw_finish_reason: Option<String>,
+}
+
+impl StreamedResponse {
+    /// The bytes the response limit covers: text, reasoning and tool calls.
+    fn output_bytes(&self) -> usize {
+        self.text
+            .len()
+            .saturating_add(self.reasoning.len())
+            .saturating_add(self.tool_calls.bytes())
+    }
+}
+
+fn output_limit_exceeded() -> ProviderExecutionError {
+    ProviderExecutionError::Incomplete {
+        message: "provider output exceeded its limit".to_owned(),
     }
 }
 
@@ -944,17 +1037,16 @@ fn reported_usage(event: &Value) -> Option<ReportedUsage> {
     })
 }
 
+/// Folds one event into `response`. An invalid tool-call fragment rejects
+/// the whole event, so none of its text is taken either.
 fn consume_event(
     event: &Value,
-    text: &mut String,
-    usage: &mut NormalizedUsage,
-    finish_reason: &mut Option<ChatFinishReason>,
-    raw_finish_reason: &mut Option<String>,
+    response: &mut StreamedResponse,
     max_output_bytes: usize,
 ) -> Result<Consumed, ProviderExecutionError> {
     let reported = reported_usage(event);
     if let Some(reported) = &reported {
-        *usage = reported.usage.clone();
+        response.usage = reported.usage.clone();
     }
     let mut consumed = Consumed {
         delta: None,
@@ -967,20 +1059,33 @@ fn consume_event(
     else {
         return Ok(consumed);
     };
-    if let Some(delta) = choice.get("delta")
-        && let Some(value) = delta.get("content").and_then(Value::as_str)
-    {
-        if text.len().saturating_add(value.len()) > max_output_bytes {
-            return Err(ProviderExecutionError::Incomplete {
-                message: "provider output exceeded its limit".to_owned(),
-            });
+    if let Some(delta) = choice.get("delta") {
+        if let Some(deltas) = delta.get("tool_calls") {
+            response
+                .tool_calls
+                .apply(deltas)
+                .map_err(incomplete_tool_calls)?;
+            if response.output_bytes() > max_output_bytes {
+                return Err(output_limit_exceeded());
+            }
         }
-        text.push_str(value);
-        consumed.delta = Some(value.to_owned());
+        if let Some(value) = delta.get("reasoning_content").and_then(Value::as_str) {
+            if response.output_bytes().saturating_add(value.len()) > max_output_bytes {
+                return Err(output_limit_exceeded());
+            }
+            response.reasoning.push_str(value);
+        }
+        if let Some(value) = delta.get("content").and_then(Value::as_str) {
+            if response.output_bytes().saturating_add(value.len()) > max_output_bytes {
+                return Err(output_limit_exceeded());
+            }
+            response.text.push_str(value);
+            consumed.delta = Some(value.to_owned());
+        }
     }
     if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
-        *raw_finish_reason = Some(raw.to_owned());
-        *finish_reason = Some(ChatFinishReason::from_openai_str(raw));
+        response.raw_finish_reason = Some(raw.to_owned());
+        response.finish_reason = Some(ChatFinishReason::from_openai_str(raw));
     }
     Ok(consumed)
 }
@@ -2216,5 +2321,989 @@ mod tests {
             }
             other => panic!("an invalid credential is refused, got {other:?}"),
         }
+    }
+
+    // ---- Tool calling ----------------------------------------------------
+
+    use crate::openai_compatible::{
+        ChatToolCallWire, FunctionDefinitionWire, MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALLS,
+        MAX_TOOLS, NamedFunctionWire, NamedToolChoiceWire, ToolChoiceWire, ToolWire,
+    };
+
+    const TOOL_CALLS: &str =
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+
+    /// One chunk whose delta carries the given `tool_calls` array.
+    fn tool_delta(calls: &str) -> &'static str {
+        leaked(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":{calls}}}}}]}}\n\n"
+        ))
+    }
+
+    fn tool(name: &str) -> ToolWire {
+        ToolWire {
+            tool_type: "function".to_owned(),
+            function: FunctionDefinitionWire {
+                name: name.to_owned(),
+                description: Some(format!("the {name} tool")),
+                parameters: Some(json!({"type": "object", "properties": {}})),
+                strict: None,
+            },
+        }
+    }
+
+    /// A conversation offering the named tools.
+    fn offering(names: &[&str]) -> ChatConversation {
+        ChatConversation {
+            messages: vec![ChatMessage::user("weather?")],
+            tools: names.iter().map(|name| tool(name)).collect(),
+            ..ChatConversation::default()
+        }
+    }
+
+    /// Reads a scripted body for `conversation` with the real reader.
+    fn read(
+        steps: Vec<Step>,
+        conversation: &ChatConversation,
+        sink: Option<&mut dyn ProviderOutputSink>,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        let config = ProviderExecutionConfig::default();
+        wait(read_response(
+            payload(steps, config.cancellation.clone()),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            sink,
+            conversation,
+        ))
+    }
+
+    fn call(index: u32, id: &str, name: &str, arguments: &str) -> CompletedToolCall {
+        CompletedToolCall {
+            index,
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments: arguments.to_owned(),
+        }
+    }
+
+    fn incomplete_message(
+        result: Result<ProviderExecutionResult, ProviderExecutionError>,
+    ) -> String {
+        match result {
+            Err(ProviderExecutionError::Incomplete { message }) => message,
+            other => panic!("expected an incomplete stream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_text_only_response_carries_no_tool_calls_or_reasoning() {
+        let mut sink = RecordingSink::default();
+        let result = read(
+            vec![Step::Chunk(CONTENT), Step::Chunk(STOP)],
+            &offering(&["get_weather"]),
+            Some(&mut sink),
+        )
+        .expect("a finished text stream");
+        assert_eq!(result.text, "hi");
+        assert_eq!(sink.deltas, ["hi"]);
+        assert!(result.tool_calls.is_empty());
+        assert!(!result.requests_tools());
+        assert_eq!(result.reasoning, "");
+        assert_eq!(
+            result_value(&result),
+            json!({"text": "hi", "finish_reason": "stop"})
+        );
+    }
+
+    #[test]
+    fn a_single_tool_call_is_reconstructed_with_its_wire_identity() {
+        let mut sink = RecordingSink::default();
+        let result = read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"function":{"arguments":"{\"city\":"}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"function":{"arguments":" \"Paris\"}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["get_weather"]),
+            Some(&mut sink),
+        )
+        .expect("a complete tool call");
+        assert_eq!(
+            result.tool_calls,
+            [call(0, "call_1", "get_weather", "{\"city\": \"Paris\"}")],
+            "the arguments are kept exactly as sent, spacing included"
+        );
+        assert!(result.requests_tools());
+        assert_eq!(result.text, "");
+        assert!(
+            sink.deltas.is_empty(),
+            "no tool fragment is published as output"
+        );
+        assert_eq!(result.finish_reason, Some(ChatFinishReason::ToolCalls));
+        assert_eq!(result.raw_finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn interleaved_calls_are_kept_apart_by_their_wire_index() {
+        let result = read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":1,"id":"call_b","function":{"name":"get_time","arguments":"{\"tz\""}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_a","function":{"name":"get_weather","arguments":"{\"city\""}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":1,"function":{"arguments":":\"UTC\"}"}},{"index":0,"function":{"arguments":":\"Oslo\"}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["get_weather", "get_time"]),
+            None,
+        )
+        .expect("two complete tool calls");
+        assert_eq!(
+            result.tool_calls,
+            [
+                call(0, "call_a", "get_weather", "{\"city\":\"Oslo\"}"),
+                call(1, "call_b", "get_time", "{\"tz\":\"UTC\"}"),
+            ],
+            "ordered by index, not by arrival"
+        );
+    }
+
+    #[test]
+    fn fragmented_names_and_late_metadata_reconstruct_one_call() {
+        let result = read(
+            vec![
+                // Arguments arrive before the call's id and name.
+                Step::Chunk(tool_delta(r#"[{"index":0,"function":{"arguments":"{\"q\":"}}]"#)),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_9","function":{"name":"web_"}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"call_9","function":{"name":"search","arguments":"\"世界\"}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["web_search"]),
+            None,
+        )
+        .expect("a complete tool call");
+        assert_eq!(
+            result.tool_calls,
+            [call(0, "call_9", "web_search", "{\"q\":\"世界\"}")]
+        );
+    }
+
+    #[test]
+    fn conflicting_or_malformed_fragments_are_refused_not_merged() {
+        let cases = [
+            (
+                "a different id at one index",
+                r#"[{"index":0,"id":"call_a","function":{"name":"f","arguments":"{}"}},{"index":0,"id":"call_b"}]"#,
+                "changed its id",
+            ),
+            (
+                "one id at two indexes",
+                r#"[{"index":0,"id":"call_a","function":{"name":"f","arguments":"{}"}},{"index":1,"id":"call_a","function":{"name":"f","arguments":"{}"}}]"#,
+                "two different indexes",
+            ),
+            (
+                "no index",
+                r#"[{"id":"call_a","function":{"name":"f","arguments":"{}"}}]"#,
+                "no valid `index`",
+            ),
+            (
+                "a negative index",
+                r#"[{"index":-1,"id":"call_a"}]"#,
+                "no valid `index`",
+            ),
+            (
+                "a non-function type",
+                r#"[{"index":0,"id":"call_a","type":"code_interpreter"}]"#,
+                "unsupported type",
+            ),
+            (
+                "arguments that are not a string",
+                r#"[{"index":0,"id":"call_a","function":{"name":"f","arguments":{"a":1}}}]"#,
+                "not a string",
+            ),
+            (
+                "tool_calls that is not an array",
+                r#"{"index":0}"#,
+                "not an array",
+            ),
+        ];
+        for (case, calls, expected) in cases {
+            let message = incomplete_message(read(
+                vec![Step::Chunk(tool_delta(calls)), Step::Chunk(TOOL_CALLS)],
+                &offering(&["f"]),
+                None,
+            ));
+            assert!(message.contains(expected), "{case}: {message}");
+        }
+    }
+
+    #[test]
+    fn missing_or_malformed_arguments_are_never_completed() {
+        let cases = [
+            (
+                "no arguments",
+                r#"[{"index":0,"id":"c","function":{"name":"f"}}]"#,
+            ),
+            (
+                "truncated JSON",
+                r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{\"a\":"}}]"#,
+            ),
+            (
+                "a JSON array",
+                r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"[1]"}}]"#,
+            ),
+            (
+                "trailing data",
+                r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{} {}"}}]"#,
+            ),
+        ];
+        for (case, calls) in cases {
+            let message = incomplete_message(read(
+                vec![Step::Chunk(tool_delta(calls)), Step::Chunk(TOOL_CALLS)],
+                &offering(&["f"]),
+                None,
+            ));
+            assert!(message.contains("not one JSON object"), "{case}: {message}");
+        }
+        // Arguments that a later call never had are not borrowed from an earlier one.
+        let message = incomplete_message(read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c0","function":{"name":"f","arguments":"{\"a\":1}"}},{"index":1,"id":"c1","function":{"name":"f"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["f"]),
+            None,
+        ));
+        assert!(message.contains("tool call 1"), "{message}");
+    }
+
+    #[test]
+    fn incomplete_tool_call_streams_stay_incomplete_and_keep_their_evidence() {
+        let partial =
+            tool_delta(r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{\"a\":"}}]"#);
+        let complete =
+            tool_delta(r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}}]"#);
+        let length = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n";
+        let cases: [(&str, Vec<Step>, &str); 5] = [
+            (
+                "a stream cut before its finish",
+                vec![Step::Chunk(CONTENT), Step::Chunk(partial)],
+                "without a finish event",
+            ),
+            (
+                "a tool_calls finish without a call",
+                vec![Step::Chunk(CONTENT), Step::Chunk(TOOL_CALLS)],
+                "sent no tool call",
+            ),
+            (
+                "a call truncated by the length limit",
+                vec![
+                    Step::Chunk(CONTENT),
+                    Step::Chunk(complete),
+                    Step::Chunk(length),
+                ],
+                "finish reason `length`",
+            ),
+            (
+                "a call without an id",
+                vec![
+                    Step::Chunk(CONTENT),
+                    Step::Chunk(tool_delta(
+                        r#"[{"index":0,"function":{"name":"f","arguments":"{}"}}]"#,
+                    )),
+                    Step::Chunk(TOOL_CALLS),
+                ],
+                "has no id",
+            ),
+            (
+                "a call without a name",
+                vec![
+                    Step::Chunk(CONTENT),
+                    Step::Chunk(tool_delta(
+                        r#"[{"index":0,"id":"c","function":{"arguments":"{}"}}]"#,
+                    )),
+                    Step::Chunk(TOOL_CALLS),
+                ],
+                "no valid function name",
+            ),
+        ];
+        for (case, steps, expected) in cases {
+            let mut sink = RecordingSink::default();
+            let message = incomplete_message(read(steps, &offering(&["f"]), Some(&mut sink)));
+            assert!(message.contains(expected), "{case}: {message}");
+            assert_eq!(sink.deltas, ["hi"], "{case}: the streamed text is kept");
+        }
+    }
+
+    #[test]
+    fn a_cancellation_during_argument_reconstruction_is_a_local_stop_without_tool_calls() {
+        let mut sink = RecordingSink::default();
+        let error = read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{\"a\":"}}]"#,
+                )),
+                Step::Cancel,
+                Step::Chunk(tool_delta(r#"[{"index":0,"function":{"arguments":"1}"}}]"#)),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["f"]),
+            Some(&mut sink),
+        )
+        .expect_err("a cancelled stream stops");
+        assert!(
+            matches!(&error, ProviderExecutionError::Stopped { facts: seen, .. } if *seen == facts(None, None)),
+            "got {error:?}"
+        );
+        assert!(sink.deltas.is_empty());
+    }
+
+    #[test]
+    fn a_stalled_stream_during_argument_reconstruction_is_unknown() {
+        let result =
+            ntex::rt::System::new("tool-idle-test", ntex::rt::DefaultRuntime).block_on(async {
+                let config = ProviderExecutionConfig {
+                    timeout: Duration::from_millis(100),
+                    ..ProviderExecutionConfig::default()
+                };
+                read_response(
+                    payload(
+                        vec![
+                            Step::Chunk(tool_delta(
+                                r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{"}}]"#,
+                            )),
+                            Step::Stall,
+                        ],
+                        config.cancellation.clone(),
+                    ),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    None,
+                    &offering(&["f"]),
+                )
+                .await
+            });
+        assert!(
+            matches!(result, Err(ProviderExecutionError::Unknown { .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn text_reasoning_and_tool_calls_in_one_response_are_each_kept() {
+        let mut sink = RecordingSink::default();
+        let result = read(
+            vec![
+                Step::Chunk(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"need \"}}]}\n\n",
+                ),
+                Step::Chunk(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"weather\"}}]}\n\n",
+                ),
+                Step::Chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Checking.\"}}]}\n\n"),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c","function":{"name":"get_weather","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["get_weather"]),
+            Some(&mut sink),
+        )
+        .expect("a mixed response");
+        assert_eq!(result.text, "Checking.");
+        assert_eq!(sink.deltas, ["Checking."], "only the text is published");
+        assert_eq!(result.reasoning, "need weather");
+        assert_eq!(result.tool_calls, [call(0, "c", "get_weather", "{}")]);
+        assert!(result.requests_tools());
+    }
+
+    #[test]
+    fn a_tool_call_exchange_is_neither_a_final_answer_nor_available_evidence() {
+        let forced = ChatConversation {
+            tool_choice: Some(ToolChoiceWire::Named(NamedToolChoiceWire {
+                kind: "function".to_owned(),
+                function: NamedFunctionWire {
+                    name: "f".to_owned(),
+                },
+            })),
+            ..offering(&["f", "g"])
+        };
+        // A forced function finishes with `stop` on the OpenAI wire.
+        let result = read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(STOP),
+            ],
+            &forced,
+            None,
+        )
+        .expect("a forced call");
+        assert_eq!(result.raw_finish_reason.as_deref(), Some("stop"));
+        assert!(
+            result.requests_tools(),
+            "a stop beside tool calls still asks for tools"
+        );
+
+        let result = read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["f"]),
+            None,
+        )
+        .expect("a tool call");
+        assert_ne!(
+            success_observation(&result).classification(),
+            crate::persistence::AvailabilityClassification::Available,
+            "a tool_calls finish is not a normal terminal answer"
+        );
+        assert_eq!(
+            result_value(&result),
+            json!({"text": "", "finish_reason": "tool_calls"}),
+            "nothing claims a tool ran or produced output"
+        );
+    }
+
+    #[test]
+    fn tool_calls_beyond_what_the_request_allowed_are_refused() {
+        let call_f =
+            tool_delta(r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}}]"#);
+        let none = ChatConversation {
+            tool_choice: Some(ToolChoiceWire::Mode("none".to_owned())),
+            ..offering(&["f"])
+        };
+        let serial = ChatConversation {
+            parallel_tool_calls: Some(false),
+            ..offering(&["f"])
+        };
+        let cases: [(&str, ChatConversation, &'static str); 4] = [
+            (
+                "a Job objective offers no tools",
+                ChatConversation::default(),
+                call_f,
+            ),
+            ("an undeclared tool", offering(&["g"]), call_f),
+            ("tool_choice none", none, call_f),
+            (
+                "parallel calls turned off",
+                serial,
+                tool_delta(
+                    r#"[{"index":0,"id":"a","function":{"name":"f","arguments":"{}"}},{"index":1,"id":"b","function":{"name":"f","arguments":"{}"}}]"#,
+                ),
+            ),
+        ];
+        for (case, conversation, calls) in cases {
+            let message = incomplete_message(read(
+                vec![Step::Chunk(calls), Step::Chunk(TOOL_CALLS)],
+                &conversation,
+                None,
+            ));
+            assert!(
+                message.contains("invalid provider tool call"),
+                "{case}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_tool_calls_are_bounded_per_call_and_per_response() {
+        let oversized = leaked(format!(
+            "[{{\"index\":0,\"id\":\"c\",\"function\":{{\"name\":\"f\",\"arguments\":\"{}\"}}}}]",
+            "a".repeat(60 * 1024)
+        ));
+        let mut steps = vec![Step::Chunk(tool_delta(oversized))];
+        let more = leaked(format!(
+            "[{{\"index\":0,\"function\":{{\"arguments\":\"{}\"}}}}]",
+            "a".repeat(60 * 1024)
+        ));
+        steps.extend(
+            (0..MAX_TOOL_ARGUMENTS_BYTES / (60 * 1024)).map(|_| Step::Chunk(tool_delta(more))),
+        );
+        steps.push(Step::Chunk(TOOL_CALLS));
+        let message = incomplete_message(read(steps, &offering(&["f"]), None));
+        assert!(message.contains("arguments longer than"), "{message}");
+
+        let calls: Vec<String> = (0..=MAX_TOOL_CALLS)
+            .map(|index| format!("{{\"index\":{index},\"id\":\"c{index}\"}}"))
+            .collect();
+        let message = incomplete_message(read(
+            vec![Step::Chunk(tool_delta(leaked(format!(
+                "[{}]",
+                calls.join(",")
+            ))))],
+            &offering(&["f"]),
+            None,
+        ));
+        assert!(message.contains("more than"), "{message}");
+
+        let long_name = leaked(format!(
+            "[{{\"index\":0,\"id\":\"c\",\"function\":{{\"name\":\"{}\"}}}}]",
+            "n".repeat(65)
+        ));
+        let message = incomplete_message(read(
+            vec![Step::Chunk(tool_delta(long_name))],
+            &offering(&["f"]),
+            None,
+        ));
+        assert!(message.contains("function name longer"), "{message}");
+
+        // Text, reasoning and tool calls share one response limit: the two
+        // text bytes fit, the four bytes of the call that follows do not.
+        let config = ProviderExecutionConfig {
+            max_output_bytes: 5,
+            ..ProviderExecutionConfig::default()
+        };
+        let mut sink = RecordingSink::default();
+        let error = wait(read_response(
+            payload(
+                vec![
+                    Step::Chunk(CONTENT),
+                    Step::Chunk(tool_delta(
+                        r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}}]"#,
+                    )),
+                    Step::Chunk(TOOL_CALLS),
+                ],
+                config.cancellation.clone(),
+            ),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            Some(&mut sink),
+            &offering(&["f"]),
+        ))
+        .expect_err("the response limit stops the stream");
+        assert!(
+            matches!(&error, ProviderExecutionError::Incomplete { message } if message.contains("exceeded its limit")),
+            "got {error:?}"
+        );
+        assert_eq!(sink.deltas, ["hi"]);
+    }
+
+    #[test]
+    fn usage_in_a_tool_call_stream_is_observed_exactly_as_in_a_text_stream() {
+        let steps = |middle: &'static str, finish: &'static str| {
+            vec![
+                Step::Chunk(running_total(
+                    "{\"prompt_tokens\":5,\"completion_tokens\":1}",
+                )),
+                Step::Chunk(middle),
+                Step::Chunk(running_total(
+                    "{\"prompt_tokens\":5,\"completion_tokens\":3}",
+                )),
+                Step::Chunk(finish),
+                Step::Chunk(usage_only("{\"prompt_tokens\":5,\"completion_tokens\":4}")),
+                Step::Chunk(DONE),
+            ]
+        };
+        let mut text_sink = RecordingSink::default();
+        let text = read(
+            steps(CONTENT, STOP),
+            &offering(&["f"]),
+            Some(&mut text_sink),
+        )
+        .expect("a text stream");
+        let mut tool_sink = RecordingSink::default();
+        let tools = read(
+            steps(
+                tool_delta(r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}}]"#),
+                TOOL_CALLS,
+            ),
+            &offering(&["f"]),
+            Some(&mut tool_sink),
+        )
+        .expect("a tool call stream");
+        assert_eq!(tool_sink.usages(), text_sink.usages());
+        assert_eq!(tool_sink.usages().len(), 3);
+        assert_eq!(tools.usage, text.usage);
+    }
+
+    #[test]
+    fn the_objective_request_body_is_unchanged() {
+        let parameters = LlmParameters {
+            temperature: Some(0.5),
+            max_tokens: Some(64),
+            ..LlmParameters::default()
+        };
+        let conversation = ChatConversation {
+            messages: vec![ChatMessage::system("be brief"), ChatMessage::user("hi")],
+            ..ChatConversation::default()
+        };
+        assert_eq!(
+            request_body("model-a", &parameters, &conversation).expect("a body"),
+            json!({
+                "model": "model-a",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "stream": true,
+                "stream_options": {"include_usage": true},
+                "temperature": 0.5,
+                "max_tokens": 64,
+            })
+        );
+    }
+
+    #[test]
+    fn an_assistant_tool_turn_and_its_results_serialize_in_order_with_exact_arguments() {
+        let arguments = "{ \"city\" : \"Paris\",\"units\":\"c\" }";
+        let mut assistant = ChatMessage::assistant(
+            None,
+            vec![ChatToolCallWire::from(&call(
+                0,
+                "call_1",
+                "get_weather",
+                arguments,
+            ))],
+        );
+        assistant.reasoning_content = Some("need weather".to_owned());
+        let conversation = ChatConversation {
+            messages: vec![
+                ChatMessage::user("weather?"),
+                assistant,
+                ChatMessage::tool("call_1", "18C"),
+            ],
+            tool_choice: Some(ToolChoiceWire::Mode("auto".to_owned())),
+            parallel_tool_calls: Some(true),
+            ..offering(&["get_weather"])
+        };
+        conversation.validate().expect("a valid conversation");
+        let body =
+            request_body("model-a", &LlmParameters::default(), &conversation).expect("a body");
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "need weather",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": arguments},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "18C"},
+            ])
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "the get_weather tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }])
+        );
+        assert_eq!(body["tool_choice"], json!("auto"));
+        assert_eq!(body["parallel_tool_calls"], json!(true));
+        assert_eq!(body["model"], json!("model-a"), "the frozen model is sent");
+    }
+
+    #[test]
+    fn invalid_or_unsupported_conversations_are_refused_before_sending() {
+        let answered = |id: &str| {
+            vec![
+                ChatMessage::user("q"),
+                ChatMessage::assistant(None, vec![ChatToolCallWire::from(&call(0, id, "f", "{}"))]),
+                ChatMessage::tool(id, "r"),
+            ]
+        };
+        let mut unsupported_type = tool("f");
+        unsupported_type.tool_type = "retrieval".to_owned();
+        let mut non_object_parameters = tool("f");
+        non_object_parameters.function.parameters = Some(json!("string"));
+        let mut duplicate_ids = answered("x");
+        duplicate_ids.extend(answered("x").into_iter().skip(1));
+        let cases: Vec<(&str, ChatConversation, &str)> = vec![
+            ("no messages", ChatConversation::default(), "messages"),
+            (
+                "an unsupported tool type",
+                ChatConversation {
+                    tools: vec![unsupported_type],
+                    ..offering(&[])
+                },
+                "tools[0].type",
+            ),
+            (
+                "an invalid tool name",
+                offering(&["get weather"]),
+                "tools[0].function.name",
+            ),
+            (
+                "a tool offered twice",
+                offering(&["f", "f"]),
+                "tools[1].function.name",
+            ),
+            (
+                "non-object parameters",
+                ChatConversation {
+                    tools: vec![non_object_parameters],
+                    ..offering(&[])
+                },
+                "tools[0].function.parameters",
+            ),
+            (
+                "tool_choice without tools",
+                ChatConversation {
+                    tool_choice: Some(ToolChoiceWire::Mode("auto".to_owned())),
+                    ..offering(&[])
+                },
+                "tool_choice",
+            ),
+            (
+                "a forced tool that is not offered",
+                ChatConversation {
+                    tool_choice: Some(ToolChoiceWire::Named(NamedToolChoiceWire {
+                        kind: "function".to_owned(),
+                        function: NamedFunctionWire {
+                            name: "g".to_owned(),
+                        },
+                    })),
+                    ..offering(&["f"])
+                },
+                "tool_choice.function.name",
+            ),
+            (
+                "an unknown tool_choice mode",
+                ChatConversation {
+                    tool_choice: Some(ToolChoiceWire::Mode("sometimes".to_owned())),
+                    ..offering(&["f"])
+                },
+                "tool_choice",
+            ),
+            (
+                "an unanswered tool call",
+                ChatConversation {
+                    messages: answered("x")[..2].to_vec(),
+                    ..offering(&["f"])
+                },
+                "never answered",
+            ),
+            (
+                "a tool result for an unknown call",
+                ChatConversation {
+                    messages: vec![ChatMessage::user("q"), ChatMessage::tool("x", "r")],
+                    ..offering(&["f"])
+                },
+                "messages[1].tool_call_id",
+            ),
+            (
+                "a message between a call and its result",
+                ChatConversation {
+                    messages: vec![
+                        answered("x")[0].clone(),
+                        answered("x")[1].clone(),
+                        ChatMessage::user("interrupt"),
+                        answered("x")[2].clone(),
+                    ],
+                    ..offering(&["f"])
+                },
+                "messages[2]",
+            ),
+            (
+                "a tool call id used twice",
+                ChatConversation {
+                    messages: duplicate_ids,
+                    ..offering(&["f"])
+                },
+                "messages[3].tool_calls[0].id",
+            ),
+            (
+                "an empty tool_calls array",
+                ChatConversation {
+                    messages: vec![ChatMessage::user("q"), {
+                        let mut message = ChatMessage::assistant(Some("a".to_owned()), Vec::new());
+                        message.tool_calls = Some(Vec::new());
+                        message
+                    }],
+                    ..offering(&["f"])
+                },
+                "messages[1].tool_calls",
+            ),
+            (
+                "malformed tool call arguments",
+                ChatConversation {
+                    messages: vec![
+                        ChatMessage::user("q"),
+                        ChatMessage::assistant(
+                            None,
+                            vec![ChatToolCallWire::from(&call(0, "x", "f", "{oops"))],
+                        ),
+                        ChatMessage::tool("x", "r"),
+                    ],
+                    ..offering(&["f"])
+                },
+                "tool_calls[0].function.arguments",
+            ),
+        ];
+        for (case, conversation, field) in cases {
+            let error = conversation.validate().expect_err(case);
+            assert!(error.to_string().contains(field), "{case}: {error}");
+        }
+        answered("x");
+        ChatConversation {
+            messages: answered("x"),
+            ..offering(&["f"])
+        }
+        .validate()
+        .expect("an answered call is valid");
+    }
+
+    #[test]
+    fn tool_definitions_and_arguments_are_size_limited() {
+        let mut huge = tool("f");
+        huge.function.description = Some("d".repeat(64 * 1024));
+        let names: Vec<String> = (0..=MAX_TOOLS).map(|index| format!("t{index}")).collect();
+        let too_many = offering(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let oversized_arguments = format!("{{\"a\":\"{}\"}}", "a".repeat(MAX_TOOL_ARGUMENTS_BYTES));
+        let long_id = "i".repeat(257);
+        let cases: Vec<(&str, ChatConversation, &str)> = vec![
+            (
+                "an oversized definition",
+                ChatConversation {
+                    tools: vec![huge],
+                    ..offering(&[])
+                },
+                "tools[0].function",
+            ),
+            ("too many tools", too_many, "tools"),
+            (
+                "oversized arguments",
+                ChatConversation {
+                    messages: vec![
+                        ChatMessage::user("q"),
+                        ChatMessage::assistant(
+                            None,
+                            vec![ChatToolCallWire::from(&call(
+                                0,
+                                "x",
+                                "f",
+                                &oversized_arguments,
+                            ))],
+                        ),
+                        ChatMessage::tool("x", "r"),
+                    ],
+                    ..offering(&["f"])
+                },
+                "function.arguments",
+            ),
+            (
+                "an oversized id",
+                ChatConversation {
+                    messages: vec![
+                        ChatMessage::user("q"),
+                        ChatMessage::assistant(
+                            None,
+                            vec![ChatToolCallWire::from(&call(0, &long_id, "f", "{}"))],
+                        ),
+                        ChatMessage::tool(long_id.clone(), "r"),
+                    ],
+                    ..offering(&["f"])
+                },
+                "tool_calls[0].id",
+            ),
+        ];
+        for (case, conversation, field) in cases {
+            let error = conversation.validate().expect_err(case);
+            assert!(error.to_string().contains(field), "{case}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_conversation_is_never_sent_and_is_known_not_delivered() {
+        let frozen = FrozenExecutionConfig {
+            agent: None,
+            llm: crate::persistence::FrozenLlmConfig {
+                config: crate::persistence::LlmConfig {
+                    model: "model-a".to_owned(),
+                    parameters: LlmParameters::default(),
+                    declared_capabilities: Default::default(),
+                },
+                provider: crate::persistence::ProviderSnapshot {
+                    id: crate::persistence::LlmProviderId::new(1),
+                    name: "local".to_owned(),
+                    transport: crate::persistence::LlmTransport::OpenAiChatCompletions,
+                    // Nothing listens here; validation must refuse first.
+                    endpoint: Some("https://127.0.0.1:9/v1".to_owned()),
+                    credential_ref: None,
+                },
+            },
+        };
+        let conversation = ChatConversation {
+            messages: vec![ChatMessage::user("q"), ChatMessage::tool("x", "r")],
+            ..offering(&["f"])
+        };
+        let mut sink = RecordingSink::default();
+        let error = wait(execute_conversation(
+            &frozen,
+            &conversation,
+            &EnvironmentCredentialResolver,
+            &ProviderExecutionConfig::default(),
+            Some(&mut sink),
+        ))
+        .expect_err("an invalid conversation is refused");
+        assert!(
+            matches!(&error, ProviderExecutionError::Build { message } if message.contains("tool_call_id")),
+            "got {error:?}"
+        );
+        assert_eq!(
+            sink.observations
+                .iter()
+                .map(|observation| observation.fact.clone())
+                .collect::<Vec<_>>(),
+            [ProviderFact::NotDelivered]
+        );
+        assert_eq!(error_observation(&error), None);
+
+        let objective = objective_conversation(
+            &FrozenExecutionConfig {
+                agent: Some(crate::persistence::AgentConfig {
+                    instructions: Some("be brief".to_owned()),
+                }),
+                ..frozen
+            },
+            Some("hi"),
+        );
+        objective
+            .validate()
+            .expect("an objective is a valid conversation");
+        assert!(objective.tools.is_empty() && objective.tool_choice.is_none());
+        assert_eq!(
+            serde_json::to_value(&objective.messages).expect("messages"),
+            json!([
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"},
+            ])
+        );
     }
 }

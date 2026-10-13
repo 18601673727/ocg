@@ -27,12 +27,14 @@ pub mod stream;
 pub use error::{ProviderFailure, TransportError};
 pub use normalize::ToolCallNormalizer;
 pub use request::{
-    ChatFunctionCallWire, ChatMessage, ChatRequest, ChatRole, ChatToolCallWire, ContentPartWire,
-    FunctionDefinitionWire, JsonSchemaWire, MessageContentWire, NamedFunctionWire,
-    NamedToolChoiceWire, ResponseFormatWire, StopSequences, StreamOptions, ToolChoiceWire,
-    ToolWire,
+    ChatConversation, ChatFunctionCallWire, ChatMessage, ChatRequest, ChatRole, ChatToolCallWire,
+    ContentPartWire, FunctionDefinitionWire, JsonSchemaWire, MAX_FUNCTION_NAME_BYTES,
+    MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS, MAX_TOOL_DEFINITION_BYTES,
+    MAX_TOOLS, MessageContentWire, NamedFunctionWire, NamedToolChoiceWire, ResponseFormatWire,
+    StopSequences, StreamOptions, ToolChoiceWire, ToolWire, is_function_name,
 };
 pub use response::ChatCompletionChunk;
 pub use stream::{
-    ChatFinishReason, ChatStreamEvent, ChatStreamSummary, CompletedToolCall, NormalizedUsage,
+    ChatFinishReason, ChatStreamEvent, ChatStreamSummary, CompletedToolCall, InvalidToolCall,
+    NormalizedUsage, ToolCallAssembler,
 };

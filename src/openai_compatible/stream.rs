@@ -2,7 +2,13 @@
 //!
 //! Normalized streaming events for the OpenAI Chat Completions wire format.
 
-use serde_json::Value;
+use serde::de::IgnoredAny;
+use serde_json::{Map, Value};
+
+use super::request::{
+    MAX_FUNCTION_NAME_BYTES, MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS,
+    is_function_name,
+};
 
 /// OpenAI-compatible finish reason for SSE framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +137,240 @@ pub struct CompletedToolCall {
     pub name: String,
     /// JSON-encoded arguments, as on the OpenAI wire.
     pub arguments: String,
+}
+
+/// Tool-call output a Provider sent that cannot be taken as a complete,
+/// well-formed tool call.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid provider tool call: {message}")]
+pub struct InvalidToolCall {
+    pub message: String,
+}
+
+impl InvalidToolCall {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Reconstructs the streamed `delta.tool_calls` of one choice. Fragments are
+/// keyed by their wire `index`, never by arrival order, so interleaved calls
+/// stay apart. Name and argument fragments are concatenated exactly as sent;
+/// an id may repeat, but a different id at one index, or one id at two
+/// indexes, is a conflict and is refused rather than merged.
+#[derive(Debug, Clone, Default)]
+pub struct ToolCallAssembler {
+    /// Ordered by `index`. An empty id or name has not been sent yet.
+    calls: Vec<CompletedToolCall>,
+    bytes: usize,
+}
+
+impl ToolCallAssembler {
+    /// Folds one `delta.tool_calls` value. `null` carries nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidToolCall`] for a malformed fragment, a conflicting
+    /// identity, or a fragment beyond the per-call or per-response limits.
+    pub fn apply(&mut self, deltas: &Value) -> Result<(), InvalidToolCall> {
+        let deltas = match deltas {
+            Value::Null => return Ok(()),
+            Value::Array(deltas) => deltas,
+            _ => return Err(InvalidToolCall::new("`tool_calls` is not an array")),
+        };
+        for delta in deltas {
+            self.apply_one(delta)?;
+        }
+        Ok(())
+    }
+
+    fn apply_one(&mut self, delta: &Value) -> Result<(), InvalidToolCall> {
+        let fields = delta
+            .as_object()
+            .ok_or_else(|| InvalidToolCall::new("a tool call delta is not an object"))?;
+        let index = fields
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or_else(|| InvalidToolCall::new("a tool call delta has no valid `index`"))?;
+        let id = fragment(fields, "id", index)?;
+        if let Some(kind) = fragment(fields, "type", index)?
+            && kind != "function"
+        {
+            return Err(InvalidToolCall::new(format!(
+                "tool call {index} has unsupported type `{kind}`"
+            )));
+        }
+        let function = match fields.get("function") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(function)) => Some(function),
+            Some(_) => {
+                return Err(InvalidToolCall::new(format!(
+                    "tool call {index} has a `function` that is not an object"
+                )));
+            }
+        };
+        let name = function
+            .map(|function| fragment(function, "name", index))
+            .transpose()?
+            .flatten();
+        let arguments = function
+            .map(|function| fragment(function, "arguments", index))
+            .transpose()?
+            .flatten();
+
+        if let Some(id) = id
+            && self
+                .calls
+                .iter()
+                .any(|call| call.index != index && call.id == id)
+        {
+            return Err(InvalidToolCall::new(format!(
+                "tool call id `{id}` was sent for two different indexes"
+            )));
+        }
+        let mut added = 0;
+        let call = self.slot(index)?;
+        if let Some(id) = id {
+            if call.id.is_empty() {
+                if id.len() > MAX_TOOL_CALL_ID_BYTES {
+                    return Err(InvalidToolCall::new(format!(
+                        "tool call {index} has an id longer than {MAX_TOOL_CALL_ID_BYTES} bytes"
+                    )));
+                }
+                call.id.push_str(id);
+                added += id.len();
+            } else if call.id != id {
+                return Err(InvalidToolCall::new(format!(
+                    "tool call {index} changed its id from `{}` to `{id}`",
+                    call.id
+                )));
+            }
+        }
+        if let Some(name) = name {
+            if call.name.len().saturating_add(name.len()) > MAX_FUNCTION_NAME_BYTES {
+                return Err(InvalidToolCall::new(format!(
+                    "tool call {index} has a function name longer than {MAX_FUNCTION_NAME_BYTES} bytes"
+                )));
+            }
+            call.name.push_str(name);
+            added += name.len();
+        }
+        if let Some(arguments) = arguments {
+            if call.arguments.len().saturating_add(arguments.len()) > MAX_TOOL_ARGUMENTS_BYTES {
+                return Err(InvalidToolCall::new(format!(
+                    "tool call {index} has arguments longer than {MAX_TOOL_ARGUMENTS_BYTES} bytes"
+                )));
+            }
+            call.arguments.push_str(arguments);
+            added += arguments.len();
+        }
+        self.bytes = self.bytes.saturating_add(added);
+        Ok(())
+    }
+
+    fn slot(&mut self, index: u32) -> Result<&mut CompletedToolCall, InvalidToolCall> {
+        let position = match self.calls.binary_search_by_key(&index, |call| call.index) {
+            Ok(position) => position,
+            Err(position) => {
+                if self.calls.len() >= MAX_TOOL_CALLS {
+                    return Err(InvalidToolCall::new(format!(
+                        "the response has more than {MAX_TOOL_CALLS} tool calls"
+                    )));
+                }
+                self.calls.insert(
+                    position,
+                    CompletedToolCall {
+                        index,
+                        ..CompletedToolCall::default()
+                    },
+                );
+                position
+            }
+        };
+        Ok(&mut self.calls[position])
+    }
+
+    /// The bytes of ids, names and arguments taken so far.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// The completed tool calls of a stream that ended with `finish`, ordered
+    /// by their wire index. A call is complete only with an id, a valid
+    /// function name and arguments that are one JSON object; the arguments
+    /// are returned exactly as sent. Tool calls are complete only beside a
+    /// `tool_calls` or `stop` finish (a forced function choice finishes with
+    /// `stop`), and a `tool_calls` finish without any call is incomplete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidToolCall`] when any call, or the finish, is not
+    /// complete. Nothing partial is returned.
+    pub fn finish(
+        self,
+        finish: Option<ChatFinishReason>,
+    ) -> Result<Vec<CompletedToolCall>, InvalidToolCall> {
+        if self.calls.is_empty() {
+            if finish == Some(ChatFinishReason::ToolCalls) {
+                return Err(InvalidToolCall::new(
+                    "the response finished with `tool_calls` but sent no tool call",
+                ));
+            }
+            return Ok(self.calls);
+        }
+        if !matches!(
+            finish,
+            Some(ChatFinishReason::ToolCalls | ChatFinishReason::Stop)
+        ) {
+            return Err(InvalidToolCall::new(format!(
+                "tool calls ended with finish reason `{}`",
+                finish.map_or("none", ChatFinishReason::as_openai_str)
+            )));
+        }
+        for call in &self.calls {
+            let index = call.index;
+            if call.id.trim().is_empty() {
+                return Err(InvalidToolCall::new(format!("tool call {index} has no id")));
+            }
+            if !is_function_name(&call.name) {
+                return Err(InvalidToolCall::new(format!(
+                    "tool call {index} has no valid function name"
+                )));
+            }
+            if !is_json_object(&call.arguments) {
+                return Err(InvalidToolCall::new(format!(
+                    "tool call {index} arguments are not one JSON object"
+                )));
+            }
+        }
+        Ok(self.calls)
+    }
+}
+
+/// An optional string field of a tool call delta. Absent, `null` and empty
+/// carry nothing; any other non-string is malformed.
+fn fragment<'a>(
+    fields: &'a Map<String, Value>,
+    key: &str,
+    index: u32,
+) -> Result<Option<&'a str>, InvalidToolCall> {
+    match fields.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str()).filter(|value| !value.is_empty())),
+        Some(_) => Err(InvalidToolCall::new(format!(
+            "tool call {index} has a `{key}` that is not a string"
+        ))),
+    }
+}
+
+/// Whether `text` is exactly one JSON object, checked without building it.
+fn is_json_object(text: &str) -> bool {
+    text.trim_start().starts_with('{') && serde_json::from_str::<IgnoredAny>(text).is_ok()
 }
 
 /// The accumulated result of a normalized stream, suitable for usage

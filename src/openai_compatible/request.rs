@@ -3,11 +3,12 @@
 //! Strict request validation for the OpenAI Chat Completions wire format.
 //! Unknown fields are rejected on deserialization.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use super::error::TransportError;
+use super::stream::{CompletedToolCall, InvalidToolCall};
 
 /// An OpenAI Chat Completions request, restricted to the fields this transport
 /// explicitly forwards. Unknown fields are rejected on deserialization.
@@ -154,6 +155,167 @@ impl ChatRequest {
     }
 }
 
+/// The conversation part of one outgoing Chat Completions request: its
+/// messages, in order, and the function tools offered with them. The model
+/// and sampling parameters are deliberately absent; they come from the
+/// frozen execution configuration and nothing here can change them.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChatConversation {
+    pub messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoiceWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+}
+
+impl ChatConversation {
+    /// Validates the conversation before it is sent: every message and tool
+    /// definition, their limits, and the tool-call structure. Each assistant
+    /// tool call has a unique id and is answered by exactly one tool message,
+    /// and those answers follow it before any other message.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`TransportError`] for the first invalid or
+    /// unsupported field.
+    pub fn validate(&self) -> Result<(), TransportError> {
+        if self.messages.is_empty() {
+            return Err(TransportError::invalid(
+                "messages",
+                "at least one message is required",
+            ));
+        }
+        if self.tools.len() > MAX_TOOLS {
+            return Err(TransportError::invalid(
+                "tools",
+                format!("at most {MAX_TOOLS} tools may be offered"),
+            ));
+        }
+        for (index, tool) in self.tools.iter().enumerate() {
+            tool.validate(index)?;
+            if self.tools[..index]
+                .iter()
+                .any(|earlier| earlier.function.name == tool.function.name)
+            {
+                return Err(TransportError::invalid(
+                    format!("tools[{index}].function.name"),
+                    format!("tool `{}` is offered twice", tool.function.name),
+                ));
+            }
+        }
+        if self.tools.is_empty() {
+            if self.tool_choice.is_some() {
+                return Err(TransportError::invalid(
+                    "tool_choice",
+                    "tool_choice requires tools",
+                ));
+            }
+            if self.parallel_tool_calls.is_some() {
+                return Err(TransportError::invalid(
+                    "parallel_tool_calls",
+                    "parallel_tool_calls requires tools",
+                ));
+            }
+        }
+        if let Some(choice) = &self.tool_choice {
+            validate_tool_choice(choice)?;
+            if let ToolChoiceWire::Named(named) = choice
+                && !self.offers(&named.function.name)
+            {
+                return Err(TransportError::invalid(
+                    "tool_choice.function.name",
+                    format!("tool `{}` is not offered", named.function.name),
+                ));
+            }
+        }
+
+        let mut issued = HashSet::new();
+        let mut pending: Vec<&str> = Vec::new();
+        for (index, message) in self.messages.iter().enumerate() {
+            message.validate(index)?;
+            if message.role == ChatRole::Tool {
+                let id = message.tool_call_id.as_deref().unwrap_or_default();
+                let Some(position) = pending.iter().position(|pending| *pending == id) else {
+                    return Err(TransportError::invalid(
+                        format!("messages[{index}].tool_call_id"),
+                        format!("`{id}` does not answer an unanswered tool call just before it"),
+                    ));
+                };
+                pending.swap_remove(position);
+                continue;
+            }
+            if let Some(id) = pending.first() {
+                return Err(TransportError::invalid(
+                    format!("messages[{index}]"),
+                    format!("tool call `{id}` must be answered before the next message"),
+                ));
+            }
+            let Some(calls) = &message.tool_calls else {
+                continue;
+            };
+            if calls.is_empty() || calls.len() > MAX_TOOL_CALLS {
+                return Err(TransportError::invalid(
+                    format!("messages[{index}].tool_calls"),
+                    format!("an assistant message carries 1 to {MAX_TOOL_CALLS} tool calls"),
+                ));
+            }
+            for (call_index, call) in calls.iter().enumerate() {
+                if !issued.insert(call.id.as_str()) {
+                    return Err(TransportError::invalid(
+                        format!("messages[{index}].tool_calls[{call_index}].id"),
+                        format!("tool call id `{}` is used twice", call.id),
+                    ));
+                }
+                pending.push(&call.id);
+            }
+        }
+        if let Some(id) = pending.first() {
+            return Err(TransportError::invalid(
+                "messages",
+                format!("tool call `{id}` is never answered"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn offers(&self, name: &str) -> bool {
+        self.tools.iter().any(|tool| tool.function.name == name)
+    }
+
+    /// Checks the completed tool calls a Provider returned for this
+    /// conversation against what it allowed: only offered tools, only the
+    /// named one when a function was forced, none with `tool_choice: none`,
+    /// and one at most when parallel calls were turned off.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidToolCall`] for the first call that was not allowed.
+    pub fn admit_tool_calls(&self, calls: &[CompletedToolCall]) -> Result<(), InvalidToolCall> {
+        if self.parallel_tool_calls == Some(false) && calls.len() > 1 {
+            return Err(InvalidToolCall::new(format!(
+                "{} tool calls were returned with parallel_tool_calls off",
+                calls.len()
+            )));
+        }
+        for call in calls {
+            let allowed = match &self.tool_choice {
+                Some(ToolChoiceWire::Mode(mode)) if mode == "none" => false,
+                Some(ToolChoiceWire::Named(named)) => named.function.name == call.name,
+                _ => self.offers(&call.name),
+            };
+            if !allowed {
+                return Err(InvalidToolCall::new(format!(
+                    "tool call {} names `{}`, which this request did not allow",
+                    call.index, call.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// OpenAI `stream_options`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -181,22 +343,75 @@ impl StopSequences {
 }
 
 /// One message in the request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: ChatRole,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContentWire>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatToolCallWire>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(default)]
+    /// Forwarded only when set: some Providers require an assistant turn's
+    /// reasoning back with its tool calls, others refuse it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+}
+
+impl ChatMessage {
+    fn with_role(role: ChatRole) -> Self {
+        Self {
+            role,
+            content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            refusal: None,
+        }
+    }
+
+    #[must_use]
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            content: Some(MessageContentWire::Text(content.into())),
+            ..Self::with_role(ChatRole::System)
+        }
+    }
+
+    #[must_use]
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            content: Some(MessageContentWire::Text(content.into())),
+            ..Self::with_role(ChatRole::User)
+        }
+    }
+
+    /// An assistant turn, as a Provider returned it: its text, if any, and
+    /// the tool calls it made, if any.
+    #[must_use]
+    pub fn assistant(content: Option<String>, tool_calls: Vec<ChatToolCallWire>) -> Self {
+        Self {
+            content: content.map(MessageContentWire::Text),
+            tool_calls: Some(tool_calls).filter(|calls| !calls.is_empty()),
+            ..Self::with_role(ChatRole::Assistant)
+        }
+    }
+
+    /// The result of the tool call `tool_call_id`.
+    #[must_use]
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            content: Some(MessageContentWire::Text(content.into())),
+            tool_call_id: Some(tool_call_id.into()),
+            ..Self::with_role(ChatRole::Tool)
+        }
+    }
 }
 
 impl ChatMessage {
@@ -307,7 +522,7 @@ impl ChatMessage {
 }
 
 /// Message role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
     System,
@@ -319,7 +534,7 @@ pub enum ChatRole {
 }
 
 /// Message content: a string or an array of content parts.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum MessageContentWire {
     Text(String),
@@ -356,14 +571,14 @@ impl MessageContentWire {
 
 /// A supported content part. Non-text parts (images, audio, files) are
 /// rejected during deserialization.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentPartWire {
     Text { text: String },
 }
 
 /// One tool definition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolWire {
     #[serde(rename = "type")]
@@ -379,43 +594,128 @@ impl ToolWire {
                 format!("unsupported tool type `{}`", self.tool_type),
             ));
         }
-        require_function_name(&self.function.name, &format!("tools[{index}]"))
+        require_function_name(&self.function.name, &format!("tools[{index}]"))?;
+        if let Some(parameters) = &self.function.parameters
+            && !parameters.is_object()
+        {
+            return Err(TransportError::invalid(
+                format!("tools[{index}].function.parameters"),
+                "function parameters must be a JSON Schema object",
+            ));
+        }
+        if !serializes_within(&self.function, MAX_TOOL_DEFINITION_BYTES) {
+            return Err(TransportError::invalid(
+                format!("tools[{index}].function"),
+                format!("a tool definition must not exceed {MAX_TOOL_DEFINITION_BYTES} bytes"),
+            ));
+        }
+        Ok(())
     }
 }
 
-/// Requires a non-blank function name. `field` names the owning tool entry
+/// Most tools one request may offer.
+pub const MAX_TOOLS: usize = 128;
+/// Most tool calls one assistant message or one streamed response may carry.
+pub const MAX_TOOL_CALLS: usize = 128;
+/// Longest function name, as the OpenAI function-calling contract allows.
+pub const MAX_FUNCTION_NAME_BYTES: usize = 64;
+/// Longest tool call id.
+pub const MAX_TOOL_CALL_ID_BYTES: usize = 256;
+/// Largest compact serialization of one function definition.
+pub const MAX_TOOL_DEFINITION_BYTES: usize = 64 * 1024;
+/// Largest serialized arguments of one tool call.
+pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
+
+/// Whether `name` is a function name of the OpenAI contract: 1 to 64 ASCII
+/// letters, digits, underscores or dashes.
+#[must_use]
+pub fn is_function_name(name: &str) -> bool {
+    (1..=MAX_FUNCTION_NAME_BYTES).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// Requires a valid function name. `field` names the owning tool entry
 /// and is used to build the error path `{field}.function.name`.
 fn require_function_name(name: &str, field: &str) -> Result<(), TransportError> {
-    if name.trim().is_empty() {
+    if !is_function_name(name) {
         return Err(TransportError::invalid(
             format!("{field}.function.name"),
-            "tool name must not be empty",
+            format!(
+                "a function name is 1 to {MAX_FUNCTION_NAME_BYTES} ASCII letters, digits, `_` or `-`"
+            ),
         ));
     }
     Ok(())
 }
 
+/// Whether the compact JSON of `value` fits in `limit` bytes. Counting stops
+/// at the limit, so an oversized value is never serialized in full.
+fn serializes_within(value: &impl Serialize, limit: usize) -> bool {
+    struct Budget(usize);
+
+    impl std::io::Write for Budget {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(buffer.len())
+                .ok_or_else(|| std::io::Error::other("over budget"))?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    serde_json::to_writer(Budget(limit), value).is_ok()
+}
+
 /// A function tool definition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FunctionDefinitionWire {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
 
 /// One tool call in an assistant message.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatToolCallWire {
     pub id: String,
-    #[serde(rename = "type", default)]
+    /// Optional when read; validation admits only `function`, which is
+    /// always written, as the outgoing contract requires it.
+    #[serde(rename = "type", default, serialize_with = "function_type")]
     pub tool_type: Option<String>,
     pub function: ChatFunctionCallWire,
+}
+
+fn function_type<S: serde::Serializer>(
+    _: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("function")
+}
+
+impl From<&CompletedToolCall> for ChatToolCallWire {
+    /// The call as an assistant message carries it back, arguments unchanged.
+    fn from(call: &CompletedToolCall) -> Self {
+        Self {
+            id: call.id.clone(),
+            tool_type: Some("function".to_owned()),
+            function: ChatFunctionCallWire {
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+        }
+    }
 }
 
 impl ChatToolCallWire {
@@ -424,6 +724,18 @@ impl ChatToolCallWire {
             return Err(TransportError::invalid(
                 format!("{field}.id"),
                 "tool call id must not be empty",
+            ));
+        }
+        if self.id.len() > MAX_TOOL_CALL_ID_BYTES {
+            return Err(TransportError::invalid(
+                format!("{field}.id"),
+                format!("a tool call id must not exceed {MAX_TOOL_CALL_ID_BYTES} bytes"),
+            ));
+        }
+        if self.function.arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
+            return Err(TransportError::invalid(
+                format!("{field}.function.arguments"),
+                format!("tool arguments must not exceed {MAX_TOOL_ARGUMENTS_BYTES} bytes"),
             ));
         }
         if let Some(kind) = &self.tool_type
@@ -443,8 +755,9 @@ impl ChatToolCallWire {
     }
 }
 
-/// A function call in an assistant message.
-#[derive(Debug, Clone, Deserialize)]
+/// A function call in an assistant message. `arguments` is the serialized
+/// JSON exactly as it was received, never re-encoded.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatFunctionCallWire {
     pub name: String,
@@ -490,27 +803,20 @@ fn validate_tool_choice(choice: &ToolChoiceWire) -> Result<(), TransportError> {
                     format!("unsupported tool_choice type `{}`", named.kind),
                 ));
             }
-            if named.function.name.trim().is_empty() {
-                Err(TransportError::invalid(
-                    "tool_choice.function.name",
-                    "tool choice function name must not be empty",
-                ))
-            } else {
-                Ok(())
-            }
+            require_function_name(&named.function.name, "tool_choice")
         }
     }
 }
 
 /// OpenAI `tool_choice`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ToolChoiceWire {
     Mode(String),
     Named(NamedToolChoiceWire),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NamedToolChoiceWire {
     #[serde(rename = "type")]
@@ -518,7 +824,7 @@ pub struct NamedToolChoiceWire {
     pub function: NamedFunctionWire,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NamedFunctionWire {
     pub name: String,

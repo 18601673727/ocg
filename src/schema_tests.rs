@@ -5766,6 +5766,7 @@ fn a_retry_shares_a_frozen_input_only_with_the_same_configuration() {
 // ---- Token annotations and capture ------------------------------------------------
 
 use crate::database::TokenConsumeError;
+use crate::openai_compatible::ChatConversation;
 use crate::orchestration::execution_runtime::{finish_provider_job, output_sink};
 use crate::persistence::{Measurements as TokenMeasurements, NewLlmProvider as TokenProvider};
 use crate::provider_execution::scripted::{Step, payload};
@@ -6025,6 +6026,8 @@ fn drive(
             None,
             &config,
             Some(&mut sink),
+            // A Job objective offers no tools.
+            &ChatConversation::default(),
         )
         .await;
         finish_provider_job(handle, run.executor, run.input, run.job, sink, execution).await
@@ -6220,6 +6223,101 @@ fn streamed_usage_reduces_after_reopening_to_one_complete_request() {
         TokenRequestSample::from_metrics(&annotated_only).expect("one Job"),
         Some(sample),
         "the annotated records alone give the same request-level result"
+    );
+}
+
+/// Runs a scripted body as a Job objective and keeps everything durable it left.
+fn run_objective(
+    name: &str,
+    steps: Vec<Step>,
+) -> (
+    JobRecord,
+    Vec<crate::persistence::JobOutputRecord>,
+    Option<TokenRequestSample>,
+    Option<AvailabilityRequestSample>,
+) {
+    let (_root, directory) = data_directory(name);
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let run = token_run(&handle, llm);
+    drive(&handle, run, steps, BOUND).expect("settle the run");
+    let job = wait(handle.job(run.job))
+        .expect("read job")
+        .expect("job exists");
+    let outputs = wait(handle.job_outputs(run.job, None, 100)).expect("read outputs");
+    let tokens = TokenRequestSample::from_metrics(&job_metrics(&handle, run.job)).expect("one Job");
+    let availability =
+        wait(handle.job_availability(run.job, None, 100)).expect("read AvailabilityStats");
+    let availability = AvailabilityRequestSample::from_records(&availability).expect("one Job");
+    worker.shutdown().expect("shutdown");
+    (job, outputs, tokens, availability)
+}
+
+#[test]
+fn a_tool_call_answer_to_a_job_objective_never_completes_the_job_or_fabricates_output() {
+    const TOOL_CALL: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n";
+    const TOOL_CALLS_FINISH: &str =
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    let (job, outputs, tokens, availability) = run_objective(
+        "tool-call-objective",
+        vec![
+            Step::Chunk(CUM_10),
+            Step::Chunk(TOOL_CALL),
+            Step::Chunk(TOOL_CALLS_FINISH),
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(DONE_CHUNK),
+        ],
+    );
+    assert!(
+        job.completed_at.is_none() && job.failed_at.is_none(),
+        "a Job objective offers no tools, so a tool call is no answer to it"
+    );
+    assert!(
+        job.unknown_at.is_some(),
+        "the exchange is an incomplete stream"
+    );
+    assert!(
+        job.stop_confirmed_at.is_some(),
+        "and its local stop is confirmed"
+    );
+    assert_eq!(
+        outputs
+            .iter()
+            .map(|output| (output.kind, output.summary.as_deref()))
+            .collect::<Vec<_>>(),
+        [(OutputKind::Progress, Some("a"))],
+        "the streamed text is kept, and no result or tool output is fabricated"
+    );
+    assert_eq!(
+        availability.map(|sample| sample.classification),
+        Some(AvailabilityClassification::Unconfirmed)
+    );
+
+    let (text_job, _, text_tokens, _) = run_objective(
+        "tool-call-objective-text",
+        vec![
+            Step::Chunk(CUM_10),
+            Step::Chunk(STOP_CHUNK),
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(DONE_CHUNK),
+        ],
+    );
+    assert!(
+        text_job.completed_at.is_some(),
+        "the text answer still completes"
+    );
+    let tokens = tokens.expect("a Token sample");
+    let text_tokens = text_tokens.expect("a Token sample");
+    assert_eq!(
+        (tokens.input, tokens.output, tokens.usage, tokens.total),
+        (
+            text_tokens.input,
+            text_tokens.output,
+            text_tokens.usage,
+            text_tokens.total
+        ),
+        "the Token evidence of the request is the same either way"
     );
 }
 
@@ -6746,6 +6844,7 @@ fn a_failed_observation_write_is_local_and_changes_nothing_that_settled() {
                 None,
                 &config,
                 Some(&mut sink),
+                &ChatConversation::default(),
             )
             .await;
             finish_provider_job(handle, run.executor, run.input, run.job, sink, execution).await
