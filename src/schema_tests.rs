@@ -322,6 +322,7 @@ fn nodes_and_relationships_round_trip_through_reopening() {
     ))
     .expect("finalize check");
     let measured = wait(handle.record_metrics(NewMetrics {
+        token: None,
         job: check,
         observed_at: at(1_000),
         measurements: Measurements {
@@ -1671,6 +1672,7 @@ fn using_a_profile_never_changes_it() {
     }))
     .expect("record AvailabilityStat");
     wait(handle.record_metrics(NewMetrics {
+        token: None,
         job,
         observed_at: at(1_000),
         measurements: Measurements {
@@ -2691,6 +2693,7 @@ fn metrics_and_availability_keep_raw_facts_about_the_llm_their_job_froze() {
     } = configured(&handle);
     let metrics = |job, observed_at, measurements| {
         wait(handle.record_metrics(NewMetrics {
+            token: None,
             job,
             observed_at: at(observed_at),
             measurements,
@@ -3023,6 +3026,7 @@ fn observation_queries_select_frozen_targets_in_stable_bounded_pages() {
     };
     let measure = |job, observed_at| {
         wait(handle.record_metrics(NewMetrics {
+            token: None,
             job,
             observed_at: at(observed_at),
             measurements: Measurements {
@@ -3074,6 +3078,7 @@ fn observation_queries_select_frozen_targets_in_stable_bounded_pages() {
     );
     assert_eq!(
         violation(wait(handle.record_metrics(NewMetrics {
+            token: None,
             job: on_a,
             observed_at: at(100),
             measurements: Measurements::default(),
@@ -3350,6 +3355,7 @@ fn observed_model_choices_come_from_the_frozen_targets_of_actual_observations() 
     };
     let measure = |job, observed_at| {
         wait(handle.record_metrics(NewMetrics {
+            token: None,
             job,
             observed_at: at(observed_at),
             measurements: Measurements {
@@ -3560,6 +3566,7 @@ fn statistics_target_lookup_reads_no_project_associations() {
     let plain = create_job(&handle, new_job("system work", genesis, projects));
     for job in [configured, plain] {
         wait(handle.record_metrics(NewMetrics {
+            token: None,
             job,
             observed_at: at(100),
             measurements: Measurements {
@@ -3650,6 +3657,7 @@ fn job_observation_reads_are_empty_without_records_and_corrupt_only_when_danglin
     let unobserved = configured_child(&handle, agent, targeted);
     let measured = configured_child(&handle, agent, targeted);
     wait(handle.record_metrics(NewMetrics {
+        token: None,
         job: measured,
         observed_at: at(100),
         measurements: Measurements {
@@ -5753,4 +5761,812 @@ fn a_retry_shares_a_frozen_input_only_with_the_same_configuration() {
     );
     worker.shutdown().expect("shutdown");
     assert_relationships_consistent(&directory);
+}
+
+// ---- Token annotations and capture ------------------------------------------------
+
+use crate::orchestration::execution_runtime::{finish_provider_job, output_sink};
+use crate::persistence::{Measurements as TokenMeasurements, NewLlmProvider as TokenProvider};
+use crate::provider_execution::scripted::{Step, payload};
+use crate::provider_execution::{
+    CancellationToken, CredentialResolver, ProviderExecutionConfig, ProviderFact, announce,
+    execute_chat_with_sink, read_response,
+};
+use crate::token_usage::{
+    RequestEligibility, TokenAnnotation, TokenCount, TokenRequestSample, TokenUsageState,
+    UsageFinality,
+};
+use std::time::{Duration, Instant};
+
+/// Metrics with the given counters, annotated or not.
+fn token_metrics(
+    job: JobId,
+    micros: i64,
+    token: Option<TokenAnnotation>,
+    counters: [Option<u32>; 2],
+) -> NewMetrics {
+    NewMetrics {
+        job,
+        observed_at: at(micros),
+        measurements: TokenMeasurements {
+            usage: NormalizedUsage {
+                input_tokens: counters[0],
+                output_tokens: counters[1],
+                ..NormalizedUsage::default()
+            },
+            ..TokenMeasurements::default()
+        },
+        token,
+    }
+}
+
+fn job_metrics(handle: &DatabaseHandle, job: JobId) -> Vec<crate::persistence::MetricsRecord> {
+    wait(handle.job_metrics(job, None, 1_000)).expect("read Metrics")
+}
+
+fn stored_sample(handle: &DatabaseHandle, job: JobId) -> Option<TokenRequestSample> {
+    TokenRequestSample::from_metrics(&job_metrics(handle, job)).expect("one Job")
+}
+
+#[test]
+fn token_annotations_are_validated_stored_and_survive_reopening() {
+    let (_root, directory) = data_directory("token-annotations");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (provider, llm) = llm_setup(&handle, "model-a");
+    let llm_job = llm_job(&handle, llm);
+    let plain = create_job(&handle, new_job("plain", handle.genesis(), Vec::new()));
+    let eligible = TokenAnnotation::eligible(UsageFinality::Cumulative);
+
+    // Generic Metrics need no annotation, on an LLM Job or not, and an empty
+    // unannotated record is still refused.
+    for job in [llm_job, plain] {
+        wait(handle.record_metrics(token_metrics(job, 10, None, [Some(1), Some(2)])))
+            .expect("unannotated Metrics are generic Metrics");
+    }
+    assert!(matches!(
+        violation(wait(handle.record_metrics(token_metrics(
+            llm_job,
+            11,
+            None,
+            [None, None]
+        )))),
+        Violation::InvalidValue("measurements", _)
+    ));
+
+    // An eligible or excluded fact needs no measurement.
+    let anchor =
+        wait(handle.record_metrics(token_metrics(llm_job, 20, Some(eligible), [None, None])))
+            .expect("an eligible fact-only record");
+    let excluded = wait(handle.record_metrics(token_metrics(
+        llm_job,
+        21,
+        Some(TokenAnnotation::excluded()),
+        [None, None],
+    )))
+    .expect("an excluded fact-only record");
+    wait(handle.record_metrics(token_metrics(
+        llm_job,
+        22,
+        Some(TokenAnnotation::eligible(UsageFinality::Final)),
+        [Some(7), None],
+    )))
+    .expect("a final count with the counters it reports");
+
+    // Refusals: an annotation needs the Job's frozen LLM, and an unsent
+    // request reports no usage and no final.
+    let before = job_metrics(&handle, llm_job).len();
+    for annotation in [eligible, TokenAnnotation::excluded()] {
+        assert_eq!(
+            violation(wait(handle.record_metrics(token_metrics(
+                plain,
+                30,
+                Some(annotation),
+                [None, None]
+            )))),
+            Violation::NotAnLlmExecution(plain)
+        );
+    }
+    for refused in [
+        token_metrics(
+            llm_job,
+            31,
+            Some(TokenAnnotation::excluded()),
+            [Some(1), None],
+        ),
+        token_metrics(
+            llm_job,
+            32,
+            Some(TokenAnnotation {
+                eligibility: RequestEligibility::Excluded,
+                finality: UsageFinality::Final,
+            }),
+            [None, None],
+        ),
+    ] {
+        assert!(matches!(
+            violation(wait(handle.record_metrics(refused))),
+            Violation::InvalidValue("token", _)
+        ));
+    }
+    assert_eq!(
+        job_metrics(&handle, llm_job).len(),
+        before,
+        "refusals wrote nothing"
+    );
+    assert_eq!(
+        job_metrics(&handle, plain).len(),
+        1,
+        "no partial link or index entry"
+    );
+
+    // The identity of an annotated record is the Job's frozen target.
+    let records = job_metrics(&handle, llm_job);
+    let target = records[1].target.clone().expect("the Job's frozen target");
+    assert_eq!(
+        (
+            target.llm_profile,
+            target.frozen.provider.id,
+            target.frozen.config.model.as_str()
+        ),
+        (llm, provider, "model-a")
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.token)
+            .collect::<Vec<_>>(),
+        [
+            None,
+            Some(eligible),
+            Some(TokenAnnotation::excluded()),
+            Some(TokenAnnotation::eligible(UsageFinality::Final)),
+        ]
+    );
+    assert_eq!((records[1].id, records[2].id), (anchor, excluded));
+    let page = wait(handle.metrics(of_profile(llm), None, 100)).expect("scope read");
+    assert_eq!(
+        page.records
+            .iter()
+            .map(|record| record.token)
+            .collect::<Vec<_>>(),
+        records
+            .iter()
+            .map(|record| record.token)
+            .collect::<Vec<_>>(),
+        "the scope index serves the annotations too"
+    );
+
+    worker.shutdown().expect("shutdown");
+    assert_relationships_consistent(&directory);
+    let worker = DatabaseWorker::start(&directory).expect("reopen database");
+    let handle = worker.handle();
+    assert_eq!(
+        job_metrics(&handle, llm_job),
+        records,
+        "the round trip is exact"
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+/// A started Job that runs `llm` directly, and the Executor settling it.
+#[derive(Clone, Copy)]
+struct TokenRun {
+    executor: ExecutorId,
+    job: JobId,
+    input: crate::persistence::JobInputId,
+}
+
+fn token_run(handle: &DatabaseHandle, llm: ProfileId) -> TokenRun {
+    let executor =
+        executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register Executor");
+    let job = llm_job(handle, llm);
+    wait(handle.start_job(job)).expect("start job");
+    let input = wait(handle.job(job))
+        .expect("read job")
+        .expect("job exists")
+        .input;
+    TokenRun {
+        executor,
+        job,
+        input,
+    }
+}
+
+fn on_ntex<F: std::future::Future + 'static>(future: F) -> F::Output
+where
+    F::Output: 'static,
+{
+    ntex::rt::System::new("token-test", ntex::rt::DefaultRuntime).block_on(future)
+}
+
+/// The execution path after a response head: announce the delivered request,
+/// read the scripted body with the real parser into the real sink, and settle.
+fn drive(
+    handle: &DatabaseHandle,
+    run: TokenRun,
+    steps: Vec<Step>,
+    timeout: Duration,
+) -> Result<crate::orchestration::execution_runtime::ExecutionReceipt, ExecutionRuntimeError> {
+    let handle = handle.clone();
+    on_ntex(async move {
+        let config = ProviderExecutionConfig {
+            timeout,
+            cancellation: CancellationToken::default(),
+            ..ProviderExecutionConfig::default()
+        };
+        let mut sink = output_sink(handle.clone(), run.job);
+        announce(Some(&mut sink), ProviderFact::Delivered).await;
+        let execution = read_response(
+            payload(steps, config.cancellation.clone()),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            Some(&mut sink),
+        )
+        .await;
+        finish_provider_job(handle, run.executor, run.input, run.job, sink, execution).await
+    })
+}
+
+const BOUND: Duration = Duration::from_secs(5);
+const CUM_10: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n";
+const CUM_25: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}],\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":2}}\n\n";
+const STOP_CHUNK: &str = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+const FINAL_40_60: &str = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4000000000,\"completion_tokens\":2000000000}}\n\n";
+const FINAL_40_61: &str = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4000000000,\"completion_tokens\":2000000001}}\n\n";
+const FINAL_INPUT_ONLY: &str = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40}}\n\n";
+const FINAL_ZERO_OUTPUT: &str =
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n";
+const DONE_CHUNK: &str = "data: [DONE]\n\n";
+
+/// Runs a scripted body, then reopens the database and reduces what was
+/// stored, with no eligibility or finality supplied by the test.
+fn run_and_reduce(
+    name: &str,
+    steps: Vec<Step>,
+    timeout: Duration,
+) -> (
+    Option<TokenRequestSample>,
+    JobRecord,
+    Vec<crate::persistence::MetricsRecord>,
+) {
+    let (_root, directory) = data_directory(name);
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let run = token_run(&handle, llm);
+    drive(&handle, run, steps, timeout).expect("settle the run");
+    worker.shutdown().expect("shutdown");
+
+    let worker = DatabaseWorker::start(&directory).expect("reopen database");
+    let handle = worker.handle();
+    let records = job_metrics(&handle, run.job);
+    let job = wait(handle.job(run.job))
+        .expect("read job")
+        .expect("job exists");
+    let sample = TokenRequestSample::from_metrics(&records).expect("one Job");
+    worker.shutdown().expect("shutdown");
+    (sample, job, records)
+}
+
+#[test]
+fn streamed_usage_reduces_after_reopening_to_one_complete_request() {
+    let (sample, job, records) = run_and_reduce(
+        "token-complete",
+        vec![
+            Step::Chunk(CUM_10),
+            Step::Chunk(CUM_25),
+            Step::Chunk(STOP_CHUNK),
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(DONE_CHUNK),
+        ],
+        BOUND,
+    );
+    let sample = sample.expect("one request sample");
+    assert!(job.completed_at.is_some());
+    assert_eq!(
+        (sample.input, sample.output, sample.usage),
+        (
+            TokenCount::Final(4_000_000_000),
+            TokenCount::Final(2_000_000_000),
+            TokenUsageState::Complete
+        ),
+        "the whole-request chunk replaces the running totals, which are never added"
+    );
+    assert_eq!(
+        sample.total,
+        Some(6_000_000_000),
+        "the total is exact above u32::MAX"
+    );
+    let annotated: Vec<_> = records
+        .iter()
+        .filter(|record| record.token.is_some())
+        .collect();
+    assert_eq!(
+        annotated.len(),
+        4,
+        "the anchor, two running totals and the final"
+    );
+    assert_eq!(
+        (sample.first_metrics, sample.observed_at),
+        (annotated[0].id, annotated[0].observed_at),
+        "the sample is fixed by the lowest Metrics ID, the eligible anchor"
+    );
+    assert!(
+        records.iter().any(|record| record.token.is_none()),
+        "the generic timing record stays unannotated"
+    );
+}
+
+#[test]
+fn a_normal_finish_without_a_final_chunk_leaves_the_usage_provisional() {
+    let (sample, job, _) = run_and_reduce(
+        "token-no-final",
+        vec![
+            Step::Chunk(CUM_25),
+            Step::Chunk(STOP_CHUNK),
+            Step::Chunk(DONE_CHUNK),
+        ],
+        BOUND,
+    );
+    let sample = sample.expect("one request sample");
+    assert!(
+        job.completed_at.is_some(),
+        "HTTP 200 and a normal finish settle the Job"
+    );
+    assert_eq!(
+        (sample.input, sample.output, sample.usage, sample.total),
+        (
+            TokenCount::Provisional(25),
+            TokenCount::Provisional(2),
+            TokenUsageState::Incomplete,
+            Some(27)
+        ),
+        "none of Completed, a finish reason, [DONE] or the end of the stream makes usage final"
+    );
+}
+
+#[test]
+fn an_incomplete_final_keeps_earlier_counts_provisional_and_zero_stays_known() {
+    let (sample, _, _) = run_and_reduce(
+        "token-partial-final",
+        vec![
+            Step::Chunk(CUM_25),
+            Step::Chunk(STOP_CHUNK),
+            Step::Chunk(FINAL_INPUT_ONLY),
+        ],
+        BOUND,
+    );
+    let sample = sample.expect("one request sample");
+    assert_eq!(
+        (sample.input, sample.output, sample.usage),
+        (
+            TokenCount::Final(40),
+            TokenCount::Provisional(2),
+            TokenUsageState::Incomplete
+        ),
+        "a final that omits output does not promote the earlier output"
+    );
+
+    let (sample, _, _) = run_and_reduce(
+        "token-zero",
+        vec![Step::Chunk(STOP_CHUNK), Step::Chunk(FINAL_ZERO_OUTPUT)],
+        BOUND,
+    );
+    let sample = sample.expect("one request sample");
+    assert_eq!(
+        (sample.input, sample.output, sample.usage, sample.total),
+        (
+            TokenCount::Final(0),
+            TokenCount::Final(0),
+            TokenUsageState::Complete,
+            Some(0)
+        ),
+        "a reported zero is a count"
+    );
+}
+
+#[test]
+fn duplicate_finals_are_idempotent_and_conflicting_finals_stay_conflicting() {
+    let (sample, _, records) = run_and_reduce(
+        "token-conflict",
+        vec![
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(FINAL_40_61),
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(STOP_CHUNK),
+        ],
+        BOUND,
+    );
+    let sample = sample.expect("one request sample");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.token.is_some())
+            .count(),
+        5,
+        "the anchor and all four reported finals are stored"
+    );
+    assert_eq!(
+        sample.input,
+        TokenCount::Final(4_000_000_000),
+        "the duplicates agree"
+    );
+    assert_eq!(
+        (sample.output, sample.total, sample.usage),
+        (TokenCount::Conflicted, None, TokenUsageState::Incomplete),
+        "a repeated candidate does not clear the conflict"
+    );
+}
+
+/// A run that stops with usage already reported. Each stop is its own test:
+/// the ntex timer belongs to the first runtime a thread creates, so a test
+/// that needs the timeout runs one runtime.
+fn assert_stop_keeps_reported_usage(name: &str, steps: Vec<Step>, timeout: Duration) {
+    let (sample, job, _) = run_and_reduce(name, steps, timeout);
+    let sample = sample.expect("an eligible request sample");
+    assert!(
+        job.unknown_at.is_some() && job.completed_at.is_none() && job.failed_at.is_none(),
+        "{name}: the Job's outcome is unchanged: unknown"
+    );
+    assert_eq!(
+        (sample.input, sample.output, sample.usage),
+        (
+            TokenCount::Provisional(25),
+            TokenCount::Provisional(2),
+            TokenUsageState::Incomplete
+        ),
+        "{name}: the usage reported before the stop is stored"
+    );
+}
+
+#[test]
+fn usage_reported_before_a_transport_failure_is_stored() {
+    assert_stop_keeps_reported_usage(
+        "token-transport-failure",
+        vec![Step::Chunk(CUM_25), Step::Fail],
+        BOUND,
+    );
+}
+
+#[test]
+fn usage_reported_before_a_stream_without_a_finish_is_stored() {
+    assert_stop_keeps_reported_usage("token-no-finish", vec![Step::Chunk(CUM_25)], BOUND);
+}
+
+#[test]
+fn usage_reported_before_a_cancellation_is_stored() {
+    assert_stop_keeps_reported_usage(
+        "token-cancelled",
+        vec![Step::Chunk(CUM_25), Step::Cancel, Step::Chunk(CUM_10)],
+        BOUND,
+    );
+}
+
+#[test]
+fn usage_reported_before_the_outer_timeout_is_stored() {
+    assert_stop_keeps_reported_usage(
+        "token-timeout",
+        vec![Step::Chunk(CUM_25), Step::Stall],
+        Duration::from_millis(150),
+    );
+}
+
+#[test]
+fn a_stop_before_any_usage_still_leaves_an_eligible_missing_usage_sample() {
+    let (sample, job, records) = run_and_reduce(
+        "token-timeout-no-usage",
+        vec![Step::Stall],
+        Duration::from_millis(150),
+    );
+    assert!(job.unknown_at.is_some());
+    let sample = sample.expect("an eligible request sample");
+    assert_eq!(sample.usage, TokenUsageState::Missing);
+    assert_eq!(sample.first_metrics, records[0].id);
+    assert_eq!(sample.observed_at, records[0].observed_at);
+}
+
+/// Resolves no credential: nothing reaches a network.
+struct NoCredential;
+
+impl CredentialResolver for NoCredential {
+    fn resolve(
+        &self,
+        _: Option<&str>,
+    ) -> Result<Option<String>, crate::provider_execution::ProviderExecutionError> {
+        Ok(None)
+    }
+}
+
+struct RefusedCredential;
+
+impl CredentialResolver for RefusedCredential {
+    fn resolve(
+        &self,
+        _: Option<&str>,
+    ) -> Result<Option<String>, crate::provider_execution::ProviderExecutionError> {
+        Err(ProviderExecutionError::Build {
+            message: "credential reference is not present".into(),
+        })
+    }
+}
+
+/// Executes the real request path against `endpoint` and settles the Job.
+fn execute_for_real(
+    name: &str,
+    endpoint: Option<String>,
+    resolver: std::sync::Arc<dyn CredentialResolver>,
+    config: ProviderExecutionConfig,
+) -> (
+    Option<TokenRequestSample>,
+    JobRecord,
+    Vec<crate::persistence::MetricsRecord>,
+) {
+    let (_root, directory) = data_directory(name);
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let provider = wait(handle.create_llm_provider(TokenProvider {
+        name: "local".into(),
+        transport: OPENAI,
+        endpoint,
+        credential_ref: None,
+    }))
+    .expect("create provider");
+    let llm = llm_profile(
+        &handle,
+        provider,
+        llm_config("model-a", &[ModelCapability::Chat]),
+    );
+    let run = token_run(&handle, llm);
+    let frozen = wait(handle.job_configuration(run.job))
+        .expect("read configuration")
+        .expect("configured")
+        .frozen;
+    let execution = {
+        let handle = handle.clone();
+        on_ntex(async move {
+            let mut sink = output_sink(handle.clone(), run.job);
+            let execution =
+                execute_chat_with_sink(&frozen, Some("hi"), resolver.as_ref(), &config, &mut sink)
+                    .await;
+            finish_provider_job(handle, run.executor, run.input, run.job, sink, execution).await
+        })
+    };
+    execution.expect("settle the run");
+    let records = job_metrics(&handle, run.job);
+    let job = wait(handle.job(run.job))
+        .expect("read job")
+        .expect("job exists");
+    let sample = TokenRequestSample::from_metrics(&records).expect("one Job");
+    worker.shutdown().expect("shutdown");
+    (sample, job, records)
+}
+
+#[test]
+fn a_request_known_not_to_have_been_sent_is_excluded_whatever_the_job_outcome() {
+    let cancelled = ProviderExecutionConfig::default();
+    cancelled.cancellation.cancel();
+    let cases = [
+        (
+            "token-build-failure",
+            std::sync::Arc::new(RefusedCredential) as std::sync::Arc<dyn CredentialResolver>,
+            ProviderExecutionConfig::default(),
+        ),
+        (
+            "token-cancelled-before-send",
+            std::sync::Arc::new(NoCredential) as std::sync::Arc<dyn CredentialResolver>,
+            cancelled,
+        ),
+    ];
+    for (name, resolver, config) in cases {
+        let (sample, job, records) = execute_for_real(
+            name,
+            Some("https://127.0.0.1:9/v1".into()),
+            resolver,
+            config,
+        );
+        assert!(job.failed_at.is_some(), "{name}: the Job fails");
+        assert_eq!(sample, None, "{name}: no Token request sample");
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record.token)
+                .collect::<Vec<_>>(),
+            [TokenAnnotation::excluded()],
+            "{name}: the exclusion is recorded and is not an eligible anchor"
+        );
+    }
+}
+
+#[test]
+fn a_send_that_may_have_been_delivered_is_eligible_even_though_nothing_answered() {
+    // A listener that accepts connections and never answers.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+    let port = listener.local_addr().expect("local address").port();
+    listener.set_nonblocking(true).expect("non-blocking");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let holder = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        })
+    };
+    let (sample, job, records) = execute_for_real(
+        "token-unanswered-send",
+        Some(format!("https://127.0.0.1:{port}/v1")),
+        std::sync::Arc::new(NoCredential),
+        ProviderExecutionConfig {
+            timeout: Duration::from_millis(300),
+            ..ProviderExecutionConfig::default()
+        },
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    holder.join().expect("listener thread");
+    assert!(
+        job.unknown_at.is_some(),
+        "an unanswered send is an unknown outcome"
+    );
+    assert_eq!(
+        sample.map(|sample| sample.usage),
+        Some(TokenUsageState::Missing),
+        "delivery cannot be ruled out, so the request is eligible with missing usage"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter_map(|record| record.token)
+            .collect::<Vec<_>>(),
+        [TokenAnnotation::eligible(UsageFinality::Cumulative)]
+    );
+}
+
+#[test]
+fn a_rejection_after_a_response_head_is_eligible_though_the_job_fails() {
+    let (_root, directory) = data_directory("token-rejection");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let run = token_run(&handle, llm);
+    let failure = ProviderFailure {
+        message: "rate limited".into(),
+        status_code: Some(429),
+        ..ProviderFailure::default()
+    };
+    let settled = {
+        let handle = handle.clone();
+        on_ntex(async move {
+            let mut sink = output_sink(handle.clone(), run.job);
+            // What the request path does when the head of any response arrives.
+            announce(Some(&mut sink), ProviderFact::Delivered).await;
+            finish_provider_job(
+                handle,
+                run.executor,
+                run.input,
+                run.job,
+                sink,
+                Err(ProviderExecutionError::Rejected { failure }),
+            )
+            .await
+        })
+    };
+    settled.expect("settle the rejection");
+    let job = wait(handle.job(run.job))
+        .expect("read job")
+        .expect("job exists");
+    assert!(job.failed_at.is_some());
+    assert_eq!(
+        stored_sample(&handle, run.job).map(|sample| sample.usage),
+        Some(TokenUsageState::Missing)
+    );
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn a_failed_observation_write_is_local_and_changes_nothing_that_settled() {
+    let (_root, directory) = data_directory("token-write-failure");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let run = token_run(&handle, llm);
+    let missing_job = JobId::new(9_999_999);
+    let receipt = {
+        let handle = handle.clone();
+        on_ntex(async move {
+            let config = ProviderExecutionConfig::default();
+            // Observations go to a Job that does not exist, so each write is refused.
+            let mut sink = output_sink(handle.clone(), missing_job);
+            announce(Some(&mut sink), ProviderFact::Delivered).await;
+            let execution = read_response(
+                payload(
+                    vec![Step::Chunk(STOP_CHUNK), Step::Chunk(FINAL_INPUT_ONLY)],
+                    config.cancellation.clone(),
+                ),
+                200,
+                Instant::now(),
+                None,
+                &config,
+                Some(&mut sink),
+            )
+            .await;
+            finish_provider_job(handle, run.executor, run.input, run.job, sink, execution).await
+        })
+    };
+    match receipt {
+        Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
+            assert_eq!(receipt.job, run.job);
+            assert!(
+                matches!(source, DatabaseError::Rejected(_)),
+                "a storage rule refused the write, not a Provider: {source:?}"
+            );
+        }
+        other => panic!("expected the settled-but-unrecorded error, got {other:?}"),
+    }
+    let job = wait(handle.job(run.job))
+        .expect("read job")
+        .expect("job exists");
+    assert!(
+        job.completed_at.is_some() && job.unknown_at.is_none(),
+        "the authoritative settlement stands"
+    );
+    assert_eq!(
+        wait(handle.job_availability(run.job, None, 10))
+            .expect("read AvailabilityStats")
+            .len(),
+        1,
+        "the availability observation is still recorded"
+    );
+    assert!(
+        job_metrics(&handle, run.job)
+            .iter()
+            .all(|record| record.token.is_none()),
+        "no Token fact was invented for the Job"
+    );
+    worker.shutdown().expect("shutdown");
+
+    // A settled failure whose availability write is refused keeps its outcome too.
+    let (_root, directory) = data_directory("token-availability-refused");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let plain = create_job(&handle, new_job("plain", handle.genesis(), Vec::new()));
+    wait(handle.start_job(plain)).expect("start job");
+    let input = wait(handle.job(plain))
+        .expect("read job")
+        .expect("job exists")
+        .input;
+    let executor = executor(&handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+    let failure = ProviderFailure {
+        message: "bad".into(),
+        status_code: Some(400),
+        ..ProviderFailure::default()
+    };
+    match wait(settle_provider_error(
+        handle.clone(),
+        executor,
+        input,
+        plain,
+        ProviderExecutionError::Rejected { failure },
+    )) {
+        Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, .. }) => {
+            assert_eq!(receipt.job, plain);
+        }
+        other => panic!("expected the settled-but-unrecorded error, got {other:?}"),
+    }
+    assert!(
+        wait(handle.job(plain))
+            .expect("read job")
+            .expect("job exists")
+            .failed_at
+            .is_some(),
+        "the Job stays failed"
+    );
+    worker.shutdown().expect("shutdown");
 }

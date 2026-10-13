@@ -2,13 +2,14 @@
 //! plus two facts those records do not store, to one derived sample per
 //! request.
 //!
-//! Nothing here is stored, scheduled or read from the database. A caller must
-//! supply, for every record, whether its request was ever issued
-//! ([`RequestEligibility`]) and whether its counters are cumulative or final
-//! ([`UsageFinality`]). Neither can be inferred from a Job's outcome, its
-//! Profile, an HTTP status, a finish reason or an availability class, and the
-//! stored Metrics record has no field for either. Until a producer supplies
-//! them, no historical Metrics record may be treated as eligible or final.
+//! Nothing here is scheduled or read from the database. The reducer needs, for
+//! every record, whether its request was ever issued ([`RequestEligibility`])
+//! and whether its counters are cumulative or final ([`UsageFinality`]).
+//! Neither can be inferred from a Job's outcome, its Profile, an HTTP status,
+//! a finish reason or an availability class. A producer states them in a
+//! [`TokenAnnotation`] stored with the Metrics record; a record without one
+//! carries no trusted Token contract and is never treated as eligible, excluded
+//! or final.
 //!
 //! The evidence keeps one small record per Token field (a cumulative maximum
 //! and a final candidate), never the observation history, so replay in any
@@ -39,6 +40,42 @@ pub enum UsageFinality {
     Final,
 }
 
+/// The Token facts a producer states about one Metrics record, stored with
+/// it. They are the producer's trusted knowledge of delivery and of what its
+/// counters mean, never derived from a Job's outcome or any response fact.
+///
+/// An [`Excluded`](RequestEligibility::Excluded) annotation says the request
+/// was positively known never to have been sent. It reports no usage and its
+/// finality is always [`Cumulative`](UsageFinality::Cumulative), so one fact
+/// has one representation; [`TokenAnnotation::excluded`] builds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenAnnotation {
+    pub eligibility: RequestEligibility,
+    /// What every counter this record reports means.
+    pub finality: UsageFinality,
+}
+
+impl TokenAnnotation {
+    /// The request was positively known not to have been sent.
+    #[must_use]
+    pub const fn excluded() -> Self {
+        Self {
+            eligibility: RequestEligibility::Excluded,
+            finality: UsageFinality::Cumulative,
+        }
+    }
+
+    /// The request was issued or may have been delivered, and the record's
+    /// counters, if any, have the given finality.
+    #[must_use]
+    pub const fn eligible(finality: UsageFinality) -> Self {
+        Self {
+            eligibility: RequestEligibility::Eligible,
+            finality,
+        }
+    }
+}
+
 /// One Metrics record with the facts it does not store. The record is only
 /// read; its raw values are not copied.
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +83,20 @@ pub struct TokenObservation<'a> {
     pub metrics: &'a MetricsRecord,
     pub eligibility: RequestEligibility,
     pub finality: UsageFinality,
+}
+
+impl<'a> TokenObservation<'a> {
+    /// The observation a stored record states; none for a record without a
+    /// Token annotation.
+    #[must_use]
+    pub fn from_record(metrics: &'a MetricsRecord) -> Option<Self> {
+        let annotation = metrics.token?;
+        Some(Self {
+            metrics,
+            eligibility: annotation.eligibility,
+            finality: annotation.finality,
+        })
+    }
 }
 
 /// Why records could not be reduced to one request.
@@ -261,6 +312,19 @@ pub struct TokenRequestSample {
 }
 
 impl TokenRequestSample {
+    /// Reduces the stored Metrics records of one request, in any order.
+    /// Records without a Token annotation carry no trusted contract and are
+    /// skipped, so they neither make nor exclude a request.
+    pub fn from_metrics<'a>(
+        records: impl IntoIterator<Item = &'a MetricsRecord>,
+    ) -> Result<Option<Self>, TokenEvidenceError> {
+        Self::from_observations(
+            records
+                .into_iter()
+                .filter_map(TokenObservation::from_record),
+        )
+    }
+
     /// Reduces the observations of one request, in any order. The result
     /// depends only on the set of observations. Empty input, and input with
     /// no eligible observation, is no sample.
@@ -307,6 +371,7 @@ mod tests {
                 },
                 ..Measurements::default()
             },
+            token: None,
             // Never the sample's time, whatever it holds.
             recorded_at: Timestamp::from_unix_micros(i64::MAX),
         }

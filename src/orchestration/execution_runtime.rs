@@ -11,13 +11,15 @@ use std::thread::{self, JoinHandle};
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
     AppendedOutput, ExecutorId, FinalResult, IntermediateOutputKind, JobFinalization, JobId,
-    JobInputDraft, JobInputId, JobOutcome, NewAvailabilityStat, NewJob, NewJobOutput, NewMetrics,
-    Timestamp,
+    JobInputDraft, JobInputId, JobOutcome, Measurements, NewAvailabilityStat, NewJob, NewJobOutput,
+    NewMetrics, Timestamp,
 };
 use crate::provider_execution::{
     self, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
-    ProviderExecutionConfig, ProviderExecutionError, ProviderOutputSink,
+    ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult, ProviderFact,
+    ProviderObservation, ProviderOutputSink,
 };
+use crate::token_usage::{TokenAnnotation, UsageFinality};
 
 pub const SCHEDULER_QUEUE_CAPACITY: usize = 64;
 pub const EXECUTOR_QUEUE_CAPACITY: usize = 64;
@@ -101,6 +103,14 @@ pub enum ExecutionRuntimeError {
     WorkerPanicked,
     #[error("provider execution failed: {0}")]
     Provider(String),
+    /// The Job's outcome is settled, as the receipt shows, but a Metrics or
+    /// availability record could not be written. It is a local storage
+    /// failure, not a Provider fault, and it changes nothing that settled.
+    #[error("the Job was settled but an observation was not recorded: {source}")]
+    ObservationsNotRecorded {
+        receipt: Box<ExecutionReceipt>,
+        source: DatabaseError,
+    },
 }
 
 type ExecutionReply = flume::Sender<Result<ExecutionReceipt, ExecutionRuntimeError>>;
@@ -434,10 +444,7 @@ async fn execute_provider_plan(
             });
         }
     };
-    let mut output_sink = DatabaseOutputSink {
-        database: database.clone(),
-        job,
-    };
+    let mut output_sink = output_sink(database.clone(), job);
     let execution = provider_execution::execute_chat_with_sink(
         &configuration.frozen,
         input_record.objective.as_deref(),
@@ -446,8 +453,24 @@ async fn execute_provider_plan(
         &mut output_sink,
     )
     .await;
+    finish_provider_job(database, executor, input, job, output_sink, execution).await
+}
 
-    match execution {
+/// Settles the Job from a finished execution, then records what the run
+/// observed. Settlement comes first and is authoritative: a later write that
+/// fails is reported as [`ExecutionRuntimeError::ObservationsNotRecorded`]
+/// and undoes nothing. Every observation is still attempted, so one failed
+/// write does not cost the others.
+pub(crate) async fn finish_provider_job(
+    database: DatabaseHandle,
+    executor: ExecutorId,
+    input: JobInputId,
+    job: JobId,
+    sink: DatabaseOutputSink,
+    execution: Result<ProviderExecutionResult, ProviderExecutionError>,
+) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let mut gap = sink.gap;
+    let receipt = match execution {
         Ok(result) => {
             let final_output = database
                 .finalize_job(
@@ -460,34 +483,68 @@ async fn execute_provider_plan(
                     }),
                 )
                 .await?;
-            database
+            let timing = database
                 .record_metrics(NewMetrics {
                     job,
                     observed_at: Timestamp::now(),
                     measurements: provider_execution::metrics(&result),
+                    token: None,
                 })
-                .await?;
-            database
+                .await
+                .map(|_| ());
+            let availability = database
                 .record_availability_stat(NewAvailabilityStat {
                     job,
                     observed_at: Timestamp::now(),
                     observation: provider_execution::success_observation(&result),
                 })
-                .await?;
-            Ok(ExecutionReceipt {
+                .await
+                .map(|_| ());
+            for error in [timing, availability].into_iter().filter_map(Result::err) {
+                gap.get_or_insert(error);
+            }
+            ExecutionReceipt {
                 executor,
                 input,
                 job,
                 result: final_output,
-            })
+            }
         }
-        Err(error) => settle_provider_error(database, executor, input, job, error).await,
+        Err(error) => match settle_provider_error(database, executor, input, job, error).await {
+            Ok(receipt) => receipt,
+            Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
+                gap.get_or_insert(source);
+                *receipt
+            }
+            Err(error) => return Err(error),
+        },
+    };
+    match gap {
+        None => Ok(receipt),
+        Some(source) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
+            receipt: Box::new(receipt),
+            source,
+        }),
     }
 }
 
-struct DatabaseOutputSink {
+/// The sink of one Job's execution: streamed output goes to the Job's
+/// outputs, and Token facts go to annotated Metrics records, each awaited
+/// before the stream moves on.
+pub(crate) struct DatabaseOutputSink {
     database: DatabaseHandle,
     job: JobId,
+    /// The first observation that could not be written. The execution goes on
+    /// regardless, see [`ProviderOutputSink::observe`].
+    gap: Option<DatabaseError>,
+}
+
+pub(crate) fn output_sink(database: DatabaseHandle, job: JobId) -> DatabaseOutputSink {
+    DatabaseOutputSink {
+        database,
+        job,
+        gap: None,
+    }
 }
 
 impl ProviderOutputSink for DatabaseOutputSink {
@@ -513,6 +570,42 @@ impl ProviderOutputSink for DatabaseOutputSink {
                 .map_err(|error| OutputSinkError {
                     message: format!("database could not persist provider output: {error}"),
                 })
+        })
+    }
+
+    fn observe<'a>(
+        &'a mut self,
+        observation: ProviderObservation,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            let (measurements, token) = match observation.fact {
+                ProviderFact::NotDelivered => {
+                    (Measurements::default(), TokenAnnotation::excluded())
+                }
+                ProviderFact::Delivered => (
+                    Measurements::default(),
+                    TokenAnnotation::eligible(UsageFinality::Cumulative),
+                ),
+                ProviderFact::Usage { usage, finality } => (
+                    Measurements {
+                        usage,
+                        ..Measurements::default()
+                    },
+                    TokenAnnotation::eligible(finality),
+                ),
+            };
+            let recorded = self
+                .database
+                .record_metrics(NewMetrics {
+                    job: self.job,
+                    observed_at: observation.observed_at,
+                    measurements,
+                    token: Some(token),
+                })
+                .await;
+            if let Err(error) = recorded {
+                self.gap.get_or_insert(error);
+            }
         })
     }
 }
@@ -548,19 +641,26 @@ pub(crate) async fn settle_provider_error(
             )
             .await?
     };
+    let receipt = ExecutionReceipt {
+        executor,
+        input,
+        job,
+        result,
+    };
     if let Some(observation) = provider_execution::error_observation(&error) {
-        database
+        let recorded = database
             .record_availability_stat(NewAvailabilityStat {
                 job,
                 observed_at: Timestamp::now(),
                 observation,
             })
-            .await?;
+            .await;
+        if let Err(source) = recorded {
+            return Err(ExecutionRuntimeError::ObservationsNotRecorded {
+                receipt: Box::new(receipt),
+                source,
+            });
+        }
     }
-    Ok(ExecutionReceipt {
-        executor,
-        input,
-        job,
-        result,
-    })
+    Ok(receipt)
 }

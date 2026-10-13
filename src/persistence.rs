@@ -8,6 +8,7 @@ use crate::storage::{
     AgentRow, AvailabilityStatRow, Batch, BatchError, ExecutorRow, JobInputRow, JobRow,
     MarkerSubjects, MetricsRow, ProfileLinks, ProfileRow, dependency_state,
 };
+use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
 /// Microseconds since the Unix epoch, as recorded by the database worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -702,6 +703,13 @@ pub struct NewMetrics {
     /// Observation queries filter and order by this time.
     pub observed_at: Timestamp,
     pub measurements: Measurements,
+    /// The producer's Token facts about this record, when it states any. A
+    /// record may be annotated without measurements: an eligible one then
+    /// establishes a request whose usage is missing. `None` is no trusted
+    /// Token contract, not Excluded and not Final. An annotation needs the
+    /// Job's frozen LLM configuration, whose Provider and model are the
+    /// request's identity; a caller cannot name another.
+    pub token: Option<TokenAnnotation>,
 }
 
 /// The LLM a Job ran, as its submission froze it: the LLM Profile as
@@ -723,6 +731,8 @@ pub struct MetricsRecord {
     /// The producer's time, see [`NewMetrics::observed_at`].
     pub observed_at: Timestamp,
     pub measurements: Measurements,
+    /// The producer's Token facts, see [`NewMetrics::token`].
+    pub token: Option<TokenAnnotation>,
     /// The wall-clock time at which the database's write transaction that
     /// stored the record began, not when its commit completed. Wall-clock
     /// time is not monotonic. It is never used in place of `observed_at`.
@@ -1884,12 +1894,22 @@ pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId) -> OpResult<()>
 /// froze; the Job itself is not changed.
 pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult<MetricsId> {
     batch.require_job(metrics.job)?;
-    if metrics.measurements.is_empty() {
+    if metrics.measurements.is_empty() && metrics.token.is_none() {
         return batch.reject(Violation::InvalidValue("measurements", "records no measurement"));
+    }
+    if let Some(token) = metrics.token {
+        if batch.job_llm_profile(metrics.job)?.is_none() {
+            return batch.reject(Violation::NotAnLlmExecution(metrics.job));
+        }
+        if token.eligibility == RequestEligibility::Excluded
+            && (token.finality != UsageFinality::Cumulative || metrics.measurements.usage != NormalizedUsage::default())
+        {
+            return batch.reject(Violation::InvalidValue("token", "a request that was never sent reports no usage"));
+        }
     }
     let id = MetricsId(batch.next_id(crate::storage::Sequence::Metrics)?);
     batch.insert_metrics(
-        &MetricsRow { id, observed_at: metrics.observed_at, measurements: metrics.measurements, recorded_at: batch.now() },
+        &MetricsRow { id, observed_at: metrics.observed_at, measurements: metrics.measurements, token: metrics.token, recorded_at: batch.now() },
         metrics.job,
     )?;
     Ok((id, MarkerSubjects::created(RecordRef::Job(metrics.job), RecordRef::Metrics(id))))

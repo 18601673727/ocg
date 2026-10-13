@@ -14,7 +14,8 @@ use ntex::time::Millis;
 use serde_json::{Value, json};
 
 use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure};
-use crate::persistence::{FrozenExecutionConfig, LlmParameters};
+use crate::persistence::{FrozenExecutionConfig, LlmParameters, Timestamp};
+use crate::token_usage::UsageFinality;
 
 const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
@@ -34,11 +35,50 @@ pub trait CredentialResolver: Send + Sync {
 /// Receives text deltas while the provider stream is still active. The
 /// runtime uses this to publish bounded intermediate outputs through the
 /// authoritative database before final settlement.
+///
+/// It also receives the Token facts of the request as they become known, see
+/// [`ProviderObservation`]. Each is awaited, so the producer never runs ahead
+/// of what the sink has taken.
 pub trait ProviderOutputSink {
     fn append<'a>(
         &'a mut self,
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>>;
+
+    /// Takes one Token fact. It cannot fail the request: a sink that cannot
+    /// keep a fact owns that gap, and the provider outcome stays what the
+    /// provider and transport made it.
+    fn observe<'a>(
+        &'a mut self,
+        _observation: ProviderObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async {})
+    }
+}
+
+/// A Token fact of one request, with the time the producer learned it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderObservation {
+    pub observed_at: Timestamp,
+    pub fact: ProviderFact,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderFact {
+    /// The request was positively known not to have been sent: it failed
+    /// while being built, or before any byte could leave. No Provider saw it.
+    NotDelivered,
+    /// The request was issued or may have been delivered: a response head
+    /// arrived, or the send failed in a way that cannot rule delivery out.
+    /// It is announced only once delivery is no longer excluded, so a
+    /// request that can still be classified NotDelivered never has it.
+    Delivered,
+    /// One usage object the provider reported. Its counters are normalized
+    /// only where valid, and the object is kept raw.
+    Usage {
+        usage: NormalizedUsage,
+        finality: UsageFinality,
+    },
 }
 
 /// A local failure to persist a streamed delta. It is a fact about this
@@ -168,7 +208,62 @@ async fn execute_chat_inner(
     objective: Option<&str>,
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
-    sink: Option<&mut dyn ProviderOutputSink>,
+    mut sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+    let mut announced = false;
+    let result = exchange(
+        frozen,
+        objective,
+        resolver,
+        config,
+        sink.as_deref_mut(),
+        &mut announced,
+    )
+    .await;
+    // An error before any response head is classified by what it proves about
+    // delivery; a response head has already announced the request.
+    if let Err(error) = &result
+        && !announced
+    {
+        announce(sink, unannounced_fact(error)).await;
+    }
+    result
+}
+
+/// What an error before any response head proves about delivery. Only a
+/// failure that positively happened before the request could leave is
+/// NotDelivered; anything that may have reached a Provider is Delivered,
+/// whatever the Job's outcome becomes.
+fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
+    match error {
+        ProviderExecutionError::Build { .. } | ProviderExecutionError::NotDelivered { .. } => {
+            ProviderFact::NotDelivered
+        }
+        ProviderExecutionError::Unknown { .. }
+        | ProviderExecutionError::Rejected { .. }
+        | ProviderExecutionError::Incomplete { .. }
+        | ProviderExecutionError::Stopped { .. } => ProviderFact::Delivered,
+    }
+}
+
+/// Hands one fact to the sink with the current time.
+pub(crate) async fn announce(sink: Option<&mut (dyn ProviderOutputSink + '_)>, fact: ProviderFact) {
+    if let Some(sink) = sink {
+        sink.observe(ProviderObservation {
+            observed_at: Timestamp::now(),
+            fact,
+        })
+        .await;
+    }
+}
+
+async fn exchange(
+    frozen: &FrozenExecutionConfig,
+    objective: Option<&str>,
+    resolver: &dyn CredentialResolver,
+    config: &ProviderExecutionConfig,
+    mut sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+    announced: &mut bool,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let provider = &frozen.llm.provider;
     let endpoint = provider.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT);
@@ -229,6 +324,9 @@ async fn execute_chat_inner(
             message: "provider request timed out after it may have been delivered".to_owned(),
         })?
         .map_err(classify_client_error)?;
+    // A response head proves the request reached a Provider, whatever it says.
+    *announced = true;
+    announce(sink.as_deref_mut(), ProviderFact::Delivered).await;
     let status = response.status().as_u16();
     let request_id = response
         .header("x-request-id")
@@ -242,22 +340,40 @@ async fn execute_chat_inner(
     }
 
     let payload = response.take_payload();
-    ntex::time::timeout(
+    read_response(payload, status, started, request_id, config, sink).await
+}
+
+/// Reads one response stream under the outer timeout. The usage capture lives
+/// here, outside the parser, so a timeout that drops the parser still finds
+/// the capture and writes what it holds.
+pub(crate) async fn read_response(
+    payload: Payload,
+    status_code: u16,
+    started: Instant,
+    request_id: Option<String>,
+    config: &ProviderExecutionConfig,
+    mut sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+    let mut capture = UsageCapture::default();
+    let outcome = ntex::time::timeout(
         config.timeout,
         parse_stream(
             payload,
-            status,
+            status_code,
             started,
             request_id,
-            config.max_output_bytes,
-            config.cancellation.clone(),
-            sink,
+            config,
+            sink.as_deref_mut(),
+            &mut capture,
         ),
     )
-    .await
-    .map_err(|_| ProviderExecutionError::Unknown {
-        message: "provider stream timed out after it may have been delivered".to_owned(),
-    })?
+    .await;
+    capture.flush(sink).await;
+    outcome.unwrap_or_else(|_| {
+        Err(ProviderExecutionError::Unknown {
+            message: "provider stream timed out after it may have been delivered".to_owned(),
+        })
+    })
 }
 
 pub async fn execute_chat_with_sink(
@@ -308,9 +424,9 @@ async fn parse_stream(
     status_code: u16,
     started: Instant,
     request_id: Option<String>,
-    max_output_bytes: usize,
-    cancellation: CancellationToken,
-    mut sink: Option<&mut dyn ProviderOutputSink>,
+    config: &ProviderExecutionConfig,
+    mut sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+    capture: &mut UsageCapture,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut buffer = Vec::with_capacity(MAX_SSE_LINE_BYTES);
     let mut text = String::new();
@@ -321,7 +437,7 @@ async fn parse_stream(
     let mut first_byte = None;
 
     while let Some(chunk) = payload.recv().await {
-        if cancellation.is_cancelled() {
+        if config.cancellation.is_cancelled() {
             return Err(local_stop(
                 "provider execution was cancelled while streaming",
                 status_code,
@@ -364,15 +480,20 @@ async fn parse_stream(
                 }
             })?;
             saw_event = true;
-            let delta = consume_event(
+            let consumed = consume_event(
                 &event,
                 &mut text,
                 &mut usage,
                 &mut finish_reason,
                 &mut raw_finish_reason,
-                max_output_bytes,
+                config.max_output_bytes,
             )?;
-            if let Some(delta) = delta.as_deref()
+            // The usage is taken before the delta, so a failed delta write
+            // loses none of the event's counters.
+            if let Some(reported) = consumed.usage {
+                capture.record(sink.as_deref_mut(), reported).await?;
+            }
+            if let Some(delta) = consumed.delta.as_deref()
                 && let Some(sink) = sink.as_deref_mut()
             {
                 // The failed delta's event is already applied, so its finish reason is kept.
@@ -389,7 +510,7 @@ async fn parse_stream(
     }
     // A stream cut short after cancellation is the local stop, not the provider's incomplete stream.
     let cut_short = !buffer.is_empty() || !saw_event || finish_reason.is_none();
-    if cut_short && cancellation.is_cancelled() {
+    if cut_short && config.cancellation.is_cancelled() {
         return Err(local_stop(
             "provider execution was cancelled before the stream finished",
             status_code,
@@ -437,6 +558,65 @@ fn local_stop(
     }
 }
 
+/// What one stream event contributed.
+struct Consumed {
+    delta: Option<String>,
+    usage: Option<ReportedUsage>,
+}
+
+/// A valid, non-null usage object of one event, and what its position says
+/// about its finality.
+#[derive(Clone, Debug, PartialEq)]
+struct ReportedUsage {
+    usage: NormalizedUsage,
+    finality: UsageFinality,
+}
+
+fn counter(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+/// The usage object of an event. `usage: null` and any other non-object is
+/// absence: it reports nothing and erases nothing.
+///
+/// Final is the documented `stream_options.include_usage` chunk: usage with
+/// an explicit empty `choices` array carries the whole request's usage. Usage
+/// beside choices (or with no `choices` at all) is a running total and stays
+/// cumulative. A finish reason, `[DONE]`, the end of the stream or the Job's
+/// completion never promotes anything to final.
+fn reported_usage(event: &Value) -> Option<ReportedUsage> {
+    let value = event.get("usage").filter(|value| value.is_object())?;
+    let usage_only = event
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    Some(ReportedUsage {
+        usage: NormalizedUsage {
+            input_tokens: counter(value.get("prompt_tokens")),
+            output_tokens: counter(value.get("completion_tokens")),
+            cache_read_tokens: counter(
+                value
+                    .get("prompt_tokens_details")
+                    .and_then(|details| details.get("cached_tokens")),
+            ),
+            cache_write_tokens: None,
+            reasoning_tokens: counter(
+                value
+                    .get("completion_tokens_details")
+                    .and_then(|details| details.get("reasoning_tokens")),
+            ),
+            raw: Some(value.clone()),
+        },
+        finality: if usage_only {
+            UsageFinality::Final
+        } else {
+            UsageFinality::Cumulative
+        },
+    })
+}
+
 fn consume_event(
     event: &Value,
     text: &mut String,
@@ -444,36 +624,22 @@ fn consume_event(
     finish_reason: &mut Option<ChatFinishReason>,
     raw_finish_reason: &mut Option<String>,
     max_output_bytes: usize,
-) -> Result<Option<String>, ProviderExecutionError> {
-    if let Some(value) = event.get("usage") {
-        usage.raw = Some(value.clone());
-        usage.input_tokens = value
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok());
-        usage.output_tokens = value
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok());
-        usage.cache_read_tokens = value
-            .get("prompt_tokens_details")
-            .and_then(|details| details.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok());
-        usage.reasoning_tokens = value
-            .get("completion_tokens_details")
-            .and_then(|details| details.get("reasoning_tokens"))
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok());
+) -> Result<Consumed, ProviderExecutionError> {
+    let reported = reported_usage(event);
+    if let Some(reported) = &reported {
+        *usage = reported.usage.clone();
     }
+    let mut consumed = Consumed {
+        delta: None,
+        usage: reported,
+    };
     let Some(choice) = event
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
     else {
-        return Ok(None);
+        return Ok(consumed);
     };
-    let mut text_delta = None;
     if let Some(delta) = choice.get("delta")
         && let Some(value) = delta.get("content").and_then(Value::as_str)
     {
@@ -483,13 +649,113 @@ fn consume_event(
             });
         }
         text.push_str(value);
-        text_delta = Some(value.to_owned());
+        consumed.delta = Some(value.to_owned());
     }
     if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
         *raw_finish_reason = Some(raw.to_owned());
         *finish_reason = Some(ChatFinishReason::from_openai_str(raw));
     }
-    Ok(text_delta)
+    Ok(consumed)
+}
+
+/// The most distinct cumulative usage objects written as they arrive. A
+/// provider that reports a running total on every chunk would otherwise cost
+/// one record per chunk; later totals are merged and written once at the end.
+const MAX_STREAMED_CUMULATIVE: usize = 16;
+/// The most final usage objects written for one request. Final usage is
+/// expected once; a stream with more is refused rather than recorded without
+/// bound.
+const MAX_FINAL_USAGE: usize = 16;
+
+/// The usage a stream has reported and not yet handed to the sink. It is
+/// bounded: a count per kind and one merged cumulative object, never the
+/// history. It is owned outside the parser so that every way the parser can
+/// stop, including its timeout, still leaves it to be flushed.
+#[derive(Default)]
+pub(crate) struct UsageCapture {
+    cumulative_written: usize,
+    finals_written: usize,
+    last_cumulative: Option<NormalizedUsage>,
+    pending: Option<NormalizedUsage>,
+}
+
+impl UsageCapture {
+    async fn record(
+        &mut self,
+        sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+        reported: ReportedUsage,
+    ) -> Result<(), ProviderExecutionError> {
+        if sink.is_none() {
+            return Ok(());
+        }
+        match reported.finality {
+            UsageFinality::Final => {
+                if self.finals_written >= MAX_FINAL_USAGE {
+                    return Err(ProviderExecutionError::Incomplete {
+                        message: "provider reported too many final usage objects".to_owned(),
+                    });
+                }
+                self.finals_written += 1;
+                announce(
+                    sink,
+                    ProviderFact::Usage {
+                        usage: reported.usage,
+                        finality: UsageFinality::Final,
+                    },
+                )
+                .await;
+            }
+            UsageFinality::Cumulative => {
+                if self.last_cumulative.as_ref() == Some(&reported.usage) {
+                    return Ok(());
+                }
+                self.last_cumulative = Some(reported.usage.clone());
+                if self.cumulative_written < MAX_STREAMED_CUMULATIVE {
+                    self.cumulative_written += 1;
+                    announce(
+                        sink,
+                        ProviderFact::Usage {
+                            usage: reported.usage,
+                            finality: UsageFinality::Cumulative,
+                        },
+                    )
+                    .await;
+                } else {
+                    self.merge(reported.usage);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Folds a cumulative object into the pending one: each counter keeps its
+    /// maximum, as the reducer does, and the raw object is the latest.
+    fn merge(&mut self, usage: NormalizedUsage) {
+        let Some(pending) = self.pending.as_mut() else {
+            self.pending = Some(usage);
+            return;
+        };
+        pending.input_tokens = pending.input_tokens.max(usage.input_tokens);
+        pending.output_tokens = pending.output_tokens.max(usage.output_tokens);
+        pending.cache_read_tokens = pending.cache_read_tokens.max(usage.cache_read_tokens);
+        pending.cache_write_tokens = pending.cache_write_tokens.max(usage.cache_write_tokens);
+        pending.reasoning_tokens = pending.reasoning_tokens.max(usage.reasoning_tokens);
+        pending.raw = usage.raw;
+    }
+
+    /// Hands over what is still pending.
+    async fn flush(&mut self, sink: Option<&mut (dyn ProviderOutputSink + '_)>) {
+        if let Some(usage) = self.pending.take() {
+            announce(
+                sink,
+                ProviderFact::Usage {
+                    usage,
+                    finality: UsageFinality::Cumulative,
+                },
+            )
+            .await;
+        }
+    }
 }
 
 async fn bounded_body(response: ClientResponse, limit: usize) -> Option<String> {
@@ -629,27 +895,26 @@ pub fn result_value(result: &ProviderExecutionResult) -> Value {
     Value::Object(value)
 }
 
+/// A scripted response body, for tests that drive the real parser.
 #[cfg(test)]
-mod tests {
+pub(crate) mod scripted {
     use std::collections::VecDeque;
     use std::io;
-    use std::time::Instant;
 
+    use ntex::http::Payload;
     use ntex::http::error::PayloadError;
     use ntex::util::{Bytes, Stream};
 
-    use super::*;
-    use crate::test_support::wait;
-
-    const CONTENT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
-    const STOP: &str = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    use super::CancellationToken;
 
     /// One scripted step of a response body.
-    enum Step {
+    pub(crate) enum Step {
         Chunk(&'static str),
         Fail,
         /// Cancels the execution, then yields the next chunk so the parser sees it.
         Cancel,
+        /// Yields nothing, ever: only a timeout ends the read.
+        Stall,
     }
 
     struct Body {
@@ -661,7 +926,7 @@ mod tests {
         type Item = Result<Bytes, PayloadError>;
 
         fn poll_next(
-            mut self: Pin<&mut Self>,
+            mut self: std::pin::Pin<&mut Self>,
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Self::Item>> {
             use std::task::Poll;
@@ -676,16 +941,54 @@ mod tests {
                             io::Error::other("connection reset"),
                         )))));
                     }
+                    Step::Stall => {
+                        // Stays at the front, so every poll stalls again.
+                        self.steps.push_front(Step::Stall);
+                        return Poll::Pending;
+                    }
                 }
             }
             Poll::Ready(None)
         }
     }
 
+    pub(crate) fn payload(steps: Vec<Step>, cancellation: CancellationToken) -> Payload {
+        Payload::from_stream(Body {
+            steps: steps.into(),
+            cancellation,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::scripted::{Step, payload};
+    use super::*;
+    use crate::test_support::wait;
+
+    const CONTENT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+    const STOP: &str = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+
     #[derive(Default)]
     struct RecordingSink {
         deltas: Vec<String>,
         fail: Option<&'static str>,
+        observations: Vec<ProviderObservation>,
+    }
+
+    impl RecordingSink {
+        /// The usage facts received, with the finality each was given.
+        fn usages(&self) -> Vec<(UsageFinality, NormalizedUsage)> {
+            self.observations
+                .iter()
+                .filter_map(|observation| match &observation.fact {
+                    ProviderFact::Usage { usage, finality } => Some((*finality, usage.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     impl ProviderOutputSink for RecordingSink {
@@ -705,25 +1008,28 @@ mod tests {
                 }
             })
         }
+
+        fn observe<'a>(
+            &'a mut self,
+            observation: ProviderObservation,
+        ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+            Box::pin(async move { self.observations.push(observation) })
+        }
     }
 
     fn parse(
         steps: Vec<Step>,
         sink: Option<&mut dyn ProviderOutputSink>,
     ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-        let cancellation = CancellationToken::default();
-        let payload = Payload::from_stream(Body {
-            steps: steps.into(),
-            cancellation: cancellation.clone(),
-        });
+        let config = ProviderExecutionConfig::default();
         wait(parse_stream(
-            payload,
+            payload(steps, config.cancellation.clone()),
             200,
             Instant::now(),
             None,
-            MAX_OUTPUT_BYTES,
-            cancellation,
+            &config,
             sink,
+            &mut UsageCapture::default(),
         ))
     }
 
@@ -876,5 +1182,302 @@ mod tests {
             observation.failure.map(|failure| failure.message),
             Some(unknown.to_string())
         );
+    }
+
+    const CUMULATIVE_10: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n";
+    const CUMULATIVE_25: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}],\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":2}}\n\n";
+    const NULL_USAGE: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"c\"}}],\"usage\":null}\n\n";
+    const FINAL_40_60: &str = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":60,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n";
+    const FINAL_40_61: &str =
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":61}}\n\n";
+    const FINAL_INPUT_ONLY: &str = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40}}\n\n";
+    const FINAL_ZERO_OUTPUT: &str =
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":0}}\n\n";
+    const DONE: &str = "data: [DONE]\n\n";
+
+    fn recorded(
+        steps: Vec<Step>,
+    ) -> (
+        Result<ProviderExecutionResult, ProviderExecutionError>,
+        RecordingSink,
+    ) {
+        let mut sink = RecordingSink::default();
+        let result = parse(steps, Some(&mut sink));
+        (result, sink)
+    }
+
+    fn counters(usage: &NormalizedUsage) -> [Option<u32>; 3] {
+        [
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+        ]
+    }
+
+    #[test]
+    fn usage_null_is_absence_and_erases_nothing() {
+        let (result, sink) = recorded(vec![
+            Step::Chunk(CUMULATIVE_10),
+            Step::Chunk(NULL_USAGE),
+            Step::Chunk(STOP),
+        ]);
+        let result = result.expect("a finished stream");
+        assert_eq!(
+            sink.usages().len(),
+            1,
+            "a null usage reports nothing, so nothing is recorded for it"
+        );
+        assert_eq!(result.usage.input_tokens, Some(10), "earlier counters stay");
+        assert!(result.usage.raw.is_some(), "and so does the raw object");
+    }
+
+    #[test]
+    fn usage_beside_choices_is_cumulative_and_only_the_empty_choices_chunk_is_final() {
+        let (result, sink) = recorded(vec![
+            Step::Chunk(CUMULATIVE_10),
+            Step::Chunk(CUMULATIVE_25),
+            Step::Chunk(STOP),
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(DONE),
+        ]);
+        result.expect("a finished stream");
+        let usages = sink.usages();
+        assert_eq!(
+            usages
+                .iter()
+                .map(|(finality, usage)| (*finality, counters(usage)))
+                .collect::<Vec<_>>(),
+            [
+                (UsageFinality::Cumulative, [Some(10), Some(1), None]),
+                (UsageFinality::Cumulative, [Some(25), Some(2), None]),
+                (UsageFinality::Final, [Some(40), Some(60), Some(0)]),
+            ]
+        );
+        assert!(
+            usages[2].1.raw.is_some(),
+            "each reported object is kept raw"
+        );
+    }
+
+    #[test]
+    fn a_normal_finish_end_of_stream_and_done_never_make_usage_final() {
+        let (result, sink) = recorded(vec![
+            Step::Chunk(CUMULATIVE_25),
+            Step::Chunk(STOP),
+            Step::Chunk(DONE),
+        ]);
+        result.expect("a finished stream");
+        let usages = sink.usages();
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].0, UsageFinality::Cumulative);
+    }
+
+    #[test]
+    fn a_final_reports_only_its_own_fields_and_zero_is_not_missing() {
+        let (_, sink) = recorded(vec![
+            Step::Chunk(CUMULATIVE_25),
+            Step::Chunk(STOP),
+            Step::Chunk(FINAL_INPUT_ONLY),
+            Step::Chunk(FINAL_ZERO_OUTPUT),
+        ]);
+        let usages = sink.usages();
+        assert_eq!(
+            counters(&usages[1].1),
+            [Some(40), None, None],
+            "an omitted field is missing, never zero and never the earlier value"
+        );
+        assert_eq!(
+            counters(&usages[2].1),
+            [Some(3), Some(0), None],
+            "a real zero is a reported count"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_conflicting_finals_all_reach_the_sink() {
+        let (_, sink) = recorded(vec![
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(FINAL_40_60),
+            Step::Chunk(FINAL_40_61),
+            Step::Chunk(STOP),
+        ]);
+        assert_eq!(
+            sink.usages()
+                .iter()
+                .map(|(finality, usage)| (*finality, usage.output_tokens))
+                .collect::<Vec<_>>(),
+            [
+                (UsageFinality::Final, Some(60)),
+                (UsageFinality::Final, Some(60)),
+                (UsageFinality::Final, Some(61)),
+            ]
+        );
+    }
+
+    #[test]
+    fn final_usage_beyond_its_bound_is_refused_after_the_bound_is_kept() {
+        let mut steps: Vec<Step> = (0..=MAX_FINAL_USAGE)
+            .map(|_| Step::Chunk(FINAL_40_60))
+            .collect();
+        steps.push(Step::Chunk(STOP));
+        let (result, sink) = recorded(steps);
+        assert!(matches!(
+            result,
+            Err(ProviderExecutionError::Incomplete { .. })
+        ));
+        assert_eq!(sink.usages().len(), MAX_FINAL_USAGE);
+    }
+
+    #[test]
+    fn running_totals_are_bounded_merged_and_flushed_once() {
+        const TOTALS: [&str; 20] = [
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":4}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":5}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":6}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":7}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":8}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":9}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":10}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":11}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":12}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":13}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":14}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":15}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":16}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":17}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":18}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":19}}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":20}}\n\n",
+        ];
+        let mut steps: Vec<Step> = TOTALS.iter().map(|chunk| Step::Chunk(chunk)).collect();
+        // A repeat of the last total is not a new object.
+        steps.push(Step::Chunk(TOTALS[19]));
+        steps.push(Step::Fail);
+        let (result, sink) = recorded(steps);
+        assert!(matches!(
+            result,
+            Err(ProviderExecutionError::Unknown { .. })
+        ));
+        // The stream failed, so nothing flushed it: the capture is flushed by
+        // `read_response`, tested with the timeout below.
+        assert_eq!(sink.usages().len(), MAX_STREAMED_CUMULATIVE);
+    }
+
+    #[test]
+    fn a_usage_reported_before_each_kind_of_stop_is_not_lost_with_the_parser() {
+        let cases: [(&str, Vec<Step>); 3] = [
+            (
+                "transport failure",
+                vec![Step::Chunk(CUMULATIVE_25), Step::Fail],
+            ),
+            ("stream without a finish", vec![Step::Chunk(CUMULATIVE_25)]),
+            (
+                "cancellation",
+                vec![
+                    Step::Chunk(CUMULATIVE_25),
+                    Step::Cancel,
+                    Step::Chunk(CONTENT),
+                ],
+            ),
+        ];
+        for (case, steps) in cases {
+            let (result, sink) = recorded(steps);
+            assert!(result.is_err(), "{case}");
+            assert_eq!(
+                sink.usages()
+                    .iter()
+                    .map(|(finality, usage)| (*finality, counters(usage)))
+                    .collect::<Vec<_>>(),
+                [(UsageFinality::Cumulative, [Some(25), Some(2), None])],
+                "{case}: the usage reached the sink before the error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_delta_write_keeps_the_counters_of_its_own_event() {
+        let mut sink = RecordingSink {
+            fail: Some("database could not persist provider output"),
+            ..RecordingSink::default()
+        };
+        let error = parse(vec![Step::Chunk(CUMULATIVE_25)], Some(&mut sink))
+            .expect_err("a sink failure stops the stream");
+        assert!(matches!(error, ProviderExecutionError::Stopped { .. }));
+        assert_eq!(sink.usages().len(), 1);
+    }
+
+    #[test]
+    fn the_outer_timeout_still_flushes_the_usage_the_dropped_parser_had_pending() {
+        // Twenty running totals fill the immediate bound and leave the rest
+        // pending inside the capture; then the stream stalls until the timeout
+        // drops the parser. The capture is not the parser's, so it flushes.
+        let chunks: Vec<String> = (1..=20)
+            .map(|n| {
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{}}}}],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":{n}}}}}\n\n"
+                )
+            })
+            .collect();
+        let leaked: Vec<&'static str> = chunks
+            .into_iter()
+            .map(|chunk| &*Box::leak(chunk.into_boxed_str()))
+            .collect();
+        let mut steps: Vec<Step> = leaked.into_iter().map(Step::Chunk).collect();
+        steps.push(Step::Stall);
+        let config = ProviderExecutionConfig {
+            timeout: Duration::from_millis(100),
+            ..ProviderExecutionConfig::default()
+        };
+        let (result, sink) = ntex::rt::System::new("timeout-test", ntex::rt::DefaultRuntime)
+            .block_on(async move {
+                let mut sink = RecordingSink::default();
+                let result = read_response(
+                    payload(steps, config.cancellation.clone()),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    Some(&mut sink),
+                )
+                .await;
+                (result, sink)
+            });
+        assert!(matches!(
+            result,
+            Err(ProviderExecutionError::Unknown { .. })
+        ));
+        let usages = sink.usages();
+        assert_eq!(usages.len(), MAX_STREAMED_CUMULATIVE + 1);
+        assert_eq!(
+            counters(&usages.last().expect("the flushed total").1),
+            [Some(1), Some(20), None],
+            "the merged pending total is written when the timeout ends the read"
+        );
+    }
+
+    #[test]
+    fn only_a_failure_before_the_request_could_leave_is_not_delivered() {
+        let message = || "x".to_owned();
+        assert_eq!(
+            unannounced_fact(&ProviderExecutionError::Build { message: message() }),
+            ProviderFact::NotDelivered
+        );
+        assert_eq!(
+            unannounced_fact(&ProviderExecutionError::NotDelivered { message: message() }),
+            ProviderFact::NotDelivered
+        );
+        for error in [
+            ProviderExecutionError::Unknown { message: message() },
+            ProviderExecutionError::Incomplete { message: message() },
+            ProviderExecutionError::Rejected {
+                failure: ProviderFailure::default(),
+            },
+        ] {
+            assert_eq!(unannounced_fact(&error), ProviderFact::Delivered, "{error}");
+        }
     }
 }

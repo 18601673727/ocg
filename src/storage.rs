@@ -49,6 +49,7 @@ use crate::persistence::{
     ProfileId, ProfileKind, ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef,
     SubmittedConfiguration, Timestamp, Violation, WrongProfileKind,
 };
+use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
@@ -68,9 +69,11 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// observation scope; a version 5 file lacks their entries. Version 7 added
 /// the AvailabilityStat aggregation state: request samples, sparse minute
 /// counts and consumption progress. A version 6 file lacks those tables, so
-/// it is refused rather than initialized in place. Files of any other
-/// version are refused on open, before anything is written to them.
-pub(crate) const FORMAT_VERSION: u32 = 7;
+/// it is refused rather than initialized in place. Version 8 added the
+/// optional Token annotation to Metrics records; a version 7 build would
+/// not decode it, and no annotation is invented for an older file. Files of
+/// any other version are refused on open, before anything is written to them.
+pub(crate) const FORMAT_VERSION: u32 = 8;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -1030,6 +1033,7 @@ pub(crate) struct MetricsRow {
     pub(crate) id: MetricsId,
     pub(crate) observed_at: Timestamp,
     pub(crate) measurements: Measurements,
+    pub(crate) token: Option<TokenAnnotation>,
     pub(crate) recorded_at: Timestamp,
 }
 
@@ -1048,6 +1052,16 @@ impl MetricsRow {
             e.ou64(ms);
         }
         e.usage(&m.usage);
+        e.opt(&self.token, |e, token| {
+            e.u8(match token.eligibility {
+                RequestEligibility::Eligible => 1,
+                RequestEligibility::Excluded => 2,
+            });
+            e.u8(match token.finality {
+                UsageFinality::Cumulative => 1,
+                UsageFinality::Final => 2,
+            });
+        });
         e.ts(self.recorded_at);
         e.0
     }
@@ -1064,6 +1078,30 @@ impl MetricsRow {
                 request_finished_in_ms: d.ou64()?,
                 usage: d.usage()?,
             },
+            token: d.opt(|d| {
+                let eligibility = match d.u8()? {
+                    1 => RequestEligibility::Eligible,
+                    2 => RequestEligibility::Excluded,
+                    other => {
+                        return Err(StorageError::corrupted(format!(
+                            "unknown Token eligibility code {other}"
+                        )));
+                    }
+                };
+                let finality = match d.u8()? {
+                    1 => UsageFinality::Cumulative,
+                    2 => UsageFinality::Final,
+                    other => {
+                        return Err(StorageError::corrupted(format!(
+                            "unknown Token finality code {other}"
+                        )));
+                    }
+                };
+                Ok(TokenAnnotation {
+                    eligibility,
+                    finality,
+                })
+            })?,
             recorded_at: d.ts()?,
         };
         d.end()?;
@@ -3797,6 +3835,7 @@ fn metrics_from(
         target,
         observed_at: row.observed_at,
         measurements: row.measurements,
+        token: row.token,
         recorded_at: row.recorded_at,
     })
 }
