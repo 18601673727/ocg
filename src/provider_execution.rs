@@ -3340,9 +3340,12 @@ mod tests {
         let open = offering_schema("f", Some(json!({"type": "object"})));
         for arguments in [
             "{}",
-            r#"{"a":0.1,"b":-0,"c":1e2,"d":2.50,"e":-1.5E-7,"f":9007199254740992}"#,
-            r#"{"a":18446744073709551615,"b":-9223372036854775808,"c":1e300}"#,
+            r#"{"a":0.1,"b":-0,"c":1e2,"d":2.50,"e":-1.5E-7}"#,
             r#"{"s":"\"}{\\","n":[1,{"m":2}]}"#,
+            // The safe-integer bounds, in every notation.
+            r#"{"a":9007199254740991,"b":-9007199254740991}"#,
+            r#"{"a":9007199254740991.0,"b":-9007199254740991.0}"#,
+            r#"{"a":9.007199254740991e15,"b":-9.007199254740991E+15,"c":90071992547409910e-1}"#,
         ] {
             let result = read(calling("f", arguments), &open, None)
                 .unwrap_or_else(|error| panic!("{arguments}: {error:?}"));
@@ -3358,6 +3361,51 @@ mod tests {
             (
                 "an integer beyond u64",
                 r#"{"a":18446744073709551616}"#,
+                "not exactly",
+            ),
+            (
+                "the integer just past the safe range",
+                r#"{"a":9007199254740992}"#,
+                "not exactly",
+            ),
+            (
+                "the negative integer just past the safe range",
+                r#"{"a":-9007199254740992}"#,
+                "not exactly",
+            ),
+            (
+                "an integer the Provider meant past 2^53",
+                r#"{"a":9007199254740993}"#,
+                "not exactly",
+            ),
+            (
+                "the largest u64",
+                r#"{"a":18446744073709551615}"#,
+                "not exactly",
+            ),
+            (
+                "the smallest i64",
+                r#"{"a":-9223372036854775808}"#,
+                "not exactly",
+            ),
+            (
+                "the first unsafe integer in decimal notation",
+                r#"{"a":9007199254740992.0}"#,
+                "not exactly",
+            ),
+            (
+                "the first unsafe integer in exponent notation",
+                r#"{"a":9.007199254740992e15}"#,
+                "not exactly",
+            ),
+            (
+                "a negative unsafe integer in exponent notation",
+                r#"{"a":-9.007199254740992E15}"#,
+                "not exactly",
+            ),
+            (
+                "an exactly representable large double",
+                r#"{"a":1e300}"#,
                 "not exactly",
             ),
             (
@@ -3388,6 +3436,62 @@ mod tests {
                 "{case}: {message}"
             );
         }
+    }
+
+    #[test]
+    fn large_integers_are_admitted_only_as_strings_a_schema_allows() {
+        let counter = offering_schema(
+            "count",
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "pattern": "^[0-9]+$"},
+                    "n": {"type": "integer"}
+                },
+                "required": ["id", "n"],
+                "additionalProperties": false
+            })),
+        );
+        let valid = r#"{"id":"18446744073709551616","n":9007199254740991}"#;
+        let result = read(calling("count", valid), &counter, None).expect("a safe call");
+        assert_eq!(result.tool_calls, [call(0, "c", "count", valid)]);
+
+        // The schema allows any integer, but not every reader takes this one exactly.
+        let error = read(
+            calling("count", r#"{"id":"1","n":9007199254740993}"#),
+            &counter,
+            None,
+        )
+        .expect_err("an unsafe integer is refused");
+        let ProviderExecutionError::Incomplete {
+            message,
+            facts: seen,
+        } = &error
+        else {
+            panic!("expected an incomplete stream, got {error:?}");
+        };
+        assert!(
+            message.contains("(invalid arguments)") && message.contains("not exactly"),
+            "{message}"
+        );
+        assert!(!message.contains("9007199254740993"), "{message}");
+        assert_eq!(
+            *seen,
+            facts(Some(ChatFinishReason::ToolCalls), Some("tool_calls"))
+        );
+        assert_eq!(
+            error_observations(&error)[0].classification(),
+            AvailabilityClassification::Unconfirmed
+        );
+        // A string the schema does not allow is still refused by the schema.
+        assert!(
+            incomplete_message(read(
+                calling("count", r#"{"id":"0x1F","n":1}"#),
+                &counter,
+                None
+            ))
+            .contains("/properties/id/pattern")
+        );
     }
 
     #[test]

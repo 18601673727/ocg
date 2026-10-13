@@ -20,6 +20,9 @@ use super::stream::{InvalidToolCall, ToolCallRefusal};
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 /// Deepest nesting of subschemas a parameter schema may have.
 const MAX_SCHEMA_DEPTH: usize = 32;
+/// The largest integer every IEEE-754 double reader takes exactly, 2^53 - 1;
+/// I-JSON's interoperable integers are those of at most this magnitude.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 /// Compiles the parameter schema of `name`, offered without one when
 /// `parameters` is `None`, which admits no call: arguments are never taken
@@ -164,7 +167,8 @@ pub(crate) fn admit_arguments(
 
 /// Parses `text` as one I-JSON value (RFC 7493), so that what the schema
 /// validates is what any reader of the text will take it to say: no object
-/// has a key twice, and every number is exactly the double it is read as.
+/// has a key twice, and every number is exactly the double it is read as,
+/// of a magnitude no greater than the largest safe integer.
 fn parse_strict(text: &str) -> Result<Value, String> {
     let mut numbers = Vec::new();
     let mut deserializer = serde_json::Deserializer::from_str(text);
@@ -306,18 +310,24 @@ fn number_literals(text: &str) -> Vec<&str> {
     literals
 }
 
-/// Whether `literal` is exactly the value `number` holds. An integer read
-/// as one is; a double is when the literal denotes the same decimal as the
-/// double's shortest representation, so a literal the double rounded, such
-/// as an integer beyond 2^53 or a fraction with more digits than a double
-/// keeps, is not.
+/// Whether `literal` is exactly the value `number` holds and every reader
+/// takes it exactly too. An integer read as one must be within
+/// ±[`MAX_SAFE_INTEGER`]. A double must be the decimal the literal denotes,
+/// its shortest representation, so a literal the double rounded, such as a
+/// fraction with more digits than a double keeps, is not; and it must be
+/// within the same bound, which, as every double beyond it is an integer,
+/// holds integers in decimal or exponent notation to the same range.
 fn is_exact(literal: &str, number: &Number) -> bool {
-    if number.is_i64() || number.is_u64() {
-        return true;
+    if let Some(integer) = number.as_i64() {
+        return integer.unsigned_abs() <= MAX_SAFE_INTEGER;
+    }
+    if let Some(integer) = number.as_u64() {
+        return integer <= MAX_SAFE_INTEGER;
     }
     number.as_f64().is_some_and(|double| {
         let shortest = format!("{double:e}");
-        decimal(literal).is_some_and(|written| decimal(&shortest) == Some(written))
+        double.abs() <= MAX_SAFE_INTEGER as f64
+            && decimal(literal).is_some_and(|written| decimal(&shortest) == Some(written))
     })
 }
 

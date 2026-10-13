@@ -13,7 +13,7 @@
 //! enforces that answer under concurrency through atomic permit acquisition.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -78,6 +78,10 @@ pub struct CapacityConfig {
 
 /// A permit that represents reserved execution capacity.
 /// Capacity is released when the permit is dropped.
+///
+/// Every permit counts as one in-flight execution of its scope from its
+/// acquisition to its drop, whether or not a capacity limit was configured
+/// when it was acquired, so it releases exactly the one unit it added.
 pub struct CapacityPermit {
     scope: GovernorScope,
     governor: Arc<Mutex<GovernorState>>,
@@ -85,11 +89,13 @@ pub struct CapacityPermit {
 
 impl Drop for CapacityPermit {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.governor.lock()
-            && let Some(capacity) = state.capacity_state.get_mut(&self.scope)
-            && capacity.current > 0
-        {
-            capacity.current -= 1;
+        // A poisoned lock still holds this permit's unit; it is released.
+        let mut state = self.governor.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(in_flight) = state.in_flight.get_mut(&self.scope) {
+            *in_flight = in_flight.saturating_sub(1);
+            if *in_flight == 0 {
+                state.in_flight.remove(&self.scope);
+            }
         }
     }
 }
@@ -113,8 +119,9 @@ impl RateLimiterState {
         }
     }
 
-    /// Check if a request can proceed now and record it if so.
-    fn check_and_acquire(&mut self, now: Instant) -> std::result::Result<(), Duration> {
+    /// Check if a request can proceed now, without recording it. Only expired
+    /// window entries and an expired cooldown are dropped.
+    fn check(&mut self, now: Instant) -> std::result::Result<(), Duration> {
         // First check upstream cooldown
         if let Some(until) = self.cooldown_until {
             if now < until {
@@ -139,10 +146,12 @@ impl RateLimiterState {
             }
             return Err(Duration::from_secs(1));
         }
-
-        // Acquire the request slot
-        self.requests.push(now);
         Ok(())
+    }
+
+    /// Record a request that [`Self::check`] allowed at `now`.
+    fn record(&mut self, now: Instant) {
+        self.requests.push(now);
     }
 
     /// Record upstream throttling feedback (HTTP 429 Retry-After).
@@ -152,47 +161,40 @@ impl RateLimiterState {
     }
 }
 
-/// Capacity state for one scope.
-#[derive(Debug, Clone)]
-struct CapacityState {
-    config: CapacityConfig,
-    /// Current number of in-flight executions.
-    current: usize,
-}
-
-impl CapacityState {
-    fn new(config: CapacityConfig) -> Self {
-        Self { config, current: 0 }
-    }
-
-    /// Try to acquire a capacity slot.
-    fn try_acquire(&mut self) -> bool {
-        if self.current < self.config.max_concurrent {
-            self.current += 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 /// Internal governor state protected by a mutex.
 #[derive(Debug)]
 struct GovernorState {
     rate_limiters: HashMap<GovernorScope, RateLimiterState>,
-    capacity_state: HashMap<GovernorScope, CapacityState>,
     rate_configs: HashMap<GovernorScope, RateConfig>,
+    /// The capacity limit in effect for each configured scope, read at every
+    /// acquisition.
     capacity_configs: HashMap<GovernorScope, CapacityConfig>,
+    /// The live permits of each scope, configured or not, so that a limit
+    /// configured later counts the executions already running. A scope with
+    /// none has no entry.
+    in_flight: HashMap<GovernorScope, usize>,
 }
 
 impl GovernorState {
     fn new() -> Self {
         Self {
             rate_limiters: HashMap::new(),
-            capacity_state: HashMap::new(),
             rate_configs: HashMap::new(),
             capacity_configs: HashMap::new(),
+            in_flight: HashMap::new(),
         }
+    }
+
+    fn in_flight(&self, scope: &GovernorScope) -> usize {
+        self.in_flight.get(scope).copied().unwrap_or(0)
+    }
+
+    /// Whether a capacity limit, if one is configured, leaves room for one
+    /// more execution of `scope` now.
+    fn capacity_available(&self, scope: &GovernorScope) -> bool {
+        self.capacity_configs
+            .get(scope)
+            .is_none_or(|config| self.in_flight(scope) < config.max_concurrent)
     }
 
     fn ensure_rate_limiter(&mut self, scope: &GovernorScope) {
@@ -218,15 +220,6 @@ impl GovernorState {
             });
             self.rate_limiters
                 .insert(scope.clone(), RateLimiterState::new(config));
-        }
-    }
-
-    fn ensure_capacity_state(&mut self, scope: &GovernorScope) {
-        if !self.capacity_state.contains_key(scope)
-            && let Some(&config) = self.capacity_configs.get(scope)
-        {
-            self.capacity_state
-                .insert(scope.clone(), CapacityState::new(config));
         }
     }
 }
@@ -262,7 +255,11 @@ impl Governor {
         Ok(())
     }
 
-    /// Configure capacity limiting for a scope.
+    /// Configure capacity limiting for a scope. The limit applies to every
+    /// later acquisition and counts the permits already held, including any
+    /// acquired before the scope had a limit; none of them is revoked. A
+    /// limit at or below the permits held admits nothing until enough of
+    /// them are released.
     pub fn configure_capacity(&self, scope: GovernorScope, config: CapacityConfig) -> Result<()> {
         let mut state = self.state.lock().map_err(|_| GovernorError::LockPoisoned)?;
         state.capacity_configs.insert(scope, config);
@@ -271,29 +268,32 @@ impl Governor {
 
     /// Check and acquire execution permission for a scope.
     /// Returns a permit if successful; the permit must be held for the duration of execution.
+    ///
+    /// Both resources are checked before either is taken, under one lock: a
+    /// rate refusal takes no capacity, a capacity refusal takes no rate
+    /// budget, and an admission records one request and one in-flight
+    /// execution together.
     pub fn acquire(
         &self,
         scope: GovernorScope,
     ) -> Result<std::result::Result<CapacityPermit, GovernorDecision>> {
         let mut state = self.state.lock().map_err(|_| GovernorError::LockPoisoned)?;
+        let now = Instant::now();
 
-        // Check rate limit first
         state.ensure_rate_limiter(&scope);
         if let Some(rate_limiter) = state.rate_limiters.get_mut(&scope)
-            && let Err(retry_after) = rate_limiter.check_and_acquire(Instant::now())
+            && let Err(retry_after) = rate_limiter.check(now)
         {
             return Ok(Err(GovernorDecision::RateLimited { retry_after }));
         }
-
-        // Then check capacity
-        state.ensure_capacity_state(&scope);
-        if let Some(capacity) = state.capacity_state.get_mut(&scope)
-            && !capacity.try_acquire()
-        {
+        if !state.capacity_available(&scope) {
             return Ok(Err(GovernorDecision::CapacityUnavailable));
         }
 
-        // Success: return a permit that will release capacity on drop
+        if let Some(rate_limiter) = state.rate_limiters.get_mut(&scope) {
+            rate_limiter.record(now);
+        }
+        *state.in_flight.entry(scope.clone()).or_insert(0) += 1;
         Ok(Ok(CapacityPermit {
             scope,
             governor: Arc::clone(&self.state),
@@ -314,13 +314,14 @@ impl Governor {
         Ok(())
     }
 
-    /// Get current capacity usage for a scope (for diagnostics).
+    /// Get current capacity usage for a scope (for diagnostics): its
+    /// in-flight permits and its limit, or `None` when it has no limit.
     pub fn capacity_usage(&self, scope: &GovernorScope) -> Result<Option<(usize, usize)>> {
         let state = self.state.lock().map_err(|_| GovernorError::LockPoisoned)?;
         Ok(state
-            .capacity_state
+            .capacity_configs
             .get(scope)
-            .map(|capacity| (capacity.current, capacity.config.max_concurrent)))
+            .map(|config| (state.in_flight(scope), config.max_concurrent)))
     }
 
     /// Evaluate rate eligibility without consuming a rate token.
@@ -379,21 +380,335 @@ impl Governor {
     /// This is a non-consuming read-only check for placement evaluation.
     /// Returns true if capacity is currently available.
     pub fn evaluate_capacity(&self, scope: &GovernorScope) -> Result<bool> {
-        let mut state = self.state.lock().map_err(|_| GovernorError::LockPoisoned)?;
-
-        state.ensure_capacity_state(scope);
-
-        if let Some(capacity) = state.capacity_state.get(scope) {
-            Ok(capacity.current < capacity.config.max_concurrent)
-        } else {
-            // No capacity config = available
-            Ok(true)
-        }
+        let state = self.state.lock().map_err(|_| GovernorError::LockPoisoned)?;
+        // No capacity config = available
+        Ok(state.capacity_available(scope))
     }
 }
 
 impl Default for Governor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
+    use super::*;
+
+    fn scope() -> GovernorScope {
+        GovernorScope::provider("p")
+    }
+
+    fn capacity(max_concurrent: usize) -> CapacityConfig {
+        CapacityConfig { max_concurrent }
+    }
+
+    /// A rate limit whose window no test outlives.
+    fn rate(max_requests: u32) -> RateConfig {
+        RateConfig {
+            max_requests,
+            window: Duration::from_secs(3_600),
+        }
+    }
+
+    fn permit(governor: &Governor, scope: &GovernorScope) -> CapacityPermit {
+        match governor.acquire(scope.clone()).expect("lock") {
+            Ok(permit) => permit,
+            Err(decision) => panic!("expected a permit, got {decision:?}"),
+        }
+    }
+
+    fn refusal(governor: &Governor, scope: &GovernorScope) -> GovernorDecision {
+        match governor.acquire(scope.clone()).expect("lock") {
+            Ok(_) => panic!("expected a refusal"),
+            Err(decision) => decision,
+        }
+    }
+
+    fn usage(governor: &Governor, scope: &GovernorScope) -> Option<(usize, usize)> {
+        governor.capacity_usage(scope).expect("lock")
+    }
+
+    #[test]
+    fn a_capacity_limit_admits_up_to_its_size() {
+        let governor = Governor::new();
+        governor
+            .configure_capacity(scope(), capacity(2))
+            .expect("lock");
+        let held = [permit(&governor, &scope()), permit(&governor, &scope())];
+        assert_eq!(
+            refusal(&governor, &scope()),
+            GovernorDecision::CapacityUnavailable
+        );
+        assert!(!governor.evaluate_capacity(&scope()).expect("lock"));
+        assert_eq!(usage(&governor, &scope()), Some((2, 2)));
+        drop(held);
+        assert_eq!(usage(&governor, &scope()), Some((0, 2)));
+
+        governor
+            .configure_capacity(scope(), capacity(0))
+            .expect("lock");
+        assert_eq!(
+            refusal(&governor, &scope()),
+            GovernorDecision::CapacityUnavailable
+        );
+        assert_eq!(usage(&governor, &scope()), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_live_limit_change_applies_at_once_and_keeps_held_permits() {
+        let governor = Governor::new();
+        governor
+            .configure_capacity(scope(), capacity(2))
+            .expect("lock");
+        let first = permit(&governor, &scope());
+        let second = permit(&governor, &scope());
+
+        governor
+            .configure_capacity(scope(), capacity(1))
+            .expect("lock");
+        assert_eq!(
+            usage(&governor, &scope()),
+            Some((2, 1)),
+            "no permit is revoked"
+        );
+        assert_eq!(
+            refusal(&governor, &scope()),
+            GovernorDecision::CapacityUnavailable
+        );
+        drop(first);
+        assert_eq!(usage(&governor, &scope()), Some((1, 1)));
+        assert_eq!(
+            refusal(&governor, &scope()),
+            GovernorDecision::CapacityUnavailable
+        );
+        drop(second);
+        let third = permit(&governor, &scope());
+
+        governor
+            .configure_capacity(scope(), capacity(3))
+            .expect("lock");
+        let more = [permit(&governor, &scope()), permit(&governor, &scope())];
+        assert_eq!(usage(&governor, &scope()), Some((3, 3)));
+        assert_eq!(
+            refusal(&governor, &scope()),
+            GovernorDecision::CapacityUnavailable
+        );
+        drop(third);
+        drop(more);
+        assert_eq!(usage(&governor, &scope()), Some((0, 3)));
+    }
+
+    #[test]
+    fn a_limit_configured_later_counts_the_permits_already_held() {
+        let governor = Governor::new();
+        let early = permit(&governor, &scope());
+        let earlier = permit(&governor, &scope());
+        assert_eq!(
+            usage(&governor, &scope()),
+            None,
+            "an unconfigured scope reports none"
+        );
+        assert!(governor.evaluate_capacity(&scope()).expect("lock"));
+
+        governor
+            .configure_capacity(scope(), capacity(2))
+            .expect("lock");
+        assert_eq!(usage(&governor, &scope()), Some((2, 2)));
+        assert_eq!(
+            refusal(&governor, &scope()),
+            GovernorDecision::CapacityUnavailable
+        );
+        // Released in another order than taken.
+        drop(earlier);
+        let late = permit(&governor, &scope());
+        assert_eq!(usage(&governor, &scope()), Some((2, 2)));
+        drop(early);
+        assert_eq!(
+            usage(&governor, &scope()),
+            Some((1, 2)),
+            "the late permit stays counted"
+        );
+        drop(late);
+        assert_eq!(
+            usage(&governor, &scope()),
+            Some((0, 2)),
+            "no release went below zero"
+        );
+        let [_a, _b] = [permit(&governor, &scope()), permit(&governor, &scope())];
+        assert_eq!(
+            refusal(&governor, &scope()),
+            GovernorDecision::CapacityUnavailable
+        );
+    }
+
+    #[test]
+    fn a_capacity_refusal_consumes_no_rate_budget() {
+        let governor = Governor::new();
+        governor.configure_rate(scope(), rate(1)).expect("lock");
+        governor
+            .configure_capacity(scope(), capacity(0))
+            .expect("lock");
+        for _ in 0..3 {
+            assert_eq!(
+                refusal(&governor, &scope()),
+                GovernorDecision::CapacityUnavailable
+            );
+        }
+        assert_eq!(
+            governor.evaluate_rate(&scope()).expect("lock"),
+            (true, None)
+        );
+
+        governor
+            .configure_capacity(scope(), capacity(1))
+            .expect("lock");
+        let held = permit(&governor, &scope());
+        drop(held);
+        assert!(
+            matches!(
+                refusal(&governor, &scope()),
+                GovernorDecision::RateLimited { .. }
+            ),
+            "the admission took the one request"
+        );
+    }
+
+    #[test]
+    fn a_rate_refusal_takes_no_capacity() {
+        let governor = Governor::new();
+        governor
+            .configure_capacity(scope(), capacity(1))
+            .expect("lock");
+        governor.configure_rate(scope(), rate(0)).expect("lock");
+        assert!(matches!(
+            refusal(&governor, &scope()),
+            GovernorDecision::RateLimited { .. }
+        ));
+        assert_eq!(usage(&governor, &scope()), Some((0, 1)));
+
+        governor.configure_rate(scope(), rate(1)).expect("lock");
+        governor
+            .record_throttling(scope(), Duration::from_secs(3_600))
+            .expect("lock");
+        assert!(matches!(
+            refusal(&governor, &scope()),
+            GovernorDecision::RateLimited { .. }
+        ));
+        assert_eq!(
+            usage(&governor, &scope()),
+            Some((0, 1)),
+            "a cooldown takes none either"
+        );
+
+        let other = GovernorScope::provider("q");
+        governor
+            .configure_rate(other.clone(), rate(1))
+            .expect("lock");
+        governor
+            .configure_capacity(other.clone(), capacity(2))
+            .expect("lock");
+        let held = permit(&governor, &other);
+        assert!(matches!(
+            refusal(&governor, &other),
+            GovernorDecision::RateLimited { .. }
+        ));
+        assert_eq!(usage(&governor, &other), Some((1, 2)));
+        drop(held);
+    }
+
+    #[test]
+    fn provider_and_provider_model_scopes_are_accounted_apart() {
+        let governor = Governor::new();
+        let provider = GovernorScope::provider("p");
+        let model = GovernorScope::provider_model("p", "m");
+        let other_model = GovernorScope::provider_model("p", "n");
+        for scope in [&provider, &model] {
+            governor
+                .configure_capacity(scope.clone(), capacity(1))
+                .expect("lock");
+        }
+        let held = [
+            permit(&governor, &provider),
+            permit(&governor, &model),
+            permit(&governor, &other_model),
+        ];
+        assert_eq!(
+            refusal(&governor, &provider),
+            GovernorDecision::CapacityUnavailable
+        );
+        assert_eq!(
+            refusal(&governor, &model),
+            GovernorDecision::CapacityUnavailable
+        );
+        governor
+            .configure_capacity(other_model.clone(), capacity(1))
+            .expect("lock");
+        assert_eq!(usage(&governor, &other_model), Some((1, 1)));
+        let [provider_permit, model_permit, other_permit] = held;
+        drop(model_permit);
+        assert_eq!(usage(&governor, &provider), Some((1, 1)));
+        assert_eq!(usage(&governor, &model), Some((0, 1)));
+        assert_eq!(usage(&governor, &other_model), Some((1, 1)));
+        drop(provider_permit);
+        drop(other_permit);
+    }
+
+    #[test]
+    fn concurrent_callers_never_exceed_the_limit_and_release_exactly() {
+        const THREADS: usize = 16;
+        const LIMIT: usize = 4;
+        let governor = Governor::new();
+        governor
+            .configure_capacity(scope(), capacity(LIMIT))
+            .expect("lock");
+        let start = Arc::new(Barrier::new(THREADS));
+        let acquired = Arc::new(Barrier::new(THREADS));
+        let release = Arc::new(Barrier::new(THREADS + 1));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                // Every thread uses its own clone of the Governor.
+                let governor = governor.clone();
+                let (start, acquired, release) = (start.clone(), acquired.clone(), release.clone());
+                thread::spawn(move || {
+                    start.wait();
+                    let held = governor.acquire(scope()).expect("lock").ok();
+                    acquired.wait();
+                    let won = held.is_some();
+                    release.wait();
+                    drop(held);
+                    // Churn: acquisitions racing releases.
+                    for _ in 0..200 {
+                        if let Ok(permit) = governor.acquire(scope()).expect("lock") {
+                            let (in_flight, limit) = governor
+                                .capacity_usage(&scope())
+                                .expect("lock")
+                                .expect("configured");
+                            assert!(in_flight <= limit, "{in_flight} in flight under {limit}");
+                            drop(permit);
+                        }
+                    }
+                    won
+                })
+            })
+            .collect();
+        // The winners hold their permits until every thread is released.
+        let deadline = Instant::now() + crate::test_support::WAIT;
+        while usage(&governor, &scope()) != Some((LIMIT, LIMIT)) {
+            assert!(Instant::now() < deadline, "the limit was never reached");
+            thread::yield_now();
+        }
+        release.wait();
+        let winners = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("no worker panicked"))
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, LIMIT);
+        assert_eq!(usage(&governor, &scope()), Some((0, LIMIT)));
     }
 }
