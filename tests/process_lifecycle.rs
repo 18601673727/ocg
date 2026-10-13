@@ -260,3 +260,68 @@ fn each_process_run_hosts_aggregation_and_ends_its_own_service_job() {
     worker.shutdown().expect("close the database");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A process killed outright cannot end its service Job. The next start of
+/// the database settles that Job as unknown with its stop confirmed, once.
+#[test]
+fn a_killed_process_leaves_its_service_job_to_the_next_start() {
+    let root = std::env::temp_dir().join(format!("ocg-process-killed-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).expect("create the data directory");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ocg"))
+        .env("OCG_DATA_DIR", &root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the executable");
+    let (lines, received) = flume::unbounded();
+    let stderr = child.stderr.take().expect("stderr");
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            lines.send(line).ok();
+        }
+    });
+    let deadline = Instant::now() + WAIT;
+    let mut seen = Vec::new();
+    let service = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(line) = received.recv_timeout(remaining) else {
+            child.kill().ok();
+            child.wait().ok();
+            panic!("the executable did not report its service in time; it said {seen:?}");
+        };
+        seen.push(line.clone());
+        if let Some(rest) = line.strip_prefix("OCG aggregation service running as job:") {
+            break JobId::new(rest.trim().parse().expect("a Job number"));
+        }
+    };
+    // SIGKILL on Unix, TerminateProcess elsewhere: nothing runs on the way out.
+    child.kill().expect("kill the executable");
+    child.wait().expect("reap the executable");
+    reader.join().expect("stderr reader");
+
+    let (worker, handle) = open(&root);
+    assert_eq!(handle.abandoned_at_open(), [service]);
+    let record = wait(handle.job(service))
+        .expect("read")
+        .expect("Job exists");
+    assert!(record.started_at.is_some());
+    assert!(
+        record.unknown_at.is_some() && record.stop_confirmed_at.is_some(),
+        "the killed run's service Job is unknown and stopped"
+    );
+    assert!(record.completed_at.is_none() && record.failed_at.is_none());
+    worker.shutdown().expect("close the database");
+
+    let (worker, handle) = open(&root);
+    assert!(handle.abandoned_at_open().is_empty());
+    assert_eq!(
+        wait(handle.job(service)).expect("read"),
+        Some(record),
+        "a settled Job is not settled again"
+    );
+    worker.shutdown().expect("close the database");
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -289,9 +289,30 @@ impl Drop for Emission<'_> {
     }
 }
 
+/// The most detailed level accepted from a target outside this crate. A
+/// dependency's debug and trace output can dump raw protocol data, such as
+/// the HTTP client's request headers, so only OCG's own targets follow the
+/// configured level below it.
+const FOREIGN_TARGET_MAX_LEVEL: log::Level = log::Level::Info;
+
+fn is_own_target(target: &str) -> bool {
+    target
+        .strip_prefix("ocg")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+}
+
+/// Whether a record at `level` from `target` is logged under `configured`.
+fn accepts(configured: log::LevelFilter, level: log::Level, target: &str) -> bool {
+    level <= configured && (level <= FOREIGN_TARGET_MAX_LEVEL || is_own_target(target))
+}
+
 impl log::Log for LoggerHandle {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= self.shared.config.level.filter()
+        accepts(
+            self.shared.config.level.filter(),
+            metadata.level(),
+            metadata.target(),
+        )
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -747,7 +768,7 @@ impl Worker {
             // a newly created log before its active identity is registered.
             let files = self.shared.database.log_files();
             let mut active = files.lock().unwrap_or_else(PoisonError::into_inner);
-            match OpenOptions::new()
+            match crate::data_directory::private_file(&mut OpenOptions::new())
                 .write(true)
                 .create_new(true)
                 .open(path.as_ref())
@@ -909,5 +930,94 @@ impl Worker {
         self.shared.buffered.store(0, Ordering::SeqCst);
         self.flush_due = None;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::system_policy::SystemPolicy;
+    use crate::test_support::data_directory;
+
+    #[test]
+    fn foreign_targets_are_capped_at_info_while_own_targets_follow_the_configured_level() {
+        let trace = log::LevelFilter::Trace;
+        for target in [
+            "ocg",
+            "ocg::provider_execution",
+            "ocg::orchestration::execution_runtime",
+        ] {
+            assert!(accepts(trace, log::Level::Trace, target), "{target}");
+            assert!(accepts(trace, log::Level::Debug, target), "{target}");
+        }
+        for target in [
+            "ntex::client::h1proto",
+            "ntex_h2::client",
+            "rustls",
+            "ocgx",
+            "",
+        ] {
+            assert!(!accepts(trace, log::Level::Trace, target), "{target}");
+            assert!(!accepts(trace, log::Level::Debug, target), "{target}");
+            assert!(accepts(trace, log::Level::Info, target), "{target}");
+            assert!(accepts(trace, log::Level::Error, target), "{target}");
+        }
+        assert!(!accepts(
+            log::LevelFilter::Warn,
+            log::Level::Info,
+            "ocg::host"
+        ));
+        assert!(!accepts(log::LevelFilter::Off, log::Level::Error, "ntex"));
+    }
+
+    #[test]
+    fn a_dependency_trace_never_reaches_the_runtime_log_and_the_log_is_private() {
+        let (_root, directory) = data_directory("ocg-logger", "foreign-trace");
+        let mut policy = SystemPolicy::default();
+        policy.filesystem_config.disk_lock_threshold_bytes = 1;
+        policy.filesystem_config.disk_resume_threshold_bytes = 2;
+        policy.logger_config.level = LoggerLevel::Trace;
+        policy.logger_config.flush_interval_ms = 1;
+        let worker = DatabaseWorker::start_with_policy(&directory, policy).expect("start database");
+        let logger = RuntimeLogger::start(worker.handle()).expect("start runtime logger");
+        let handle = logger.handle();
+        let record = |target: &'static str, message: std::fmt::Arguments<'_>| {
+            log::Log::log(
+                &handle,
+                &log::Record::builder()
+                    .args(message)
+                    .level(log::Level::Trace)
+                    .target(target)
+                    .build(),
+            );
+        };
+        // What the HTTP client traces for an HTTP/1.1 request.
+        record(
+            "ntex::client::h1proto",
+            format_args!("sending http1 request {{\"authorization\": \"Bearer sk-leaked\"}}"),
+        );
+        record("ocg::provider_execution", format_args!("own trace record"));
+        log::Log::flush(&handle);
+        let status = logger.shutdown().expect("flush and stop logger");
+        assert_eq!(status.written_records, 1, "logger status: {status:?}");
+
+        let mut contents = String::new();
+        for entry in std::fs::read_dir(directory.logs_path()).expect("read log directory") {
+            let entry = entry.expect("read log entry");
+            if !is_runtime_file_name(&entry.file_name()) {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = entry.metadata().expect("metadata").permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} is private", entry.path().display());
+            }
+            contents.push_str(&std::fs::read_to_string(entry.path()).expect("read log file"));
+        }
+        assert!(contents.contains("own trace record"), "{contents}");
+        assert!(!contents.contains("sk-leaked"), "{contents}");
+        worker.shutdown().expect("shutdown database");
     }
 }

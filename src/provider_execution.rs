@@ -1,16 +1,18 @@
 //! OpenAI-compatible provider execution for an admitted Job.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex, PoisonError,
     atomic::{AtomicBool, Ordering},
 };
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
 use ntex::client::{Client, ClientResponse, error::ClientError};
-use ntex::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use ntex::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use ntex::http::{Payload, StatusCode};
 use ntex::time::Millis;
+use ntex::util::{Either, select};
 use serde_json::{Value, json};
 
 use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure};
@@ -127,16 +129,62 @@ impl Default for ProviderExecutionConfig {
     }
 }
 
+/// A cancellation shared by an execution and whoever may stop it. Cancelling
+/// wakes every task waiting in [`CancellationToken::cancelled`], so a wait on
+/// a stalled Provider ends at once instead of at its timeout.
 #[derive(Clone, Debug, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<Cancellation>);
+
+#[derive(Debug, Default)]
+struct Cancellation {
+    cancelled: AtomicBool,
+    waiters: Mutex<Vec<Waker>>,
+}
 
 impl CancellationToken {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        let waiters = std::mem::take(
+            &mut *self
+                .0
+                .waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for waiter in waiters {
+            waiter.wake();
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Resolves once the token is cancelled. Needs no particular async runtime.
+    pub async fn cancelled(&self) {
+        std::future::poll_fn(|cx| {
+            if self.is_cancelled() {
+                return Poll::Ready(());
+            }
+            {
+                let mut waiters = self
+                    .0
+                    .waiters
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !waiters.iter().any(|waiter| waiter.will_wake(cx.waker())) {
+                    waiters.push(cx.waker().clone());
+                }
+            }
+            // Checked again after registering, so a cancellation between the
+            // first check and the registration is not missed.
+            if self.is_cancelled() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
     }
 }
 
@@ -174,6 +222,12 @@ pub enum ProviderExecutionError {
     Rejected { failure: ProviderFailure },
     #[error("provider stream was incomplete: {message}")]
     Incomplete { message: String },
+    /// Execution was cancelled on this side before any response head
+    /// arrived, after the request may have been sent. Delivery cannot be
+    /// ruled out, and nothing about the Provider was observed: it is neither
+    /// a Provider nor a transport fault.
+    #[error("provider execution was interrupted locally: {message}")]
+    Interrupted { message: String },
     /// Execution stopped on this side after the provider had answered: the
     /// caller cancelled, or the runtime could not persist streamed output.
     /// Neither is a provider or transport fault, so only the response facts
@@ -242,6 +296,7 @@ fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
         ProviderExecutionError::Unknown { .. }
         | ProviderExecutionError::Rejected { .. }
         | ProviderExecutionError::Incomplete { .. }
+        | ProviderExecutionError::Interrupted { .. }
         | ProviderExecutionError::Stopped { .. } => ProviderFact::Delivered,
     }
 }
@@ -287,6 +342,7 @@ async fn exchange(
     }
 
     let credential = resolver.resolve(provider.credential_ref.as_deref())?;
+    let authorization = credential.as_deref().map(authorization).transpose()?;
     if config.cancellation.is_cancelled() {
         return Err(ProviderExecutionError::NotDelivered {
             message: "provider execution was cancelled before sending".to_owned(),
@@ -320,17 +376,29 @@ async fn exchange(
         .set_header(CONTENT_TYPE, "application/json")
         .set_header(ACCEPT, "text/event-stream")
         .set_header("Cache-Control", "no-cache")
-        .if_some(credential.as_deref(), |credential, request| {
-            request.set_header(AUTHORIZATION, format!("Bearer {credential}"))
+        .if_some(authorization, |authorization, request| {
+            request.set_header(AUTHORIZATION, authorization)
         });
 
     let started = Instant::now();
-    let response = ntex::time::timeout(config.timeout, request.send_json(&body))
-        .await
-        .map_err(|_| ProviderExecutionError::Unknown {
-            message: "provider request timed out after it may have been delivered".to_owned(),
-        })?
-        .map_err(classify_client_error)?;
+    let sent = select(
+        config.cancellation.cancelled(),
+        ntex::time::timeout(config.timeout, request.send_json(&body)),
+    )
+    .await;
+    let response = match sent {
+        // The request future is dropped here, with whatever it had sent.
+        Either::Left(()) => {
+            return Err(ProviderExecutionError::Interrupted {
+                message: "provider execution was cancelled before a response arrived".to_owned(),
+            });
+        }
+        Either::Right(sent) => sent,
+    }
+    .map_err(|_| ProviderExecutionError::Unknown {
+        message: "provider request timed out after it may have been delivered".to_owned(),
+    })?
+    .map_err(classify_client_error)?;
     // A response head proves the request reached a Provider, whatever it says.
     *announced = true;
     announce(sink.as_deref_mut(), ProviderFact::Delivered).await;
@@ -340,7 +408,16 @@ async fn exchange(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     if response.status() != StatusCode::OK {
-        let body = bounded_body(response, MAX_PROVIDER_ERROR_BYTES).await;
+        // A cancelled read keeps the status the Provider answered with.
+        let body = match select(
+            config.cancellation.cancelled(),
+            bounded_body(response, MAX_PROVIDER_ERROR_BYTES),
+        )
+        .await
+        {
+            Either::Left(()) => None,
+            Either::Right(body) => body,
+        };
         return Err(ProviderExecutionError::Rejected {
             failure: provider_failure(status, request_id, body),
         });
@@ -394,6 +471,20 @@ pub async fn execute_chat_with_sink(
     execute_chat_inner(frozen, objective, resolver, config, Some(sink)).await
 }
 
+/// The Authorization header of a request. It is marked sensitive, so no
+/// dump of the request's headers, such as the HTTP client's own request
+/// tracing, prints the credential. A credential that is no valid header
+/// value is refused without being named.
+fn authorization(credential: &str) -> Result<HeaderValue, ProviderExecutionError> {
+    let mut value = HeaderValue::try_from(format!("Bearer {credential}")).map_err(|_| {
+        ProviderExecutionError::Build {
+            message: "the resolved credential is not a valid HTTP header value".to_owned(),
+        }
+    })?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
 fn request_body(
     model: &str,
     parameters: &LlmParameters,
@@ -444,15 +535,22 @@ async fn parse_stream(
     let mut saw_event = false;
     let mut first_byte = None;
 
-    while let Some(chunk) = payload.recv().await {
-        if config.cancellation.is_cancelled() {
+    loop {
+        // A stalled stream is raced against cancellation, so a cancelled
+        // execution stops now rather than at its timeout.
+        let chunk = match select(config.cancellation.cancelled(), payload.recv()).await {
+            Either::Left(()) => None,
+            Either::Right(None) => break,
+            Either::Right(Some(chunk)) => Some(chunk),
+        };
+        let Some(chunk) = chunk.filter(|_| !config.cancellation.is_cancelled()) else {
             return Err(local_stop(
                 "provider execution was cancelled while streaming",
                 status_code,
                 finish_reason,
                 raw_finish_reason.as_deref(),
             ));
-        }
+        };
         let chunk = chunk.map_err(|error| ProviderExecutionError::Unknown {
             message: error.to_string(),
         })?;
@@ -813,7 +911,11 @@ pub fn error_observation(
 ) -> Option<crate::persistence::AvailabilityObservation> {
     use crate::persistence::AvailabilityObservation;
     match error {
-        ProviderExecutionError::Build { .. } | ProviderExecutionError::NotDelivered { .. } => None,
+        // A local interruption before any response head observed nothing
+        // about the Provider.
+        ProviderExecutionError::Build { .. }
+        | ProviderExecutionError::NotDelivered { .. }
+        | ProviderExecutionError::Interrupted { .. } => None,
         ProviderExecutionError::Stopped { facts, .. } => Some(AvailabilityObservation {
             status_code: Some(facts.status_code),
             finish_reason: facts.finish_reason,
@@ -1591,5 +1693,87 @@ mod tests {
             [Some(1), Some(2)],
             "the second write was interrupted and nothing was resent or merged; the third was never read"
         );
+    }
+
+    #[test]
+    fn a_cancellation_wakes_every_waiter_at_once() {
+        let token = CancellationToken::default();
+        let waiter = token.clone();
+        let waiting = std::thread::spawn(move || wait(waiter.cancelled()));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!waiting.is_finished(), "nothing was cancelled yet");
+        token.cancel();
+        waiting.join().expect("the waiter woke");
+        assert!(token.is_cancelled());
+        wait(token.cancelled());
+    }
+
+    #[test]
+    fn a_cancellation_ends_a_stalled_stream_at_once_with_the_facts_it_had() {
+        let config = ProviderExecutionConfig::default();
+        assert!(config.timeout >= Duration::from_secs(60));
+        let cancellation = config.cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancellation.cancel();
+        });
+        let started = Instant::now();
+        let mut sink = RecordingSink::default();
+        let result = wait(parse_stream(
+            payload(
+                vec![Step::Chunk(CONTENT), Step::Stall],
+                config.cancellation.clone(),
+            ),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            Some(&mut sink),
+            &mut UsageCapture::default(),
+        ));
+        canceller.join().expect("cancelled");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stalled read did not wait for its timeout"
+        );
+        assert!(
+            matches!(&result, Err(ProviderExecutionError::Stopped { facts: seen, .. }) if *seen == facts(None, None)),
+            "a cancelled stream is a local stop, got {result:?}"
+        );
+        assert_eq!(
+            sink.deltas,
+            ["hi"],
+            "what arrived before the stall was kept"
+        );
+    }
+
+    #[test]
+    fn an_interruption_before_any_response_observes_nothing_but_cannot_rule_out_delivery() {
+        let interrupted = ProviderExecutionError::Interrupted {
+            message: "provider execution was cancelled before a response arrived".into(),
+        };
+        assert_eq!(error_observation(&interrupted), None);
+        assert_eq!(unannounced_fact(&interrupted), ProviderFact::Delivered);
+    }
+
+    #[test]
+    fn the_authorization_header_is_sensitive_and_no_header_dump_prints_it() {
+        let value = authorization("sk-test-secret").expect("a valid credential");
+        assert!(value.is_sensitive());
+        assert_eq!(value.to_str().ok(), Some("Bearer sk-test-secret"));
+        let mut headers = ntex::http::HeaderMap::new();
+        headers.insert(AUTHORIZATION, value);
+        let dumped = format!("{headers:?}");
+        assert!(!dumped.contains("sk-test-secret"), "{dumped}");
+
+        match authorization("sk-test\nsecret") {
+            Err(ProviderExecutionError::Build { message }) => {
+                assert!(
+                    !message.contains("sk-test"),
+                    "the credential is not named: {message}"
+                )
+            }
+            other => panic!("an invalid credential is refused, got {other:?}"),
+        }
     }
 }

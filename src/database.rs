@@ -52,6 +52,20 @@ const COMPACTION_MIN_RECLAIMABLE_BYTES: u64 = 32 * 1024 * 1024;
 /// The estimated free space must also be at least `1 / this` of the file.
 const COMPACTION_MIN_RECLAIMABLE_DIVISOR: u64 = 4;
 const COMPACTION_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+/// While admission is locked, the protected filesystems are checked at
+/// least this often, so a lock that only lacked space lifts soon after the
+/// space returns, however long the configured interval is.
+pub(crate) const PROTECTED_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long to wait for the next full check: the configured interval, but
+/// no longer than [`PROTECTED_CHECK_INTERVAL`] while admission is locked.
+pub(crate) fn next_check_interval(configured: Duration, locked: bool) -> Duration {
+    if locked {
+        configured.min(PROTECTED_CHECK_INTERVAL)
+    } else {
+        configured
+    }
+}
 /// Reads run on this many dedicated threads, separate from the write worker.
 pub const READ_WORKERS: usize = 2;
 pub const READ_QUEUE_CAPACITY: usize = 64;
@@ -432,6 +446,10 @@ enum Command {
         job: JobId,
         reply: Reply<()>,
     },
+    StartLocalJob {
+        job: JobId,
+        reply: Reply<()>,
+    },
     AssignJobExecutor {
         job: JobId,
         executor: ExecutorId,
@@ -560,6 +578,14 @@ impl Command {
                 Kind::StartJob,
                 reply,
                 |batch| persistence::start_job(batch, job),
+            ),
+            Self::StartLocalJob { job, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::StartLocalJob,
+                reply,
+                |batch| persistence::start_local_job(batch, job, operation.epoch),
             ),
             Self::AssignJobExecutor {
                 job,
@@ -708,6 +734,7 @@ impl Command {
             Self::CreateJobWithInput { job, .. } => text_bytes(&job.name),
             Self::RetryJob { retry, .. } => text_bytes(&retry.name),
             Self::StartJob { .. }
+            | Self::StartLocalJob { .. }
             | Self::AssignJobExecutor { .. }
             | Self::AssociateJobProject { .. }
             | Self::ConfirmJobStopped { .. } => 0,
@@ -765,6 +792,7 @@ impl Command {
                 refuse(reply, error)
             }
             Self::StartJob { reply, .. }
+            | Self::StartLocalJob { reply, .. }
             | Self::AssignJobExecutor { reply, .. }
             | Self::AssociateJobProject { reply, .. } => refuse(reply, error),
             Self::AppendJobOutput { reply, .. } => refuse(reply, error),
@@ -978,6 +1006,9 @@ struct Shared {
     /// admission read lock never mix openings.
     epoch: AtomicU64,
     next_operation: AtomicU64,
+    /// The Jobs this worker's start settled as abandoned by an earlier
+    /// opening; see [`DatabaseHandle::abandoned_at_open`].
+    abandoned_at_open: Vec<JobId>,
     /// Set while the database is released, so status checks never wait on
     /// the database lock behind a pending release.
     released: AtomicBool,
@@ -1285,6 +1316,13 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
+                let (abandoned_at_open, next_operation) = match settle_abandoned(&database, epoch) {
+                    Ok(settled) => settled,
+                    Err(error) => {
+                        ready_sender.send(Err(DatabaseError::Open(error))).ok();
+                        return Ok(());
+                    }
+                };
                 let shared = Arc::new(Shared {
                     active_policy: policy,
                     log_directory,
@@ -1295,7 +1333,8 @@ impl DatabaseWorker {
                     staging: RwLock::new(()),
                     genesis,
                     epoch: AtomicU64::new(epoch),
-                    next_operation: AtomicU64::new(1),
+                    next_operation: AtomicU64::new(next_operation),
+                    abandoned_at_open,
                     released: AtomicBool::new(false),
                     live_readers: AtomicUsize::new(0),
                     reads_stopped: RwLock::new(false),
@@ -1457,6 +1496,46 @@ fn open_error(error: OpenError, directory: &std::path::Path) -> DatabaseError {
             supported: storage::FORMAT_VERSION,
         },
     }
+}
+
+/// Settles every Job that an earlier opening started as its own local
+/// execution and left unsettled, before this opening admits any command; see
+/// [`persistence::reconcile_abandoned_job`]. Only one opening of the file can
+/// exist at a time, so when a worker starts, every earlier opening is closed
+/// and nothing it ran can still settle its Jobs. A reopen during recovery
+/// keeps its process's executions running and never comes here.
+///
+/// Each Job is settled in its own durable transaction, so a failure part-way
+/// leaves the rest claimed for the next start, and a settled Job is not
+/// touched again. Returns the settled Jobs and the next operation sequence
+/// number of this opening.
+fn settle_abandoned(database: &Database, epoch: u64) -> Result<(Vec<JobId>, u64), StorageError> {
+    let mut settled = Vec::new();
+    let mut seq = 1;
+    for (job, claimed) in storage::abandoned_local_executions(database, epoch)? {
+        let operation = OperationId::new(epoch, seq);
+        seq += 1;
+        let outcome = storage::run_batch_declinable(
+            database,
+            operation,
+            OperationKind::ReconcileAbandonedJob,
+            Commit::Durable,
+            |batch| persistence::reconcile_abandoned_job(batch, job, claimed),
+        );
+        match outcome.result {
+            Ok(Some(())) => settled.push(job),
+            Ok(None) => {}
+            Err(BatchFailure::Rejected(violation)) => {
+                return Err(StorageError::corrupted(format!(
+                    "{job}, abandoned by opening {claimed}, could not be settled: {violation}"
+                )));
+            }
+            Err(BatchFailure::NotCommitted(error) | BatchFailure::OutcomeUnknown(error)) => {
+                return Err(error);
+            }
+        }
+    }
+    Ok((settled, seq))
 }
 
 fn join(thread: JoinHandle<Result<(), DatabaseError>>) -> Result<(), DatabaseError> {
@@ -1708,7 +1787,7 @@ impl WriteWorker {
             std::process::id(),
             NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = crate::data_directory::private_file(&mut std::fs::OpenOptions::new())
             .write(true)
             .create_new(true)
             .open(&temporary)
@@ -2090,21 +2169,58 @@ impl WriteWorker {
         if storage_failed {
             self.shared.release_database();
         }
+        // A locked database is checked again soon, whatever the interval.
+        let soon = Instant::now().checked_add(self.check_interval());
+        self.next_check = match (self.next_check, soon) {
+            (Some(due), Some(soon)) => Some(due.min(soon)),
+            (due, soon) => soon.or(due),
+        };
         lock
     }
 
+    fn check_interval(&self) -> Duration {
+        next_check_interval(
+            self.config.check_interval(),
+            self.shared.protection.status().lock.is_some(),
+        )
+    }
+
     /// Checks every protected filesystem against the lock threshold and
-    /// locks when any is short or cannot be measured.
+    /// locks when any is short or cannot be measured. When every one meets
+    /// it and the lock only ever lacked space, it attempts the recovery a
+    /// caller could request, which lifts the lock only once every
+    /// filesystem has the resume threshold available.
     fn check_all_paths(&mut self) {
         let reasons = space_shortfalls(&self.paths, self.config.disk_lock_threshold_bytes);
         if !reasons.is_empty() {
             self.activate(reasons);
+        } else if self.only_lacks_space() {
+            // A failed attempt keeps the lock; the next check tries again.
+            let _ = self.recover();
         }
         self.shared.protection.update(|status| {
             status.completed_checks += 1;
             status.last_checked_at = Some(Timestamp::now());
         });
-        self.next_check = Instant::now().checked_add(self.config.check_interval());
+        self.next_check = Instant::now().checked_add(self.check_interval());
+    }
+
+    /// Whether admission is locked for no reason but measured shortages of
+    /// space, so lifting it needs nothing but space. A failed measurement, a
+    /// failed write, a failed commit or flush, and any operation whose
+    /// outcome is unknown all leave the lock to an explicit recovery.
+    fn only_lacks_space(&self) -> bool {
+        matches!(self.shared.admission(), Admission::Protected(_))
+            && self.storage_failure.is_none()
+            && self.uncertain.is_empty()
+            && !self.shared.released.load(Ordering::SeqCst)
+            && self.shared.protection.status().lock.is_some_and(|lock| {
+                !lock.reasons.is_empty()
+                    && lock
+                        .reasons
+                        .iter()
+                        .all(|reason| matches!(reason, ProtectionReason::InsufficientSpace(_)))
+            })
     }
 
     /// Runs one recovery attempt for every caller that joined it. The lock
@@ -2523,6 +2639,14 @@ impl DatabaseHandle {
             .recv_async()
             .await
             .map_err(|_| DatabaseError::ReadInterrupted)?
+    }
+
+    /// The Jobs that this worker's start found abandoned by an earlier
+    /// opening of the database, a process that died or a worker that was
+    /// shut down while they ran, and settled as unknown with their stop
+    /// confirmed. Empty when nothing was abandoned.
+    pub fn abandoned_at_open(&self) -> &[JobId] {
+        &self.shared.abandoned_at_open
     }
 
     pub fn status(&self) -> DatabaseStatus {
@@ -3104,6 +3228,19 @@ impl DatabaseHandle {
         self.submit(|reply| Command::StartJob { job, reply }).await
     }
 
+    /// Starts a Job that this process executes itself, claiming its
+    /// execution for the current opening of the database. The claim ends
+    /// when the Job settles: with a confirmed outcome, or with a confirmed
+    /// stop after an unknown one. If this opening closes first, as it does
+    /// when the process dies, the next start of a database worker records
+    /// the Job's outcome as unknown and its stop as confirmed; see
+    /// [`DatabaseHandle::abandoned_at_open`]. Work executed outside this
+    /// process must use [`DatabaseHandle::start_job`] instead.
+    pub async fn start_local_job(&self, job: JobId) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::StartLocalJob { job, reply })
+            .await
+    }
+
     pub async fn assign_job_executor(
         &self,
         job: JobId,
@@ -3199,13 +3336,6 @@ impl DatabaseHandle {
     /// releasing the Profiles it holds; the outcome stays unknown. Only the
     /// trusted execution path that observed the termination may call this,
     /// so it is not part of the public API.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the runtime runs no provider execution yet whose termination it could observe"
-        )
-    )]
     pub(crate) async fn confirm_job_stopped(&self, job: JobId) -> Result<(), DatabaseError> {
         self.submit(|reply| Command::ConfirmJobStopped { job, reply })
             .await

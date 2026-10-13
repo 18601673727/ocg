@@ -5,17 +5,17 @@
 //! database handle. Every worker boundary is a bounded `flume` channel; the
 //! database handle itself has a separate bounded command channel.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
     AppendedOutput, ExecutorId, FinalResult, IntermediateOutputKind, JobFinalization, JobId,
     JobInputDraft, JobInputId, JobOutcome, Measurements, NewAvailabilityStat, NewJob, NewJobOutput,
-    NewMetrics, Timestamp,
+    NewMetrics, Timestamp, Violation,
 };
 use crate::provider_execution::{
-    self, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
+    self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
     ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult, ProviderFact,
     ProviderObservation, ProviderOutputSink,
 };
@@ -101,6 +101,12 @@ pub enum ExecutionRuntimeError {
     Startup(#[source] std::io::Error),
     #[error("execution worker panicked")]
     WorkerPanicked,
+    /// Shutdown began before the plan started, so nothing of it, not even
+    /// its input, was persisted.
+    #[error(
+        "the execution runtime is shutting down; the plan was not started and nothing was persisted"
+    )]
+    ShuttingDown,
     #[error("provider execution failed: {0}")]
     Provider(String),
     /// The Job's outcome is settled, as the receipt shows, but a Metrics or
@@ -111,38 +117,73 @@ pub enum ExecutionRuntimeError {
         receipt: Box<ExecutionReceipt>,
         source: DatabaseError,
     },
+    /// The Job's outcome was recorded as unknown, as the receipt shows, but
+    /// the stop of its local execution could not be recorded. The Job keeps
+    /// its Profiles until a later start of the database settles it as
+    /// abandoned; see [`DatabaseHandle::start_local_job`].
+    #[error("the Job's outcome was recorded as unknown but its stop was not confirmed: {source}")]
+    StopNotConfirmed {
+        receipt: Box<ExecutionReceipt>,
+        source: DatabaseError,
+        /// The first observation that could not be recorded either, if any.
+        observations: Option<Box<DatabaseError>>,
+    },
 }
 
 type ExecutionReply = flume::Sender<Result<ExecutionReceipt, ExecutionRuntimeError>>;
 
+enum Work {
+    Plan(ExecutionPlan),
+    Provider(ProviderExecutionPlan),
+}
+
+/// One submitted plan with its caller's reply.
+struct Submission {
+    work: Work,
+    reply: ExecutionReply,
+}
+
+impl Submission {
+    /// Answers a plan that will never start: nothing of it was persisted.
+    fn refuse(self) {
+        self.reply
+            .send(Err(ExecutionRuntimeError::ShuttingDown))
+            .ok();
+    }
+}
+
 enum SchedulerMessage {
-    Schedule {
-        plan: ExecutionPlan,
-        reply: ExecutionReply,
-    },
-    ScheduleProvider {
-        plan: ProviderExecutionPlan,
-        reply: ExecutionReply,
-    },
+    Schedule(Box<Submission>),
     Shutdown,
 }
 
 enum ExecutorMessage {
-    Execute {
-        plan: ExecutionPlan,
-        reply: ExecutionReply,
-    },
-    ExecuteProvider {
-        plan: ProviderExecutionPlan,
-        reply: ExecutionReply,
-    },
+    Execute(Box<Submission>),
     Shutdown,
+}
+
+/// What submitters, the workers and shutdown share. One lock covers both
+/// fields, so a plan either starts before shutdown begins, and then has its
+/// cancellation registered for shutdown to cancel, or never starts.
+#[derive(Default)]
+struct RuntimeState {
+    /// Set once shutdown begins. No plan starts after it.
+    stopping: bool,
+    /// The cancellation of the provider execution in flight, if any.
+    current: Option<CancellationToken>,
+}
+
+type SharedState = Arc<Mutex<RuntimeState>>;
+
+fn lock(state: &SharedState) -> std::sync::MutexGuard<'_, RuntimeState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A cloneable endpoint for scheduler submissions.
 #[derive(Clone)]
 pub struct SchedulerHandle {
     sender: flume::Sender<SchedulerMessage>,
+    state: SharedState,
 }
 
 impl SchedulerHandle {
@@ -154,26 +195,29 @@ impl SchedulerHandle {
         &self,
         plan: ExecutionPlan,
     ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-        let (reply, response) = flume::bounded(1);
-        self.sender
-            .try_send(SchedulerMessage::Schedule { plan, reply })
-            .map_err(|error| match error {
-                flume::TrySendError::Full(_) => ExecutionRuntimeError::SchedulerQueueFull,
-                flume::TrySendError::Disconnected(_) => ExecutionRuntimeError::SchedulerStopped,
-            })?;
-        response
-            .recv_async()
-            .await
-            .map_err(|_| ExecutionRuntimeError::SchedulerStopped)?
+        self.submit(Work::Plan(plan)).await
     }
 
+    /// Submits a provider execution. Shutdown of the runtime cancels
+    /// `plan.provider_config.cancellation` if the plan is executing then.
     pub async fn schedule_provider(
         &self,
         plan: ProviderExecutionPlan,
     ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+        self.submit(Work::Provider(plan)).await
+    }
+
+    /// Once shutdown has begun, a plan is refused here without being queued.
+    async fn submit(&self, work: Work) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+        if lock(&self.state).stopping {
+            return Err(ExecutionRuntimeError::ShuttingDown);
+        }
         let (reply, response) = flume::bounded(1);
         self.sender
-            .try_send(SchedulerMessage::ScheduleProvider { plan, reply })
+            .try_send(SchedulerMessage::Schedule(Box::new(Submission {
+                work,
+                reply,
+            })))
             .map_err(|error| match error {
                 flume::TrySendError::Full(_) => ExecutionRuntimeError::SchedulerQueueFull,
                 flume::TrySendError::Disconnected(_) => ExecutionRuntimeError::SchedulerStopped,
@@ -197,20 +241,28 @@ impl ExecutionRuntime {
     pub fn start(database: DatabaseHandle) -> Result<Self, ExecutionRuntimeError> {
         let (scheduler_sender, scheduler_receiver) = flume::bounded(SCHEDULER_QUEUE_CAPACITY);
         let (executor_sender, executor_receiver) = flume::bounded(EXECUTOR_QUEUE_CAPACITY);
+        let state = SharedState::default();
 
+        let executor_state = state.clone();
         let executor_thread = thread::Builder::new()
             .name("ocg-executor".to_string())
             .spawn(move || {
                 ntex::rt::System::new("ocg-executor", ntex::rt::DefaultRuntime)
-                    .block_on(executor_loop(database, executor_receiver))
+                    .block_on(executor_loop(database, executor_receiver, executor_state))
             })
             .map_err(ExecutionRuntimeError::Startup)?;
 
         let scheduler_executor_sender = executor_sender.clone();
+        let scheduler_state = state.clone();
         let scheduler_thread = match thread::Builder::new()
             .name("ocg-scheduler".to_string())
-            .spawn(move || scheduler_loop(scheduler_receiver, scheduler_executor_sender))
-        {
+            .spawn(move || {
+                scheduler_loop(
+                    scheduler_receiver,
+                    scheduler_executor_sender,
+                    scheduler_state,
+                )
+            }) {
             Ok(thread) => thread,
             Err(error) => {
                 executor_sender.send(ExecutorMessage::Shutdown).ok();
@@ -224,6 +276,7 @@ impl ExecutionRuntime {
         Ok(Self {
             scheduler: SchedulerHandle {
                 sender: scheduler_sender,
+                state,
             },
             scheduler_thread: Some(scheduler_thread),
             executor_sender,
@@ -235,16 +288,32 @@ impl ExecutionRuntime {
         self.scheduler.clone()
     }
 
+    /// Stops the runtime without waiting for queued work. From the moment it
+    /// is called, no plan starts: every plan still queued, or submitted
+    /// later, is refused as [`ExecutionRuntimeError::ShuttingDown`] with
+    /// nothing persisted. A provider execution in flight is cancelled and
+    /// settles like any cancelled execution; a plain plan in flight
+    /// finishes its few database writes. Returns once both workers have
+    /// exited, so no worker is left holding a database call.
     pub fn shutdown(mut self) -> Result<(), ExecutionRuntimeError> {
         self.stop_and_join()
     }
 
     fn stop_and_join(&mut self) -> Result<(), ExecutionRuntimeError> {
+        {
+            let mut state = lock(&self.scheduler.state);
+            state.stopping = true;
+            if let Some(current) = &state.current {
+                current.cancel();
+            }
+        }
         if self.scheduler_thread.is_some() {
             self.scheduler.sender.send(SchedulerMessage::Shutdown).ok();
         }
         let scheduler_result = join_worker(self.scheduler_thread.take());
 
+        // The executor refuses whatever is still queued ahead of this marker
+        // without starting it, so the wait for queue space is short.
         self.executor_sender.send(ExecutorMessage::Shutdown).ok();
         let executor_result = join_worker(self.executor_thread.take());
 
@@ -273,88 +342,81 @@ impl Drop for ExecutionRuntime {
 fn scheduler_loop(
     receiver: flume::Receiver<SchedulerMessage>,
     executor_sender: flume::Sender<ExecutorMessage>,
+    state: SharedState,
 ) -> Result<(), ExecutionRuntimeError> {
     while let Ok(message) = receiver.recv() {
-        match message {
-            SchedulerMessage::Schedule { plan, reply } => {
-                let message = ExecutorMessage::Execute { plan, reply };
-                match executor_sender.try_send(message) {
-                    Ok(()) => {}
-                    Err(flume::TrySendError::Full(ExecutorMessage::Execute { reply, .. })) => {
-                        reply
-                            .send(Err(ExecutionRuntimeError::ExecutorQueueFull))
-                            .ok();
-                    }
-                    Err(flume::TrySendError::Disconnected(ExecutorMessage::Execute {
-                        reply,
-                        ..
-                    })) => {
-                        reply.send(Err(ExecutionRuntimeError::ExecutorStopped)).ok();
-                        return Err(ExecutionRuntimeError::ExecutorStopped);
-                    }
-                    Err(flume::TrySendError::Full(ExecutorMessage::Shutdown))
-                    | Err(flume::TrySendError::Disconnected(ExecutorMessage::Shutdown)) => {
-                        unreachable!("scheduler only sends execution messages")
-                    }
-                    Err(flume::TrySendError::Full(ExecutorMessage::ExecuteProvider { .. }))
-                    | Err(flume::TrySendError::Disconnected(ExecutorMessage::ExecuteProvider {
-                        ..
-                    })) => {
-                        unreachable!("scheduler sent the wrong execution message variant")
-                    }
-                }
+        let submission = match message {
+            SchedulerMessage::Schedule(submission) => submission,
+            SchedulerMessage::Shutdown => break,
+        };
+        if lock(&state).stopping {
+            submission.refuse();
+            continue;
+        }
+        match executor_sender.try_send(ExecutorMessage::Execute(submission)) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(ExecutorMessage::Execute(submission))) => {
+                submission
+                    .reply
+                    .send(Err(ExecutionRuntimeError::ExecutorQueueFull))
+                    .ok();
             }
-            SchedulerMessage::ScheduleProvider { plan, reply } => {
-                let message = ExecutorMessage::ExecuteProvider { plan, reply };
-                match executor_sender.try_send(message) {
-                    Ok(()) => {}
-                    Err(flume::TrySendError::Full(ExecutorMessage::ExecuteProvider {
-                        reply,
-                        ..
-                    })) => {
-                        reply
-                            .send(Err(ExecutionRuntimeError::ExecutorQueueFull))
-                            .ok();
-                    }
-                    Err(flume::TrySendError::Disconnected(ExecutorMessage::ExecuteProvider {
-                        reply,
-                        ..
-                    })) => {
-                        reply.send(Err(ExecutionRuntimeError::ExecutorStopped)).ok();
-                        return Err(ExecutionRuntimeError::ExecutorStopped);
-                    }
-                    Err(flume::TrySendError::Full(ExecutorMessage::Execute { .. }))
-                    | Err(flume::TrySendError::Disconnected(ExecutorMessage::Execute { .. }))
-                    | Err(flume::TrySendError::Full(ExecutorMessage::Shutdown))
-                    | Err(flume::TrySendError::Disconnected(ExecutorMessage::Shutdown)) => {
-                        unreachable!("scheduler only sends provider execution messages")
-                    }
-                }
+            Err(flume::TrySendError::Disconnected(ExecutorMessage::Execute(submission))) => {
+                submission
+                    .reply
+                    .send(Err(ExecutionRuntimeError::ExecutorStopped))
+                    .ok();
+                return Err(ExecutionRuntimeError::ExecutorStopped);
             }
-            SchedulerMessage::Shutdown => {
-                return Ok(());
+            Err(
+                flume::TrySendError::Full(ExecutorMessage::Shutdown)
+                | flume::TrySendError::Disconnected(ExecutorMessage::Shutdown),
+            ) => {
+                unreachable!("the scheduler sends only executions")
             }
         }
     }
-
+    // Plans queued behind the shutdown marker never start.
+    for message in receiver.drain() {
+        if let SchedulerMessage::Schedule(submission) = message {
+            submission.refuse();
+        }
+    }
     Ok(())
 }
 
 async fn executor_loop(
     database: DatabaseHandle,
     receiver: flume::Receiver<ExecutorMessage>,
+    state: SharedState,
 ) -> Result<(), ExecutionRuntimeError> {
     while let Ok(message) = receiver.recv_async().await {
-        match message {
-            ExecutorMessage::Execute { plan, reply } => {
-                let result = execute_plan(database.clone(), plan).await;
-                reply.send(result).ok();
+        let Submission { work, reply } = match message {
+            ExecutorMessage::Execute(submission) => *submission,
+            ExecutorMessage::Shutdown => break,
+        };
+        {
+            let mut state = lock(&state);
+            if state.stopping {
+                drop(state);
+                Submission { work, reply }.refuse();
+                continue;
             }
-            ExecutorMessage::ExecuteProvider { plan, reply } => {
-                let result = execute_provider_plan(database.clone(), plan).await;
-                reply.send(result).ok();
-            }
-            ExecutorMessage::Shutdown => return Ok(()),
+            state.current = match &work {
+                Work::Provider(plan) => Some(plan.provider_config.cancellation.clone()),
+                Work::Plan(_) => None,
+            };
+        }
+        let result = match work {
+            Work::Plan(plan) => execute_plan(database.clone(), plan).await,
+            Work::Provider(plan) => execute_provider_plan(database.clone(), plan).await,
+        };
+        lock(&state).current = None;
+        reply.send(result).ok();
+    }
+    for message in receiver.drain() {
+        if let ExecutorMessage::Execute(submission) = message {
+            submission.refuse();
         }
     }
     Ok(())
@@ -372,17 +434,43 @@ async fn execute_plan(
 
     let input = database.save_job_input(None, plan.input).await?;
     let job = database.create_job_with_input(plan.job, input).await?;
-    database.start_job(job).await?;
+    database.start_local_job(job).await?;
     let result = database
         .finalize_job(job, plan.outcome.finalization(plan.result))
         .await?;
-
-    Ok(ExecutionReceipt {
+    let receipt = ExecutionReceipt {
         executor,
         input,
         job,
         result,
-    })
+    };
+    // Recording the outcome was all this runtime executed for the plan.
+    if plan.outcome == JobOutcome::Unknown
+        && let Err(source) = confirm_stopped(&database, job).await
+    {
+        return Err(ExecutionRuntimeError::StopNotConfirmed {
+            receipt: Box::new(receipt),
+            source,
+            observations: None,
+        });
+    }
+    Ok(receipt)
+}
+
+/// Records that this runtime's execution of a Job whose outcome was settled
+/// unknown has stopped, which releases the Job's Profiles. It is called only
+/// once the execution has returned: its future, its request and its
+/// response have been dropped, so nothing in this process acts for the Job
+/// any more. That says nothing about the Provider, and the outcome stays
+/// unknown. A stop already confirmed counts as confirmed.
+pub(crate) async fn confirm_stopped(
+    database: &DatabaseHandle,
+    job: JobId,
+) -> Result<(), DatabaseError> {
+    match database.confirm_job_stopped(job).await {
+        Ok(()) | Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 async fn execute_provider_plan(
@@ -396,7 +484,7 @@ async fn execute_provider_plan(
     plan.job.assigned_executor = Some(executor);
     let input = database.save_job_input(None, plan.input).await?;
     let job = database.create_job_with_input(plan.job, input).await?;
-    database.start_job(job).await?;
+    database.start_local_job(job).await?;
 
     let configuration = match database.job_configuration(job).await? {
         Some(configuration) => configuration,
@@ -516,6 +604,17 @@ pub(crate) async fn finish_provider_job(
                 gap.get_or_insert(source);
                 *receipt
             }
+            Err(ExecutionRuntimeError::StopNotConfirmed {
+                receipt,
+                source,
+                observations,
+            }) => {
+                return Err(ExecutionRuntimeError::StopNotConfirmed {
+                    receipt,
+                    source,
+                    observations: gap.map(Box::new).or(observations),
+                });
+            }
             Err(error) => return Err(error),
         },
     };
@@ -612,7 +711,9 @@ impl ProviderOutputSink for DatabaseOutputSink {
 
 /// Settles a failed provider execution. Its Job outcome follows the error
 /// alone; its availability observation records only the facts the error
-/// carries, see [`provider_execution::error_observation`].
+/// carries, see [`provider_execution::error_observation`]. The execution has
+/// returned, so an unknown outcome also has its local stop confirmed, but
+/// only once that outcome is committed: a failed settlement confirms nothing.
 pub(crate) async fn settle_provider_error(
     database: DatabaseHandle,
     executor: ExecutorId,
@@ -624,6 +725,7 @@ pub(crate) async fn settle_provider_error(
         error,
         ProviderExecutionError::Unknown { .. }
             | ProviderExecutionError::Incomplete { .. }
+            | ProviderExecutionError::Interrupted { .. }
             | ProviderExecutionError::Stopped { .. }
     );
     let result = if unknown {
@@ -647,20 +749,32 @@ pub(crate) async fn settle_provider_error(
         job,
         result,
     };
+    let stop = if unknown {
+        confirm_stopped(&database, job).await.err()
+    } else {
+        None
+    };
+    let mut gap = None;
     if let Some(observation) = provider_execution::error_observation(&error) {
-        let recorded = database
+        gap = database
             .record_availability_stat(NewAvailabilityStat {
                 job,
                 observed_at: Timestamp::now(),
                 observation,
             })
-            .await;
-        if let Err(source) = recorded {
-            return Err(ExecutionRuntimeError::ObservationsNotRecorded {
-                receipt: Box::new(receipt),
-                source,
-            });
-        }
+            .await
+            .err();
     }
-    Ok(receipt)
+    match (stop, gap) {
+        (Some(source), observations) => Err(ExecutionRuntimeError::StopNotConfirmed {
+            receipt: Box::new(receipt),
+            source,
+            observations: observations.map(Box::new),
+        }),
+        (None, Some(source)) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
+            receipt: Box::new(receipt),
+            source,
+        }),
+        (None, None) => Ok(receipt),
+    }
 }

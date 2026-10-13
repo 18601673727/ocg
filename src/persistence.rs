@@ -1238,6 +1238,12 @@ pub enum OperationKind {
     /// One bounded batch of Token aggregation. Its marker's subject is the
     /// last Metrics record the batch consumed.
     ConsumeTokenUsage,
+    /// A start by this process's own runtime, which claims the Job's
+    /// execution for the current opening of the database.
+    StartLocalJob,
+    /// The settlement, when the database is opened, of a Job that an
+    /// earlier opening started locally and never settled.
+    ReconcileAbandonedJob,
 }
 
 /// Written in the same transaction as every accepted mutation, so its
@@ -1623,6 +1629,50 @@ pub(crate) fn start_job(batch: &mut Batch, job: JobId) -> OpResult<()> {
     Ok(((), MarkerSubjects::addressed(RecordRef::Job(job))))
 }
 
+/// Records that the Job's execution began in this process, under the
+/// opening of `epoch`. Besides the start, it claims the execution for that
+/// opening until the Job settles, so a later opening can tell that work this
+/// opening left unsettled can no longer be running; see
+/// [`reconcile_abandoned_job`]. The Genesis Job is never executed.
+pub(crate) fn start_local_job(batch: &mut Batch, job: JobId, epoch: u64) -> OpResult<()> {
+    if batch.genesis()? == job {
+        return batch.reject(Violation::GenesisProtected(job));
+    }
+    let started = start_job(batch, job)?;
+    batch.claim_local_execution(job, epoch)?;
+    Ok(started)
+}
+
+/// Settles a Job that the opening of `epoch` started as its own local
+/// execution and left unsettled. Runs only when the database is opened, so
+/// that opening is closed: nothing it ran can still execute or settle the
+/// Job. An unsettled Job's outcome becomes unknown, never a claimed result,
+/// and its stop is confirmed, which releases the Profiles it holds. An
+/// unknown outcome only has its stop confirmed. Children are not touched: a
+/// parent still needs a confirmed outcome from each of them.
+///
+/// Declines when the Job no longer has that claim, so running it again
+/// changes nothing.
+pub(crate) fn reconcile_abandoned_job(
+    batch: &mut Batch,
+    job: JobId,
+    epoch: u64,
+) -> Result<Option<((), MarkerSubjects)>, BatchError> {
+    if batch.local_execution(job)? != Some(epoch) {
+        return Ok(None);
+    }
+    let now = batch.now();
+    let mut row = batch.require_job(job)?;
+    if batch.genesis()? != job && row.holds_profiles() {
+        row.unknown_at.get_or_insert(now);
+        row.stop_confirmed_at = Some(now);
+        row.updated_at = now;
+        batch.put_job(&row)?;
+    }
+    batch.release_local_execution(job)?;
+    Ok(Some(((), MarkerSubjects::addressed(RecordRef::Job(job)))))
+}
+
 /// Replaces the Job's main Executor; refused once the Job has started. The
 /// Executor must support the transport of the LLM configuration the Job
 /// froze, if any; the Job's Provider, model and parameters stay as frozen.
@@ -1732,6 +1782,8 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
     *outcome(&mut row) = Some(now);
     row.updated_at = now;
     batch.put_job(&row)?;
+    // A confirmed outcome settles the Job, so no opening owns its execution.
+    batch.release_local_execution(job)?;
     let output_id = appended.output;
     Ok((Some(appended), MarkerSubjects::created(RecordRef::Job(job), RecordRef::JobOutput(output_id))))
 }
@@ -1890,6 +1942,7 @@ pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId) -> OpResult<()>
     row.stop_confirmed_at = Some(now);
     row.updated_at = now;
     batch.put_job(&row)?;
+    batch.release_local_execution(job)?;
     Ok(((), MarkerSubjects::addressed(RecordRef::Job(job))))
 }
 

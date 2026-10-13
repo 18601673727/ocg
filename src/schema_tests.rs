@@ -9239,3 +9239,587 @@ fn a_host_run_keeps_stopping_after_a_failed_step_and_reports_every_failure() {
         "one report carries every component's failure: {text}"
     );
 }
+
+// ---- runtime lifecycle closure -----------------------------------------------------
+
+/// Local execution claims, stop confirmation, abandoned-work settlement and
+/// bounded runtime shutdown.
+mod lifecycle_closure {
+    use std::net::{TcpListener, TcpStream};
+
+    use super::*;
+    use crate::disk_protection::{
+        CleanupConfig, FilesystemConfig, ProtectedArea, ProtectionReason, SpaceShortage,
+    };
+    use crate::orchestration::execution_runtime::{ProviderExecutionPlan, confirm_stopped};
+    use crate::persistence::{OperationKind, OperationMarker};
+    use crate::provider_execution::{
+        CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,
+    };
+    use crate::storage::StorageError;
+
+    fn record(handle: &DatabaseHandle, job: JobId) -> JobRecord {
+        wait(handle.job(job))
+            .expect("read job")
+            .expect("job exists")
+    }
+
+    /// A configured Job that this process started as its own execution.
+    fn local_child(handle: &DatabaseHandle, agent: ProfileId, llm: ProfileId) -> JobId {
+        let job = configured_child(handle, agent, llm);
+        wait(handle.start_local_job(job)).expect("start the Job locally");
+        job
+    }
+
+    fn reconciliations(handle: &DatabaseHandle) -> Vec<OperationMarker> {
+        wait(handle.operation_markers(None, 1_000))
+            .expect("read markers")
+            .into_iter()
+            .filter(|marker| marker.kind == OperationKind::ReconcileAbandonedJob)
+            .collect()
+    }
+
+    fn space_only(directory: &DataDirectory) -> ProtectionReason {
+        ProtectionReason::InsufficientSpace(SpaceShortage {
+            area: ProtectedArea::Database,
+            path: directory.database_path().to_path_buf(),
+            available_bytes: 0,
+            expected_write_bytes: 0,
+            threshold_bytes: 1,
+        })
+    }
+
+    /// Thresholds any test machine meets, and no periodic check of its own
+    /// during a test.
+    fn lenient() -> FilesystemConfig {
+        FilesystemConfig {
+            disk_lock_threshold_bytes: 1,
+            disk_resume_threshold_bytes: 2,
+            disk_check_interval_ms: 3_600_000,
+            cleanup_config: CleanupConfig::default(),
+        }
+    }
+
+    #[test]
+    fn every_unknown_provider_settlement_confirms_the_local_stop_and_releases_its_profiles() {
+        let (_root, directory) = data_directory("unknown-stops");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let Configured {
+            targeted, agent, ..
+        } = configured(&handle);
+        let executor = executor(&handle, "llm worker", ExecutorType::Llm, &[OPENAI])
+            .expect("register Executor");
+        let active = local_child(&handle, agent, targeted);
+        let facts = ResponseFacts {
+            status_code: 200,
+            finish_reason: None,
+            raw_finish_reason: None,
+        };
+        let endings = [
+            ProviderExecutionError::Unknown {
+                message: "provider request timed out after it may have been delivered".into(),
+            },
+            ProviderExecutionError::Unknown {
+                message: "connection reset".into(),
+            },
+            ProviderExecutionError::Incomplete {
+                message: "provider output exceeded its limit".into(),
+            },
+            ProviderExecutionError::Stopped {
+                message: "provider execution was cancelled while streaming".into(),
+                facts: facts.clone(),
+            },
+            ProviderExecutionError::Stopped {
+                message: "database could not persist provider output".into(),
+                facts,
+            },
+            ProviderExecutionError::Interrupted {
+                message: "provider execution was cancelled before a response arrived".into(),
+            },
+        ];
+        let mut settled = Vec::new();
+        for ending in endings {
+            let interrupted = matches!(ending, ProviderExecutionError::Interrupted { .. });
+            let job = local_child(&handle, agent, targeted);
+            let input = record(&handle, job).input;
+            let receipt = wait(settle_provider_error(
+                handle.clone(),
+                executor,
+                input,
+                job,
+                ending,
+            ))
+            .expect("settle the execution");
+            assert_eq!(
+                receipt.result, None,
+                "an unknown outcome publishes no result"
+            );
+            let job_record = record(&handle, job);
+            assert!(
+                job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_some(),
+                "the outcome stays unknown and the local stop is confirmed"
+            );
+            assert_eq!(
+                (
+                    job_record.completed_at,
+                    job_record.failed_at,
+                    job_record.cancelled_at
+                ),
+                (None, None, None),
+                "no remote outcome is claimed"
+            );
+            if interrupted {
+                assert!(
+                    wait(handle.job_availability(job, None, 10))
+                        .expect("read observations")
+                        .is_empty(),
+                    "a local interruption observed nothing about the Provider"
+                );
+            }
+            settled.push(job);
+        }
+        for profile in [agent, targeted] {
+            assert_eq!(
+                blocking(&handle, profile),
+                [active],
+                "only work that is still running holds its Profiles"
+            );
+        }
+        for job in settled {
+            wait(confirm_stopped(&handle, job)).expect("confirming again changes nothing");
+        }
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("reopen database");
+        assert_eq!(
+            worker.handle().abandoned_at_open(),
+            [active],
+            "settled Jobs left no claim behind"
+        );
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_settlement_that_was_not_committed_confirms_no_stop() {
+        let (_root, directory) = data_directory("uncommitted-stop");
+        let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+        let handle = worker.handle();
+        let Configured {
+            targeted, agent, ..
+        } = configured(&handle);
+        let executor = executor(&handle, "llm worker", ExecutorType::Llm, &[OPENAI])
+            .expect("register Executor");
+        let job = local_child(&handle, agent, targeted);
+        let input = record(&handle, job).input;
+
+        assert!(handle.activate_filesystem_protection(space_only(&directory)));
+        match wait(settle_provider_error(
+            handle.clone(),
+            executor,
+            input,
+            job,
+            ProviderExecutionError::Unknown {
+                message: "connection reset".into(),
+            },
+        )) {
+            Err(ExecutionRuntimeError::Database(error)) => assert!(
+                error
+                    .command_outcome()
+                    .is_some_and(|outcome| outcome != crate::database::CommandOutcome::Unknown),
+                "the settlement was known not to commit: {error}"
+            ),
+            other => panic!("a refused settlement must fail, got {other:?}"),
+        }
+        wait(handle.recover_storage()).expect("recover");
+        let job_record = record(&handle, job);
+        assert!(job_record.started_at.is_some());
+        assert_eq!(
+            (job_record.unknown_at, job_record.stop_confirmed_at),
+            (None, None),
+            "nothing was settled, so no stop is confirmed"
+        );
+        assert_eq!(blocking(&handle, targeted), [job]);
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn work_abandoned_by_a_closed_opening_is_settled_unknown_and_stopped_exactly_once() {
+        let (_root, directory) = data_directory("abandoned");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let Configured {
+            targeted, agent, ..
+        } = configured(&handle);
+        assert!(handle.abandoned_at_open().is_empty());
+        assert_eq!(
+            violation(wait(handle.start_local_job(handle.genesis()))),
+            Violation::GenesisProtected(handle.genesis()),
+            "the Genesis Job is never executed"
+        );
+
+        // A queued parent whose locally started child is left running.
+        let parent = create_job(&handle, new_job("parent", handle.genesis(), Vec::new()));
+        let child = create_job(
+            &handle,
+            NewJob {
+                configuration: configuration(agent, targeted),
+                ..new_job("running child", parent, Vec::new())
+            },
+        );
+        wait(handle.start_local_job(child)).expect("start the child locally");
+        // Locally started work whose outcome was recorded unknown, unconfirmed.
+        let unconfirmed = local_child(&handle, agent, targeted);
+        wait(handle.finalize_job(unconfirmed, JobFinalization::Unknown)).expect("unknown");
+        let unknown_at = record(&handle, unconfirmed).unknown_at;
+        // Locally started work that finished.
+        let finished = local_child(&handle, agent, targeted);
+        wait(handle.finalize_job(finished, JobFinalization::Completed(result("done"))))
+            .expect("finish");
+        // Work started outside this process is never presumed stopped.
+        let external = configured_child(&handle, agent, targeted);
+        wait(handle.start_job(external)).expect("start externally");
+        let finished_before = record(&handle, finished);
+        // The opening closes with its work unsettled, as when the process dies.
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        let handle = worker.handle();
+        let mut abandoned = handle.abandoned_at_open().to_vec();
+        abandoned.sort();
+        assert_eq!(abandoned, [child, unconfirmed]);
+        let child_record = record(&handle, child);
+        assert!(child_record.unknown_at.is_some() && child_record.stop_confirmed_at.is_some());
+        assert_eq!(
+            (
+                child_record.completed_at,
+                child_record.failed_at,
+                child_record.cancelled_at,
+                child_record.sterilized_at
+            ),
+            (None, None, None, None),
+            "an abandoned Job is not given a result"
+        );
+        assert!(
+            wait(handle.job_outputs(child, None, 10))
+                .expect("read outputs")
+                .is_empty()
+        );
+        let unconfirmed_record = record(&handle, unconfirmed);
+        assert_eq!(
+            unconfirmed_record.unknown_at, unknown_at,
+            "the recorded outcome is kept"
+        );
+        assert!(unconfirmed_record.stop_confirmed_at.is_some());
+        assert_eq!(record(&handle, finished), finished_before);
+        let external_record = record(&handle, external);
+        assert!(
+            external_record.started_at.is_some()
+                && external_record.unknown_at.is_none()
+                && external_record.stop_confirmed_at.is_none()
+        );
+        for profile in [agent, targeted] {
+            assert_eq!(blocking(&handle, profile), [external]);
+        }
+        // The parent still needs a confirmed outcome from its child.
+        assert_eq!(
+            violation(wait(
+                handle.finalize_job(parent, JobFinalization::Completed(result("done")))
+            )),
+            Violation::UnfinishedChild(parent)
+        );
+        let markers = reconciliations(&handle);
+        assert_eq!(markers.len(), 2);
+        assert!(
+            markers
+                .iter()
+                .all(|marker| marker.operation.epoch() == handle.epoch())
+        );
+        let child_after = record(&handle, child);
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("restart again");
+        let handle = worker.handle();
+        assert!(
+            handle.abandoned_at_open().is_empty(),
+            "settled work is not settled twice"
+        );
+        assert_eq!(record(&handle, child), child_after);
+        assert_eq!(reconciliations(&handle).len(), 2);
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_reopen_during_recovery_never_settles_its_own_process_work() {
+        let (_root, directory) = data_directory("recovery-reopen");
+        let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+        let handle = worker.handle();
+        let Configured {
+            targeted, agent, ..
+        } = configured(&handle);
+        let running = local_child(&handle, agent, targeted);
+        let epoch = handle.epoch();
+
+        assert!(
+            handle.activate_filesystem_protection(ProtectionReason::StorageUnavailable(
+                StorageError::corrupted("injected storage failure")
+            ))
+        );
+        let report = wait(handle.recover_storage()).expect("recover");
+        assert!(
+            report
+                .reopened_epoch
+                .is_some_and(|reopened| reopened > epoch)
+        );
+        let running_record = record(&handle, running);
+        assert!(running_record.unknown_at.is_none() && running_record.stop_confirmed_at.is_none());
+        assert_eq!(blocking(&handle, targeted), [running]);
+        assert!(reconciliations(&handle).is_empty());
+        wait(handle.finalize_job(running, JobFinalization::Completed(result("done"))))
+            .expect("the running work settles normally");
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        assert!(worker.handle().abandoned_at_open().is_empty());
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn an_abandoned_aggregation_service_job_is_settled_by_the_next_start() {
+        let (_root, directory) = data_directory("abandoned-service");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let service = wait(AggregationService::start(
+            handle.clone(),
+            AggregationServiceConfig {
+                interval: Duration::from_secs(3_600),
+                check_immediately: false,
+                seams: TestSeams::default(),
+            },
+        ))
+        .expect("start the service");
+        let job = service.job();
+        // Dropped without a shutdown, as a dying process leaves it.
+        drop(service);
+        assert!(record(&handle, job).started_at.is_some());
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        let handle = worker.handle();
+        assert_eq!(handle.abandoned_at_open(), [job]);
+        let job_record = record(&handle, job);
+        assert!(job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_some());
+        assert!(job_record.completed_at.is_none() && job_record.failed_at.is_none());
+
+        // A service that ends normally leaves nothing to settle.
+        let service = wait(AggregationService::start(
+            handle.clone(),
+            AggregationServiceConfig {
+                interval: Duration::from_secs(3_600),
+                check_immediately: false,
+                seams: TestSeams::default(),
+            },
+        ))
+        .expect("start the next service");
+        wait(service.shutdown())
+            .into_result()
+            .expect("end the service");
+        worker.shutdown().expect("shutdown");
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        assert!(worker.handle().abandoned_at_open().is_empty());
+        worker.shutdown().expect("shutdown");
+    }
+
+    /// A Provider endpoint that accepts connections and never answers, so a
+    /// request to it stalls before any response head. The accepted
+    /// connections stay open while the returned receiver holds them.
+    fn silent_provider(connections: usize) -> (String, flume::Receiver<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener.local_addr().expect("local address").port();
+        let (sender, accepted) = flume::unbounded();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(connections) {
+                match stream {
+                    Ok(stream) => {
+                        if sender.send(stream).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("https://127.0.0.1:{port}/v1"), accepted)
+    }
+
+    struct SilentSetup {
+        executor: ExecutorId,
+        llm: ProfileId,
+    }
+
+    fn silent_setup(handle: &DatabaseHandle, endpoint: String) -> SilentSetup {
+        let provider = wait(handle.create_llm_provider(NewLlmProvider {
+            name: "silent".into(),
+            transport: OPENAI,
+            endpoint: Some(endpoint),
+            credential_ref: None,
+        }))
+        .expect("create provider");
+        let llm = llm_profile(
+            handle,
+            provider,
+            llm_config("model-s", &[ModelCapability::Chat]),
+        );
+        let executor = executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI])
+            .expect("register Executor");
+        SilentSetup { executor, llm }
+    }
+
+    fn provider_plan(
+        handle: &DatabaseHandle,
+        setup: &SilentSetup,
+        timeout: Duration,
+    ) -> ProviderExecutionPlan {
+        ProviderExecutionPlan {
+            executor_id: setup.executor,
+            input: JobInputDraft {
+                objective: Some("answer".into()),
+                ..JobInputDraft::default()
+            },
+            job: NewJob {
+                configuration: llm_only(setup.llm),
+                ..new_job("provider request", handle.genesis(), Vec::new())
+            },
+            credential_resolver: Arc::new(EnvironmentCredentialResolver),
+            provider_config: ProviderExecutionConfig {
+                timeout,
+                cancellation: CancellationToken::default(),
+                ..ProviderExecutionConfig::default()
+            },
+        }
+    }
+
+    fn job_count(handle: &DatabaseHandle) -> usize {
+        wait(handle.jobs(None, 1_000)).expect("read jobs").len()
+    }
+
+    #[test]
+    fn a_timed_out_request_settles_unknown_with_its_local_stop_confirmed() {
+        let (_root, directory) = data_directory("runtime-timeout");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (endpoint, _accepted) = silent_provider(1);
+        let setup = silent_setup(&handle, endpoint);
+        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let receipt = match wait(runtime.scheduler().schedule_provider(provider_plan(
+            &handle,
+            &setup,
+            Duration::from_millis(300),
+        ))) {
+            Ok(receipt) => receipt,
+            Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
+                panic!("observations of {receipt:?} were not recorded: {source}")
+            }
+            Err(error) => panic!("the request must settle, got {error}"),
+        };
+        let job_record = record(&handle, receipt.job);
+        assert!(job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_some());
+        assert!(blocking(&handle, setup.llm).is_empty());
+        runtime.shutdown().expect("shutdown runtime");
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        assert!(worker.handle().abandoned_at_open().is_empty());
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn shutdown_cancels_the_running_request_and_refuses_queued_plans_unpersisted() {
+        let (_root, directory) = data_directory("runtime-shutdown");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (endpoint, accepted) = silent_provider(1);
+        let setup = silent_setup(&handle, endpoint);
+        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let scheduler = runtime.scheduler();
+
+        // A request that would wait two minutes for a response head.
+        let running = {
+            let scheduler = scheduler.clone();
+            let plan = provider_plan(&handle, &setup, Duration::from_secs(120));
+            std::thread::spawn(move || wait(scheduler.schedule_provider(plan)))
+        };
+        let _connection = accepted
+            .recv_timeout(crate::test_support::WAIT)
+            .expect("the request reached the Provider");
+        let jobs_running = job_count(&handle);
+
+        // Plans queued behind it, of both kinds.
+        let queued_provider = admit(scheduler.schedule_provider(provider_plan(
+            &handle,
+            &setup,
+            Duration::from_secs(120),
+        )));
+        let queued_plain = admit(scheduler.schedule(ExecutionPlan {
+            executor_id: setup.executor,
+            input: JobInputDraft::default(),
+            job: NewJob {
+                configuration: llm_only(setup.llm),
+                ..new_job("plain plan", handle.genesis(), Vec::new())
+            },
+            outcome: JobOutcome::Completed,
+            result: result("answered"),
+        }));
+
+        let started = Instant::now();
+        runtime.shutdown().expect("shutdown runtime");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown waited for the request's timeout"
+        );
+        for refused in [queued_provider(), queued_plain()] {
+            assert!(
+                matches!(refused, Err(ExecutionRuntimeError::ShuttingDown)),
+                "a queued plan is refused, got {refused:?}"
+            );
+        }
+        assert_eq!(
+            job_count(&handle),
+            jobs_running,
+            "refused plans persisted nothing"
+        );
+        assert!(matches!(
+            wait(scheduler.schedule_provider(provider_plan(
+                &handle,
+                &setup,
+                Duration::from_secs(120)
+            ))),
+            Err(ExecutionRuntimeError::ShuttingDown)
+        ));
+
+        let receipt = running
+            .join()
+            .expect("the submitter finished")
+            .expect("the cancelled request settles");
+        assert_eq!(receipt.result, None);
+        let job_record = record(&handle, receipt.job);
+        assert!(
+            job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_some(),
+            "a request cancelled after it may have been sent is unknown, and stopped"
+        );
+        assert!(
+            wait(handle.job_availability(receipt.job, None, 10))
+                .expect("read observations")
+                .is_empty(),
+            "a local cancellation is no observation of the Provider"
+        );
+        assert!(blocking(&handle, setup.llm).is_empty());
+        worker.shutdown().expect("shutdown");
+
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        assert!(worker.handle().abandoned_at_open().is_empty());
+        worker.shutdown().expect("shutdown");
+    }
+}

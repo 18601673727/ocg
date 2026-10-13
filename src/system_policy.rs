@@ -229,7 +229,7 @@ impl SystemPolicy {
             std::process::id(),
             NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed),
         ));
-        let mut file = OpenOptions::new()
+        let mut file = crate::data_directory::private_file(&mut OpenOptions::new())
             .write(true)
             .create_new(true)
             .open(&temporary)

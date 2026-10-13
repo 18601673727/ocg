@@ -538,4 +538,191 @@ mod tests {
         assert!(handle.disk_protection().lock.is_some());
         worker.shutdown().expect("shutdown database");
     }
+
+    /// Every protected filesystem is checked every 20 milliseconds.
+    fn checked_often(resume_threshold_bytes: u64) -> FilesystemConfig {
+        FilesystemConfig {
+            disk_lock_threshold_bytes: 1,
+            disk_resume_threshold_bytes: resume_threshold_bytes,
+            disk_check_interval_ms: 20,
+            cleanup_config: CleanupConfig::default(),
+        }
+    }
+
+    #[test]
+    fn a_locked_database_is_checked_at_least_every_protected_interval() {
+        use crate::database::{PROTECTED_CHECK_INTERVAL, next_check_interval};
+        let hours = Duration::from_secs(2 * 60 * 60);
+        assert_eq!(next_check_interval(hours, false), hours);
+        assert_eq!(next_check_interval(hours, true), PROTECTED_CHECK_INTERVAL);
+        let short = Duration::from_millis(20);
+        assert_eq!(next_check_interval(short, true), short);
+        assert_eq!(next_check_interval(short, false), short);
+    }
+
+    fn shortage(area: ProtectedArea, path: &Path) -> ProtectionReason {
+        ProtectionReason::InsufficientSpace(SpaceShortage {
+            area,
+            path: path.to_path_buf(),
+            available_bytes: 0,
+            expected_write_bytes: 0,
+            threshold_bytes: 1,
+        })
+    }
+
+    /// Waits until the database has completed `checks` more full checks.
+    fn await_checks(handle: &crate::database::DatabaseHandle, checks: u64) {
+        let target = handle.disk_protection().completed_checks + checks;
+        let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+        while handle.disk_protection().completed_checks < target {
+            assert!(std::time::Instant::now() < deadline, "no check ran in time");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn await_open(handle: &crate::database::DatabaseHandle) {
+        let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+        while handle.status() != DatabaseStatus::Open {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lock was not lifted in time"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_lock_for_lack_of_space_on_several_paths_lifts_by_itself_once_space_returns() {
+        let (_root, directory) = data_directory("auto-recovery");
+        // Checked every second, so both reasons are in place before the
+        // first check after they were locked runs.
+        let worker = DatabaseWorker::start_with_config(
+            &directory,
+            FilesystemConfig {
+                disk_check_interval_ms: 1_000,
+                ..checked_often(2)
+            },
+        )
+        .expect("start database");
+        let handle = worker.handle();
+        let checks = handle.disk_protection().completed_checks;
+        assert!(handle.activate_filesystem_protection(shortage(
+            ProtectedArea::Database,
+            directory.database_path()
+        )));
+        assert!(
+            handle.activate_filesystem_protection(shortage(
+                ProtectedArea::Logs,
+                directory.logs_path()
+            ))
+        );
+        assert_eq!(
+            handle.disk_protection().lock.map(|lock| lock.reasons.len()),
+            Some(2)
+        );
+        assert_eq!(handle.status(), DatabaseStatus::Protected);
+
+        // The next check finds the resume threshold on every path.
+        await_open(&handle);
+        let status = handle.disk_protection();
+        assert!(status.lock.is_none());
+        assert!(status.recovery_attempts >= 1);
+        assert!(status.completed_checks > checks);
+        wait(handle.create_project(crate::persistence::NewProject {
+            name: "after recovery".into(),
+            description: None,
+        }))
+        .expect("commands are accepted again");
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn a_lock_stays_while_a_path_lacks_the_resume_threshold() {
+        let (_root, directory) = data_directory("auto-recovery-short");
+        let worker = DatabaseWorker::start_with_config(&directory, checked_often(u64::MAX))
+            .expect("start database");
+        let handle = worker.handle();
+        assert!(handle.activate_filesystem_protection(shortage(
+            ProtectedArea::Attachments,
+            directory.attachments_path()
+        )));
+        let attempts = handle.disk_protection().recovery_attempts;
+        await_checks(&handle, 3);
+        let status = handle.disk_protection();
+        assert_eq!(handle.status(), DatabaseStatus::Protected);
+        assert!(status.lock.is_some());
+        assert!(
+            status.recovery_attempts > attempts,
+            "every check tried, and each attempt kept the lock"
+        );
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn a_failed_space_measurement_keeps_the_lock_until_an_explicit_recovery() {
+        let (_root, directory) = data_directory("auto-recovery-unmeasured");
+        let worker = DatabaseWorker::start_with_config(&directory, checked_often(2))
+            .expect("start database");
+        let handle = worker.handle();
+        // A path that cannot be measured fails closed.
+        std::fs::remove_dir(directory.attachments_path()).expect("remove attachments");
+        assert!(handle.activate_filesystem_protection(shortage(
+            ProtectedArea::Database,
+            directory.database_path()
+        )));
+        await_checks(&handle, 1);
+        let lock = handle.disk_protection().lock.expect("still locked");
+        assert!(lock.reasons.iter().any(|reason| matches!(
+            reason,
+            ProtectionReason::SpaceQueryFailed(failure) if failure.area == ProtectedArea::Attachments
+        )));
+
+        // Measurable again, but the failed measurement is no shortage of
+        // space, so the lock is left to an explicit recovery.
+        std::fs::create_dir(directory.attachments_path()).expect("restore attachments");
+        await_checks(&handle, 3);
+        assert_eq!(handle.status(), DatabaseStatus::Protected);
+        wait(handle.recover_storage()).expect("explicit recovery");
+        assert_eq!(handle.status(), DatabaseStatus::Open);
+        worker.shutdown().expect("shutdown database");
+    }
+
+    #[test]
+    fn storage_and_write_failures_are_never_lifted_automatically() {
+        let failures = [
+            ProtectionReason::StorageUnavailable(crate::storage::StorageError::corrupted(
+                "injected failed commit",
+            )),
+            ProtectionReason::FilesystemWriteFailed {
+                area: ProtectedArea::Logs,
+                path: PathBuf::from("injected"),
+                kind: io::ErrorKind::Other,
+                os_error: None,
+                detail: "injected failed write".into(),
+            },
+        ];
+        for (index, failure) in failures.into_iter().enumerate() {
+            let (_root, directory) = data_directory(&format!("no-auto-recovery-{index}"));
+            let worker = DatabaseWorker::start_with_config(&directory, checked_often(2))
+                .expect("start database");
+            let handle = worker.handle();
+            // A shortage beside the failure does not make it lift either.
+            assert!(handle.activate_filesystem_protection(shortage(
+                ProtectedArea::Database,
+                directory.database_path()
+            )));
+            assert!(handle.activate_filesystem_protection(failure));
+            let attempts = handle.disk_protection().recovery_attempts;
+            await_checks(&handle, 3);
+            assert_eq!(handle.status(), DatabaseStatus::Protected);
+            assert_eq!(
+                handle.disk_protection().recovery_attempts,
+                attempts,
+                "no recovery is attempted for it"
+            );
+            wait(handle.recover_storage()).expect("explicit recovery");
+            assert_eq!(handle.status(), DatabaseStatus::Open);
+            worker.shutdown().expect("shutdown database");
+        }
+    }
 }

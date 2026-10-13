@@ -74,9 +74,12 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// not decode it, and no annotation is invented for an older file. Version 9
 /// added the Token aggregation state: per-Job request evidence, sparse minute
 /// totals and the Token stream's progress. A version 8 file lacks those
-/// tables, so it is refused rather than initialized in place. Files of any
-/// other version are refused on open, before anything is written to them.
-pub(crate) const FORMAT_VERSION: u32 = 9;
+/// tables, so it is refused rather than initialized in place. Version 10
+/// added the local execution claims of Jobs started by this process's own
+/// runtime; a version 9 build would leave them behind when it settled such
+/// a Job. Files of any other version are refused on open, before anything
+/// is written to them.
+pub(crate) const FORMAT_VERSION: u32 = 10;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -161,6 +164,11 @@ const OBSERVES: Link = TableDefinition::new("observes");
 const JOB_AVAILABILITY: PairSet = TableDefinition::new("observes_in");
 /// (scope, observed_at, stat), written like METRICS_BY_SCOPE.
 const AVAILABILITY_BY_SCOPE: ScopeIndex = TableDefinition::new("availability_stat_by_scope");
+/// Job -> the epoch of the opening whose own runtime started it. Written
+/// with the start and removed when the Job settles: with a confirmed outcome,
+/// or with a confirmed stop after an unknown one. An entry of an earlier
+/// opening is work that no running process can still execute or settle.
+const LOCAL_EXECUTIONS: Link = TableDefinition::new("local_execution");
 /// (epoch, seq) -> operation marker.
 const OPERATIONS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("operation");
 /// Job -> its request sample as materialized. Rebuildable from the raw
@@ -693,6 +701,7 @@ codes!(OperationKind {
     OperationKind::CreateProfile = 16, OperationKind::CreateAgent = 17, OperationKind::UpdateProfile = 19,
     OperationKind::ConfirmJobStopped = 20, OperationKind::RecordMetrics = 21, OperationKind::RecordAvailabilityStat = 22,
     OperationKind::ConsumeAvailability = 23, OperationKind::ConsumeTokenUsage = 24,
+    OperationKind::StartLocalJob = 25, OperationKind::ReconcileAbandonedJob = 26,
 });
 
 // ---- rows ------------------------------------------------------------------------
@@ -1349,6 +1358,7 @@ pub(crate) struct OpenedFile {
 /// allocates this opening's operation epoch, all in one transaction.
 pub(crate) fn open(directory: &Path) -> Result<OpenedFile, OpenError> {
     let path = database_file(directory);
+    prepare_private_file(&path)?;
     let mut builder = Database::builder();
     builder.set_cache_size(CACHE_BYTES);
     // A writable opening lets redb rewrite its own bookkeeping in the file,
@@ -1368,6 +1378,28 @@ pub(crate) fn open(directory: &Path) -> Result<OpenedFile, OpenError> {
         epoch,
         genesis,
     })
+}
+
+/// Creates the database file empty and private to its owner (0600 on Unix)
+/// when it is missing, so redb initializes a file nobody else can read, and
+/// makes an existing regular file private. A symbolic link is not followed.
+fn prepare_private_file(path: &Path) -> Result<(), StorageError> {
+    let io_error = |error: std::io::Error| StorageError {
+        kind: StorageErrorKind::Io(error.kind()),
+        os_error: error.raw_os_error(),
+        detail: format!("cannot make {} private: {error}", path.display()),
+    };
+    match crate::data_directory::private_file(&mut std::fs::OpenOptions::new())
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            crate::data_directory::restrict_file(path).map_err(io_error)
+        }
+        Err(error) => Err(io_error(error)),
+    }
 }
 
 /// How a file's recorded format compares with this build's.
@@ -1497,6 +1529,7 @@ fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
         RUNS_LLM_PROFILE,
         MEASURES,
         OBSERVES,
+        LOCAL_EXECUTIONS,
     ] {
         tx.open_table(table)?;
     }
@@ -2619,6 +2652,38 @@ impl Batch {
         }
     }
 
+    /// LOCAL_EXECUTIONS: records that the opening of `epoch` started `job`
+    /// as its own local execution.
+    pub(crate) fn claim_local_execution(
+        &mut self,
+        job: JobId,
+        epoch: u64,
+    ) -> Result<(), BatchError> {
+        self.step(|tx| {
+            tx.open_table(LOCAL_EXECUTIONS)?.insert(job.get(), epoch)?;
+            Ok(())
+        })
+    }
+
+    /// The epoch of the opening that started `job` as its own local
+    /// execution, while the Job is unsettled.
+    pub(crate) fn local_execution(&mut self, job: JobId) -> Result<Option<u64>, BatchError> {
+        self.step(|tx| {
+            Ok(tx
+                .open_table(LOCAL_EXECUTIONS)?
+                .get(job.get())?
+                .map(|v| v.value()))
+        })
+    }
+
+    /// Removes the Job's local execution claim, if it has one.
+    pub(crate) fn release_local_execution(&mut self, job: JobId) -> Result<(), BatchError> {
+        self.step(|tx| {
+            tx.open_table(LOCAL_EXECUTIONS)?.remove(job.get())?;
+            Ok(())
+        })
+    }
+
     /// ASSIGNED_TO: one per Job; replacing it is the caller's decision.
     pub(crate) fn set_assigned_executor(
         &mut self,
@@ -3308,6 +3373,25 @@ pub(crate) fn read_marker(
     bytes
         .map(|b| decode_marker(operation, b.value()))
         .transpose()
+}
+
+/// Every unsettled local execution claimed by an opening before `epoch`,
+/// with the epoch that claimed it, in Job order. Settled Jobs leave no
+/// claim, so this reads only work that an earlier opening left unsettled.
+pub(crate) fn abandoned_local_executions(
+    database: &Database,
+    epoch: u64,
+) -> Result<Vec<(JobId, u64)>, StorageError> {
+    let rx = read(database)?;
+    let t = rx.open_table(LOCAL_EXECUTIONS)?;
+    let mut abandoned = Vec::new();
+    for entry in t.iter()? {
+        let (job, claimed) = entry?;
+        if claimed.value() < epoch {
+            abandoned.push((JobId::new(job.value()), claimed.value()));
+        }
+    }
+    Ok(abandoned)
 }
 
 /// Markers in commit-identifier order, after `after` when given.

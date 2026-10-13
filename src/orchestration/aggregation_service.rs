@@ -338,7 +338,7 @@ impl AggregationService {
                 input,
             )
             .await?;
-        if let Err(error) = database.start_job(job).await {
+        if let Err(error) = database.start_local_job(job).await {
             let end = end_failed(&database, job, "the Job could not be started").await;
             return Err(failed_start(job, StartCause::Database(error), end));
         }
