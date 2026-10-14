@@ -1,15 +1,12 @@
 "use client";
 
-import { useEffect, useId, useState } from "react";
-import { ChevronDown, LockKeyhole, RefreshCw, SlidersHorizontal } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { STATUS_TEXT } from "../primitives/tone";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useEffect, useState } from "react";
 import type { ChatModelSelection, Model, ProfileView } from "../contracts";
 import { useI18n } from "../i18n";
 import type { ActiveExecutionTarget, ActivityStep, ExecutionPhase } from "./execution-status";
 import { useOcgControlUrl } from "../profile/control-url";
 import { createProfileClient } from "../profile/profile-client";
+import { ModelSelectorView } from "./model-selector-view";
 
 const EFFORT_LABELS = {
   none: "chat.effortNone", minimal: "chat.effortMinimal", low: "chat.effortLow",
@@ -38,8 +35,6 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
 }) {
   const { t } = useI18n();
   const baseUrl = useOcgControlUrl();
-  const id = useId();
-  const [expanded, setExpanded] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const [result, setResult] = useState<{ baseUrl: string; refresh: number; view?: ProfileView; error?: string } | null>(null);
 
@@ -76,7 +71,7 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
   };
   const disabled = busy || loading || !baseUrl || !model || Boolean(error);
   const selectModel = (key: string) => {
-    if (disabled) return;
+    if (disabled || !choices.includes(key)) return;
     const next = profile?.models[key];
     const supported = efforts(next, profile?.providers[next?.provider ?? ""]?.protocol);
     const configured = next?.variant ?? next?.metadata?.effort ?? next?.metadata?.variant;
@@ -103,80 +98,42 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
   const status = busy ? t("chat.settingsLocked") : !baseUrl ? t("chat.selectorUnavailable")
     : loading ? t("chat.modelsLoading") : error ? t("chat.modelsFailed")
       : !model ? t("chat.noModels") : t("chat.settingsNextTurn");
-  const selectClass = "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
-
   return (
-    // A compact dropdown button beside the Project button, not a full-width
-    // bar: it hugs its label up to a share of the row, and long model names
-    // ellipsize. The raised panel still resolves against the composer's
-    // selector row, so it can open wider than the button itself.
-    <div className="min-w-0 max-w-[min(26rem,58%)] shrink rounded-full border border-border bg-background/80 px-1.5 shadow-sm">
-      <div className="flex min-w-0 items-center gap-1">
-        <button
-          type="button"
-          aria-label={t("chat.executionSettings")}
-          aria-expanded={expanded}
-          aria-controls={id + "-panel"}
-          aria-describedby={id + "-status"}
-          onClick={() => setExpanded(value => !value)}
-          className="flex min-h-9 min-w-0 flex-1 items-center gap-2 rounded-full px-1 py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring/30 pointer-coarse:min-h-11"
-        >
-          <SlidersHorizontal className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-xs font-medium" title={active ? t("chat.activeExecution") : undefined}>{title}</span>
-            <span className="block truncate text-xs text-muted-foreground">
-              {subtitle ?? status}
-            </span>
-          </span>          {(busy || active) && <LockKeyhole className={`size-3.5 shrink-0 ${STATUS_TEXT['warning']}`} aria-hidden="true" />}
-          <ChevronDown className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", expanded && "rotate-180")} aria-hidden="true" />
-        </button>
-        {baseUrl && <Tooltip><TooltipTrigger render={<button
-          type="button"
-          aria-label={t(error ? "common.retry" : "chat.refreshModels")}
-          disabled={busy || loading}
-          onClick={() => setRefresh(value => value + 1)}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          <RefreshCw className={cn("size-3.5", loading && "animate-spin")} aria-hidden="true" />
-        </button>} /><TooltipContent>{t(error ? "common.retry" : "chat.refreshModels")}</TooltipContent></Tooltip>}
-      </div>
-      {expanded && <div id={id + "-panel"} className="absolute bottom-full left-0 z-30 mb-2 max-h-[min(40dvh,20rem)] w-full space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md [@media(max-height:600px)]:max-h-[30dvh]">
-        <fieldset disabled={disabled} aria-describedby={id + "-status"} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-12">
-          <legend className="sr-only">{t("chat.executionSettings")}</legend>
-          <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:col-span-3">
-            {t("chat.provider")}
-            <select aria-label={t("chat.provider")} value={providerKey} onChange={event => {
-              const key = choices.find(key => profile?.models[key]?.provider === event.target.value);
-              if (key) selectModel(key);
-            }} className={selectClass}>
-              {!providers.length && <option value="">{loading ? t("chat.modelsLoading") : t("chat.noModels")}</option>}
-              {providers.map(key => <option key={key} value={key}>{profile?.providers[key]?.label || key}</option>)}
-            </select>
-          </label>
-          <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:col-span-6">
-            {t("chat.model")}
-            <select aria-label={t("chat.model")} value={modelKey} onChange={event => selectModel(event.target.value)} className={selectClass}>
-              {!options.length && <option value="">{loading ? t("chat.modelsLoading") : t("chat.noModels")}</option>}
-              {options.map(key => <option key={key} value={key}>{profile?.models[key]?.label || profile?.models[key]?.id || key}</option>)}
-            </select>
-          </label>
-          <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:col-span-3">
-            {t("chat.effort")}
-            <select aria-label={t("chat.effort")} value={effort} disabled={!availableEfforts.length} onChange={event => {
-              if (disabled) return;
-              const chosen = { model: modelKey, effort: event.target.value || null };
-              onChange(chosen);
-              onPreference?.(chosen);
-            }} className={selectClass}>
-              <option value="">{availableEfforts.length ? t("chat.providerDefault") : t("chat.effortUnsupported")}</option>
-              {availableEfforts.map(value => <option key={value} value={value}>{effortLabel(value)}</option>)}
-            </select>
-          </label>
-        </fieldset>
-        {model?.label && model.label !== model.id && <p className="truncate font-mono text-xs text-muted-foreground" title={model.id}>{model.id}</p>}
-        {model && !availableEfforts.length && <p className="text-xs text-muted-foreground">{t("chat.effortUnsupportedHint")}</p>}
-      </div>}
-      {error && <p role="alert" className="mt-2 break-words text-xs text-destructive">{error}</p>}
-    </div>
+    <ModelSelectorView
+      title={title}
+      subtitle={subtitle}
+      status={status}
+      active={Boolean(active)}
+      locked={busy || Boolean(active)}
+      disabled={disabled}
+      loading={loading}
+      error={error}
+      refresh={baseUrl ? { disabled: busy || loading, onRefresh: () => setRefresh(value => value + 1) } : undefined}
+      provider={{
+        value: providerKey,
+        options: providers.map(key => ({ value: key, label: profile?.providers[key]?.label || key })),
+        onChange: value => {
+          const key = choices.find(key => profile?.models[key]?.provider === value);
+          if (key) selectModel(key);
+        },
+      }}
+      model={{
+        value: modelKey,
+        options: options.map(key => ({ value: key, label: profile?.models[key]?.label || profile?.models[key]?.id || key })),
+        onChange: selectModel,
+      }}
+      effort={{
+        value: effort,
+        options: availableEfforts.map(value => ({ value, label: effortLabel(value) })),
+        onChange: value => {
+          if (disabled || (value && !availableEfforts.includes(value))) return;
+          const chosen = { model: modelKey, effort: value || null };
+          onChange(chosen);
+          onPreference?.(chosen);
+        },
+      }}
+      modelId={model?.label && model.label !== model.id ? model.id : undefined}
+      effortUnsupported={Boolean(model && !availableEfforts.length)}
+    />
   );
 }
