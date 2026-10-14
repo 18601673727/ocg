@@ -16678,4 +16678,556 @@ mod requests_and_tool_loop {
             worker.shutdown().expect("shutdown");
         }
     }
+
+    // ---- workspace_write_file -----------------------------------------------
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    mod workspace_write_file {
+        use std::path::{Path, PathBuf};
+
+        use super::*;
+        use crate::orchestration::workspace_read::{self, Workspace};
+        use crate::orchestration::workspace_write::{self, write_seam};
+
+        const NOTES: &str = "Project: OCG\nStatus: pending\n";
+        const DONE: &str = "Project: OCG\nStatus: completed\n";
+
+        /// A Workspace holding `notes.txt`, beside the test's data directory.
+        fn notes_workspace(name: &str) -> (TestRoot, PathBuf) {
+            let (guard, root) = crate::test_support::temporary_directory(SUITE, name);
+            std::fs::write(root.join("notes.txt"), NOTES).expect("write notes.txt");
+            (guard, root)
+        }
+
+        fn edit_tools(root: &Path, directory: &DataDirectory) -> ToolExecution {
+            workspace_write::edit_file_tools(
+                Workspace::authorize(root, directory).expect("authorize the Workspace"),
+            )
+            .expect("enable the tools")
+        }
+
+        /// What an independent read of the Workspace finds at `path`.
+        fn on_disk(root: &Path, path: &str) -> Option<String> {
+            std::fs::read_to_string(root.join(path)).ok()
+        }
+
+        fn read_call(index: u32, id: &str, path: &str) -> String {
+            let arguments = json!({ "path": path }).to_string();
+            call(index, id, workspace_read::TOOL_NAME, &arguments)
+        }
+
+        fn write_call(index: u32, id: &str, arguments: &Value) -> String {
+            call(
+                index,
+                id,
+                workspace_write::TOOL_NAME,
+                &arguments.to_string(),
+            )
+        }
+
+        fn update(expected: &str, content: &str) -> Value {
+            json!({
+                "operation": "update",
+                "path": "notes.txt",
+                "expected_content": expected,
+                "content": content,
+            })
+        }
+
+        fn create(path: &str, content: &str) -> Value {
+            json!({"operation": "create", "path": path, "content": content})
+        }
+
+        fn written(operation: &str, path: &str, content: &str) -> String {
+            json!({"operation": operation, "path": path, "bytes_written": content.len()})
+                .to_string()
+        }
+
+        #[test]
+        fn a_provider_reads_then_conditionally_updates_a_file_for_its_final_answer() {
+            let (_workspace_guard, root) = notes_workspace("workspace-write-update-files");
+            let (_root, directory) = data_directory("workspace-write-update");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let write = tool_call(run.job, 2, 0);
+
+            // The write is admitted durably before the file changes, and the
+            // file changes before its outcome is recorded.
+            let (seen_root, seam_handle) = (root.clone(), handle.clone());
+            let points = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let reached = points.clone();
+            dispatch_seam::install(move |point, call| {
+                if call != write {
+                    return;
+                }
+                let records = wait(seam_handle.tool_evidence(call.job, None, 10)).expect("read");
+                let record = records.iter().find(|record| record.call == write);
+                let content = on_disk(&seen_root, "notes.txt");
+                match point {
+                    Point::BeforeAdmission => assert!(record.is_none()),
+                    Point::Admitted => {
+                        let record = record.expect("admitted");
+                        assert!(record.admission().is_some() && record.outcome.is_none());
+                        assert_eq!(content.as_deref(), Some(NOTES), "nothing written yet");
+                    }
+                    Point::Ran => {
+                        assert!(record.expect("admitted").outcome.is_none());
+                        assert_eq!(content.as_deref(), Some(DONE), "written, not recorded");
+                    }
+                }
+                reached.lock().expect("lock").push(point);
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(edit_tools(&root, &directory)),
+                vec![
+                    calling(&[read_call(0, "call_read", "notes.txt")], (20, 5)),
+                    calling(
+                        &[write_call(0, "call_write", &update(NOTES, DONE))],
+                        (60, 30),
+                    ),
+                    answering("notes.txt now says Status: completed.", (90, 9)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            let receipt = looped.settled.expect("the loop settles");
+            assert_eq!(receipt.job, run.job);
+            assert_eq!(
+                *points.lock().expect("lock"),
+                [Point::BeforeAdmission, Point::Admitted, Point::Ran]
+            );
+            assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(DONE));
+
+            let [first, second, third] = looped.sent.as_slice() else {
+                panic!("three Provider requests");
+            };
+            assert_eq!(
+                first
+                    .tools
+                    .iter()
+                    .map(|tool| tool.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                [workspace_read::TOOL_NAME, workspace_write::TOOL_NAME]
+            );
+            let read_result = json!({"path": "notes.txt", "content": NOTES}).to_string();
+            assert_eq!(
+                answer_to(second, "call_read").as_deref(),
+                Some(read_result.as_str())
+            );
+            let write_result = written("update", "notes.txt", DONE);
+            assert_eq!(
+                answer_to(third, "call_write").as_deref(),
+                Some(write_result.as_str()),
+                "the continuation carries the recorded, compact result"
+            );
+
+            let records = evidence(&handle, run.job);
+            let [read, write_record] = records.as_slice() else {
+                panic!("two calls: {records:?}");
+            };
+            assert_eq!(read.call, tool_call(run.job, 1, 0));
+            let read_admission = read.admission().expect("admitted");
+            assert_eq!(read_admission.effect, ToolEffect::ReadOnly);
+            assert_eq!(outcome_of(read), Some(completed(&read_result)));
+            assert_eq!(write_record.call, write);
+            assert_eq!(
+                (
+                    write_record.tool_call_id.as_str(),
+                    write_record.name.as_str()
+                ),
+                ("call_write", workspace_write::TOOL_NAME)
+            );
+            let admission = write_record.admission().expect("admitted");
+            assert_eq!(admission.handler_version, "workspace_write_file-1");
+            assert_eq!(admission.effect, ToolEffect::NonIdempotent);
+            assert_eq!(
+                serde_json::from_str::<Value>(admission.arguments.as_str()).expect("JSON"),
+                update(NOTES, DONE),
+                "the evidence keeps the complete arguments, contents included"
+            );
+            assert_eq!(outcome_of(write_record), Some(completed(&write_result)));
+            assert!(write_record.is_applied() && !write_record.is_unresolved());
+
+            let job = job_record(&handle, run.job);
+            assert!(job.completed_at.is_some());
+            let outputs = wait(handle.job_outputs(run.job, None, 100)).expect("outputs");
+            assert_eq!(
+                outputs.last().and_then(|output| output.summary.as_deref()),
+                Some("notes.txt now says Status: completed.")
+            );
+            assert!(blocking(&handle, llm).is_empty(), "the Profile is released");
+            let samples = TokenRequestSample::per_request(&job_metrics(&handle, run.job))
+                .expect("per request");
+            assert_eq!(
+                samples
+                    .iter()
+                    .map(|sample| (sample.request, sample.total))
+                    .collect::<Vec<_>>(),
+                [
+                    (number(1), Some(25)),
+                    (number(2), Some(90)),
+                    (number(3), Some(99))
+                ]
+            );
+
+            // Repeating a known write needs an explicit acknowledgement.
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(run.job, llm, false)))),
+                Violation::RepeatedEffectNotAcknowledged(write)
+            );
+            // A restart replays nothing and keeps what was recorded.
+            std::fs::write(root.join("notes.txt"), NOTES).expect("restore the file");
+            worker.shutdown().expect("shutdown");
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            assert!(handle.abandoned_at_open().is_empty());
+            assert_eq!(evidence(&handle, run.job), records);
+            assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
+            wait(handle.retry_job(retry_of(run.job, llm, true))).expect("an acknowledged retry");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_provider_creates_a_new_file_and_never_replaces_an_existing_one() {
+            let (_workspace_guard, root) = notes_workspace("workspace-write-create-files");
+            let (_root, directory) = data_directory("workspace-write-create");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+
+            let run = local_run(&handle, llm);
+            let summary = "Summary: done.\n";
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(edit_tools(&root, &directory)),
+                vec![
+                    calling(
+                        &[write_call(
+                            0,
+                            "call_create",
+                            &create("summary.txt", summary),
+                        )],
+                        (10, 5),
+                    ),
+                    answering("Created summary.txt.", (20, 4)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            looped.settled.expect("the loop settles");
+            assert_eq!(on_disk(&root, "summary.txt").as_deref(), Some(summary));
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(completed(&written("create", "summary.txt", summary)))
+            );
+            assert!(job_record(&handle, run.job).completed_at.is_some());
+
+            // A second create of the same name is refused and changes nothing.
+            let run = local_run(&handle, llm);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(edit_tools(&root, &directory)),
+                vec![
+                    calling(
+                        &[write_call(
+                            0,
+                            "call_create",
+                            &create("summary.txt", "other\n"),
+                        )],
+                        (10, 5),
+                    ),
+                    answering("never sent", (1, 1)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert_eq!(looped.sent.len(), 1, "no result is sent");
+            let (_, stop) = stopped(looped);
+            let message = "something already exists at the path".to_owned();
+            assert_eq!(
+                stop,
+                ToolLoopStop::HandlerFailed {
+                    index: 0,
+                    message: message.clone()
+                }
+            );
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::NotApplied { message })
+            );
+            assert!(!record.is_applied() && !record.is_unresolved());
+            assert_eq!(on_disk(&root, "summary.txt").as_deref(), Some(summary));
+            assert!(job_record(&handle, run.job).failed_at.is_some());
+            wait(handle.retry_job(retry_of(run.job, llm, false)))
+                .expect("nothing was applied, so nothing repeats");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_failed_precondition_is_not_applied_and_fails_the_job() {
+            let (_workspace_guard, root) = notes_workspace("workspace-write-mismatch-files");
+            let (_root, directory) = data_directory("workspace-write-mismatch");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let stale = "Project: OCG\nStatus: pending";
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(edit_tools(&root, &directory)),
+                vec![
+                    calling(
+                        &[write_call(0, "call_write", &update(stale, DONE))],
+                        (10, 5),
+                    ),
+                    answering("never sent", (1, 1)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert_eq!(looped.sent.len(), 1);
+            let (receipt, stop) = stopped(looped);
+            let message = "the file's current content differs from expected_content".to_owned();
+            assert_eq!(
+                stop,
+                ToolLoopStop::HandlerFailed {
+                    index: 0,
+                    message: message.clone()
+                }
+            );
+            assert!(receipt.result.is_some());
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::NotApplied { message })
+            );
+            assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
+            assert!(job_record(&handle, run.job).failed_at.is_some());
+            assert!(blocking(&handle, llm).is_empty());
+            wait(handle.retry_job(retry_of(run.job, llm, false))).expect("nothing to repeat");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_failure_after_publication_is_uncertain_and_blocks_a_retry() {
+            let (_workspace_guard, root) = notes_workspace("workspace-write-uncertain-files");
+            let (_root, directory) = data_directory("workspace-write-uncertain");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            write_seam::install(|point| point != write_seam::Point::Published);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(edit_tools(&root, &directory)),
+                vec![
+                    calling(
+                        &[write_call(0, "call_write", &update(NOTES, DONE))],
+                        (10, 5),
+                    ),
+                    answering("never sent", (1, 1)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            write_seam::clear();
+            assert_eq!(looped.sent.len(), 1, "an uncertain write sends no result");
+            let (receipt, stop) = stopped(looped);
+            let message =
+                "the new content was published, but its durability could not be confirmed";
+            assert_eq!(
+                stop,
+                ToolLoopStop::HandlerUncertain {
+                    index: 0,
+                    message: message.to_owned()
+                }
+            );
+            assert_eq!(receipt.result, None);
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::Uncertain {
+                    cause: UncertainCause::HandlerReported,
+                    message: Some(message.to_owned()),
+                })
+            );
+            assert!(record.is_unresolved());
+            assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(DONE));
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                Violation::UnresolvedToolEffect(tool_call(run.job, 1, 0))
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_write_whose_outcome_cannot_be_recorded_is_never_reported_as_done() {
+            let (_workspace_guard, root) = notes_workspace("workspace-write-unrecorded-files");
+            let (_root, directory) = data_directory("workspace-write-unrecorded");
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let (seam_handle, path) = (handle.clone(), directory.database_path().to_path_buf());
+            dispatch_seam::install(move |point, _| {
+                if point == Point::Ran {
+                    protect(&seam_handle, &path);
+                }
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(edit_tools(&root, &directory)),
+                vec![
+                    calling(
+                        &[write_call(0, "call_write", &update(NOTES, DONE))],
+                        (10, 5),
+                    ),
+                    answering("never sent", (1, 1)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert_eq!(looped.sent.len(), 1, "an unrecorded result is never sent");
+            match looped.settled {
+                Err(ExecutionRuntimeError::ToolLoopNotSettled { stop, .. }) => assert_eq!(
+                    *stop,
+                    ToolLoopStop::EvidenceNotRecorded {
+                        index: 0,
+                        outcome: Some(ToolOutcomeKind::Completed),
+                    }
+                ),
+                other => panic!("the unrecorded outcome must be reported, got {other:?}"),
+            }
+            assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(DONE));
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("restart");
+            let handle = worker.handle();
+            assert_eq!(handle.abandoned_at_open(), [run.job]);
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.completed_at.is_none());
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert!(record.outcome.is_none() && record.is_unresolved());
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                Violation::UnresolvedToolEffect(record.call)
+            );
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_cancellation_after_the_admission_writes_nothing() {
+            let (_workspace_guard, root) = notes_workspace("workspace-write-cancelled-files");
+            let (_root, directory) = data_directory("workspace-write-cancelled");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let cancellation = CancellationToken::default();
+            let canceller = cancellation.clone();
+            dispatch_seam::install(move |point, _| {
+                if point == Point::Admitted {
+                    canceller.cancel();
+                }
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(edit_tools(&root, &directory)),
+                vec![calling(
+                    &[write_call(0, "call_write", &update(NOTES, DONE))],
+                    (10, 5),
+                )],
+                cancellation,
+                |_| {},
+            );
+            let (_, stop) = stopped(looped);
+            assert_eq!(stop, ToolLoopStop::Cancelled);
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::NotInvoked {
+                    reason: NotInvokedReason::Cancelled
+                })
+            );
+            assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            wait(handle.retry_job(retry_of(run.job, llm, false))).expect("nothing ran");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_crash_after_the_write_leaves_it_unresolved_and_a_restart_replays_nothing() {
+            let (_workspace_guard, root) = notes_workspace("workspace-write-crash-files");
+            let (_root, directory) = data_directory("workspace-write-crash");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let tools = edit_tools(&root, &directory);
+            let loop_handle = handle.clone();
+            let died = std::thread::spawn(move || {
+                dispatch_seam::install(|point, _| {
+                    assert_ne!(point, Point::Ran, "the process died here");
+                });
+                run_loop(
+                    &loop_handle,
+                    run,
+                    Some(tools),
+                    vec![
+                        calling(
+                            &[write_call(0, "call_write", &update(NOTES, DONE))],
+                            (10, 5),
+                        ),
+                        answering("never sent", (1, 1)),
+                    ],
+                    CancellationToken::default(),
+                    |_| {},
+                );
+            })
+            .join();
+            assert!(died.is_err(), "the process died after the write");
+            assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(DONE));
+            worker.shutdown().expect("shutdown");
+
+            // The file is put back; no restart may write it again.
+            std::fs::write(root.join("notes.txt"), NOTES).expect("restore the file");
+            for _ in 0..2 {
+                let worker = DatabaseWorker::start(&directory).expect("restart");
+                let handle = worker.handle();
+                let job = job_record(&handle, run.job);
+                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+                assert!(blocking(&handle, llm).is_empty());
+                let [record] = evidence(&handle, run.job).try_into().expect("one call");
+                assert!(
+                    record.admission().is_some()
+                        && record.outcome.is_none()
+                        && record.is_unresolved()
+                );
+                assert_eq!(
+                    violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                    Violation::UnresolvedToolEffect(record.call)
+                );
+                worker.shutdown().expect("shutdown");
+                assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
+            }
+            assert_relationships_consistent(&directory);
+        }
+    }
 }

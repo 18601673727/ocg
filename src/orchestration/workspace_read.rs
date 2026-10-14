@@ -1,5 +1,7 @@
-//! `workspace_read_file`: OCG's one filesystem tool. It reads one small UTF-8
-//! text file inside a Workspace the operator authorized, and nothing else.
+//! `workspace_read_file`: reads one small UTF-8 text file inside a Workspace
+//! the operator authorized, and nothing else. The Workspace, its path rules
+//! and its checks are shared with `workspace_write_file`, see
+//! [`crate::orchestration::workspace_write`].
 //!
 //! The Workspace root is chosen by the operator, never by a Provider: a call
 //! carries only a path relative to it. The root is resolved and checked once,
@@ -108,8 +110,9 @@ pub enum WorkspaceError {
 }
 
 /// A Workspace root the operator authorized for Provider access, resolved
-/// and checked. Only [`Workspace::authorize`] makes one.
-#[derive(Debug)]
+/// and checked. Only [`Workspace::authorize`] makes one; a clone is the same
+/// authorization, for the tools of one execution to share.
+#[derive(Clone, Debug)]
 pub struct Workspace {
     root: PathBuf,
     identity: Identity,
@@ -159,6 +162,16 @@ impl Workspace {
 
     /// The whole text of the file at `path`, relative to the root.
     fn read(&self, path: &str) -> Result<String, Refusal> {
+        let (directory, name) = self.parent(path)?;
+        let file = open_at(&directory, name, Step::File)?;
+        read_whole(&file)
+    }
+
+    /// The directory that holds the last component of `path`, opened from
+    /// the root through every directory before it, and that component. The
+    /// path is checked first, and the root must still be the directory that
+    /// was authorized; no directory on the way may be the data directory.
+    pub(super) fn parent<'a>(&self, path: &'a str) -> Result<(File, &'a str), Refusal> {
         let components = components(path)?;
         let (name, parents) = components.split_last().ok_or(Refusal::InvalidPath)?;
         let mut directory = open_directory(&self.root).map_err(|_| Refusal::WorkspaceChanged)?;
@@ -175,15 +188,14 @@ impl Workspace {
                 return Err(Refusal::Protected);
             }
         }
-        let file = open_at(&directory, name, Step::File)?;
-        read_whole(&file)
+        Ok((directory, *name))
     }
 }
 
 /// Why a call reads nothing. Its message is recorded and may reach the
 /// Provider, so it never repeats the path or anything read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-enum Refusal {
+pub(super) enum Refusal {
     #[error("the path is not a plain relative path inside the Workspace")]
     InvalidPath,
     #[error("the path names a hidden, secret-bearing or OCG-internal location")]
@@ -213,7 +225,7 @@ enum Refusal {
 }
 
 impl Refusal {
-    fn from_errno(errno: Errno) -> Self {
+    pub(super) fn from_errno(errno: Errno) -> Self {
         match errno {
             Errno::NOENT => Self::NotFound,
             Errno::ACCESS | Errno::PERM => Self::PermissionDenied,
@@ -266,7 +278,7 @@ fn is_protected(component: &str) -> bool {
 
 /// What a component of a path must be.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Step {
+pub(super) enum Step {
     Directory,
     File,
 }
@@ -284,7 +296,7 @@ fn open_directory(path: &Path) -> std::io::Result<File> {
 /// regular file of an acceptable size is opened; the open itself refuses a
 /// link, and a directory step refuses anything but a directory, whatever
 /// replaced the checked entry meanwhile.
-fn open_at(directory: &File, name: &str, step: Step) -> Result<File, Refusal> {
+pub(super) fn open_at(directory: &File, name: &str, step: Step) -> Result<File, Refusal> {
     let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(Refusal::from_errno)?;
     match (FileType::from_raw_mode(stat.st_mode), step) {
@@ -312,7 +324,7 @@ fn open_at(directory: &File, name: &str, step: Step) -> Result<File, Refusal> {
 }
 
 /// Reads the whole of an opened file, bounded by [`MAX_FILE_BYTES`], as text.
-fn read_whole(file: &File) -> Result<String, Refusal> {
+pub(super) fn read_whole(file: &File) -> Result<String, Refusal> {
     let before = file.metadata().map_err(|_| Refusal::Unreadable)?;
     if !before.is_file() {
         return Err(Refusal::NotRegularFile);

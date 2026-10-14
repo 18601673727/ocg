@@ -1,10 +1,15 @@
 //! `ocg workspace-read <objective>`: the executable's opt-in, one-shot Job
-//! that may read files of a Workspace the operator authorized. This module
-//! belongs to the executable, not to the library.
+//! that may read files of a Workspace the operator authorized, and
+//! `ocg workspace-edit <objective>`, its counterpart that may also create
+//! and conditionally update them. This module belongs to the executable, not
+//! to the library.
 //!
 //! It runs the ordinary host and submits exactly one Job through the host's
-//! scheduler, offering only `workspace_read_file`, bound to the Workspace
-//! named by [`WORKSPACE_ROOT_VARIABLE`]. The Provider and model are named by
+//! scheduler, offering only `workspace_read_file`, or, for `workspace-edit`,
+//! `workspace_read_file` and `workspace_write_file`, bound to the Workspace
+//! named by [`WORKSPACE_ROOT_VARIABLE`]. Writing is offered by that command
+//! alone; every write is recorded, with its contents, in plaintext tool
+//! evidence. The Provider and model are named by
 //! the environment too. The credential is named only by reference: the
 //! existing resolver reads it when the request is built, and it is never
 //! stored, printed or logged. Once the Job settles, what the database
@@ -29,6 +34,8 @@ use ocg::orchestration::execution_runtime::{
     ExecutionRuntimeError, ProviderExecutionPlan, ToolExecution,
 };
 use ocg::orchestration::workspace_read::{self, Workspace, WorkspaceError};
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+use ocg::orchestration::workspace_write;
 use ocg::persistence::{
     AvailabilityStatRecord, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, JobId,
     JobInputDraft, LlmConfig, LlmParameters, LlmTransport, MetricsRecord, ModelCapability,
@@ -40,9 +47,12 @@ use ocg::provider_execution::{
 };
 use ocg::token_usage::{TokenCount, TokenRequestSample};
 
-/// The command that selects this mode, as the executable's only argument
-/// before the objective.
+/// The command that selects the read-only mode, as the executable's only
+/// argument before the objective.
 pub const COMMAND: &str = "workspace-read";
+/// The command that selects the mode that may also write files.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+pub const EDIT_COMMAND: &str = "workspace-edit";
 /// The Workspace the Job may read from: an absolute path to a directory.
 pub const WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
 /// The Provider's OpenAI-compatible endpoint, an `https://` URL.
@@ -51,9 +61,39 @@ pub const MODEL_VARIABLE: &str = "OCG_PROVIDER_MODEL";
 /// The name of the environment variable that holds the Provider's key.
 pub const CREDENTIAL_REF_VARIABLE: &str = "OCG_PROVIDER_CREDENTIAL_REF";
 
-/// The Executor every one-shot Job runs on. It is registered once and
-/// reused, as are the Provider and the LLM Profile of a configuration.
-const EXECUTOR_NAME: &str = "workspace-read";
+/// What the one Job may do in its Workspace, as its command chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Read files: `workspace_read_file` alone.
+    Read,
+    /// Read, create and conditionally update files: `workspace_read_file`
+    /// and `workspace_write_file`.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    Edit,
+}
+
+impl Mode {
+    /// The mode `command` selects, if it selects one.
+    pub fn of(command: &str) -> Option<Self> {
+        match command {
+            COMMAND => Some(Self::Read),
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            EDIT_COMMAND => Some(Self::Edit),
+            _ => None,
+        }
+    }
+
+    /// The command of the mode. It also names the Executor every Job of the
+    /// mode runs on, which is registered once and reused, as are the
+    /// Provider and the LLM Profile of a configuration.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Read => COMMAND,
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            Self::Edit => EDIT_COMMAND,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -63,8 +103,8 @@ pub enum Error {
     NotHttps,
     #[error("the variable named by {CREDENTIAL_REF_VARIABLE} is not set")]
     CredentialMissing,
-    #[error("usage: ocg {COMMAND} <objective>")]
-    Usage,
+    #[error("usage: ocg {0} <objective>")]
+    Usage(&'static str),
     #[error("workspace_read_file is not enabled: {0}")]
     Workspace(#[from] WorkspaceError),
     #[error("workspace_read_file cannot be offered: {0}")]
@@ -83,6 +123,7 @@ pub enum Error {
 
 /// What the operator chose for one run.
 pub struct Config {
+    mode: Mode,
     workspace_root: PathBuf,
     endpoint: String,
     model: String,
@@ -91,12 +132,13 @@ pub struct Config {
 }
 
 impl Config {
-    /// Reads the configuration from the environment, with `objective` given
-    /// on the command line. The credential itself is only checked to exist.
-    pub fn from_environment(objective: Option<String>) -> Result<Self, Error> {
+    /// Reads the configuration from the environment, with the `mode` and
+    /// `objective` given on the command line. The credential itself is only
+    /// checked to exist.
+    pub fn from_environment(mode: Mode, objective: Option<String>) -> Result<Self, Error> {
         let objective = objective
             .filter(|objective| !objective.trim().is_empty())
-            .ok_or(Error::Usage)?;
+            .ok_or(Error::Usage(mode.command()))?;
         let variable = |name: &'static str| {
             std::env::var(name)
                 .ok()
@@ -117,6 +159,7 @@ impl Config {
             return Err(Error::CredentialMissing);
         }
         Ok(Self {
+            mode,
             workspace_root,
             endpoint,
             model,
@@ -131,12 +174,28 @@ impl Config {
 /// start, unless the Workspace is authorized.
 pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> {
     let workspace = Workspace::authorize(&config.workspace_root, data_directory)?;
-    eprintln!(
-        "OCG Workspace authorized for {}: {}",
-        workspace_read::TOOL_NAME,
-        workspace.root().display()
-    );
-    let tools = workspace_read::read_file_tools(workspace)?;
+    let root = workspace.root().display().to_string();
+    let tools = match config.mode {
+        Mode::Read => {
+            eprintln!(
+                "OCG Workspace authorized for {}: {root}",
+                workspace_read::TOOL_NAME
+            );
+            workspace_read::read_file_tools(workspace)?
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        Mode::Edit => {
+            eprintln!(
+                "OCG Workspace authorized for {} and {}: {root}",
+                workspace_read::TOOL_NAME,
+                workspace_write::TOOL_NAME
+            );
+            eprintln!(
+                "OCG records the path and complete content of every write, and an update's expected content, in plaintext tool evidence"
+            );
+            workspace_write::edit_file_tools(workspace)?
+        }
+    };
     let settled = Rc::new(RefCell::new(None));
     let slot = settled.clone();
     let hosted = host::run_hosted(data_directory, true, move |context| async move {
@@ -157,6 +216,7 @@ async fn submit(context: &HostContext, config: Config, tools: ToolExecution) -> 
     let signal = ntex::rt::signals::signal();
     let database = context.database();
     let (executor, llm_profile) = targets(database, &config).await?;
+    let command = config.mode.command();
     let cancellation = CancellationToken::default();
     let plan = ProviderExecutionPlan {
         executor_id: executor,
@@ -165,7 +225,7 @@ async fn submit(context: &HostContext, config: Config, tools: ToolExecution) -> 
             ..JobInputDraft::default()
         },
         job: NewJob {
-            name: Some(format!("{COMMAND} one-shot")),
+            name: Some(format!("{command} one-shot")),
             execution_mode: ExecutionMode::Once,
             eligible_at: None,
             scheduled_at: None,
@@ -227,7 +287,8 @@ fn settled_job(error: &ExecutionRuntimeError) -> Option<JobId> {
 }
 
 /// The Executor and LLM Profile for `config`, reusing those an earlier run
-/// registered for the same endpoint, credential reference and model.
+/// of its mode registered for the same endpoint, credential reference and
+/// model.
 async fn targets(
     database: &DatabaseHandle,
     config: &Config,
@@ -238,7 +299,7 @@ async fn targets(
         .await?
         .into_iter()
         .find(|executor| {
-            executor.name == EXECUTOR_NAME
+            executor.name == config.mode.command()
                 && executor.executor_type == ExecutorType::Llm
                 && executor.llm_transports.contains(&transport)
         });
@@ -247,7 +308,7 @@ async fn targets(
         None => {
             database
                 .create_executor(NewExecutor {
-                    name: EXECUTOR_NAME.to_owned(),
+                    name: config.mode.command().to_owned(),
                     executor_type: ExecutorType::Llm,
                     concurrency_limit: NonZeroU32::MIN,
                     llm_transports: BTreeSet::from([transport]),
@@ -269,7 +330,7 @@ async fn targets(
         None => {
             database
                 .create_llm_provider(NewLlmProvider {
-                    name: EXECUTOR_NAME.to_owned(),
+                    name: config.mode.command().to_owned(),
                     transport,
                     endpoint: Some(config.endpoint.clone()),
                     credential_ref: Some(config.credential_ref.clone()),
@@ -345,7 +406,7 @@ async fn report(
                 "admitted ({:?}, handler {}), arguments {}",
                 admission.effect,
                 admission.handler_version,
-                admission.arguments.as_str()
+                shown_arguments(&evidence.name, admission.arguments.as_str())
             ),
         };
         let _ = match evidence.outcome.as_ref().map(|outcome| &outcome.fact) {
@@ -373,6 +434,28 @@ async fn report(
     let stats = database.job_availability(job, None, 1_000).await?;
     provider_requests(&mut report, &stats, &metrics);
     Ok((outcome, report))
+}
+
+/// A call's arguments as the report shows them: as recorded, except that
+/// the contents a write carries are shown only by their size.
+fn shown_arguments(tool: &str, arguments: &str) -> String {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    if tool == workspace_write::TOOL_NAME {
+        let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_str(arguments) else {
+            return "(not shown)".to_owned();
+        };
+        for key in ["content", "expected_content"] {
+            if let Some(field) = fields.get_mut(key) {
+                *field = serde_json::Value::String(match field.as_str() {
+                    Some(text) => format!("{} bytes", text.len()),
+                    None => "(not shown)".to_owned(),
+                });
+            }
+        }
+        return serde_json::Value::Object(fields).to_string();
+    }
+    let _ = tool;
+    arguments.to_owned()
 }
 
 /// One line per Provider request: what it answered and the Token usage its
@@ -679,5 +762,57 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains("112"), "{report}");
+    }
+
+    #[test]
+    fn each_mode_is_selected_by_its_own_command_only() {
+        assert_eq!(Mode::of("workspace-read"), Some(Mode::Read));
+        assert_eq!(Mode::of("workspace-edit"), Some(Mode::Edit));
+        for other in ["", "workspace", "workspace-write", "Workspace-Edit", "edit"] {
+            assert_eq!(Mode::of(other), None, "{other:?}");
+        }
+        assert_eq!(Mode::Read.command(), COMMAND);
+        assert_eq!(Mode::Edit.command(), EDIT_COMMAND);
+        assert_eq!(
+            Error::Usage(Mode::Read.command()).to_string(),
+            "usage: ocg workspace-read <objective>"
+        );
+    }
+
+    #[test]
+    fn a_write_is_reported_by_the_size_of_its_contents_only() {
+        let recorded = serde_json::json!({
+            "operation": "update",
+            "path": "notes.txt",
+            "expected_content": "secret old\n",
+            "content": "secret new text\n",
+        })
+        .to_string();
+        let shown = shown_arguments("workspace_write_file", &recorded);
+        assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&shown).expect("JSON"),
+            serde_json::json!({
+                "operation": "update",
+                "path": "notes.txt",
+                "expected_content": "11 bytes",
+                "content": "16 bytes",
+            })
+        );
+        let created = r#"{"operation":"create","path":"empty.txt","content":""}"#;
+        assert_eq!(
+            shown_arguments("workspace_write_file", created),
+            r#"{"content":"0 bytes","operation":"create","path":"empty.txt"}"#
+        );
+        assert_eq!(
+            shown_arguments("workspace_write_file", "[1]"),
+            "(not shown)"
+        );
+        let read = r#"{"path":"README.md"}"#;
+        assert_eq!(
+            shown_arguments("workspace_read_file", read),
+            read,
+            "a read is shown as recorded"
+        );
     }
 }
