@@ -2,19 +2,11 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowUp,
-  Square,
   ListPlus,
   X,
   ChevronDown,
-  Command,
-  Loader2,
-  Paperclip,
-  Sparkles,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { STATUS_TEXT } from "@/components/ocg/primitives";
 import { ActivityPulse } from "../activity-pulse";
 import { useI18n, runtimeStatusDetail } from "../i18n";
 import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
@@ -25,6 +17,7 @@ import { retryInput } from "./retry";
 import { activeExecutionTarget, currentActivity, executionActivity, isExecutionActive, type ActiveExecutionTarget, type ActivityStep, type ExecutionPhase } from "./execution-status";
 import { readModelPreference, writeModelPreference } from "./model-preference";
 import { ChatTranscript } from "./chat-transcript";
+import { ChatComposerInput, ChatComposerView } from "./chat-composer-view";
 import type { JobExecution } from "../execution/domain";
 import { AttachmentStaging, ImageGallery, useImageAttachments } from "./image-attachments";
 import {
@@ -181,202 +174,140 @@ export function ChatComposer({
   };
 
   return (
-    <div className="shrink-0 bg-background px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-5">
-      <form
-        onSubmit={(e) => {
+    <ChatComposerView
+      form={{
+        onSubmit: (e) => {
           e.preventDefault();
           void submit();
-        }}
-        onDragEnter={(event) => {
+        },
+        onDragEnter: (event) => {
           if (!event.dataTransfer.types.includes("Files")) return;
           event.preventDefault();
           dragDepth.current += 1;
           setDragging(true);
-        }}
-        onDragOver={(event) => {
+        },
+        onDragOver: (event) => {
           if (!event.dataTransfer.types.includes("Files")) return;
           event.preventDefault();
           event.dataTransfer.dropEffect = submitting || cancelling ? "none" : "copy";
-        }}
-        onDragLeave={(event) => {
+        },
+        onDragLeave: (event) => {
           event.preventDefault();
           dragDepth.current = Math.max(0, dragDepth.current - 1);
           if (dragDepth.current === 0) setDragging(false);
-        }}
-        onDrop={(event) => {
+        },
+        onDrop: (event) => {
           if (!event.dataTransfer.types.includes("Files")) return;
           event.preventDefault();
           dragDepth.current = 0;
           setDragging(false);
           if (!submitting && !cancelling) images.add(Array.from(event.dataTransfer.files));
-        }}
-        className="relative mx-auto max-w-3xl"
-      >
-        {dragging && <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-lg border-2 border-dashed border-primary bg-background/95 text-sm font-medium" role="status">{t("chat.dropImages")}</div>}
-        <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden disabled={submitting || cancelling} aria-label={t("chat.attachFile")} onChange={(event) => {
+        },
+      }}
+      dragging={dragging}
+      attachmentInput={<input ref={fileInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden disabled={submitting || cancelling} aria-label={t("chat.attachFile")} onChange={(event) => {
           images.add(Array.from(event.target.files ?? []));
           event.target.value = "";
-        }} />
-        {/*
-          The turn's two selections sit outside and above the card as compact
-          dropdown buttons: which Project this turn belongs to, and the model
-          and reasoning effort the next turn runs with. Both hug their label up
-          to a share of the row and ellipsize beyond it, so they read as two
-          buttons rather than one bar. Keeping them outside the card means the
-          card stays the input, and a raised panel opens upward over the
-          conversation instead of covering it.
-        */}
-        <div className="relative z-30 flex min-w-0 items-stretch gap-1.5 px-0.5 pb-1.5">
-          {projectSelector && <div className="flex min-w-0 max-w-[min(18rem,58%)] shrink items-stretch [&>button]:h-full">{projectSelector}</div>}
-          <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active} activity={activity} />
-        </div>
-        <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
-          <AttachmentStaging state={images} disabled={submitting || cancelling} />
-          <div className="relative">
-            {suggestionsOpen && (
-              <ul
-                id="composer-suggestions"
-                role="listbox"
-                aria-label={t("chat.composerSuggestions")}
-                className="absolute inset-x-1 bottom-full z-20 mb-1 overflow-hidden rounded-md border border-border bg-popover text-popover-foreground shadow-md"
-              >
-                {suggestions.map((suggestion, index) => {
-                  const selected = activeIndex === index;
-                  return (
-                    <li key={suggestion.id} role="presentation">
-                      <button
-                        id={`composer-suggestion-${suggestion.id}`}
-                        type="button"
-                        role="option"
-                        aria-selected={selected}
-                        onMouseDown={(event) => event.preventDefault()}
-                        onClick={() => applySuggestion(suggestion)}
-                        className={cn(
-                          "flex w-full items-start gap-2 px-2.5 py-2 text-left transition-colors hover:bg-muted",
-                          selected && "bg-muted",
-                        )}
-                      >
-                        <span className="mt-0.5 text-muted-foreground" aria-hidden="true">
-                          {suggestion.action === "create-job"
-                            ? <Sparkles className="size-3.5" />
-                            : <Command className="size-3.5" />}
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block text-xs font-medium">{suggestion.label}</span>
-                          <span className="block truncate text-xs text-muted-foreground">{suggestion.description}</span>
-                        </span>
-                        {suggestion.command !== suggestion.label && (
-                          <span className="mt-0.5 shrink-0 font-mono text-xs text-muted-foreground">{suggestion.command.trim()}</span>
-                        )}
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-            <textarea
-              ref={ref}
-              value={draft}
-              readOnly={submitting || cancelling}
-              onChange={(e) => {
-                setDismissedFor(null);
-                onDraftChange(e.target.value);
-              }}
-              onPaste={(e) => {
-                if (submitting || cancelling) return;
-                const clipboard = e.clipboardData;
-                if (!clipboard) return;
-                // One image can arrive as both an item and a file. Collect once
-                // and let the shared attachment state drop the duplicate.
-                const pasted = [
-                  ...Array.from(clipboard.items).flatMap(item => item.type.startsWith("image/") ? [item.getAsFile()] : []),
-                  ...Array.from(clipboard.files),
-                ].filter((file): file is File => file !== null && file.type.startsWith("image/"));
-                if (pasted.length > 0) {
+        }} />}
+      selectors={
+        <>
+          {/*
+            The turn's two selections sit outside and above the card as compact
+            dropdown buttons: which Project this turn belongs to, and the model
+            and reasoning effort the next turn runs with. Both hug their label up
+            to a share of the row and ellipsize beyond it, so they read as two
+            buttons rather than one bar. Keeping them outside the card means the
+            card stays the input, and a raised panel opens upward over the
+            conversation instead of covering it.
+          */}
+          <div className="relative z-30 flex min-w-0 items-stretch gap-1.5 px-0.5 pb-1.5">
+            {projectSelector && <div className="flex min-w-0 max-w-[min(18rem,58%)] shrink items-stretch [&>button]:h-full">{projectSelector}</div>}
+            <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active} activity={activity} />
+          </div>
+        </>
+      }
+      unavailableMessage={chatReady ? undefined : `${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
+    >
+      <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
+        <AttachmentStaging state={images} disabled={submitting || cancelling} />
+        <ChatComposerInput
+          textarea={{
+            ref,
+            value: draft,
+            readOnly: submitting || cancelling,
+            onChange: (e) => {
+              setDismissedFor(null);
+              onDraftChange(e.target.value);
+            },
+            onPaste: (e) => {
+              if (submitting || cancelling) return;
+              const clipboard = e.clipboardData;
+              if (!clipboard) return;
+              // One image can arrive as both an item and a file. Collect once
+              // and let the shared attachment state drop the duplicate.
+              const pasted = [
+                ...Array.from(clipboard.items).flatMap(item => item.type.startsWith("image/") ? [item.getAsFile()] : []),
+                ...Array.from(clipboard.files),
+              ].filter((file): file is File => file !== null && file.type.startsWith("image/"));
+              if (pasted.length > 0) {
+                e.preventDefault();
+                images.add(pasted);
+              }
+            },
+            onKeyDown: (e) => {
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+              if (e.key === "Escape" && suggestionsOpen) {
+                e.preventDefault();
+                closeSuggestions();
+                return;
+              }
+              if (suggestionsOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                e.preventDefault();
+                setHighlight({
+                  raw: draft,
+                  index: moveComposerSuggestionIndex(activeIndex, e.key === "ArrowDown" ? 1 : -1, suggestions.length),
+                });
+                return;
+              }
+              if (e.key === "Enter" && !e.shiftKey) {
+                if (suggestionsOpen && activeIndex >= 0) {
                   e.preventDefault();
-                  images.add(pasted);
-                }
-              }}
-              onKeyDown={(e) => {
-                if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
-                if (e.key === "Escape" && suggestionsOpen) {
-                  e.preventDefault();
-                  closeSuggestions();
+                  applySuggestion(suggestions[activeIndex]);
                   return;
                 }
-                if (suggestionsOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-                  e.preventDefault();
-                  setHighlight({
-                    raw: draft,
-                    index: moveComposerSuggestionIndex(activeIndex, e.key === "ArrowDown" ? 1 : -1, suggestions.length),
-                  });
-                  return;
-                }
-                if (e.key === "Enter" && !e.shiftKey) {
-                  if (suggestionsOpen && activeIndex >= 0) {
-                    e.preventDefault();
-                    applySuggestion(suggestions[activeIndex]);
-                    return;
-                  }
-                  if (window.matchMedia("(pointer: coarse)").matches && !e.ctrlKey && !e.metaKey) return;
-                  e.preventDefault();
-                  void submit();
-                }
-              }}
-              rows={1}
-              placeholder={t("chat.messagePlaceholder")}
-              aria-label={t("chat.messageLabel")}
-              role="combobox"
-              aria-autocomplete="list"
-              aria-expanded={suggestionsOpen}
-              aria-controls={suggestionsOpen ? "composer-suggestions" : undefined}
-              aria-activedescendant={activeIndex >= 0 ? `composer-suggestion-${suggestions[activeIndex].id}` : undefined}
-              aria-describedby={chatReady ? "composer-hint" : "composer-hint composer-status"}
-              aria-invalid={Boolean(error)}
-              className="max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
-            />
-          </div>
-          {error && (
-            <p role="alert" className={`border-t border-border px-3 py-1.5 text-xs ${STATUS_TEXT['error']}`}>
-              {error}
-            </p>
-          )}
-          <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              className="size-11 rounded-md sm:size-9"
-              aria-label={t("chat.attachFile")}
-              title={t("chat.attachFile")}
-              disabled={submitting || cancelling}
-              onClick={() => fileInput.current?.click()}
-            >
-              <Paperclip className="size-4" />
-            </Button>
-            <span id="composer-hint" className="sr-only sm:ml-1 sm:not-sr-only sm:text-xs sm:text-muted-foreground">
-              <span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span>
-              <span className="pointer-coarse:hidden">{busy ? t("chat.queueHint") : t("chat.hint")}</span>
-            </span>
-            <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
-              {busy && onCancel && <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={submitting || cancelling} onClick={() => void cancel()} title={t("chat.cancel")}>
-                {cancelling ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}{t("chat.cancel")}
-              </Button>}
-              {busy && <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={!canSend || !chatReady || submitting || cancelling} onClick={() => void submit("steer")} title={t("chat.steerHint")}>
-                {t("chat.steer")}
-              </Button>}
-              <Button type="submit" size={queueing ? "xs" : "icon-sm"} className={cn("h-11 rounded-md tracking-normal normal-case sm:h-9", !queueing && "w-11 sm:w-9")} disabled={!canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat")} aria-label={t(queueing ? "chat.queue" : "chat.send")} title={t(busy ? "chat.queueHint" : "chat.send")}>
-                {submitting ? <Loader2 className="size-4 animate-spin" /> : busy ? <ListPlus className="size-4" /> : <ArrowUp className="size-4" />}
-                {queueing && t("chat.queue")}
-              </Button>
-            </div>
-          </div>
-        </div>
-        {!chatReady && <p id="composer-status" role="status" className="mt-1.5 text-center text-xs text-muted-foreground">
-          {`${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
-        </p>}
-      </form>
-    </div>
+                if (window.matchMedia("(pointer: coarse)").matches && !e.ctrlKey && !e.metaKey) return;
+                e.preventDefault();
+                void submit();
+              }
+            },
+            "aria-describedby": chatReady ? "composer-hint" : "composer-hint composer-status",
+          }}
+          suggestions={suggestionsOpen ? {
+            items: suggestions.map(suggestion => ({
+              id: suggestion.id,
+              label: suggestion.label,
+              description: suggestion.description,
+              command: suggestion.command,
+              icon: suggestion.action === "create-job" ? "job" : "command",
+            })),
+            activeIndex,
+            onSelect: index => applySuggestion(suggestions[index]),
+          } : undefined}
+          error={error}
+          actions={{
+            busy,
+            queueing,
+            submitting,
+            cancelling,
+            sendDisabled: !canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat"),
+            steerDisabled: !canSend || !chatReady || submitting || cancelling,
+            onAttach: () => fileInput.current?.click(),
+            onSteer: () => void submit("steer"),
+            onCancel: onCancel ? () => void cancel() : undefined,
+          }}
+        />
+      </div>
+    </ChatComposerView>
   );
 }
 
