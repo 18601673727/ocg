@@ -486,6 +486,33 @@ struct RequestSecurity {
     bound: SocketAddr,
 }
 
+/// The `GET /api/v1/auth/session` projection of a request's security state.
+///
+/// The signed Access email is carried here and nowhere else: it comes from the
+/// already-verified `email` claim on the request's own identity, so a client
+/// that sends an `email`-bearing header it controls cannot put a value on the
+/// wire. Local mode has no verified identity and therefore no email, and a
+/// session is never identified by this address — that stays `user_id`.
+///
+/// `remote_execution` is supplied rather than looked up, because the answer
+/// comes from deployment state this projection must not own.
+fn authentication_session(
+    identity: Option<&crate::control_security::Identity>,
+    remote_execution: impl FnOnce(&crate::control_security::Identity) -> bool,
+) -> crate::contracts::AuthenticationSession {
+    crate::contracts::AuthenticationSession {
+        mode: if identity.is_some() {
+            crate::contracts::AuthenticationMode::CloudflareAccess
+        } else {
+            crate::contracts::AuthenticationMode::Local
+        },
+        user_id: identity.map(|identity| identity.user_id.clone()),
+        expires_at: identity.map(|identity| identity.expires_at),
+        remote_execution: identity.is_some_and(remote_execution),
+        email: identity.and_then(|identity| identity.email.clone()),
+    }
+}
+
 fn handle_security(
     stream: &mut TcpStream,
     canonical: Option<&crate::orchestration::canonical_control::CanonicalControlService>,
@@ -494,27 +521,12 @@ fn handle_security(
 ) -> bool {
     let result = match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/api/v1/auth/session") => {
-            let session = crate::contracts::AuthenticationSession {
-                mode: if request.identity.is_some() {
-                    crate::contracts::AuthenticationMode::CloudflareAccess
-                } else {
-                    crate::contracts::AuthenticationMode::Local
-                },
-                user_id: request
-                    .identity
+            let session = authentication_session(request.identity.as_ref(), |identity| {
+                security
+                    .remote_execution
                     .as_ref()
-                    .map(|identity| identity.user_id.clone()),
-                expires_at: request
-                    .identity
-                    .as_ref()
-                    .map(|identity| identity.expires_at),
-                remote_execution: request.identity.as_ref().is_some_and(|identity| {
-                    security
-                        .remote_execution
-                        .as_ref()
-                        .is_some_and(|confinement| confinement.operator_id == identity.user_id)
-                }),
-            };
+                    .is_some_and(|confinement| confinement.operator_id == identity.user_id)
+            });
             match serde_json::to_value(session) {
                 Ok(value) => {
                     write_json_with_origin(stream, 200, &value, request.approved_origin.as_deref())
@@ -2825,5 +2837,75 @@ fn reason(status: u16) -> &'static str {
         503 => "Service Unavailable",
         505 => "HTTP Version Not Supported",
         _ => "Error",
+    }
+}
+
+#[cfg(test)]
+mod authentication_session_projection {
+    use super::authentication_session;
+    use crate::contracts::{AuthenticationMode, AuthenticationSession};
+    use crate::control_security::Identity;
+
+    fn identity(user_id: &str, email: Option<&str>) -> Identity {
+        Identity {
+            user_id: user_id.to_string(),
+            expires_at: 1_800_000_000,
+            session_id: format!("session-{user_id}"),
+            email: email.map(str::to_string),
+        }
+    }
+
+    fn projection(identity: Option<&Identity>) -> AuthenticationSession {
+        authentication_session(identity, |_| false)
+    }
+
+    #[test]
+    fn signed_in_session_carries_the_verified_email() {
+        let identity = identity("user-1", Some("operator@example.com"));
+        assert_eq!(
+            projection(Some(&identity)),
+            AuthenticationSession {
+                mode: AuthenticationMode::CloudflareAccess,
+                user_id: Some("user-1".to_string()),
+                expires_at: Some(1_800_000_000),
+                remote_execution: false,
+                email: Some("operator@example.com".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn local_session_projects_no_identity_and_no_email() {
+        assert_eq!(
+            projection(None),
+            AuthenticationSession {
+                mode: AuthenticationMode::Local,
+                user_id: None,
+                expires_at: None,
+                remote_execution: false,
+                email: None,
+            }
+        );
+    }
+
+    /// The email is display only. Two different addresses under one `user_id`
+    /// keep one session identity, so ownership and revocation cannot be steered
+    /// by an address, and `remote_execution` stays keyed by `user_id` alone.
+    #[test]
+    fn email_does_not_define_the_session_or_the_operator() {
+        let one = identity("user-1", Some("operator@example.com"));
+        let other = identity("user-1", Some("someone-else@example.com"));
+        let first = projection(Some(&one));
+        let second = projection(Some(&other));
+        assert_eq!(first.user_id, second.user_id);
+        assert_eq!(first.mode, second.mode);
+        assert_eq!(first.expires_at, second.expires_at);
+        assert_ne!(first.email, second.email);
+
+        let confined = authentication_session(Some(&one), |identity| identity.user_id == "user-1");
+        assert!(confined.remote_execution);
+        // Without an identity there is no operator to confine, so the flag can
+        // never be set from deployment state alone.
+        assert!(!authentication_session(None, |_| true).remote_execution);
     }
 }

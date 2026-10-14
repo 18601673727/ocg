@@ -13,10 +13,63 @@ type DropdownMenuContextValue = {
   open: boolean;
   setOpen: (open: boolean) => void;
   triggerRef: React.RefObject<HTMLElement | null>;
-  registerItem: (index: number, ref: HTMLButtonElement | null) => void;
-  getItemCount: () => number;
-  focusItem: (index: number) => void;
 };
+
+/** A menu item as the keyboard logic sees it. */
+export type MenuItemState = { index: number; disabled: boolean };
+
+/** A menu key that moves focus. */
+export type MenuNavigationKey = "ArrowUp" | "ArrowDown" | "Home" | "End";
+
+/** A focusable menu item, in the order the menu renders it. */
+export type MenuFocusable = { index: number; disabled: boolean; focus: () => void };
+
+/**
+ * The focusable items of a rendered menu, in document order.
+ *
+ * Reading the rendered menu keeps one source of truth: a menu that re-renders
+ * (a row appearing or disappearing) needs no separate registration step, and an
+ * item cannot be focusable in one place and not the other.
+ */
+export function menuFocusables(root: HTMLElement | null): MenuFocusable[] {
+  const items = root?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [];
+  return [...items].map((element, index) => ({
+    index,
+    disabled: element.disabled,
+    focus: () => element.focus(),
+  }));
+}
+
+/** The enabled item indexes, ascending. */
+export function enabledMenuIndexes(items: readonly MenuItemState[]): number[] {
+  return items
+    .filter((item) => !item.disabled)
+    .map((item) => item.index)
+    .sort((first, second) => first - second);
+}
+
+/**
+ * Where a navigation key moves focus, or `null` when nothing can be focused.
+ *
+ * A disabled row is never a target — a menu whose only rows are disabled is
+ * inert rather than focused on a control the operator cannot use. `current` is
+ * the focused item's index, or any index when focus is elsewhere; arrows step
+ * from that position and wrap, Home/End jump to the ends.
+ */
+export function menuFocusTarget(
+  items: readonly MenuItemState[],
+  current: number,
+  key: MenuNavigationKey,
+): number | null {
+  const enabled = enabledMenuIndexes(items);
+  if (enabled.length === 0) return null;
+  if (key === "Home") return enabled[0];
+  if (key === "End") return enabled[enabled.length - 1];
+  const position = enabled.indexOf(current);
+  if (position === -1) return key === "ArrowDown" ? enabled[0] : enabled[enabled.length - 1];
+  const step = key === "ArrowDown" ? 1 : -1;
+  return enabled[(position + step + enabled.length) % enabled.length];
+}
 
 const DropdownMenuContext = React.createContext<DropdownMenuContextValue | null>(null);
 
@@ -28,7 +81,6 @@ function useDropdownMenu() {
 
 export function DropdownMenu({ children, open: controlledOpen, onOpenChange }: DropdownMenuProps) {
   const [internalOpen, setInternalOpen] = React.useState(false);
-  const [itemRefs, setItemRefs] = React.useState<Map<number, HTMLButtonElement | null>>(new Map());
   const triggerRef = React.useRef<HTMLElement | null>(null);
   const isControlled = controlledOpen !== undefined;
   const open = isControlled ? controlledOpen : internalOpen;
@@ -41,30 +93,9 @@ export function DropdownMenu({ children, open: controlledOpen, onOpenChange }: D
     [isControlled, onOpenChange],
   );
 
-  const registerItem = React.useCallback((index: number, ref: HTMLButtonElement | null) => {
-    setItemRefs(prev => {
-      const next = new Map(prev);
-      if (ref) {
-        next.set(index, ref);
-      } else {
-        next.delete(index);
-      }
-      return next;
-    });
-  }, []);
-
-  const getItemCount = React.useCallback(() => itemRefs.size, [itemRefs.size]);
-
-  const focusItem = React.useCallback((index: number) => {
-    const item = itemRefs.get(index);
-    if (item && !item.disabled) {
-      item.focus();
-    }
-  }, [itemRefs]);
-
   const contextValue = React.useMemo(
-    () => ({ open, setOpen, triggerRef, registerItem, getItemCount, focusItem }),
-    [open, setOpen, registerItem, getItemCount, focusItem]
+    () => ({ open, setOpen, triggerRef }),
+    [open, setOpen]
   );
 
   return (
@@ -129,30 +160,45 @@ type DropdownMenuContentProps = {
 
 export const DropdownMenuContent = React.forwardRef<HTMLDivElement, DropdownMenuContentProps>(
   function DropdownMenuContent({ children, align = "end", className, onEscapeKeyDown, onInteractOutside }, ref) {
-    const { open, setOpen, triggerRef, focusItem, getItemCount } = useDropdownMenu();
+    const { open, setOpen, triggerRef } = useDropdownMenu();
     const contentRef = React.useRef<HTMLDivElement>(null);
-    const [focusedIndex, setFocusedIndex] = React.useState(0);
+    // The focused index is a ref, not state: moving focus must not re-render
+    // the menu, and must not re-identify the navigation it came from.
+    const focusedIndex = React.useRef(-1);
 
     React.useImperativeHandle(ref, () => contentRef.current!);
 
-    // Focus first item when menu opens
+    /** Moves focus by a menu key; false when there is no enabled action. */
+    const focusByKey = React.useCallback((key: MenuNavigationKey) => {
+      const items = menuFocusables(contentRef.current);
+      const target = menuFocusTarget(items, focusedIndex.current, key);
+      if (target === null) return false;
+      focusedIndex.current = target;
+      items[target]?.focus();
+      return true;
+    }, []);
+
+    // Opening focuses the first enabled action, once. The navigation is read
+    // through a ref so this effect depends on the open state alone: it must not
+    // re-run as focus moves, or it would step the menu on its own.
+    const navigate = React.useRef(focusByKey);
     React.useEffect(() => {
-      if (open) {
-        // Small delay to ensure items are registered
-        const timer = setTimeout(() => {
-          focusItem(0);
-          setFocusedIndex(0);
-        }, 0);
-        return () => clearTimeout(timer);
-      }
-    }, [open, focusItem]);
+      navigate.current = focusByKey;
+    }, [focusByKey]);
+
+    React.useEffect(() => {
+      if (!open) return;
+      focusedIndex.current = -1;
+      const timer = setTimeout(() => {
+        navigate.current("ArrowDown");
+      }, 0);
+      return () => clearTimeout(timer);
+    }, [open]);
 
     React.useEffect(() => {
       if (!open) return;
 
       const handleKeyDown = (event: KeyboardEvent) => {
-        const itemCount = getItemCount();
-        
         if (event.key === "Escape") {
           // The consumer sees the event first and may cancel the dismissal;
           // only the uncancelled Escape closes the menu and restores focus.
@@ -163,25 +209,10 @@ export const DropdownMenuContent = React.forwardRef<HTMLDivElement, DropdownMenu
             // Restore focus to trigger
             triggerRef.current?.focus();
           }
-        } else if (event.key === "ArrowDown") {
-          event.preventDefault();
-          const nextIndex = (focusedIndex + 1) % itemCount;
-          focusItem(nextIndex);
-          setFocusedIndex(nextIndex);
-        } else if (event.key === "ArrowUp") {
-          event.preventDefault();
-          const prevIndex = (focusedIndex - 1 + itemCount) % itemCount;
-          focusItem(prevIndex);
-          setFocusedIndex(prevIndex);
-        } else if (event.key === "Home") {
-          event.preventDefault();
-          focusItem(0);
-          setFocusedIndex(0);
-        } else if (event.key === "End") {
-          event.preventDefault();
-          const lastIndex = itemCount - 1;
-          focusItem(lastIndex);
-          setFocusedIndex(lastIndex);
+        } else if (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Home" || event.key === "End") {
+          // Enabled actions only, wrapping at both ends; a menu with no enabled
+          // action leaves the event alone instead of swallowing it.
+          if (focusByKey(event.key)) event.preventDefault();
         }
       };
 
@@ -207,21 +238,9 @@ export const DropdownMenuContent = React.forwardRef<HTMLDivElement, DropdownMenu
         document.removeEventListener("mousedown", handleClickOutside);
         document.removeEventListener("touchstart", handleClickOutside);
       };
-    }, [open, setOpen, triggerRef, focusedIndex, focusItem, getItemCount, onEscapeKeyDown, onInteractOutside]);
+    }, [open, setOpen, triggerRef, focusByKey, onEscapeKeyDown, onInteractOutside]);
 
     if (!open) return null;
-
-    // Assign indices to menu items
-    let itemIndex = 0;
-    const enhancedChildren = React.Children.map(children, (child) => {
-      if (React.isValidElement(child) && child.type === DropdownMenuItem) {
-        const currentIndex = itemIndex++;
-        return React.cloneElement(child as React.ReactElement<{ itemIndex?: number }>, {
-          itemIndex: currentIndex,
-        });
-      }
-      return child;
-    });
 
     return (
       <div
@@ -234,7 +253,7 @@ export const DropdownMenuContent = React.forwardRef<HTMLDivElement, DropdownMenu
           className,
         )}
       >
-        {enhancedChildren}
+        {children}
       </div>
     );
   },
@@ -245,24 +264,14 @@ type DropdownMenuItemProps = {
   onSelect?: () => void;
   disabled?: boolean;
   className?: string;
-  itemIndex?: number;
 };
 
 export const DropdownMenuItem = React.forwardRef<HTMLButtonElement, DropdownMenuItemProps>(
-  function DropdownMenuItem({ children, onSelect, disabled, className, itemIndex }, ref) {
-    const { setOpen, triggerRef, registerItem } = useDropdownMenu();
+  function DropdownMenuItem({ children, onSelect, disabled, className }, ref) {
+    const { setOpen, triggerRef } = useDropdownMenu();
     const localRef = React.useRef<HTMLButtonElement>(null);
 
     React.useImperativeHandle(ref, () => localRef.current!);
-
-    React.useEffect(() => {
-      if (typeof itemIndex === "number") {
-        registerItem(itemIndex, localRef.current);
-        return () => {
-          registerItem(itemIndex, null);
-        };
-      }
-    }, [itemIndex, registerItem]);
 
     const handleSelect = () => {
       if (disabled) return;

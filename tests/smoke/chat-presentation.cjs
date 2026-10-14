@@ -781,8 +781,8 @@ function dropdownEscapeDismissesAfterConsumer() {
  * The canonical sidebar's Workbench menu.
  *
  * In canonical mode Chat stays the one primary destination and every other
- * destination moves into the compact bottom Workbench menu — none is lost and
- * the active destination is still marked.
+ * destination moves into the Workbench menu beside the primary controls — none
+ * is lost and the active destination is still marked.
  */
 function sidebarWorkbenchPreservesDestinations() {
   const React = frontendRequire("react");
@@ -805,28 +805,262 @@ function sidebarWorkbenchPreservesDestinations() {
   }
   // The active destination (health) is still marked.
   assert.ok(html.includes('aria-current="page"'), "the active destination is marked");
-  // Chat is the one primary destination outside the menu, above it.
+  // Chat is the one primary destination outside the menu, and the menu is a
+  // primary control: it sits above the conversation list, not below it.
   const chatIdx = html.indexOf(">Chat<");
   const workbenchIdx = html.indexOf("data-workbench-menu");
-  assert.ok(chatIdx >= 0 && workbenchIdx >= 0 && chatIdx < workbenchIdx,
-    "Chat stays above the Workbench menu as the primary destination");
+  const sessionsIdx = html.indexOf('aria-label="Chat sessions grouped by work type"');
+  assert.ok(chatIdx >= 0 && workbenchIdx >= 0 && sessionsIdx >= 0,
+    "the primary destination, the Workbench menu and the conversation list all render");
+  assert.ok(workbenchIdx < sessionsIdx,
+    "the Workbench menu sits with the primary controls above the conversation list");
   assert.equal((html.match(/>Chat</g) ?? []).length, 1, "Chat is not duplicated inside the Workbench menu");
+  // The Project selector is no longer a sidebar control, and neither is a
+  // second copy of New chat or the account control.
+  const sidebar = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/ocg-sidebar.tsx"), "utf8");
+  assert.ok(!sidebar.includes("<ProjectSwitcher"), "the sidebar does not host the Project selector");
+  assert.equal((html.match(/>New chat</g) ?? []).length, 1, "New chat is not duplicated");
+  assert.equal((html.match(/aria-label="Account"/g) ?? []).length, 1, "the account menu is not duplicated");
 }
 
 /**
- * The composer card owns model selection.
+ * The composer owns the turn's selections, outside its card.
  *
- * Model selection sits inside the composer card, above the staged attachments,
- * so the whole turn surface reads as one card.
+ * The Project and model selectors sit above the composer card as compact
+ * dropdown buttons, and the card itself starts at the staged attachments so it
+ * stays the input.
  */
-function composerPlacesModelSelectionInCard() {
+function composerPlacesTurnSelectionsAboveCard() {
   const source = fs.readFileSync(path.join(frontend, "components/ocg/chat/chat-view.tsx"), "utf8");
   const card = source.indexOf("rounded-lg border border-border bg-card");
+  const selectorRow = source.indexOf("relative z-30 flex min-w-0 items-stretch");
   const selector = source.indexOf("<ModelSelector");
+  const projectSlot = source.indexOf("{projectSelector &&");
   const staging = source.indexOf("<AttachmentStaging");
   assert.ok(card >= 0 && selector >= 0 && staging >= 0, "the composer card, model selector and staging exist");
-  assert.ok(card < selector, "the model selector is inside the composer card");
-  assert.ok(selector < staging, "the model selector heads the card above the staged attachments");
+  assert.ok(selectorRow >= 0 && selectorRow < selector, "the model selector sits in its own row");
+  assert.ok(projectSlot >= 0 && projectSlot < selector, "the Project selector shares that row");
+  assert.ok(selector < card, "both selectors sit above the composer card, not inside it");
+  assert.ok(card < staging, "the composer card heads with the staged attachments");
+}
+
+/**
+ * The floating Chat header.
+ *
+ * The header draws no bottom border and no toolbar band, and it keeps only the
+ * conversation title and the execution-details control: Settings and signing
+ * out belong to the sidebar's account menu, so the header must not offer a
+ * second copy of either.
+ */
+function chatHeaderFloatsWithoutDuplicateControls() {
+  const topbar = fs.readFileSync(path.join(frontend, "components/ocg/topbar/ocg-topbar.tsx"), "utf8");
+  const header = topbar.slice(topbar.indexOf("<header"), topbar.indexOf("</header>"));
+  assert.ok(header.length > 0, "the header element exists");
+  assert.ok(!header.includes("border-b border-border"), "the header draws no bottom border");
+  assert.ok(!header.includes("bg-background"), "the header has no toolbar band");
+  assert.ok(header.includes("rounded-full"), "the header's controls are pills");
+  assert.ok(header.includes("data-execution-details-control"), "the execution-details control stays on the right");
+  assert.ok(!topbar.includes("useRemoteLogout"), "signing out is not duplicated in the header");
+  assert.ok(!topbar.includes("onOpenSettings"), "settings is not duplicated in the header");
+
+  // Both stay reachable from the sidebar's account menu instead, which the
+  // sidebar reaches through the one shared menu component.
+  const sidebar = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/ocg-sidebar.tsx"), "utf8");
+  const account = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/account-menu.tsx"), "utf8");
+  assert.ok(sidebar.includes("<AccountMenu"), "the sidebar renders the shared account menu");
+  assert.ok(sidebar.includes("useRemoteLogout()"), "the sidebar reads the real logout operation");
+  assert.ok(sidebar.includes("useAccountEmail()"), "the sidebar reads the signed-in operator");
+  assert.ok(account.includes('t("sidebar.logout")'), "the shared menu offers logging out");
+  assert.ok(account.includes('t("sidebar.openSettings")'), "the shared menu offers settings");
+}
+
+/**
+ * The account menu's contents, order and form.
+ *
+ * The one menu component is rendered for both identities and both placements:
+ * the identity row is never actionable, signing out (where it exists) precedes
+ * Settings, and local mode offers Settings without a logout item. This is a
+ * render of the production component, not a source grep.
+ */
+function accountMenuOrderAndForm() {
+  const React = frontendRequire("react");
+  const { renderToStaticMarkup } = frontendRequire("react-dom/server");
+  const { I18nProvider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+  const { AccountMenu } = require(path.join(frontend, "components/ocg/sidebar/account-menu.tsx"));
+
+  const render = (props) => renderToStaticMarkup(
+    React.createElement(I18nProvider, null, React.createElement(AccountMenu, props)));
+
+  // The menu items, in document order, with their actionable state.
+  const items = (html) => {
+    const menu = html.slice(html.indexOf('role="menu"'));
+    assert.ok(menu.length > 0, "the menu content rendered");
+    return [...menu.matchAll(/<button[^>]*role="menuitem"[^>]*>([\s\S]*?)<\/button>/g)].map((match) => ({
+      disabled: /\sdisabled(=|>|\s)/.test(match[0]),
+      text: match[1].replace(/<[^>]+>/g, "").trim(),
+    }));
+  };
+
+  const remote = render({ open: true, email: "operator@example.com", onLogout: () => undefined, onSettingsClick: () => undefined });
+  assert.deepEqual(items(remote), [
+    { disabled: true, text: "operator@example.com" },
+    { disabled: false, text: "Log out" },
+    { disabled: false, text: "Open settings" },
+  ], "remote: identity (non-actionable), then Log out, then Open settings");
+  assert.ok(remote.includes(">operator@example.com<"), "the trigger and the identity row name the signed-in operator");
+
+  const local = render({ open: true, email: null, onSettingsClick: () => undefined });
+  assert.deepEqual(items(local), [
+    { disabled: true, text: "Local operator" },
+    { disabled: false, text: "Open settings" },
+  ], "local: identity (non-actionable), then Open settings, and no logout item");
+  assert.ok(!local.includes("Log out"), "local mode offers nothing to log out of");
+
+  // The collapsed rail renders the same menu, reachable from its own icon.
+  const rail = render({ open: true, variant: "rail", email: "operator@example.com", onLogout: () => undefined, onSettingsClick: () => undefined });
+  assert.deepEqual(items(rail), items(remote), "the rail menu carries the identical identity and actions");
+  const railTrigger = rail.slice(0, rail.indexOf('role="menu"'));
+  assert.ok(railTrigger.includes('aria-label="Account"'), "the rail account icon is named for assistive technology");
+  const triggerMarkup = railTrigger.slice(railTrigger.indexOf("<button"));
+  const triggerText = triggerMarkup.slice(0, triggerMarkup.indexOf("</button>")).replace(/<[^>]+>/g, "").trim();
+  assert.equal(triggerText, "", "the rail trigger is the icon alone, not a label row");
+  // The rail is 64px wide and clips its overflow, so its menu is anchored to
+  // the viewport instead of to the rail box.
+  const railMenu = rail.slice(rail.indexOf('role="menu"'));
+  assert.ok(railMenu.includes("fixed"), "the rail menu is anchored to the viewport");
+
+  // Ordering and actions are declared once, not per placement.
+  const account = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/account-menu.tsx"), "utf8");
+  assert.equal((account.match(/<DropdownMenuItem/g) ?? []).length, 3, "there is exactly one definition of the three rows");
+}
+
+/**
+ * Account-menu keyboard focus.
+ *
+ * The navigation the menu uses is exercised directly with the mixes a menu can
+ * have: a leading non-actionable identity row, wrap-around in both directions,
+ * a menu whose every row is non-actionable, and focus resting on a
+ * non-actionable row. The component's own wiring (which key calls it) is
+ * asserted alongside, and the real interaction is driven in the browser.
+ */
+function accountMenuKeyboardFocus() {
+  const { enabledMenuIndexes, menuFocusTarget } = require(path.join(frontend, "components/ui/dropdown-menu.tsx"));
+
+  // identity (disabled) / Log out / Open settings
+  const items = [
+    { index: 0, disabled: true },
+    { index: 1, disabled: false },
+    { index: 2, disabled: false },
+  ];
+  assert.deepEqual(enabledMenuIndexes(items), [1, 2], "only the actions are focusable");
+
+  assert.equal(menuFocusTarget(items, -1, "ArrowDown"), 1, "opening focuses the first enabled action, not the identity row");
+  assert.equal(menuFocusTarget(items, -1, "ArrowUp"), 2, "an upward entry from outside the list lands on the last action");
+  assert.equal(menuFocusTarget(items, 1, "ArrowDown"), 2, "ArrowDown moves to the next action");
+  assert.equal(menuFocusTarget(items, 2, "ArrowDown"), 1, "ArrowDown wraps past the end");
+  assert.equal(menuFocusTarget(items, 1, "ArrowUp"), 2, "ArrowUp wraps past the start");
+  assert.equal(menuFocusTarget(items, 0, "ArrowDown"), 1, "focus on the identity row steps into the actions");
+  assert.equal(menuFocusTarget(items, 0, "ArrowUp"), 2, "focus on the identity row steps back to the last action");
+  assert.equal(menuFocusTarget(items, 2, "Home"), 1, "Home focuses the first enabled action");
+  assert.equal(menuFocusTarget(items, 1, "End"), 2, "End focuses the last enabled action");
+
+  // A single enabled action is its own next and previous action.
+  const single = [{ index: 0, disabled: true }, { index: 1, disabled: false }];
+  assert.equal(menuFocusTarget(single, 1, "ArrowDown"), 1, "one action wraps onto itself");
+  assert.equal(menuFocusTarget(single, 1, "ArrowUp"), 1, "one action wraps onto itself upward");
+
+  // Nothing actionable: no target at all, for every key.
+  const inert = [{ index: 0, disabled: true }, { index: 1, disabled: true }];
+  assert.deepEqual(enabledMenuIndexes(inert), [], "a menu of non-actionable rows has no focusable item");
+  for (const key of ["ArrowDown", "ArrowUp", "Home", "End"]) {
+    assert.equal(menuFocusTarget(inert, -1, key), null, `${key} focuses nothing when no action is enabled`);
+  }
+
+  // The content wires those keys to that navigation, and leaves the event to
+  // the page when there is nothing to focus.
+  const source = fs.readFileSync(path.join(frontend, "components/ui/dropdown-menu.tsx"), "utf8");
+  assert.ok(source.includes("menuFocusTarget(items, focusedIndex.current, key)"), "the content navigates through the shared logic");
+  assert.ok(source.includes("const items = menuFocusables(contentRef.current)"), "the items are read from the rendered menu");
+  assert.ok(!source.includes("itemIndex"), "no second, registration-time index of the same items exists");
+  for (const key of ["ArrowDown", "ArrowUp", "Home", "End"]) {
+    assert.ok(source.includes(`event.key === "${key}"`), `${key} is handled`);
+  }
+  assert.ok(source.includes("if (focusByKey(event.key)) event.preventDefault()"), "an inert menu does not swallow the key");
+  // Opening focuses once. The index lives in a ref and the effect depends on
+  // the open state alone: while it was React state, the effect re-ran on every
+  // focus move and stepped the menu on its own past the first action.
+  assert.ok(source.includes('navigate.current("ArrowDown")'), "opening focuses the first enabled action through the same navigation");
+  assert.ok(/const focusedIndex = React\.useRef\(-1\)/.test(source), "the focused index is a ref, not render state");
+  assert.ok(/focusedIndex\.current = -1;/.test(source), "opening starts outside the item list, so the first enabled action is the target");
+  assert.ok(/\}, \[open\]\);/.test(source), "the open effect depends on the open state alone");
+}
+
+/**
+ * Both sidebar forms offer the account menu.
+ *
+ * The collapsed rail gained the account control at its bottom; the expanded
+ * footer keeps it. Both render the same component, so identity, actions and
+ * ordering cannot drift between them.
+ */
+function collapsedSidebarOffersTheAccountMenu() {
+  const React = frontendRequire("react");
+  const { renderToStaticMarkup } = frontendRequire("react-dom/server");
+  const { OcgSidebar } = require(path.join(frontend, "components/ocg/sidebar/ocg-sidebar.tsx"));
+  const { I18nProvider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+
+  const sidebar = (collapsed) => renderToStaticMarkup(React.createElement(I18nProvider, null,
+    React.createElement(OcgSidebar, {
+      sessions: [], activeSessionId: "", collapsed, onToggle: () => undefined,
+      onSelect: () => undefined, onNewChat: () => undefined,
+      runtimeStatus: { state: "connected", detailCode: "provider-ready", detail: "" },
+      runtimeAuthority: "canonical", activeView: "chat", attentionCount: 0,
+      onNavigate: () => undefined, onSettingsClick: () => undefined,
+    })));
+
+  const rail = sidebar(true);
+  assert.equal((rail.match(/aria-label="Account"/g) ?? []).length, 1, "the collapsed rail offers the account control");
+  assert.ok(rail.includes("OCG"), "the rail still shows its wordmark");
+
+  const expanded = sidebar(false);
+  assert.equal((expanded.match(/aria-label="Account"/g) ?? []).length, 1, "the expanded footer offers it once");
+  assert.ok(/Local operator/.test(expanded), "the expanded footer names the local operator");
+
+  const source = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/ocg-sidebar.tsx"), "utf8");
+  assert.equal((source.match(/<AccountMenu/g) ?? []).length, 2, "both forms render the one account menu");
+  assert.ok(source.includes('variant="rail"'), "the rail is the rail form of that menu");
+}
+
+/**
+ * Conversation search is title-only and Project-scoped.
+ *
+ * The overlay filters the session list it is handed — the sidebar's own
+ * project-filtered list — by title, and selecting a result uses the same
+ * selection callback as the list. It must not grow a body search, an index, or
+ * a control-plane request of its own.
+ */
+function conversationSearchStaysTitleOnlyAndProjectScoped() {
+  const source = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/conversation-search.tsx"), "utf8");
+  assert.ok(/sessions\.filter\(session =>/.test(source), "results come from the sessions it is given");
+  assert.ok(source.includes("session.title"), "filtering reads the conversation title");
+  assert.ok(source.includes('t("sidebar.newChat")'), "an untitled conversation matches its displayed name");
+  assert.ok(source.includes("onSelect(session.id)") || source.includes("select(session.id)"),
+    "a result is opened through the shared selection callback");
+  for (const forbidden of ["fetch(", "XMLHttpRequest", "message.content", "messagesBySession", "localStorage"]) {
+    assert.ok(!source.includes(forbidden), `the overlay does not ${forbidden}`);
+  }
+  // Same overlay conventions as the Project switcher: the Dialog primitive, a
+  // named dialog, an initial focus target, and both empty states.
+  for (const marker of ["<Dialog", "<DialogContent", "initialFocus", "<DialogTitle", "aria-label"]) {
+    assert.ok(source.includes(marker), `the overlay keeps ${marker}`);
+  }
+  assert.ok(source.includes('t("sidebar.noSearchMatches")'), "no-title-match state exists");
+  assert.ok(source.includes('t("sidebar.searchNoConversations")'), "no-conversations state exists");
+
+  // The sidebar hands it the same list it renders, and opens it from a button.
+  const sidebar = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/ocg-sidebar.tsx"), "utf8");
+  assert.ok(sidebar.includes("<ConversationSearch"), "the sidebar opens the overlay");
+  assert.ok(!sidebar.includes('type="search"'), "the sidebar keeps no inline filter input");
+  assert.ok(!/const \[searchQuery/.test(sidebar), "the sidebar keeps no inline filter state");
 }
 
 /**
@@ -1269,8 +1503,13 @@ async function boundedMessagesExpandAndCollapseForBothRoles() {
     markdownAdmitsRelativeTargetsAndHeadings,
     markdownNestingMatchesDepth,
     dropdownEscapeDismissesAfterConsumer,
+    accountMenuOrderAndForm,
+    accountMenuKeyboardFocus,
+    collapsedSidebarOffersTheAccountMenu,
     sidebarWorkbenchPreservesDestinations,
-    composerPlacesModelSelectionInCard,
+    composerPlacesTurnSelectionsAboveCard,
+    chatHeaderFloatsWithoutDuplicateControls,
+    conversationSearchStaysTitleOnlyAndProjectScoped,
     highlightingThemeIsScoped,
     markdownStreamingRecoveryProbe,
     boundedMessagesExpandAndCollapseForBothRoles,

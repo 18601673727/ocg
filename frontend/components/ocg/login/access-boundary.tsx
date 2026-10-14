@@ -7,9 +7,23 @@ const subscribe = () => () => {};
 const browserLocation = () => window.location.origin;
 const serverLocation = () => "";
 const RemoteLogout = createContext<(() => Promise<void>) | null>(null);
+/**
+ * The signed email of the current Access operator, or null when the request
+ * carries no signed identity. Local mode never renders the gate, so it has no
+ * session to project and stays null; the account surface names that state
+ * instead of showing an opaque user id.
+ *
+ * Nothing here changes who a session *is*: identity, ownership and revocation
+ * stay keyed by the backend's `user_id` and session id. This is a label.
+ */
+const AccountEmail = createContext<string | null>(null);
 
 export function useRemoteLogout() {
   return useContext(RemoteLogout);
+}
+
+export function useAccountEmail() {
+  return useContext(AccountEmail);
 }
 
 export function AccessBoundary({ children }: { children: ReactNode }) {
@@ -79,7 +93,11 @@ function RemoteAccess({ children }: { children: ReactNode }) {
   }, []);
 
   if (session?.remote_execution && !error && !signingOut) {
-    return <RemoteLogout value={logout}>{children}</RemoteLogout>;
+    return (
+      <RemoteLogout value={logout}>
+        <AccountEmail value={session.email}>{children}</AccountEmail>
+      </RemoteLogout>
+    );
   }
 
   return (

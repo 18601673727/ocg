@@ -233,6 +233,7 @@ export function ChatComposer({
   activity,
   onCancel,
   autoFocus = false,
+  projectSelector,
 }: {
   projectId?: string;
   busy: boolean;
@@ -244,6 +245,8 @@ export function ChatComposer({
   activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
   onCancel?: () => Promise<void>;
   autoFocus?: boolean;
+  /** Compact Project selector shown beside the model selector above the card. */
+  projectSelector?: React.ReactNode;
   draft: string;
   onDraftChange: (v: string) => void;
   onIntent: (intent: ComposerIntent) => void | Promise<void>;
@@ -394,8 +397,20 @@ export function ChatComposer({
           images.add(Array.from(event.target.files ?? []));
           event.target.value = "";
         }} />
-        <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
+        {/*
+          The turn's two selections sit outside and above the card as compact
+          dropdown buttons: which Project this turn belongs to, and the model
+          and reasoning effort the next turn runs with. Both hug their label up
+          to a share of the row and ellipsize beyond it, so they read as two
+          buttons rather than one bar. Keeping them outside the card means the
+          card stays the input, and a raised panel opens upward over the
+          conversation instead of covering it.
+        */}
+        <div className="relative z-30 flex min-w-0 items-stretch gap-1.5 px-0.5 pb-1.5">
+          {projectSelector && <div className="flex min-w-0 max-w-[min(18rem,58%)] shrink items-stretch [&>button]:h-full">{projectSelector}</div>}
           <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active} activity={activity} />
+        </div>
+        <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
           <AttachmentStaging state={images} disabled={submitting || cancelling} />
           <div className="relative">
             {suggestionsOpen && (

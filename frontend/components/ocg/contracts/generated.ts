@@ -44,7 +44,14 @@ export type ApiErrorEnvelope = { error: ApiErrorBody, };
 export type AuthenticationMode = "local" | "cloudflare-access";
 
 
-export type AuthenticationSession = { mode: AuthenticationMode, user_id: string | null, expires_at: number | null, remote_execution: boolean, };
+export type AuthenticationSession = { mode: AuthenticationMode, user_id: string | null, expires_at: number | null, remote_execution: boolean,
+/**
+ * The signed Cloudflare Access email address of the current operator, when
+ * the request carried one. Display information only: identity, ownership
+ * and revocation stay keyed by `user_id` and `session_id`. Local mode has
+ * no signed identity to project, so this is always null there.
+ */
+email: string | null, };
 
 
 /**

@@ -45,6 +45,11 @@ export interface ChatScreenProps {
   onRemoveQueued?: (id: string) => void;
   onResumeQueue?: () => void;
   composerSurface?: ReactNode;
+  /**
+   * Compact Project selector for the row above the composer. The shell owns
+   * the selection; the composer only presents it.
+   */
+  projectSelector?: ReactNode;
 }
 
 type ChatComposerContextValue = {
@@ -62,6 +67,7 @@ type ChatComposerContextValue = {
   onComposerIntent: (intent: ComposerIntent) => Promise<void> | void;
   onCancel: () => Promise<void>;
   composerSurface?: ReactNode;
+  projectSelector?: ReactNode;
   onRemoveQueued?: (id: string) => void;
   onResumeQueue?: () => void;
 };
@@ -94,6 +100,7 @@ const ChatComposerSlot: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
         activity={value.activity}
         onCancel={value.onCancel}
         autoFocus={autoFocus}
+        projectSelector={value.projectSelector}
         draft={value.draft}
         onDraftChange={value.setDraft}
         onIntent={value.onComposerIntent}
@@ -177,6 +184,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
   onResumeQueue,
   onCancel,
   composerSurface,
+  projectSelector,
 }) => {
   const runtime = useOcgRuntime();
   const [draft, setDraft] = useState("");
@@ -217,6 +225,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
       onComposerIntent,
       onCancel,
       composerSurface,
+      projectSelector,
       onRemoveQueued,
       onResumeQueue,
     }),
@@ -233,6 +242,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
       onComposerIntent,
       onCancel,
       composerSurface,
+      projectSelector,
       onRemoveQueued,
       onResumeQueue,
     ],

@@ -15,7 +15,9 @@ const session: Decoder<AuthenticationSession> = (input, path) => {
   if (!expiration.ok) return expiration;
   const execution = req(value.value, "remote_execution", boolean, path);
   if (!execution.ok) return execution;
-  return yes({ mode: authentication.value, user_id: user.value, expires_at: expiration.value, remote_execution: execution.value });
+  const email = req(value.value, "email", nullable(string), path);
+  if (!email.ok) return email;
+  return yes({ mode: authentication.value, user_id: user.value, expires_at: expiration.value, remote_execution: execution.value, email: email.value });
 };
 
 export const decodeAuthenticationSession = (input: unknown): AuthenticationSession => decode((value) => session(value, "session"), input);

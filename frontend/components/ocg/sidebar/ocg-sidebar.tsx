@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, useMemo } from "react";
+import { useRef, useState } from "react";
 import {
   ChevronsLeft,
   ChevronDown,
@@ -18,13 +18,10 @@ import {
   Workflow,
   LoaderCircle,
   MoreVertical,
-  Settings,
-  User,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { STATUS_TEXT } from "../primitives/tone";
@@ -36,9 +33,9 @@ import {
 } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus } from "../types";
 import type { RuntimeAuthority } from "../runtime/runtime-types";
-import { ProjectSwitcher } from "../project/project-switcher";
-import type { ProjectId, ProjectSummary } from "../project/domain";
-import { DEFAULT_PROJECT_ID } from "../project/domain";
+import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
+import { AccountMenu } from "./account-menu";
+import { ConversationSearch } from "./conversation-search";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
 
@@ -69,10 +66,8 @@ type OcgSidebarProps = {
   runtimeAuthority: RuntimeAuthority;
   /** Active top-level workspace, used to highlight the navigation group. */
   activeView?: WorkspaceView;
-  /** Project switcher inputs. The switcher renders only when onChange is given. */
-  projects?: readonly ProjectSummary[];
-  activeProjectId?: ProjectId;
-  onProjectChange?: (id: ProjectId) => void;
+  /** Name of the active Project, shown as the conversation search's scope line. */
+  projectName?: string;
   /** Unresolved attention count shown as a quiet badge next to Attention. */
   attentionCount?: number;
   /**
@@ -81,9 +76,7 @@ type OcgSidebarProps = {
    * how a page renders the sidebar without shell navigation.
    */
   onNavigate?: (view: WorkspaceView) => void;
-  /** Called when account/profile button is clicked. */
-  onAccountClick?: () => void;
-  /** Called when settings button is clicked. */
+  /** Opens Settings from the account menu. Omitting it hides that item. */
   onSettingsClick?: () => void;
 };
 
@@ -132,12 +125,9 @@ export function OcgSidebar({
   busySessionIds = [],
   runtimeAuthority,
   activeView = "chat",
-  projects = [],
-  activeProjectId = DEFAULT_PROJECT_ID,
-  onProjectChange,
+  projectName,
   attentionCount = 0,
   onNavigate,
-  onAccountClick,
   onSettingsClick,
 }: OcgSidebarProps) {
   const { t } = useI18n();
@@ -145,19 +135,12 @@ export function OcgSidebar({
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
-  const [searchQuery, setSearchQuery] = useState<string>("");
   const cancelDeleteRef = useRef<HTMLButtonElement>(null);
   const targetBusy = deleteTarget !== null && busySessionIds.includes(deleteTarget.id);
-  // An untitled session is shown as "New chat", so it is matched under that
-  // name too rather than only against its empty title.
-  const filteredSessions = useMemo(() => {
-    const query = searchQuery.trim().toLowerCase();
-    if (!query) return sessions;
-    const untitledLabel = t("sidebar.newChat").toLowerCase();
-    return sessions.filter(session =>
-      (session.title || untitledLabel).toLowerCase().includes(query)
-    );
-  }, [sessions, searchQuery, t]);
+  // The signed Access email, when the request carried one. Local mode has no
+  // signed identity, so the account menu names that state instead.
+  const email = useAccountEmail();
+  const logout = useRemoteLogout();
   const confirmDelete = async () => {
     if (!deleteTarget || !onDelete || deleting || targetBusy) return;
     setDeleting(true);
@@ -176,7 +159,7 @@ export function OcgSidebar({
     ? WORKSPACE_NAV.filter(item => ["home", "chat", "job-execution", "health", "attention", "usage", "control-center"].includes(item.target))
     : WORKSPACE_NAV;
   // In canonical mode Chat is the one primary destination; every other
-  // destination moves into the compact bottom Workbench menu so none is lost.
+  // destination moves into the Workbench menu so none is lost.
   const primaryNav = canonicalMode ? workspaceNav.filter(item => item.target === "chat") : workspaceNav;
   const workbenchNav = canonicalMode ? workspaceNav.filter(item => item.target !== "chat") : [];
   const hasNav = Boolean(onNavigate);
@@ -215,6 +198,63 @@ export function OcgSidebar({
     );
   };
 
+  // The primary controls sit directly under the wordmark: New chat, the
+  // conversation search, and (in canonical mode) the Workbench menu that holds
+  // every destination other than Chat.
+  const primaryControls = (
+    <>
+      <div className="flex items-center gap-1 px-2 pb-2">
+        <Button
+          variant="outline"
+          size="sm"
+          className="min-w-0 flex-1 justify-start"
+          onClick={onNewChat}
+        >
+          <Plus className="size-3.5" data-icon="inline-start" />
+          {t("sidebar.newChat")}
+        </Button>
+        {/*
+          The search button opens the full-screen conversation overlay. It keeps
+          its own accessible name and tooltip title rather than a Tooltip
+          wrapper, because the overlay owns the trigger's props.
+        */}
+        <ConversationSearch
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          projectName={projectName}
+          onSelect={onSelect}
+          trigger={
+            <Button variant="outline" size="icon-sm" aria-label={t("sidebar.searchConversations")} title={t("sidebar.searchConversations")}>
+              <Search className="size-4" aria-hidden="true" />
+            </Button>
+          }
+        />
+      </div>
+
+      {hasNav && workbenchNav.length > 0 && (
+        /*
+          Canonical mode keeps Chat as the single primary destination and folds
+          every other destination into this compact Workbench menu. Each item
+          keeps its icon, label, attention badge and active state.
+        */
+        <details
+          className="px-2 pb-2"
+          open={workbenchNav.some((item) => item.target === activeView) || undefined}
+          data-workbench-menu=""
+        >
+          <summary className={cn("group flex cursor-pointer items-center gap-2 rounded-md border border-border px-2 py-1.5 select-none", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground hover:bg-muted/60")}>
+            <LayoutGrid className="size-3.5 shrink-0" aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
+            <ChevronDown className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+          </summary>
+          <ul className="mt-1 flex flex-col gap-px pl-2">
+            {workbenchNav.map(renderWorkspaceItem)}
+          </ul>
+        </details>
+      )}
+    </>
+  );
+
   if (collapsed) {
     return (
       <TooltipProvider delay={100}>
@@ -223,17 +263,25 @@ export function OcgSidebar({
           <RailButton label={t("sidebar.expand")} onClick={onToggle}>
             <ChevronsLeft className="size-4 rotate-180" />
           </RailButton>
-          {onProjectChange && (
-            <ProjectSwitcher
-              projects={projects}
-              activeProjectId={activeProjectId}
-              collapsed
-              onChange={onProjectChange}
-            />
-          )}
           <RailButton label={t("sidebar.newChat")} onClick={onNewChat}>
             <Plus className="size-4" />
           </RailButton>
+          <ConversationSearch
+            sessions={sessions}
+            activeSessionId={activeSessionId}
+            projectName={projectName}
+            onSelect={onSelect}
+            trigger={
+              <button
+                type="button"
+                aria-label={t("sidebar.searchConversations")}
+                title={t("sidebar.searchConversations")}
+                className="flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              >
+                <Search className="size-4" aria-hidden="true" />
+              </button>
+            }
+          />
           {hasNav && (
             <>
               <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
@@ -277,6 +325,20 @@ export function OcgSidebar({
               </RailButton>
             ))}
           </div>
+          {/*
+            The collapsed rail keeps the account menu: same identity, same
+            actions, same order as the expanded footer, from the same component.
+          */}
+          <div className="mt-2 w-full border-t border-border pt-2">
+            <div className="flex w-full justify-center">
+              <AccountMenu
+                variant="rail"
+                email={email}
+                onLogout={logout ? () => { void logout(); } : undefined}
+                onSettingsClick={onSettingsClick}
+              />
+            </div>
+          </div>
         </div>
       </TooltipProvider>
     );
@@ -308,27 +370,7 @@ export function OcgSidebar({
           </Tooltip>
         </div>
 
-        {onProjectChange && (
-          <div className="px-3 pb-2">
-            <ProjectSwitcher
-              projects={projects}
-              activeProjectId={activeProjectId}
-              onChange={onProjectChange}
-            />
-          </div>
-        )}
-
-        <div className="px-3 pb-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full justify-start"
-            onClick={onNewChat}
-          >
-            <Plus className="size-3.5" data-icon="inline-start" />
-            {t("sidebar.newChat")}
-          </Button>
-        </div>
+        {primaryControls}
 
         {hasNav && (
           <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
@@ -344,27 +386,12 @@ export function OcgSidebar({
           </nav>
         )}
 
-        {/* Conversation search filters the history list below it. */}
-        <div className="px-2 pb-2">
-          <div className="relative">
-            <Search className="absolute left-2.5 top-2.5 size-3.5 text-muted-foreground pointer-events-none" aria-hidden="true" />
-            <Input
-              type="search"
-              placeholder={t("sidebar.searchChats")}
-              aria-label={t("sidebar.searchChatsLabel")}
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="h-8 pl-8 text-xs"
-            />
-          </div>
-        </div>
-
         <nav
           aria-label={t("nav.chatSessions")}
           className="min-h-0 flex-1 overflow-y-auto px-2 pb-2"
         >
           <ul className="flex flex-col gap-px">
-            {filteredSessions.map((session) => {
+            {sessions.map((session) => {
               const active = session.id === activeSessionId;
               const isMenuOpen = openMenuId === session.id;
               return (
@@ -429,65 +456,21 @@ export function OcgSidebar({
                 </li>
               );
             })}
-            {filteredSessions.length === 0 && searchQuery.trim() !== "" && (
-              <li className={cn("px-2 py-3 text-center text-muted-foreground", TYPOGRAPHY_SCALE.caption)}>
-                {t("sidebar.noSearchMatches")}
-              </li>
-            )}
           </ul>
         </nav>
 
         {/*
-          Canonical mode keeps Chat as the single primary destination and folds
-          every other destination into this compact bottom Workbench menu. Each
-          item keeps its icon, label, attention badge and active state.
+          The account menu holds who is signed in and what they can do here.
+          Local mode has no signed identity and no logout to run, so it names
+          that state and offers Settings only.
         */}
-        {hasNav && workbenchNav.length > 0 && (
-          <details
-            className="border-t border-border px-2 py-2"
-            open={workbenchNav.some((item) => item.target === activeView) || undefined}
-            data-workbench-menu=""
-          >
-            <summary className={cn("group flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 select-none", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground hover:bg-muted/60")}>
-              <LayoutGrid className="size-3.5 shrink-0" aria-hidden="true" />
-              <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
-              <ChevronDown className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
-            </summary>
-            <ul className="mt-1 flex flex-col gap-px pl-2">
-              {workbenchNav.map(renderWorkspaceItem)}
-            </ul>
-          </details>
-        )}
-
-        {/* Account and Settings, shown only where they do something real. */}
-        {(onAccountClick || onSettingsClick) && (
-          <div className="border-t border-border px-2 py-2 flex gap-1">
-            {onAccountClick && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={onAccountClick}
-                className="h-8 w-8 p-0"
-                title={t("sidebar.account")}
-                aria-label={t("sidebar.account")}
-              >
-                <User className="size-3.5" />
-              </Button>
-            )}
-            {onSettingsClick && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={onSettingsClick}
-                className="h-8 w-8 p-0"
-                title={t("sidebar.settings")}
-                aria-label={t("sidebar.settings")}
-              >
-                <Settings className="size-3.5" />
-              </Button>
-            )}
-          </div>
-        )}
+        <div className="relative border-t border-border px-2 py-2">
+          <AccountMenu
+            email={email}
+            onLogout={logout ? () => { void logout(); } : undefined}
+            onSettingsClick={onSettingsClick}
+          />
+        </div>
       </div>
       <Dialog open={deleteTarget !== null} onOpenChange={open => { if (!open && !deleting) setDeleteTarget(null); }}>
         <DialogContent initialFocus={cancelDeleteRef} showCloseButton={!deleting} className="rounded-lg">

@@ -32,6 +32,8 @@ export type ProjectSwitcherProps = {
   activeProjectId: ProjectId;
   /** Compact icon-only trigger used by the collapsed sidebar rail. */
   collapsed?: boolean;
+  /** Extra classes for the expanded trigger, e.g. the pill style above the composer. */
+  triggerClassName?: string;
   onChange: (id: ProjectId) => void;
 };
 
@@ -39,6 +41,7 @@ export function ProjectSwitcher({
   projects,
   activeProjectId,
   collapsed = false,
+  triggerClassName,
   onChange,
 }: ProjectSwitcherProps) {
   const [open, setOpen] = useState(false);
@@ -66,7 +69,7 @@ export function ProjectSwitcher({
         <Button
           variant="outline"
           size="sm"
-          className="w-full justify-start"
+          className={cn("w-full justify-start", triggerClassName)}
           aria-label={triggerAria}
         >
           <FolderKanban className="size-3.5" data-icon="inline-start" aria-hidden="true" />

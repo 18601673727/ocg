@@ -106,8 +106,12 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
   const selectClass = "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
 
   return (
-    <div className="border-b border-border px-2 pt-1.5 pb-1">
-      <div className="flex min-w-0 items-center gap-2">
+    // A compact dropdown button beside the Project button, not a full-width
+    // bar: it hugs its label up to a share of the row, and long model names
+    // ellipsize. The raised panel still resolves against the composer's
+    // selector row, so it can open wider than the button itself.
+    <div className="min-w-0 max-w-[min(26rem,58%)] shrink rounded-full border border-border bg-background/80 px-1.5 shadow-sm">
+      <div className="flex min-w-0 items-center gap-1">
         <button
           type="button"
           aria-label={t("chat.executionSettings")}
@@ -115,7 +119,7 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
           aria-controls={id + "-panel"}
           aria-describedby={id + "-status"}
           onClick={() => setExpanded(value => !value)}
-          className="flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-md py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring/30"
+          className="flex min-h-9 min-w-0 flex-1 items-center gap-2 rounded-full px-1 py-1 text-left outline-none hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring/30 pointer-coarse:min-h-11"
         >
           <SlidersHorizontal className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="min-w-0 flex-1">
@@ -123,8 +127,7 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
             <span className="block truncate text-xs text-muted-foreground">
               {subtitle ?? status}
             </span>
-          </span>
-          {(busy || active) && <LockKeyhole className={`size-3.5 shrink-0 ${STATUS_TEXT['warning']}`} aria-hidden="true" />}
+          </span>          {(busy || active) && <LockKeyhole className={`size-3.5 shrink-0 ${STATUS_TEXT['warning']}`} aria-hidden="true" />}
           <ChevronDown className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", expanded && "rotate-180")} aria-hidden="true" />
         </button>
         {baseUrl && <Tooltip><TooltipTrigger render={<button
@@ -132,12 +135,12 @@ export function ModelSelector({ selection, onChange, onPreference, busy, active,
           aria-label={t(error ? "common.retry" : "chat.refreshModels")}
           disabled={busy || loading}
           onClick={() => setRefresh(value => value + 1)}
-          className="flex size-11 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40 sm:size-9"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40"
         >
           <RefreshCw className={cn("size-3.5", loading && "animate-spin")} aria-hidden="true" />
         </button>} /><TooltipContent>{t(error ? "common.retry" : "chat.refreshModels")}</TooltipContent></Tooltip>}
       </div>
-      {expanded && <div id={id + "-panel"} className="mt-2 max-h-[min(25dvh,12rem)] space-y-2 overflow-y-auto overscroll-contain border-t border-border pt-2 [@media(max-height:600px)]:max-h-[18dvh]">
+      {expanded && <div id={id + "-panel"} className="absolute bottom-full left-0 z-30 mb-2 max-h-[min(40dvh,20rem)] w-full space-y-2 overflow-y-auto overscroll-contain rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-md [@media(max-height:600px)]:max-h-[30dvh]">
         <fieldset disabled={disabled} aria-describedby={id + "-status"} className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-12">
           <legend className="sr-only">{t("chat.executionSettings")}</legend>
           <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground sm:col-span-3">

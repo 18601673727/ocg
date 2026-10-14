@@ -61,6 +61,11 @@ pub struct AuthenticationSession {
     pub user_id: Option<String>,
     pub expires_at: Option<i64>,
     pub remote_execution: bool,
+    /// The signed Cloudflare Access email address of the current operator, when
+    /// the request carried one. Display information only: identity, ownership
+    /// and revocation stay keyed by `user_id` and `session_id`. Local mode has
+    /// no signed identity to project, so this is always null there.
+    pub email: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

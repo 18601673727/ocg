@@ -5,7 +5,6 @@ import {
   ChevronsRight,
   PanelLeft,
   PanelRight,
-  Settings,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -20,7 +19,6 @@ import {
 } from "@/components/ocg/primitives";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
-import { useRemoteLogout } from "../login/access-boundary";
 
 type OcgTopbarProps = {
   session?: ChatSession;
@@ -28,14 +26,22 @@ type OcgTopbarProps = {
   inspectorOpen: boolean;
   /** When false, the job inspector toggles are hidden (for example on the ledger view). Defaults to true. */
   inspectorControls?: boolean;
-  onOpenSettings?: () => void;
   onToggleInspector: () => void;
   onOpenMobileSidebar: () => void;
   onOpenMobileInspector: () => void;
   activeView?: WorkspaceView;
   /** Canonical reconciler sync status. Only degraded states are surfaced. */
   syncStatus?: RuntimeSyncStatus | null;
+  /**
+   * Compact Project selector for the views that do not present one themselves.
+   * Chat owns its selector above the composer, so the shell withholds it here
+   * while the Chat surface is up; every other view gets it in this row.
+   */
+  projectSelector?: React.ReactNode;
 };
+
+/** Quiet floating surface shared by the title and the details control. */
+const PILL = "rounded-full border border-border/70 bg-muted/40 text-foreground";
 
 export function OcgTopbar({
   session,
@@ -43,16 +49,15 @@ export function OcgTopbar({
   projectName,
   inspectorOpen,
   inspectorControls = true,
-  onOpenSettings,
   onToggleInspector,
   onOpenMobileSidebar,
   onOpenMobileInspector,
   activeView = "chat",
   syncStatus,
+  projectSelector,
 }: OcgTopbarProps) {
   const { t } = useI18n();
-  const logout = useRemoteLogout();
-  
+
   // Map view types to i18n title keys
   const getViewTitle = (view: WorkspaceView): string => {
     const viewTitleMap: Record<WorkspaceView, string> = {
@@ -70,7 +75,7 @@ export function OcgTopbar({
     };
     return viewTitleMap[view];
   };
-  
+
   // Degraded sync states are the only ones the bar surfaces; the visual comes
   // from the shared scale so it matches the inspector and the ledger.
   const sync = syncStatus ? SYNC_STATUS[syncStatus] : null;
@@ -82,8 +87,13 @@ export function OcgTopbar({
         : "topbar.syncing",
   );
   const inspectorLabel = inspectorOpen ? t("topbar.collapseInspector") : t("topbar.expandInspector");
+  // An untitled conversation has no title to show. The pill is only drawn when
+  // there is text for it, rather than leaving an empty outline in the header.
+  const title = session && activeView === "chat" ? session.title : getViewTitle(activeView);
   return (
-    <header className="flex h-12 shrink-0 items-center gap-1.5 border-b border-border bg-background px-2 sm:px-3">
+    // The header floats over the conversation: no bottom border and no toolbar
+    // band, so the thread reads as one surface. Its controls are pills.
+    <header className="flex h-12 shrink-0 items-center gap-1.5 px-2 sm:px-3">
       {/* Mobile sidebar toggle */}
       <Tooltip>
         <TooltipTrigger
@@ -101,18 +111,18 @@ export function OcgTopbar({
         />
         <TooltipContent side="bottom">{t("topbar.openNavigation")}</TooltipContent>
       </Tooltip>
-      <div className="flex min-w-0 flex-1 items-center gap-2">
-        {session && activeView === "chat" ? (
-          <h1 className="truncate text-[13px] font-semibold tracking-tight">{session.title}</h1>
-        ) : (
-          <h1 className="truncate text-[13px] font-semibold tracking-tight">{getViewTitle(activeView)}</h1>
-        )}
-      </div>
+      {/* Conversation title, or the open workspace's name. */}
+      {title && (
+        <h1 className={cn("min-w-0 max-w-full truncate px-3 py-1.5 text-[13px] font-semibold tracking-tight", PILL)}>
+          {title}
+        </h1>
+      )}
+      {projectSelector && <div className="flex min-w-0 shrink-0 items-center">{projectSelector}</div>}
 
       {syncStatus && sync && isDegradedSyncStatus(syncStatus) && (
         <div
           className={cn(
-            "hidden shrink-0 items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs md:flex",
+            "hidden shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs md:flex",
             SURFACE_TONE[sync.tone],
             TEXT_TONE[sync.tone],
           )}
@@ -123,8 +133,9 @@ export function OcgTopbar({
         </div>
       )}
 
+      {/* The execution-details control, kept clear of the title on the right. */}
       {inspectorControls && (
-        <>
+        <div className="ml-auto flex shrink-0 items-center gap-1" data-execution-details-control="">
           {/* Mobile job inspector toggle */}
           <Tooltip>
             <TooltipTrigger
@@ -132,7 +143,7 @@ export function OcgTopbar({
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  className="size-11 rounded-md lg:hidden"
+                  className={cn("size-11 rounded-full lg:hidden", PILL)}
                   onClick={onOpenMobileInspector}
                   aria-label={t("topbar.openInspector")}
                 >
@@ -147,9 +158,9 @@ export function OcgTopbar({
             <TooltipTrigger
               render={
                 <Button
-                  variant={!inspectorOpen ? "secondary" : "ghost"}
+                  variant="ghost"
                   size="icon-xs"
-                  className="hidden lg:inline-flex"
+                  className={cn("hidden rounded-full lg:inline-flex", PILL, inspectorOpen && "bg-muted")}
                   onClick={onToggleInspector}
                   aria-label={inspectorLabel}
                   aria-expanded={inspectorOpen}
@@ -164,26 +175,7 @@ export function OcgTopbar({
             />
             <TooltipContent side="bottom">{inspectorLabel}</TooltipContent>
           </Tooltip>
-        </>
-      )}
-      {logout && <Button variant="ghost" size="sm" onClick={() => { void logout(); }}>Sign out</Button>}
-      {onOpenSettings && (
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                variant={activeView === "settings" ? "secondary" : "ghost"}
-                size="icon-xs"
-                className="size-11 rounded-md sm:size-8"
-                onClick={onOpenSettings}
-                aria-label={t("sidebar.openSettings")}
-              >
-                <Settings className="size-4" />
-              </Button>
-            }
-          />
-          <TooltipContent side="bottom">{t("sidebar.openSettings")}</TooltipContent>
-        </Tooltip>
+        </div>
       )}
     </header>
   );

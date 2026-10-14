@@ -20,6 +20,11 @@ pub(crate) struct Identity {
     pub user_id: String,
     pub expires_at: i64,
     pub session_id: String,
+    /// The verified Access `email` claim. `verify` already rejects a missing or
+    /// malformed address, so this is only `None` for identities that were never
+    /// derived from an Access JWT. It is display information; identity,
+    /// ownership and revocation stay keyed by `user_id` and `session_id`.
+    pub email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -198,6 +203,7 @@ impl Authentication {
                     user_id,
                     expires_at: claims.exp,
                     session_id,
+                    email: Some(claims.email),
                 }))
             }
         }

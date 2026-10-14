@@ -11,7 +11,7 @@ import { JobInspector } from "../execution/job-inspector";
 import { JobDraftSurface } from "../job/job-draft-surface";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
-import { useRemoteLogout } from "../login/access-boundary";
+import { ProjectSwitcher } from "../project/project-switcher";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
 import { ControlCenterSurface } from "../control-center/control-center-surface";
 import { JobExecutionSurface } from "../execution/job-execution-surface";
@@ -754,36 +754,46 @@ export function RuntimeWorkspace({
   const accounting = sessionAccounting;
   const observability = activeSession ? snapshot.observabilityBySession[activeSession.id] : undefined;
   const inspectorOpen = inspectorMode !== "collapsed";
-
-  // The sidebar footer controls are only offered where they do something real:
-  // signing out is a remote-host concern, and Settings is a workspace view.
-  const remoteLogout = useRemoteLogout();
-  const onAccountClick = useMemo(
-    () => (remoteLogout ? () => { void remoteLogout(); } : undefined),
-    [remoteLogout],
-  );
   const onSettingsClick = useCallback(() => navigate("settings"), [navigate]);
+
+  // Settings and signing out live in the sidebar's account menu, where they do
+  // something real: signing out is a remote-host concern the sidebar reads from
+  // the access boundary, and Settings is a workspace view.
+  const sidebarProps = {
+    sessions: snapshot.sessions,
+    activeSessionId: activeSession?.id ?? "",
+    onSelect: selectSession,
+    onNewChat: activeSession ? handleNewChat : handleNewProjectChat,
+    onDelete: handleDeleteChat,
+    busySessionIds,
+    runtimeStatus: snapshot.status,
+    runtimeAuthority,
+    projectName: activeProjectId ? activeProject.name : undefined,
+    activeView: view,
+    attentionCount,
+    onNavigate: navigate,
+    onSettingsClick,
+  } as const;
+
+  // The compact Project selector lives in exactly one place at a time: above
+  // the composer while the Chat surface is up, and in the header everywhere
+  // else, including the Chat states that render no composer.
+  const projectSelector = projects.length === 0 ? null : (
+    <ProjectSwitcher
+      projects={projects}
+      activeProjectId={activeProjectId}
+      triggerClassName="h-full min-h-9 rounded-full border-border/70 bg-background/80 px-2.5 text-xs shadow-sm pointer-coarse:min-h-11"
+      onChange={handleProjectChange}
+    />
+  );
+  const chatSurfaceOwnsProjectSelector =
+    view === "chat" && Boolean(activeProjectId) && historyStatus === "ready" && Boolean(activeSession);
 
   const sidebar = (
     <OcgSidebar
-      sessions={snapshot.sessions}
-      activeSessionId={activeSession?.id ?? ""}
+      {...sidebarProps}
       collapsed={sidebarCollapsed}
       onToggle={() => setSidebarCollapsed((value) => !value)}
-      onSelect={selectSession}
-      onNewChat={activeSession ? handleNewChat : handleNewProjectChat}
-      onDelete={handleDeleteChat}
-      busySessionIds={busySessionIds}
-      runtimeStatus={snapshot.status}
-      runtimeAuthority={runtimeAuthority}
-      projects={projects}
-      activeProjectId={activeProjectId}
-      onProjectChange={handleProjectChange}
-      activeView={view}
-      attentionCount={attentionCount}
-      onNavigate={navigate}
-      onAccountClick={onAccountClick}
-      onSettingsClick={onSettingsClick}
     />
   );
 
@@ -818,24 +828,9 @@ export function RuntimeWorkspace({
           )}
         >
           <OcgSidebar
-            sessions={snapshot.sessions}
-            activeSessionId={activeSession?.id ?? ""}
+            {...sidebarProps}
             collapsed={false}
             onToggle={() => setMobileNavOpen(false)}
-            onSelect={selectSession}
-            onNewChat={activeSession ? handleNewChat : handleNewProjectChat}
-            onDelete={handleDeleteChat}
-            busySessionIds={busySessionIds}
-            runtimeStatus={snapshot.status}
-            runtimeAuthority={runtimeAuthority}
-            projects={projects}
-            activeProjectId={activeProjectId}
-            onProjectChange={handleProjectChange}
-            activeView={view}
-            attentionCount={attentionCount}
-            onNavigate={navigate}
-            onAccountClick={onAccountClick}
-            onSettingsClick={onSettingsClick}
           />
         </aside>
       </div>
@@ -847,7 +842,7 @@ export function RuntimeWorkspace({
           inspectorOpen={inspectorOpen}
           inspectorControls={Boolean(activeSession) && view === "chat"}
           activeView={view}
-          onOpenSettings={() => navigate("settings")}
+          projectSelector={chatSurfaceOwnsProjectSelector ? undefined : projectSelector}
           onToggleInspector={() => startTransition(() => setInspectorMode((value) => value === "collapsed" ? "docked" : "collapsed"))}
           onOpenMobileSidebar={() => setMobileNavOpen(true)}
           onOpenMobileInspector={() => startTransition(() => setMobileInspectorOpen(true))}
@@ -980,6 +975,7 @@ export function RuntimeWorkspace({
                 queueState={runtimeSnapshot.chatQueues?.[activeSession.id]}
                 onRemoveQueued={id => client.removeQueuedMessage?.(activeSession.id, id)}
                 onResumeQueue={() => client.resumeQueue?.(activeSession.id)}
+                projectSelector={projectSelector}
                 composerSurface={activeDraft ? (
                   <JobDraftSurface
                     project={activeProject}
