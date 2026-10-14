@@ -1,0 +1,190 @@
+//! The LLM Executor, Provider and Profile an operator names by the
+//! environment, registered once and reused, and `ocg register-llm`, which
+//! registers them, prints their identities and exits. Nothing is sent to the
+//! Provider and no Job is run. The credential is named only by reference:
+//! it must be set where OCG runs, and is never stored, printed or logged.
+//! This module belongs to the executable, not to the library.
+
+use std::collections::BTreeSet;
+use std::num::NonZeroU32;
+
+use ocg::data_directory::DataDirectory;
+use ocg::database::{DatabaseError, DatabaseHandle};
+use ocg::host::{self, HostError};
+use ocg::persistence::{
+    ExecutorId, ExecutorType, LlmConfig, LlmParameters, LlmTransport, ModelCapability, NewExecutor,
+    NewLlmProvider, NewProfile, NewProfileConfig, ProfileConfig, ProfileId,
+};
+
+/// The command that registers the Control Plane's LLM target.
+pub const COMMAND: &str = "register-llm";
+/// The Provider's OpenAI-compatible endpoint, an `https://` URL.
+pub const ENDPOINT_VARIABLE: &str = "OCG_PROVIDER_ENDPOINT";
+pub const MODEL_VARIABLE: &str = "OCG_PROVIDER_MODEL";
+/// The name of the environment variable that holds the Provider's key.
+pub const CREDENTIAL_REF_VARIABLE: &str = "OCG_PROVIDER_CREDENTIAL_REF";
+/// The name of the Executor and Provider `register-llm` registers.
+const CONTROL_PLANE: &str = "control-plane";
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{0} must be set")]
+    NotConfigured(&'static str),
+    #[error("{ENDPOINT_VARIABLE} must be an https:// URL")]
+    NotHttps,
+    #[error("the variable named by {CREDENTIAL_REF_VARIABLE} is not set")]
+    CredentialMissing,
+    #[error("usage: ocg {COMMAND}")]
+    Usage,
+    #[error("database: {0}")]
+    Database(#[from] DatabaseError),
+    #[error("the host stopped before the target was registered")]
+    NotRun,
+    #[error(transparent)]
+    Host(#[from] HostError),
+}
+
+/// An LLM target: one Llm Executor for its transport, one Provider and one
+/// LLM Profile of the model, each found by what it is, or registered.
+pub struct Target {
+    /// The name of the Executor and the Provider when they are registered.
+    pub name: String,
+    pub endpoint: String,
+    pub model: String,
+    pub credential_ref: String,
+    pub capabilities: BTreeSet<ModelCapability>,
+}
+
+impl Target {
+    /// The endpoint, model and credential reference in the environment; the
+    /// credential itself is only checked to exist.
+    pub fn from_environment(
+        name: &str,
+        capabilities: BTreeSet<ModelCapability>,
+    ) -> Result<Self, Error> {
+        let variable = |name: &'static str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(Error::NotConfigured(name))
+        };
+        let endpoint = variable(ENDPOINT_VARIABLE)?;
+        if !endpoint.starts_with("https://") {
+            return Err(Error::NotHttps);
+        }
+        let model = variable(MODEL_VARIABLE)?;
+        let credential_ref = variable(CREDENTIAL_REF_VARIABLE)?;
+        if std::env::var_os(&credential_ref).is_none_or(|credential| credential.is_empty()) {
+            return Err(Error::CredentialMissing);
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            endpoint,
+            model,
+            credential_ref,
+            capabilities,
+        })
+    }
+}
+
+/// The Executor and LLM Profile of `target`, reusing those an earlier run
+/// registered under the same name, for the same endpoint, credential
+/// reference and model.
+pub async fn targets(
+    database: &DatabaseHandle,
+    target: &Target,
+) -> Result<(ExecutorId, ProfileId), DatabaseError> {
+    let transport = LlmTransport::OpenAiChatCompletions;
+    let existing = database
+        .executors(None, 1_000)
+        .await?
+        .into_iter()
+        .find(|executor| {
+            executor.name == target.name
+                && executor.executor_type == ExecutorType::Llm
+                && executor.llm_transports.contains(&transport)
+        });
+    let executor = match existing {
+        Some(executor) => executor.id,
+        None => {
+            database
+                .create_executor(NewExecutor {
+                    name: target.name.clone(),
+                    executor_type: ExecutorType::Llm,
+                    concurrency_limit: NonZeroU32::MIN,
+                    llm_transports: BTreeSet::from([transport]),
+                })
+                .await?
+        }
+    };
+    let existing = database
+        .llm_providers(None, 1_000)
+        .await?
+        .into_iter()
+        .find(|provider| {
+            provider.transport == transport
+                && provider.endpoint.as_deref() == Some(target.endpoint.as_str())
+                && provider.credential_ref.as_deref() == Some(target.credential_ref.as_str())
+        });
+    let provider = match existing {
+        Some(provider) => provider.id,
+        None => {
+            database
+                .create_llm_provider(NewLlmProvider {
+                    name: target.name.clone(),
+                    transport,
+                    endpoint: Some(target.endpoint.clone()),
+                    credential_ref: Some(target.credential_ref.clone()),
+                })
+                .await?
+        }
+    };
+    let llm = LlmConfig {
+        model: target.model.clone(),
+        parameters: LlmParameters::default(),
+        declared_capabilities: target.capabilities.clone(),
+    };
+    for profile in database.provider_profiles(provider).await? {
+        if let Some(record) = database.profile(profile).await?
+            && record.config == ProfileConfig::Llm(llm.clone())
+        {
+            return Ok((executor, profile));
+        }
+    }
+    let profile = database
+        .create_profile(NewProfile {
+            name: target.model.clone(),
+            config: NewProfileConfig::Llm {
+                provider,
+                config: llm,
+            },
+        })
+        .await?;
+    Ok((executor, profile))
+}
+
+/// `ocg register-llm`: registers, or finds, the Control Plane's chat target
+/// named by the environment, and prints the identities a submission names,
+/// as one JSON object on standard output.
+pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Error> {
+    let registered = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = registered.clone();
+    host::run_hosted(data_directory, false, move |context| async move {
+        *slot.borrow_mut() = Some(targets(context.database(), &target).await);
+    })?;
+    let (executor, llm_profile) = registered.borrow_mut().take().ok_or(Error::NotRun)??;
+    println!(
+        "{}",
+        serde_json::json!({
+            "executor": executor.to_string(),
+            "llm_profile": llm_profile.to_string(),
+        })
+    );
+    Ok(())
+}
+
+/// The target `register-llm` registers: a chat model, run by the
+/// `control-plane` Executor.
+pub fn control_plane_target() -> Result<Target, Error> {
+    Target::from_environment(CONTROL_PLANE, BTreeSet::from([ModelCapability::Chat]))
+}

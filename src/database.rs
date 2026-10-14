@@ -24,12 +24,12 @@ use crate::persistence::{
     JobInputDraft, JobInputId, JobOutputRecord, JobRecord, JobRetry, LlmProviderId,
     LlmProviderRecord, MetricsId, MetricsRecord, NewAgent, NewAttachment, NewAvailabilityStat,
     NewExecutor, NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig,
-    NewProject, NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage,
-    ObservedModel, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind,
-    OperationMarker, Profile, ProfileId, ProfileRecord, ProfileVariant, ProjectId, ProjectRecord,
-    PublishedAttachment, ReadSnapshot, RequestNumber, RequestRef, RequestSampleRecord, Timestamp,
-    ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation,
-    WrongProfileKind,
+    NewProject, NewSubmission, NewToolEvidence, ObservationCursor, ObservationFilter,
+    ObservationPage, ObservedModel, ObservedModelFilter, ObservedModelPage, OperationId,
+    OperationKind, OperationMarker, Profile, ProfileId, ProfileRecord, ProfileVariant, ProjectId,
+    ProjectRecord, PublishedAttachment, ReadSnapshot, RequestNumber, RequestRef,
+    RequestSampleRecord, SubmissionKey, SubmissionRecord, Timestamp, ToolCallRef, ToolDecision,
+    ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation, WrongProfileKind,
 };
 use crate::storage::{
     self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile,
@@ -452,6 +452,8 @@ enum Command {
     CreateLocalJobWithInput {
         job: NewJob,
         input: JobInputId,
+        /// Recorded with the Job, in the same transaction, when given.
+        submission: Option<NewSubmission>,
         reply: Reply<JobId>,
     },
     RetryJob {
@@ -618,14 +620,28 @@ impl Command {
                 |batch| persistence::create_job_with_input(batch, job, input),
             ),
             // Its marker is that of the creation; the start is part of it.
-            Self::CreateLocalJobWithInput { job, input, reply } => run(
+            Self::CreateLocalJobWithInput {
+                job,
+                input,
+                submission,
+                reply,
+            } => run(
                 database,
                 operation,
                 commit,
                 Kind::CreateJobWithInput,
                 reply,
-                |batch| {
-                    persistence::create_local_job_with_input(batch, job, input, operation.epoch)
+                |batch| match submission {
+                    None => {
+                        persistence::create_local_job_with_input(batch, job, input, operation.epoch)
+                    }
+                    Some(submission) => persistence::create_submitted_local_job(
+                        batch,
+                        job,
+                        input,
+                        operation.epoch,
+                        submission,
+                    ),
                 },
             ),
             Self::RetryJob { retry, reply } => run(
@@ -3454,7 +3470,43 @@ impl DatabaseHandle {
         job: NewJob,
         input: JobInputId,
     ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateLocalJobWithInput { job, input, reply })
+        self.submit(|reply| Command::CreateLocalJobWithInput {
+            job,
+            input,
+            submission: None,
+            reply,
+        })
+        .await
+    }
+
+    /// Like [`DatabaseHandle::create_local_job_with_input`], and records
+    /// `submission` with the Job in the same transaction. A key already
+    /// recorded refuses the creation with
+    /// [`Violation::SubmissionKeyUsed`], which names the Job the key
+    /// created; nothing of the refused creation is committed.
+    pub async fn create_submitted_local_job(
+        &self,
+        job: NewJob,
+        input: JobInputId,
+        submission: NewSubmission,
+    ) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateLocalJobWithInput {
+            job,
+            input,
+            submission: Some(submission),
+            reply,
+        })
+        .await
+    }
+
+    /// The submission recorded under `key`: the Job it created and the
+    /// fingerprint of its request. `None` when no committed Job was created
+    /// with it. A read never sees a creation whose commit is not durable.
+    pub async fn submission(
+        &self,
+        key: SubmissionKey,
+    ) -> Result<Option<SubmissionRecord>, DatabaseError> {
+        self.read(move |database| storage::read_submission(database, key))
             .await
     }
 

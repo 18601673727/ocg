@@ -1,7 +1,10 @@
 //! The local Control Plane: an opt-in, authenticated HTTP listener on the
 //! loopback interface that reads persisted Job facts for a client on the
-//! same machine. It reads only, through the host's own [`DatabaseHandle`];
-//! it owns no Job, keeps no copy of any, and changes nothing.
+//! same machine, submits Provider Jobs to the host's own execution runtime
+//! and requests their stop. It reads through the host's own
+//! [`DatabaseHandle`] and submits through the host's own
+//! [`SchedulerHandle`]; it keeps no copy of any Job, and the runtime, not
+//! the listener or a request, owns every Job it submits.
 //!
 //! It is enabled only when the operator sets both [`PORT_VARIABLE`] and
 //! [`TOKEN_VARIABLE`]; setting one without the other, or a token that is
@@ -15,13 +18,16 @@
 //!
 //! Every request must:
 //!
-//! - use `GET`;
+//! - use `GET`, or `POST` on a route that submits or stops;
 //! - name the listener exactly in `Host`: `127.0.0.1:<port>` or
 //!   `localhost:<port>` with the bound port, so a page served from any
 //!   other name, rebound to this address, is refused;
 //! - when it carries `Origin`, name the same origin over `http`, and when
 //!   it carries `Sec-Fetch-Site`, be `same-origin` or `none`;
-//! - carry `Authorization: Bearer <token>` with the configured token.
+//! - carry `Authorization: Bearer <token>` with the configured token;
+//! - carry no body, except a submission, whose body must be JSON, declared
+//!   `application/json` with its one `Content-Length`, at most
+//!   [`MAX_SUBMISSION_BYTES`].
 //!
 //! The connection's loopback peer authorizes nothing. No response carries
 //! a CORS header, a cookie or the token, and no route serves a file. A
@@ -38,10 +44,33 @@
 //! - `GET /api/v1/jobs/{job}/outputs?after_seq=N&limit=M`: the Job's
 //!   outputs as stored, in `seq` order, strictly after `after_seq`, at most
 //!   `limit` ([`MAX_OUTPUT_PAGE`]) of them, with the cursor of the next page.
+//! - `POST /api/v1/jobs`: submits one Provider Job, under the request's one
+//!   `Idempotency-Key`, of `{"llm_profile": "profile:<n>", "executor":
+//!   "executor:<n>", "objective": "...", "name": "..."}`, `name` optional:
+//!   an existing LLM Profile and an Executor that can run it, both checked
+//!   here and again when the Job is created. No tool is offered, and
+//!   nothing of a Provider, credential or command is accepted. The answer
+//!   is `{"admission": {"status", "job"}}`: `201` when this request created
+//!   the Job, `200` when the key already named it, `202` with `pending`
+//!   when the admission did not end within a bounded wait; it runs on, and
+//!   the key is looked up later. The answer never waits for the Provider.
+//!   A key used for another request is `409`; a Job that may exist but
+//!   cannot be confirmed is `500` `admission_uncertain`, and the key is not
+//!   submitted again while that lasts. See [`submissions`].
+//! - `GET /api/v1/admissions`: what the request's `Idempotency-Key`
+//!   created: `{"admission": {"status", "job"}}`, with `status` one of
+//!   `admitted` (with its Job), `pending`, `uncertain` or `not_found`.
+//! - `POST /api/v1/jobs/{job}/stop`: requests the stop of a Job this
+//!   listener admitted: `202` `requested` once the request reached its
+//!   execution, `200` `already_settled` once its outcome is recorded, `409`
+//!   `not_stoppable` for a Job with no execution here, such as one of an
+//!   earlier process. A requested stop is not an outcome: the Job's record
+//!   says how it settled.
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aws_lc_rs::constant_time::verify_slices_are_equal;
 use aws_lc_rs::digest::{SHA256, digest};
@@ -55,7 +84,10 @@ use ntex::web::{self, App, HttpRequest, HttpResponse, HttpServer};
 use serde_json::{Value, json};
 
 use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
+use crate::orchestration::execution_runtime::SchedulerHandle;
 use crate::persistence::{ExecutionMode, JobId, JobOutputRecord, JobRecord, OutputKind};
+
+mod submissions;
 
 /// The loopback TCP port the listener binds, from 1 to 65535.
 pub const PORT_VARIABLE: &str = "OCG_CONTROL_PORT";
@@ -71,6 +103,9 @@ pub const MIN_TOKEN_CHARS: usize = 32;
 const MAX_TOKEN_CHARS: usize = 512;
 /// The fewest distinct characters a token may have.
 const MIN_TOKEN_DISTINCT: usize = 8;
+
+/// The largest submission body, in bytes.
+pub const MAX_SUBMISSION_BYTES: usize = 64 * 1024;
 
 /// The most outputs one page returns, and the default.
 pub const MAX_OUTPUT_PAGE: usize = 100;
@@ -88,6 +123,10 @@ const RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// How long a stop waits for requests in flight before it closes them.
 const STOP_TIMEOUT: Seconds = Seconds(5);
+
+/// How long a submission waits for its admission before it answers
+/// `pending`. The admission runs on either way.
+const ADMISSION_WAIT: Duration = Duration::from_secs(3);
 
 /// The bearer token. Its value is never displayed.
 #[derive(Clone)]
@@ -132,6 +171,8 @@ pub struct ControlPlaneConfig {
     token: Token,
     /// The largest response body.
     response_bytes: usize,
+    /// How long a submission waits for its admission.
+    admission_wait: Duration,
 }
 
 impl ControlPlaneConfig {
@@ -194,6 +235,7 @@ impl ControlPlaneConfig {
             port,
             token: Token(token.into()),
             response_bytes: RESPONSE_BYTES,
+            admission_wait: ADMISSION_WAIT,
         })
     }
 
@@ -205,6 +247,12 @@ impl ControlPlaneConfig {
     #[cfg(test)]
     pub(crate) fn with_response_bytes(mut self, bytes: usize) -> Self {
         self.response_bytes = bytes;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_admission_wait(mut self, wait: Duration) -> Self {
+        self.admission_wait = wait;
         self
     }
 }
@@ -234,16 +282,23 @@ pub struct ControlPlane {
     address: SocketAddr,
     server: Server,
     thread: std::thread::JoinHandle<()>,
+    #[cfg(test)]
+    shared: Arc<Shared>,
 }
 
 impl ControlPlane {
     /// Binds `127.0.0.1` at the configured port, then starts answering on
     /// a thread of its own. Nothing is answered unless the bind succeeded.
+    /// Jobs are submitted to `scheduler`, which must be the host's own.
     ///
     /// # Errors
     ///
     /// Returns why the listener cannot be bound.
-    pub fn start(config: ControlPlaneConfig, database: DatabaseHandle) -> Result<Self, StartError> {
+    pub fn start(
+        config: ControlPlaneConfig,
+        database: DatabaseHandle,
+        scheduler: SchedulerHandle,
+    ) -> Result<Self, StartError> {
         let bind = |source| StartError::Bind {
             port: config.port,
             source,
@@ -252,10 +307,15 @@ impl ControlPlane {
         let address = listener.local_addr().map_err(bind)?;
         let shared = Arc::new(Shared {
             database,
+            scheduler,
+            submissions: submissions::Registry::default(),
             token: config.token,
             port: address.port(),
             response_bytes: config.response_bytes,
+            admission_wait: config.admission_wait,
         });
+        #[cfg(test)]
+        let kept = shared.clone();
         let (started, starting) = flume::bounded(1);
         let thread = std::thread::Builder::new()
             .name("ocg-control-plane".to_owned())
@@ -314,6 +374,8 @@ impl ControlPlane {
             address,
             server,
             thread,
+            #[cfg(test)]
+            shared: kept,
         })
     }
 
@@ -322,9 +384,21 @@ impl ControlPlane {
         self.address
     }
 
+    /// How many Jobs it admitted whose execution has not returned, and how
+    /// many keys it holds unresolved.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> (usize, usize) {
+        (
+            self.shared.submissions.running(),
+            self.shared.submissions.unresolved(),
+        )
+    }
+
     /// Stops accepting, lets requests in flight finish within a bounded
     /// time, then closes them and the listening socket, and joins the
-    /// listener's thread.
+    /// listener's thread. Admissions still running are dropped with it:
+    /// none of them owns its Job, which the execution runtime settles or
+    /// refuses as it stops, and whose record a later lookup reads.
     ///
     /// # Errors
     ///
@@ -338,16 +412,22 @@ impl ControlPlane {
 /// What every request shares.
 struct Shared {
     database: DatabaseHandle,
+    scheduler: SchedulerHandle,
+    submissions: submissions::Registry,
     token: Token,
     port: u16,
     response_bytes: usize,
+    admission_wait: Duration,
 }
 
 /// A refused or failed request: its status and a fixed code and message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Refusal {
     status: StatusCode,
     code: &'static str,
     message: &'static str,
+    /// The methods a `405` names.
+    allow: &'static str,
 }
 
 impl Refusal {
@@ -356,6 +436,7 @@ impl Refusal {
             status,
             code,
             message,
+            allow: "GET",
         }
     }
 
@@ -375,9 +456,25 @@ impl Refusal {
         if self.status == StatusCode::METHOD_NOT_ALLOWED {
             response
                 .headers_mut()
-                .insert(header::ALLOW, HeaderValue::from_static("GET"));
+                .insert(header::ALLOW, HeaderValue::from_static(self.allow));
         }
         response
+    }
+}
+
+/// An answered request: its status and JSON body.
+struct Reply {
+    status: StatusCode,
+    body: Value,
+}
+
+impl Reply {
+    fn new(status: StatusCode, body: Value) -> Self {
+        Self { status, body }
+    }
+
+    fn ok(body: Value) -> Self {
+        Self::new(StatusCode::OK, body)
     }
 }
 
@@ -408,6 +505,11 @@ const METHOD_NOT_ALLOWED: Refusal = Refusal::new(
     "method_not_allowed",
     "only GET is accepted",
 );
+const ONLY_POST: Refusal = Refusal {
+    message: "only POST is accepted",
+    allow: "POST",
+    ..METHOD_NOT_ALLOWED
+};
 const URI_TOO_LONG: Refusal = Refusal::new(
     StatusCode::URI_TOO_LONG,
     "uri_too_long",
@@ -422,6 +524,21 @@ const BODY_NOT_ACCEPTED: Refusal = Refusal::new(
     StatusCode::PAYLOAD_TOO_LARGE,
     "body_not_accepted",
     "a request may not carry a body",
+);
+const BODY_TOO_LARGE: Refusal = Refusal::new(
+    StatusCode::PAYLOAD_TOO_LARGE,
+    "body_too_large",
+    "the body is larger than a submission may be",
+);
+const LENGTH_REQUIRED: Refusal = Refusal::new(
+    StatusCode::LENGTH_REQUIRED,
+    "length_required",
+    "a submission must declare its one Content-Length and no Transfer-Encoding",
+);
+const UNSUPPORTED_MEDIA_TYPE: Refusal = Refusal::new(
+    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+    "unsupported_media_type",
+    "a submission must be application/json",
 );
 const OUTPUT_TOO_LARGE: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -480,13 +597,30 @@ fn json_response(status: StatusCode, body: &Value) -> HttpResponse {
 
 /// Answers one request: refuses it unless it passes every check, in order,
 /// then routes it.
-async fn answer(request: HttpRequest, shared: web::types::State<Arc<Shared>>) -> HttpResponse {
+async fn answer(
+    request: HttpRequest,
+    payload: web::types::Payload,
+    shared: web::types::State<Arc<Shared>>,
+) -> HttpResponse {
     match admit(&request, &shared).and_then(|()| route(&request)) {
-        Ok(route) => match respond(route, &shared).await {
-            Ok(body) => json_response(StatusCode::OK, &body),
+        Ok(route) => match respond(route, &request, payload, &shared).await {
+            Ok(reply) => json_response(reply.status, &reply.body),
             Err(refusal) => refusal.response(),
         },
         Err(refusal) => refusal.response(),
+    }
+}
+
+/// Whether `path` names a route that is submitted to with `POST`: Job
+/// submission and a Job's stop.
+fn takes_post(path: &str) -> bool {
+    match path.strip_prefix("/api/v1/") {
+        Some("jobs") => true,
+        Some(rest) => rest
+            .strip_prefix("jobs/")
+            .and_then(|rest| rest.strip_suffix("/stop"))
+            .is_some_and(|job| !job.contains('/')),
+        None => false,
     }
 }
 
@@ -503,8 +637,14 @@ fn admit(request: &HttpRequest, shared: &Shared) -> Result<(), Refusal> {
     if request.path().len() > MAX_PATH_BYTES || request.query_string().len() > MAX_QUERY_BYTES {
         return Err(URI_TOO_LONG);
     }
-    if request.method() != Method::GET {
-        return Err(METHOD_NOT_ALLOWED);
+    let takes_post = takes_post(request.path());
+    let method = request.method();
+    if method != Method::GET && !(takes_post && method == Method::POST) {
+        return Err(if takes_post {
+            ONLY_POST
+        } else {
+            METHOD_NOT_ALLOWED
+        });
     }
     let Some(host) = names_listener(headers, shared.port) else {
         return Err(FORBIDDEN_HOST);
@@ -514,6 +654,9 @@ fn admit(request: &HttpRequest, shared: &Shared) -> Result<(), Refusal> {
     }
     if !authenticated(headers, &shared.token) {
         return Err(UNAUTHENTICATED);
+    }
+    if method == Method::POST && request.path() == "/api/v1/jobs" {
+        return submission_body(headers);
     }
     let length = headers.get_all(header::CONTENT_LENGTH).collect::<Vec<_>>();
     if headers.contains_key(header::TRANSFER_ENCODING)
@@ -525,6 +668,51 @@ fn admit(request: &HttpRequest, shared: &Shared) -> Result<(), Refusal> {
         return Err(BODY_NOT_ACCEPTED);
     }
     Ok(())
+}
+
+/// A submission's body is declared JSON, with exactly one length, and no
+/// larger than a submission may be, before any of it is read.
+fn submission_body(headers: &HeaderMap) -> Result<(), Refusal> {
+    let mut lengths = headers.get_all(header::CONTENT_LENGTH);
+    let length = match (lengths.next(), lengths.next()) {
+        (Some(length), None) if !headers.contains_key(header::TRANSFER_ENCODING) => length,
+        _ => return Err(LENGTH_REQUIRED),
+    };
+    let length = length
+        .to_str()
+        .ok()
+        .and_then(decimal::<usize>)
+        .ok_or(LENGTH_REQUIRED)?;
+    if length > MAX_SUBMISSION_BYTES {
+        return Err(BODY_TOO_LARGE);
+    }
+    let json = single(headers, &header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let mut parts = value.split(';').map(str::trim);
+            parts
+                .next()
+                .is_some_and(|media| media.eq_ignore_ascii_case("application/json"))
+                && parts.all(|parameter| parameter.eq_ignore_ascii_case("charset=utf-8"))
+        });
+    if json {
+        Ok(())
+    } else {
+        Err(UNSUPPORTED_MEDIA_TYPE)
+    }
+}
+
+/// The body, whole, refused once it exceeds `limit` bytes.
+async fn read_body(mut payload: web::types::Payload, limit: usize) -> Result<Vec<u8>, Refusal> {
+    let mut body = Vec::new();
+    while let Some(chunk) = payload.recv().await {
+        let chunk = chunk.map_err(|_| submissions::INVALID_BODY)?;
+        if body.len() + chunk.len() > limit {
+            return Err(BODY_TOO_LARGE);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// The only value of `name`, if it has exactly one.
@@ -584,6 +772,9 @@ enum Route {
         after_seq: Option<i64>,
         limit: usize,
     },
+    Submit,
+    Admission,
+    Stop(JobId),
 }
 
 fn route(request: &HttpRequest) -> Result<Route, Refusal> {
@@ -594,8 +785,19 @@ fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         .ok_or(NOT_FOUND)?
         .split('/')
         .collect::<Vec<_>>();
+    if request.method() == Method::POST {
+        return match segments.as_slice() {
+            ["jobs"] => no_query(query).map(|()| Route::Submit),
+            ["jobs", job, "stop"] => {
+                let job = job_id(job)?;
+                no_query(query).map(|()| Route::Stop(job))
+            }
+            _ => Err(NOT_FOUND),
+        };
+    }
     match segments.as_slice() {
         ["health"] => no_query(query).map(|()| Route::Health),
+        ["admissions"] => no_query(query).map(|()| Route::Admission),
         ["jobs", job] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
@@ -662,19 +864,37 @@ fn output_query(query: &str) -> Result<(Option<i64>, usize), Refusal> {
     Ok((after_seq, limit.unwrap_or(DEFAULT_OUTPUT_PAGE)))
 }
 
-async fn respond(route: Route, shared: &Shared) -> Result<Value, Refusal> {
+async fn respond(
+    route: Route,
+    request: &HttpRequest,
+    payload: web::types::Payload,
+    shared: &Arc<Shared>,
+) -> Result<Reply, Refusal> {
     let database = &shared.database;
     match route {
-        Route::Health => Ok(health(database).await),
+        Route::Health => Ok(Reply::ok(health(database).await)),
         Route::Job(job) => {
             let record = database.job(job).await?.ok_or(JOB_NOT_FOUND)?;
-            Ok(json!({"api_version": API_VERSION, "job": job_json(&record)?}))
+            Ok(Reply::ok(
+                json!({"api_version": API_VERSION, "job": job_json(&record)?}),
+            ))
         }
         Route::Outputs {
             job,
             after_seq,
             limit,
-        } => outputs(shared, job, after_seq, limit).await,
+        } => outputs(shared, job, after_seq, limit).await.map(Reply::ok),
+        Route::Submit => {
+            let key = submissions::idempotency_key(request.headers())?;
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let job = submissions::JobRequest::parse(&body)?;
+            submissions::submit(shared, key, job).await
+        }
+        Route::Admission => {
+            let key = submissions::idempotency_key(request.headers())?;
+            submissions::lookup(shared, key).await
+        }
+        Route::Stop(job) => submissions::stop(shared, job).await,
     }
 }
 

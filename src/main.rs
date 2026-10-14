@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use ocg::control_plane::ControlPlaneConfig;
 use ocg::data_directory::DataDirectory;
 
+mod llm_target;
 #[cfg(unix)]
 mod workspace_job;
 
@@ -24,8 +25,10 @@ fn main() -> ExitCode {
 /// `workspace-code <objective>` one that may also run its build and tests,
 /// and `workspace-vision <image-path> <objective>` one that stores an image
 /// of it as an Attachment and sends it with the objective, see
-/// `workspace_job`. Without arguments, the local Control Plane is served
-/// too when it is configured, see [`ocg::control_plane`].
+/// `workspace_job`. `register-llm` registers the LLM target that Control
+/// Plane submissions name, prints its identities and exits, see
+/// `llm_target`. Without arguments, the local Control Plane is served too
+/// when it is configured, see [`ocg::control_plane`].
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
@@ -45,6 +48,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let data_directory = DataDirectory::from_environment()?;
             eprintln!("OCG data directory: {}", data_directory.root().display());
             return Ok(workspace_job::run(&data_directory, config)?);
+        }
+        if command == llm_target::COMMAND {
+            if arguments.next().is_some() {
+                return Err(llm_target::Error::Usage.into());
+            }
+            let target = llm_target::control_plane_target()?;
+            let data_directory = DataDirectory::from_environment()?;
+            eprintln!("OCG data directory: {}", data_directory.root().display());
+            return Ok(llm_target::register(&data_directory, target)?);
         }
         return Err(format!("unknown command `{command}`").into());
     }

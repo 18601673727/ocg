@@ -274,8 +274,8 @@ fn protection_notice(
 
 /// Runs the components that need the host's async runtime, waits for
 /// `until_stopped`, then stops everything it was given, in this order: the
-/// Control Plane, if any, so no request reads past this point; the
-/// execution runtime, so no submission starts once stopping begins; log
+/// Control Plane, if any, so no request reads or submits past this point;
+/// the execution runtime, so no submission starts once stopping begins; log
 /// cleanup; the aggregation service; the logger. The caller closes the
 /// database after it.
 async fn serve<F>(
@@ -381,7 +381,7 @@ where
             None => Some(None),
             Some(config) => {
                 report.attempted.push(Phase::ControlPlane);
-                match ControlPlane::start(config, handle.clone()) {
+                match ControlPlane::start(config, handle.clone(), execution.scheduler()) {
                     Ok(listener) => Some(Some(listener)),
                     Err(error) => {
                         log::error!("{error}");

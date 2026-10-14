@@ -465,6 +465,80 @@ impl fmt::Debug for ContentDigest {
     }
 }
 
+/// What a client's idempotency key is recorded as: a SHA-256 digest of it,
+/// computed by its caller. The key itself is never stored, and only the
+/// first bytes of the digest are ever displayed.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubmissionKey([u8; 32]);
+
+impl SubmissionKey {
+    #[must_use]
+    pub const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SubmissionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SubmissionKey(")?;
+        self.0[..4]
+            .iter()
+            .try_for_each(|byte| write!(f, "{byte:02x}"))?;
+        f.write_str("…)")
+    }
+}
+
+/// A SHA-256 digest of a submission's normalized request, computed by its
+/// caller, so a key reused for another request is told apart.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestFingerprint([u8; 32]);
+
+impl RequestFingerprint {
+    #[must_use]
+    pub const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RequestFingerprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RequestFingerprint(")?;
+        self.0[..4]
+            .iter()
+            .try_for_each(|byte| write!(f, "{byte:02x}"))?;
+        f.write_str("…)")
+    }
+}
+
+/// The idempotency of one submitted Job: recorded in the transaction that
+/// creates the Job, and refused there when its key is already recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewSubmission {
+    pub key: SubmissionKey,
+    pub fingerprint: RequestFingerprint,
+}
+
+/// A recorded submission: the one Job its key ever created, and the request
+/// that created it. Never changed once committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubmissionRecord {
+    pub key: SubmissionKey,
+    pub fingerprint: RequestFingerprint,
+    pub job: JobId,
+    /// When the Job was created with it.
+    pub recorded_at: Timestamp,
+}
+
 /// Where an Attachment's content came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentOrigin {
@@ -1888,6 +1962,10 @@ pub enum Violation {
     /// A new input may not carry an Attachment whose content is gone.
     #[error("{0} was cleaned up, so its content can no longer be used")]
     AttachmentCleanedUp(AttachmentId),
+    /// A submission key names one Job forever; `same_request` says whether
+    /// the refused creation was for the request that created it.
+    #[error("the submission key already created {job}")]
+    SubmissionKeyUsed { job: JobId, same_request: bool },
 }
 
 pub(crate) type OpResult<T> = Result<(T, MarkerSubjects), BatchError>;
@@ -2147,6 +2225,34 @@ pub(crate) fn create_local_job_with_input(
 ) -> OpResult<JobId> {
     let (id, subjects) = create_job_with_input(batch, job, input)?;
     start_local_job(batch, id, epoch)?;
+    Ok((id, subjects))
+}
+
+/// Like [`create_local_job_with_input`], and records `submission` as the
+/// one submission that created the Job, in the same transaction. A key that
+/// is already recorded refuses the whole creation, so a key never names two
+/// Jobs, and a recorded key always names the Job created with it.
+pub(crate) fn create_submitted_local_job(
+    batch: &mut Batch,
+    job: NewJob,
+    input: JobInputId,
+    epoch: u64,
+    submission: NewSubmission,
+) -> OpResult<JobId> {
+    if let Some(recorded) = batch.submission(submission.key)? {
+        return batch.reject(Violation::SubmissionKeyUsed {
+            job: recorded.job,
+            same_request: recorded.fingerprint == submission.fingerprint,
+        });
+    }
+    let (id, subjects) = create_local_job_with_input(batch, job, input, epoch)?;
+    let recorded_at = batch.now();
+    batch.insert_submission(&SubmissionRecord {
+        key: submission.key,
+        fingerprint: submission.fingerprint,
+        job: id,
+        recorded_at,
+    })?;
     Ok((id, subjects))
 }
 

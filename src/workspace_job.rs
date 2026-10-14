@@ -29,7 +29,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -50,16 +49,16 @@ use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceErro
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 use ocg::orchestration::{workspace_command, workspace_discovery, workspace_write};
 use ocg::persistence::{
-    AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, ExecutionMode, ExecutorId,
-    ExecutorType, JobId, JobInputDraft, LlmConfig, LlmParameters, LlmTransport, MetricsRecord,
-    ModelCapability, NewAttachment, NewExecutor, NewJob, NewLlmProvider, NewProfile,
-    NewProfileConfig, OutputKind, ProfileConfig, ProfileId, RequestNumber, ToolDecision,
-    ToolOutcome,
+    AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, ExecutionMode, JobId,
+    JobInputDraft, MetricsRecord, ModelCapability, NewAttachment, NewJob, OutputKind,
+    RequestNumber, ToolDecision, ToolOutcome,
 };
 use ocg::provider_execution::{
     CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,
 };
 use ocg::token_usage::{TokenCount, TokenRequestSample};
+
+use crate::llm_target::{Target, targets};
 
 /// The command that selects the read-only mode, as the executable's only
 /// argument before the objective.
@@ -76,11 +75,7 @@ pub const CODE_COMMAND: &str = "workspace-code";
 pub const VISION_COMMAND: &str = "workspace-vision";
 /// The Workspace the Job may read from: an absolute path to a directory.
 pub const WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
-/// The Provider's OpenAI-compatible endpoint, an `https://` URL.
-pub const ENDPOINT_VARIABLE: &str = "OCG_PROVIDER_ENDPOINT";
-pub const MODEL_VARIABLE: &str = "OCG_PROVIDER_MODEL";
-/// The name of the environment variable that holds the Provider's key.
-pub const CREDENTIAL_REF_VARIABLE: &str = "OCG_PROVIDER_CREDENTIAL_REF";
+pub use crate::llm_target::{CREDENTIAL_REF_VARIABLE, ENDPOINT_VARIABLE, MODEL_VARIABLE};
 
 /// What the one Job may do in its Workspace, as its command chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -366,7 +361,14 @@ async fn submit(
     // Registered first, so a signal while the Job is prepared cancels it too.
     let signal = ntex::rt::signals::signal();
     let database = context.database();
-    let (executor, llm_profile) = targets(database, &config).await?;
+    let target = Target {
+        name: config.mode.command().to_owned(),
+        endpoint: config.endpoint,
+        model: config.model,
+        credential_ref: config.credential_ref,
+        capabilities: config.mode.capabilities(),
+    };
+    let (executor, llm_profile) = targets(database, &target).await?;
     let mut attachments = Vec::new();
     if let Some(image) = image {
         attachments.push(database.create_user_attachment(image).await?);
@@ -449,82 +451,6 @@ fn settled_job(error: &ExecutionRuntimeError) -> Option<JobId> {
         | ExecutionRuntimeError::StopNotConfirmed { receipt, .. } => Some(receipt.job),
         _ => None,
     }
-}
-
-/// The Executor and LLM Profile for `config`, reusing those an earlier run
-/// of its mode registered for the same endpoint, credential reference and
-/// model.
-async fn targets(
-    database: &DatabaseHandle,
-    config: &Config,
-) -> Result<(ExecutorId, ProfileId), DatabaseError> {
-    let transport = LlmTransport::OpenAiChatCompletions;
-    let existing = database
-        .executors(None, 1_000)
-        .await?
-        .into_iter()
-        .find(|executor| {
-            executor.name == config.mode.command()
-                && executor.executor_type == ExecutorType::Llm
-                && executor.llm_transports.contains(&transport)
-        });
-    let executor = match existing {
-        Some(executor) => executor.id,
-        None => {
-            database
-                .create_executor(NewExecutor {
-                    name: config.mode.command().to_owned(),
-                    executor_type: ExecutorType::Llm,
-                    concurrency_limit: NonZeroU32::MIN,
-                    llm_transports: BTreeSet::from([transport]),
-                })
-                .await?
-        }
-    };
-    let existing = database
-        .llm_providers(None, 1_000)
-        .await?
-        .into_iter()
-        .find(|provider| {
-            provider.transport == transport
-                && provider.endpoint.as_deref() == Some(config.endpoint.as_str())
-                && provider.credential_ref.as_deref() == Some(config.credential_ref.as_str())
-        });
-    let provider = match existing {
-        Some(provider) => provider.id,
-        None => {
-            database
-                .create_llm_provider(NewLlmProvider {
-                    name: config.mode.command().to_owned(),
-                    transport,
-                    endpoint: Some(config.endpoint.clone()),
-                    credential_ref: Some(config.credential_ref.clone()),
-                })
-                .await?
-        }
-    };
-    let llm = LlmConfig {
-        model: config.model.clone(),
-        parameters: LlmParameters::default(),
-        declared_capabilities: config.mode.capabilities(),
-    };
-    for profile in database.provider_profiles(provider).await? {
-        if let Some(record) = database.profile(profile).await?
-            && record.config == ProfileConfig::Llm(llm.clone())
-        {
-            return Ok((executor, profile));
-        }
-    }
-    let profile = database
-        .create_profile(NewProfile {
-            name: config.model.clone(),
-            config: NewProfileConfig::Llm {
-                provider,
-                config: llm,
-            },
-        })
-        .await?;
-    Ok((executor, profile))
 }
 
 /// What the database recorded of the settled Job: its outcome, its result,
@@ -745,8 +671,9 @@ impl std::fmt::Display for TokenDisplay {
 mod tests {
     use ocg::openai_compatible::NormalizedUsage;
     use ocg::persistence::{
-        AvailabilityObservation, AvailabilityStatId, FrozenLlmConfig, LlmProviderId, LlmTarget,
-        Measurements, MetricsId, ProviderSnapshot, Timestamp,
+        AvailabilityObservation, AvailabilityStatId, FrozenLlmConfig, LlmConfig, LlmParameters,
+        LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsId, ProfileId,
+        ProviderSnapshot, Timestamp,
     };
     use ocg::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 

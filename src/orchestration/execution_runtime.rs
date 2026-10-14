@@ -31,9 +31,9 @@ use crate::persistence::{
     AppendedOutput, AttachmentId, AuthorizationBasis, ExecutorId, FinalResult,
     IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobInputId, JobOutcome,
     MAX_STORED_TOOL_ARGUMENTS_BYTES, MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements,
-    NewAvailabilityStat, NewJob, NewJobOutput, NewMetrics, NewToolEvidence, NotInvokedReason,
-    RequestNumber, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolOutcome,
-    ToolOutcomeKind, ToolPayload, UncertainCause, Violation, WithheldReason,
+    NewAvailabilityStat, NewJob, NewJobOutput, NewMetrics, NewSubmission, NewToolEvidence,
+    NotInvokedReason, RequestNumber, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
+    ToolOutcome, ToolOutcomeKind, ToolPayload, UncertainCause, Violation, WithheldReason,
 };
 use crate::provider_execution::{
     self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
@@ -449,10 +449,11 @@ struct ProviderReply {
     settled: ExecutionReply,
 }
 
-/// One submitted plan with its caller's reply.
+/// One submitted plan with its caller's reply. A provider plan may carry
+/// the submission to record with its Job.
 enum Submission {
     Plan(ExecutionPlan, ExecutionReply),
-    Provider(ProviderExecutionPlan, ProviderReply),
+    Provider(ProviderExecutionPlan, Option<NewSubmission>, ProviderReply),
 }
 
 impl Submission {
@@ -467,7 +468,7 @@ impl Submission {
             Self::Plan(_, reply) => {
                 reply.send(Err(error)).ok();
             }
-            Self::Provider(_, reply) => {
+            Self::Provider(_, _, reply) => {
                 reply
                     .started
                     .send(Err(AdmissionError::NotAdmitted(error)))
@@ -571,7 +572,34 @@ impl SchedulerHandle {
     /// Returns why no Job is known to have been admitted.
     pub async fn admit_provider(
         &self,
+        plan: ProviderExecutionPlan,
+    ) -> Result<AdmittedJob, AdmissionError> {
+        self.admit(plan, None).await
+    }
+
+    /// Like [`Self::admit_provider`], and records `submission` with the
+    /// plan's Job, in the transaction that creates and starts it, so the
+    /// Job exists only with its submission, and the submission only with its
+    /// Job. A key already recorded refuses the plan before its Job is
+    /// created, as [`AdmissionError::NotAdmitted`] with
+    /// [`DatabaseError::Rejected`] of [`Violation::SubmissionKeyUsed`],
+    /// which names the Job the key created.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_provider`].
+    pub async fn admit_submitted_provider(
+        &self,
+        plan: ProviderExecutionPlan,
+        submission: NewSubmission,
+    ) -> Result<AdmittedJob, AdmissionError> {
+        self.admit(plan, Some(submission)).await
+    }
+
+    async fn admit(
+        &self,
         mut plan: ProviderExecutionPlan,
+        submission: Option<NewSubmission>,
     ) -> Result<AdmittedJob, AdmissionError> {
         // The execution observes a cancellation of its own, which the
         // plan's token, however widely it is shared, still cancels.
@@ -581,6 +609,7 @@ impl SchedulerHandle {
         let (settled, settlement) = flume::bounded(1);
         self.submit(Submission::Provider(
             plan,
+            submission,
             ProviderReply { started, settled },
         ))
         .map_err(AdmissionError::NotAdmitted)?;
@@ -889,7 +918,7 @@ async fn executor_loop(
                 continue;
             }
             state.current = match &submission {
-                Submission::Provider(plan, _) => Some(plan.provider_config.cancellation.clone()),
+                Submission::Provider(plan, ..) => Some(plan.provider_config.cancellation.clone()),
                 Submission::Plan(..) => None,
             };
         }
@@ -899,8 +928,9 @@ async fn executor_loop(
                 lock(&state).current = None;
                 reply.send(result).ok();
             }
-            Submission::Provider(plan, reply) => {
-                let result = execute_provider_plan(database.clone(), plan, &reply.started).await;
+            Submission::Provider(plan, submission, reply) => {
+                let result =
+                    execute_provider_plan(database.clone(), plan, submission, &reply.started).await;
                 lock(&state).current = None;
                 // A plan that never started has had its answer.
                 if let Some(result) = result {
@@ -977,9 +1007,10 @@ pub(crate) async fn confirm_stopped(
 async fn execute_provider_plan(
     database: DatabaseHandle,
     mut plan: ProviderExecutionPlan,
+    submission: Option<NewSubmission>,
     started: &flume::Sender<Result<StartedJob, AdmissionError>>,
 ) -> Option<Result<ExecutionReceipt, ExecutionRuntimeError>> {
-    let offered = match start_provider_job(&database, &mut plan).await {
+    let offered = match start_provider_job(&database, &mut plan, submission).await {
         Ok((job, offered)) => {
             started.send(Ok(job)).ok();
             (job, offered)
@@ -995,10 +1026,12 @@ async fn execute_provider_plan(
 /// Creates and locally starts the Job of a provider plan, once the plan is
 /// checked, and returns it with the tool definitions to offer. Nothing is
 /// persisted unless the Executor is registered, the tool limits are valid
-/// and the tools can still be offered.
+/// and the tools can still be offered. A `submission` is recorded with the
+/// Job in the transaction that creates it.
 async fn start_provider_job(
     database: &DatabaseHandle,
     plan: &mut ProviderExecutionPlan,
+    submission: Option<NewSubmission>,
 ) -> Result<(StartedJob, Option<Vec<ToolWire>>), AdmissionError> {
     let refused = AdmissionError::NotAdmitted;
     let executor = plan.executor_id;
@@ -1033,15 +1066,22 @@ async fn start_provider_job(
         .map_err(|error| refused(error.into()))?;
     #[cfg(test)]
     provider_seam::before_creation(plan.job.name.as_deref());
-    let job = database
-        .create_local_job_with_input(plan.job.clone(), input)
-        .await
-        .map_err(|error| match error.command_outcome() {
-            Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted) => {
-                refused(error.into())
-            }
-            Some(CommandOutcome::Unknown) | None => AdmissionError::Uncertain(error.into()),
-        })?;
+    let created = match submission {
+        None => {
+            database
+                .create_local_job_with_input(plan.job.clone(), input)
+                .await
+        }
+        Some(submission) => {
+            database
+                .create_submitted_local_job(plan.job.clone(), input, submission)
+                .await
+        }
+    };
+    let job = created.map_err(|error| match error.command_outcome() {
+        Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted) => refused(error.into()),
+        Some(CommandOutcome::Unknown) | None => AdmissionError::Uncertain(error.into()),
+    })?;
     Ok((
         StartedJob {
             executor,

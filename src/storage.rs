@@ -51,9 +51,10 @@ use crate::persistence::{
     ObservedModel, ObservedModelChoice, ObservedModelFilter, ObservedModelPage, OperationId,
     OperationKind, OperationMarker, OutputKind, ProfileConfig, ProfileEditability, ProfileId,
     ProfileKind, ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef, Recorded,
-    RequestNumber, RequestRef, SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef,
-    ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation,
-    UncertainCause, Violation, WithheldReason, WrongProfileKind,
+    RequestFingerprint, RequestNumber, RequestRef, SubmissionKey, SubmissionRecord,
+    SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
+    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause, Violation,
+    WithheldReason, WrongProfileKind,
 };
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
@@ -91,6 +92,13 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// the ordered Attachments of each JobInput; an older build would decode
 /// such an input without them. Files of any other version are refused on
 /// open, before anything is written to them.
+///
+/// Format 13 later gained [`SUBMISSIONS`], the index of Control Plane
+/// submissions, without a new version: it is created empty when a format 13
+/// file without it is opened, which is exact, since no earlier build ever
+/// created a Job with a submission key. An earlier build that opens a file
+/// holding it leaves it alone and cannot contradict it: it never creates a
+/// Job with a key, and a committed Job identity is never reused.
 pub(crate) const FORMAT_VERSION: u32 = 13;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
@@ -221,6 +229,13 @@ const TOOL_EVIDENCE: TableDefinition<(u64, u32, u32), &[u8]> =
 const TOOL_CALL_IDS: TableDefinition<(u64, &str), (u32, u32)> =
     TableDefinition::new("tool_call_id");
 
+/// The SHA-256 of a Control Plane submission's idempotency key -> the one
+/// Job it created, with the fingerprint of the request that created it.
+/// Written only by the transaction that creates that Job, and never changed
+/// or removed, so a key names at most one Job and only a committed one. Not
+/// rebuildable: it is the only record of which key created which Job.
+const SUBMISSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("control_submission");
+
 mod availability_aggregation;
 mod token_aggregation;
 pub(crate) use availability_aggregation::{
@@ -330,6 +345,7 @@ const TAG_TOKEN_REQUEST: u8 = 18;
 const TAG_TOKEN_MINUTE: u8 = 19;
 const TAG_TOOL_EVIDENCE: u8 = 20;
 const TAG_ATTACHMENT: u8 = 21;
+const TAG_SUBMISSION: u8 = 22;
 
 struct Enc(Vec<u8>);
 
@@ -950,6 +966,29 @@ fn decode_attachment(bytes: &[u8]) -> DecodeResult<AttachmentRecord> {
     };
     d.end()?;
     Ok(a)
+}
+
+fn encode_submission(record: &SubmissionRecord) -> Vec<u8> {
+    let mut e = Enc::new(TAG_SUBMISSION);
+    e.u64(record.job.get());
+    e.0.extend_from_slice(record.fingerprint.as_bytes());
+    e.ts(record.recorded_at);
+    e.0
+}
+
+/// A submission record stored under `key`, which must be a 32-byte digest.
+fn decode_submission(key: &[u8], bytes: &[u8]) -> DecodeResult<SubmissionRecord> {
+    let key = <[u8; 32]>::try_from(key)
+        .map_err(|_| StorageError::corrupted("a submission key is not a 32-byte digest"))?;
+    let mut d = Dec::new(bytes, TAG_SUBMISSION)?;
+    let record = SubmissionRecord {
+        key: SubmissionKey::from_digest(key),
+        job: JobId::new(d.u64()?),
+        fingerprint: RequestFingerprint::from_digest(d.take(32)?.try_into().expect("32 bytes")),
+        recorded_at: d.ts()?,
+    };
+    d.end()?;
+    Ok(record)
 }
 
 fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
@@ -1825,6 +1864,7 @@ fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(TOKEN_MINUTES)?;
     tx.open_table(TOOL_EVIDENCE)?;
     tx.open_table(TOOL_CALL_IDS)?;
+    tx.open_table(SUBMISSIONS)?;
     tx.open_table(TRANSPORT_EXECUTORS)?;
     tx.open_table(HAS_OUTPUT)?;
     tx.open_table(HAS_ATTACHMENT)?;
@@ -3204,6 +3244,45 @@ impl Batch {
         })
     }
 
+    /// The submission recorded under `key`, if any.
+    pub(crate) fn submission(
+        &mut self,
+        key: SubmissionKey,
+    ) -> Result<Option<SubmissionRecord>, BatchError> {
+        let bytes = self.step(|tx| {
+            Ok(tx
+                .open_table(SUBMISSIONS)?
+                .get(key.as_bytes().as_slice())?
+                .map(|v| v.value().to_vec()))
+        })?;
+        let record = bytes
+            .map(|bytes| decode_submission(key.as_bytes(), &bytes))
+            .transpose();
+        self.decoded(record)
+    }
+
+    /// SUBMISSIONS: records a submission of a Job created in this batch. A
+    /// key is never overwritten; the caller has checked that it is free.
+    pub(crate) fn insert_submission(
+        &mut self,
+        record: &SubmissionRecord,
+    ) -> Result<(), BatchError> {
+        self.require_job(record.job)?;
+        let bytes = encode_submission(record);
+        let existed = self.step(|tx| {
+            let mut table = tx.open_table(SUBMISSIONS)?;
+            if table.get(record.key.as_bytes().as_slice())?.is_some() {
+                return Ok(true);
+            }
+            table.insert(record.key.as_bytes().as_slice(), bytes.as_slice())?;
+            Ok(false)
+        })?;
+        if existed {
+            return self.corrupted(format!("{:?} was recorded twice", record.key));
+        }
+        Ok(())
+    }
+
     /// ASSIGNED_TO: one per Job; replacing it is the caller's decision.
     pub(crate) fn set_assigned_executor(
         &mut self,
@@ -4062,6 +4141,18 @@ pub(crate) fn read_job_input_for_job(
         .ok_or_else(|| StorageError::corrupted(format!("HAS_INPUT names missing input {input}")))?;
     let row = JobInputRow::decode(bytes.value())?;
     job_input_record(&rx, row).map(Some)
+}
+
+/// The submission recorded under `key`, if a Job was ever created with it.
+pub(crate) fn read_submission(
+    database: &Database,
+    key: SubmissionKey,
+) -> Result<Option<SubmissionRecord>, StorageError> {
+    let rx = read(database)?;
+    rx.open_table(SUBMISSIONS)?
+        .get(key.as_bytes().as_slice())?
+        .map(|v| decode_submission(key.as_bytes(), v.value()))
+        .transpose()
 }
 
 pub(crate) fn read_attachment(
@@ -5437,6 +5528,17 @@ pub(crate) fn relationship_inconsistencies(
     }
     if indexed_tool_call_ids != expected_tool_call_ids {
         problems.push("the tool call id index and the tool evidence disagree".into());
+    }
+    let mut submitted = BTreeSet::new();
+    for entry in rx.open_table(SUBMISSIONS)?.iter()? {
+        let (key, bytes) = entry?;
+        let record = decode_submission(key.value(), bytes.value())?;
+        if !jobs.contains(&record.job.get()) {
+            problems.push(format!("{:?} names the missing {}", record.key, record.job));
+        }
+        if !submitted.insert(record.job) {
+            problems.push(format!("{} was created by two submissions", record.job));
+        }
     }
     for (profile, kind) in &profile_kinds {
         let has_provider = uses_provider.iter().any(|(source, _)| source == profile);

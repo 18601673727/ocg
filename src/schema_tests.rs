@@ -19823,6 +19823,1347 @@ mod requests_and_tool_loop {
         }
     }
 
+    // ---- Control Plane submissions ----------------------------------------------
+
+    mod control_plane_submissions {
+        use std::collections::BTreeMap;
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+
+        use super::*;
+        use crate::control_plane::{ControlPlane, ControlPlaneConfig, MAX_SUBMISSION_BYTES};
+        use crate::host::{HostContext, Phase, run_controlled_reporting};
+        use crate::orchestration::execution_runtime::provider_seam::{self, Response};
+        use crate::provider_execution::scripted::Step;
+
+        const TOKEN: &str = "C2-Submission-Token_0123456789.abcdefghijk~";
+
+        fn config(admission_wait: Duration) -> ControlPlaneConfig {
+            ControlPlaneConfig::new(0, TOKEN)
+                .expect("a valid configuration")
+                .with_admission_wait(admission_wait)
+        }
+
+        /// One HTTP/1.1 response.
+        struct Answer {
+            status: u16,
+            headers: BTreeMap<String, String>,
+            body: String,
+        }
+
+        impl Answer {
+            fn json(&self) -> Value {
+                serde_json::from_str(&self.body)
+                    .unwrap_or_else(|_| panic!("a JSON body: {}", self.body))
+            }
+
+            fn error(&self) -> String {
+                self.json()["error"]["code"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("an error code: {}", self.body))
+                    .to_owned()
+            }
+
+            fn admission(&self) -> (String, Option<String>) {
+                let admission = &self.json()["admission"];
+                (
+                    admission["status"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("an admission: {}", self.body))
+                        .to_owned(),
+                    admission["job"].as_str().map(str::to_owned),
+                )
+            }
+
+            fn job(&self) -> JobId {
+                let (status, job) = self.admission();
+                assert_eq!(status, "admitted", "{}", self.body);
+                job.and_then(|job| job.strip_prefix("job:")?.parse().ok())
+                    .map(JobId::new)
+                    .expect("an admitted Job")
+            }
+
+            fn stop(&self) -> String {
+                self.json()["stop"]["status"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a stop: {}", self.body))
+                    .to_owned()
+            }
+        }
+
+        fn parse(raw: &[u8]) -> Answer {
+            let raw = String::from_utf8(raw.to_vec()).expect("UTF-8");
+            let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+            let mut lines = head.lines();
+            let status = lines
+                .next()
+                .and_then(|line| line.split(' ').nth(1))
+                .and_then(|code| code.parse().ok())
+                .expect("a status");
+            let headers = lines
+                .filter_map(|line| line.split_once(": "))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.to_owned()))
+                .collect();
+            Answer {
+                status,
+                headers,
+                body: body.to_owned(),
+            }
+        }
+
+        /// Writes `request_line` with exactly `headers` and `body` on a new
+        /// connection, and returns the connection.
+        fn open(
+            address: SocketAddr,
+            request_line: &str,
+            headers: &[(&str, &str)],
+            body: &[u8],
+        ) -> TcpStream {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            stream
+                .set_read_timeout(Some(crate::test_support::WAIT))
+                .expect("timeout");
+            let mut request = format!("{request_line} HTTP/1.1\r\n");
+            for (name, value) in headers {
+                request.push_str(&format!("{name}: {value}\r\n"));
+            }
+            request.push_str("Connection: close\r\n\r\n");
+            let mut bytes = request.into_bytes();
+            bytes.extend_from_slice(body);
+            stream.write_all(&bytes).expect("send");
+            stream
+        }
+
+        fn send(
+            address: SocketAddr,
+            request_line: &str,
+            headers: &[(&str, &str)],
+            body: &[u8],
+        ) -> Answer {
+            let mut stream = open(address, request_line, headers, body);
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).expect("read");
+            parse(&raw)
+        }
+
+        fn host(address: SocketAddr) -> String {
+            format!("127.0.0.1:{}", address.port())
+        }
+
+        fn bearer() -> String {
+            format!("Bearer {TOKEN}")
+        }
+
+        /// The request a well-behaved client sends to submit `body`.
+        fn submission(address: SocketAddr, key: &str, body: &str) -> TcpStream {
+            let (host, bearer, length) = (host(address), bearer(), body.len().to_string());
+            open(
+                address,
+                "POST /api/v1/jobs",
+                &[
+                    ("Host", &host),
+                    ("Authorization", &bearer),
+                    ("Idempotency-Key", key),
+                    ("Content-Type", "application/json"),
+                    ("Content-Length", &length),
+                ],
+                body.as_bytes(),
+            )
+        }
+
+        fn submit(address: SocketAddr, key: &str, body: &str) -> Answer {
+            let mut stream = submission(address, key, body);
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).expect("read");
+            parse(&raw)
+        }
+
+        fn lookup(address: SocketAddr, key: &str) -> Answer {
+            let (host, bearer) = (host(address), bearer());
+            send(
+                address,
+                "GET /api/v1/admissions",
+                &[
+                    ("Host", &host),
+                    ("Authorization", &bearer),
+                    ("Idempotency-Key", key),
+                ],
+                b"",
+            )
+        }
+
+        fn stop(address: SocketAddr, job: JobId) -> Answer {
+            let (host, bearer) = (host(address), bearer());
+            send(
+                address,
+                &format!("POST /api/v1/jobs/{job}/stop"),
+                &[("Host", &host), ("Authorization", &bearer)],
+                b"",
+            )
+        }
+
+        fn get(address: SocketAddr, path: &str) -> Answer {
+            let (host, bearer) = (host(address), bearer());
+            send(
+                address,
+                &format!("GET {path}"),
+                &[("Host", &host), ("Authorization", &bearer)],
+                b"",
+            )
+        }
+
+        fn state(address: SocketAddr, job: JobId) -> String {
+            let answer = get(address, &format!("/api/v1/jobs/{job}"));
+            assert_eq!(answer.status, 200, "{}", answer.body);
+            answer.json()["job"]["settlement"]["state"]
+                .as_str()
+                .expect("a state")
+                .to_owned()
+        }
+
+        fn until(mut condition: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "not reached in time");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn now(steps: Vec<Step>) -> Response {
+            Response { gate: None, steps }
+        }
+
+        fn gated(steps: Vec<Step>) -> (flume::Sender<()>, Response) {
+            let (open, gate) = flume::bounded(1);
+            (
+                open,
+                Response {
+                    gate: Some(gate),
+                    steps,
+                },
+            )
+        }
+
+        fn stalled() -> Response {
+            now(vec![Step::Stall])
+        }
+
+        /// An LLM Profile on a Provider answered by the test, an Executor
+        /// that runs it, and the count of requests the Provider received.
+        struct Target {
+            llm: ProfileId,
+            executor: ExecutorId,
+            requests: Arc<AtomicUsize>,
+        }
+
+        impl Target {
+            fn body(&self, objective: &str, name: &str) -> String {
+                json!({
+                    "llm_profile": self.llm.to_string(),
+                    "executor": self.executor.to_string(),
+                    "objective": objective,
+                    "name": name,
+                })
+                .to_string()
+            }
+
+            fn requests(&self) -> usize {
+                self.requests.load(Ordering::SeqCst)
+            }
+        }
+
+        fn target(handle: &DatabaseHandle, name: &str, responses: Vec<Response>) -> Target {
+            let provider = provider(handle, name);
+            let llm = llm_profile(handle, provider, llm_config(name, &[ModelCapability::Chat]));
+            let executor =
+                executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = requests.clone();
+            let mut responses = responses.into_iter();
+            provider_seam::install(&format!("https://{name}.invalid/v1"), move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                responses
+                    .next()
+                    .expect("a scripted response for every request")
+            });
+            Target {
+                llm,
+                executor,
+                requests,
+            }
+        }
+
+        /// The real database, execution runtime and listener, started as
+        /// the host starts them.
+        struct Running {
+            worker: DatabaseWorker,
+            handle: DatabaseHandle,
+            runtime: ExecutionRuntime,
+            control: ControlPlane,
+        }
+
+        impl Running {
+            fn start(directory: &DataDirectory, admission_wait: Duration) -> Self {
+                let worker =
+                    DatabaseWorker::start_with_config(directory, lenient()).expect("start");
+                let handle = worker.handle();
+                let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+                let control = ControlPlane::start(
+                    config(admission_wait),
+                    handle.clone(),
+                    runtime.scheduler(),
+                )
+                .expect("start listener");
+                Self {
+                    worker,
+                    handle,
+                    runtime,
+                    control,
+                }
+            }
+
+            fn address(&self) -> SocketAddr {
+                self.control.address()
+            }
+
+            /// Stops in the host's order: listener, runtime, database.
+            fn stop(self) {
+                wait(self.control.stop()).expect("stop the listener");
+                self.runtime.shutdown().expect("shutdown runtime");
+                self.worker.shutdown().expect("shutdown");
+            }
+        }
+
+        /// `headers` with each of `extra` in place of any of its name.
+        fn replaced<'a>(
+            headers: &[(&'a str, &'a str)],
+            extra: &[(&'a str, &'a str)],
+        ) -> Vec<(&'a str, &'a str)> {
+            let mut headers = headers.to_vec();
+            for (name, value) in extra {
+                headers.retain(|(existing, _)| existing != name);
+                headers.push((name, value));
+            }
+            headers
+        }
+
+        fn settled(record: &JobRecord) -> bool {
+            record.completed_at.is_some()
+                || record.failed_at.is_some()
+                || record.cancelled_at.is_some()
+                || record.unknown_at.is_some()
+        }
+
+        /// Submits `body` under `key` and returns its Job once admitted,
+        /// looking the key up while the answer was pending.
+        fn admitted(address: SocketAddr, key: &str, body: &str) -> JobId {
+            let answer = submit(address, key, body);
+            match answer.status {
+                200 | 201 => answer.job(),
+                202 => {
+                    until(|| lookup(address, key).admission().0 == "admitted");
+                    lookup(address, key).job()
+                }
+                _ => panic!("not admitted: {}", answer.body),
+            }
+        }
+
+        fn jobs_named(handle: &DatabaseHandle, name: &str) -> Vec<JobRecord> {
+            wait(handle.jobs(None, 1_000))
+                .expect("read Jobs")
+                .into_iter()
+                .filter(|job| job.name.as_deref() == Some(name))
+                .collect()
+        }
+
+        const LONG: Duration = Duration::from_secs(5);
+        const SHORT: Duration = Duration::from_millis(200);
+
+        #[test]
+        fn a_submission_is_admitted_once_and_answered_before_its_provider() {
+            let (_root, directory) = data_directory("c2-admission");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let (open, response) = gated(answering("hello there", (5, 2)));
+            let target = target(&handle, "c2-admission", vec![response]);
+            let address = running.address();
+            let body = target.body("Say hello", "c2 ordinary");
+            let key = "c2-ordinary-0000000001";
+
+            let created = submit(address, key, &body);
+            assert_eq!(created.status, 201, "{}", created.body);
+            let job = created.job();
+            assert_eq!(
+                created.headers.get("cache-control").map(String::as_str),
+                Some("no-store")
+            );
+            // Acknowledged while the Provider has not answered: one durable
+            // Job, started and claimed, with its frozen configuration.
+            let [record] = jobs_named(&handle, "c2 ordinary")
+                .try_into()
+                .expect("one Job");
+            assert_eq!(record.id, job);
+            assert!(record.started_at.is_some() && !settled(&record));
+            assert_eq!(record.assigned_executor, Some(target.executor));
+            assert_eq!(record.parent, handle.genesis());
+            let input = wait(handle.job_input(record.input))
+                .expect("read")
+                .expect("its input");
+            assert_eq!(input.objective.as_deref(), Some("Say hello"));
+            assert!(input.submitted_at.is_some());
+            let configuration = wait(handle.job_configuration(job))
+                .expect("read")
+                .expect("frozen");
+            assert_eq!(configuration.llm_profile, target.llm);
+            assert_eq!(configuration.frozen.llm.config.model, "c2-admission");
+            assert_eq!(
+                configuration.frozen.llm.provider.endpoint.as_deref(),
+                Some("https://c2-admission.invalid/v1")
+            );
+            assert_eq!(state(address, job), "unsettled");
+            assert_eq!(
+                lookup(address, key).admission(),
+                ("admitted".to_owned(), Some(job.to_string()))
+            );
+            assert_eq!(running.control.held().0, 1, "its stop is held");
+
+            open.send(()).expect("let the Provider answer");
+            until(|| state(address, job) == "completed");
+            let outputs = get(address, &format!("/api/v1/jobs/{job}/outputs")).json();
+            let outputs = outputs["outputs"].as_array().expect("outputs").clone();
+            assert_eq!(outputs.last().expect("a result")["kind"], "result");
+            assert_eq!(outputs.last().expect("a result")["summary"], "hello there");
+            assert_eq!(target.requests(), 1);
+            until(|| running.control.held() == (0, 0));
+
+            // A replay names the same Job and runs nothing.
+            let replay = submit(address, key, &body);
+            assert_eq!((replay.status, replay.job()), (200, job));
+            assert_eq!(jobs_named(&handle, "c2 ordinary").len(), 1);
+            assert_eq!(target.requests(), 1);
+            assert!(!replay.body.contains(key) && !replay.body.contains(TOKEN));
+            running.stop();
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn concurrent_requests_with_one_key_create_one_job_and_one_execution() {
+            let (_root, directory) = data_directory("c2-concurrent");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let (open, response) = gated(answering("once", (3, 1)));
+            let target = target(&handle, "c2-concurrent", vec![response]);
+            let address = running.address();
+            let body = Arc::new(target.body("Run once", "c2 concurrent"));
+            let key = "c2-concurrent-000000001";
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let clients = (0..8)
+                .map(|_| {
+                    let (body, barrier) = (body.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        submit(address, key, &body)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let answers = clients
+                .into_iter()
+                .map(|client| client.join().expect("joined"))
+                .collect::<Vec<_>>();
+            let jobs = answers.iter().map(Answer::job).collect::<BTreeSet<_>>();
+            assert_eq!(jobs.len(), 1, "every acknowledgment names one Job");
+            let created = answers.iter().filter(|answer| answer.status == 201).count();
+            assert_eq!(created, 1, "one request created it");
+            assert!(
+                answers
+                    .iter()
+                    .all(|answer| matches!(answer.status, 200 | 201))
+            );
+            let [record] = jobs_named(&handle, "c2 concurrent")
+                .try_into()
+                .expect("one Job");
+            assert!(jobs.contains(&record.id));
+
+            open.send(()).expect("let the Provider answer");
+            until(|| state(address, record.id) == "completed");
+            assert_eq!(target.requests(), 1, "one execution");
+            assert_eq!(jobs_named(&handle, "c2 concurrent").len(), 1);
+            running.stop();
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_key_reused_for_another_request_is_refused_without_a_job() {
+            let (_root, directory) = data_directory("c2-conflict");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let (open, response) = gated(answering("first", (3, 1)));
+            let target = target(&handle, "c2-conflict", vec![response]);
+            let address = running.address();
+            let key = "c2-conflict-0000000001";
+            let job = submit(address, key, &target.body("First", "c2 conflict")).job();
+            // While it runs, and once it has settled, another request with
+            // the key is refused, and nothing more is created.
+            for different in [
+                target.body("Second", "c2 conflict"),
+                target.body("First", "c2 conflict renamed"),
+            ] {
+                let refused = submit(address, key, &different);
+                assert_eq!(
+                    (refused.status, refused.error().as_str()),
+                    (409, "idempotency_key_conflict")
+                );
+            }
+            open.send(()).expect("let the Provider answer");
+            until(|| state(address, job) == "completed");
+            let refused = submit(address, key, &target.body("Second", "c2 conflict"));
+            assert_eq!(refused.status, 409);
+            assert_eq!(
+                lookup(address, key).admission(),
+                ("admitted".to_owned(), Some(job.to_string()))
+            );
+            assert_eq!(jobs_named(&handle, "c2 conflict").len(), 1);
+            assert!(jobs_named(&handle, "c2 conflict renamed").is_empty());
+            assert_eq!(target.requests(), 1);
+            running.stop();
+        }
+
+        /// Runs the real host with the listener, runs `client` on a thread
+        /// of its own against its address, and stops the host.
+        fn hosted<T: Send + 'static>(
+            directory: &DataDirectory,
+            admission_wait: Duration,
+            client: impl FnOnce(SocketAddr) -> T + Send + 'static,
+        ) -> T {
+            let returned = Arc::new(std::sync::Mutex::new(None));
+            let slot = returned.clone();
+            let report = run_controlled_reporting(
+                directory,
+                false,
+                Some(config(admission_wait)),
+                move |context: HostContext| {
+                    let address = context.control_plane().expect("listening");
+                    async move {
+                        let value = std::thread::spawn(move || client(address))
+                            .join()
+                            .expect("the client did not panic");
+                        *slot.lock().expect("lock") = Some(value);
+                    }
+                },
+            );
+            assert!(
+                report
+                    .failures
+                    .iter()
+                    .all(|failure| failure.phase == Phase::Logger),
+                "{:?}",
+                report.failures
+            );
+            returned
+                .lock()
+                .expect("lock")
+                .take()
+                .expect("the client ran")
+        }
+
+        #[test]
+        fn admissions_survive_a_restart_and_are_never_executed_again() {
+            let (_root, directory) = data_directory("c2-restart");
+            let target = {
+                let policy = crate::system_policy::SystemPolicy::load_for_startup(&directory)
+                    .expect("policy");
+                let worker =
+                    DatabaseWorker::start_with_policy(&directory, policy).expect("start database");
+                let target = target(
+                    &worker.handle(),
+                    "c2-restart",
+                    vec![
+                        now(answering("done", (2, 1))),
+                        stalled(),
+                        now(answering("queued done", (2, 1))),
+                    ],
+                );
+                worker.shutdown().expect("shutdown");
+                target
+            };
+            let done_body = target.body("Finish", "c2 restart done");
+            let running_body = target.body("Keep running", "c2 restart running");
+            let queued_body = target.body("Wait in line", "c2 restart queued");
+            let (done_key, running_key, queued_key) = (
+                "c2-restart-done-000001",
+                "c2-restart-running-0001",
+                "c2-restart-queued-00001",
+            );
+            let bodies = (done_body.clone(), running_body.clone(), queued_body.clone());
+            let requests = target.requests.clone();
+            let (done, left) = hosted(&directory, SHORT, move |address| {
+                let (done_body, running_body, queued_body) = bodies;
+                let done = admitted(address, done_key, &done_body);
+                until(|| state(address, done) == "completed");
+                let left = admitted(address, running_key, &running_body);
+                until(|| requests.load(Ordering::SeqCst) == 2);
+                // The executor is busy, so this one is only queued when the
+                // host stops: it is pending, never admitted.
+                let queued = submit(address, queued_key, &queued_body);
+                assert_eq!(queued.status, 202, "{}", queued.body);
+                assert_eq!(queued.admission(), ("pending".to_owned(), None));
+                assert_eq!(lookup(address, queued_key).admission().0, "pending");
+                (done, left)
+            });
+            assert_eq!(target.requests(), 2);
+
+            // A new process: the database, not any memory of the earlier one,
+            // answers; nothing of it runs again.
+            let requests = target.requests.clone();
+            let (done_again, queued) = hosted(&directory, LONG, move |address| {
+                assert_eq!(
+                    lookup(address, done_key).admission(),
+                    ("admitted".to_owned(), Some(done.to_string()))
+                );
+                assert_eq!(
+                    lookup(address, running_key).admission(),
+                    ("admitted".to_owned(), Some(left.to_string()))
+                );
+                // The shutdown stopped it after its request was delivered.
+                assert_eq!(state(address, left), "unknown");
+                assert_eq!(stop(address, left).stop(), "already_settled");
+                let replay = submit(address, running_key, &running_body);
+                assert_eq!((replay.status, replay.job()), (200, left));
+                let replay = submit(address, done_key, &done_body);
+                assert_eq!((replay.status, replay.job()), (200, done));
+                let conflict = submit(address, done_key, &queued_body);
+                assert_eq!(conflict.status, 409);
+                // The queued submission never created a Job, and the restart
+                // settled that: its key is free and creates one now.
+                assert_eq!(lookup(address, queued_key).admission().0, "not_found");
+                let queued = submit(address, queued_key, &queued_body);
+                assert_eq!(queued.status, 201, "{}", queued.body);
+                let queued = queued.job();
+                until(|| requests.load(Ordering::SeqCst) == 3);
+                (done, queued)
+            });
+            assert_eq!(done_again, done);
+            let worker = DatabaseWorker::start(&directory).expect("reopen");
+            let handle = worker.handle();
+            assert_eq!(jobs_named(&handle, "c2 restart done").len(), 1);
+            assert_eq!(jobs_named(&handle, "c2 restart running").len(), 1);
+            let [record] = jobs_named(&handle, "c2 restart queued")
+                .try_into()
+                .expect("one Job, created after the restart");
+            assert_eq!(record.id, queued);
+            let left = job_record(&handle, left);
+            assert!(left.unknown_at.is_some() && left.cancelled_at.is_none());
+            worker.shutdown().expect("shutdown");
+            assert_eq!(target.requests(), 3, "nothing ran twice");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_lost_acknowledgment_is_reconciled_without_a_second_job() {
+            let (_root, directory) = data_directory("c2-lost");
+            let running = Running::start(&directory, SHORT);
+            let handle = running.handle.clone();
+            let (open_busy, busy) = gated(answering("busy done", (2, 1)));
+            let target = target(
+                &handle,
+                "c2-lost",
+                vec![
+                    busy,
+                    now(answering("before done", (2, 1))),
+                    now(answering("after done", (2, 1))),
+                ],
+            );
+            let address = running.address();
+
+            // The executor is busy, so the next admission cannot end yet.
+            let busy = admitted(
+                address,
+                "c2-lost-busy-000000001",
+                &target.body("Busy", "c2 busy"),
+            );
+            until(|| target.requests() == 1);
+
+            // Lost before the admission ended: the client sends the whole
+            // request, the admission starts, and the connection is gone.
+            let before_key = "c2-lost-before-0000001";
+            let before_body = target.body("Before", "c2 lost before");
+            let connection = submission(address, before_key, &before_body);
+            until(|| lookup(address, before_key).admission().0 == "pending");
+            drop(connection);
+            // A retry while it is pending waits on the same admission.
+            let retry = submit(address, before_key, &before_body);
+            assert_eq!(
+                (retry.status, retry.admission().0.as_str()),
+                (202, "pending")
+            );
+            assert!(jobs_named(&handle, "c2 lost before").is_empty());
+            open_busy.send(()).expect("free the executor");
+            until(|| lookup(address, before_key).admission().0 == "admitted");
+            let before = lookup(address, before_key).job();
+            until(|| state(address, before) == "completed");
+
+            // Lost after the Job was created: the client never reads the
+            // answer, and the connection is gone once the Job is durable.
+            let after_key = "c2-lost-after-00000001";
+            let after_body = target.body("After", "c2 lost after");
+            let connection = submission(address, after_key, &after_body);
+            until(|| jobs_named(&handle, "c2 lost after").len() == 1);
+            drop(connection);
+            let after = lookup(address, after_key).job();
+            let replay = submit(address, after_key, &after_body);
+            assert_eq!((replay.status, replay.job()), (200, after));
+            let replay = submit(address, before_key, &before_body);
+            assert_eq!((replay.status, replay.job()), (200, before));
+            until(|| state(address, after) == "completed");
+
+            assert_eq!(jobs_named(&handle, "c2 lost before").len(), 1);
+            assert_eq!(jobs_named(&handle, "c2 lost after").len(), 1);
+            assert_eq!(target.requests(), 3, "each Job ran once");
+            assert_eq!(state(address, busy), "completed");
+            until(|| running.control.held() == (0, 0));
+            running.stop();
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn an_unknown_commit_stays_uncertain_and_is_never_executed_again() {
+            let (_root, directory) = data_directory("c2-unknown");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let target = target(&handle, "c2-unknown", vec![now(answering("later", (2, 1)))]);
+            let companion = llm_job(&handle, target.llm);
+            let failed_group = Arc::new(std::sync::Mutex::new(None));
+            let (group, seam_handle) = (failed_group.clone(), handle.clone());
+            provider_seam::before_creation_of("c2 unknown", move || {
+                let mut group = group.lock().expect("lock");
+                if group.is_none() {
+                    *group = Some(fail_next_commit(&seam_handle, companion));
+                }
+            });
+            let address = running.address();
+            let key = "c2-unknown-commit-00001";
+            let body = target.body("Uncertain", "c2 unknown");
+
+            let answer = submit(address, key, &body);
+            assert_eq!(
+                (answer.status, answer.error().as_str()),
+                (500, "admission_uncertain"),
+                "an unknown commit is not a refusal"
+            );
+            let companion = failed_group
+                .lock()
+                .expect("lock")
+                .take()
+                .expect("the commit was failed");
+            assert!(companion.join().expect("joined").is_err());
+            // Neither a lookup nor a retry treats it as refused, and the
+            // retry submits nothing.
+            assert_eq!(
+                lookup(address, key).admission(),
+                ("uncertain".to_owned(), None)
+            );
+            let retry = submit(address, key, &body);
+            assert_eq!(retry.error(), "admission_uncertain");
+            let conflict = submit(address, key, &target.body("Other", "c2 unknown"));
+            assert_eq!(conflict.error(), "idempotency_key_conflict");
+            assert_eq!(running.control.held(), (0, 1));
+            assert_eq!(target.requests(), 0, "nothing was sent");
+
+            // Once storage is recovered, the database says what happened.
+            wait(handle.recover_storage()).expect("recover storage");
+            let (status, job) = lookup(address, key).admission();
+            let jobs = jobs_named(&handle, "c2 unknown");
+            match status.as_str() {
+                "admitted" => {
+                    let [record] = jobs.try_into().expect("the one Job");
+                    assert_eq!(job, Some(record.id.to_string()));
+                    assert!(record.started_at.is_some() && !settled(&record));
+                    let replay = submit(address, key, &body);
+                    assert_eq!((replay.status, replay.job()), (200, record.id));
+                    // Nothing executes it in this process; it is not stoppable here.
+                    assert_eq!(stop(address, record.id).error(), "not_stoppable");
+                    assert_eq!(target.requests(), 0);
+                }
+                "not_found" => {
+                    assert!(jobs.is_empty(), "no Job: {jobs:?}");
+                    let created = submit(address, key, &body);
+                    assert_eq!(created.status, 201, "{}", created.body);
+                    let job = created.job();
+                    until(|| state(address, job) == "completed");
+                    assert_eq!(target.requests(), 1);
+                }
+                other => panic!("recovery resolves the key, got {other}"),
+            }
+            assert_eq!(running.control.held().1, 0);
+            assert!(jobs_named(&handle, "c2 unknown").len() <= 1);
+            running.stop();
+        }
+
+        #[test]
+        fn a_stop_reaches_only_the_job_it_names() {
+            let (_root, directory) = data_directory("c2-stop");
+            let running = Running::start(&directory, SHORT);
+            let handle = running.handle.clone();
+            let target = target(
+                &handle,
+                "c2-stop",
+                vec![stalled(), now(answering("second answer", (3, 1)))],
+            );
+            let address = running.address();
+            let first = admitted(
+                address,
+                "c2-stop-first-00000001",
+                &target.body("One", "c2 stopped"),
+            );
+            until(|| target.requests() == 1);
+            // The second shares the Profile and Provider, and waits for the
+            // executor.
+            let second_key = "c2-stop-second-0000001";
+            let pending = submit(address, second_key, &target.body("Two", "c2 untouched"));
+            assert_eq!(pending.admission().0, "pending");
+
+            let stopped = stop(address, first);
+            assert_eq!(
+                (stopped.status, stopped.stop().as_str()),
+                (202, "requested")
+            );
+            assert_eq!(stopped.json()["stop"]["job"], first.to_string());
+            until(|| job_record(&handle, first).stop_confirmed_at.is_some());
+            let record = job_record(&handle, first);
+            assert!(
+                record.unknown_at.is_some()
+                    && record.stop_confirmed_at.is_some()
+                    && record.cancelled_at.is_none(),
+                "a stopped request that reached the Provider is Unknown, not Cancelled"
+            );
+            until(|| lookup(address, second_key).admission().0 == "admitted");
+            let second = lookup(address, second_key).job();
+            assert_ne!(second, first);
+            until(|| state(address, second) != "unsettled");
+            assert_eq!(
+                state(address, second),
+                "completed",
+                "the sibling was not stopped"
+            );
+            assert_eq!(
+                (stop(address, first).stop(), stop(address, second).stop()),
+                ("already_settled".to_owned(), "already_settled".to_owned())
+            );
+            // A Job this listener never admitted has nothing here to stop,
+            // and an unknown one is not found.
+            let foreign = llm_job(&handle, target.llm);
+            for job in [foreign, handle.genesis()] {
+                let refused = stop(address, job);
+                assert_eq!(
+                    (refused.status, refused.error().as_str()),
+                    (409, "not_stoppable")
+                );
+            }
+            assert!(!settled(&job_record(&handle, foreign)));
+            let missing = stop(address, JobId::new(999_999));
+            assert_eq!(
+                (missing.status, missing.error().as_str()),
+                (404, "job_not_found")
+            );
+            until(|| running.control.held() == (0, 0));
+            running.stop();
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_stop_racing_settlement_or_shutdown_claims_no_outcome() {
+            let (_root, directory) = data_directory("c2-races");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let mut gates = Vec::new();
+            let mut responses = Vec::new();
+            for round in 0..6 {
+                let (open, response) = gated(answering(&format!("answer {round}"), (2, 1)));
+                gates.push(open);
+                responses.push(response);
+            }
+            responses.push(stalled());
+            let target = target(&handle, "c2-races", responses);
+            let address = running.address();
+            // Stop against settlement: either may win; neither invents the
+            // other's result.
+            for (round, open) in gates.into_iter().enumerate() {
+                let key = format!("c2-race-settle-{round:08}");
+                let job = submit(
+                    address,
+                    &key,
+                    &target.body("Race", &format!("c2 race {round}")),
+                )
+                .job();
+                until(|| target.requests() == round + 1);
+                let stopping = std::thread::spawn(move || stop(address, job));
+                open.send(()).ok();
+                let answer = stopping.join().expect("joined");
+                let reported = answer.stop();
+                until(|| state(address, job) != "unsettled");
+                let record = job_record(&handle, job);
+                assert!(record.cancelled_at.is_none(), "a stop is never Cancelled");
+                assert!(record.completed_at.is_some() || record.unknown_at.is_some());
+                match reported.as_str() {
+                    "requested" => assert_eq!(answer.status, 202),
+                    "already_settled" => assert_eq!(answer.status, 200),
+                    other => panic!("unexpected stop answer {other}"),
+                }
+                // Stopping again changes nothing.
+                assert_eq!(stop(address, job).stop(), "already_settled");
+            }
+            until(|| running.control.held() == (0, 0));
+
+            // Stop against shutdown: the listener stops first; whichever
+            // reaches the execution, it settles once, as a stop does.
+            let last = submit(
+                address,
+                "c2-race-shutdown-00001",
+                &target.body("Last", "c2 last"),
+            )
+            .job();
+            until(|| target.requests() == 7);
+            let stopping = std::thread::spawn(move || {
+                std::panic::catch_unwind(|| stop(address, last).stop()).ok()
+            });
+            let Running {
+                worker,
+                handle,
+                runtime,
+                control,
+            } = running;
+            wait(control.stop()).expect("stop the listener");
+            runtime.shutdown().expect("shutdown runtime");
+            if let Some(answer) = stopping.join().expect("joined") {
+                assert!(matches!(answer.as_str(), "requested" | "already_settled"));
+            }
+            let record = job_record(&handle, last);
+            assert!(
+                record.unknown_at.is_some()
+                    && record.stop_confirmed_at.is_some()
+                    && record.cancelled_at.is_none()
+            );
+            worker.shutdown().expect("shutdown");
+
+            // A later process has no stop of it, and says it is settled.
+            let running = Running::start(&directory, LONG);
+            assert_eq!(stop(running.address(), last).stop(), "already_settled");
+            assert_eq!(running.control.held(), (0, 0));
+            running.stop();
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn submissions_and_stops_are_refused_unless_authentic_well_formed_and_runnable() {
+            let (_root, directory) = data_directory("c2-security");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let target = target(&handle, "c2-security", vec![now(answering("ok", (2, 1)))]);
+            let system =
+                executor(&handle, "system worker", ExecutorType::System, &[]).expect("register");
+            let agent = agent_profile(&handle, "Be brief.", vec![target.llm]);
+            let address = running.address();
+            let port = address.port();
+            let host = host(address);
+            let bearer = bearer();
+            let body = target.body("Secure", "c2 secure");
+            let length = body.len().to_string();
+            let key = "c2-security-key-000001";
+            let submit_line = "POST /api/v1/jobs";
+            let before = wait(handle.jobs(None, 1_000)).expect("read").len();
+            let mut answers = Vec::new();
+            let mut refused =
+                |status: u16, code: &str, line: &str, headers: &[(&str, &str)], body: &[u8]| {
+                    let answer = send(address, line, headers, body);
+                    assert_eq!(
+                        (answer.status, answer.error().as_str()),
+                        (status, code),
+                        "{line} {headers:?}"
+                    );
+                    answers.push(answer);
+                };
+            let json = ("Content-Type", "application/json");
+            let standard = vec![
+                ("Host", host.as_str()),
+                ("Authorization", bearer.as_str()),
+                ("Idempotency-Key", key),
+                json,
+                ("Content-Length", length.as_str()),
+            ];
+            // Authentication, Host and Origin, on every new route.
+            let stop_line = format!("POST /api/v1/jobs/{}/stop", handle.genesis());
+            for (line, sent) in [
+                (submit_line, body.as_bytes()),
+                ("GET /api/v1/admissions", b"".as_slice()),
+                (stop_line.as_str(), b"".as_slice()),
+            ] {
+                let length = sent.len().to_string();
+                let mut common = vec![
+                    ("Host", host.as_str()),
+                    ("Authorization", bearer.as_str()),
+                    ("Idempotency-Key", key),
+                ];
+                if !sent.is_empty() {
+                    common.extend([json, ("Content-Length", length.as_str())]);
+                }
+                let mut unauthenticated = replaced(&common, &[]);
+                unauthenticated.retain(|(name, _)| *name != "Authorization");
+                refused(401, "unauthenticated", line, &unauthenticated, sent);
+                refused(
+                    401,
+                    "unauthenticated",
+                    line,
+                    &replaced(
+                        &common,
+                        &[("Authorization", "Bearer not-the-token-0123456789abcdef")],
+                    ),
+                    sent,
+                );
+                let duplicated = [
+                    replaced(&common, &[]),
+                    vec![("Authorization", bearer.as_str())],
+                ]
+                .concat();
+                refused(401, "unauthenticated", line, &duplicated, sent);
+                refused(
+                    403,
+                    "forbidden_host",
+                    line,
+                    &replaced(&common, &[("Host", "evil.example")]),
+                    sent,
+                );
+                refused(
+                    403,
+                    "forbidden_origin",
+                    line,
+                    &replaced(&common, &[("Origin", "http://evil.example")]),
+                    sent,
+                );
+                let other = format!("http://localhost:{port}");
+                refused(
+                    403,
+                    "forbidden_origin",
+                    line,
+                    &replaced(&common, &[("Origin", &other)]),
+                    sent,
+                );
+                refused(
+                    403,
+                    "forbidden_origin",
+                    line,
+                    &replaced(&common, &[("Sec-Fetch-Site", "cross-site")]),
+                    sent,
+                );
+            }
+            // Methods: POST only where it submits or stops; GET elsewhere.
+            let only_post = send(
+                address,
+                "PUT /api/v1/jobs",
+                &replaced(&standard, &[]),
+                body.as_bytes(),
+            );
+            assert_eq!(
+                (
+                    only_post.status,
+                    only_post.headers.get("allow").map(String::as_str)
+                ),
+                (405, Some("POST"))
+            );
+            let only_post = send(
+                address,
+                &format!("DELETE {}", &stop_line[5..]),
+                &replaced(&standard, &[]),
+                b"",
+            );
+            assert_eq!(only_post.status, 405);
+            for line in [
+                "POST /api/v1/admissions",
+                "POST /api/v1/health",
+                "POST /api/v1/jobs/job:1",
+            ] {
+                let answer = send(address, line, &replaced(&standard, &[]), body.as_bytes());
+                assert_eq!(
+                    (
+                        answer.status,
+                        answer.headers.get("allow").map(String::as_str)
+                    ),
+                    (405, Some("GET")),
+                    "{line}"
+                );
+            }
+            // Keys travel in their header only, once, well formed.
+            let mut keyless = replaced(&standard, &[]);
+            keyless.retain(|(name, _)| *name != "Idempotency-Key");
+            refused(
+                400,
+                "idempotency_key_required",
+                submit_line,
+                &keyless,
+                body.as_bytes(),
+            );
+            let twice = [replaced(&standard, &[]), vec![("Idempotency-Key", key)]].concat();
+            refused(
+                400,
+                "invalid_idempotency_key",
+                submit_line,
+                &twice,
+                body.as_bytes(),
+            );
+            let long_key = "k".repeat(129);
+            for malformed in ["short", "has space in-the-key-0001", &long_key] {
+                refused(
+                    400,
+                    "invalid_idempotency_key",
+                    submit_line,
+                    &replaced(&standard, &[("Idempotency-Key", malformed)]),
+                    body.as_bytes(),
+                );
+            }
+            refused(
+                400,
+                "invalid_request",
+                &format!("GET /api/v1/admissions?idempotency_key={key}"),
+                &[("Host", &host), ("Authorization", &bearer)],
+                b"",
+            );
+            let mut keyless_lookup =
+                vec![("Host", host.as_str()), ("Authorization", bearer.as_str())];
+            refused(
+                400,
+                "idempotency_key_required",
+                "GET /api/v1/admissions",
+                &keyless_lookup,
+                b"",
+            );
+            keyless_lookup.extend([("Idempotency-Key", key), ("Idempotency-Key", key)]);
+            refused(
+                400,
+                "invalid_idempotency_key",
+                "GET /api/v1/admissions",
+                &keyless_lookup,
+                b"",
+            );
+            refused(
+                400,
+                "invalid_request",
+                &format!("GET /api/v1/admissions?key={key}"),
+                &[
+                    ("Host", &host),
+                    ("Authorization", &bearer),
+                    ("Idempotency-Key", key),
+                ],
+                b"",
+            );
+            refused(
+                400,
+                "invalid_request",
+                "POST /api/v1/jobs?x=1",
+                &replaced(&standard, &[]),
+                body.as_bytes(),
+            );
+            // Bodies: declared JSON, of one bounded length, read strictly.
+            refused(
+                415,
+                "unsupported_media_type",
+                submit_line,
+                &replaced(&standard, &[("Content-Type", "text/plain")]),
+                body.as_bytes(),
+            );
+            let mut untyped = replaced(&standard, &[]);
+            untyped.retain(|(name, _)| *name != "Content-Type");
+            refused(
+                415,
+                "unsupported_media_type",
+                submit_line,
+                &untyped,
+                body.as_bytes(),
+            );
+            let too_long = (MAX_SUBMISSION_BYTES + 1).to_string();
+            refused(
+                413,
+                "body_too_large",
+                submit_line,
+                &replaced(&standard, &[("Content-Length", &too_long)]),
+                b"",
+            );
+            let mut chunked = replaced(&standard, &[("Transfer-Encoding", "chunked")]);
+            chunked.retain(|(name, _)| *name != "Content-Length");
+            let answer = send(address, submit_line, &chunked, b"0\r\n\r\n");
+            assert_eq!(answer.status, 411, "{}", answer.body);
+            for malformed in [
+                "{".to_owned(),
+                "[]".to_owned(),
+                json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "credential_ref": "KEY"}).to_string(),
+                json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "endpoint": "https://evil.example/v1"}).to_string(),
+                json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "command": "rm -rf /"}).to_string(),
+                json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "job": "job:1"}).to_string(),
+                json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string()}).to_string(),
+            ] {
+                let length = malformed.len().to_string();
+                refused(
+                    400,
+                    "invalid_body",
+                    submit_line,
+                    &replaced(&standard, &[("Content-Length", &length)]),
+                    malformed.as_bytes(),
+                );
+            }
+            // A stop carries no body.
+            refused(
+                413,
+                "body_not_accepted",
+                &stop_line,
+                &[
+                    ("Host", &host),
+                    ("Authorization", &bearer),
+                    ("Content-Length", "2"),
+                ],
+                b"{}",
+            );
+            // The C1 routes are as they were.
+            assert_eq!(get(address, "/api/v1/jobs").error(), "not_found");
+            assert_eq!(
+                get(address, &format!("/api/v1/jobs/{}/stop", handle.genesis())).error(),
+                "not_found"
+            );
+
+            // Configurations that cannot run are refused, and the key stays
+            // free for one that can.
+            for (llm, executor, code) in [
+                (
+                    ProfileId::new(999_999),
+                    target.executor,
+                    "llm_profile_not_found",
+                ),
+                (agent, target.executor, "llm_profile_not_found"),
+                (target.llm, ExecutorId::new(999_999), "executor_not_found"),
+                (target.llm, system, "executor_incompatible"),
+            ] {
+                let body = json!({
+                    "llm_profile": llm.to_string(),
+                    "executor": executor.to_string(),
+                    "objective": "Secure",
+                    "name": "c2 secure",
+                })
+                .to_string();
+                let answer = submit(address, key, &body);
+                assert_eq!((answer.status, answer.error().as_str()), (422, code));
+                assert_eq!(lookup(address, key).admission().0, "not_found");
+            }
+            assert_eq!(wait(handle.jobs(None, 1_000)).expect("read").len(), before);
+            assert_eq!(target.requests(), 0);
+            for answer in &answers {
+                assert!(!answer.body.contains(TOKEN) && !answer.body.contains(key));
+                assert!(
+                    !answer
+                        .headers
+                        .keys()
+                        .any(|name| name.starts_with("access-control-"))
+                );
+                assert!(!answer.headers.contains_key("set-cookie"));
+            }
+
+            // Storage that refuses commands admits nothing, and says so.
+            let accepted = submit(address, key, &body);
+            assert_eq!(accepted.status, 201, "{}", accepted.body);
+            until(|| state(address, accepted.job()) == "completed");
+            protect(&handle, directory.database_path());
+            let protected_key = "c2-security-protected1";
+            let refused = submit(
+                address,
+                protected_key,
+                &target.body("Protected", "c2 protected"),
+            );
+            assert_eq!(
+                (refused.status, refused.error().as_str()),
+                (503, "storage_refused")
+            );
+            assert_eq!(lookup(address, protected_key).admission().0, "not_found");
+            assert!(jobs_named(&handle, "c2 protected").is_empty());
+            running.stop();
+        }
+
+        #[test]
+        fn the_submission_index_is_added_to_a_format_13_file_and_enforced_by_its_transaction() {
+            use crate::persistence::{NewSubmission, RequestFingerprint, SubmissionKey};
+
+            let (_root, directory) = data_directory("c2-format");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let llm = llm_profile(
+                &handle,
+                provider(&handle, "c2-format"),
+                llm_config("c2-format", &[ModelCapability::Chat]),
+            );
+            worker.shutdown().expect("shutdown");
+            // As the previous build left it: format 13, without the index.
+            let file = crate::storage::database_file(directory.database_path());
+            {
+                let database = redb::Database::create(&file).expect("open the file");
+                let tx = database.begin_write().expect("write");
+                assert!(
+                    tx.delete_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                        "control_submission"
+                    ))
+                    .expect("delete the index")
+                );
+                tx.commit().expect("commit");
+            }
+
+            let worker = DatabaseWorker::start(&directory).expect("a format 13 file opens");
+            let handle = worker.handle();
+            let key = SubmissionKey::from_digest([7; 32]);
+            let fingerprint = RequestFingerprint::from_digest([1; 32]);
+            assert!(matches!(wait(handle.submission(key)), Ok(None)));
+            let create = |fingerprint| {
+                let input = wait(handle.save_job_input(
+                    None,
+                    JobInputDraft {
+                        objective: Some("c2 format".into()),
+                        ..JobInputDraft::default()
+                    },
+                ))
+                .expect("save input");
+                wait(handle.create_submitted_local_job(
+                    NewJob {
+                        configuration: llm_only(llm),
+                        ..new_job("c2 format", handle.genesis(), Vec::new())
+                    },
+                    input,
+                    NewSubmission { key, fingerprint },
+                ))
+            };
+            let job = create(fingerprint).expect("created with its key");
+            let record = wait(handle.submission(key))
+                .expect("read")
+                .expect("recorded");
+            assert_eq!((record.job, record.fingerprint), (job, fingerprint));
+            assert!(job_record(&handle, job).started_at.is_some());
+            // The transaction refuses the key again, whatever the request,
+            // and names the Job it created; nothing more is committed.
+            for (other, same_request) in [
+                (fingerprint, true),
+                (RequestFingerprint::from_digest([2; 32]), false),
+            ] {
+                assert_eq!(
+                    violation(create(other)),
+                    Violation::SubmissionKeyUsed { job, same_request }
+                );
+            }
+            assert_eq!(jobs_named(&handle, "c2 format").len(), 1);
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start(&directory).expect("reopen");
+            assert_eq!(
+                wait(worker.handle().submission(key)).expect("read"),
+                Some(record),
+                "the record is durable and unchanged"
+            );
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+    }
+
     // ---- Image input ----------------------------------------------------------
 
     mod image_input {
