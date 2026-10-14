@@ -17,8 +17,8 @@ use ntex::util::{Either, select};
 
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::openai_compatible::{
-    ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, InvalidToolCall,
-    ToolCallRefusal,
+    ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, ImageInput,
+    InvalidToolCall, ToolCallRefusal,
 };
 use crate::orchestration::tools::{
     FailureCertainty, ToolFailure, ToolFuture, ToolOffer, ToolRegistryError,
@@ -76,6 +76,12 @@ pub struct ProviderExecutionPlan {
     /// The OCG tools offered to the Provider, if any. `None`, the default,
     /// offers none, and the execution is the single request it always was.
     pub tools: Option<ToolExecution>,
+    /// Images sent with the objective, in order, in its user message after
+    /// its text, see [`provider_execution::objective_conversation_with_images`].
+    /// They belong to this execution alone: the Job's input records the
+    /// objective text only, so nothing of an image is stored, and a retry or
+    /// a later reading of the Job does not have it.
+    pub images: Vec<ImageInput>,
 }
 
 /// Tools OCG offers one execution, and the limits of the tool loop. Only
@@ -273,6 +279,7 @@ impl ProviderExecutionPlan {
             credential_resolver: Arc::new(EnvironmentCredentialResolver),
             provider_config: ProviderExecutionConfig::default(),
             tools: None,
+            images: Vec::new(),
         }
     }
 }
@@ -849,9 +856,10 @@ async fn execute_provider_plan(
             });
         }
     };
-    let mut conversation = provider_execution::objective_conversation(
+    let mut conversation = provider_execution::objective_conversation_with_images(
         &configuration.frozen,
         input_record.objective.as_deref(),
+        &plan.images,
     );
     conversation.tools = offered.unwrap_or_default();
     let frozen = &configuration.frozen;

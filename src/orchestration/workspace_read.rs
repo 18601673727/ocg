@@ -167,6 +167,21 @@ impl Workspace {
         read_whole(&file)
     }
 
+    /// The whole content of the file at `path`, relative to the root, as
+    /// bytes, when it has at most `limit` of them: the path rules, the walk
+    /// and the checks of reading text, without requiring text. For a file
+    /// the operator chose, such as an image to send.
+    ///
+    /// # Errors
+    ///
+    /// Returns why nothing was read; [`Refusal::TooLarge`] for a file over
+    /// `limit`.
+    pub fn read_binary(&self, path: &str, limit: usize) -> Result<Vec<u8>, Refusal> {
+        let (directory, name) = self.parent(path)?;
+        let file = open_within(&directory, name, Step::File, limit)?;
+        read_bytes(&file, limit)
+    }
+
     /// The directory that holds the last component of `path`, opened from
     /// the root through every directory before it, and that component. The
     /// path is checked first, and the root must still be the directory that
@@ -202,7 +217,7 @@ impl Workspace {
 /// Why a call reads nothing. Its message is recorded and may reach the
 /// Provider, so it never repeats the path or anything read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub(super) enum Refusal {
+pub enum Refusal {
     #[error("the path is not a plain relative path inside the Workspace")]
     InvalidPath,
     #[error("the path names a hidden, secret-bearing or OCG-internal location")]
@@ -304,13 +319,18 @@ fn open_directory(path: &Path) -> std::io::Result<File> {
 /// link, and a directory step refuses anything but a directory, whatever
 /// replaced the checked entry meanwhile.
 pub(super) fn open_at(directory: &File, name: &str, step: Step) -> Result<File, Refusal> {
+    open_within(directory, name, step, MAX_FILE_BYTES)
+}
+
+/// [`open_at`], with a file of up to `limit` bytes.
+fn open_within(directory: &File, name: &str, step: Step, limit: usize) -> Result<File, Refusal> {
     let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(Refusal::from_errno)?;
     match (FileType::from_raw_mode(stat.st_mode), step) {
         (FileType::Symlink, _) => return Err(Refusal::SymbolicLink),
         (FileType::Directory, Step::Directory) => {}
         (FileType::RegularFile, Step::File) => {
-            if !u64::try_from(stat.st_size).is_ok_and(|size| size <= MAX_FILE_BYTES as u64) {
+            if !u64::try_from(stat.st_size).is_ok_and(|size| size <= limit as u64) {
                 return Err(Refusal::TooLarge);
             }
         }
@@ -332,6 +352,17 @@ pub(super) fn open_at(directory: &File, name: &str, step: Step) -> Result<File, 
 
 /// Reads the whole of an opened file, bounded by [`MAX_FILE_BYTES`], as text.
 pub(super) fn read_whole(file: &File) -> Result<String, Refusal> {
+    let content = read_bytes(file, MAX_FILE_BYTES)?;
+    let text = String::from_utf8(content).map_err(|_| Refusal::NotText)?;
+    if text.contains('\0') {
+        return Err(Refusal::NotText);
+    }
+    Ok(text)
+}
+
+/// Reads the whole of an opened file, bounded by `limit`: a regular file
+/// with a single link, unchanged while it was read.
+fn read_bytes(file: &File, limit: usize) -> Result<Vec<u8>, Refusal> {
     let before = file.metadata().map_err(|_| Refusal::Unreadable)?;
     if !before.is_file() {
         return Err(Refusal::NotRegularFile);
@@ -339,14 +370,15 @@ pub(super) fn read_whole(file: &File) -> Result<String, Refusal> {
     if before.nlink() != 1 {
         return Err(Refusal::HardLinked);
     }
-    if before.len() > MAX_FILE_BYTES as u64 {
+    if before.len() > limit as u64 {
         return Err(Refusal::TooLarge);
     }
-    let mut content = Vec::with_capacity(MAX_FILE_BYTES + 1);
-    file.take(MAX_FILE_BYTES as u64 + 1)
+    let size = usize::try_from(before.len()).unwrap_or(limit);
+    let mut content = Vec::with_capacity(size.min(limit) + 1);
+    file.take(limit as u64 + 1)
         .read_to_end(&mut content)
         .map_err(|_| Refusal::Unreadable)?;
-    if content.len() > MAX_FILE_BYTES {
+    if content.len() > limit {
         return Err(Refusal::TooLarge);
     }
     let after = file.metadata().map_err(|_| Refusal::Unreadable)?;
@@ -362,11 +394,7 @@ pub(super) fn read_whole(file: &File) -> Result<String, Refusal> {
     if content.len() as u64 != before.len() || unchanged(&before) != unchanged(&after) {
         return Err(Refusal::Changed);
     }
-    let text = String::from_utf8(content).map_err(|_| Refusal::NotText)?;
-    if text.contains('\0') {
-        return Err(Refusal::NotText);
-    }
-    Ok(text)
+    Ok(content)
 }
 
 /// The parameters a call must match exactly: one relative path.
@@ -785,5 +813,50 @@ mod tests {
         };
         assert_eq!(handler.effect(), ToolEffect::ReadOnly);
         assert!(crate::persistence::is_handler_version(handler.version()));
+    }
+
+    #[test]
+    fn binary_files_are_read_whole_within_their_limit_and_the_same_boundary() {
+        let (_guard, root, _data, directory) = workspace("binary");
+        let (_outside_guard, outside, _outside_data, _) = workspace("binary-outside");
+        let image = b"\x89PNG\r\n\x1a\n\x00\xff\xfe binary".to_vec();
+        write(&root, "images/shot.png", &image);
+        write(&root, "big.png", &[0; 64]);
+        write(&root, ".hidden.png", &image);
+        write(&outside, "secret.png", &image);
+        symlink(outside.join("secret.png"), root.join("linked.png")).expect("link");
+        symlink(&outside, root.join("outside")).expect("link");
+        std::fs::hard_link(root.join("big.png"), root.join("twice.png")).expect("hard link");
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+
+        assert_eq!(
+            workspace.read_binary("images/shot.png", 1024),
+            Ok(image.clone())
+        );
+        assert_eq!(
+            workspace.read_binary("images/shot.png", image.len()),
+            Ok(image.clone()),
+            "a file at the limit is read"
+        );
+        assert_eq!(
+            workspace.read_binary("images/shot.png", image.len() - 1),
+            Err(Refusal::TooLarge)
+        );
+        let absolute = outside.join("secret.png");
+        for (path, refusal) in [
+            ("missing.png", Refusal::NotFound),
+            ("images", Refusal::NotRegularFile),
+            ("linked.png", Refusal::SymbolicLink),
+            ("outside/secret.png", Refusal::SymbolicLink),
+            (
+                "../binary-outside-workspace/secret.png",
+                Refusal::InvalidPath,
+            ),
+            (absolute.to_str().expect("UTF-8"), Refusal::InvalidPath),
+            (".hidden.png", Refusal::Protected),
+            ("twice.png", Refusal::HardLinked),
+        ] {
+            assert_eq!(workspace.read_binary(path, 1024), Err(refusal), "{path}");
+        }
     }
 }

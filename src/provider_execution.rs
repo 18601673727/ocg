@@ -16,8 +16,8 @@ use ntex::util::{Either, select};
 use serde_json::{Value, json};
 
 use crate::openai_compatible::{
-    ChatConversation, ChatFinishReason, ChatMessage, CompletedToolCall, InvalidToolCall,
-    NormalizedUsage, ProviderFailure, ToolCallAssembler,
+    ChatConversation, ChatFinishReason, ChatMessage, CompletedToolCall, ContentPartWire,
+    ImageInput, InvalidToolCall, NormalizedUsage, ProviderFailure, ToolCallAssembler,
 };
 use crate::persistence::{FrozenExecutionConfig, LlmParameters, Timestamp};
 use crate::token_usage::UsageFinality;
@@ -327,6 +327,34 @@ pub fn objective_conversation(
         messages,
         ..ChatConversation::default()
     }
+}
+
+/// [`objective_conversation`] with `images` in the objective's user message:
+/// its text first, when there is any, then each image as an `image_url`
+/// part, in order. Without images it is exactly [`objective_conversation`].
+#[must_use]
+pub fn objective_conversation_with_images(
+    frozen: &FrozenExecutionConfig,
+    objective: Option<&str>,
+    images: &[ImageInput],
+) -> ChatConversation {
+    let mut conversation = objective_conversation(frozen, objective);
+    if images.is_empty() {
+        return conversation;
+    }
+    let text = objective
+        .filter(|objective| !objective.is_empty())
+        .map(|text| ContentPartWire::Text {
+            text: text.to_owned(),
+        });
+    let parts = text
+        .into_iter()
+        .chain(images.iter().map(ImageInput::part))
+        .collect();
+    if let Some(user) = conversation.messages.last_mut() {
+        *user = ChatMessage::user_parts(parts);
+    }
+    conversation
 }
 
 /// Sends one validated conversation, with the tools it offers, to the
@@ -4618,6 +4646,129 @@ mod tests {
                 {"role": "system", "content": "be brief"},
                 {"role": "user", "content": "hi"},
             ])
+        );
+    }
+
+    /// A frozen configuration whose endpoint nothing listens on.
+    fn unreachable_frozen() -> FrozenExecutionConfig {
+        FrozenExecutionConfig {
+            agent: None,
+            llm: crate::persistence::FrozenLlmConfig {
+                config: crate::persistence::LlmConfig {
+                    model: "model-v".to_owned(),
+                    parameters: LlmParameters::default(),
+                    declared_capabilities: Default::default(),
+                },
+                provider: crate::persistence::ProviderSnapshot {
+                    id: crate::persistence::LlmProviderId::new(1),
+                    name: "local".to_owned(),
+                    transport: crate::persistence::LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some("https://127.0.0.1:9/v1".to_owned()),
+                    credential_ref: None,
+                },
+            },
+        }
+    }
+
+    fn body_of(frozen: &FrozenExecutionConfig, conversation: &ChatConversation) -> Value {
+        let config = &frozen.llm.config;
+        request_body(&config.model, &config.parameters, conversation).expect("a body")
+    }
+
+    #[test]
+    fn images_reach_the_request_body_as_real_parts_and_text_alone_is_unchanged() {
+        use crate::openai_compatible::image::tests::{PNG_BASE64, jpeg, png};
+        use crate::openai_compatible::{ImageInput, ImageMime};
+
+        let frozen = unreachable_frozen();
+        let text_only = body_of(&frozen, &objective_conversation(&frozen, Some("hi")));
+        assert_eq!(
+            text_only,
+            json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "model": "model-v",
+                "stream": true,
+                "stream_options": {"include_usage": true},
+            })
+        );
+        assert_eq!(
+            body_of(
+                &frozen,
+                &objective_conversation_with_images(&frozen, Some("hi"), &[])
+            ),
+            text_only,
+            "no image, no change"
+        );
+
+        let images = [
+            ImageInput::new(ImageMime::Png, png()).expect("a PNG"),
+            ImageInput::new(ImageMime::Jpeg, jpeg()).expect("a JPEG"),
+        ];
+        let conversation =
+            objective_conversation_with_images(&frozen, Some("Read the image."), &images);
+        conversation.validate().expect("valid");
+        let jpeg_url = format!(
+            "data:image/jpeg;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, jpeg())
+        );
+        assert_eq!(
+            body_of(&frozen, &conversation),
+            json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Read the image."},
+                    {"type": "image_url", "image_url": {
+                        "url": format!("data:image/png;base64,{PNG_BASE64}")
+                    }},
+                    {"type": "image_url", "image_url": {"url": jpeg_url}},
+                ]}],
+                "model": "model-v",
+                "stream": true,
+                "stream_options": {"include_usage": true},
+            })
+        );
+        let image_only = objective_conversation_with_images(&frozen, Some(""), &images[..1]);
+        image_only.validate().expect("an image alone is valid");
+        assert_eq!(
+            body_of(&frozen, &image_only)["messages"],
+            json!([{"role": "user", "content": [{"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{PNG_BASE64}")
+            }}]}])
+        );
+    }
+
+    #[test]
+    fn an_invalid_image_is_never_sent_and_is_known_not_delivered() {
+        use crate::openai_compatible::image::tests::PNG_BASE64;
+        use crate::openai_compatible::{ContentPartWire, ImageUrlWire};
+
+        let conversation = ChatConversation {
+            messages: vec![ChatMessage::user_parts(vec![ContentPartWire::ImageUrl {
+                image_url: ImageUrlWire {
+                    url: format!("data:image/jpeg;base64,{PNG_BASE64}"),
+                },
+            }])],
+            ..ChatConversation::default()
+        };
+        let mut sink = RecordingSink::default();
+        let error = wait(execute_conversation(
+            &unreachable_frozen(),
+            &conversation,
+            &EnvironmentCredentialResolver,
+            &ProviderExecutionConfig::default(),
+            Some(&mut sink),
+        ))
+        .expect_err("a mislabelled image is refused");
+        assert!(
+            matches!(&error, ProviderExecutionError::Build { message }
+                if message.contains("not the image/jpeg") && !message.contains(&PNG_BASE64[..12])),
+            "got {error:?}"
+        );
+        assert_eq!(
+            sink.observations
+                .iter()
+                .map(|observation| observation.fact.clone())
+                .collect::<Vec<_>>(),
+            [ProviderFact::NotDelivered]
         );
     }
 }

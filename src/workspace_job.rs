@@ -2,8 +2,10 @@
 //! that may read files of a Workspace the operator authorized, and
 //! `ocg workspace-edit <objective>`, its counterpart that may also create
 //! and conditionally update them, and `ocg workspace-code <objective>`, which
-//! may also build and test the Workspace. This module belongs to the
-//! executable, not to the library.
+//! may also build and test the Workspace. `ocg workspace-vision <image-path>
+//! <objective>` instead sends one PNG or JPEG image of the Workspace with the
+//! objective, offering no tool. This module belongs to the executable, not to
+//! the library.
 //!
 //! It runs the ordinary host and submits exactly one Job through the host's
 //! scheduler, offering only `workspace_read_file`; for `workspace-edit`,
@@ -12,7 +14,8 @@
 //! [`WORKSPACE_ROOT_VARIABLE`]. Writing is offered by the last two commands
 //! alone, and running commands by `workspace-code` alone; every write is
 //! recorded, with its contents, and every command's output in plaintext tool
-//! evidence. The Provider and model are named by
+//! evidence. An image is sent, never stored: the Job's input records the
+//! objective text only. The Provider and model are named by
 //! the environment too. The credential is named only by reference: the
 //! existing resolver reads it when the request is built, and it is never
 //! stored, printed or logged. Once the Job settles, what the database
@@ -29,14 +32,18 @@ use std::sync::Arc;
 
 use ntex::util::{Either, select};
 
+use aws_lc_rs::digest;
+
 use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseError, DatabaseHandle};
 use ocg::host::{self, HostContext, HostError};
+use ocg::openai_compatible::image::MAX_IMAGE_BYTES;
+use ocg::openai_compatible::{ImageError, ImageInput, ImageMime};
 use ocg::orchestration::ToolRegistryError;
 use ocg::orchestration::execution_runtime::{
     ExecutionRuntimeError, ProviderExecutionPlan, ToolExecution,
 };
-use ocg::orchestration::workspace_read::{self, Workspace, WorkspaceError};
+use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceError};
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 use ocg::orchestration::{workspace_command, workspace_write};
 use ocg::persistence::{
@@ -60,6 +67,9 @@ pub const EDIT_COMMAND: &str = "workspace-edit";
 /// commands.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 pub const CODE_COMMAND: &str = "workspace-code";
+/// The command that selects the mode that sends one image with the
+/// objective.
+pub const VISION_COMMAND: &str = "workspace-vision";
 /// The Workspace the Job may read from: an absolute path to a directory.
 pub const WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
 /// The Provider's OpenAI-compatible endpoint, an `https://` URL.
@@ -81,6 +91,8 @@ pub enum Mode {
     /// `workspace_write_file` and `workspace_run_command`.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     Code,
+    /// Send one image of the Workspace with the objective; no tool.
+    Vision,
 }
 
 impl Mode {
@@ -92,6 +104,7 @@ impl Mode {
             EDIT_COMMAND => Some(Self::Edit),
             #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
             CODE_COMMAND => Some(Self::Code),
+            VISION_COMMAND => Some(Self::Vision),
             _ => None,
         }
     }
@@ -106,7 +119,32 @@ impl Mode {
             Self::Edit => EDIT_COMMAND,
             #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
             Self::Code => CODE_COMMAND,
+            Self::Vision => VISION_COMMAND,
         }
+    }
+
+    /// Whether the command takes an image path before the objective.
+    pub fn takes_image(self) -> bool {
+        self == Self::Vision
+    }
+
+    /// The error that shows how the mode's command is used.
+    pub fn usage(self) -> Error {
+        if self.takes_image() {
+            Error::ImageUsage(self.command())
+        } else {
+            Error::Usage(self.command())
+        }
+    }
+
+    /// What the mode's Model is declared to be capable of.
+    fn capabilities(self) -> BTreeSet<ModelCapability> {
+        let used = if self.takes_image() {
+            ModelCapability::Vision
+        } else {
+            ModelCapability::Tools
+        };
+        BTreeSet::from([ModelCapability::Chat, used])
     }
 }
 
@@ -120,6 +158,10 @@ pub enum Error {
     CredentialMissing,
     #[error("usage: ocg {0} <objective>")]
     Usage(&'static str),
+    #[error("usage: ocg {0} <image-path> <objective>")]
+    ImageUsage(&'static str),
+    #[error("the image cannot be sent: {0}")]
+    Image(String),
     #[error("workspace_read_file is not enabled: {0}")]
     Workspace(#[from] WorkspaceError),
     #[error("workspace_read_file cannot be offered: {0}")]
@@ -139,6 +181,9 @@ pub enum Error {
 /// What the operator chose for one run.
 pub struct Config {
     mode: Mode,
+    /// The image to send, relative to the Workspace root, for a mode that
+    /// takes one.
+    image: Option<String>,
     workspace_root: PathBuf,
     endpoint: String,
     model: String,
@@ -147,13 +192,21 @@ pub struct Config {
 }
 
 impl Config {
-    /// Reads the configuration from the environment, with the `mode` and
-    /// `objective` given on the command line. The credential itself is only
-    /// checked to exist.
-    pub fn from_environment(mode: Mode, objective: Option<String>) -> Result<Self, Error> {
+    /// Reads the configuration from the environment, with the `mode`, the
+    /// `image` path for a mode that takes one, and the `objective` given on
+    /// the command line. The credential itself is only checked to exist.
+    pub fn from_environment(
+        mode: Mode,
+        image: Option<String>,
+        objective: Option<String>,
+    ) -> Result<Self, Error> {
         let objective = objective
             .filter(|objective| !objective.trim().is_empty())
-            .ok_or(Error::Usage(mode.command()))?;
+            .ok_or_else(|| mode.usage())?;
+        let image = image.filter(|image| !image.is_empty());
+        if image.is_some() != mode.takes_image() {
+            return Err(mode.usage());
+        }
         let variable = |name: &'static str| {
             std::env::var(name)
                 .ok()
@@ -175,6 +228,7 @@ impl Config {
         }
         Ok(Self {
             mode,
+            image,
             workspace_root,
             endpoint,
             model,
@@ -190,13 +244,14 @@ impl Config {
 pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> {
     let workspace = Workspace::authorize(&config.workspace_root, data_directory)?;
     let root = workspace.root().display().to_string();
+    let mut images = Vec::new();
     let tools = match config.mode {
         Mode::Read => {
             eprintln!(
                 "OCG Workspace authorized for {}: {root}",
                 workspace_read::TOOL_NAME
             );
-            workspace_read::read_file_tools(workspace)?
+            Some(workspace_read::read_file_tools(workspace)?)
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         Mode::Edit => {
@@ -208,7 +263,7 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
             eprintln!(
                 "OCG records the path and complete content of every write, and an update's expected content, in plaintext tool evidence"
             );
-            workspace_write::edit_file_tools(workspace)?
+            Some(workspace_write::edit_file_tools(workspace)?)
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         Mode::Code => {
@@ -224,13 +279,29 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
             eprintln!(
                 "OCG runs `cargo check` and `cargo test` in the Workspace with its own permissions; build scripts and tests run project code unsandboxed, so authorize only a Workspace you trust"
             );
-            workspace_command::code_tools(workspace)?
+            Some(workspace_command::code_tools(workspace)?)
+        }
+        Mode::Vision => {
+            let path = config
+                .image
+                .as_deref()
+                .ok_or(Error::ImageUsage(VISION_COMMAND))?;
+            let image = load_image(&workspace, path)?;
+            eprintln!("OCG Workspace authorized for one image: {root}");
+            eprintln!(
+                "OCG sends {path} ({}, {} bytes, sha256 {}) with the objective to the Provider; OCG's database records the objective text only, never the image",
+                image.mime().as_str(),
+                image.bytes().len(),
+                sha256(image.bytes())
+            );
+            images.push(image);
+            None
         }
     };
     let settled = Rc::new(RefCell::new(None));
     let slot = settled.clone();
     let hosted = host::run_hosted(data_directory, true, move |context| async move {
-        *slot.borrow_mut() = Some(submit(&context, config, tools).await);
+        *slot.borrow_mut() = Some(submit(&context, config, tools, images).await);
     });
     let settled = settled.borrow_mut().take();
     match (settled, hosted) {
@@ -241,8 +312,53 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
     }
 }
 
+/// The image at `path` in the Workspace: its type is the one its extension
+/// declares, and its bytes, read within the image limit, must be of that
+/// type.
+fn load_image(workspace: &Workspace, path: &str) -> Result<ImageInput, Error> {
+    let declared = declared_type(path).ok_or_else(|| {
+        Error::Image("only .png, .jpg and .jpeg files can be sent as images".to_owned())
+    })?;
+    let bytes = workspace
+        .read_binary(path, MAX_IMAGE_BYTES)
+        .map_err(|refusal| {
+            Error::Image(match refusal {
+                Refusal::TooLarge => ImageError::TooLarge.to_string(),
+                other => other.to_string(),
+            })
+        })?;
+    ImageInput::new(declared, bytes).map_err(|error| Error::Image(error.to_string()))
+}
+
+/// The image type a path's extension declares, if it is one OCG sends.
+fn declared_type(path: &str) -> Option<ImageMime> {
+    let (_, extension) = path.rsplit_once('.')?;
+    match extension.to_ascii_lowercase().as_str() {
+        "png" => Some(ImageMime::Png),
+        "jpg" | "jpeg" => Some(ImageMime::Jpeg),
+        _ => None,
+    }
+}
+
+/// The SHA-256 of `bytes`, in hexadecimal: how the report names an image
+/// without showing it.
+fn sha256(bytes: &[u8]) -> String {
+    digest::digest(&digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
 /// Submits the Job, waits for it to settle, and prints what was recorded.
-async fn submit(context: &HostContext, config: Config, tools: ToolExecution) -> Result<(), Error> {
+async fn submit(
+    context: &HostContext,
+    config: Config,
+    tools: Option<ToolExecution>,
+    images: Vec<ImageInput>,
+) -> Result<(), Error> {
     // Registered first, so a signal while the Job is prepared cancels it too.
     let signal = ntex::rt::signals::signal();
     let database = context.database();
@@ -279,7 +395,8 @@ async fn submit(context: &HostContext, config: Config, tools: ToolExecution) -> 
             cancellation: cancellation.clone(),
             ..ProviderExecutionConfig::default()
         },
-        tools: Some(tools),
+        tools,
+        images,
     };
     let mut scheduled = std::pin::pin!(context.scheduler().schedule_provider(plan));
     let settled = match select(signal, scheduled.as_mut()).await {
@@ -372,7 +489,7 @@ async fn targets(
     let llm = LlmConfig {
         model: config.model.clone(),
         parameters: LlmParameters::default(),
-        declared_capabilities: BTreeSet::from([ModelCapability::Chat, ModelCapability::Tools]),
+        declared_capabilities: config.mode.capabilities(),
     };
     for profile in database.provider_profiles(provider).await? {
         if let Some(record) = database.profile(profile).await?
@@ -917,5 +1034,97 @@ mod tests {
         );
         let command = r#"{"command":"cargo_test"}"#;
         assert_eq!(shown_arguments("workspace_run_command", command), command);
+    }
+
+    #[test]
+    fn the_vision_mode_takes_an_image_path_before_its_objective() {
+        assert_eq!(Mode::of("workspace-vision"), Some(Mode::Vision));
+        assert_eq!(Mode::Vision.command(), VISION_COMMAND);
+        assert!(Mode::Vision.takes_image());
+        assert!(
+            !Mode::Read.takes_image() && !Mode::Edit.takes_image() && !Mode::Code.takes_image()
+        );
+        assert_eq!(
+            Mode::Vision.usage().to_string(),
+            "usage: ocg workspace-vision <image-path> <objective>"
+        );
+        assert_eq!(
+            Mode::Code.usage().to_string(),
+            "usage: ocg workspace-code <objective>"
+        );
+        assert_eq!(
+            Mode::Vision.capabilities(),
+            BTreeSet::from([ModelCapability::Chat, ModelCapability::Vision])
+        );
+        assert_eq!(
+            Mode::Read.capabilities(),
+            BTreeSet::from([ModelCapability::Chat, ModelCapability::Tools]),
+            "the other modes declare what they always did"
+        );
+        for (path, declared) in [
+            ("shot.png", Some(ImageMime::Png)),
+            ("dir/Photo.JPG", Some(ImageMime::Jpeg)),
+            ("scan.jpeg", Some(ImageMime::Jpeg)),
+            ("anim.gif", None),
+            ("vector.svg", None),
+            ("png", None),
+            ("dir.png/file", None),
+        ] {
+            assert_eq!(declared_type(path), declared, "{path}");
+        }
+    }
+
+    #[test]
+    fn an_image_is_loaded_only_when_its_content_is_its_declared_type() {
+        let base = std::env::temp_dir().join(format!("ocg-vision-load-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).expect("create the Workspace");
+        let data = DataDirectory::bootstrap(base.join("data").into_os_string()).expect("data");
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        std::fs::write(root.join("shot.png"), &png).expect("write");
+        std::fs::write(root.join("fake.jpg"), &png).expect("write");
+        std::fs::write(root.join("notes.txt"), "text").expect("write");
+        std::fs::write(root.join("anim.gif"), b"GIF89a").expect("write");
+        let mut large = png.clone();
+        large.resize(MAX_IMAGE_BYTES + 1, 0);
+        std::fs::write(root.join("large.png"), &large).expect("write");
+        std::os::unix::fs::symlink(root.join("shot.png"), root.join("link.png")).expect("link");
+        let workspace = Workspace::authorize(&root, &data).expect("authorize");
+
+        let image = load_image(&workspace, "shot.png").expect("a PNG");
+        assert_eq!(
+            (image.mime(), image.bytes()),
+            (ImageMime::Png, png.as_slice())
+        );
+        let refusal = |path: &str| match load_image(&workspace, path) {
+            Err(Error::Image(message)) => message,
+            other => panic!("{path} must be refused, got {other:?}"),
+        };
+        assert_eq!(
+            refusal("fake.jpg"),
+            "the image's content is not the image/jpeg its type declares"
+        );
+        for path in ["notes.txt", "anim.gif"] {
+            assert_eq!(
+                refusal(path),
+                "only .png, .jpg and .jpeg files can be sent as images"
+            );
+        }
+        assert_eq!(
+            refusal("large.png"),
+            "the image is larger than 4194304 bytes"
+        );
+        assert_eq!(refusal("link.png"), "the path traverses a symbolic link");
+        assert_eq!(refusal("missing.png"), "no such file in the Workspace");
+        assert_eq!(
+            refusal("../data/shot.png"),
+            "the path is not a plain relative path inside the Workspace"
+        );
+        assert_eq!(
+            sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

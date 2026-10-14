@@ -1273,6 +1273,7 @@ name = "ocg"
 version = "0.5.0"
 dependencies = [
  "aws-lc-rs",
+ "base64",
  "flume",
  "fs4",
  "jsonschema",

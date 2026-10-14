@@ -10700,6 +10700,7 @@ mod lifecycle_closure {
                 ..ProviderExecutionConfig::default()
             },
             tools: None,
+            images: Vec::new(),
         }
     }
 
@@ -17878,6 +17879,165 @@ mod requests_and_tool_loop {
             }
             assert_eq!(project.source().as_deref(), Some(BUGGY));
             assert_relationships_consistent(&directory);
+        }
+    }
+
+    // ---- Image input ----------------------------------------------------------
+
+    mod image_input {
+        use super::*;
+        use crate::openai_compatible::image::tests::{PNG_BASE64, png};
+        use crate::openai_compatible::{ImageInput, ImageMime, ProviderFailure};
+        use crate::provider_execution::objective_conversation_with_images;
+
+        const OBJECTIVE: &str = "Describe what the image shows.";
+
+        /// Settles `run` from one request of its objective with a PNG, as a
+        /// plan with that image sends it; `respond` answers the request.
+        /// Returns the settlement and the conversation sent.
+        fn settle_with_image(
+            handle: &DatabaseHandle,
+            run: TokenRun,
+            respond: Result<Vec<Step>, ProviderFailure>,
+        ) -> (
+            Result<ExecutionReceipt, ExecutionRuntimeError>,
+            ChatConversation,
+        ) {
+            let configuration = wait(handle.job_configuration(run.job))
+                .expect("read")
+                .expect("a frozen configuration");
+            let image = ImageInput::new(ImageMime::Png, png()).expect("a PNG");
+            let conversation = objective_conversation_with_images(
+                &configuration.frozen,
+                Some(OBJECTIVE),
+                &[image],
+            );
+            let handle = handle.clone();
+            on_ntex(async move {
+                let config = ProviderExecutionConfig::default();
+                let mut sent = None;
+                let mut respond = Some(respond);
+                let settled = run_provider_job(
+                    ProviderRun {
+                        database: handle,
+                        executor: run.executor,
+                        input: run.input,
+                        job: run.job,
+                    },
+                    conversation,
+                    None,
+                    &CancellationToken::default(),
+                    async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
+                        sent = Some(conversation.clone());
+                        conversation
+                            .validate()
+                            .map_err(|error| ProviderExecutionError::Build {
+                                message: error.to_string(),
+                            })?;
+                        announce(Some(&mut *sink), ProviderFact::Delivered).await;
+                        match respond.take().expect("one request") {
+                            Err(failure) => Err(ProviderExecutionError::Rejected { failure }),
+                            Ok(steps) => {
+                                read_response(
+                                    payload(steps, config.cancellation.clone()),
+                                    200,
+                                    Instant::now(),
+                                    None,
+                                    &config,
+                                    Some(&mut *sink),
+                                    conversation,
+                                )
+                                .await
+                            }
+                        }
+                    },
+                )
+                .await;
+                (settled, sent.expect("a request was sent"))
+            })
+        }
+
+        /// The objective's user message, as the Provider received it.
+        fn sent_user_message(conversation: &ChatConversation) -> Value {
+            let [user] = conversation.messages.as_slice() else {
+                panic!("one message");
+            };
+            serde_json::to_value(user).expect("JSON")
+        }
+
+        fn expected_user_message() -> Value {
+            json!({"role": "user", "content": [
+                {"type": "text", "text": OBJECTIVE},
+                {"type": "image_url", "image_url": {
+                    "url": format!("data:image/png;base64,{PNG_BASE64}")
+                }},
+            ]})
+        }
+
+        #[test]
+        fn an_answer_about_an_image_completes_the_job() {
+            let (_root, directory) = data_directory("image-answer");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let answer = "A single transparent pixel.";
+            let (settled, sent) = settle_with_image(&handle, run, Ok(answering(answer, (85, 7))));
+            settled.expect("settled");
+            assert_eq!(sent_user_message(&sent), expected_user_message());
+            let job = job_record(&handle, run.job);
+            assert!(job.completed_at.is_some() && job.failed_at.is_none());
+            let output = wait(handle.latest_output(run.job))
+                .expect("read")
+                .expect("a result");
+            assert_eq!(output.summary.as_deref(), Some(answer));
+            assert!(blocking(&handle, llm).is_empty());
+            let input = wait(handle.job_input(run.input))
+                .expect("read")
+                .expect("input");
+            assert!(
+                !format!("{input:?}").contains(&PNG_BASE64[..12]),
+                "the image is not stored with the Job"
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_provider_that_refuses_the_image_fails_the_job_with_its_own_error() {
+            let (_root, directory) = data_directory("image-refused");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let message = "This model does not support image input.";
+            let (settled, sent) = settle_with_image(
+                &handle,
+                run,
+                Err(ProviderFailure {
+                    message: message.to_owned(),
+                    status_code: Some(400),
+                    provider_code: Some("invalid_request_error".to_owned()),
+                    response_body: None,
+                    request_id: None,
+                    retry_after_ms: None,
+                    retryable: false,
+                }),
+            );
+            let receipt = settled.expect("settled");
+            assert_eq!(sent_user_message(&sent), expected_user_message());
+            let job = job_record(&handle, run.job);
+            assert!(job.failed_at.is_some() && job.completed_at.is_none());
+            let output = wait(handle.latest_output(run.job))
+                .expect("read")
+                .expect("a result");
+            assert_eq!(Some(output.id), receipt.result.map(|result| result.output));
+            let summary = output.summary.expect("a summary");
+            assert!(
+                summary.contains("rejected") && summary.contains(message),
+                "{summary}"
+            );
+            assert!(blocking(&handle, llm).is_empty());
+            worker.shutdown().expect("shutdown");
         }
     }
 }

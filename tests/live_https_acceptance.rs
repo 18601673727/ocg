@@ -801,6 +801,7 @@ fn run_writer(mode: Mode, directory: &Path) {
                     ..ProviderExecutionConfig::default()
                 },
                 tools: None,
+                images: Vec::new(),
             };
             // The one and only Provider request. Nothing below resends it.
             let outcome = wait_for(

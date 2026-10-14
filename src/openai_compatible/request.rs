@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::admission;
 use super::error::TransportError;
+use super::image::{self, MAX_REQUEST_IMAGE_BYTES, MAX_REQUEST_IMAGES};
 use super::stream::{CompletedToolCall, InvalidToolCall, ToolCallRefusal};
 
 /// An OpenAI Chat Completions request, restricted to the fields this transport
@@ -150,8 +151,9 @@ impl ChatRequest {
                 tool.validate(index)?;
             }
         }
+        let mut images = ImageTally::default();
         for (index, message) in self.messages.iter().enumerate() {
-            message.validate(index)?;
+            message.validate(index, &mut images)?;
         }
         Ok(())
     }
@@ -174,7 +176,8 @@ pub struct ChatConversation {
 
 impl ChatConversation {
     /// Validates the conversation before it is sent: every message and tool
-    /// definition, their limits, and the tool-call structure. Each assistant
+    /// definition, their limits, its images and their total, and the
+    /// tool-call structure. Each assistant
     /// tool call has a unique id and is answered by exactly one tool message,
     /// and those answers follow it before any other message.
     ///
@@ -235,8 +238,9 @@ impl ChatConversation {
 
         let mut issued = HashSet::new();
         let mut pending: Vec<&str> = Vec::new();
+        let mut images = ImageTally::default();
         for (index, message) in self.messages.iter().enumerate() {
-            message.validate(index)?;
+            message.validate(index, &mut images)?;
             if message.role == ChatRole::Tool {
                 let id = message.tool_call_id.as_deref().unwrap_or_default();
                 let Some(position) = pending.iter().position(|pending| *pending == id) else {
@@ -436,6 +440,15 @@ impl ChatMessage {
         }
     }
 
+    /// A user turn of content parts, in order: text, images, or both.
+    #[must_use]
+    pub fn user_parts(parts: Vec<ContentPartWire>) -> Self {
+        Self {
+            content: Some(MessageContentWire::Parts(parts)),
+            ..Self::with_role(ChatRole::User)
+        }
+    }
+
     /// An assistant turn, as a Provider returned it: its text, if any, and
     /// the tool calls it made, if any.
     #[must_use]
@@ -458,8 +471,15 @@ impl ChatMessage {
     }
 }
 
+/// The images a request's messages carry so far.
+#[derive(Default)]
+struct ImageTally {
+    count: usize,
+    bytes: usize,
+}
+
 impl ChatMessage {
-    fn validate(&self, index: usize) -> Result<(), TransportError> {
+    fn validate(&self, index: usize, images: &mut ImageTally) -> Result<(), TransportError> {
         let field = |suffix: &str| format!("messages[{index}].{suffix}");
         if let Some(name) = &self.name {
             return Err(TransportError::unsupported(
@@ -478,12 +498,27 @@ impl ChatMessage {
                 field("role"),
                 "the legacy `function` role is not supported",
             )),
-            ChatRole::System | ChatRole::Developer | ChatRole::User => {
+            ChatRole::System | ChatRole::Developer => {
                 self.require_text_content(&field("content"))?;
                 self.reject_tool_fields(index)?;
                 Ok(())
             }
+            ChatRole::User => {
+                self.require_user_content(&field("content"), images)?;
+                self.reject_tool_fields(index)?;
+                Ok(())
+            }
             ChatRole::Assistant => {
+                if let Some(MessageContentWire::Parts(parts)) = &self.content
+                    && parts
+                        .iter()
+                        .any(|part| matches!(part, ContentPartWire::ImageUrl { .. }))
+                {
+                    return Err(TransportError::unsupported(
+                        field("content"),
+                        "images are accepted in user messages only",
+                    ));
+                }
                 if let Some(calls) = &self.tool_calls {
                     for (call_index, call) in calls.iter().enumerate() {
                         call.validate(&field(&format!("tool_calls[{call_index}]")))?;
@@ -563,6 +598,57 @@ impl ChatMessage {
         })?;
         content.to_text_parts(field)
     }
+
+    /// A user message's content: text, or parts of text and images. Each
+    /// image is checked, and counted toward the request's image limits.
+    fn require_user_content(
+        &self,
+        field: &str,
+        images: &mut ImageTally,
+    ) -> Result<(), TransportError> {
+        let content = self.content.as_ref().ok_or_else(|| {
+            TransportError::invalid(field.to_string(), "message content is required")
+        })?;
+        let parts = match content {
+            MessageContentWire::Text(_) => return Ok(()),
+            MessageContentWire::Parts(parts) => parts,
+        };
+        if parts.is_empty() {
+            return Err(TransportError::invalid(
+                field.to_string(),
+                "content parts must not be empty",
+            ));
+        }
+        for (position, part) in parts.iter().enumerate() {
+            let ContentPartWire::ImageUrl { image_url } = part else {
+                continue;
+            };
+            let field = format!("{field}[{position}].image_url.url");
+            let bytes = image::check_data_url(&image_url.url).map_err(|error| match error {
+                image::ImageError::UnsupportedType | image::ImageError::NotDataUrl => {
+                    TransportError::unsupported(field.clone(), error.to_string())
+                }
+                _ => TransportError::invalid(field.clone(), error.to_string()),
+            })?;
+            images.count += 1;
+            images.bytes = images.bytes.saturating_add(bytes);
+            if images.count > MAX_REQUEST_IMAGES {
+                return Err(TransportError::invalid(
+                    field,
+                    format!("a request may carry at most {MAX_REQUEST_IMAGES} images"),
+                ));
+            }
+            if images.bytes > MAX_REQUEST_IMAGE_BYTES {
+                return Err(TransportError::invalid(
+                    field,
+                    format!(
+                        "a request's images may not exceed {MAX_REQUEST_IMAGE_BYTES} bytes together"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Message role.
@@ -603,22 +689,54 @@ impl MessageContentWire {
                     .iter()
                     .map(|part| match part {
                         ContentPartWire::Text { text } => {
-                            super::normalize::ContentPart::text(text.clone())
+                            Ok(super::normalize::ContentPart::text(text.clone()))
                         }
+                        ContentPartWire::ImageUrl { .. } => Err(TransportError::unsupported(
+                            field.to_string(),
+                            "images are accepted in user messages only",
+                        )),
                     })
-                    .collect()
+                    .collect::<Result<_, _>>()?
             }
         };
         Ok(parts)
     }
 }
 
-/// A supported content part. Non-text parts (images, audio, files) are
+/// A supported content part: text, or, in a user message, an image as an
+/// inline `data:` URL, see [`super::image`]. Other parts (audio, files) are
 /// rejected during deserialization.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentPartWire {
     Text { text: String },
+    ImageUrl { image_url: ImageUrlWire },
+}
+
+/// The image of an `image_url` part. Only its URL is forwarded; its `Debug`
+/// never shows the URL, which carries the whole image.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImageUrlWire {
+    pub url: String,
+}
+
+impl std::fmt::Debug for ImageUrlWire {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let header = self
+            .url
+            .split_once(',')
+            .map_or("", |(header, _)| header)
+            .strip_prefix("data:")
+            .unwrap_or("");
+        formatter
+            .debug_struct("ImageUrlWire")
+            .field(
+                "url",
+                &format_args!("data:{header},<{} bytes>", self.url.len()),
+            )
+            .finish()
+    }
 }
 
 /// One tool definition.
@@ -909,6 +1027,255 @@ impl ResponseFormatWire {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::openai_compatible::image::tests::{PNG_BASE64, jpeg, png};
+    use crate::openai_compatible::image::{ImageInput, ImageMime, MAX_IMAGE_BYTES};
+
+    fn png_part() -> ContentPartWire {
+        ImageInput::new(ImageMime::Png, png())
+            .expect("a PNG")
+            .part()
+    }
+
+    fn jpeg_part() -> ContentPartWire {
+        ImageInput::new(ImageMime::Jpeg, jpeg())
+            .expect("a JPEG")
+            .part()
+    }
+
+    fn text(text: &str) -> ContentPartWire {
+        ContentPartWire::Text {
+            text: text.to_owned(),
+        }
+    }
+
+    fn image_url(url: &str) -> ContentPartWire {
+        ContentPartWire::ImageUrl {
+            image_url: ImageUrlWire {
+                url: url.to_owned(),
+            },
+        }
+    }
+
+    fn conversation(messages: Vec<ChatMessage>) -> ChatConversation {
+        ChatConversation {
+            messages,
+            ..ChatConversation::default()
+        }
+    }
+
+    #[test]
+    fn a_text_message_serializes_as_it_always_did() {
+        assert_eq!(
+            serde_json::to_value(ChatMessage::user("Describe it.")).expect("JSON"),
+            json!({"role": "user", "content": "Describe it."})
+        );
+        let parts = ChatMessage::user_parts(vec![text("a"), text("b")]);
+        assert_eq!(
+            serde_json::to_value(&parts).expect("JSON"),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+            ]})
+        );
+        conversation(vec![parts]).validate().expect("valid");
+    }
+
+    #[test]
+    fn text_and_images_keep_their_order_as_real_image_parts() {
+        let message = ChatMessage::user_parts(vec![
+            text("Compare these."),
+            png_part(),
+            text("and"),
+            jpeg_part(),
+            png_part(),
+        ]);
+        let jpeg_url = format!(
+            "data:image/jpeg;base64,{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, jpeg())
+        );
+        let png_url = format!("data:image/png;base64,{PNG_BASE64}");
+        assert_eq!(
+            serde_json::to_value(&message).expect("JSON"),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "Compare these."},
+                {"type": "image_url", "image_url": {"url": png_url}},
+                {"type": "text", "text": "and"},
+                {"type": "image_url", "image_url": {"url": jpeg_url}},
+                {"type": "image_url", "image_url": {"url": png_url}},
+            ]})
+        );
+        conversation(vec![message]).validate().expect("valid");
+        conversation(vec![ChatMessage::user_parts(vec![png_part()])])
+            .validate()
+            .expect("an image alone is a valid user message");
+    }
+
+    #[test]
+    fn images_are_accepted_in_user_messages_only() {
+        let system = ChatMessage {
+            content: Some(MessageContentWire::Parts(vec![png_part()])),
+            ..ChatMessage::system("")
+        };
+        let assistant = ChatMessage {
+            content: Some(MessageContentWire::Parts(vec![text("x"), png_part()])),
+            ..ChatMessage::assistant(None, Vec::new())
+        };
+        let tool_call = ChatToolCallWire {
+            id: "call_1".to_owned(),
+            tool_type: Some("function".to_owned()),
+            function: ChatFunctionCallWire {
+                name: "f".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        };
+        let tool = ChatMessage {
+            content: Some(MessageContentWire::Parts(vec![png_part()])),
+            ..ChatMessage::tool("call_1", "")
+        };
+        let offered = ChatConversation {
+            tools: vec![ToolWire {
+                tool_type: "function".to_owned(),
+                function: FunctionDefinitionWire {
+                    name: "f".to_owned(),
+                    description: None,
+                    parameters: Some(json!({"type": "object"})),
+                    strict: None,
+                },
+            }],
+            ..ChatConversation::default()
+        };
+        for (case, messages) in [
+            ("system", vec![system, ChatMessage::user("q")]),
+            ("assistant", vec![ChatMessage::user("q"), assistant]),
+            (
+                "tool",
+                vec![
+                    ChatMessage::user("q"),
+                    ChatMessage::assistant(None, vec![tool_call]),
+                    tool,
+                ],
+            ),
+        ] {
+            let error = ChatConversation {
+                messages,
+                ..offered.clone()
+            }
+            .validate()
+            .expect_err(case);
+            assert!(
+                error.to_string().contains("user messages only"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_image_is_checked_and_no_refusal_repeats_it() {
+        let data = &PNG_BASE64;
+        for (url, problem) in [
+            ("https://example.com/a.png".to_owned(), "never a remote URL"),
+            (
+                format!("data:image/gif;base64,{data}"),
+                "image/png and image/jpeg",
+            ),
+            (format!("data:image/png;base64,{data}!"), "canonical base64"),
+            (
+                format!("data:image/jpeg;base64,{data}"),
+                "not the image/jpeg",
+            ),
+        ] {
+            let error = conversation(vec![ChatMessage::user_parts(vec![
+                text("look"),
+                image_url(&url),
+            ])])
+            .validate()
+            .expect_err(problem);
+            let message = error.to_string();
+            assert!(message.contains(problem), "{message}");
+            assert!(
+                message.contains("messages[0].content[1].image_url.url"),
+                "{message}"
+            );
+            assert!(!message.contains(&data[..12]), "{message}");
+        }
+        assert!(
+            conversation(vec![ChatMessage::user_parts(Vec::new())])
+                .validate()
+                .is_err(),
+            "content parts must not be empty"
+        );
+    }
+
+    #[test]
+    fn a_request_carries_a_bounded_number_and_size_of_images() {
+        let many = (0..=MAX_REQUEST_IMAGES).map(|_| png_part()).collect();
+        let error = conversation(vec![ChatMessage::user_parts(many)])
+            .validate()
+            .expect_err("too many images");
+        assert!(error.to_string().contains("at most 8 images"), "{error}");
+
+        let mut largest = png();
+        largest.resize(MAX_IMAGE_BYTES, 0);
+        let large = ImageInput::new(ImageMime::Png, largest)
+            .expect("a PNG at the limit")
+            .part();
+        let within = MAX_REQUEST_IMAGE_BYTES / MAX_IMAGE_BYTES;
+        let messages = (0..within)
+            .map(|_| ChatMessage::user_parts(vec![large.clone()]))
+            .collect::<Vec<_>>();
+        conversation(messages.clone())
+            .validate()
+            .expect("the total is at its limit");
+        let mut over = messages;
+        over.push(ChatMessage::user_parts(vec![png_part()]));
+        let error = conversation(over)
+            .validate()
+            .expect_err("the total is over its limit");
+        assert!(error.to_string().contains("together"), "{error}");
+    }
+
+    #[test]
+    fn an_inbound_request_may_carry_images_under_the_same_rules() {
+        let url = format!("data:image/png;base64,{PNG_BASE64}");
+        let request = ChatRequest::from_json(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": url}},
+            ]}],
+        }))
+        .expect("parsed");
+        request.validate().expect("valid");
+        let remote = ChatRequest::from_json(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            ]}],
+        }))
+        .expect("parsed");
+        assert!(remote.validate().is_err());
+        for refused in [
+            json!({"type": "image_url", "image_url": {"url": url, "detail": "high"}}),
+            json!({"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}),
+            json!({"type": "file", "file": {"file_data": ""}}),
+        ] {
+            assert!(
+                ChatRequest::from_json(json!({
+                    "model": "m",
+                    "messages": [{"role": "user", "content": [refused]}],
+                }))
+                .is_err(),
+                "{refused:.80}"
+            );
         }
     }
 }
