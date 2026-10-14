@@ -69,11 +69,13 @@ pub struct ProviderExecutionPlan {
     pub tools: Option<ToolExecution>,
 }
 
-/// Tools OCG offers one execution, and the limits of the tool loop.
+/// Tools OCG offers one execution, and the limits of the tool loop. Only
+/// OCG's own code can build one, from tools it registered and authorized;
+/// a plan built outside the crate can only offer no tools.
 #[derive(Clone, Debug)]
 pub struct ToolExecution {
-    pub offer: ToolOffer,
-    pub limits: ToolLoopLimits,
+    pub(crate) offer: ToolOffer,
+    pub(crate) limits: ToolLoopLimits,
 }
 
 /// Bounds of one execution's tool loop. Each is a refusal, never a
@@ -95,6 +97,36 @@ pub struct ToolLoopLimits {
     pub handler_timeout: Duration,
 }
 
+/// A [`ToolLoopLimits`] that cannot bound an execution as written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ToolLimitsError {
+    /// No Provider request is allowed, not even the first.
+    #[error("the tool loop allows no Provider request")]
+    NoProviderRequest,
+    /// No handler is given any time, so every call would time out.
+    #[error("the tool loop gives handlers no time")]
+    NoHandlerTime,
+}
+
+impl ToolLoopLimits {
+    /// Refuses limits that cannot bound an execution as written. A zero call
+    /// limit or result limit stays valid: it refuses every call, or every
+    /// result, explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns which limit cannot be met.
+    pub fn validate(&self) -> Result<(), ToolLimitsError> {
+        if self.max_provider_requests == 0 {
+            return Err(ToolLimitsError::NoProviderRequest);
+        }
+        if self.handler_timeout.is_zero() {
+            return Err(ToolLimitsError::NoHandlerTime);
+        }
+        Ok(())
+    }
+}
+
 impl Default for ToolLoopLimits {
     fn default() -> Self {
         Self {
@@ -111,6 +143,9 @@ impl Default for ToolLoopLimits {
 /// end it. None of these is a Provider failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolLoopStop {
+    /// The limits cannot bound the execution, see
+    /// [`ToolLoopLimits::validate`], so no Provider request was sent.
+    InvalidLimits(ToolLimitsError),
     /// The Provider requested tools in the last request the limits allow.
     /// None of them ran.
     RequestLimit,
@@ -144,6 +179,7 @@ impl ToolLoopStop {
 impl std::fmt::Display for ToolLoopStop {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidLimits(error) => write!(formatter, "invalid tool loop limits: {error}"),
             Self::RequestLimit => {
                 formatter.write_str("the Provider requested tools after the last allowed request")
             }
@@ -241,6 +277,10 @@ pub enum ExecutionRuntimeError {
     /// or no longer authorized. Nothing of the plan was persisted.
     #[error("the plan's tools cannot be offered: {0}")]
     ToolsUnavailable(ToolRegistryError),
+    /// The plan's tool loop limits cannot bound its execution. Nothing of
+    /// the plan was persisted and nothing was sent.
+    #[error("the plan's tool loop limits are invalid: {0}")]
+    InvalidToolLimits(ToolLimitsError),
     /// The tool loop ended on this side before a final answer, as `stop`
     /// says, and the receipt shows how the Job settled: Failed when the stop
     /// is known, Unknown, with its stop confirmed, when a handler was stopped
@@ -670,7 +710,14 @@ async fn execute_provider_plan(
         return Err(ExecutionRuntimeError::ExecutorNotFound(executor));
     }
     plan.job.assigned_executor = Some(executor);
-    // The offer is read from the registry before anything is persisted.
+    // The limits are checked, and the offer read from the registry, before
+    // anything is persisted.
+    if let Some(tools) = &plan.tools {
+        tools
+            .limits
+            .validate()
+            .map_err(ExecutionRuntimeError::InvalidToolLimits)?;
+    }
     let offered = plan
         .tools
         .as_ref()
@@ -787,6 +834,10 @@ pub(crate) async fn run_provider_job(
     ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let mut sink = output_sink(run.database.clone(), run.job);
+    if let Some(Err(error)) = tools.map(|tools| tools.limits.validate()) {
+        // Nothing was sent, so nothing of a Provider is recorded.
+        return stop_tool_loop(run, sink, None, ToolLoopStop::InvalidLimits(error)).await;
+    }
     let mut budget = ToolBudget::default();
     loop {
         let result = match exchange(&conversation, &mut sink).await {
@@ -830,7 +881,7 @@ pub(crate) async fn run_provider_job(
         };
         let (answers, next) = match (answered, next) {
             (Ok(answers), Some(next)) => (answers, next),
-            (Err(stop), _) => return stop_tool_loop(run, sink, &result, stop).await,
+            (Err(stop), _) => return stop_tool_loop(run, sink, Some(&result), stop).await,
             (Ok(_), None) => unreachable!("calls are answered only when a request may follow"),
         };
         let text = Some(result.text.clone()).filter(|text| !text.is_empty());
@@ -941,13 +992,13 @@ async fn answer_calls(
 
 /// Settles a Job whose tool loop stopped on this side. A known stop fails
 /// the Job, a local orchestration failure that keeps the Provider's last
-/// response as its value; a handler stopped while it ran leaves the outcome
-/// unknown, and the stop of the execution is then confirmed. No Provider
-/// failure is recorded for either.
+/// response, if there was one, as its value; a handler stopped while it ran
+/// leaves the outcome unknown, and the stop of the execution is then
+/// confirmed. No Provider failure is recorded for either.
 async fn stop_tool_loop(
     run: ProviderRun,
     sink: DatabaseOutputSink,
-    last: &ProviderExecutionResult,
+    last: Option<&ProviderExecutionResult>,
     stop: ToolLoopStop,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let database = run.database;
@@ -959,7 +1010,7 @@ async fn stop_tool_loop(
             summary: Some(stop.to_string()),
             code: None,
             goal_reached: Some(false),
-            value: Some(provider_execution::result_value(last)),
+            value: last.map(provider_execution::result_value),
         })
     };
     let observations = sink.gap.map(Box::new);

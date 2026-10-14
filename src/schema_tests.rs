@@ -13722,6 +13722,362 @@ mod requests_and_tool_loop {
         worker.shutdown().expect("shutdown");
     }
 
+    fn add_tool() -> Arc<TestTool> {
+        Arc::new(TestTool {
+            behavior: Behavior::Add,
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[test]
+    fn the_registry_grants_nothing_unasked_and_never_to_a_new_registration() {
+        use crate::openai_compatible::CompletedToolCall;
+        use crate::orchestration::tools::ToolRegistryError;
+
+        let registry = ToolRegistry::default();
+        assert_eq!(
+            registry.offer(&["add"]).map(|_| ()),
+            Err(ToolRegistryError::Unregistered("add".into())),
+            "a registry starts empty"
+        );
+        assert!(
+            registry
+                .offer(&[])
+                .expect("no tools")
+                .wires()
+                .expect("none")
+                .is_empty()
+        );
+        registry
+            .register("add", None, add_schema(), add_tool())
+            .expect("register");
+        assert_eq!(
+            registry.offer(&["add"]).map(|_| ()),
+            Err(ToolRegistryError::Unauthorized("add".into())),
+            "registering grants nothing"
+        );
+        registry.authorize("add").expect("authorize");
+        let offer = registry.offer(&["add"]).expect("an authorized tool");
+        let call = CompletedToolCall {
+            index: 0,
+            id: "c".into(),
+            name: "add".into(),
+            arguments: r#"{"a":1,"b":2}"#.into(),
+        };
+        assert!(offer.resolve(&call).is_ok());
+
+        registry.unregister("add").expect("unregister");
+        registry
+            .register("add", None, add_schema(), add_tool())
+            .expect("register again");
+        assert_eq!(
+            registry.offer(&["add"]).map(|_| ()),
+            Err(ToolRegistryError::Unauthorized("add".into())),
+            "the new registration does not inherit the old grant"
+        );
+        registry.authorize("add").expect("authorize the new one");
+        assert_eq!(
+            offer.wires().map(|_| ()),
+            Err(ToolRegistryError::Changed("add".into()))
+        );
+        let refused = offer
+            .resolve(&call)
+            .map(|_| ())
+            .expect_err("another generation");
+        assert_eq!(refused.kind, ToolCallRefusal::Unauthorized);
+        assert!(
+            refused.message.contains("registered again"),
+            "{}",
+            refused.message
+        );
+    }
+
+    #[test]
+    fn a_handler_admitted_before_its_revocation_finishes_and_no_later_call_is_admitted() {
+        let (_root, directory) = data_directory("tool-loop-revocation");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let registry = ToolRegistry::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // The handler withdraws its own grant while it runs.
+        registry
+            .register(
+                "add",
+                None,
+                add_schema(),
+                Arc::new(TestTool {
+                    behavior: Behavior::Revoke(registry.clone(), "add"),
+                    calls: calls.clone(),
+                }),
+            )
+            .expect("register");
+        registry.authorize("add").expect("authorize");
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+            vec![
+                calling(&[add(0, "first", 1, 2)], (1, 1)),
+                calling(&[add(0, "second", 1, 2)], (1, 1)),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        assert_eq!(looped.sent.len(), 2, "the admitted call's result was sent");
+        let answered = looped.sent[1].messages.iter().find_map(|message| {
+            match (&message.tool_call_id, &message.content) {
+                (Some(id), Some(MessageContentWire::Text(text))) if id == "first" => {
+                    Some(text.clone())
+                }
+                _ => None,
+            }
+        });
+        assert_eq!(answered.as_deref(), Some(r#"{"revoked":"add"}"#));
+        let (_, stop) = stopped(looped);
+        assert!(
+            matches!(&stop, ToolLoopStop::Refused(refusal)
+                if refusal.kind == ToolCallRefusal::Unauthorized && refusal.index == Some(0)),
+            "{stop:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no call was admitted after the revocation"
+        );
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn limits_that_allow_no_request_are_refused_before_anything_is_sent() {
+        use crate::orchestration::execution_runtime::ToolLimitsError;
+
+        assert_eq!(ToolLoopLimits::default().validate(), Ok(()));
+        let zero_requests = ToolLoopLimits {
+            max_provider_requests: 0,
+            ..ToolLoopLimits::default()
+        };
+        let zero_time = ToolLoopLimits {
+            handler_timeout: Duration::ZERO,
+            ..ToolLoopLimits::default()
+        };
+        assert_eq!(
+            zero_requests.validate(),
+            Err(ToolLimitsError::NoProviderRequest)
+        );
+        assert_eq!(zero_time.validate(), Err(ToolLimitsError::NoHandlerTime));
+        for refusing in [
+            ToolLoopLimits {
+                max_tool_calls: 0,
+                ..ToolLoopLimits::default()
+            },
+            ToolLoopLimits {
+                max_tool_result_bytes: 0,
+                max_tool_results_bytes: 0,
+                ..ToolLoopLimits::default()
+            },
+        ] {
+            assert_eq!(
+                refusing.validate(),
+                Ok(()),
+                "an explicit refusal stays valid"
+            );
+        }
+
+        let (_root, directory) = data_directory("tool-loop-invalid-limits");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+
+        // Through the runtime: refused before anything is persisted.
+        let executor =
+            executor(&handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+        let markers = || {
+            wait(handle.operation_markers(None, 1_000))
+                .expect("markers")
+                .len()
+        };
+        let before = markers();
+        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let mut plan = ProviderExecutionPlan::environment_credentials(
+            executor,
+            JobInputDraft::default(),
+            NewJob {
+                configuration: llm_only(llm),
+                ..new_job("tool plan", handle.genesis(), Vec::new())
+            },
+        );
+        plan.tools = Some(execution(&registry, &["add"], zero_requests));
+        assert!(matches!(
+            wait(runtime.scheduler().schedule_provider(plan)),
+            Err(ExecutionRuntimeError::InvalidToolLimits(
+                ToolLimitsError::NoProviderRequest
+            ))
+        ));
+        runtime.shutdown().expect("shutdown runtime");
+        assert_eq!(markers(), before, "no input, Job or evidence was written");
+
+        // Called on a Job already started: it fails without a request.
+        for (limits, expected) in [
+            (zero_requests, ToolLimitsError::NoProviderRequest),
+            (zero_time, ToolLimitsError::NoHandlerTime),
+        ] {
+            let run = local_run(&handle, llm);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], limits)),
+                Vec::new(),
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert!(looped.sent.is_empty(), "{expected}: no request was sent");
+            let (receipt, stop) = stopped(looped);
+            assert_eq!(stop, ToolLoopStop::InvalidLimits(expected));
+            assert!(
+                receipt.result.is_some(),
+                "{expected}: the failure is published"
+            );
+            let job = job_record(&handle, run.job);
+            assert!(
+                job.failed_at.is_some() && job.completed_at.is_none(),
+                "{expected}"
+            );
+            assert!(
+                job_metrics(&handle, run.job).is_empty() && stats(&handle, run.job).is_empty(),
+                "{expected}: no Provider fact is made up"
+            );
+            let outputs = wait(handle.job_outputs(run.job, None, 10)).expect("outputs");
+            assert_eq!(outputs.last().and_then(|output| output.value.clone()), None);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(blocking(&handle, llm).is_empty(), "no Profile stays held");
+        worker.shutdown().expect("shutdown");
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        assert!(
+            worker.handle().abandoned_at_open().is_empty(),
+            "no local claim stays behind"
+        );
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn one_allowed_request_is_exactly_one() {
+        let (_root, directory) = data_directory("tool-loop-one-request");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let one = ToolLoopLimits {
+            max_provider_requests: 1,
+            ..ToolLoopLimits::default()
+        };
+        let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+
+        let run = local_run(&handle, llm);
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], one)),
+            vec![answering("no tools needed", (1, 1))],
+            CancellationToken::default(),
+            |_| {},
+        );
+        assert_eq!(looped.sent.len(), 1);
+        looped.settled.expect("one request answers");
+        assert!(job_record(&handle, run.job).completed_at.is_some());
+
+        let run = local_run(&handle, llm);
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], one)),
+            vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+            CancellationToken::default(),
+            |_| {},
+        );
+        assert_eq!(
+            looped.sent.len(),
+            1,
+            "a response asking for tools sends no second request"
+        );
+        let (_, stop) = stopped(looped);
+        assert_eq!(stop, ToolLoopStop::RequestLimit);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no tool ran for a request never sent"
+        );
+        assert!(job_record(&handle, run.job).failed_at.is_some());
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_failed_settlement_of_invalid_limits_is_reported_and_claims_no_outcome() {
+        use crate::disk_protection::{
+            CleanupConfig, FilesystemConfig, ProtectedArea, ProtectionReason, SpaceShortage,
+        };
+
+        let (_root, directory) = data_directory("tool-loop-invalid-unsettled");
+        let lenient = FilesystemConfig {
+            disk_lock_threshold_bytes: 1,
+            disk_resume_threshold_bytes: 2,
+            disk_check_interval_ms: 3_600_000,
+            cleanup_config: CleanupConfig::default(),
+        };
+        let worker = DatabaseWorker::start_with_config(&directory, lenient).expect("start");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let (registry, _) = registered(vec![("add", Behavior::Add)]);
+        let run = local_run(&handle, llm);
+        assert!(
+            handle.activate_filesystem_protection(ProtectionReason::InsufficientSpace(
+                SpaceShortage {
+                    area: ProtectedArea::Database,
+                    path: directory.database_path().to_path_buf(),
+                    available_bytes: 0,
+                    expected_write_bytes: 0,
+                    threshold_bytes: 1,
+                }
+            ))
+        );
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(
+                &registry,
+                &["add"],
+                ToolLoopLimits {
+                    max_provider_requests: 0,
+                    ..ToolLoopLimits::default()
+                },
+            )),
+            Vec::new(),
+            CancellationToken::default(),
+            |_| {},
+        );
+        assert!(looped.sent.is_empty());
+        match looped.settled {
+            Err(ExecutionRuntimeError::NotSettled {
+                source,
+                observations: None,
+            }) => assert!(
+                !matches!(source, DatabaseError::Rejected(_)),
+                "storage refused it, not a rule: {source:?}"
+            ),
+            other => panic!("the failed settlement must be reported, got {other:?}"),
+        }
+        wait(handle.recover_storage()).expect("recover");
+        let job = job_record(&handle, run.job);
+        assert!(
+            job.failed_at.is_none() && job.completed_at.is_none() && job.unknown_at.is_none(),
+            "no outcome was claimed"
+        );
+        assert!(job_metrics(&handle, run.job).is_empty() && stats(&handle, run.job).is_empty());
+        worker.shutdown().expect("shutdown");
+    }
+
     #[test]
     fn without_tools_one_request_settles_as_before() {
         let (_root, directory) = data_directory("tool-loop-none");

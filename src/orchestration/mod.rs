@@ -3,4 +3,6 @@
 pub mod aggregation_service;
 pub mod execution_runtime;
 pub mod governor;
-pub mod tools;
+pub(crate) mod tools;
+
+pub use tools::ToolRegistryError;

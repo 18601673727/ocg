@@ -9,6 +9,23 @@
 //! then; nothing the Provider sent can register, redefine or authorize a
 //! tool. This authorization is the registry's explicit grant alone; no
 //! user, role or persistent policy is consulted, because none exists yet.
+//!
+//! Registration is a trusted-code boundary. Everything here is visible only
+//! inside the crate, so no consumer of the library can register, authorize
+//! or offer a handler, and a plan built outside the crate offers no tools.
+//! Visibility restricts who may register a handler; it cannot prove that a
+//! handler OCG registers is free of side effects, which stays the duty of
+//! the OCG code that registers it. OCG registers no handler by default and
+//! implements no privileged one: tools with side effects need durable call
+//! records and a permission contract that do not exist yet.
+//!
+//! A call is admitted for dispatch in [`ToolOffer::resolve`], under the
+//! registry's lock, which [`ToolRegistry::revoke`], `unregister` and
+//! `register` take too, so each admission is ordered before or after each of
+//! them. An admission ordered after a revocation is refused; a handler
+//! admitted before it runs to its end, as the lock is released before the
+//! handler is awaited. A registration is a new generation and starts
+//! unauthorized, so it never inherits an earlier registration's grant.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,10 +43,11 @@ use crate::openai_compatible::{
 };
 
 /// A tool call's result, or its handler's failure.
-pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolFailure>> + 'a>>;
+pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolFailure>> + 'a>>;
 
-/// Runs the calls of one registered tool.
-pub trait ToolHandler: Send + Sync {
+/// Runs the calls of one registered tool. Only OCG's own code implements and
+/// registers it.
+pub(crate) trait ToolHandler: Send + Sync {
     /// Runs one call with arguments its registered schema accepted, exactly
     /// as the Provider sent them. A handler OCG registers must be free of
     /// side effects: no call of it is durably recorded, so one whose outcome
@@ -42,12 +60,16 @@ pub trait ToolHandler: Send + Sync {
 /// A failure a handler reports.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
-pub struct ToolFailure {
-    pub message: String,
+pub(crate) struct ToolFailure {
+    pub(crate) message: String,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "OCG registers no tool outside its tests yet")
+)]
 impl ToolFailure {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -84,6 +106,10 @@ struct Registration {
 }
 
 #[derive(Default)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "OCG registers no tool outside its tests yet")
+)]
 struct Registry {
     tools: BTreeMap<String, Registration>,
     generations: u64,
@@ -91,7 +117,7 @@ struct Registry {
 
 /// OCG's tool registry. Clones share it. It starts empty and grants nothing.
 #[derive(Clone, Default)]
-pub struct ToolRegistry {
+pub(crate) struct ToolRegistry {
     inner: Arc<Mutex<Registry>>,
 }
 
@@ -105,6 +131,10 @@ impl fmt::Debug for ToolRegistry {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "OCG registers no tool outside its tests yet")
+)]
 impl ToolRegistry {
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
@@ -118,7 +148,7 @@ impl ToolRegistry {
     ///
     /// Refuses an invalid name, a name already registered, and a schema
     /// that cannot be enforced.
-    pub fn register(
+    pub(crate) fn register(
         &self,
         name: &str,
         description: Option<&str>,
@@ -151,7 +181,7 @@ impl ToolRegistry {
     }
 
     /// Removes a tool. A call to it that was offered is refused from now on.
-    pub fn unregister(&self, name: &str) -> Result<(), ToolRegistryError> {
+    pub(crate) fn unregister(&self, name: &str) -> Result<(), ToolRegistryError> {
         self.lock()
             .tools
             .remove(name)
@@ -160,12 +190,12 @@ impl ToolRegistry {
     }
 
     /// Grants the execution of a registered tool.
-    pub fn authorize(&self, name: &str) -> Result<(), ToolRegistryError> {
+    pub(crate) fn authorize(&self, name: &str) -> Result<(), ToolRegistryError> {
         self.set_authorized(name, true)
     }
 
     /// Withdraws the grant. A call to the tool not yet run is refused.
-    pub fn revoke(&self, name: &str) -> Result<(), ToolRegistryError> {
+    pub(crate) fn revoke(&self, name: &str) -> Result<(), ToolRegistryError> {
         self.set_authorized(name, false)
     }
 
@@ -186,7 +216,7 @@ impl ToolRegistry {
     /// # Errors
     ///
     /// Refuses a name selected twice, unregistered or unauthorized.
-    pub fn offer(&self, names: &[&str]) -> Result<ToolOffer, ToolRegistryError> {
+    pub(crate) fn offer(&self, names: &[&str]) -> Result<ToolOffer, ToolRegistryError> {
         let registry = self.lock();
         let mut tools = Vec::with_capacity(names.len());
         for name in names {
@@ -212,7 +242,7 @@ impl ToolRegistry {
 /// The tools OCG selected for one execution, each pinned to the
 /// registration it chose.
 #[derive(Clone, Debug)]
-pub struct ToolOffer {
+pub(crate) struct ToolOffer {
     registry: ToolRegistry,
     tools: Vec<(String, u64)>,
 }
@@ -231,7 +261,7 @@ impl ToolOffer {
     /// # Errors
     ///
     /// Refuses when any selected tool no longer is.
-    pub fn wires(&self) -> Result<Vec<ToolWire>, ToolRegistryError> {
+    pub(crate) fn wires(&self) -> Result<Vec<ToolWire>, ToolRegistryError> {
         let registry = self.registry.lock();
         self.tools
             .iter()
