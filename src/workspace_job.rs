@@ -10,7 +10,8 @@
 //! It runs the ordinary host and submits exactly one Job through the host's
 //! scheduler, offering only `workspace_read_file`; for `workspace-edit`,
 //! `workspace_read_file` and `workspace_write_file`; for `workspace-code`,
-//! those and `workspace_run_command`; all bound to the Workspace named by
+//! those, `workspace_run_command`, `workspace_list_directory` and
+//! `workspace_search`; all bound to the Workspace named by
 //! [`WORKSPACE_ROOT_VARIABLE`]. Writing is offered by the last two commands
 //! alone, and running commands by `workspace-code` alone; every write is
 //! recorded, with its contents, and every command's output in plaintext tool
@@ -47,7 +48,7 @@ use ocg::orchestration::execution_runtime::{
 };
 use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceError};
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-use ocg::orchestration::{workspace_command, workspace_write};
+use ocg::orchestration::{workspace_command, workspace_discovery, workspace_write};
 use ocg::persistence::{
     AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, ExecutionMode, ExecutorId,
     ExecutorType, JobId, JobInputDraft, LlmConfig, LlmParameters, LlmTransport, MetricsRecord,
@@ -90,8 +91,10 @@ pub enum Mode {
     /// and `workspace_write_file`.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     Edit,
-    /// Read, write, and build and test: `workspace_read_file`,
-    /// `workspace_write_file` and `workspace_run_command`.
+    /// Read, write, build and test, and discover files:
+    /// `workspace_read_file`, `workspace_write_file`,
+    /// `workspace_run_command`, `workspace_list_directory` and
+    /// `workspace_search`.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     Code,
     /// Send one image of the Workspace with the objective; no tool.
@@ -273,10 +276,12 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         Mode::Code => {
             eprintln!(
-                "OCG Workspace authorized for {}, {} and {}: {root}",
+                "OCG Workspace authorized for {}, {}, {}, {} and {}: {root}",
                 workspace_read::TOOL_NAME,
                 workspace_write::TOOL_NAME,
-                workspace_command::TOOL_NAME
+                workspace_command::TOOL_NAME,
+                workspace_discovery::LIST_TOOL_NAME,
+                workspace_discovery::SEARCH_TOOL_NAME
             );
             eprintln!(
                 "OCG records the path and complete content of every write, an update's expected content, and every command's output in plaintext tool evidence, and sends command output to the Provider"

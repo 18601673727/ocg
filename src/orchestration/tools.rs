@@ -19,11 +19,13 @@
 //! OCG code that implements and registers it. Every call is recorded
 //! durably before its handler runs, and its outcome after, see
 //! [`crate::persistence::ToolEvidenceRecord`]. OCG registers no handler by
-//! default; its handlers, `workspace_read_file`, `workspace_write_file` and
-//! `workspace_run_command`, are registered only for an execution an operator
+//! default; its handlers, `workspace_read_file`, `workspace_write_file`,
+//! `workspace_run_command`, `workspace_list_directory` and
+//! `workspace_search`, are registered only for an execution an operator
 //! enabled them for, see [`crate::orchestration::workspace_read`],
-//! [`crate::orchestration::workspace_write`] and
-//! [`crate::orchestration::workspace_command`].
+//! [`crate::orchestration::workspace_write`],
+//! [`crate::orchestration::workspace_command`] and
+//! [`crate::orchestration::workspace_discovery`].
 //!
 //! A call is authorized for dispatch in [`ToolOffer::resolve`], under the
 //! registry's lock, which [`ToolRegistry::revoke`], `unregister` and

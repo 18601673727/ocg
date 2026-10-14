@@ -1,7 +1,9 @@
-//! `workspace_read_file`: reads one small UTF-8 text file inside a Workspace
-//! the operator authorized, and nothing else. The Workspace, its path rules
-//! and its checks are shared with `workspace_write_file`, see
-//! [`crate::orchestration::workspace_write`].
+//! `workspace_read_file`: reads one UTF-8 text file inside a Workspace the
+//! operator authorized, whole when it is small, or a range of its lines, and
+//! nothing else. The Workspace, its path rules and its checks are shared with
+//! `workspace_write_file` and the discovery tools, see
+//! [`crate::orchestration::workspace_write`] and
+//! [`crate::orchestration::workspace_discovery`].
 //!
 //! The Workspace root is chosen by the operator, never by a Provider: a call
 //! carries only a path relative to it. The root is resolved and checked once,
@@ -22,6 +24,16 @@
 //! A file is read only when it is a regular file with a single link, within
 //! [`MAX_FILE_BYTES`], and the same size and modification time before and
 //! after the read; its contents are returned whole, or not at all.
+//!
+//! A ranged read, a call that names `start_line` or `line_count`, reads a
+//! file of up to [`MAX_RANGED_FILE_BYTES`] with the same walk and checks. It
+//! streams the file once, keeping only the lines asked for, at most
+//! [`MAX_RANGE_LINES`] of them and as many as fit [`MAX_FILE_BYTES`] once
+//! escaped for JSON, and returns them exactly, with their line ends. Lines
+//! are numbered from 1 and end at `\n`. The result says which lines it holds,
+//! how many the file has, and where to continue; a single line too long for
+//! the limit is returned cut, and says so. Only the lines returned must be
+//! UTF-8 text.
 //!
 //! What this does not establish: a bind mount or a hard-linked directory
 //! inside the Workspace can still lead outside it; the root itself is
@@ -51,11 +63,18 @@ use crate::persistence::ToolEffect;
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_read_file";
 
-/// The largest file the tool reads. A larger one is refused, never truncated.
+/// The largest file the tool reads whole. A larger one is refused, never
+/// truncated; it may be read in ranges. Also the most a ranged read returns.
 pub const MAX_FILE_BYTES: usize = 8 * 1024;
 
+/// The largest file a ranged read reads from.
+pub const MAX_RANGED_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most lines one ranged read returns.
+pub const MAX_RANGE_LINES: u64 = 2_000;
+
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_read_file-1";
+const HANDLER_VERSION: &str = "workspace_read_file-2";
 
 /// The longest relative path, in bytes, and the most components, a call may
 /// name.
@@ -185,6 +204,27 @@ impl Workspace {
         read_whole(&file)
     }
 
+    /// Up to `line_count` lines of the file at `path`, relative to the root,
+    /// from line `start_line`, see [`read_lines`].
+    fn read_range(
+        &self,
+        path: &str,
+        start_line: u64,
+        line_count: u64,
+    ) -> Result<LineRange, Refusal> {
+        if start_line == 0 || line_count == 0 || line_count > MAX_RANGE_LINES {
+            return Err(Refusal::InvalidRange);
+        }
+        let (directory, name) = self.parent(path)?;
+        let file = open_within(&directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(
+            |refusal| match refusal {
+                Refusal::TooLarge => Refusal::TooLargeForRange,
+                other => other,
+            },
+        )?;
+        read_lines(&file, start_line, line_count)
+    }
+
     /// The whole content of the file at `path`, relative to the root, as
     /// bytes, when it has at most `limit` of them: the path rules, the walk
     /// and the checks of reading text, without requiring text. For a file
@@ -209,13 +249,36 @@ impl Workspace {
         let (name, parents) = components.split_last().ok_or(Refusal::InvalidPath)?;
         let mut directory = self.open_root()?;
         for parent in parents {
-            directory = open_at(&directory, parent, Step::Directory)?;
-            let metadata = directory.metadata().map_err(|_| Refusal::Unreadable)?;
-            if Identity::of(&metadata) == self.data_directory {
-                return Err(Refusal::Protected);
-            }
+            directory = self.subdirectory(&directory, parent)?;
         }
         Ok((directory, *name))
+    }
+
+    /// The directory at `path`, relative to the root, opened from the root
+    /// through every directory on the way, as [`Self::parent`] opens them;
+    /// `.` names the root itself.
+    pub(super) fn directory(&self, path: &str) -> Result<File, Refusal> {
+        let components = if path == "." {
+            Vec::new()
+        } else {
+            components(path)?
+        };
+        let mut directory = self.open_root()?;
+        for component in components {
+            directory = self.subdirectory(&directory, component)?;
+        }
+        Ok(directory)
+    }
+
+    /// The directory `name` inside `directory`, opened without following a
+    /// link, unless it is the data directory.
+    pub(super) fn subdirectory(&self, directory: &File, name: &str) -> Result<File, Refusal> {
+        let opened = open_at(directory, name, Step::Directory)?;
+        let metadata = opened.metadata().map_err(|_| Refusal::Unreadable)?;
+        if Identity::of(&metadata) == self.data_directory {
+            return Err(Refusal::Protected);
+        }
+        Ok(opened)
     }
 
     /// The root, opened, when it still exists and is still the directory
@@ -289,6 +352,12 @@ pub enum Refusal {
     HardLinked,
     #[error("the file is larger than {MAX_FILE_BYTES} bytes")]
     TooLarge,
+    #[error("the file is larger than {MAX_RANGED_FILE_BYTES} bytes, the most a ranged read reads")]
+    TooLargeForRange,
+    #[error(
+        "the range must name a start_line of at least 1 and a line_count from 1 to {MAX_RANGE_LINES}"
+    )]
+    InvalidRange,
     #[error("the file is not UTF-8 text")]
     NotText,
     #[error("the file changed while it was read")]
@@ -312,7 +381,7 @@ impl Refusal {
 /// The components of a plain relative path: no leading, trailing or doubled
 /// separator, no `.` or `..`, no backslash, colon or control character, and
 /// no hidden or protected name.
-fn components(path: &str) -> Result<Vec<&str>, Refusal> {
+pub(super) fn components(path: &str) -> Result<Vec<&str>, Refusal> {
     if path.is_empty() || path.len() > MAX_PATH_BYTES {
         return Err(Refusal::InvalidPath);
     }
@@ -321,20 +390,26 @@ fn components(path: &str) -> Result<Vec<&str>, Refusal> {
         return Err(Refusal::InvalidPath);
     }
     for component in &components {
-        if component.is_empty()
-            || *component == "."
-            || *component == ".."
-            || component
-                .chars()
-                .any(|character| matches!(character, '\\' | ':') || character.is_control())
-        {
-            return Err(Refusal::InvalidPath);
-        }
-        if is_protected(component) {
-            return Err(Refusal::Protected);
-        }
+        check_component(component)?;
     }
     Ok(components)
+}
+
+/// Checks one component of a path as [`components`] does.
+pub(super) fn check_component(component: &str) -> Result<(), Refusal> {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component
+            .chars()
+            .any(|character| matches!(character, '\\' | ':') || character.is_control())
+    {
+        return Err(Refusal::InvalidPath);
+    }
+    if is_protected(component) {
+        return Err(Refusal::Protected);
+    }
+    Ok(())
 }
 
 fn is_protected(component: &str) -> bool {
@@ -374,7 +449,12 @@ pub(super) fn open_at(directory: &File, name: &str, step: Step) -> Result<File, 
 }
 
 /// [`open_at`], with a file of up to `limit` bytes.
-fn open_within(directory: &File, name: &str, step: Step, limit: usize) -> Result<File, Refusal> {
+pub(super) fn open_within(
+    directory: &File,
+    name: &str,
+    step: Step,
+    limit: usize,
+) -> Result<File, Refusal> {
     let stat = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(Refusal::from_errno)?;
     match (FileType::from_raw_mode(stat.st_mode), step) {
@@ -413,17 +493,8 @@ pub(super) fn read_whole(file: &File) -> Result<String, Refusal> {
 
 /// Reads the whole of an opened file, bounded by `limit`: a regular file
 /// with a single link, unchanged while it was read.
-fn read_bytes(file: &File, limit: usize) -> Result<Vec<u8>, Refusal> {
-    let before = file.metadata().map_err(|_| Refusal::Unreadable)?;
-    if !before.is_file() {
-        return Err(Refusal::NotRegularFile);
-    }
-    if before.nlink() != 1 {
-        return Err(Refusal::HardLinked);
-    }
-    if before.len() > limit as u64 {
-        return Err(Refusal::TooLarge);
-    }
+pub(super) fn read_bytes(file: &File, limit: usize) -> Result<Vec<u8>, Refusal> {
+    let before = readable(file, limit)?;
     let size = usize::try_from(before.len()).unwrap_or(limit);
     let mut content = Vec::with_capacity(size.min(limit) + 1);
     file.take(limit as u64 + 1)
@@ -432,8 +503,31 @@ fn read_bytes(file: &File, limit: usize) -> Result<Vec<u8>, Refusal> {
     if content.len() > limit {
         return Err(Refusal::TooLarge);
     }
+    unchanged(file, &before, content.len() as u64)?;
+    Ok(content)
+}
+
+/// The metadata of an opened file that may be read: a regular file with a
+/// single link, of at most `limit` bytes.
+fn readable(file: &File, limit: usize) -> Result<std::fs::Metadata, Refusal> {
+    let metadata = file.metadata().map_err(|_| Refusal::Unreadable)?;
+    if !metadata.is_file() {
+        return Err(Refusal::NotRegularFile);
+    }
+    if metadata.nlink() != 1 {
+        return Err(Refusal::HardLinked);
+    }
+    if metadata.len() > limit as u64 {
+        return Err(Refusal::TooLarge);
+    }
+    Ok(metadata)
+}
+
+/// Refuses a file that `read` bytes were read from when they are not all it
+/// held, or when its size or times changed since `before`.
+fn unchanged(file: &File, before: &std::fs::Metadata, read: u64) -> Result<(), Refusal> {
     let after = file.metadata().map_err(|_| Refusal::Unreadable)?;
-    let unchanged = |metadata: &std::fs::Metadata| {
+    let state = |metadata: &std::fs::Metadata| {
         (
             metadata.len(),
             metadata.mtime(),
@@ -442,13 +536,153 @@ fn read_bytes(file: &File, limit: usize) -> Result<Vec<u8>, Refusal> {
             metadata.ctime_nsec(),
         )
     };
-    if content.len() as u64 != before.len() || unchanged(&before) != unchanged(&after) {
+    if read != before.len() || state(before) != state(&after) {
         return Err(Refusal::Changed);
     }
-    Ok(content)
+    Ok(())
 }
 
-/// The parameters a call must match exactly: one relative path.
+/// Lines of a file, as a ranged read returns them.
+#[derive(Debug, PartialEq, Eq)]
+struct LineRange {
+    /// The first line asked for.
+    start_line: u64,
+    /// The last line returned, if any is: none when the file ends before
+    /// `start_line`.
+    end_line: Option<u64>,
+    /// The lines returned, exactly as the file holds them.
+    content: String,
+    /// The one line returned is only its beginning: it alone is longer
+    /// than the limit.
+    line_truncated: bool,
+    total_lines: u64,
+}
+
+impl LineRange {
+    /// The line to read next, unless the file ends with these lines.
+    fn next_start_line(&self) -> Option<u64> {
+        let last = self.end_line.unwrap_or(self.start_line - 1);
+        (last < self.total_lines).then_some(last + 1)
+    }
+
+    fn to_json(&self, path: &str) -> Value {
+        json!({
+            "path": path,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "total_lines": self.total_lines,
+            "next_start_line": self.next_start_line(),
+            "line_truncated": self.line_truncated,
+            "content": self.content,
+        })
+    }
+}
+
+/// The bytes `byte` takes in a JSON string: it is escaped when it is a quote,
+/// a backslash or a control character; a byte of a multibyte character is
+/// written as it is.
+fn escaped_len(byte: u8) -> usize {
+    match byte {
+        b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+        0x00..=0x1f => 6,
+        _ => 1,
+    }
+}
+
+/// Reads an opened file once, from its start, in a bounded buffer, keeping
+/// only lines `start_line` to `start_line + line_count - 1`, and of those
+/// only whole lines that fit [`MAX_FILE_BYTES`] escaped for JSON, except
+/// that a first line too long for it alone is kept cut at a character
+/// boundary. The file must be a regular file with a single link, within
+/// [`MAX_RANGED_FILE_BYTES`] and unchanged while it was read, and the lines
+/// kept must be UTF-8 text without NUL.
+fn read_lines(file: &File, start_line: u64, line_count: u64) -> Result<LineRange, Refusal> {
+    let before = readable(file, MAX_RANGED_FILE_BYTES).map_err(|refusal| match refusal {
+        Refusal::TooLarge => Refusal::TooLargeForRange,
+        other => other,
+    })?;
+    let end = start_line.saturating_add(line_count);
+    let mut reader = file.take(MAX_RANGED_FILE_BYTES as u64 + 1);
+    let mut buffer = [0; 8 * 1024];
+    let mut content = Vec::new();
+    let mut escaped = 0;
+    // The line the next byte belongs to, and how many lines were kept
+    // whole, ending where `kept` ends.
+    let mut line = 1;
+    let mut whole = 0;
+    let mut kept = 0;
+    let mut full = false;
+    let mut cut = false;
+    let mut read = 0_u64;
+    let mut last = b'\n';
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(Refusal::Unreadable),
+        };
+        read += count as u64;
+        if read > MAX_RANGED_FILE_BYTES as u64 {
+            return Err(Refusal::TooLargeForRange);
+        }
+        for &byte in &buffer[..count] {
+            let wanted = !full && line >= start_line && line < end;
+            if wanted {
+                let cost = escaped_len(byte);
+                if escaped + cost > MAX_FILE_BYTES {
+                    full = true;
+                    if whole == 0 {
+                        cut = true;
+                    } else {
+                        content.truncate(kept);
+                    }
+                } else {
+                    content.push(byte);
+                    escaped += cost;
+                }
+            }
+            if byte == b'\n' {
+                if wanted && !full {
+                    whole += 1;
+                    kept = content.len();
+                }
+                line += 1;
+            }
+        }
+        last = buffer[count - 1];
+    }
+    unchanged(file, &before, read)?;
+    if cut {
+        // The cut may fall inside a character, which is left out.
+        if let Err(error) = std::str::from_utf8(&content)
+            && error.error_len().is_none()
+        {
+            content.truncate(error.valid_up_to());
+        }
+    }
+    let content = String::from_utf8(content).map_err(|_| Refusal::NotText)?;
+    if content.contains('\0') {
+        return Err(Refusal::NotText);
+    }
+    let total_lines = (line - 1) + u64::from(last != b'\n');
+    let returned = if cut {
+        1
+    } else {
+        content.matches('\n').count() as u64
+            + u64::from(!content.is_empty() && !content.ends_with('\n'))
+    };
+    Ok(LineRange {
+        start_line,
+        end_line: (returned > 0).then(|| start_line + returned - 1),
+        content,
+        line_truncated: cut,
+        total_lines,
+    })
+}
+
+/// The parameters a call must match exactly: one relative path, and for a
+/// ranged read, where its lines start and how many it asks for.
 fn parameters() -> Value {
     json!({
         "type": "object",
@@ -456,11 +690,39 @@ fn parameters() -> Value {
             "path": {
                 "type": "string",
                 "description": "A path relative to the authorized Workspace root"
+            },
+            "start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Ranged read: the first line to return, counting from 1; defaults to 1"
+            },
+            "line_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_RANGE_LINES,
+                "description": "Ranged read: the most lines to return; defaults to the maximum, 2000"
             }
         },
         "required": ["path"],
         "additionalProperties": false
     })
+}
+
+/// The range a call asks for, if it names one: its first line and how many
+/// lines, each defaulted when not named. The schema already refuses other
+/// values; they are checked again here.
+fn requested_range(arguments: &Value) -> Result<Option<(u64, u64)>, Refusal> {
+    let field = |name: &str| match arguments.get(name) {
+        None => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or(Refusal::InvalidRange),
+    };
+    match (field("start_line")?, field("line_count")?) {
+        (None, None) => Ok(None),
+        (start_line, line_count) => Ok(Some((
+            start_line.unwrap_or(1),
+            line_count.unwrap_or(MAX_RANGE_LINES),
+        ))),
+    }
 }
 
 /// The handler of `workspace_read_file`, bound to one authorized Workspace.
@@ -480,19 +742,28 @@ impl ToolHandler for ReadFile {
         ToolEffect::ReadOnly
     }
 
-    /// Reads the file synchronously: it is small and local, so the call
+    /// Reads the file synchronously: it is local and bounded, so the call
     /// does not yield while it reads, and its time limit cannot interrupt a
     /// read that blocks.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
+            let refused = |refusal: Refusal| ToolFailure::not_applied(refusal.to_string());
             let Some(path) = arguments.get("path").and_then(Value::as_str) else {
-                return Err(ToolFailure::not_applied(Refusal::InvalidPath.to_string()));
+                return Err(refused(Refusal::InvalidPath));
             };
-            let content = self
-                .workspace
-                .read(path)
-                .map_err(|refusal| ToolFailure::not_applied(refusal.to_string()))?;
-            Ok(json!({"path": path, "content": content}))
+            match requested_range(&arguments).map_err(refused)? {
+                None => {
+                    let content = self.workspace.read(path).map_err(refused)?;
+                    Ok(json!({"path": path, "content": content}))
+                }
+                Some((start_line, line_count)) => {
+                    let range = self
+                        .workspace
+                        .read_range(path, start_line, line_count)
+                        .map_err(refused)?;
+                    Ok(range.to_json(path))
+                }
+            }
         })
     }
 }
@@ -506,7 +777,7 @@ pub(crate) fn register(
     registry.register(
         TOOL_NAME,
         Some(
-            "Read the complete contents of one UTF-8 text file, of at most 8 KiB, from the authorized Workspace.",
+            "Read one UTF-8 text file from the authorized Workspace. With only `path`, return its complete contents; a file over 8 KiB fails the call, so read larger files in ranges. With `start_line` or `line_count`, return whole lines from `start_line` (from 1) of a file of up to 16 MiB, at most `line_count` (up to 2000) and about 8 KiB of them, exactly as the file holds them, with `end_line` (null when the file ends before `start_line`), `total_lines`, and `next_start_line` to continue from (null at the end of the file); `line_truncated` says the one line returned is cut because it alone is longer than the limit.",
         ),
         parameters(),
         Arc::new(ReadFile { workspace }),
@@ -1050,5 +1321,317 @@ mod tests {
         ] {
             assert_eq!(workspace.read_binary(path, 1024), Err(refusal), "{path}");
         }
+    }
+
+    /// A ranged call's result, or its refusal's message.
+    fn ranged(workspace: &Workspace, arguments: Value) -> Result<Value, String> {
+        call(workspace.clone(), arguments).map_err(|failure| {
+            assert_eq!(
+                failure.certainty,
+                crate::orchestration::tools::FailureCertainty::NotApplied
+            );
+            failure.message
+        })
+    }
+
+    #[test]
+    fn a_file_larger_than_the_whole_file_limit_is_read_exactly_in_ranges() {
+        let (_guard, root, _data, directory) = workspace("ranges");
+        let text = (1..=3_000)
+            .map(|line| format!("line {line}: {}\n", "x".repeat(line % 17)))
+            .collect::<String>();
+        assert!(text.len() > 4 * MAX_FILE_BYTES);
+        write(&root, "src/big.rs", text.as_bytes());
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+        assert_eq!(
+            read(&workspace, "src/big.rs"),
+            Err(Refusal::TooLarge),
+            "a call without a range reads whole files only, as it always did"
+        );
+
+        let mut joined = String::new();
+        let mut start = 1;
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            assert!(calls < 100, "the traversal ends");
+            let result = ranged(
+                &workspace,
+                json!({"path": "src/big.rs", "start_line": start}),
+            )
+            .expect("a range");
+            assert!(
+                result.to_string().len() <= MAX_FILE_BYTES + 256,
+                "each result stays bounded"
+            );
+            let content = result["content"].as_str().expect("text");
+            let end = result["end_line"].as_u64().expect("lines were returned");
+            assert_eq!(result["start_line"], start);
+            assert_eq!(result["total_lines"], 3_000);
+            assert_eq!(result["line_truncated"], false);
+            assert_eq!(
+                content.lines().count() as u64,
+                end - start + 1,
+                "end_line names the last line returned"
+            );
+            assert!(content.ends_with('\n'), "only whole lines are returned");
+            joined.push_str(content);
+            match result["next_start_line"].as_u64() {
+                Some(next) => {
+                    assert_eq!(next, end + 1);
+                    start = next;
+                }
+                None => {
+                    assert_eq!(end, 3_000);
+                    break;
+                }
+            }
+        }
+        assert_eq!(joined, text, "the ranges are the file, exactly");
+        assert!(calls > 4);
+
+        // A narrow range is exactly the lines asked for.
+        let result = ranged(
+            &workspace,
+            json!({"path": "src/big.rs", "start_line": 1_000, "line_count": 3}),
+        )
+        .expect("a range");
+        let expected = text
+            .lines()
+            .skip(999)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(
+            result,
+            json!({
+                "path": "src/big.rs",
+                "start_line": 1_000,
+                "end_line": 1_002,
+                "total_lines": 3_000,
+                "next_start_line": 1_003,
+                "line_truncated": false,
+                "content": expected,
+            })
+        );
+    }
+
+    #[test]
+    fn ranges_keep_line_ends_and_report_where_the_file_ends() {
+        let (_guard, root, _data, directory) = workspace("range-edges");
+        let text = "first\r\nsecond ünïcødé ✓\n\n\"quoted\"\tand \\ last";
+        write(&root, "mixed.txt", text.as_bytes());
+        write(&root, "empty.txt", b"");
+        write(&root, "ended.txt", b"a\nb\n");
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+        let range = |path: &str, start: u64, count: u64| {
+            ranged(
+                &workspace,
+                json!({"path": path, "start_line": start, "line_count": count}),
+            )
+            .expect("a range")
+        };
+
+        let result = range("mixed.txt", 1, 2);
+        assert_eq!(result["content"], "first\r\nsecond ünïcødé ✓\n");
+        assert_eq!(
+            (&result["end_line"], &result["next_start_line"]),
+            (&json!(2), &json!(3))
+        );
+        let result = range("mixed.txt", 3, 10);
+        assert_eq!(result["content"], "\n\"quoted\"\tand \\ last");
+        assert_eq!(result["end_line"], 4, "a last line without its end counts");
+        assert_eq!(result["total_lines"], 4);
+        assert_eq!(result["next_start_line"], Value::Null);
+
+        // Past the end: no line, and nothing to continue from.
+        for (path, start, total) in [
+            ("mixed.txt", 5, 4),
+            ("ended.txt", 3, 2),
+            ("empty.txt", 1, 0),
+        ] {
+            let result = range(path, start, 1);
+            assert_eq!(
+                result,
+                json!({
+                    "path": path,
+                    "start_line": start,
+                    "end_line": null,
+                    "total_lines": total,
+                    "next_start_line": null,
+                    "line_truncated": false,
+                    "content": "",
+                }),
+                "{path}"
+            );
+        }
+        // A range with only one of its arguments defaults the other.
+        let result =
+            ranged(&workspace, json!({"path": "ended.txt", "line_count": 1})).expect("a range");
+        assert_eq!(
+            (&result["content"], &result["next_start_line"]),
+            (&json!("a\n"), &json!(2))
+        );
+        let result =
+            ranged(&workspace, json!({"path": "ended.txt", "start_line": 2})).expect("a range");
+        assert_eq!(
+            (&result["content"], &result["end_line"]),
+            (&json!("b\n"), &json!(2))
+        );
+        // Without a range, the result is what it always was.
+        assert_eq!(
+            call(workspace, json!({"path": "ended.txt"})),
+            Ok(json!({"path": "ended.txt", "content": "a\nb\n"}))
+        );
+    }
+
+    #[test]
+    fn a_line_longer_than_the_limit_is_returned_cut_at_a_character_and_marked() {
+        let (_guard, root, _data, directory) = workspace("range-long-line");
+        let long = format!("a{}", "é".repeat(MAX_FILE_BYTES));
+        write(
+            &root,
+            "minified.js",
+            format!("{long}\nshort\n{}\n", "\"".repeat(MAX_FILE_BYTES)).as_bytes(),
+        );
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+        let result =
+            ranged(&workspace, json!({"path": "minified.js", "start_line": 1})).expect("a range");
+        let content = result["content"].as_str().expect("text");
+        assert_eq!(
+            content,
+            format!("a{}", "é".repeat(MAX_FILE_BYTES / 2 - 1)),
+            "the limit falls inside a character, which is left out"
+        );
+        assert_eq!(result["line_truncated"], true);
+        assert_eq!(result["end_line"], 1);
+        assert_eq!(result["next_start_line"], 2);
+
+        // A line that would not fit after another is left for the next read.
+        let result =
+            ranged(&workspace, json!({"path": "minified.js", "start_line": 2})).expect("a range");
+        assert_eq!(result["content"], "short\n");
+        assert_eq!(
+            (&result["end_line"], &result["next_start_line"]),
+            (&json!(2), &json!(3))
+        );
+        assert_eq!(result["line_truncated"], false);
+
+        // The limit counts what the content costs escaped in JSON.
+        let result =
+            ranged(&workspace, json!({"path": "minified.js", "start_line": 3})).expect("a range");
+        assert_eq!(result["content"], "\"".repeat(MAX_FILE_BYTES / 2));
+        assert_eq!(result["line_truncated"], true);
+        assert!(
+            serde_json::to_string(&result["content"])
+                .expect("JSON")
+                .len()
+                <= MAX_FILE_BYTES + 2
+        );
+    }
+
+    #[test]
+    fn invalid_ranges_are_refused_by_the_schema_and_the_handler() {
+        let (_guard, root, _data, directory) = workspace("range-invalid");
+        write(&root, "file.txt", b"a\nb\n");
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+        let validator = crate::openai_compatible::admission::compile_parameters(&parameters())
+            .expect("an enforceable schema");
+        for arguments in [
+            json!({"path": "file.txt", "start_line": 0}),
+            json!({"path": "file.txt", "start_line": -1}),
+            json!({"path": "file.txt", "start_line": 1.5}),
+            json!({"path": "file.txt", "start_line": "1"}),
+            json!({"path": "file.txt", "line_count": 0}),
+            json!({"path": "file.txt", "line_count": MAX_RANGE_LINES + 1}),
+            json!({"path": "file.txt", "start_line": null}),
+        ] {
+            assert!(
+                !validator.is_valid(&arguments),
+                "the schema refuses {arguments}"
+            );
+            assert_eq!(
+                ranged(&workspace, arguments.clone()),
+                Err(Refusal::InvalidRange.to_string()),
+                "the handler refuses {arguments} too"
+            );
+        }
+        for arguments in [
+            json!({"path": "file.txt", "start_line": 1, "offset": 3}),
+            json!({"path": "file.txt", "end_line": 3}),
+        ] {
+            assert!(!validator.is_valid(&arguments), "{arguments}");
+        }
+        for arguments in [
+            json!({"path": "file.txt", "start_line": 1, "line_count": MAX_RANGE_LINES}),
+            json!({"path": "file.txt", "start_line": u64::MAX, "line_count": 1}),
+        ] {
+            assert!(validator.is_valid(&arguments), "{arguments}");
+            assert!(ranged(&workspace, arguments).is_ok());
+        }
+    }
+
+    #[test]
+    fn ranged_reads_keep_every_boundary_of_whole_reads() {
+        let (_guard, root, _data, directory) = workspace("range-boundary");
+        let (_outside_guard, outside, _outside_data, _) = workspace("range-boundary-outside");
+        write(&outside, "secret.txt", b"outside\n");
+        write(&root, "inside.txt", b"inside\n");
+        write(&root, ".env", b"TOKEN=secret\n");
+        write(&root, "keys/server.pem", b"secret\n");
+        write(&root, "binary.bin", b"text\n\x00\x01\n");
+        write(&root, "latin1.txt", b"ok\ncaf\xe9\n");
+        symlink(outside.join("secret.txt"), root.join("escape.txt")).expect("link");
+        symlink(&outside, root.join("outside")).expect("link");
+        std::fs::write(directory.key_path(), b"key material").expect("write a key");
+        std::fs::hard_link(directory.key_path(), root.join("notes.txt")).expect("hard link");
+        let huge = std::fs::File::create(root.join("huge.log")).expect("create");
+        huge.set_len(MAX_RANGED_FILE_BYTES as u64 + 1)
+            .expect("a sparse file");
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+        let range = |path: &str| ranged(&workspace, json!({"path": path, "start_line": 1}));
+        for (path, refusal) in [
+            ("escape.txt", Refusal::SymbolicLink),
+            ("outside/secret.txt", Refusal::SymbolicLink),
+            (".env", Refusal::Protected),
+            ("keys/server.pem", Refusal::Protected),
+            (
+                "../range-boundary-outside-workspace/secret.txt",
+                Refusal::InvalidPath,
+            ),
+            ("notes.txt", Refusal::HardLinked),
+            ("huge.log", Refusal::TooLargeForRange),
+            ("keys", Refusal::NotRegularFile),
+            ("missing.txt", Refusal::NotFound),
+        ] {
+            assert_eq!(range(path), Err(refusal.to_string()), "{path}");
+        }
+        // Only the lines returned must be text.
+        assert_eq!(
+            ranged(&workspace, json!({"path": "binary.bin", "line_count": 1}))
+                .expect("a text line")["content"],
+            "text\n"
+        );
+        assert_eq!(range("binary.bin"), Err(Refusal::NotText.to_string()));
+        assert_eq!(
+            ranged(&workspace, json!({"path": "latin1.txt", "start_line": 2})),
+            Err(Refusal::NotText.to_string())
+        );
+        assert!(
+            range("latin1.txt").is_err(),
+            "a range holding invalid text returns none of it"
+        );
+
+        // A replaced root is refused, whatever the new one holds.
+        let (_moved_guard, moved) = temporary_directory(SUITE, "range-boundary-moved");
+        std::fs::remove_dir(&moved).expect("free the name");
+        std::fs::rename(&root, &moved).expect("move the Workspace away");
+        std::fs::create_dir(&root).expect("create another directory");
+        write(&root, "inside.txt", b"replaced\n");
+        assert_eq!(
+            range("inside.txt"),
+            Err(Refusal::WorkspaceChanged.to_string())
+        );
     }
 }

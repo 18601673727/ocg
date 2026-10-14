@@ -16395,7 +16395,7 @@ mod requests_and_tool_loop {
                 ("call_read", workspace_read::TOOL_NAME)
             );
             let admission = record.admission().expect("admitted");
-            assert_eq!(admission.handler_version, "workspace_read_file-1");
+            assert_eq!(admission.handler_version, "workspace_read_file-2");
             assert_eq!(admission.effect, ToolEffect::ReadOnly);
             assert_eq!(admission.arguments.as_str(), r#"{"path":"README.md"}"#);
             assert_eq!(admission.authorization, AuthorizationBasis::RegistryGrant);
@@ -17499,7 +17499,9 @@ mod requests_and_tool_loop {
                 [
                     workspace_read::TOOL_NAME,
                     workspace_write::TOOL_NAME,
-                    workspace_command::TOOL_NAME
+                    workspace_command::TOOL_NAME,
+                    crate::orchestration::workspace_discovery::LIST_TOOL_NAME,
+                    crate::orchestration::workspace_discovery::SEARCH_TOOL_NAME
                 ]
             );
             let failed = answer_to(third, "call_test_1").expect("answered");
@@ -17878,6 +17880,394 @@ mod requests_and_tool_loop {
             }
             assert_eq!(project.source().as_deref(), Some(BUGGY));
             assert_relationships_consistent(&directory);
+        }
+    }
+
+    // ---- Workspace discovery and ranged reading -----------------------------
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    mod workspace_discovery {
+        use std::path::{Path, PathBuf};
+
+        use super::*;
+        use crate::orchestration::workspace_command;
+        use crate::orchestration::workspace_discovery::{LIST_TOOL_NAME, SEARCH_TOOL_NAME};
+        use crate::orchestration::workspace_read::{self, Workspace};
+
+        /// The line of `src/net/client.rs` that holds the answer.
+        const ANSWER_LINE: usize = 297;
+
+        /// A project whose answer lies in a file over the whole-file limit,
+        /// with decoys a search must never show.
+        fn project(name: &str) -> (TestRoot, PathBuf, String) {
+            let (guard, root) =
+                crate::test_support::temporary_directory(SUITE, &format!("{name}-files"));
+            let write = |path: &str, content: &str| {
+                let path = root.join(path);
+                std::fs::create_dir_all(path.parent().expect("a parent")).expect("create");
+                std::fs::write(path, content).expect("write");
+            };
+            write("Cargo.toml", "[package]\nname = \"demo\"\n");
+            write("README.md", "# Demo\n\nA small networking demo.\n");
+            write("src/lib.rs", "pub mod net;\n");
+            write("src/net/mod.rs", "pub mod client;\npub mod server;\n");
+            write("src/net/server.rs", "pub fn serve() {}\n");
+            let client = (1..=600)
+                .map(|line| match line {
+                    295 => "/// How long the client waits for a connection, in milliseconds.\n"
+                        .to_owned(),
+                    296 => "/// Chosen to stay under the gateway's 3 s limit.\n".to_owned(),
+                    ANSWER_LINE => "pub const CONNECT_TIMEOUT_MS: u64 = 2_750;\n".to_owned(),
+                    _ => format!("// client implementation detail {line:03}\n"),
+                })
+                .collect::<String>();
+            assert!(client.len() > workspace_read::MAX_FILE_BYTES);
+            write("src/net/client.rs", &client);
+            write(".env", "CONNECT_TIMEOUT_MS=1\n");
+            write(
+                "target/debug/build.rs",
+                "const CONNECT_TIMEOUT_MS: u64 = 9;\n",
+            );
+            write("config/secrets.yaml", "CONNECT_TIMEOUT_MS: 5\n");
+            (guard, root, client)
+        }
+
+        fn parsed(text: &str) -> Value {
+            serde_json::from_str(text).expect("JSON")
+        }
+
+        /// The result of the last tool call a conversation answered.
+        fn last_result(conversation: &ChatConversation) -> Value {
+            let text = conversation
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match (&message.tool_call_id, &message.content) {
+                    (Some(_), Some(MessageContentWire::Text(text))) => Some(text.clone()),
+                    _ => None,
+                })
+                .expect("a tool result");
+            parsed(&text)
+        }
+
+        /// A Provider that knows no file name: it lists the root, searches
+        /// the source directory it finds for what the objective names,
+        /// reads the lines around the first match, and answers from them.
+        /// Each step is derived from the results OCG sent it.
+        fn agent(conversation: &ChatConversation) -> Vec<Step> {
+            let tool = |id: &str, name: &str, arguments: Value| {
+                calling(&[call(0, id, name, &arguments.to_string())], (40, 10))
+            };
+            let requests = conversation
+                .messages
+                .iter()
+                .filter(|message| message.tool_calls.is_some())
+                .count();
+            match requests {
+                0 => tool("call_list", LIST_TOOL_NAME, json!({})),
+                1 => {
+                    let listing = last_result(conversation);
+                    let source = listing["entries"]
+                        .as_array()
+                        .expect("entries")
+                        .iter()
+                        .find(|entry| entry["type"] == "directory" && entry["name"] == "src")
+                        .expect("a source directory is listed");
+                    tool(
+                        "call_search",
+                        SEARCH_TOOL_NAME,
+                        json!({"path": source["name"], "text": "CONNECT_TIMEOUT_MS"}),
+                    )
+                }
+                2 => {
+                    let found = last_result(conversation);
+                    let file = &found["files"][0];
+                    let line = file["matches"][0]["line"].as_u64().expect("a line");
+                    // Too large to read whole, so read the lines around it.
+                    assert!(file["bytes"].as_u64().expect("a size") > 8 * 1024);
+                    tool(
+                        "call_read",
+                        workspace_read::TOOL_NAME,
+                        json!({"path": file["path"], "start_line": line - 2, "line_count": 3}),
+                    )
+                }
+                _ => {
+                    let read = last_result(conversation);
+                    let content = read["content"].as_str().expect("content");
+                    let value = content
+                        .lines()
+                        .find_map(|line| line.strip_prefix("pub const CONNECT_TIMEOUT_MS: u64 = "))
+                        .and_then(|rest| rest.strip_suffix(';'))
+                        .expect("the constant is in the lines read");
+                    let why = content
+                        .lines()
+                        .find_map(|line| line.strip_prefix("/// Chosen to "))
+                        .expect("its reason is in the lines read");
+                    answering(
+                        &format!(
+                            "The client's connect timeout is {value} ms ({}:{}), chosen to {why}",
+                            read["path"].as_str().expect("a path"),
+                            read["end_line"],
+                        ),
+                        (80, 20),
+                    )
+                }
+            }
+        }
+
+        /// Runs the real tool loop on `run` with `objective`, answering each
+        /// request with what `respond` derives from the conversation sent.
+        fn run_agent(
+            handle: &DatabaseHandle,
+            run: TokenRun,
+            tools: ToolExecution,
+            objective: &str,
+            mut respond: impl FnMut(&ChatConversation) -> Vec<Step> + 'static,
+        ) -> Looped {
+            let handle = handle.clone();
+            let objective = objective.to_owned();
+            on_ntex(async move {
+                let cancellation = CancellationToken::default();
+                let config = ProviderExecutionConfig::default();
+                let conversation = ChatConversation {
+                    messages: vec![ChatMessage::user(objective)],
+                    tools: tools.offer.wires().expect("offer"),
+                    ..ChatConversation::default()
+                };
+                let mut sent = Vec::new();
+                let settled = run_provider_job(
+                    ProviderRun {
+                        database: handle,
+                        executor: run.executor,
+                        input: run.input,
+                        job: run.job,
+                    },
+                    conversation,
+                    Some(&tools),
+                    &cancellation,
+                    async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
+                        sent.push(conversation.clone());
+                        conversation
+                            .validate()
+                            .map_err(|error| ProviderExecutionError::Build {
+                                message: error.to_string(),
+                            })?;
+                        let steps = respond(conversation);
+                        announce(Some(&mut *sink), ProviderFact::Delivered).await;
+                        read_response(
+                            payload(steps, config.cancellation.clone()),
+                            200,
+                            Instant::now(),
+                            None,
+                            &config,
+                            Some(&mut *sink),
+                            conversation,
+                        )
+                        .await
+                    },
+                )
+                .await;
+                Looped { settled, sent }
+            })
+        }
+
+        fn authorize(root: &Path, directory: &DataDirectory) -> Workspace {
+            Workspace::authorize(root, directory).expect("authorize")
+        }
+
+        #[test]
+        fn a_coding_agent_discovers_searches_and_reads_a_file_it_was_never_named() {
+            let (_files, root, client) = project("discovery-agent");
+            let (_root, directory) = data_directory("discovery-agent");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            // The registry `ocg workspace-code` builds.
+            let tools = workspace_command::code_tools(authorize(&root, &directory))
+                .expect("enable the coding tools");
+            let looped = run_agent(
+                &handle,
+                run,
+                tools,
+                "What connect timeout does the networking client use, and why?",
+                agent,
+            );
+            let receipt = looped.settled.expect("the loop settles");
+            assert_eq!(receipt.job, run.job);
+            let [first, second, third, fourth] = looped.sent.as_slice() else {
+                panic!("four Provider requests: {}", looped.sent.len());
+            };
+            let offered = first
+                .tools
+                .iter()
+                .map(|tool| tool.function.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                offered.contains(&LIST_TOOL_NAME)
+                    && offered.contains(&SEARCH_TOOL_NAME)
+                    && offered.contains(&workspace_read::TOOL_NAME),
+                "{offered:?}"
+            );
+
+            // What OCG sent back at each step, from the real files.
+            let listing = last_result(second);
+            assert_eq!(
+                listing["entries"],
+                json!([
+                    {"name": "Cargo.toml", "type": "file", "bytes": 24},
+                    {"name": "README.md", "type": "file", "bytes": 33},
+                    {"name": "config", "type": "directory"},
+                    {"name": "src", "type": "directory"},
+                    {"name": "target", "type": "directory"},
+                ]),
+                "hidden names are never listed"
+            );
+            let found = last_result(third);
+            assert_eq!(
+                found,
+                json!({
+                    "path": "src",
+                    "files": [{
+                        "path": "src/net/client.rs",
+                        "bytes": client.len(),
+                        "matches": [{
+                            "line": ANSWER_LINE,
+                            "text": "pub const CONNECT_TIMEOUT_MS: u64 = 2_750;",
+                        }],
+                        "more_matches": false,
+                    }],
+                    "complete": true,
+                    "limit": null,
+                    "skipped": 0,
+                })
+            );
+            let read = last_result(fourth);
+            let expected = client
+                .lines()
+                .skip(ANSWER_LINE - 3)
+                .take(3)
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            assert_eq!(
+                read,
+                json!({
+                    "path": "src/net/client.rs",
+                    "start_line": ANSWER_LINE - 2,
+                    "end_line": ANSWER_LINE,
+                    "total_lines": 600,
+                    "next_start_line": ANSWER_LINE + 1,
+                    "line_truncated": false,
+                    "content": expected,
+                }),
+                "exactly the lines asked for"
+            );
+
+            // The answer is grounded in the lines read.
+            let job = job_record(&handle, run.job);
+            assert!(job.completed_at.is_some());
+            let outputs = wait(handle.job_outputs(run.job, None, 100)).expect("outputs");
+            assert_eq!(
+                outputs.last().and_then(|output| output.summary.as_deref()),
+                Some(
+                    "The client's connect timeout is 2_750 ms (src/net/client.rs:297), \
+                     chosen to stay under the gateway's 3 s limit."
+                )
+            );
+
+            // Every call is recorded as a read-only admission with the result sent.
+            let records = evidence(&handle, run.job);
+            let [list, search, range] = records.as_slice() else {
+                panic!("three calls: {records:?}");
+            };
+            for (record, request, name, version, sent) in [
+                (
+                    list,
+                    1,
+                    LIST_TOOL_NAME,
+                    "workspace_list_directory-1",
+                    second,
+                ),
+                (search, 2, SEARCH_TOOL_NAME, "workspace_search-1", third),
+                (
+                    range,
+                    3,
+                    workspace_read::TOOL_NAME,
+                    "workspace_read_file-2",
+                    fourth,
+                ),
+            ] {
+                assert_eq!(record.call, tool_call(run.job, request, 0));
+                assert_eq!(record.name, name);
+                let admission = record.admission().expect("admitted");
+                assert_eq!(admission.handler_version, version);
+                assert_eq!(admission.effect, ToolEffect::ReadOnly);
+                assert_eq!(admission.authorization, AuthorizationBasis::RegistryGrant);
+                let ToolOutcome::Completed { result } = outcome_of(record).expect("an outcome")
+                else {
+                    panic!("completed: {record:?}");
+                };
+                assert_eq!(parsed(result.as_str()), last_result(sent));
+                assert!(!record.is_unresolved());
+            }
+            for record in &records {
+                let recorded = format!("{record:?}");
+                for hidden in ["CONNECT_TIMEOUT_MS=1", ".env", "build.rs", "secrets"] {
+                    assert!(!recorded.contains(hidden), "{hidden} was never disclosed");
+                }
+            }
+            // Read-only calls repeat no effect, so a retry needs no acknowledgement.
+            wait(handle.retry_job(retry_of(run.job, llm, false))).expect("a retry");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_refused_discovery_call_sends_nothing_and_fails_the_job() {
+            let (_files, root, _) = project("discovery-refused");
+            let (_outside_guard, outside) =
+                crate::test_support::temporary_directory(SUITE, "discovery-refused-outside");
+            std::fs::write(
+                outside.join("secret.rs"),
+                "const CONNECT_TIMEOUT_MS: u64 = 1;\n",
+            )
+            .expect("write");
+            std::os::unix::fs::symlink(&outside, root.join("vendor")).expect("link");
+            let (_root, directory) = data_directory("discovery-refused");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let tools = workspace_command::code_tools(authorize(&root, &directory))
+                .expect("enable the coding tools");
+            let looped = run_agent(&handle, run, tools, "Search vendor.", |_| {
+                calling(
+                    &[call(
+                        0,
+                        "call_search",
+                        SEARCH_TOOL_NAME,
+                        r#"{"path":"vendor","text":"CONNECT_TIMEOUT_MS"}"#,
+                    )],
+                    (10, 5),
+                )
+            });
+            assert_eq!(looped.sent.len(), 1, "a refused call sends no result");
+            let (_, stop) = stopped(looped);
+            let message = "the path traverses a symbolic link".to_owned();
+            assert_eq!(
+                stop,
+                ToolLoopStop::HandlerFailed {
+                    index: 0,
+                    message: message.clone()
+                }
+            );
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::NotApplied { message })
+            );
+            assert!(job_record(&handle, run.job).failed_at.is_some());
+            worker.shutdown().expect("shutdown");
         }
     }
 

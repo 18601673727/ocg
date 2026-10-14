@@ -77,7 +77,7 @@ use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
 use crate::orchestration::workspace_read::{self, Refusal as PathRefusal, Workspace};
-use crate::orchestration::workspace_write;
+use crate::orchestration::{workspace_discovery, workspace_write};
 use crate::persistence::ToolEffect;
 
 /// The name the tool is offered and recorded under.
@@ -665,9 +665,10 @@ pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
 }
 
 /// The tools of an execution that may read, write and build `workspace`:
-/// exactly `workspace_read_file`, `workspace_write_file` and
-/// `workspace_run_command`, registered in a registry of their own and
-/// authorized there, with [`coding_limits`]. Commands get the environment
+/// exactly `workspace_read_file`, `workspace_write_file`,
+/// `workspace_run_command`, `workspace_list_directory` and
+/// `workspace_search`, registered in a registry of their own and authorized
+/// there, with [`coding_limits`]. Commands get the environment
 /// OCG was started with, filtered, and run for at most [`COMMAND_TIMEOUT`].
 ///
 /// # Errors
@@ -687,11 +688,14 @@ pub(crate) fn code_tools_with(
     let registry = ToolRegistry::default();
     workspace_read::register(&registry, workspace.clone())?;
     workspace_write::register(&registry, workspace.clone())?;
-    register(&registry, workspace, environment, timeout)?;
+    register(&registry, workspace.clone(), environment, timeout)?;
+    workspace_discovery::register(&registry, workspace)?;
     let names = [
         workspace_read::TOOL_NAME,
         workspace_write::TOOL_NAME,
         TOOL_NAME,
+        workspace_discovery::LIST_TOOL_NAME,
+        workspace_discovery::SEARCH_TOOL_NAME,
     ];
     for name in names {
         registry.authorize(name)?;
@@ -901,7 +905,9 @@ mod tests {
             [
                 workspace_read::TOOL_NAME,
                 workspace_write::TOOL_NAME,
-                TOOL_NAME
+                TOOL_NAME,
+                workspace_discovery::LIST_TOOL_NAME,
+                workspace_discovery::SEARCH_TOOL_NAME
             ]
         );
         assert_eq!(
