@@ -27,7 +27,7 @@
 //! bounded petgraph view from records read inside the current write
 //! transaction, adds the proposed edges and rejects any cycle.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -745,6 +745,7 @@ codes!(OperationKind {
     OperationKind::StartLocalJob = 25, OperationKind::ReconcileAbandonedJob = 26,
     OperationKind::RecordToolDecision = 27, OperationKind::RecordToolOutcome = 28,
     OperationKind::ReconcileToolEffect = 29, OperationKind::CreateAttachment = 30,
+    OperationKind::CleanupAttachment = 31,
 });
 codes!(ToolCallRefusal {
     ToolCallRefusal::Malformed = 1, ToolCallRefusal::ConflictingIdentity = 2, ToolCallRefusal::AmbiguousIdentity = 3,
@@ -2397,6 +2398,10 @@ impl Batch {
             encode_attachment(record),
             RecordRef::Attachment(record.id),
         )
+    }
+
+    pub(crate) fn put_attachment(&mut self, record: &AttachmentRecord) -> Result<(), BatchError> {
+        self.overwrite(ATTACHMENTS, record.id.get(), encode_attachment(record))
     }
 
     /// Replaces the input's HAS_ATTACHMENT entries, and their incoming
@@ -4087,9 +4092,47 @@ pub(crate) fn read_attachments(
     )
 }
 
-/// Test stand-in for the cleanup a later milestone adds: records `cleanup`
-/// on an Attachment in one transition, as that operation will, and touches
-/// nothing else, its content file included.
+/// Whether an available Attachment names the content `digest`. Every
+/// Attachment record is read: they have no index by content.
+pub(crate) fn content_available(
+    database: &Database,
+    digest: ContentDigest,
+) -> Result<bool, StorageError> {
+    let rx = read(database)?;
+    for entry in rx.open_table(ATTACHMENTS)?.iter()? {
+        let record = decode_attachment(entry?.1.value())?;
+        if record.sha256 == digest && record.is_available() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The content that cleaned-up Attachments name and no available one does:
+/// each digest once, with its recorded length, in digest order. Every
+/// Attachment record is read.
+pub(crate) fn unneeded_content(
+    database: &Database,
+) -> Result<Vec<(ContentDigest, u64)>, StorageError> {
+    let rx = read(database)?;
+    let mut contents = BTreeMap::new();
+    for entry in rx.open_table(ATTACHMENTS)?.iter()? {
+        let record = decode_attachment(entry?.1.value())?;
+        let needed = contents
+            .entry(record.sha256)
+            .or_insert((record.byte_length, false));
+        needed.1 |= record.is_available();
+    }
+    Ok(contents
+        .into_iter()
+        .filter(|(_, (_, needed))| !needed)
+        .map(|(digest, (length, _))| (digest, length))
+        .collect())
+}
+
+/// Records `cleanup` on an Attachment directly, so a test can choose its
+/// kind and time, without the cleanup operation's marker or reclamation:
+/// it touches nothing else, its content file included.
 #[cfg(test)]
 pub(crate) fn record_attachment_cleanup(
     database: &Database,

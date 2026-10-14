@@ -1278,6 +1278,7 @@ dependencies = [
  "fs4",
  "jsonschema",
  "log",
+ "nix",
  "ntex",
  "petgraph",
  "redb",

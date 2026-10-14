@@ -18211,7 +18211,10 @@ mod requests_and_tool_loop {
         use std::time::Duration;
 
         use super::*;
-        use crate::attachments::{AttachmentError, AttachmentStore, StoreError, publish_seam};
+        use crate::attachments::{
+            AttachmentCleanupReport, AttachmentError, AttachmentStore, Reclamation,
+            ReclamationError, StoreError, publish_seam, reclaim_seam,
+        };
         use crate::openai_compatible::image::tests::{PNG_BASE64, jpeg, png};
         use crate::openai_compatible::image::{MAX_IMAGE_BYTES, MAX_REQUEST_IMAGES};
         use crate::openai_compatible::{ImageError, ImageMime};
@@ -18294,6 +18297,25 @@ mod requests_and_tool_loop {
             record: &AttachmentRecord,
         ) -> std::path::PathBuf {
             directory.attachments_path().join(record.sha256.to_string())
+        }
+
+        /// The operator's manual cleanup of `id`.
+        fn clean_up_manually(handle: &DatabaseHandle, id: AttachmentId) -> AttachmentCleanupReport {
+            wait(handle.cleanup_attachment(id)).expect("clean up")
+        }
+
+        fn reclaimed(report: &AttachmentCleanupReport) -> Option<Reclamation> {
+            report.content.as_ref().ok().copied()
+        }
+
+        fn cleanup_markers(handle: &DatabaseHandle) -> Vec<crate::persistence::OperationMarker> {
+            wait(handle.operation_markers(None, 1_000))
+                .expect("markers")
+                .into_iter()
+                .filter(|marker| {
+                    marker.kind == crate::persistence::OperationKind::CleanupAttachment
+                })
+                .collect()
         }
 
         fn clean_up(handle: &DatabaseHandle, id: AttachmentId, cleanup: AttachmentCleanup) {
@@ -18772,8 +18794,658 @@ mod requests_and_tool_loop {
                 wait(handle.attachment_inputs(manual)).expect("read"),
                 [run.input]
             );
-            // Unavailable is not erased: recording the state removes no bytes.
-            assert!(content_path(&directory, &before.0).exists());
+            // The restart reclaimed the content the committed cleanups
+            // authorized; the records, their metadata and references stay.
+            let mut reclaimed_at_open = handle.reclaimed_at_open().to_vec();
+            reclaimed_at_open.sort_by_key(|(digest, _)| *digest);
+            let mut expected = vec![
+                (before.0.sha256, Ok(Reclamation::Removed)),
+                (before.1.sha256, Ok(Reclamation::Removed)),
+            ];
+            expected.sort_by_key(|(digest, _)| *digest);
+            assert_eq!(reclaimed_at_open, expected);
+            assert!(!content_path(&directory, &before.0).exists());
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_manual_cleanup_ends_availability_and_keeps_the_history() {
+            let (_root, directory) = data_directory("attachment-manual");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let cleaned = attach(&handle, png(), "image/png", "../shots/screen.png");
+            let other = attach(&handle, jpeg(), "image/jpeg", "photo.jpg");
+            let run = run_with(&handle, llm, vec![cleaned, other]);
+            let before = attachment(&handle, cleaned);
+            let path = content_path(&directory, &before);
+
+            let report = clean_up_manually(&handle, cleaned);
+            assert!(report.recorded);
+            assert_eq!(reclaimed(&report), Some(Reclamation::Removed));
+            let [marker] = cleanup_markers(&handle)
+                .try_into()
+                .expect("one cleanup marker");
+            assert_eq!(
+                (marker.subject, marker.created),
+                (RecordRef::Attachment(cleaned), None)
+            );
+            let cleanup = AttachmentCleanup {
+                kind: CleanupKind::Manual,
+                cleaned_at: marker.committed_at,
+            };
+            assert_eq!(
+                report.record,
+                AttachmentRecord {
+                    cleanup: Some(cleanup),
+                    ..before.clone()
+                },
+                "only the cleanup changed: digest, length, type, name, origin and creation stay"
+            );
+            assert!(cleanup.cleaned_at >= before.created_at);
+            assert_eq!(attachment(&handle, cleaned), report.record);
+            assert_eq!(
+                (
+                    report.record.byte_length,
+                    report.record.display_name.as_deref(),
+                    report.record.origin
+                ),
+                (
+                    png().len() as u64,
+                    Some("screen.png"),
+                    AttachmentOrigin::UserProvided
+                )
+            );
+            assert!(matches!(
+                wait(handle.attachment_content(cleaned)),
+                Err(AttachmentError::CleanedUp { id, cleanup: recorded })
+                    if id == cleaned && recorded == cleanup
+            ));
+            assert!(!path.exists(), "its content was the only copy needed");
+            assert_eq!(
+                stored_names(&directory),
+                [attachment(&handle, other).sha256.to_string()]
+            );
+            assert_eq!(
+                wait(handle.attachment_content(other))
+                    .expect("content")
+                    .bytes,
+                jpeg()
+            );
+            // The library still lists it, and every input still names it.
+            let listed = wait(handle.attachments(None, 10)).expect("list");
+            assert_eq!(listed.len(), 2);
+            assert!(listed.contains(&report.record));
+            assert_eq!(
+                wait(handle.attachment_inputs(cleaned)).expect("read"),
+                [run.input]
+            );
+            assert_eq!(input_attachments(&handle, run.input), [cleaned, other]);
+
+            // Again: nothing is recorded, nothing changes.
+            let again = clean_up_manually(&handle, cleaned);
+            assert!(!again.recorded);
+            assert_eq!(again.record, report.record);
+            assert_eq!(reclaimed(&again), Some(Reclamation::Absent));
+            assert_eq!(cleanup_markers(&handle), std::slice::from_ref(&marker));
+
+            let missing = AttachmentId::new(99);
+            assert!(matches!(
+                wait(handle.cleanup_attachment(missing)),
+                Err(AttachmentError::NotFound(id)) if id == missing
+            ));
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            assert!(worker.handle().reclaimed_at_open().is_empty());
+            assert_eq!(attachment(&handle, cleaned), report.record, "durable");
+            let after_restart = clean_up_manually(&handle, cleaned);
+            assert!(!after_restart.recorded);
+            assert_eq!(after_restart.record, report.record);
+            assert_eq!(cleanup_markers(&handle), [marker]);
+            assert_eq!(input_attachments(&handle, run.input), [cleaned, other]);
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn an_earlier_cleanup_is_kept_and_only_its_reclamation_repeated() {
+            let (_root, directory) = data_directory("attachment-earlier-cleanup");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let automatic = attach(&handle, png(), "image/png", "a.png");
+            let earlier = AttachmentCleanup {
+                kind: CleanupKind::Automatic,
+                cleaned_at: Timestamp::from_unix_micros(1_760_538_720_000_000),
+            };
+            // Recorded without reclaiming, as by a reclamation that failed.
+            clean_up(&handle, automatic, earlier);
+            let path = content_path(&directory, &attachment(&handle, automatic));
+            assert!(path.exists());
+            let report = clean_up_manually(&handle, automatic);
+            assert!(!report.recorded);
+            assert_eq!(
+                report.record.cleanup,
+                Some(earlier),
+                "not rewritten as manual"
+            );
+            assert_eq!(reclaimed(&report), Some(Reclamation::Removed));
+            assert!(!path.exists());
+            assert!(cleanup_markers(&handle).is_empty());
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn shared_content_is_reclaimed_only_with_its_last_available_attachment() {
+            let (_root, directory) = data_directory("attachment-shared");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let first = attach(&handle, png(), "image/png", "a.png");
+            let second = attach(&handle, png(), "image/png", "b.png");
+            let path = content_path(&directory, &attachment(&handle, first));
+            let inode = std::fs::metadata(&path).expect("metadata").ino();
+
+            let report = clean_up_manually(&handle, first);
+            assert!(report.recorded);
+            assert_eq!(reclaimed(&report), Some(Reclamation::Retained));
+            assert_eq!(
+                std::fs::metadata(&path).expect("kept").ino(),
+                inode,
+                "the shared file is intact"
+            );
+            assert!(matches!(
+                wait(handle.attachment_content(first)),
+                Err(AttachmentError::CleanedUp { id, .. }) if id == first
+            ));
+            assert_eq!(
+                wait(handle.attachment_content(second))
+                    .expect("content")
+                    .bytes,
+                png()
+            );
+            assert_eq!(
+                reclaimed(&clean_up_manually(&handle, first)),
+                Some(Reclamation::Retained),
+                "still needed"
+            );
+            worker.shutdown().expect("shutdown");
+
+            // A restart reclaims nothing another Attachment needs.
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            assert!(handle.reclaimed_at_open().is_empty());
+            assert!(path.exists());
+            let last = clean_up_manually(&handle, second);
+            assert!(last.recorded);
+            assert_eq!(reclaimed(&last), Some(Reclamation::Removed));
+            assert!(!path.exists());
+            let (a, b) = (attachment(&handle, first), attachment(&handle, second));
+            assert_eq!(a.cleanup, report.record.cleanup, "each keeps its own");
+            assert_eq!(b.cleanup, last.record.cleanup);
+            assert!(
+                a.cleanup.expect("cleaned").cleaned_at <= b.cleanup.expect("cleaned").cleaned_at
+            );
+            assert_eq!(a.sha256, b.sha256);
+            assert_eq!(cleanup_markers(&handle).len(), 2);
+
+            // The same bytes uploaded again are a new Attachment, published anew.
+            let again = attach(&handle, png(), "image/png", "c.png");
+            assert!(path.exists());
+            assert_eq!(
+                wait(handle.attachment_content(again))
+                    .expect("content")
+                    .bytes,
+                png()
+            );
+            assert!(
+                attachment(&handle, first).cleanup.is_some(),
+                "history stays"
+            );
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_cleanup_that_does_not_commit_leaves_the_attachment_available() {
+            let (_root, directory) = data_directory("attachment-uncommitted");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let id = attach(&handle, png(), "image/png", "a.png");
+            let before = attachment(&handle, id);
+            assert!(handle.activate_filesystem_protection(protection_reason(&directory)));
+            assert!(matches!(
+                wait(handle.cleanup_attachment(id)),
+                Err(AttachmentError::Database(DatabaseError::DiskProtected(_)))
+            ));
+            assert_eq!(attachment(&handle, id), before, "still available");
+            assert_eq!(
+                wait(handle.attachment_content(id)).expect("content").bytes,
+                png()
+            );
+            assert!(cleanup_markers(&handle).is_empty());
+            worker.shutdown().expect("shutdown");
+
+            // As after a crash before the commit: nothing to recover.
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            assert!(handle.reclaimed_at_open().is_empty());
+            assert_eq!(attachment(&handle, id), before);
+            assert_eq!(
+                wait(handle.attachment_content(id)).expect("content").bytes,
+                png()
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_failed_reclamation_keeps_the_cleanup_and_is_completed_later() {
+            let (_root, directory) = data_directory("attachment-reclaim-failed");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let retried = attach(&handle, png(), "image/png", "a.png");
+            let recovered = attach(&handle, jpeg(), "image/jpeg", "b.jpg");
+            let available = attach(&handle, other_png(), "image/png", "c.png");
+            let unreferenced = handle
+                .attachment_store()
+                .publish(b"published, never recorded")
+                .expect("publish");
+            let orphan = unreferenced.digest();
+            unreferenced.release();
+            let paths = [retried, recovered, available]
+                .map(|id| content_path(&directory, &attachment(&handle, id)));
+
+            // The removal fails, as the file system can: the cleanup stays.
+            handle
+                .attachment_store()
+                .install_reclaim_seam(|point| point != reclaim_seam::Point::Verified);
+            for id in [retried, recovered] {
+                let report = clean_up_manually(&handle, id);
+                assert!(report.recorded);
+                assert!(matches!(
+                    report.content,
+                    Err(ReclamationError::Store(StoreError::Io(_)))
+                ));
+                assert!(matches!(
+                    wait(handle.attachment_content(id)),
+                    Err(AttachmentError::CleanedUp { id: cleaned, .. }) if cleaned == id
+                ));
+            }
+            assert!(paths.iter().all(|path| path.exists()));
+            handle.attachment_store().install_reclaim_seam(|_| true);
+            let report = clean_up_manually(&handle, retried);
+            assert!(!report.recorded);
+            assert_eq!(reclaimed(&report), Some(Reclamation::Removed));
+            assert!(!paths[0].exists());
+            worker.shutdown().expect("shutdown");
+
+            // As after a crash between the commit and the removal: the next
+            // start removes what the committed cleanup authorized, and only
+            // that.
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            let digest = attachment(&handle, recovered).sha256;
+            assert_eq!(
+                handle.reclaimed_at_open(),
+                [(digest, Ok(Reclamation::Removed))]
+            );
+            assert!(!paths[1].exists());
+            assert!(paths[2].exists(), "an available Attachment's content stays");
+            assert!(
+                directory
+                    .attachments_path()
+                    .join(orphan.to_string())
+                    .exists(),
+                "content no record names is not collected"
+            );
+            assert!(attachment(&handle, recovered).cleanup.is_some());
+            assert_eq!(
+                wait(handle.attachment_content(available))
+                    .expect("content")
+                    .bytes,
+                other_png()
+            );
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            assert!(worker.handle().reclaimed_at_open().is_empty());
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_removal_whose_directory_sync_was_lost_is_settled_at_restart() {
+            let (_root, directory) = data_directory("attachment-unsynced");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let reappears = attach(&handle, png(), "image/png", "a.png");
+            let stays_gone = attach(&handle, jpeg(), "image/jpeg", "b.jpg");
+            let changed = attach(&handle, other_png(), "image/png", "c.png");
+            let records = [reappears, stays_gone, changed].map(|id| attachment(&handle, id));
+            let paths = records
+                .clone()
+                .map(|record| content_path(&directory, &record));
+            handle
+                .attachment_store()
+                .install_reclaim_seam(|point| point != reclaim_seam::Point::Unlinked);
+            for id in [reappears, stays_gone, changed] {
+                let report = clean_up_manually(&handle, id);
+                assert!(report.recorded);
+                assert!(report.content.is_err(), "not reported as reclaimed");
+            }
+            assert!(paths.iter().all(|path| !path.exists()));
+            worker.shutdown().expect("shutdown");
+
+            // A crash may lose an unsynced removal, or keep it.
+            std::fs::write(&paths[0], png()).expect("the removal was lost");
+            std::fs::write(&paths[2], b"\x89PNG\r\n\x1a\nnot the recorded bytes!")
+                .expect("other bytes under the name");
+            for path in [&paths[0], &paths[2]] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .expect("chmod");
+            }
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            let mut reclaimed_at_open = handle.reclaimed_at_open().to_vec();
+            reclaimed_at_open.sort_by_key(|(digest, _)| *digest);
+            let mut expected = vec![
+                (records[0].sha256, Ok(Reclamation::Removed)),
+                (records[2].sha256, Err(StoreError::LengthMismatch)),
+            ];
+            expected.sort_by_key(|(digest, _)| *digest);
+            assert_eq!(reclaimed_at_open, expected);
+            assert!(!paths[0].exists() && !paths[1].exists());
+            assert!(paths[2].exists(), "a file that is not the content is kept");
+            for record in &records {
+                assert!(
+                    matches!(
+                        wait(handle.attachment_content(record.id)),
+                        Err(AttachmentError::CleanedUp { .. })
+                    ),
+                    "never revived"
+                );
+                assert!(attachment(&handle, record.id).cleanup.is_some());
+            }
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn an_upload_pinned_before_a_cleanup_keeps_its_content() {
+            let (_root, directory) = data_directory("attachment-race-upload-first");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let cleaned = attach(&handle, png(), "image/png", "a.png");
+            let path = content_path(&directory, &attachment(&handle, cleaned));
+            let (pinned, held) = flume::bounded(1);
+            let (release, released) = flume::bounded::<()>(1);
+            let uploader = {
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    publish_seam::install(move |point| {
+                        if point == publish_seam::Point::Pinned {
+                            pinned.send(()).ok();
+                            released.recv_timeout(crate::test_support::WAIT).ok();
+                        }
+                        true
+                    });
+                    let created = wait(handle.create_user_attachment(new_attachment(
+                        png(),
+                        "image/png",
+                        Some("again.png"),
+                    )));
+                    publish_seam::clear();
+                    created
+                })
+            };
+            held.recv_timeout(crate::test_support::WAIT)
+                .expect("the upload has pinned the content, and recorded nothing");
+            let report = clean_up_manually(&handle, cleaned);
+            assert!(report.recorded);
+            assert_eq!(
+                reclaimed(&report),
+                Some(Reclamation::Retained),
+                "the content is being published"
+            );
+            assert!(path.exists());
+            release.send(()).expect("let the upload go on");
+            let uploaded = uploader
+                .join()
+                .expect("the uploader")
+                .expect("the upload succeeds");
+            assert_eq!(attachment(&handle, uploaded).sha256, report.record.sha256);
+            assert_eq!(
+                wait(handle.attachment_content(uploaded))
+                    .expect("content")
+                    .bytes,
+                png(),
+                "a returned Attachment has its content"
+            );
+            // The pin is gone once the record committed; the record now
+            // protects the content, and its own cleanup reclaims it.
+            assert_eq!(
+                reclaimed(&clean_up_manually(&handle, cleaned)),
+                Some(Reclamation::Retained)
+            );
+            assert_eq!(
+                reclaimed(&clean_up_manually(&handle, uploaded)),
+                Some(Reclamation::Removed)
+            );
+            assert!(!path.exists());
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn an_upload_awaiting_its_commit_keeps_its_content() {
+            let (_root, directory) = data_directory("attachment-race-uncommitted");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let cleaned = attach(&handle, png(), "image/png", "a.png");
+            let path = content_path(&directory, &attachment(&handle, cleaned));
+            // Cleaned up without reclaiming, so a retry only reclaims.
+            clean_up(
+                &handle,
+                cleaned,
+                AttachmentCleanup {
+                    kind: CleanupKind::Manual,
+                    cleaned_at: Timestamp::from_unix_micros(1),
+                },
+            );
+            let (held, release) = handle.group_probe().hold_next_group();
+            let uploader = {
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    wait(handle.create_user_attachment(new_attachment(
+                        png(),
+                        "image/png",
+                        Some("again.png"),
+                    )))
+                })
+            };
+            held.recv_timeout(crate::test_support::WAIT)
+                .expect("the upload published its content; its record is not committed");
+            let report = clean_up_manually(&handle, cleaned);
+            assert!(!report.recorded);
+            assert_eq!(reclaimed(&report), Some(Reclamation::Retained));
+            assert!(path.exists());
+            release.send(()).expect("let the commit happen");
+            let uploaded = uploader
+                .join()
+                .expect("the uploader")
+                .expect("the upload succeeds");
+            assert_eq!(
+                wait(handle.attachment_content(uploaded))
+                    .expect("content")
+                    .bytes,
+                png()
+            );
+            assert_eq!(
+                reclaimed(&clean_up_manually(&handle, cleaned)),
+                Some(Reclamation::Retained),
+                "the new record needs it"
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn an_upload_during_a_reclamation_publishes_its_content_anew() {
+            let (_root, directory) = data_directory("attachment-race-reclaim-first");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let cleaned = attach(&handle, png(), "image/png", "a.png");
+            let path = content_path(&directory, &attachment(&handle, cleaned));
+            let (verified, holding) = flume::bounded(1);
+            let (release, released) = flume::bounded::<()>(1);
+            let mut once = true;
+            handle
+                .attachment_store()
+                .install_reclaim_seam(move |point| {
+                    if point == reclaim_seam::Point::Verified && std::mem::take(&mut once) {
+                        verified.send(()).ok();
+                        released.recv_timeout(crate::test_support::WAIT).ok();
+                    }
+                    true
+                });
+            let cleaner = {
+                let handle = handle.clone();
+                std::thread::spawn(move || wait(handle.cleanup_attachment(cleaned)))
+            };
+            holding
+                .recv_timeout(crate::test_support::WAIT)
+                .expect("the reclamation decided to remove the file and holds the lock");
+            let (done, finished) = flume::bounded(1);
+            let uploader = {
+                let handle = handle.clone();
+                std::thread::spawn(move || {
+                    let created = wait(handle.create_user_attachment(new_attachment(
+                        png(),
+                        "image/png",
+                        Some("again.png"),
+                    )));
+                    done.send(()).ok();
+                    created
+                })
+            };
+            assert!(
+                finished.recv_timeout(Duration::from_millis(200)).is_err(),
+                "the upload waits for the reclamation"
+            );
+            assert!(path.exists());
+            release.send(()).expect("let the reclamation go on");
+            let report = cleaner.join().expect("the cleaner").expect("the cleanup");
+            assert_eq!(reclaimed(&report), Some(Reclamation::Removed));
+            let uploaded = uploader
+                .join()
+                .expect("the uploader")
+                .expect("the upload succeeds");
+            assert!(path.exists(), "published anew after the removal");
+            assert_eq!(
+                wait(handle.attachment_content(uploaded))
+                    .expect("content")
+                    .bytes,
+                png()
+            );
+            assert!(matches!(
+                wait(handle.attachment_content(cleaned)),
+                Err(AttachmentError::CleanedUp { .. })
+            ));
+            worker.shutdown().expect("shutdown");
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            assert!(
+                worker.handle().reclaimed_at_open().is_empty(),
+                "the new upload's content is needed"
+            );
+            assert!(path.exists());
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_read_that_loses_the_race_with_a_cleanup_is_refused_as_cleaned_up() {
+            let (_root, directory) = data_directory("attachment-race-read");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let id = attach(&handle, png(), "image/png", "a.png");
+            let path = content_path(&directory, &attachment(&handle, id));
+
+            // A read whose record said available, overtaken by the cleanup
+            // and its reclamation before it opens the file.
+            let cleaner = handle.clone();
+            let report = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let recorded = report.clone();
+            publish_seam::install(move |point| {
+                if point == publish_seam::Point::Loading && recorded.borrow().is_none() {
+                    *recorded.borrow_mut() = Some(clean_up_manually(&cleaner, id));
+                }
+                true
+            });
+            let read = wait(handle.attachment_content(id));
+            publish_seam::clear();
+            let report = report.borrow_mut().take().expect("the cleanup ran");
+            assert_eq!(reclaimed(&report), Some(Reclamation::Removed));
+            assert!(!path.exists());
+            assert!(matches!(
+                read,
+                Err(AttachmentError::CleanedUp { id: cleaned, cleanup })
+                    if cleaned == id && Some(cleanup) == report.record.cleanup
+            ));
+
+            // A file missing under an available record is still reported as
+            // missing, not as a cleanup.
+            let missing = attach(&handle, jpeg(), "image/jpeg", "b.jpg");
+            std::fs::remove_file(content_path(&directory, &attachment(&handle, missing)))
+                .expect("remove");
+            assert!(matches!(
+                wait(handle.attachment_content(missing)),
+                Err(AttachmentError::Content { id, error: StoreError::Missing }) if id == missing
+            ));
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_cleanup_leaves_settled_jobs_alone_and_fails_unsent_ones() {
+            let (_root, directory) = data_directory("attachment-cleanup-jobs");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let id = attach(&handle, png(), "image/png", "shot.png");
+            let completed = run_with(&handle, llm, vec![id]);
+            answer(&handle, completed, "One transparent pixel.");
+            let pending = run_with(&handle, llm, vec![id]);
+            let settled = (
+                job_record(&handle, completed.job),
+                wait(handle.latest_output(completed.job)).expect("read"),
+                wait(handle.job_input_for_job(completed.job)).expect("read"),
+            );
+            assert!(settled.0.completed_at.is_some());
+            let expected = image_body(&[format!("data:image/png;base64,{PNG_BASE64}")]);
+            assert_eq!(
+                persisted_body(&handle, pending.job).expect("a body"),
+                expected
+            );
+
+            let report = clean_up_manually(&handle, id);
+            assert_eq!(reclaimed(&report), Some(Reclamation::Removed));
+            assert_eq!(
+                (
+                    job_record(&handle, completed.job),
+                    wait(handle.latest_output(completed.job)).expect("read"),
+                    wait(handle.job_input_for_job(completed.job)).expect("read"),
+                ),
+                settled,
+                "a completed Job is not touched"
+            );
+            // The submitted Job's execution reads its images after the
+            // cleanup: it is refused before any request, with nothing
+            // substituted or left out.
+            assert!(matches!(
+                persisted_body(&handle, pending.job),
+                Err(AttachmentImageError::Attachment(AttachmentError::CleanedUp { id: cleaned, .. }))
+                    if cleaned == id
+            ));
+            assert_eq!(input_attachments(&handle, pending.input), [id]);
+            assert_eq!(
+                wait(handle.attachment_inputs(id)).expect("read"),
+                [completed.input, pending.input]
+            );
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }
@@ -18828,7 +19500,8 @@ mod requests_and_tool_loop {
             let orphan = AttachmentStore::open(directory.attachments_path())
                 .expect("open the store")
                 .publish(&jpeg())
-                .expect("publish");
+                .expect("publish")
+                .digest();
             // Crashes while staging: one partial, one complete.
             let path = directory.attachments_path();
             std::fs::write(path.join(".ocg-staging-1-2-3"), &png()[..4]).expect("write");

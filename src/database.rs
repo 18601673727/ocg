@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use redb::Database;
 
-use crate::attachments::{AttachmentContent, AttachmentError, AttachmentStore, StoreError};
+use crate::attachments::{
+    AttachmentCleanupReport, AttachmentContent, AttachmentError, AttachmentStore, Reclamation,
+    ReclamationError, StoreError,
+};
 use crate::data_directory::DataDirectory;
 use crate::disk_protection::{
     self, DiskProtectionStatus, FilesystemConfig, FilesystemConfigError, ProtectedArea,
@@ -17,15 +20,16 @@ use crate::disk_protection::{
 use crate::persistence::{
     self, AgentId, AgentRecord, AppendedOutput, AttachmentId, AttachmentOrigin, AttachmentRecord,
     AvailabilityAggregationProgress, AvailabilityBatch, AvailabilityCounts, AvailabilityStatId,
-    AvailabilityStatRecord, ExecutorId, JobFinalization, JobId, JobInputDraft, JobInputId,
-    JobOutputRecord, JobRecord, JobRetry, LlmProviderId, LlmProviderRecord, MetricsId,
-    MetricsRecord, NewAgent, NewAttachment, NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput,
-    NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject, NewToolEvidence,
-    ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelFilter,
-    ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile, ProfileId,
-    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, PublishedAttachment, ReadSnapshot,
-    RequestNumber, RequestRef, RequestSampleRecord, Timestamp, ToolCallRef, ToolDecision,
-    ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation, WrongProfileKind,
+    AvailabilityStatRecord, CleanupKind, ContentDigest, ExecutorId, JobFinalization, JobId,
+    JobInputDraft, JobInputId, JobOutputRecord, JobRecord, JobRetry, LlmProviderId,
+    LlmProviderRecord, MetricsId, MetricsRecord, NewAgent, NewAttachment, NewAvailabilityStat,
+    NewExecutor, NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig,
+    NewProject, NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage,
+    ObservedModel, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind,
+    OperationMarker, Profile, ProfileId, ProfileRecord, ProfileVariant, ProjectId, ProjectRecord,
+    PublishedAttachment, ReadSnapshot, RequestNumber, RequestRef, RequestSampleRecord, Timestamp,
+    ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation,
+    WrongProfileKind,
 };
 use crate::storage::{
     self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile,
@@ -511,6 +515,11 @@ enum Command {
         attachment: Box<PublishedAttachment>,
         reply: Reply<AttachmentId>,
     },
+    CleanupAttachment {
+        id: AttachmentId,
+        kind: CleanupKind,
+        reply: Reply<AttachmentRecord>,
+    },
     ConfirmJobStopped {
         job: JobId,
         reply: Reply<()>,
@@ -743,6 +752,14 @@ impl Command {
                 reply,
                 |batch| persistence::create_attachment(batch, *attachment),
             ),
+            Self::CleanupAttachment { id, kind, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CleanupAttachment,
+                reply,
+                |batch| persistence::cleanup_attachment(batch, id, kind),
+            ),
             Self::ConfirmJobStopped { job, reply } => run(
                 database,
                 operation,
@@ -836,6 +853,8 @@ impl Command {
             | Self::AssignJobExecutor { .. }
             | Self::AssociateJobProject { .. }
             | Self::ConfirmJobStopped { .. } => 0,
+            // The record rewritten keeps its length; the allowance covers it.
+            Self::CleanupAttachment { .. } => 0,
             Self::AppendJobOutput { output, .. } => {
                 output_bytes(&output.summary, &output.code, &output.value)
             }
@@ -926,6 +945,7 @@ impl Command {
             Self::UpdateProfile { reply, .. } => refuse(reply, error),
             Self::CreateAgent { reply, .. } => refuse(reply, error),
             Self::CreateAttachment { reply, .. } => refuse(reply, error),
+            Self::CleanupAttachment { reply, .. } => refuse(reply, error),
             Self::ConfirmJobStopped { reply, .. } => refuse(reply, error),
             Self::RecordMetrics { reply, .. } => refuse(reply, error),
             Self::RecordAvailabilityStat { reply, .. } => refuse(reply, error),
@@ -1156,6 +1176,10 @@ struct Shared {
     protection: Arc<ProtectionCell>,
     /// The content files of Attachments, opened with the database.
     attachments: AttachmentStore,
+    /// What this worker's start did to the content files that committed
+    /// cleanups authorized it to reclaim; see
+    /// [`DatabaseHandle::reclaimed_at_open`].
+    reclaimed_at_open: Vec<(ContentDigest, Result<Reclamation, StoreError>)>,
     /// `None` answers a check that the stopping worker will never run.
     space_check: SharedRequest<Option<DiskProtectionStatus>>,
     recovery: SharedRequest<Result<RecoveryReport, RecoveryError>>,
@@ -1475,6 +1499,17 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
+                // Finishes reclamations that an earlier opening's cleanups
+                // committed and did not complete, before anything can be
+                // published. A file that cannot be reclaimed is reported,
+                // and does not keep the database from starting.
+                let reclaimed_at_open = match storage::unneeded_content(&database) {
+                    Ok(unneeded) => attachments.reclaim_unneeded(&unneeded),
+                    Err(error) => {
+                        ready_sender.send(Err(DatabaseError::Open(error))).ok();
+                        return Ok(());
+                    }
+                };
                 let shared = Arc::new(Shared {
                     active_policy: policy,
                     log_directory,
@@ -1492,6 +1527,7 @@ impl DatabaseWorker {
                     reads_stopped: RwLock::new(false),
                     protection: ProtectionCell::new(),
                     attachments,
+                    reclaimed_at_open,
                     space_check: SharedRequest::new(),
                     recovery: SharedRequest::new(),
                     aggregation_host: AtomicBool::new(false),
@@ -2794,6 +2830,16 @@ impl DatabaseHandle {
         &self.shared.abandoned_at_open
     }
 
+    /// The content files this worker's start found that committed cleanups
+    /// authorized it to reclaim, those of cleaned-up Attachments whose
+    /// content no available Attachment names, and what became of each:
+    /// [`Reclamation::Removed`], or why it is still there. Such a file is
+    /// left over by a reclamation that failed or was interrupted. Empty
+    /// when there was none; a file already gone is not listed.
+    pub fn reclaimed_at_open(&self) -> &[(ContentDigest, Result<Reclamation, StoreError>)] {
+        &self.shared.reclaimed_at_open
+    }
+
     pub fn status(&self) -> DatabaseStatus {
         match self.shared.admission() {
             Admission::Open => DatabaseStatus::Open,
@@ -3531,6 +3577,13 @@ impl DatabaseHandle {
     /// record committed. When the commit fails, the published content stays,
     /// named by no Attachment, and a later publication of the same bytes
     /// reuses it. Nothing is published while commands are not admitted.
+    ///
+    /// The content is pinned from before it is published until the commit's
+    /// outcome is known, so no cleanup reclaims it meanwhile; a returned
+    /// Attachment always has its content. When the outcome is unknown, the
+    /// content stays pinned until the process ends. Publishing waits, on the
+    /// caller's thread like the rest of the publication, while a cleanup
+    /// reclaims content.
     pub async fn create_user_attachment(
         &self,
         attachment: NewAttachment,
@@ -3543,24 +3596,37 @@ impl DatabaseHandle {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner),
         )?;
-        let sha256 = self
+        let pin = self
             .shared
             .attachments
             .publish(&attachment.content)
             .map_err(AttachmentError::NotStored)?;
         let published = PublishedAttachment {
-            sha256,
+            sha256: pin.digest(),
             byte_length: attachment.content.len() as u64,
             mime: attachment.mime,
             display_name: attachment.display_name,
             origin: AttachmentOrigin::UserProvided,
         };
-        Ok(self
+        let created = self
             .submit(|reply| Command::CreateAttachment {
                 attachment: Box::new(published),
                 reply,
             })
-            .await?)
+            .await;
+        // Committed, and durable, so every later read sees the record that
+        // now protects the content; or certainly not committed.
+        let settled = match &created {
+            Ok(_) => true,
+            Err(error) => matches!(
+                error.command_outcome(),
+                Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted)
+            ),
+        };
+        if settled {
+            pin.release();
+        }
+        Ok(created?)
     }
 
     pub async fn attachment(
@@ -3606,12 +3672,104 @@ impl DatabaseHandle {
         if let Some(cleanup) = record.cleanup {
             return Err(AttachmentError::CleanedUp { id, cleanup });
         }
-        let bytes = self
+        let bytes = match self
             .shared
             .attachments
             .load(record.sha256, record.byte_length)
-            .map_err(|error| AttachmentError::Content { id, error })?;
+        {
+            Ok(bytes) => bytes,
+            // Reclaimed since the record was read, by a cleanup that
+            // committed meanwhile; otherwise the file is truly missing.
+            Err(StoreError::Missing) => {
+                return Err(match self.attachment(id).await?.and_then(|r| r.cleanup) {
+                    Some(cleanup) => AttachmentError::CleanedUp { id, cleanup },
+                    None => AttachmentError::Content {
+                        id,
+                        error: StoreError::Missing,
+                    },
+                });
+            }
+            Err(error) => return Err(AttachmentError::Content { id, error }),
+        };
         Ok(AttachmentContent { record, bytes })
+    }
+
+    /// The operator's manual cleanup of an Attachment: records that it was
+    /// cleaned up, [`CleanupKind::Manual`] at the database's time, in one
+    /// commit, then reclaims its content file unless another available
+    /// Attachment, or a publication in progress, still needs that content;
+    /// see [`crate::attachments`]. The Attachment keeps its identity and
+    /// every other field, and every input keeps naming it; from the commit
+    /// on, its content is refused to every new read and to every Job whose
+    /// execution has not yet read it. Bytes already read, or already sent to
+    /// a Provider, are not recalled.
+    ///
+    /// An Attachment already cleaned up, manually or automatically, keeps
+    /// its cleanup: nothing is recorded, and only the reclamation of its
+    /// content is tried again. The report says which, and what became of
+    /// the content file; a failed reclamation does not undo the cleanup.
+    ///
+    /// # Errors
+    ///
+    /// [`AttachmentError::NotFound`] for an unknown Attachment, or why the
+    /// cleanup was not recorded.
+    pub async fn cleanup_attachment(
+        &self,
+        id: AttachmentId,
+    ) -> Result<AttachmentCleanupReport, AttachmentError> {
+        let record = self
+            .attachment(id)
+            .await?
+            .ok_or(AttachmentError::NotFound(id))?;
+        let (record, recorded) = if record.is_available() {
+            let kind = CleanupKind::Manual;
+            match self
+                .submit(|reply| Command::CleanupAttachment { id, kind, reply })
+                .await
+            {
+                Ok(record) => (record, true),
+                // Cleaned up meanwhile by another cleanup, which is kept.
+                Err(DatabaseError::Rejected(Violation::AttachmentCleanedUp(_))) => (
+                    self.attachment(id)
+                        .await?
+                        .ok_or(AttachmentError::NotFound(id))?,
+                    false,
+                ),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            (record, false)
+        };
+        let content = self.reclaim(record.sha256, record.byte_length).await;
+        Ok(AttachmentCleanupReport {
+            record,
+            recorded,
+            content,
+        })
+    }
+
+    /// Reclaims the content `digest` on a read worker, so that whether an
+    /// available Attachment still names it is read from committed, durable
+    /// records while the store holds its pins' lock.
+    async fn reclaim(
+        &self,
+        digest: ContentDigest,
+        length: u64,
+    ) -> Result<Reclamation, ReclamationError> {
+        let shared = self.shared.clone();
+        self.read(move |database| {
+            shared.attachments.reclaim(digest, length, || {
+                storage::content_available(database, digest)
+            })
+        })
+        .await
+        .map_err(ReclamationError::Database)?
+        .map_err(ReclamationError::Store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attachment_store(&self) -> &AttachmentStore {
+        &self.shared.attachments
     }
 
     /// Records that an unknown-outcome Job's execution has actually stopped,

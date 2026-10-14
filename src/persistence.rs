@@ -497,7 +497,7 @@ pub struct AttachmentCleanup {
 /// own, independent of its content. Two Attachments of identical bytes are
 /// two Attachments with one [`ContentDigest`]; each keeps its own name,
 /// origin and cleanup. Attachments have no update path apart from cleanup,
-/// which no operation records yet.
+/// see [`crate::database::DatabaseHandle::cleanup_attachment`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentRecord {
     pub id: AttachmentId,
@@ -1739,6 +1739,8 @@ pub enum OperationKind {
     ReconcileToolEffect,
     /// A new Attachment, recorded once its content was published.
     CreateAttachment,
+    /// The cleanup of an available Attachment: its kind and time, together.
+    CleanupAttachment,
 }
 
 /// Written in the same transaction as every accepted mutation, so its
@@ -2800,6 +2802,27 @@ pub(crate) fn create_attachment(
         id,
         MarkerSubjects::created(RecordRef::Attachment(id), RecordRef::Attachment(id)),
     ))
+}
+
+/// Records that an available Attachment was cleaned up: `kind` and the
+/// batch's time, in one write. Nothing else of it changes, nor any input
+/// that names it. An Attachment already cleaned up keeps its cleanup, and
+/// the batch is refused with [`Violation::AttachmentCleanedUp`].
+pub(crate) fn cleanup_attachment(
+    batch: &mut Batch,
+    id: AttachmentId,
+    kind: CleanupKind,
+) -> OpResult<AttachmentRecord> {
+    let mut record = batch.require_attachment(id)?;
+    if !record.is_available() {
+        return batch.reject(Violation::AttachmentCleanedUp(id));
+    }
+    record.cleanup = Some(AttachmentCleanup {
+        kind,
+        cleaned_at: batch.now(),
+    });
+    batch.put_attachment(&record)?;
+    Ok((record, MarkerSubjects::addressed(RecordRef::Attachment(id))))
 }
 
 pub(crate) fn create_project(batch: &mut Batch, project: NewProject) -> OpResult<ProjectId> {

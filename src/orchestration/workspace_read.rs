@@ -8,7 +8,10 @@
 //! by [`Workspace::authorize`], before the tool can be registered, and it is
 //! refused when it is not an existing directory, when it would contain the
 //! home directory or the OCG data directory, or when it lies inside the data
-//! directory.
+//! directory. The home directory is that of the effective user's account, as
+//! the system's account database states it, never `HOME`, which whoever
+//! starts OCG can set to anything; when it cannot be found, every root is
+//! refused.
 //!
 //! Each call opens the root, then every component of its path, relative to
 //! the directory opened before it, with `O_NOFOLLOW`, so no symbolic link is
@@ -105,6 +108,12 @@ pub enum WorkspaceError {
     NotDirectory,
     #[error("the Workspace root may not be the filesystem root or contain the home directory")]
     TooBroad,
+    /// The effective user's home directory is unknown, so whether the root
+    /// contains it cannot be checked.
+    #[error(
+        "the home directory of the effective user cannot be determined from the account database, so no Workspace root can be authorized: {0}"
+    )]
+    HomeUnknown(HomeError),
     #[error("the Workspace root overlaps the OCG data directory")]
     OverlapsDataDirectory,
 }
@@ -121,13 +130,25 @@ pub struct Workspace {
 
 impl Workspace {
     /// Resolves `root` and checks that it may be read from: it must be an
-    /// absolute path to an existing directory that neither contains the home
-    /// directory nor overlaps `data_directory`.
+    /// absolute path to an existing directory that neither contains the
+    /// effective user's home directory, see [`account_home`], nor overlaps
+    /// `data_directory`.
     ///
     /// # Errors
     ///
-    /// Returns why the root is refused.
+    /// Returns why the root is refused; [`WorkspaceError::HomeUnknown`]
+    /// whatever the root when the home directory cannot be determined.
     pub fn authorize(root: &Path, data_directory: &DataDirectory) -> Result<Self, WorkspaceError> {
+        Self::authorize_beside(root, data_directory, account_home())
+    }
+
+    /// [`Self::authorize`], with `home` as what [`account_home`] answered.
+    fn authorize_beside(
+        root: &Path,
+        data_directory: &DataDirectory,
+        home: Result<PathBuf, HomeError>,
+    ) -> Result<Self, WorkspaceError> {
+        let home = home.map_err(WorkspaceError::HomeUnknown)?;
         if !root.is_absolute() {
             return Err(WorkspaceError::NotAbsolute);
         }
@@ -137,10 +158,7 @@ impl Workspace {
         if !metadata.is_dir() {
             return Err(WorkspaceError::NotDirectory);
         }
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .and_then(|home| home.canonicalize().ok());
-        if root.parent().is_none() || home.is_some_and(|home| home.starts_with(&root)) {
+        if root.parent().is_none() || home.starts_with(&root) {
             return Err(WorkspaceError::TooBroad);
         }
         let data = data_directory.root();
@@ -212,6 +230,39 @@ impl Workspace {
         }
         Ok(directory)
     }
+}
+
+/// Why the effective user's home directory is unknown.
+#[derive(Debug, thiserror::Error)]
+pub enum HomeError {
+    #[error("the account lookup failed: {0}")]
+    Lookup(#[source] std::io::Error),
+    #[error("the effective user has no account entry")]
+    NoAccount,
+    #[error("the account's home directory is not an absolute path")]
+    NotAbsolute,
+    #[error("the account's home directory cannot be resolved: {0}")]
+    Unresolved(#[source] std::io::Error),
+}
+
+/// The home directory of the effective user, resolved: the one its entry in
+/// the account database names (`getpwuid_r` of the effective user ID), the
+/// source the system itself uses to set `HOME` at login. The environment is
+/// never consulted, so an unset, missing or misleading `HOME` changes
+/// nothing. A home directory that is not absolute or does not exist is not
+/// one a root can be checked against, so it is an error too.
+///
+/// # Errors
+///
+/// Returns why the home directory cannot be determined.
+pub fn account_home() -> Result<PathBuf, HomeError> {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
+        .map_err(|errno| HomeError::Lookup(errno.into()))?
+        .ok_or(HomeError::NoAccount)?;
+    if !user.dir.is_absolute() {
+        return Err(HomeError::NotAbsolute);
+    }
+    user.dir.canonicalize().map_err(HomeError::Unresolved)
 }
 
 /// Why a call reads nothing. Its message is recorded and may reach the
@@ -759,6 +810,147 @@ mod tests {
         let workspace =
             Workspace::authorize(&links.join("to-root"), &directory).expect("authorize");
         assert_eq!(workspace.root(), root);
+    }
+
+    #[test]
+    fn a_root_is_checked_against_the_home_directory_it_is_given() {
+        let (_guard, base, _data, directory) = workspace("home-boundary");
+        let home = base.join("home");
+        let project = home.join("Workspace/example-project");
+        std::fs::create_dir_all(&project).expect("create a project");
+        let authorize =
+            |root: &Path| Workspace::authorize_beside(root, &directory, Ok(home.clone()));
+
+        let workspace = authorize(&project).expect("a project inside the home directory");
+        assert_eq!(workspace.root(), project);
+        authorize(&home.join("Workspace")).expect("a directory inside the home directory");
+        for broad in [&home, &base, Path::new("/")] {
+            assert!(
+                matches!(authorize(broad), Err(WorkspaceError::TooBroad)),
+                "{}",
+                broad.display()
+            );
+        }
+        // A link to the home directory is the home directory.
+        symlink(&home, base.join("to-home")).expect("link");
+        assert!(matches!(
+            authorize(&base.join("to-home")),
+            Err(WorkspaceError::TooBroad)
+        ));
+        // The data directory stays apart, wherever the home directory is.
+        assert!(matches!(
+            authorize(directory.root()),
+            Err(WorkspaceError::OverlapsDataDirectory)
+        ));
+        assert!(matches!(
+            authorize(directory.logs_path()),
+            Err(WorkspaceError::OverlapsDataDirectory)
+        ));
+
+        // No home directory, no Workspace: not even an ordinary one.
+        for unknown in [
+            HomeError::NoAccount,
+            HomeError::NotAbsolute,
+            HomeError::Lookup(std::io::ErrorKind::Other.into()),
+            HomeError::Unresolved(std::io::ErrorKind::NotFound.into()),
+        ] {
+            assert!(matches!(
+                Workspace::authorize_beside(&project, &directory, Err(unknown)),
+                Err(WorkspaceError::HomeUnknown(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn the_accounts_home_directory_and_its_ancestors_are_refused() {
+        let (_guard, root, _data, directory) = workspace("account-home");
+        let home = account_home().expect("the effective user's home directory");
+        assert!(home.is_absolute() && home.is_dir(), "{}", home.display());
+        assert_eq!(home.canonicalize().expect("resolve"), home, "resolved");
+        for ancestor in home.ancestors() {
+            assert!(
+                matches!(
+                    Workspace::authorize(ancestor, &directory),
+                    Err(WorkspaceError::TooBroad)
+                ),
+                "{}",
+                ancestor.display()
+            );
+        }
+        Workspace::authorize(&root, &directory).expect("an ordinary root");
+        // This checkout, when it lies inside the home directory, is the
+        // kind of project that stays authorized.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .expect("resolve the checkout");
+        if manifest.starts_with(&home) && manifest != home {
+            Workspace::authorize(&manifest, &directory).expect("a project in the home directory");
+        }
+    }
+
+    /// Set only in the child processes of
+    /// [`home_is_never_taken_from_the_environment`]: the home directory the
+    /// parent resolved, and a directory its `HOME` may name.
+    const PROBE_HOME: &str = "OCG_TEST_ACCOUNT_HOME";
+    const PROBE_OTHER: &str = "OCG_TEST_OTHER_DIRECTORY";
+
+    /// Runs this test again in a child process for each `HOME` an attacker
+    /// or a careless launcher could give OCG: none, a missing directory, an
+    /// unrelated existing one and a relative path. Each child resolves the
+    /// same home directory as this process, still refuses it, and treats
+    /// the directory `HOME` names as any other. The environment of this
+    /// process is never changed.
+    #[test]
+    fn home_is_never_taken_from_the_environment() {
+        if let Some(expected) = std::env::var_os(PROBE_HOME) {
+            let home = account_home().expect("the effective user's home directory");
+            assert_eq!(home.as_os_str(), expected, "HOME changed nothing");
+            let (_guard, root, _data, directory) = workspace("probe");
+            assert!(matches!(
+                Workspace::authorize(&home, &directory),
+                Err(WorkspaceError::TooBroad)
+            ));
+            if let Some(parent) = home.parent() {
+                assert!(matches!(
+                    Workspace::authorize(parent, &directory),
+                    Err(WorkspaceError::TooBroad)
+                ));
+            }
+            Workspace::authorize(&root, &directory).expect("an ordinary root");
+            let other = std::env::var_os(PROBE_OTHER).expect("the other directory");
+            Workspace::authorize(Path::new(&other), &directory)
+                .expect("the directory HOME names is no home directory");
+            return;
+        }
+        let home = account_home().expect("the effective user's home directory");
+        let (_guard, other) = temporary_directory(SUITE, "home-environment");
+        let missing = other.join("missing");
+        let name = "orchestration::workspace_read::tests::home_is_never_taken_from_the_environment";
+        let environments = [
+            None,
+            Some(missing.into_os_string()),
+            Some(other.clone().into_os_string()),
+            Some("relative/home".into()),
+        ];
+        for claimed in environments {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("this test binary"));
+            child
+                .args([name, "--exact", "--test-threads=1", "--nocapture"])
+                .env(PROBE_HOME, &home)
+                .env(PROBE_OTHER, &other);
+            match &claimed {
+                Some(value) => child.env("HOME", value),
+                None => child.env_remove("HOME"),
+            };
+            let output = child.output().expect("run the child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "HOME={claimed:?}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

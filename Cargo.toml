@@ -42,3 +42,7 @@ time = { version = "=0.3.55", default-features = false, features = ["std"] }
 # same rustix that fs4 already builds. `process` waits for, and kills the
 # process group of, a Workspace command.
 rustix = { version = "1", features = ["fs", "process"] }
+# The effective user's home directory from the account database
+# (`getpwuid_r`), never from `HOME`, for Workspace authorization; the nix the
+# tree already builds, with only its safe account lookup.
+nix = { version = "0.31", default-features = false, features = ["user"] }

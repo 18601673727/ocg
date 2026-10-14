@@ -28,14 +28,33 @@
 //! start of the database removes: only a regular file whose name has the
 //! staging form, never a published file, a link or anything else.
 //!
+//! A cleanup ends an Attachment's availability in its record first; its
+//! content file is reclaimed afterwards, and only once no available
+//! Attachment names the same content and no publication of it is in
+//! progress. A publication pins its digest, see [`ContentPin`], before it
+//! touches the directory, until whether its record committed is known. A
+//! reclamation holds the pins' lock from its check of the pins and of the
+//! committed records until the file is gone and the directory synced, so a
+//! publication either pinned first, and the content is kept, or waits for
+//! the reclamation and then publishes the content anew. A file is removed
+//! only when it is a private regular file of this user with one link and
+//! exactly the recorded length and SHA-256, still under its name. Removing a
+//! file is not erasure: copies in backups, snapshots or freed blocks remain.
+//! Reclamation that did not finish is retried by a later cleanup of an
+//! Attachment of that content and by the next start of the database, see
+//! [`crate::database::DatabaseHandle::reclaimed_at_open`]; neither touches
+//! a file no cleanup authorized, such as content no record names.
+//!
 //! What this does not establish: the root's ancestors are resolved by path;
 //! the checks guard against mistakes and other users, not against code
 //! running as this user, which can change any file between a check and its
 //! use (a changed file is still refused when it is read, by its digest); and
 //! durability is what `fsync` gives.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::database::DatabaseError;
 use crate::persistence::{AttachmentCleanup, AttachmentId, AttachmentRecord, ContentDigest};
@@ -81,6 +100,91 @@ pub enum AttachmentError {
     Content { id: AttachmentId, error: StoreError },
     #[error("the content was not stored: {0}")]
     NotStored(StoreError),
+}
+
+/// What became of an Attachment's content file when a cleanup tried to
+/// reclaim it. Removal is never erasure, see [`crate::attachments`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reclamation {
+    /// The file was verified, removed, and the directory synced.
+    Removed,
+    /// No file had the content's name; the directory was synced, so that
+    /// absence is durable.
+    Absent,
+    /// The file was kept: another available Attachment names the same
+    /// content, or a publication of it is in progress.
+    Retained,
+}
+
+/// Why a content file was not reclaimed. A later cleanup of an Attachment
+/// of that content, or the next start of the database, tries again.
+#[derive(Debug, thiserror::Error)]
+pub enum ReclamationError {
+    #[error("whether other Attachments still need the content could not be read: {0}")]
+    Database(DatabaseError),
+    #[error("the content file was not removed: {0}")]
+    Store(StoreError),
+}
+
+/// What a cleanup of an Attachment did. The cleanup of the record and the
+/// reclamation of the content are separate facts: the first is durable
+/// whatever became of the second.
+#[derive(Debug)]
+pub struct AttachmentCleanupReport {
+    /// The Attachment as it is recorded now: its original metadata, with the
+    /// cleanup that applies to it, this call's or an earlier one.
+    pub record: AttachmentRecord,
+    /// Whether this call recorded the cleanup. `false` when the Attachment
+    /// was already cleaned up; that cleanup, its kind and time, is kept.
+    pub recorded: bool,
+    /// What became of the content file.
+    pub content: Result<Reclamation, ReclamationError>,
+}
+
+/// The publications in progress, by digest, see [`ContentPin`]. Its lock is
+/// also held through a whole reclamation.
+#[derive(Debug, Default)]
+struct Pins(Mutex<HashMap<ContentDigest, usize>>);
+
+impl Pins {
+    fn lock(&self) -> MutexGuard<'_, HashMap<ContentDigest, usize>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Pins `digest`; waits while a reclamation holds the lock.
+    fn pin(&self, digest: ContentDigest) -> ContentPin<'_> {
+        *self.lock().entry(digest).or_default() += 1;
+        ContentPin { pins: self, digest }
+    }
+}
+
+/// Content published for a record that has not committed yet: as long as
+/// it exists, the content is never reclaimed. Released once whether the
+/// record committed is known; dropped without that, the content stays
+/// pinned for the rest of this process run, because a record whose commit
+/// is unknown may still name it.
+#[derive(Debug)]
+pub(crate) struct ContentPin<'a> {
+    pins: &'a Pins,
+    digest: ContentDigest,
+}
+
+impl ContentPin<'_> {
+    pub(crate) fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+
+    /// Ends the pin: the record committed, and now names the content
+    /// itself, or it did not commit and never will.
+    pub(crate) fn release(self) {
+        let mut pins = self.pins.lock();
+        if let Some(count) = pins.get_mut(&self.digest) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.digest);
+            }
+        }
+    }
 }
 
 /// An available Attachment and its verified content. Its `Debug` shows the
@@ -173,6 +277,9 @@ mod supported {
         name: std::ffi::OsString,
         directory: File,
         identity: Identity,
+        pins: Pins,
+        #[cfg(test)]
+        seam: reclaim_seam::Slot,
     }
 
     impl AttachmentStore {
@@ -195,6 +302,9 @@ mod supported {
                 name: name.to_owned(),
                 identity: Identity::of(&metadata),
                 directory,
+                pins: Pins::default(),
+                #[cfg(test)]
+                seam: reclaim_seam::Slot::default(),
             })
         }
 
@@ -223,14 +333,30 @@ mod supported {
         }
 
         /// Publishes `content` under its digest, durably, and returns the
-        /// digest. Existing content of that digest is reused once its bytes
-        /// are verified equal to `content`; nothing is ever replaced.
-        pub(crate) fn publish(&self, content: &[u8]) -> Result<ContentDigest, StoreError> {
-            let digest = ContentDigest::of(content);
+        /// digest pinned, see [`ContentPin`]. Existing content of that
+        /// digest is reused once its bytes are verified equal to `content`;
+        /// nothing is ever replaced. The digest is pinned before anything
+        /// is looked at, after any reclamation of it in progress.
+        pub(crate) fn publish(&self, content: &[u8]) -> Result<ContentPin<'_>, StoreError> {
+            let pin = self.pins.pin(ContentDigest::of(content));
+            match self.publish_pinned(pin.digest(), content) {
+                Ok(()) => Ok(pin),
+                Err(error) => {
+                    pin.release();
+                    Err(error)
+                }
+            }
+        }
+
+        fn publish_pinned(&self, digest: ContentDigest, content: &[u8]) -> Result<(), StoreError> {
+            #[cfg(test)]
+            if !publish_seam::reach(publish_seam::Point::Pinned) {
+                return Err(StoreError::Io(std::io::ErrorKind::Other));
+            }
             let name = digest.to_string();
             self.verify()?;
             if self.reuse(&name, content)? {
-                return Ok(digest);
+                return Ok(());
             }
             let staged = Staged::new(&self.directory)?;
             staged.fill(content)?;
@@ -246,7 +372,7 @@ mod supported {
                 Err(Errno::EXIST) => {
                     drop(staged);
                     return if self.reuse(&name, content)? {
-                        Ok(digest)
+                        Ok(())
                     } else {
                         Err(StoreError::Conflict)
                     };
@@ -258,7 +384,7 @@ mod supported {
                 return Err(StoreError::Io(std::io::ErrorKind::Other));
             }
             self.directory.sync_all().map_err(failed)?;
-            Ok(digest)
+            Ok(())
         }
 
         /// Whether a file under `name` already holds `content`, synced with
@@ -289,11 +415,127 @@ mod supported {
             length: u64,
         ) -> Result<Vec<u8>, StoreError> {
             self.verify()?;
+            #[cfg(test)]
+            if !publish_seam::reach(publish_seam::Point::Loading) {
+                return Err(StoreError::Io(std::io::ErrorKind::Other));
+            }
             let (_, bytes) = self.read_file(&digest.to_string(), length)?;
             if ContentDigest::of(&bytes) != digest {
                 return Err(StoreError::DigestMismatch);
             }
             Ok(bytes)
+        }
+
+        /// Reclaims the content named `digest`, of `length` bytes, which a
+        /// committed cleanup no longer lets one Attachment use: it is kept
+        /// while a publication of it is pinned or while `needed` says that
+        /// an available Attachment names it; otherwise it is removed, see
+        /// [`Self::remove`], or found absent and the directory synced. The
+        /// pins' lock is held throughout, so no publication of the content
+        /// begins between `needed` and the removal; `needed` must read the
+        /// committed records within that time. Its error is returned as it
+        /// is, and nothing is removed.
+        pub(crate) fn reclaim<E>(
+            &self,
+            digest: ContentDigest,
+            length: u64,
+            needed: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Result<Reclamation, StoreError>, E> {
+            let pins = self.pins.lock();
+            if pins.contains_key(&digest) || needed()? {
+                return Ok(Ok(Reclamation::Retained));
+            }
+            let removed = self.remove(digest, length).and_then(|reclaimed| {
+                if reclaimed == Reclamation::Absent {
+                    self.directory.sync_all().map_err(failed)?;
+                }
+                Ok(reclaimed)
+            });
+            drop(pins);
+            Ok(removed)
+        }
+
+        /// Reclaims, when the database opens, before anything is published,
+        /// the content that committed cleanups authorize and no available
+        /// Attachment needs: `unneeded`, digests with their lengths. Returns
+        /// what became of each file that was found; the absence of the
+        /// others is made durable by one sync of the directory.
+        pub(crate) fn reclaim_unneeded(
+            &self,
+            unneeded: &[(ContentDigest, u64)],
+        ) -> Vec<(ContentDigest, Result<Reclamation, StoreError>)> {
+            let _pins = self.pins.lock();
+            let mut found = Vec::new();
+            let mut absent = Vec::new();
+            for &(digest, length) in unneeded {
+                match self.remove(digest, length) {
+                    Ok(Reclamation::Absent) => absent.push(digest),
+                    removed => found.push((digest, removed)),
+                }
+            }
+            if !absent.is_empty()
+                && let Err(error) = self.directory.sync_all()
+            {
+                found.extend(
+                    absent
+                        .into_iter()
+                        .map(|digest| (digest, Err(StoreError::Io(error.kind())))),
+                );
+            }
+            found
+        }
+
+        /// Removes the file named `digest` when it is exactly the recorded
+        /// content: a private regular file of this user with one link,
+        /// `length` bytes and that SHA-256, and still under its name when it
+        /// is removed. [`Reclamation::Absent`] when there is none; the
+        /// directory is synced only after a removal. Any other file is left
+        /// as it is.
+        fn remove(&self, digest: ContentDigest, length: u64) -> Result<Reclamation, StoreError> {
+            self.verify()?;
+            let name = digest.to_string();
+            let file = match self.read_file(&name, length) {
+                Ok((file, bytes)) if ContentDigest::of(&bytes) == digest => file,
+                Ok(_) => return Err(StoreError::DigestMismatch),
+                Err(StoreError::Missing) => return Ok(Reclamation::Absent),
+                Err(error) => return Err(error),
+            };
+            let held = rustix::fs::fstat(&file).map_err(io)?;
+            let named =
+                match rustix::fs::statat(&self.directory, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                {
+                    Ok(named) => named,
+                    Err(Errno::NOENT) => return Ok(Reclamation::Absent),
+                    Err(errno) => return Err(io(errno)),
+                };
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino) {
+                return Err(StoreError::Conflict);
+            }
+            #[cfg(test)]
+            if !self.seam.reach(reclaim_seam::Point::Verified) {
+                return Err(StoreError::Io(std::io::ErrorKind::Other));
+            }
+            match rustix::fs::unlinkat(&self.directory, name.as_str(), AtFlags::empty()) {
+                Ok(()) => {}
+                Err(Errno::NOENT) => return Ok(Reclamation::Absent),
+                Err(errno) => return Err(io(errno)),
+            }
+            #[cfg(test)]
+            if !self.seam.reach(reclaim_seam::Point::Unlinked) {
+                return Err(StoreError::Io(std::io::ErrorKind::Other));
+            }
+            self.directory.sync_all().map_err(failed)?;
+            Ok(Reclamation::Removed)
+        }
+
+        /// Runs `seam` at every point of this store's reclamations, on
+        /// whichever thread runs them; a step fails when it returns `false`.
+        #[cfg(test)]
+        pub(crate) fn install_reclaim_seam(
+            &self,
+            seam: impl FnMut(reclaim_seam::Point) -> bool + Send + 'static,
+        ) {
+            self.seam.install(Box::new(seam));
         }
 
         /// The whole of the file `name`, which must be a private regular
@@ -488,8 +730,24 @@ mod unsupported {
             Ok(Self)
         }
 
-        pub(crate) fn publish(&self, _content: &[u8]) -> Result<ContentDigest, StoreError> {
+        pub(crate) fn publish(&self, _content: &[u8]) -> Result<ContentPin<'_>, StoreError> {
             Err(StoreError::Unsupported)
+        }
+
+        pub(crate) fn reclaim<E>(
+            &self,
+            _digest: ContentDigest,
+            _length: u64,
+            _needed: impl FnOnce() -> Result<bool, E>,
+        ) -> Result<Result<Reclamation, StoreError>, E> {
+            Ok(Err(StoreError::Unsupported))
+        }
+
+        pub(crate) fn reclaim_unneeded(
+            &self,
+            _unneeded: &[(ContentDigest, u64)],
+        ) -> Vec<(ContentDigest, Result<Reclamation, StoreError>)> {
+            Vec::new()
         }
 
         pub(crate) fn load(
@@ -506,18 +764,22 @@ mod unsupported {
     }
 }
 
-/// Test seams of a publication: each runs at its point and may make the
-/// step there fail.
+/// Test seams of a publication and of a read, on the thread that runs
+/// them: each runs at its point and may make the step there fail.
 #[cfg(test)]
 pub(crate) mod publish_seam {
     use std::cell::RefCell;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Point {
+        /// The digest is pinned; nothing is published yet.
+        Pinned,
         /// The content is staged and synced under a staging name.
         Staged,
         /// The content has its digest's name; the directory is not synced.
         Published,
+        /// The content is about to be opened and read.
+        Loading,
     }
 
     type Seam = Box<dyn FnMut(Point) -> bool>;
@@ -550,6 +812,55 @@ pub(crate) mod publish_seam {
             installed.borrow_mut().get_or_insert(seam);
         });
         proceed
+    }
+}
+
+/// Test seams of one store's reclamations, which run on a database read
+/// worker: each runs at its point and may make the step there fail.
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+pub(crate) mod reclaim_seam {
+    use std::sync::{Mutex, PoisonError};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// The file is verified and still under its name; not removed yet.
+        Verified,
+        /// The file is removed; the directory is not synced.
+        Unlinked,
+    }
+
+    type Seam = Box<dyn FnMut(Point) -> bool + Send>;
+
+    #[derive(Default)]
+    pub(super) struct Slot(Mutex<Option<Seam>>);
+
+    impl std::fmt::Debug for Slot {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Slot")
+        }
+    }
+
+    impl Slot {
+        pub(super) fn install(&self, seam: Seam) {
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(seam);
+        }
+
+        /// Runs the seam without holding the slot, so it may wait.
+        pub(super) fn reach(&self, point: Point) -> bool {
+            let seam = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let Some(mut seam) = seam else {
+                return true;
+            };
+            let proceed = seam(point);
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(seam);
+            proceed
+        }
     }
 }
 
@@ -615,7 +926,7 @@ mod tests {
     fn content_is_published_whole_under_its_digest_and_private() {
         let (_root, directory, store) = store("publish");
         let content = b"\x89PNG\r\n\x1a\nsome image bytes".to_vec();
-        let digest = store.publish(&content).expect("publish");
+        let digest = store.publish(&content).expect("publish").digest();
         assert_eq!(digest, ContentDigest::of(&content));
         let path = content_path(&directory, digest);
         assert_eq!(std::fs::read(&path).expect("read"), content);
@@ -636,10 +947,13 @@ mod tests {
     fn existing_content_is_reused_only_once_its_bytes_are_verified() {
         let (_root, directory, store) = store("reuse");
         let content = b"shared content".to_vec();
-        let digest = store.publish(&content).expect("publish");
+        let digest = store.publish(&content).expect("publish").digest();
         let path = content_path(&directory, digest);
         let inode = std::fs::metadata(&path).expect("metadata").ino();
-        assert_eq!(store.publish(&content).expect("publish again"), digest);
+        assert_eq!(
+            store.publish(&content).expect("publish again").digest(),
+            digest
+        );
         assert_eq!(
             std::fs::metadata(&path).expect("metadata").ino(),
             inode,
@@ -651,7 +965,10 @@ mod tests {
         // whether it has the content's length or not.
         for other in [b"SHARED CONTENT".to_vec(), b"short".to_vec()] {
             std::fs::write(&path, &other).expect("corrupt the file");
-            assert_eq!(store.publish(&content), Err(StoreError::Conflict));
+            assert_eq!(
+                store.publish(&content).map(|pin| pin.digest()),
+                Err(StoreError::Conflict)
+            );
             assert_eq!(std::fs::read(&path).expect("read"), other, "left as it was");
             assert_eq!(names(&directory).len(), 1, "no staging file is left");
         }
@@ -659,7 +976,10 @@ mod tests {
         std::fs::remove_file(&path).expect("remove");
         std::fs::write(&path, &content).expect("write");
         set_mode(&path, 0o644);
-        assert_eq!(store.publish(&content), Err(StoreError::Conflict));
+        assert_eq!(
+            store.publish(&content).map(|pin| pin.digest()),
+            Err(StoreError::Conflict)
+        );
         assert_eq!(mode(&path), 0o644);
     }
 
@@ -668,7 +988,7 @@ mod tests {
         let (_root, directory, store) = store("load");
         let content = b"recorded content".to_vec();
         let length = content.len() as u64;
-        let digest = store.publish(&content).expect("publish");
+        let digest = store.publish(&content).expect("publish").digest();
         let path = content_path(&directory, digest);
         assert_eq!(
             store.load(digest, length + 1),
@@ -724,7 +1044,7 @@ mod tests {
     fn a_directory_replaced_after_it_was_opened_is_refused() {
         let (_root, directory, store) = store("replaced");
         let content = b"content".to_vec();
-        let digest = store.publish(&content).expect("publish");
+        let digest = store.publish(&content).expect("publish").digest();
         let path = directory.attachments_path();
         let moved = directory.root().join("moved-attachments");
         std::fs::rename(path, &moved).expect("move the directory away");
@@ -735,7 +1055,10 @@ mod tests {
             path.join(digest.to_string()),
         )
         .expect("copy the content into the replacement");
-        assert_eq!(store.publish(b"new"), Err(StoreError::DirectoryChanged));
+        assert_eq!(
+            store.publish(b"new").map(|pin| pin.digest()),
+            Err(StoreError::DirectoryChanged)
+        );
         assert_eq!(
             store.load(digest, content.len() as u64),
             Err(StoreError::DirectoryChanged)
@@ -760,13 +1083,16 @@ mod tests {
             content
         );
         set_mode(path, 0o750);
-        assert_eq!(store.publish(b"new"), Err(StoreError::UntrustedDirectory));
+        assert_eq!(
+            store.publish(b"new").map(|pin| pin.digest()),
+            Err(StoreError::UntrustedDirectory)
+        );
     }
 
     #[test]
     fn only_staging_files_are_removed_at_startup() {
         let (_root, directory, store) = store("staging");
-        let published = store.publish(b"published").expect("publish");
+        let published = store.publish(b"published").expect("publish").digest();
         let path = directory.attachments_path();
         std::fs::write(path.join(".ocg-staging-1-2-3"), b"partial").expect("write");
         std::fs::write(path.join(".ocg-staging-41-5-6"), b"complete, never renamed")
@@ -819,6 +1145,159 @@ mod tests {
         ] {
             assert!(!is_staging_name(name), "{name}");
         }
+    }
+
+    /// Reclaims `digest` of `content`'s length when nothing else needs it.
+    fn reclaim(store: &AttachmentStore, content: &[u8]) -> Result<Reclamation, StoreError> {
+        let digest = ContentDigest::of(content);
+        store
+            .reclaim(digest, content.len() as u64, || Ok::<_, ()>(false))
+            .expect("nothing else needs it")
+    }
+
+    #[test]
+    fn content_is_reclaimed_only_when_nothing_needs_it() {
+        let (_root, directory, store) = store("reclaim");
+        let content = b"content to reclaim".to_vec();
+        let digest = ContentDigest::of(&content);
+        let length = content.len() as u64;
+        store.publish(&content).expect("publish").release();
+        let path = content_path(&directory, digest);
+
+        assert_eq!(
+            store.reclaim(digest, length, || Ok::<_, ()>(true)),
+            Ok(Ok(Reclamation::Retained)),
+            "an available Attachment still names it"
+        );
+        assert_eq!(
+            store.reclaim(digest, length, || Err::<bool, _>("unreadable")),
+            Err("unreadable"),
+            "an unknown answer removes nothing"
+        );
+        let pin = store.publish(&content).expect("publish again");
+        assert_eq!(
+            reclaim(&store, &content),
+            Ok(Reclamation::Retained),
+            "a publication is in progress"
+        );
+        assert!(path.exists());
+        pin.release();
+        assert_eq!(reclaim(&store, &content), Ok(Reclamation::Removed));
+        assert!(names(&directory).is_empty());
+        assert_eq!(
+            reclaim(&store, &content),
+            Ok(Reclamation::Absent),
+            "idempotent"
+        );
+        // A pin that is never released keeps the content for good.
+        let _kept = store.publish(&content).expect("publish anew");
+        assert_eq!(reclaim(&store, &content), Ok(Reclamation::Retained));
+        assert_eq!(names(&directory), [digest.to_string()]);
+    }
+
+    #[test]
+    fn only_a_file_that_is_exactly_the_recorded_content_is_removed() {
+        let (_root, directory, store) = store("reclaim-identity");
+        let content = b"recorded content".to_vec();
+        let digest = ContentDigest::of(&content);
+        let path = content_path(&directory, digest);
+        store.publish(&content).expect("publish").release();
+
+        for (other, refusal) in [
+            (b"RECORDED CONTENT".to_vec(), StoreError::DigestMismatch),
+            (b"recorded".to_vec(), StoreError::LengthMismatch),
+        ] {
+            std::fs::write(&path, &other).expect("replace the bytes");
+            assert_eq!(reclaim(&store, &content), Err(refusal));
+            assert_eq!(std::fs::read(&path).expect("read"), other, "kept");
+        }
+        std::fs::write(&path, &content).expect("restore");
+        set_mode(&path, 0o644);
+        assert_eq!(reclaim(&store, &content), Err(StoreError::UntrustedFile));
+        set_mode(&path, 0o600);
+        let link = directory.root().join("hard-link");
+        std::fs::hard_link(&path, &link).expect("hard link");
+        assert_eq!(reclaim(&store, &content), Err(StoreError::UntrustedFile));
+        assert!(path.exists() && link.exists());
+        std::fs::remove_file(&link).expect("remove the link");
+
+        // A link under the content's name is not followed, nor removed.
+        std::fs::remove_file(&path).expect("remove");
+        let elsewhere = directory.root().join("elsewhere");
+        std::fs::write(&elsewhere, &content).expect("write");
+        set_mode(&elsewhere, 0o600);
+        symlink(&elsewhere, &path).expect("link the content name elsewhere");
+        assert_eq!(reclaim(&store, &content), Err(StoreError::UntrustedFile));
+        assert!(std::fs::symlink_metadata(&path).is_ok() && elsewhere.exists());
+        std::fs::remove_file(&path).expect("remove the link");
+
+        // Nothing is removed through a replaced directory.
+        store.publish(&content).expect("publish").release();
+        let moved = directory.root().join("moved-attachments");
+        std::fs::rename(directory.attachments_path(), &moved).expect("move away");
+        std::fs::create_dir(directory.attachments_path()).expect("replace");
+        set_mode(directory.attachments_path(), 0o700);
+        assert_eq!(reclaim(&store, &content), Err(StoreError::DirectoryChanged));
+        assert!(moved.join(digest.to_string()).exists());
+    }
+
+    #[test]
+    fn a_failed_removal_is_completed_by_a_later_reclamation() {
+        let (_root, directory, store) = store("reclaim-failed");
+        let content = b"content".to_vec();
+        let digest = ContentDigest::of(&content);
+        store.publish(&content).expect("publish").release();
+
+        // Fails before the file is removed: it stays, verified intact.
+        store.install_reclaim_seam(|point| point != reclaim_seam::Point::Verified);
+        assert!(matches!(reclaim(&store, &content), Err(StoreError::Io(_))));
+        assert_eq!(names(&directory), [digest.to_string()]);
+        // Fails after the removal, before the directory is synced.
+        store.install_reclaim_seam(|point| point != reclaim_seam::Point::Unlinked);
+        assert!(matches!(reclaim(&store, &content), Err(StoreError::Io(_))));
+        assert!(names(&directory).is_empty());
+        store.install_reclaim_seam(|_| true);
+        assert_eq!(
+            reclaim(&store, &content),
+            Ok(Reclamation::Absent),
+            "the absence is made durable"
+        );
+    }
+
+    #[test]
+    fn reclamation_at_open_reports_each_file_found() {
+        let (_root, directory, store) = store("reclaim-at-open");
+        let (removed, absent, changed) = (
+            b"left by an interrupted reclamation".to_vec(),
+            b"already reclaimed".to_vec(),
+            b"changed since".to_vec(),
+        );
+        store.publish(&removed).expect("publish").release();
+        store.publish(&changed).expect("publish").release();
+        let orphan = store
+            .publish(b"named by no record")
+            .expect("publish")
+            .digest();
+        let changed_path = content_path(&directory, ContentDigest::of(&changed));
+        std::fs::write(&changed_path, b"CHANGED SINCE").expect("change the bytes");
+        let unneeded = [&removed, &absent, &changed]
+            .map(|content| (ContentDigest::of(content), content.len() as u64));
+
+        let mut found = store.reclaim_unneeded(&unneeded);
+        found.sort_by_key(|(digest, _)| *digest);
+        let mut expected = vec![
+            (ContentDigest::of(&removed), Ok(Reclamation::Removed)),
+            (ContentDigest::of(&changed), Err(StoreError::DigestMismatch)),
+        ];
+        expected.sort_by_key(|(digest, _)| *digest);
+        assert_eq!(found, expected, "an absent file is not listed");
+        let mut kept = vec![orphan.to_string(), ContentDigest::of(&changed).to_string()];
+        kept.sort();
+        assert_eq!(names(&directory), kept, "nothing else is touched");
+        assert_eq!(
+            std::fs::read(&changed_path).expect("read"),
+            b"CHANGED SINCE"
+        );
     }
 
     #[test]
