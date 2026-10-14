@@ -12,7 +12,7 @@
 //! cancels it, and the host stops once it has settled.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -30,14 +30,15 @@ use ocg::orchestration::execution_runtime::{
 };
 use ocg::orchestration::workspace_read::{self, Workspace, WorkspaceError};
 use ocg::persistence::{
-    ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, JobId, JobInputDraft,
-    LlmConfig, LlmParameters, LlmTransport, ModelCapability, NewExecutor, NewJob, NewLlmProvider,
-    NewProfile, NewProfileConfig, OutputKind, ProfileConfig, ProfileId, ToolDecision, ToolOutcome,
+    AvailabilityStatRecord, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, JobId,
+    JobInputDraft, LlmConfig, LlmParameters, LlmTransport, MetricsRecord, ModelCapability,
+    NewExecutor, NewJob, NewLlmProvider, NewProfile, NewProfileConfig, OutputKind, ProfileConfig,
+    ProfileId, RequestNumber, ToolDecision, ToolOutcome,
 };
 use ocg::provider_execution::{
     CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,
 };
-use ocg::token_usage::UsageFinality;
+use ocg::token_usage::{TokenCount, TokenRequestSample};
 
 /// The command that selects this mode, as the executable's only argument
 /// before the objective.
@@ -359,28 +360,324 @@ async fn report(
         };
     }
     let _ = writeln!(report, "Provider requests:");
-    let metrics = database.job_metrics(job, None, 1_000).await?;
-    for stat in database.job_availability(job, None, 1_000).await? {
-        let usage = metrics
-            .iter()
-            .rev()
-            .find(|record| {
-                record.request == stat.request
-                    && record
-                        .token
-                        .is_some_and(|token| token.finality == UsageFinality::Final)
-            })
-            .map(|record| &record.measurements.usage);
+    // Every page, so no request's usage is reduced from part of its records.
+    let mut metrics: Vec<MetricsRecord> = Vec::new();
+    loop {
+        let after = metrics.last().map(|record| record.id);
+        let page = database.job_metrics(job, after, 1_000).await?;
+        if page.is_empty() {
+            break;
+        }
+        metrics.extend(page);
+    }
+    let stats = database.job_availability(job, None, 1_000).await?;
+    provider_requests(&mut report, &stats, &metrics);
+    Ok((outcome, report))
+}
+
+/// One line per Provider request: what it answered and the Token usage its
+/// own annotated Metrics establish under the Token contract. Each request is
+/// reduced on its own, so nothing is taken from one request for another.
+fn provider_requests(
+    report: &mut String,
+    stats: &[AvailabilityStatRecord],
+    metrics: &[MetricsRecord],
+) {
+    let mut requests: BTreeMap<RequestNumber, Vec<&MetricsRecord>> = BTreeMap::new();
+    for record in metrics {
+        requests.entry(record.request).or_default().push(record);
+    }
+    for stat in stats {
         let observation = &stat.observation;
-        let _ = writeln!(
+        let _ = write!(
             report,
-            "  request {}: status {:?}, finish {:?}, input tokens {:?}, output tokens {:?}",
-            stat.request,
-            observation.status_code,
-            observation.raw_finish_reason,
-            usage.and_then(|usage| usage.input_tokens),
-            usage.and_then(|usage| usage.output_tokens),
+            "  request {}: status {:?}, finish {:?}",
+            stat.request, observation.status_code, observation.raw_finish_reason,
+        );
+        let records = requests.get(&stat.request).map_or(&[][..], Vec::as_slice);
+        match TokenRequestSample::from_metrics(records.iter().copied()) {
+            Err(error) => {
+                let _ = writeln!(report, ", token usage unavailable: {error}");
+            }
+            Ok(sample) => {
+                let count = |count: fn(&TokenRequestSample) -> TokenCount| {
+                    sample.as_ref().map_or(TokenCount::Missing, count)
+                };
+                let _ = write!(
+                    report,
+                    ", input tokens {}, output tokens {}",
+                    TokenDisplay(count(|sample| sample.input)),
+                    TokenDisplay(count(|sample| sample.output)),
+                );
+                // Detail counters only when reported; never shown as zero.
+                for (name, count) in [
+                    ("reasoning", count(|sample| sample.reasoning)),
+                    ("cache read", count(|sample| sample.cache_read)),
+                    ("cache write", count(|sample| sample.cache_write)),
+                ] {
+                    if count != TokenCount::Missing {
+                        let _ = write!(report, ", {name} tokens {}", TokenDisplay(count));
+                    }
+                }
+                let _ = writeln!(report);
+            }
+        }
+    }
+}
+
+/// A counter with its certainty: a value is final or provisional, and a
+/// counter without one says why rather than showing a number.
+struct TokenDisplay(TokenCount);
+
+impl std::fmt::Display for TokenDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            TokenCount::Final(count) => write!(f, "{count} (final)"),
+            TokenCount::Provisional(count) => write!(f, "{count} (provisional)"),
+            TokenCount::Missing => f.write_str("unreported"),
+            TokenCount::Conflicted => f.write_str("conflicted"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ocg::openai_compatible::NormalizedUsage;
+    use ocg::persistence::{
+        AvailabilityObservation, AvailabilityStatId, FrozenLlmConfig, LlmProviderId, LlmTarget,
+        Measurements, MetricsId, ProviderSnapshot, Timestamp,
+    };
+    use ocg::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
+
+    use super::*;
+
+    const CUMULATIVE: Option<TokenAnnotation> =
+        Some(TokenAnnotation::eligible(UsageFinality::Cumulative));
+    const FINAL: Option<TokenAnnotation> = Some(TokenAnnotation::eligible(UsageFinality::Final));
+
+    fn request(number: u32) -> RequestNumber {
+        RequestNumber::new(number).unwrap()
+    }
+
+    fn target() -> LlmTarget {
+        LlmTarget {
+            llm_profile: ProfileId::new(1),
+            frozen: FrozenLlmConfig {
+                config: LlmConfig {
+                    model: "model".to_owned(),
+                    parameters: LlmParameters::default(),
+                    declared_capabilities: BTreeSet::from([ModelCapability::Chat]),
+                },
+                provider: ProviderSnapshot {
+                    id: LlmProviderId::new(1),
+                    name: "provider".to_owned(),
+                    transport: LlmTransport::OpenAiChatCompletions,
+                    endpoint: None,
+                    credential_ref: None,
+                },
+            },
+        }
+    }
+
+    /// A Metrics record of `request` with input, output and reasoning counts.
+    fn metrics(
+        id: u64,
+        request: RequestNumber,
+        [input, output, reasoning]: [Option<u32>; 3],
+        token: Option<TokenAnnotation>,
+    ) -> MetricsRecord {
+        MetricsRecord {
+            id: MetricsId::new(id),
+            job: JobId::new(3),
+            request,
+            target: Some(target()),
+            observed_at: Timestamp::from_unix_micros(i64::try_from(id).unwrap()),
+            measurements: Measurements {
+                ttfb_ms: None,
+                reasoning_ttft_ms: None,
+                output_ttft_ms: None,
+                request_finished_in_ms: None,
+                usage: NormalizedUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    reasoning_tokens: reasoning,
+                    ..NormalizedUsage::default()
+                },
+            },
+            token,
+            recorded_at: Timestamp::from_unix_micros(i64::try_from(id).unwrap()),
+        }
+    }
+
+    fn stat(request: RequestNumber, finish: &str) -> AvailabilityStatRecord {
+        AvailabilityStatRecord {
+            id: AvailabilityStatId::new(u64::from(request.get())),
+            job: JobId::new(3),
+            request,
+            target: target(),
+            observed_at: Timestamp::from_unix_micros(0),
+            observation: AvailabilityObservation {
+                status_code: Some(200),
+                finish_reason: None,
+                raw_finish_reason: Some(finish.to_owned()),
+                failure: None,
+            },
+            recorded_at: Timestamp::from_unix_micros(0),
+        }
+    }
+
+    fn lines(stats: &[AvailabilityStatRecord], metrics: &[MetricsRecord]) -> String {
+        let mut report = String::new();
+        provider_requests(&mut report, stats, metrics);
+        report
+    }
+
+    #[test]
+    fn cumulative_usage_is_shown_as_provisional() {
+        let report = lines(
+            &[stat(request(1), "tool_calls")],
+            &[
+                metrics(1, request(1), [None; 3], CUMULATIVE),
+                metrics(2, request(1), [Some(112), Some(20), Some(0)], CUMULATIVE),
+            ],
+        );
+        assert_eq!(
+            report,
+            "  request request 1: status Some(200), finish Some(\"tool_calls\"), \
+             input tokens 112 (provisional), output tokens 20 (provisional), \
+             reasoning tokens 0 (provisional)\n"
         );
     }
-    Ok((outcome, report))
+
+    #[test]
+    fn final_usage_is_shown_as_final_and_explicit_zero_stays_zero() {
+        let report = lines(
+            &[stat(request(1), "stop")],
+            &[metrics(1, request(1), [Some(0), Some(54), Some(0)], FINAL)],
+        );
+        assert_eq!(
+            report,
+            "  request request 1: status Some(200), finish Some(\"stop\"), \
+             input tokens 0 (final), output tokens 54 (final), reasoning tokens 0 (final)\n"
+        );
+    }
+
+    #[test]
+    fn cumulative_observations_take_their_maximum_not_their_sum() {
+        let report = lines(
+            &[stat(request(1), "stop")],
+            &[
+                metrics(2, request(1), [Some(112), Some(20), None], CUMULATIVE),
+                metrics(1, request(1), [Some(100), Some(7), None], CUMULATIVE),
+            ],
+        );
+        assert!(
+            report.contains("input tokens 112 (provisional), output tokens 20 (provisional)\n"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_final_observation_wins_over_cumulative_values() {
+        let report = lines(
+            &[stat(request(1), "stop")],
+            &[
+                metrics(1, request(1), [Some(112), Some(30), None], FINAL),
+                metrics(2, request(1), [Some(150), Some(40), None], CUMULATIVE),
+            ],
+        );
+        assert!(
+            report.contains("input tokens 112 (final), output tokens 30 (final)\n"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn missing_counters_stay_unreported() {
+        let report = lines(
+            &[stat(request(1), "stop"), stat(request(2), "stop")],
+            &[metrics(1, request(1), [Some(112), None, None], CUMULATIVE)],
+        );
+        assert_eq!(
+            report,
+            "  request request 1: status Some(200), finish Some(\"stop\"), \
+             input tokens 112 (provisional), output tokens unreported\n  \
+             request request 2: status Some(200), finish Some(\"stop\"), \
+             input tokens unreported, output tokens unreported\n"
+        );
+    }
+
+    #[test]
+    fn conflicting_finals_are_shown_as_conflicted() {
+        let report = lines(
+            &[stat(request(1), "stop")],
+            &[
+                metrics(1, request(1), [Some(112), Some(20), Some(3)], FINAL),
+                metrics(2, request(1), [Some(113), Some(20), Some(4)], FINAL),
+            ],
+        );
+        assert!(
+            report.contains(
+                "input tokens conflicted, output tokens 20 (final), reasoning tokens conflicted\n"
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn requests_of_one_job_are_reduced_independently() {
+        let report = lines(
+            &[stat(request(1), "tool_calls"), stat(request(2), "stop")],
+            &[
+                metrics(4, request(2), [Some(223), Some(54), Some(0)], CUMULATIVE),
+                metrics(1, request(1), [Some(112), Some(20), Some(0)], CUMULATIVE),
+                metrics(3, request(2), [Some(200), None, None], CUMULATIVE),
+                metrics(2, request(1), [Some(112), Some(20), Some(0)], FINAL),
+            ],
+        );
+        assert_eq!(
+            report,
+            "  request request 1: status Some(200), finish Some(\"tool_calls\"), \
+             input tokens 112 (final), output tokens 20 (final), reasoning tokens 0 (final)\n  \
+             request request 2: status Some(200), finish Some(\"stop\"), \
+             input tokens 223 (provisional), output tokens 54 (provisional), \
+             reasoning tokens 0 (provisional)\n"
+        );
+    }
+
+    #[test]
+    fn unannotated_metrics_are_not_token_evidence() {
+        let report = lines(
+            &[stat(request(1), "stop")],
+            &[
+                metrics(1, request(1), [Some(500), Some(500), Some(500)], None),
+                metrics(2, request(1), [Some(112), None, None], CUMULATIVE),
+            ],
+        );
+        assert!(
+            report.ends_with("input tokens 112 (provisional), output tokens unreported\n"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn records_that_disagree_on_eligibility_report_no_usage() {
+        let excluded = TokenAnnotation::excluded();
+        assert_eq!(excluded.eligibility, RequestEligibility::Excluded);
+        let report = lines(
+            &[stat(request(1), "stop")],
+            &[
+                metrics(1, request(1), [None; 3], Some(excluded)),
+                metrics(2, request(1), [Some(112), Some(20), None], FINAL),
+            ],
+        );
+        assert!(
+            report.starts_with(
+                "  request request 1: status Some(200), finish Some(\"stop\"), \
+                 token usage unavailable: "
+            ),
+            "{report}"
+        );
+        assert!(!report.contains("112"), "{report}");
+    }
 }
