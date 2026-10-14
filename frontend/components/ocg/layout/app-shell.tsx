@@ -3,7 +3,7 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState, ViewTransition } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { ChatView } from "../chat/chat-view";
+import { ChatScreen } from "../chat/chat-screen";
 import { UsageSurface } from "../usage/usage-surface";
 import { ConversationInspector } from "../usage/conversation-inspector";
 import { conversationUsageLive, useConversationUsage, useJobUsage, useLiveUsageRefresh } from "../usage/use-usage";
@@ -11,6 +11,7 @@ import { JobInspector } from "../execution/job-inspector";
 import { JobDraftSurface } from "../job/job-draft-surface";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
+import { useRemoteLogout } from "../login/access-boundary";
 import { ResourceLedgerSurface } from "../resource-ledger/resource-ledger-surface";
 import { ControlCenterSurface } from "../control-center/control-center-surface";
 import { JobExecutionSurface } from "../execution/job-execution-surface";
@@ -165,7 +166,7 @@ export function RuntimeWorkspace({
   view?: WorkspaceView;
   controlCenterView?: ControlCenterView;
 }) {
-  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, deleteSession, sendMessage, retryMessage, cancel, client, setActiveProfile, launchJob, sync } = useOcgRuntime();
+  const { snapshot: runtimeSnapshot, authority: runtimeAuthority, createSession, deleteSession, sendMessage, cancel, client, setActiveProfile, launchJob, sync } = useOcgRuntime();
   const {
     activeProjectId,
     activeProject,
@@ -194,7 +195,7 @@ export function RuntimeWorkspace({
   }, [activeProjectId, runtimeAuthority]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [inspectorMode, setInspectorMode] = useState<InspectorMode>(runtimeAuthority === "canonical" ? "docked" : "collapsed");
+  const [inspectorMode, setInspectorMode] = useState<InspectorMode>("collapsed");
   const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
   // Job drafts are held keyed by Project + session scope so one Project's
   // in-progress launch can never appear in another.
@@ -754,6 +755,15 @@ export function RuntimeWorkspace({
   const observability = activeSession ? snapshot.observabilityBySession[activeSession.id] : undefined;
   const inspectorOpen = inspectorMode !== "collapsed";
 
+  // The sidebar footer controls are only offered where they do something real:
+  // signing out is a remote-host concern, and Settings is a workspace view.
+  const remoteLogout = useRemoteLogout();
+  const onAccountClick = useMemo(
+    () => (remoteLogout ? () => { void remoteLogout(); } : undefined),
+    [remoteLogout],
+  );
+  const onSettingsClick = useCallback(() => navigate("settings"), [navigate]);
+
   const sidebar = (
     <OcgSidebar
       sessions={snapshot.sessions}
@@ -772,6 +782,8 @@ export function RuntimeWorkspace({
       activeView={view}
       attentionCount={attentionCount}
       onNavigate={navigate}
+      onAccountClick={onAccountClick}
+      onSettingsClick={onSettingsClick}
     />
   );
 
@@ -822,6 +834,8 @@ export function RuntimeWorkspace({
             activeView={view}
             attentionCount={attentionCount}
             onNavigate={navigate}
+            onAccountClick={onAccountClick}
+            onSettingsClick={onSettingsClick}
           />
         </aside>
       </div>
@@ -956,10 +970,9 @@ export function RuntimeWorkspace({
         ) : (
           <main aria-label="OCG workspace" className="flex min-h-0 flex-1">
             <div className="flex min-w-0 flex-1 flex-col">
-              <ChatView
+              <ChatScreen
                 key={`${activeProjectId}:${activeSession.id}`}
                 session={activeSession}
-                messages={messages}
                 execution={execution}
                 runtimeStatus={snapshot.status}
                 onComposerIntent={handleComposerIntent}
@@ -967,7 +980,6 @@ export function RuntimeWorkspace({
                 queueState={runtimeSnapshot.chatQueues?.[activeSession.id]}
                 onRemoveQueued={id => client.removeQueuedMessage?.(activeSession.id, id)}
                 onResumeQueue={() => client.resumeQueue?.(activeSession.id)}
-                onRetryMessage={(messageId) => retryMessage(activeSession.id, messageId)}
                 composerSurface={activeDraft ? (
                   <JobDraftSurface
                     project={activeProject}
@@ -981,7 +993,6 @@ export function RuntimeWorkspace({
                     onClose={handleCloseJobDraft}
                   />
                 ) : null}
-                composerSurfaceKey={activeDraft?.id}
               />
             </div>
 

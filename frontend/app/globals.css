@@ -1,6 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@import "katex/dist/katex.min.css";
+@import "highlight.js/styles/github.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -223,3 +225,73 @@ html[data-density="compact"] {
 @custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
 
 @custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
+
+/*
+ * highlight.js ships one theme per colour scheme, so the dark rules are
+ * scoped to our `.dark` root and layered over the light ones.
+ */
+.dark .hljs {
+  color: var(--hljs-fg, #c9d1d9);
+  background: transparent;
+}
+
+.dark .hljs-comment,
+.dark .hljs-quote {
+  color: #8b949e;
+}
+
+.dark .hljs-keyword,
+.dark .hljs-selector-tag,
+.dark .hljs-literal,
+.dark .hljs-type {
+  color: #ff7b72;
+}
+
+.dark .hljs-string,
+.dark .hljs-doctag,
+.dark .hljs-regexp,
+.dark .hljs-addition {
+  color: #a5d6ff;
+}
+
+.dark .hljs-number,
+.dark .hljs-symbol,
+.dark .hljs-bullet,
+.dark .hljs-link {
+  color: #79c0ff;
+}
+
+.dark .hljs-title,
+.dark .hljs-section,
+.dark .hljs-name,
+.dark .hljs-selector-id,
+.dark .hljs-selector-class {
+  color: #d2a8ff;
+}
+
+.dark .hljs-attr,
+.dark .hljs-attribute,
+.dark .hljs-variable,
+.dark .hljs-template-variable,
+.dark .hljs-selector-attr,
+.dark .hljs-selector-pseudo {
+  color: #ffa657;
+}
+
+.dark .hljs-built_in,
+.dark .hljs-class .hljs-title,
+.dark .hljs-title.class_ {
+  color: #7ee787;
+}
+
+.dark .hljs-deletion {
+  color: #ffdcd7;
+}
+
+.dark .hljs-emphasis {
+  font-style: italic;
+}
+
+.dark .hljs-strong {
+  font-weight: 600;
+}

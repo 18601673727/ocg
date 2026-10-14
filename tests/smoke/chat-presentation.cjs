@@ -9,16 +9,33 @@ const ts = frontendRequire("typescript");
 
 // The runtime provider renders nothing before browser hydration; Chat only
 // needs its client handle for image upload, which these checks never reach.
-const runtimeStub = { useOcgRuntime: () => ({ client: {} }) };
+// A surface that reads the projection replaces this with a real snapshot.
+let runtimeStubRef = { useOcgRuntime: () => ({ client: {} }) };
+
+// Disposable module stubs for the effect probes. Empty by default, so the
+// normal checks load the real `react`/JSX runtime and the real Mermaid/KaTeX
+// packages. A probe temporarily points these at a hook harness and controllable
+// fakes, then clears them, so production code is what runs under the probe.
+let moduleStubs = {};
 
 // Exercise the production TypeScript modules with the existing compiler and alias.
 for (const extension of [".ts", ".tsx"]) {
   require.extensions[extension] = (module, filename) => {
     const load = module.require.bind(module);
-    module.require = (name) => name === "../runtime/runtime-context" ? runtimeStub : load(name.startsWith("@/") ? path.join(frontend, name.slice(2))
-      : name.startsWith(".") || path.isAbsolute(name) ? name : frontendRequire.resolve(name));
+    // The runtime context is stubbed rather than provided, so match every
+    // specifier the Chat graph uses to reach it.
+    module.require = (name) => name in moduleStubs ? moduleStubs[name]
+      : /(^|\/)runtime-context$/.test(name) ? runtimeStubRef : load(name.startsWith("@/") ? path.join(frontend, name.slice(2))
+        : name.startsWith(".") || path.isAbsolute(name) ? name : frontendRequire.resolve(name));
+    // Mirror the app's own tsconfig: these modules use `import x from "cjs"`,
+    // which only binds a default under esModuleInterop.
     const source = ts.transpileModule(fs.readFileSync(filename, "utf8"), {
-      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2022,
+        jsx: ts.JsxEmit.ReactJSX,
+        esModuleInterop: true,
+      },
       fileName: filename,
     }).outputText;
     module._compile(source, filename);
@@ -164,38 +181,231 @@ function reasoningSurvivesHistoryAndRoundReset() {
 function chatSurfaceRendersWithoutRuntimeBanner() {
   const React = frontendRequire("react");
   const { renderToStaticMarkup } = frontendRequire("react-dom/server");
-  const { ChatView } = chat("chat-view.tsx");
   const { I18nProvider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+  const { applyEnvelopeToSnapshot } = require(path.join(frontend, "components/ocg/runtime/reconciler.ts"));
+  const { RuntimeEnvelopeFactory } = require(path.join(frontend, "components/ocg/runtime/runtime-envelope.ts"));
+  const { emptyRuntimeSnapshot } = require(path.join(frontend, "components/ocg/runtime/runtime-snapshot.ts"));
+
+  // The active Chat surface reads its messages from the runtime projection, so
+  // the messages are folded into the snapshot the same way a history load and
+  // a live stream would fold them.
+  const project = (messages) => {
+    const session = { id: "s", sessionId: "chat-1", projectId: "p", title: "", workType: "coding", updatedAt: "now" };
+    const factory = new RuntimeEnvelopeFactory("chat-presentation", 1);
+    const scope = { projectId: "p", sessionId: "s" };
+    const base = emptyRuntimeSnapshot("normal-chat");
+    const created = applyEnvelopeToSnapshot(base, factory.envelope("conversation.session-created", { session }, scope));
+    const loaded = applyEnvelopeToSnapshot(created.snapshot, factory.envelope("conversation.history-loaded", { messages }, scope));
+    assert.deepEqual(loaded.diagnostics, []);
+    return loaded.snapshot;
+  };
+
   const long = Array.from({ length: 200 }, (_, index) => `line ${index}`).join("\n");
-  const render = (messages, executionValue) => renderToStaticMarkup(React.createElement(I18nProvider, null, React.createElement(ChatView, {
-    session: { id: "s", sessionId: "chat-1", projectId: "p", title: "", workType: "coding", updatedAt: "now" },
-    messages,
-    execution: executionValue,
-    runtimeStatus: { state: "connected", detailCode: "provider-ready", detail: "OCG provider runtime" },
-    onComposerIntent: () => undefined,
-    onRetryMessage: async () => undefined,
-  })));
-  const html = render([
+  const streaming = [
     { id: "u", role: "user", content: long, createdAt: "t", status: "completed" },
     { id: "a", role: "assistant", jobId: "job-1", content: "short", createdAt: "t", status: "streaming" },
-    { id: "tool", role: "tool", jobId: "job-1", content: "", createdAt: "t", status: "streaming",
-      tool: { name: "filesystem.edit", status: "running", durationMs: 0, summary: "src/orchestration/domain.rs", detail: "replace" } },
-  ], execution("running", { calls: [call(2, "running", tool("filesystem.edit", { file: "src/orchestration/domain.rs" }))] }));
-  assert.ok(!html.includes("OCG provider runtime"), "the generic runtime row is gone");
-  assert.ok(!html.includes("border-dashed"), "the generic runtime container is gone");
-  assert.equal((html.match(/data-message-bounds="bounded"/g) ?? []).length, 2, "every message renders bounded");
-  assert.ok(html.includes("gpt-6.1-sol"), "the frozen active model is shown");
-  assert.ok(html.includes("domain.rs"), "the current observable action is shown");
-  assert.ok(!html.includes("hidden chain of thought"));
-
-  // Once the Job settles the composer is the next-turn selection again.
-  const settled = render([
+  ];
+  const settledMessages = [
     { id: "u", role: "user", content: "hi", createdAt: "t", status: "completed" },
     { id: "a", role: "assistant", jobId: "job-1", content: "done", createdAt: "t", status: "completed" },
-  ], execution("completed"));
-  assert.ok(!settled.includes("gpt-6.1-sol"));
-  assert.ok(!settled.includes("domain.rs"));
+  ];
+
+  // The runtime provider supplies the projection the surface renders from.
+  // It is built once per case: a fresh snapshot per render would defeat the
+  // memoisation the provider relies on.
+  let snapshot = project(streaming);
+  const runtimeStub = {
+    useOcgRuntime: () => ({
+      client: {},
+      snapshot,
+    }),
+  };
+  // chat-screen and everything under it resolve the runtime context at import
+  // time, so the module graph is rebuilt against this snapshot.
+  for (const key of Object.keys(require.cache)) {
+    if (key.startsWith(path.join(frontend, "components"))) delete require.cache[key];
+  }
+  const previous = runtimeStubRef;
+  runtimeStubRef = runtimeStub;
+  try {
+    const { ChatScreen } = require(path.join(frontend, "components/ocg/chat/chat-screen.tsx"));
+    const { I18nProvider: Provider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+    const render = (executionValue) => renderToStaticMarkup(React.createElement(Provider, null, React.createElement(ChatScreen, {
+      session: { id: "s", sessionId: "chat-1", projectId: "p", title: "", workType: "coding", updatedAt: "now" },
+      execution: executionValue,
+      runtimeStatus: { state: "connected", detailCode: "provider-ready", detail: "OCG provider runtime" },
+      onComposerIntent: () => undefined,
+      onCancel: async () => undefined,
+    })));
+
+    const html = render(execution("running", { calls: [call(2, "running", tool("filesystem.edit", { file: "src/orchestration/domain.rs" }))] }));
+    // The generic runtime row and container are gone from the surface.
+    assert.ok(!html.includes("OCG provider runtime"), "the generic runtime row is gone");
+    assert.ok(!html.includes("border-dashed"), "the generic runtime container is gone");
+    // The frozen active model and provider are shown in the composer.
+    assert.ok(html.includes("gpt-6.1-sol"), "the frozen active model is shown");
+    assert.ok(html.includes("nexotokensub"), "the frozen provider is shown");
+    // A running execution offers the real controls, not a placeholder.
+    assert.ok(html.includes("Cancel execution"), "a running execution can be cancelled");
+    assert.ok(html.includes("Steer now"), "a running execution can be steered");
+    // Both messages reach the surface through the runtime projection.
+    assert.ok(html.includes('data-message-id="u"'), "the user message is rendered");
+    assert.ok(html.includes('data-message-id="a"'), "the assistant message is rendered");
+    assert.ok(html.includes("short"), "the assistant message body renders");
+    // Both roles bound their long messages behind the same expand/collapse
+    // viewport the legacy rows use. Each message root owns its own bounded
+    // viewport, so a long user message and a long answer both stay bounded.
+    const userRoot = html.indexOf('data-message-id="u"');
+    const assistantRoot = html.indexOf('data-message-id="a"');
+    assert.ok(userRoot >= 0 && assistantRoot > userRoot, "both message roles render");
+    assert.ok(html.slice(userRoot, assistantRoot).includes("data-message-bounds"),
+      "the user message is bounded on the Thread surface");
+    assert.ok(html.slice(assistantRoot).includes("data-message-bounds"),
+      "the assistant message is bounded on the Thread surface");
+    // The provider request's chain of thought never reaches the surface.
+    assert.ok(!html.includes("hidden chain of thought"));
+
+    // Once the Job settles the composer is the next-turn selection again.
+    snapshot = project(settledMessages);
+    const settled = render(execution("completed"));
+    assert.ok(!settled.includes("gpt-6.1-sol"));
+    assert.ok(!settled.includes("nexotokensub"));
+    assert.ok(!settled.includes("Cancel execution"), "a settled execution offers no cancel");
+    assert.ok(!settled.includes("Steer now"), "a settled execution offers no steer");
+    assert.ok(settled.includes("done"), "the settled assistant message still renders");
+  } finally {
+    runtimeStubRef = previous;
+    for (const key of Object.keys(require.cache)) {
+      if (key.startsWith(path.join(frontend, "components"))) delete require.cache[key];
+    }
+  }
 }
+
+/**
+ * The Markdown body of an assistant message.
+ *
+ * Chat renders prose through this pipeline, so the guarantees it makes about
+ * nesting, unsafe URLs, raw HTML and half-streamed content are contract, not
+ * implementation detail.
+ */
+function markdownBodyRendersSafely() {
+  const React = frontendRequire("react");
+  const { renderToStaticMarkup } = frontendRequire("react-dom/server");
+  const { MarkdownText } = require(path.join(frontend, "components/assistant-ui/elements/markdown-text.tsx"));
+  const { I18nProvider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+
+  // The assistant-ui runtime passes the message part itself.
+  const render = (text, props = {}) => renderToStaticMarkup(
+    React.createElement(I18nProvider, null, React.createElement(MarkdownText, { text, ...props })));
+
+  const body = render("hello **bold** and `code`");
+  assert.ok(body.includes("<strong>bold</strong>"), "emphasis renders");
+  assert.ok(body.includes("<code"), "inline code renders");
+
+  // Nesting survives, including lists several levels deep.
+  const nested = render("- a\n  - b\n    - c");
+  assert.equal((nested.match(/<ul/g) ?? []).length, 3, "nested lists nest");
+  assert.ok(nested.includes('type="checkbox"') === false, "a plain list has no task checkbox");
+
+  const task = render("- [x] done\n- [ ] todo");
+  assert.equal((task.match(/type="checkbox"/g) ?? []).length, 2, "task lists render both checkboxes");
+
+  // A fenced block renders its language, a copy control, and highlighted source.
+  const fence = render("```ts\nconst a = 1;\n```");
+  assert.ok(fence.includes("Copy code"), "a fenced block offers a copy control");
+  assert.ok(fence.includes(">ts<"), "a fenced block names its language");
+  assert.ok(fence.includes("hljs"), "a known language is highlighted");
+  // highlight.js escapes and spans the source, so no raw tag can appear.
+  assert.ok(fence.includes("hljs-keyword"), "the source is tokenized, not pasted");
+  // An unknown language still renders the plain code rather than nothing.
+  const plain = render("```notalanguage\nplain text\n```");
+  assert.ok(plain.includes("plain text"), "an unknown language renders plain code");
+  assert.ok(!plain.includes("hljs-keyword"), "an unknown language is not highlighted");
+
+  // Math is recognised but rendered client-side, so the token is not text.
+  assert.ok(render("cost $x^2$").includes("inline-math"), "inline math is recognised");
+  assert.ok(render("$$\n\\frac{a}{b}\n$$").includes("text-center"), "block math is recognised");
+
+  // An unsafe URL never becomes a live link or an image source.
+  assert.ok(!render("[t](javascript:alert(1))").includes("<a "), "a javascript: link is not a link");
+  assert.ok(!render("![alt](javascript:alert(1))").includes("<img"), "a javascript: image is not an image");
+  const safe = render("[t](https://example.com)");
+  assert.ok(safe.includes('href="https://example.com"'), "an https link is preserved");
+
+  // Document-authored HTML is escaped rather than emitted.
+  const script = render("<script>alert(1)</script>");
+  assert.ok(!script.includes("<script>"), "raw HTML never reaches the DOM");
+  assert.ok(script.includes("&lt;script&gt;"), "raw HTML is shown as text");
+
+  // A stream that stops mid-token still renders what arrived.
+  assert.ok(render("**bold and unterminated").includes("unterminated"), "an unterminated emphasis keeps its text");
+  assert.ok(render("so $a + b").includes("$a + b"), "an unterminated inline equation keeps its text");
+  assert.ok(render("```ts\nconst a = 1;").includes("Copy code"), "an unterminated fence still renders a block");
+
+  // Reasoning renders in the muted tone.
+  assert.ok(render("thinking", { inMuted: true }).includes("text-[13px]"), "reasoning renders muted");
+}
+
+/**
+ * Browser-only render guards.
+ *
+ * Mermaid and KaTeX only ever run in an effect, so a server-rendered page
+ * cannot show whether their options are still the safe ones. The options are
+ * therefore asserted as values, and the renderer is additionally checked for
+ * the sanitiser it applies to Mermaid's SVG.
+ */
+function markdownBrowserGuardsStayLocked() {
+  const { KATEX_OPTIONS, MERMAID_OPTIONS } = require(path.join(frontend, "components/ocg/markdown/markdown-pipeline.ts"));
+
+  // Mermaid must not be relaxed: "strict" is what blocks markup in a diagram.
+  assert.equal(MERMAID_OPTIONS.securityLevel, "strict", "Mermaid stays at securityLevel strict");
+  assert.equal(MERMAID_OPTIONS.htmlLabels, false, "Mermaid does not emit HTML labels");
+  assert.equal(MERMAID_OPTIONS.startOnLoad, false, "Mermaid renders on demand, not on load");
+
+  // KaTeX must not be trusted: `\href` and `\url` would become live links.
+  assert.equal(KATEX_OPTIONS.trust, false, "KaTeX trust stays off");
+  assert.equal(KATEX_OPTIONS.throwOnError, true, "KaTeX surfaces a bad expression instead of guessing");
+
+  // The renderer must pass Mermaid's SVG through DOMPurify.
+  const source = fs.readFileSync(
+    path.join(frontend, "components/ocg/markdown/markdown-body.tsx"),
+    "utf8",
+  );
+  assert.ok(source.includes("dompurify"), "Mermaid's SVG is sanitised");
+  assert.ok(/purify\.sanitize\(svg/.test(source), "the sanitiser is applied to the SVG");
+  // KaTeX writes into a ref rather than assigning HTML, so there is no sink.
+  assert.ok(!/dangerouslySetInnerHTML[\s\S]{0,200}katex/i.test(source), "KaTeX does not assign HTML");
+}
+
+/**
+ * URL admission.
+ *
+ * markdown-it already refuses some schemes while parsing, so the pipeline's
+ * own check is the backstop for URLs that reach it another way. Both layers
+ * are asserted here.
+ */
+function markdownUrlsAreAdmittedSafely() {
+  const { sanitizeUrl } = require(path.join(frontend, "components/ocg/markdown/markdown-pipeline.ts"));
+
+  for (const url of ["https://example.com", "http://example.com/x?y=1", "mailto:a@b.c"]) {
+    assert.equal(sanitizeUrl(url), url, `${url} is admitted`);
+  }
+  for (const url of ["/settings", "#anchor", "./relative"]) {
+    assert.equal(sanitizeUrl(url), url, `${url} stays in-site`);
+  }
+  for (const url of [
+    "javascript:alert(1)",
+    "JaVaScRiPt:alert(1)",
+    " javascript:alert(1)",
+    "data:text/html,<script>",
+    "vbscript:msgbox",
+    "//evil.example",
+    "",
+  ]) {
+    assert.equal(sanitizeUrl(url), null, `${JSON.stringify(url)} is refused`);
+  }
+}
+
 
 function conversationUsageGateChecksCanonicalIdentity() {
   // The gate should check for canonical Job identity, not reconciliation state.
@@ -421,7 +631,654 @@ function conversationInspectorRemainsStableDuringPolling() {
   assert.ok(refreshing.includes("disabled"), "refresh button disabled while reading");
 }
 
-for (const check of [conversationUsageGateChecksCanonicalIdentity, executionInspectorIsCanonicalFirst, conversationUsageRefreshesWhileLive, conversationInspectorRemainsStableDuringPolling, activeTargetBeatsComposer, preferenceIsScopedPerChat, observableActivityDrivesStatus, longMessagesFold, retryClearsPresentation, reasoningSurvivesHistoryAndRoundReset, chatSurfaceRendersWithoutRuntimeBanner]) {
-  check();
+/**
+ * Managed images across the real SDK conversion.
+ *
+ * The installed SDK drops an assistant `image` part whose URL is not
+ * `data:`/`https:`/`blob:`, so an assistant's managed image must arrive as a
+ * `file` part with the absolute control URL. A user image stays an `image`
+ * part (the SDK passes those through) with its attachment URL resolved the
+ * same way. The ordering rule — reasoning before the answer — is asserted on
+ * the same converted message.
+ */
+function managedImagesSurviveSdkConversion() {
+  const adapter = require(path.join(frontend, "components/ocg/runtime/assistant-ui-adapter.ts"));
+  const base = "http://127.0.0.1:43109";
+
+  const assistant = {
+    id: "a", role: "assistant", status: "completed", createdAt: "t",
+    content: "answer", reasoning: "thought",
+    images: [{ id: "img-1", url: "/api/v1/canonical/chat/images/s/i", name: "a.png", media_type: "image/png" }],
+  };
+  const like = adapter.convertOcgMessage(assistant, 0, [assistant], base);
+
+  // Reasoning precedes the answer, and the managed image is a file part.
+  assert.deepEqual(like.content.map((part) => part.type), ["reasoning", "text", "file"],
+    "reasoning precedes the answer and the managed image is a file part");
+
+  const file = like.content.find((part) => part.type === "file");
+  assert.equal(file.id, "img-1", "the managed image keeps its id");
+  assert.equal(file.mimeType, "image/png", "the managed image keeps its media type");
+  assert.equal(file.sourceType, "url");
+  assert.equal(file.data, base + "/api/v1/canonical/chat/images/s/i",
+    "the relative managed URL is resolved against the control base");
+
+  // A user image stays an image part with its attachment URL resolved.
+  const user = {
+    id: "u", role: "user", status: "completed", createdAt: "t", content: "hi",
+    images: [{ id: "img-2", url: "/api/v1/canonical/chat/images/s/j", name: "b.png", media_type: "image/png" }],
+  };
+  const ulike = adapter.convertOcgMessage(user, 0, [user], base);
+  const image = ulike.attachments[0].content.find((part) => part.type === "image");
+  assert.equal(image.image, base + "/api/v1/canonical/chat/images/s/j",
+    "the user attachment image URL is resolved");
+
+  // The real installed SDK conversion is what the surface runs through. It keeps
+  // the file part and the order, and drops a relative assistant image part — the
+  // regression the file part exists to avoid.
+  const reactEntry = frontendRequire.resolve("@assistant-ui/react");
+  const coreRequire = createRequire(reactEntry);
+  const { fromThreadMessageLike } = coreRequire("@assistant-ui/core/internal");
+  const complete = { type: "complete", reason: "stop" };
+  const kept = fromThreadMessageLike(
+    { id: "a", role: "assistant", createdAt: new Date(), status: complete, content: like.content },
+    "fallback", complete,
+  );
+  assert.deepEqual(kept.content.map((part) => part.type), ["reasoning", "text", "file"],
+    "the SDK keeps the file part and the reasoning-before-answer order");
+  const dropped = fromThreadMessageLike(
+    { id: "x", role: "assistant", createdAt: new Date(), status: complete,
+      content: [{ type: "image", id: "i", image: "/relative.png", filename: "i.png" }] },
+    "fallback", complete,
+  );
+  assert.deepEqual(dropped.content.map((part) => part.type), [],
+    "the SDK drops a relative assistant image part, which is the regression");
 }
-process.stdout.write("chat presentation contract ok\n");
+
+/**
+ * URL admission and heading fidelity.
+ *
+ * Scheme-less relative references are legitimate targets (`docs/readme.md`,
+ * `diagram.png`); protocol-relative and unsafe schemes are still refused, and
+ * every heading level renders.
+ */
+function markdownAdmitsRelativeTargetsAndHeadings() {
+  const { sanitizeUrl } = require(path.join(frontend, "components/ocg/markdown/markdown-pipeline.ts"));
+  for (const url of ["docs/readme.md", "diagram.png", "../up/one.png", "a/b?c=d#frag"]) {
+    assert.equal(sanitizeUrl(url), url, `${url} is admitted as a relative target`);
+  }
+  for (const url of ["//evil.example", "javascript:alert(1)", "data:text/html,x"]) {
+    assert.equal(sanitizeUrl(url), null, `${url} is refused`);
+  }
+
+  const React = frontendRequire("react");
+  const { renderToStaticMarkup } = frontendRequire("react-dom/server");
+  const { MarkdownText } = require(path.join(frontend, "components/assistant-ui/elements/markdown-text.tsx"));
+  const { I18nProvider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+  const heads = renderToStaticMarkup(React.createElement(I18nProvider, null,
+    React.createElement(MarkdownText, { text: "# one\n\n## two\n\n### three\n\n#### four\n\n##### five\n\n###### six" })));
+  for (let level = 1; level <= 6; level++) {
+    assert.ok(heads.includes(`<h${level}`), `h${level} renders`);
+  }
+}
+
+/**
+ * Nested Markdown structure.
+ *
+ * A nested list with a later sibling must close the nesting so the sibling
+ * returns to the top level, and content after a nested blockquote is a sibling
+ * rather than being swallowed. Counting `<ul>` alone would miss either.
+ */
+function markdownNestingMatchesDepth() {
+  const React = frontendRequire("react");
+  const { renderToStaticMarkup } = frontendRequire("react-dom/server");
+  const { MarkdownText } = require(path.join(frontend, "components/assistant-ui/elements/markdown-text.tsx"));
+  const { I18nProvider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+  const render = (text) => renderToStaticMarkup(React.createElement(I18nProvider, null,
+    React.createElement(MarkdownText, { text })));
+
+  // A nested list with a later sibling: the sibling returns to the top level.
+  const branch = render("- a\n  - b\n- c");
+  assert.equal((branch.match(/<ul/g) ?? []).length, 2, "a nested list with a later sibling nests exactly one level");
+  assert.match(branch, /<li[^>]*>\s*<p[^>]*>a<\/p>\s*<ul[^>]*>\s*<li[^>]*>\s*<p[^>]*>b<\/p>\s*<\/li>\s*<\/ul>\s*<\/li>\s*<li[^>]*>\s*<p[^>]*>c<\/p>\s*<\/li>/,
+    "the later sibling closes the nesting and stays a top-level item");
+
+  // Deep nesting with an outer sibling after the nested blocks close.
+  const deep = render("- a\n  - b\n    - c\n- d");
+  assert.equal((deep.match(/<ul/g) ?? []).length, 3, "three levels nest");
+  assert.match(deep, /<\/ul>\s*<\/li>\s*<li[^>]*>\s*<p[^>]*>d<\/p>/,
+    "the outer sibling is a top-level item after the nested blocks close");
+
+  // A nested blockquote with trailing content: the trailing paragraph is a sibling.
+  const quote = render("> outer\n> > inner\n\ntrailing");
+  assert.ok((quote.match(/<blockquote/g) ?? []).length >= 2, "blockquotes nest");
+  assert.match(quote, /<\/blockquote>\s*<p[^>]*>\s*trailing/,
+    "content after a nested blockquote is a sibling, not swallowed");
+}
+
+/**
+ * Dropdown Escape.
+ *
+ * The consumer sees the Escape first and may cancel the dismissal; the menu
+ * closes and restores focus only when it was not prevented.
+ */
+function dropdownEscapeDismissesAfterConsumer() {
+  const source = fs.readFileSync(path.join(frontend, "components/ui/dropdown-menu.tsx"), "utf8");
+  const start = source.indexOf("event.key === \"Escape\"");
+  assert.ok(start >= 0, "the Escape branch exists");
+  const branch = source.slice(start, start + 420);
+  const consumer = branch.indexOf("onEscapeKeyDown?.(event)");
+  const guarded = branch.indexOf("if (!event.defaultPrevented)");
+  const close = branch.indexOf("setOpen(false)");
+  const focus = branch.indexOf(".focus()");
+  assert.ok(consumer >= 0 && guarded >= 0 && close >= 0, "the consumer call and the guarded close exist");
+  assert.ok(consumer < guarded, "the consumer's onEscapeKeyDown runs before the menu decides");
+  assert.ok(guarded < close, "the menu closes only inside the un-cancelled branch");
+  assert.ok(close < focus, "focus is restored after the menu closes");
+}
+
+/**
+ * The canonical sidebar's Workbench menu.
+ *
+ * In canonical mode Chat stays the one primary destination and every other
+ * destination moves into the compact bottom Workbench menu — none is lost and
+ * the active destination is still marked.
+ */
+function sidebarWorkbenchPreservesDestinations() {
+  const React = frontendRequire("react");
+  const { renderToStaticMarkup } = frontendRequire("react-dom/server");
+  const { OcgSidebar } = require(path.join(frontend, "components/ocg/sidebar/ocg-sidebar.tsx"));
+  const { I18nProvider } = require(path.join(frontend, "components/ocg/i18n/context.tsx"));
+  const html = renderToStaticMarkup(React.createElement(I18nProvider, null,
+    React.createElement(OcgSidebar, {
+      sessions: [], activeSessionId: "", collapsed: false, onToggle: () => undefined,
+      onSelect: () => undefined, onNewChat: () => undefined,
+      runtimeStatus: { state: "connected", detailCode: "provider-ready", detail: "" },
+      runtimeAuthority: "canonical", activeView: "health", attentionCount: 0,
+      onNavigate: () => undefined,
+    })));
+
+  assert.ok(html.includes("data-workbench-menu"), "the Workbench menu exists in canonical mode");
+  // Every non-chat canonical destination is preserved inside the menu.
+  for (const label of ["Home", "Jobs", "Health", "Attention", "Usage", "Control Center"]) {
+    assert.ok(html.includes(label), `${label} is preserved in the Workbench menu`);
+  }
+  // The active destination (health) is still marked.
+  assert.ok(html.includes('aria-current="page"'), "the active destination is marked");
+  // Chat is the one primary destination outside the menu, above it.
+  const chatIdx = html.indexOf(">Chat<");
+  const workbenchIdx = html.indexOf("data-workbench-menu");
+  assert.ok(chatIdx >= 0 && workbenchIdx >= 0 && chatIdx < workbenchIdx,
+    "Chat stays above the Workbench menu as the primary destination");
+  assert.equal((html.match(/>Chat</g) ?? []).length, 1, "Chat is not duplicated inside the Workbench menu");
+}
+
+/**
+ * The composer card owns model selection.
+ *
+ * Model selection sits inside the composer card, above the staged attachments,
+ * so the whole turn surface reads as one card.
+ */
+function composerPlacesModelSelectionInCard() {
+  const source = fs.readFileSync(path.join(frontend, "components/ocg/chat/chat-view.tsx"), "utf8");
+  const card = source.indexOf("rounded-lg border border-border bg-card");
+  const selector = source.indexOf("<ModelSelector");
+  const staging = source.indexOf("<AttachmentStaging");
+  assert.ok(card >= 0 && selector >= 0 && staging >= 0, "the composer card, model selector and staging exist");
+  assert.ok(card < selector, "the model selector is inside the composer card");
+  assert.ok(selector < staging, "the model selector heads the card above the staged attachments");
+}
+
+/**
+ * Highlighting theme scoping.
+ *
+ * The light theme is the base import; the dark rules are scoped under `.dark`,
+ * so the dark tokens never leak into light mode.
+ */
+function highlightingThemeIsScoped() {
+  const css = fs.readFileSync(path.join(frontend, "app/globals.css"), "utf8");
+  assert.ok(css.includes("highlight.js/styles/github.css"), "the light highlight theme is imported");
+  assert.ok(!/^\s*@import\s+"highlight\.js\/styles\/github-dark\.css"/m.test(css),
+    "the dark highlight theme is not imported globally");
+  assert.ok(/\.dark\s+\.hljs/.test(css), "the dark highlight rules are scoped under .dark");
+}
+
+/**
+ * Streaming recovery of the two render-on-effect blocks.
+ *
+ * Mermaid and KaTeX render inside an effect, so the SSR harness cannot exercise
+ * them. This is a disposable probe: production `markdown-body.tsx` is loaded
+ * against a tiny hook runtime and controllable Mermaid/KaTeX fakes, then the
+ * components' effects are driven directly. That is what proves an invalid code
+ * that becomes valid recovers, and that a superseded async result is dropped —
+ * neither is observable from options or SSR alone.
+ */
+async function markdownStreamingRecoveryProbe() {
+  const Fragment = Symbol("fragment");
+  const rt = { slots: [], cursor: 0, effects: [], refs: new WeakMap() };
+  const reactStub = {
+    Fragment,
+    useState(initial) {
+      const i = rt.cursor++;
+      if (!(i in rt.slots)) rt.slots[i] = { value: typeof initial === "function" ? initial() : initial };
+      const slot = rt.slots[i];
+      const set = (nextValue) => {
+        const next = typeof nextValue === "function" ? nextValue(slot.value) : nextValue;
+        if (next !== slot.value) slot.value = next;
+      };
+      return [slot.value, set];
+    },
+    useRef(initial) {
+      const i = rt.cursor++;
+      if (!(i in rt.slots)) rt.slots[i] = { value: { current: initial } };
+      return rt.slots[i].value;
+    },
+    useEffect(fn, deps) {
+      const i = rt.cursor++;
+      const slot = rt.slots[i] ?? (rt.slots[i] = {});
+      const changed = !deps || !slot.deps || deps.length !== slot.deps.length
+        || deps.some((depth, index) => depth !== slot.deps[index]);
+      slot.deps = deps;
+      if (changed) rt.effects.push({ i, fn });
+    },
+    useCallback(fn) { return fn; },
+    useMemo(fn) { return fn(); },
+  };
+  const jsxRuntime = {
+    Fragment,
+    jsx: (type, props, key) => ({ type, props: props || {}, key }),
+    jsxs: (type, props, key) => ({ type, props: props || {}, key }),
+  };
+
+  // Host nodes are plain objects so the components can write `innerHTML`.
+  const attachRefs = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) { node.forEach(attachRefs); return; }
+    const ref = node.props && node.props.ref;
+    if (ref && typeof ref === "object") {
+      if (!rt.refs.has(ref)) rt.refs.set(ref, { innerHTML: "" });
+      ref.current = rt.refs.get(ref);
+    }
+    if (node.props && node.props.children) attachRefs(node.props.children);
+  };
+  // Reaches MermaidDiagram through the pure CodeBlock wrapper it is returned from.
+  const findMermaid = (node) => {
+    if (!node || typeof node !== "object") return null;
+    if (Array.isArray(node)) { for (const child of node) { const hit = findMermaid(child); if (hit) return hit; } return null; }
+    if (node.props && node.props.diagramLabel === "Mermaid diagram") return node.type;
+    if (typeof node.type === "function") return findMermaid(node.type(node.props));
+    return findMermaid(node.props && node.props.children);
+  };
+  const findMath = (node) => {
+    if (!node || typeof node !== "object") return null;
+    if (Array.isArray(node)) { for (const child of node) { const hit = findMath(child); if (hit) return hit; } return null; }
+    if (typeof node.type === "function" && typeof node.props.inline === "boolean" && typeof node.props.content === "string") return node.type;
+    return findMath(node.props && node.props.children);
+  };
+  const collectHosts = (node, out = []) => {
+    if (!node || typeof node !== "object") return out;
+    if (Array.isArray(node)) { node.forEach((child) => collectHosts(child, out)); return out; }
+    const ref = node.props && node.props.ref;
+    if (ref && typeof ref === "object") out.push(ref.current);
+    if (node.props && node.props.children) collectHosts(node.props.children, out);
+    return out;
+  };
+  const textOf = (node) => {
+    if (node === null || node === undefined || typeof node === "boolean") return "";
+    if (typeof node === "string" || typeof node === "number") return String(node);
+    if (Array.isArray(node)) return node.map(textOf).join("");
+    if (node.props && node.props.children) return textOf(node.props.children);
+    return "";
+  };
+
+  // Controllable fakes: Mermaid's render is deferred so resolution order is in
+  // the probe's hands; KaTeX records what it was asked to render and fails the
+  // same way `throwOnError` would.
+  const mermaidRenders = [];
+  const katexRenders = [];
+  const mermaidStub = { initialize() {}, render: (id, code) => new Promise((resolve, reject) => mermaidRenders.push({ code, resolve, reject })) };
+  const purifyStub = { sanitize: (svg) => svg };
+  const katexStub = {
+    render: (content, host) => {
+      katexRenders.push(content);
+      if (content.startsWith("bad")) throw new Error("KaTeX parse error");
+      host.innerHTML = `katex:${content}`;
+    },
+  };
+
+  const bodyPath = path.join(frontend, "components/ocg/markdown/markdown-body.tsx");
+  const savedStubs = moduleStubs;
+  const savedBody = require.cache[bodyPath];
+  moduleStubs = {
+    react: reactStub,
+    "react/jsx-runtime": jsxRuntime,
+    mermaid: { __esModule: true, default: mermaidStub },
+    dompurify: { __esModule: true, default: purifyStub },
+    katex: { __esModule: true, default: katexStub },
+  };
+  delete require.cache[bodyPath];
+
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  try {
+    const { MarkdownBody } = require(bodyPath);
+    const MermaidDiagram = findMermaid(MarkdownBody({ content: "```mermaid\ngraph TD; A-->\n```", inMuted: false }));
+    const MathBlock = findMath(MarkdownBody({ content: "$$bad \\frac{1$$", inMuted: false }));
+    assert.equal(typeof MermaidDiagram, "function", "the Mermaid component is reachable through the rendered tree");
+    assert.equal(typeof MathBlock, "function", "the math component is reachable through the rendered tree");
+
+    const render = (Component, props) => {
+      rt.cursor = 0;
+      rt.effects = [];
+      const tree = Component(props);
+      attachRefs(tree);
+      return tree;
+    };
+    const flush = () => {
+      const run = rt.effects;
+      rt.effects = [];
+      for (const { i, fn } of run) {
+        const slot = rt.slots[i];
+        if (slot.cleanup) { slot.cleanup(); slot.cleanup = undefined; }
+        const cleanup = fn();
+        if (typeof cleanup === "function") slot.cleanup = cleanup;
+      }
+    };
+    const fresh = () => { rt.slots = []; rt.cursor = 0; rt.effects = []; };
+
+    // ---- Mermaid: invalid code recovers; a stale result is dropped ----
+    const mprops = (code) => ({ code, inMuted: false, errorLabel: "Diagram error", diagramLabel: "Mermaid diagram" });
+    fresh();
+    render(MermaidDiagram, mprops("graph TD; A-->"));
+    flush();
+    await tick(); // the import resolves and marks the component ready
+    render(MermaidDiagram, mprops("graph TD; A-->"));
+    flush();
+    await tick(); // the render effect's imports resolve and call Mermaid's render
+    assert.equal(mermaidRenders.length, 1, "the invalid code reaches Mermaid's render");
+    mermaidRenders[0].reject(new Error("Parse error on line 1"));
+    await tick();
+    const hostBefore = collectHosts(render(MermaidDiagram, mprops("graph TD; A-->")))[0];
+    let tree = render(MermaidDiagram, mprops("graph TD; A-->"));
+    assert.ok(hostBefore, "the diagram host is mounted before the error");
+    assert.equal(collectHosts(tree)[0], hostBefore, "the host node is reused, never remounted across the error");
+    assert.ok(textOf(tree).includes("Diagram error"), "the failure is surfaced");
+
+    // The same mounted component recovers when the code becomes valid.
+    tree = render(MermaidDiagram, mprops("graph TD; A-->B"));
+    flush();
+    await tick(); // the render effect's imports resolve and call Mermaid's render
+    assert.equal(mermaidRenders.length, 2, "the valid code reaches Mermaid's render");
+    mermaidRenders[1].resolve({ svg: "<svg>ok</svg>" });
+    await tick();
+    tree = render(MermaidDiagram, mprops("graph TD; A-->B"));
+    assert.ok(!textOf(tree).includes("Diagram error"), "the cleared error is gone after recovery");
+    assert.equal(collectHosts(tree)[0].innerHTML, "<svg>ok</svg>", "the valid diagram renders into the same host");
+
+    // A superseded async result never overwrites the newest diagram.
+    mermaidRenders.length = 0;
+    render(MermaidDiagram, mprops("graph TD; A"));
+    flush();
+    render(MermaidDiagram, mprops("graph TD; B"));
+    flush();
+    await tick(); // both codes' imports resolve and call Mermaid's render
+    assert.equal(mermaidRenders.length, 2, "both codes reach Mermaid's render");
+    mermaidRenders[1].resolve({ svg: "<svg>B</svg>" }); // newest resolves first
+    await tick();
+    tree = render(MermaidDiagram, mprops("graph TD; B"));
+    assert.equal(collectHosts(tree)[0].innerHTML, "<svg>B</svg>", "the newest code is rendered");
+    mermaidRenders[0].resolve({ svg: "<svg>A</svg>" }); // stale resolves later
+    await tick();
+    tree = render(MermaidDiagram, mprops("graph TD; B"));
+    assert.equal(collectHosts(tree)[0].innerHTML, "<svg>B</svg>", "a stale async result never overwrites the newest diagram");
+
+    // ---- KaTeX: an invalid expression recovers; a superseded one is dropped ----
+    const kprops = (content) => ({ content, inline: false, inMuted: false });
+    fresh();
+    katexRenders.length = 0;
+    let ktree = render(MathBlock, kprops("bad \\frac{1"));
+    flush();
+    await tick(); // the import resolves, the render throws, the failure is set
+    ktree = render(MathBlock, kprops("bad \\frac{1"));
+    const mathHost = collectHosts(ktree)[0];
+    assert.ok(mathHost, "the math host stays mounted across the failure");
+    assert.ok(textOf(ktree).includes("$$bad \\frac{1$$"), "the failed expression falls back to its source");
+
+    // A valid expression recovers into the same mounted host.
+    ktree = render(MathBlock, kprops("x^2"));
+    flush();
+    await tick();
+    ktree = render(MathBlock, kprops("x^2"));
+    assert.equal(collectHosts(ktree)[0], mathHost, "the math host is reused across recovery");
+    assert.equal(collectHosts(ktree)[0].innerHTML, "katex:x^2", "the valid expression renders into the host");
+    assert.ok(!textOf(ktree).includes("$$x^2$$"), "the fallback is gone after recovery");
+
+    // A superseded math render is dropped; only the newest content renders.
+    fresh();
+    katexRenders.length = 0;
+    render(MathBlock, kprops("alpha"));
+    flush();
+    render(MathBlock, kprops("beta"));
+    flush();
+    await tick(); // both imports resolve; alpha is cancelled, beta renders
+    ktree = render(MathBlock, kprops("beta"));
+    assert.deepEqual(katexRenders, ["beta"], "a superseded math render is dropped; only the newest content renders");
+    assert.equal(collectHosts(ktree)[0].innerHTML, "katex:beta", "the newest expression is in the host");
+  } finally {
+    moduleStubs = savedStubs;
+    if (savedBody) require.cache[bodyPath] = savedBody;
+    else delete require.cache[bodyPath];
+    for (const key of Object.keys(require.cache)) {
+      if (key.startsWith(path.join(frontend, "components"))) delete require.cache[key];
+    }
+  }
+}
+
+/**
+ * Bounded messages expand and collapse for both roles.
+ *
+ * The SSR check proves the Thread wires both a user and an assistant message
+ * into the shared bounded viewport. This probe goes further and exercises the
+ * real interaction the viewport offers: it mounts production `BoundedMessage`
+ * against a tiny hook runtime with a controllable ResizeObserver, then invokes
+ * the actual rendered toggle handler to expand and collapse, asserting the
+ * bounded and expanded states each way. Both roles are driven, since the one
+ * shared component serves each. This is an interaction check — it fires the
+ * rendered onClick — not a static render or a source grep.
+ */
+async function boundedMessagesExpandAndCollapseForBothRoles() {
+  const Fragment = Symbol("fragment");
+  const rt = { slots: [], cursor: 0, effects: [], refs: new WeakMap() };
+  const reactStub = {
+    Fragment,
+    useState(initial) {
+      const i = rt.cursor++;
+      if (!(i in rt.slots)) rt.slots[i] = { value: typeof initial === "function" ? initial() : initial };
+      const slot = rt.slots[i];
+      const set = (nextValue) => {
+        const next = typeof nextValue === "function" ? nextValue(slot.value) : nextValue;
+        if (next !== slot.value) slot.value = next;
+      };
+      return [slot.value, set];
+    },
+    useRef(initial) {
+      const i = rt.cursor++;
+      if (!(i in rt.slots)) rt.slots[i] = { value: { current: initial } };
+      return rt.slots[i].value;
+    },
+    useEffect(fn, deps) {
+      const i = rt.cursor++;
+      const slot = rt.slots[i] ?? (rt.slots[i] = {});
+      const changed = !deps || !slot.deps || deps.length !== slot.deps.length
+        || deps.some((depth, index) => depth !== slot.deps[index]);
+      slot.deps = deps;
+      if (changed) rt.effects.push({ i, fn });
+    },
+    useCallback(fn) { return fn; },
+    useMemo(fn) { return fn(); },
+  };
+  const jsxRuntime = {
+    Fragment,
+    jsx: (type, props, key) => ({ type, props: props || {}, key }),
+    jsxs: (type, props, key) => ({ type, props: props || {}, key }),
+  };
+
+  // The host reports as overflowing, so a long message offers the toggle.
+  const attachRefs = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) { node.forEach(attachRefs); return; }
+    const ref = node.props && node.props.ref;
+    if (ref && typeof ref === "object") {
+      if (!rt.refs.has(ref)) rt.refs.set(ref, { innerHTML: "", scrollHeight: 1000, clientHeight: 200 });
+      ref.current = rt.refs.get(ref);
+    }
+    if (node.props && node.props.children) attachRefs(node.props.children);
+  };
+  const findViewport = (node) => {
+    if (!node || typeof node !== "object") return null;
+    if (Array.isArray(node)) { for (const child of node) { const hit = findViewport(child); if (hit) return hit; } return null; }
+    if (node.props && node.props["data-message-bounds"] !== undefined) return node;
+    return findViewport(node.props && node.props.children);
+  };
+  const findToggle = (node) => {
+    if (!node || typeof node !== "object") return null;
+    if (Array.isArray(node)) { for (const child of node) { const hit = findToggle(child); if (hit) return hit; } return null; }
+    if (node.props && typeof node.props.onClick === "function") return node;
+    return findToggle(node.props && node.props.children);
+  };
+  const textOf = (node) => {
+    if (node === null || node === undefined || typeof node === "boolean") return "";
+    if (typeof node === "string" || typeof node === "number") return String(node);
+    if (Array.isArray(node)) return node.map(textOf).join("");
+    if (node.props && node.props.children) return textOf(node.props.children);
+    return "";
+  };
+
+  // A controllable ResizeObserver: the probe triggers the overflow measurement.
+  const resizeObservers = [];
+  const OriginalResizeObserver = global.ResizeObserver;
+  global.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; resizeObservers.push(this); }
+    observe() {}
+    disconnect() {}
+  };
+
+  const boundedPath = path.join(frontend, "components/ocg/chat/bounded-message.tsx");
+  const savedStubs = moduleStubs;
+  const savedBounded = require.cache[boundedPath];
+  moduleStubs = {
+    react: reactStub,
+    "react/jsx-runtime": jsxRuntime,
+    "lucide-react": { ChevronDown: () => null },
+    "@/lib/utils": { cn: (...parts) => parts.flat().filter(Boolean).join(" ") },
+    "../i18n": { useI18n: () => ({ t: (key) => key }) },
+  };
+  delete require.cache[boundedPath];
+
+  try {
+    const { BoundedMessage } = require(boundedPath);
+    const render = (props) => {
+      rt.cursor = 0;
+      rt.effects = [];
+      const tree = BoundedMessage(props);
+      attachRefs(tree);
+      return tree;
+    };
+    const flush = () => {
+      const run = rt.effects;
+      rt.effects = [];
+      for (const { i, fn } of run) {
+        const slot = rt.slots[i];
+        if (slot.cleanup) { slot.cleanup(); slot.cleanup = undefined; }
+        const cleanup = fn();
+        if (typeof cleanup === "function") slot.cleanup = cleanup;
+      }
+    };
+
+    // Drive the full expand/collapse cycle once per role: the one shared
+    // component bounds and unfolds both a long user message and a long answer.
+    for (const role of ["user", "assistant"]) {
+      resizeObservers.length = 0;
+      rt.slots = [];
+      const props = { streaming: role === "assistant", children: `long ${role} message body` };
+
+      let tree = render(props);
+      flush();
+      assert.equal(resizeObservers.length, 1, `${role}: a ResizeObserver measures the message for overflow`);
+
+      // The measurement reports overflow, so the message becomes bounded and
+      // offers an expand toggle.
+      resizeObservers[0].callback();
+      tree = render(props);
+      let viewport = findViewport(tree);
+      let toggle = findToggle(tree);
+      assert.equal(viewport.props["data-message-bounds"], "bounded", `${role}: a long message starts bounded`);
+      assert.match(viewport.props.className, /max-h-/, `${role}: the bounded viewport caps the height`);
+      assert.ok(toggle, `${role}: an expand toggle appears`);
+      assert.equal(toggle.props["aria-expanded"], false, `${role}: the toggle reports collapsed`);
+      assert.ok(textOf(toggle).includes("chat.expandMessage"), `${role}: the toggle offers to expand`);
+
+      // Expanding: the real onClick flips the state and the viewport unfolds.
+      toggle.props.onClick();
+      tree = render(props);
+      viewport = findViewport(tree);
+      toggle = findToggle(tree);
+      assert.equal(viewport.props["data-message-bounds"], "expanded", `${role}: the message expands`);
+      assert.ok(!/max-h-/.test(viewport.props.className), `${role}: the expanded viewport drops the height cap`);
+      assert.equal(toggle.props["aria-expanded"], true, `${role}: the toggle reports expanded`);
+      assert.ok(textOf(toggle).includes("chat.collapseMessage"), `${role}: the toggle offers to collapse`);
+
+      // Collapsing: the same handler folds it back to the bounded viewport.
+      toggle.props.onClick();
+      tree = render(props);
+      viewport = findViewport(tree);
+      toggle = findToggle(tree);
+      assert.equal(viewport.props["data-message-bounds"], "bounded", `${role}: the message collapses back`);
+      assert.match(viewport.props.className, /max-h-/, `${role}: the height cap returns`);
+      assert.equal(toggle.props["aria-expanded"], false, `${role}: the toggle reports collapsed again`);
+      assert.ok(textOf(toggle).includes("chat.expandMessage"), `${role}: the expand label returns`);
+    }
+  } finally {
+    global.ResizeObserver = OriginalResizeObserver;
+    moduleStubs = savedStubs;
+    if (savedBounded) require.cache[boundedPath] = savedBounded;
+    else delete require.cache[boundedPath];
+    for (const key of Object.keys(require.cache)) {
+      if (key.startsWith(path.join(frontend, "components"))) delete require.cache[key];
+    }
+  }
+}
+
+(async () => {
+  for (const check of [
+    conversationUsageGateChecksCanonicalIdentity,
+    executionInspectorIsCanonicalFirst,
+    conversationUsageRefreshesWhileLive,
+    conversationInspectorRemainsStableDuringPolling,
+    activeTargetBeatsComposer,
+    preferenceIsScopedPerChat,
+    observableActivityDrivesStatus,
+    longMessagesFold,
+    retryClearsPresentation,
+    reasoningSurvivesHistoryAndRoundReset,
+    markdownBodyRendersSafely,
+    markdownUrlsAreAdmittedSafely,
+    markdownBrowserGuardsStayLocked,
+    chatSurfaceRendersWithoutRuntimeBanner,
+    managedImagesSurviveSdkConversion,
+    markdownAdmitsRelativeTargetsAndHeadings,
+    markdownNestingMatchesDepth,
+    dropdownEscapeDismissesAfterConsumer,
+    sidebarWorkbenchPreservesDestinations,
+    composerPlacesModelSelectionInCard,
+    highlightingThemeIsScoped,
+    markdownStreamingRecoveryProbe,
+    boundedMessagesExpandAndCollapseForBothRoles,
+  ]) {
+    await check();
+  }
+  process.stdout.write("chat presentation contract ok\n");
+})().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

@@ -1,12 +1,14 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useRef, useState, useMemo } from "react";
 import {
   ChevronsLeft,
+  ChevronDown,
   Activity,
   Home,
   BarChart3,
   Bell,
+  LayoutGrid,
   MessageSquare,
   Plus,
   Search,
@@ -15,12 +17,16 @@ import {
   Table2,
   Workflow,
   LoaderCircle,
-  Trash2,
+  MoreVertical,
+  Settings,
+  User,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { STATUS_TEXT } from "../primitives/tone";
 import {
   Tooltip,
@@ -75,6 +81,10 @@ type OcgSidebarProps = {
    * how a page renders the sidebar without shell navigation.
    */
   onNavigate?: (view: WorkspaceView) => void;
+  /** Called when account/profile button is clicked. */
+  onAccountClick?: () => void;
+  /** Called when settings button is clicked. */
+  onSettingsClick?: () => void;
 };
 
 function RailButton({
@@ -127,13 +137,27 @@ export function OcgSidebar({
   onProjectChange,
   attentionCount = 0,
   onNavigate,
+  onAccountClick,
+  onSettingsClick,
 }: OcgSidebarProps) {
   const { t } = useI18n();
   const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState<string>("");
   const cancelDeleteRef = useRef<HTMLButtonElement>(null);
   const targetBusy = deleteTarget !== null && busySessionIds.includes(deleteTarget.id);
+  // An untitled session is shown as "New chat", so it is matched under that
+  // name too rather than only against its empty title.
+  const filteredSessions = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return sessions;
+    const untitledLabel = t("sidebar.newChat").toLowerCase();
+    return sessions.filter(session =>
+      (session.title || untitledLabel).toLowerCase().includes(query)
+    );
+  }, [sessions, searchQuery, t]);
   const confirmDelete = async () => {
     if (!deleteTarget || !onDelete || deleting || targetBusy) return;
     setDeleting(true);
@@ -147,9 +171,14 @@ export function OcgSidebar({
       setDeleting(false);
     }
   };
-  const workspaceNav = runtimeAuthority === "canonical"
+  const canonicalMode = runtimeAuthority === "canonical";
+  const workspaceNav = canonicalMode
     ? WORKSPACE_NAV.filter(item => ["home", "chat", "job-execution", "health", "attention", "usage", "control-center"].includes(item.target))
     : WORKSPACE_NAV;
+  // In canonical mode Chat is the one primary destination; every other
+  // destination moves into the compact bottom Workbench menu so none is lost.
+  const primaryNav = canonicalMode ? workspaceNav.filter(item => item.target === "chat") : workspaceNav;
+  const workbenchNav = canonicalMode ? workspaceNav.filter(item => item.target !== "chat") : [];
   const hasNav = Boolean(onNavigate);
   const navLabel = (item: (typeof WORKSPACE_NAV)[number]) => t(item.labelKey);
 
@@ -304,7 +333,7 @@ export function OcgSidebar({
         {hasNav && (
           <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
             <ul className="flex flex-col gap-px">
-              {(runtimeAuthority === "canonical" ? workspaceNav : workspaceNav.slice(0, 4)).map(renderWorkspaceItem)}
+              {(canonicalMode ? primaryNav : workspaceNav.slice(0, 4)).map(renderWorkspaceItem)}
             </ul>
             {runtimeAuthority === "mock" && <details open={workspaceNav.slice(4).some((item) => item.target === activeView) || undefined} className="mt-1">
               <summary className={cn("cursor-pointer rounded-md px-2 py-1.5", TYPOGRAPHY_SCALE.caption, "text-muted-foreground hover:bg-muted/60")}>{t("nav.tools")}</summary>
@@ -315,15 +344,31 @@ export function OcgSidebar({
           </nav>
         )}
 
+        {/* Conversation search filters the history list below it. */}
+        <div className="px-2 pb-2">
+          <div className="relative">
+            <Search className="absolute left-2.5 top-2.5 size-3.5 text-muted-foreground pointer-events-none" aria-hidden="true" />
+            <Input
+              type="search"
+              placeholder={t("sidebar.searchChats")}
+              aria-label={t("sidebar.searchChatsLabel")}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="h-8 pl-8 text-xs"
+            />
+          </div>
+        </div>
+
         <nav
           aria-label={t("nav.chatSessions")}
           className="min-h-0 flex-1 overflow-y-auto px-2 pb-2"
         >
           <ul className="flex flex-col gap-px">
-            {sessions.map((session) => {
+            {filteredSessions.map((session) => {
               const active = session.id === activeSessionId;
+              const isMenuOpen = openMenuId === session.id;
               return (
-                <li key={session.id} className={cn("group/session flex min-w-0 items-center rounded-md transition-colors", active ? "bg-muted" : "hover:bg-muted/60")}>
+                <li key={session.id} className={cn("group/session relative flex min-w-0 items-center rounded-md transition-colors", active ? "bg-muted" : "hover:bg-muted/60")}>
                   <button
                     type="button"
                     onClick={() => onSelect(session.id)}
@@ -346,21 +391,103 @@ export function OcgSidebar({
                       {session.title || t("sidebar.newChat")}
                     </span>
                   </button>
-                  {onDelete && <button
-                    type="button"
-                    aria-label={t("sidebar.deleteChatNamed", { title: session.title || t("sidebar.newChat") })}
-                    title={t(busySessionIds.includes(session.id) ? "sidebar.deleteRunning" : "sidebar.deleteChat")}
-                    disabled={busySessionIds.includes(session.id) || deleting}
-                    onClick={() => { setDeleteError(null); setDeleteTarget(session); }}
-                    className="mr-1 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/60 outline-none hover:bg-destructive/10 hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-40"
-                  >
-                    <Trash2 className="size-3.5" aria-hidden="true" />
-                  </button>}
+                  {onDelete && (
+                    <DropdownMenu open={isMenuOpen} onOpenChange={(open) => setOpenMenuId(open ? session.id : null)}>
+                      <DropdownMenuTrigger asChild>
+                        <button
+                          type="button"
+                          aria-label={t("sidebar.deleteChatNamed", { title: session.title || t("sidebar.newChat") })}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                          }}
+                          className={cn(
+                            "mr-1 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/60 outline-none transition-opacity hover:bg-muted hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/30",
+                            // On hover-capable devices: hide by default, show on hover/focus/menu-open
+                            // On touch devices: always visible
+                            isMenuOpen
+                              ? "opacity-100"
+                              : "[@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/session:opacity-100 [@media(hover:hover)]:group-focus-within/session:opacity-100 [@media(hover:none)]:opacity-100",
+                          )}
+                        >
+                          <MoreVertical className="size-3.5" aria-hidden="true" />
+                        </button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          disabled={busySessionIds.includes(session.id) || deleting}
+                          onSelect={() => {
+                            setDeleteError(null);
+                            setDeleteTarget(session);
+                          }}
+                          className="text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive"
+                        >
+                          {t("sidebar.deleteChat")}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
                 </li>
               );
             })}
+            {filteredSessions.length === 0 && searchQuery.trim() !== "" && (
+              <li className={cn("px-2 py-3 text-center text-muted-foreground", TYPOGRAPHY_SCALE.caption)}>
+                {t("sidebar.noSearchMatches")}
+              </li>
+            )}
           </ul>
         </nav>
+
+        {/*
+          Canonical mode keeps Chat as the single primary destination and folds
+          every other destination into this compact bottom Workbench menu. Each
+          item keeps its icon, label, attention badge and active state.
+        */}
+        {hasNav && workbenchNav.length > 0 && (
+          <details
+            className="border-t border-border px-2 py-2"
+            open={workbenchNav.some((item) => item.target === activeView) || undefined}
+            data-workbench-menu=""
+          >
+            <summary className={cn("group flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 select-none", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground hover:bg-muted/60")}>
+              <LayoutGrid className="size-3.5 shrink-0" aria-hidden="true" />
+              <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
+              <ChevronDown className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+            </summary>
+            <ul className="mt-1 flex flex-col gap-px pl-2">
+              {workbenchNav.map(renderWorkspaceItem)}
+            </ul>
+          </details>
+        )}
+
+        {/* Account and Settings, shown only where they do something real. */}
+        {(onAccountClick || onSettingsClick) && (
+          <div className="border-t border-border px-2 py-2 flex gap-1">
+            {onAccountClick && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onAccountClick}
+                className="h-8 w-8 p-0"
+                title={t("sidebar.account")}
+                aria-label={t("sidebar.account")}
+              >
+                <User className="size-3.5" />
+              </Button>
+            )}
+            {onSettingsClick && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onSettingsClick}
+                className="h-8 w-8 p-0"
+                title={t("sidebar.settings")}
+                aria-label={t("sidebar.settings")}
+              >
+                <Settings className="size-3.5" />
+              </Button>
+            )}
+          </div>
+        )}
       </div>
       <Dialog open={deleteTarget !== null} onOpenChange={open => { if (!open && !deleting) setDeleteTarget(null); }}>
         <DialogContent initialFocus={cancelDeleteRef} showCloseButton={!deleting} className="rounded-lg">

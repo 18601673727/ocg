@@ -12,6 +12,7 @@ import { callKindOf, currentActivity, executionActivity, frozenEffort, nativeToo
 import { currentLabel, stepLabel } from "../chat/activity-labels";
 import { isTerminalJobState, summarizeCalls, type JobExecution } from "./domain";
 import { placementOf } from "./placement";
+import { SpecSheet, type SpecRow } from "@/components/assistant-ui/elements/spec-sheet";
 
 const RECENT_STEPS = 8;
 
@@ -199,16 +200,21 @@ export function CanonicalJobOverview({ execution }: { execution: JobExecution })
       </Section>
 
       <Section title={t("execution.canonical.counts")}>
-        <dl>
-          <Fact label="execution.attempts">{formatCount(execution.attempts.length)}</Fact>
-          <Fact label="execution.executors">{formatCount(execution.executors.length)}</Fact>
-          <Fact label="execution.calls">{formatCount(summary.total)}</Fact>
-          <Fact label="execution.canonical.providerCalls">{formatCount(kinds.filter(kind => kind === "provider").length)}</Fact>
-          <Fact label="execution.canonical.nativeCalls">{formatCount(kinds.filter(kind => kind === "native").length)}</Fact>
-          <Fact label="execution.canonical.running">{formatCount(summary.running + summary.queued)}</Fact>
-          <Fact label="execution.canonical.completed">{formatCount(summary.completed)}</Fact>
-          <Fact label="execution.canonical.failed">{formatCount(summary.failed)}</Fact>
-        </dl>
+        <SpecSheet
+          title={t("execution.canonical.counts")}
+          rows={[
+            { label: t("execution.attempts"), value: formatCount(execution.attempts.length) },
+            { label: t("execution.executors"), value: formatCount(execution.executors.length) },
+            { label: t("execution.calls"), value: formatCount(summary.total), emphasis: true },
+            { label: t("execution.canonical.providerCalls"), value: formatCount(kinds.filter(kind => kind === "provider").length) },
+            { label: t("execution.canonical.nativeCalls"), value: formatCount(kinds.filter(kind => kind === "native").length) },
+            { label: t("execution.canonical.running"), value: formatCount(summary.running + summary.queued) },
+            { label: t("execution.canonical.completed"), value: formatCount(summary.completed) },
+            { label: t("execution.canonical.failed"), value: formatCount(summary.failed) },
+          ] as SpecRow[]}
+          visibleCount={8}
+          className="mt-2"
+        />
       </Section>
 
       {latestRecovery && (

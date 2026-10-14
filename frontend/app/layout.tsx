@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 import { Geist_Mono, Noto_Sans, Noto_Sans_SC, Playfair_Display } from "next/font/google";
 import "./globals.css";
+import "katex/dist/katex.min.css";
 import { cn } from "@/lib/utils";
 import { ThemeProvider } from "@/components/ocg/appearance/theme-provider";
 import { THEME_BOOTSTRAP_SCRIPT } from "@/components/ocg/appearance/theme-bootstrap";

@@ -25,7 +25,6 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { BORDER_TONE, StatusDot, STATUS_TEXT, TEXT_TONE, TOOL_STATUS } from "@/components/ocg/primitives";
 import { ActivityPulse } from "../activity-pulse";
@@ -37,9 +36,8 @@ import type { QueuedChatMessage } from "../types";
 import { retryInput } from "./retry";
 import { activeExecutionTarget, currentActivity, executionActivity, isExecutionActive, type ActiveExecutionTarget, type ActivityStep, type ExecutionPhase } from "./execution-status";
 import { readModelPreference, writeModelPreference } from "./model-preference";
-import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./message-bounds";
+import { BoundedMessage } from "./bounded-message";
 import type { JobExecution } from "../execution/domain";
-import { parseMarkdownTable, type MarkdownTable } from "./markdown-table";
 import { AttachmentStaging, ImageGallery, useImageAttachments } from "./image-attachments";
 import {
   applyComposerSuggestion,
@@ -49,184 +47,7 @@ import {
   type ComposerIntent,
   type ComposerSuggestion,
 } from "../composer/domain";
-
-/* ---------- lightweight markdown rendering (no new deps) ---------- */
-
-function renderInline(text: string, keyPrefix: string): React.ReactNode[] {
-  const parts: React.ReactNode[] = [];
-  const re = /(\*\*[^*]+\*\*|`[^`]+`)/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let i = 0;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) parts.push(text.slice(last, m.index));
-    const token = m[0];
-    if (token.startsWith("**")) {
-      parts.push(
-        <strong key={`${keyPrefix}-b${i}`} className="font-semibold text-foreground">
-          {token.slice(2, -2)}
-        </strong>,
-      );
-    } else {
-      parts.push(
-        <code
-          key={`${keyPrefix}-c${i}`}
-          className="rounded border border-border bg-muted px-1 py-px font-mono text-xs text-foreground"
-        >
-          {token.slice(1, -1)}
-        </code>,
-      );
-    }
-    last = m.index + token.length;
-    i += 1;
-  }
-  if (last < text.length) parts.push(text.slice(last));
-  return parts;
-}
-
-function CodeBlock({ language, code }: { language: string; code: string }) {
-  const { isCopied, copyToClipboard } = useCopyToClipboard();
-  const { t } = useI18n();
-  return (
-    <div className="overflow-hidden rounded-md border border-border bg-muted/40">
-      <div className="flex items-center gap-2 border-b border-border px-2.5 py-1.5">
-        <span className="font-mono text-xs text-muted-foreground">
-          {language || t("chat.code")}
-        </span>
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <button
-                type="button"
-                onClick={() => copyToClipboard(code)}
-                className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                aria-label={isCopied ? t("common.copied") : t("chat.copyCodeToClipboard")}
-              >
-                {isCopied ? <Check className="size-3" /> : <Copy className="size-3" />}
-                {isCopied ? t("common.copied") : t("common.copy")}
-              </button>
-            }
-          />
-          <TooltipContent side="left">{t("chat.copyCode")}</TooltipContent>
-        </Tooltip>
-      </div>
-      <pre className="overflow-x-auto p-2.5 font-mono text-xs leading-5 text-foreground">
-        <code>{code}</code>
-      </pre>
-    </div>
-  );
-}
-
-function TableBlock({ table }: { table: MarkdownTable }) {
-  const { t } = useI18n();
-  return (
-    <div role="region" aria-label={t("chat.markdownTable")} tabIndex={0} className="max-w-full overflow-x-auto rounded-md border border-border focus-visible:outline-ring">
-      <table className="w-full min-w-max border-collapse text-xs leading-5">
-        <thead className="bg-muted/50">
-          <tr>
-            {table.headers.map((header, index) => (
-              <th key={index} scope="col" style={{ textAlign: table.alignments[index] }} className="border-r border-border px-3 py-2 font-semibold last:border-r-0">
-                {renderInline(header, `table-header-${index}`)}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        {table.rows.length > 0 && <tbody>
-          {table.rows.map((row, rowIndex) => (
-            <tr key={rowIndex} className="border-t border-border">
-              {row.map((cell, columnIndex) => (
-                <td key={columnIndex} style={{ textAlign: table.alignments[columnIndex] }} className="border-r border-border px-3 py-2 align-top last:border-r-0">
-                  {renderInline(cell, `table-${rowIndex}-${columnIndex}`)}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>}
-      </table>
-    </div>
-  );
-}
-
-function Markdown({ content }: { content: string }) {
-  const blocks: React.ReactNode[] = [];
-  const fence = /```(\w*)\n([\s\S]*?)```/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let bi = 0;
-  const pushText = (text: string, key: string) => {
-    const lines = text.split("\n");
-    let li = 0;
-    let listBuffer: string[] = [];
-    const flushList = () => {
-      if (listBuffer.length === 0) return;
-      blocks.push(
-        <ul key={`${key}-ul${li}`} className="flex list-disc flex-col gap-1 pl-5">
-          {listBuffer.map((item, idx) => (
-            <li key={idx}>{renderInline(item, `${key}-li${idx}`)}</li>
-          ))}
-        </ul>,
-      );
-      listBuffer = [];
-    };
-    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-      const table = parseMarkdownTable(lines, lineIndex);
-      if (table) {
-        flushList();
-        blocks.push(<TableBlock key={`${key}-table${li}`} table={table} />);
-        lineIndex = table.nextLine - 1;
-        li += 1;
-        continue;
-      }
-      const line = lines[lineIndex];
-      const trimmed = line.trim();
-      const embeddedImages = [...line.matchAll(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)\)/g)];
-      if (embeddedImages.length) {
-        flushList();
-        const text = line.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)\)/g, "").trim();
-        if (text) blocks.push(<p key={`${key}-p${li}`} className="leading-6">{renderInline(text, `${key}-p${li}`)}</p>);
-        blocks.push(<ImageGallery key={`${key}-images${li}`} images={embeddedImages.map((match, index) => ({ id: `${key}-${li}-${index}`, name: match[1] || "Image", media_type: "image/*", url: match[2] }))} />);
-      } else if (trimmed.startsWith("- ")) {
-        listBuffer.push(trimmed.slice(2));
-      } else {
-        flushList();
-        if (trimmed === "") {
-          // paragraph break — no node needed
-        } else if (trimmed.startsWith("### ")) {
-          blocks.push(
-            <h4 key={`${key}-h${li}`} className="pt-1 text-[13px] font-semibold">
-              {renderInline(trimmed.slice(4), `${key}-h${li}`)}
-            </h4>,
-          );
-        } else if (trimmed.startsWith("## ")) {
-          blocks.push(
-            <h3 key={`${key}-h${li}`} className="pt-1 text-[13px] font-semibold">
-              {renderInline(trimmed.slice(3), `${key}-h${li}`)}
-            </h3>,
-          );
-        } else if (/^\d+\.\s/.test(trimmed)) {
-          listBuffer.push(trimmed.replace(/^\d+\.\s/, ""));
-        } else {
-          blocks.push(
-            <p key={`${key}-p${li}`} className="leading-6">
-              {renderInline(line, `${key}-p${li}`)}
-            </p>,
-          );
-        }
-      }
-      li += 1;
-    }
-    flushList();
-  };
-
-  while ((m = fence.exec(content)) !== null) {
-    if (m.index > last) pushText(content.slice(last, m.index), `t${bi}`);
-    blocks.push(<CodeBlock key={`c${bi}`} language={m[1]} code={m[2].replace(/\n$/, "")} />);
-    last = m.index + m[0].length;
-    bi += 1;
-  }
-  if (last < content.length) pushText(content.slice(last), `t${bi}`);
-  return <div className="flex flex-col gap-2">{blocks}</div>;
-}
+import { MarkdownRenderer } from "./markdown-renderer";
 
 /* ---------- tool / activity block ---------- */
 
@@ -285,65 +106,6 @@ function ToolBlock({ message }: { message: ChatMessage }) {
 
 /* ---------- message row ---------- */
 
-/**
- * A long message scrolls inside its own bounded viewport until the reader
- * expands it. A streaming message keeps its newest output in view until the
- * reader scrolls up inside it.
- */
-function BoundedMessage({ streaming, children }: { streaming: boolean; children: React.ReactNode }) {
-  const { t } = useI18n();
-  const viewport = useRef<HTMLDivElement>(null);
-  const content = useRef<HTMLDivElement>(null);
-  const following = useRef(true);
-  const lastTop = useRef(0);
-  const [expanded, setExpanded] = useState(false);
-  const [overflowing, setOverflowing] = useState(false);
-
-  useEffect(() => {
-    const el = viewport.current;
-    const inner = content.current;
-    if (!el || !inner) return;
-    const observer = new ResizeObserver(() => {
-      if (!expanded && streaming && following.current) {
-        el.scrollTop = el.scrollHeight;
-        lastTop.current = el.scrollTop;
-      }
-      setOverflowing(el.scrollHeight - el.clientHeight > 1);
-    });
-    observer.observe(inner);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [expanded, streaming]);
-
-  const toggle = boundedToggle(overflowing, expanded);
-  return (
-    <>
-      <div
-        ref={viewport}
-        data-message-bounds={expanded ? "expanded" : "bounded"}
-        onScroll={() => {
-          const el = viewport.current;
-          if (!el || expanded) return;
-          following.current = followAfterScroll(following.current, lastTop.current, el);
-          lastTop.current = el.scrollTop;
-        }}
-        className={cn("min-w-0", !expanded && BOUNDED_MESSAGE_CLASS)}
-      >
-        <div ref={content}>{children}</div>
-      </div>
-      {toggle && <button
-        type="button"
-        aria-expanded={expanded}
-        onClick={() => setExpanded(value => !value)}
-        className="mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring"
-      >
-        <ChevronDown className={cn("size-3 transition-transform", expanded && "rotate-180")} aria-hidden="true" />
-        {t(toggle === "collapse" ? "chat.collapseMessage" : "chat.expandMessage")}
-      </button>}
-    </>
-  );
-}
-
 function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message: ChatMessage; toolMessages?: ChatMessage[]; onRetry?: () => void; retryDisabled?: boolean }) {
   const { t } = useI18n();
   const { isCopied, copyToClipboard } = useCopyToClipboard();
@@ -373,23 +135,17 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
           <div className="mb-1 flex items-center gap-2">
             <span className="text-xs font-semibold">{isUser ? t("chat.you") : t("chat.assistant")}</span>
             <span className="text-xs text-muted-foreground">{message.createdAt}</span>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    type="button"
-                    onClick={() => copyToClipboard(message.content)}
-                    disabled={message.content.length === 0}
-                    className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
-                    aria-label={isUser ? t("chat.copyRawUserMessage") : t("chat.copyRawAssistantMessage")}
-                  >
-                    {isCopied ? <Check className="size-3" aria-hidden="true" /> : <Copy className="size-3" aria-hidden="true" />}
-                    <span role="status">{isCopied ? t("common.copied") : t("common.copy")}</span>
-                  </button>
-                }
-              />
-              <TooltipContent side="left">{t("chat.copyRawMessage")}</TooltipContent>
-            </Tooltip>
+            <button
+              type="button"
+              onClick={() => copyToClipboard(message.content)}
+              disabled={message.content.length === 0}
+              className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
+              aria-label={isUser ? t("chat.copyRawUserMessage") : t("chat.copyRawAssistantMessage")}
+              title={t("chat.copyRawMessage")}
+            >
+              {isCopied ? <Check className="size-3" aria-hidden="true" /> : <Copy className="size-3" aria-hidden="true" />}
+              <span role="status">{isCopied ? t("common.copied") : t("common.copy")}</span>
+            </button>
           </div>
           {!isUser && message.reasoning && (
             <Collapsible open={reasoningOpen} onOpenChange={setReasoningOpen}>
@@ -410,8 +166,8 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
                   />
                 </CollapsibleTrigger>
                 <CollapsibleContent>
-                  <div className="border-t border-border bg-background/40 px-2.5 py-2 text-[13px] leading-relaxed text-muted-foreground">
-                    <Markdown content={message.reasoning} />
+                  <div className="border-t border-border bg-background/40 px-2.5 py-2 text-[13px] leading-6 text-muted-foreground">
+                    <MarkdownRenderer content={message.reasoning} inMuted={true} />
                   </div>
                 </CollapsibleContent>
               </div>
@@ -419,14 +175,14 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
           )}
            <div
              className={cn(
-               "text-sm text-foreground/90",
+               "text-base leading-7 text-foreground/90",
                isUser && "rounded-md border border-border bg-muted/30 px-3 py-2",
                message.status === "failed" && STATUS_TEXT['error'],
                message.status === "cancelled" && "text-muted-foreground italic",
              )}
            >
              <BoundedMessage streaming={message.status === "streaming"}>
-               <Markdown content={message.content} />
+               <MarkdownRenderer content={message.content} />
                <ImageGallery images={message.images} />
              </BoundedMessage>
              {message.status === "failed" && <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-xs">
@@ -462,7 +218,7 @@ function MessageRow({ message, toolMessages, onRetry, retryDisabled }: { message
 
 /* ---------- composer ---------- */
 
-function Composer({
+export function ChatComposer({
   projectId,
   draft,
   onDraftChange,
@@ -476,6 +232,7 @@ function Composer({
   active,
   activity,
   onCancel,
+  autoFocus = false,
 }: {
   projectId?: string;
   busy: boolean;
@@ -486,6 +243,7 @@ function Composer({
   active: ActiveExecutionTarget | null;
   activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
   onCancel?: () => Promise<void>;
+  autoFocus?: boolean;
   draft: string;
   onDraftChange: (v: string) => void;
   onIntent: (intent: ComposerIntent) => void | Promise<void>;
@@ -524,6 +282,10 @@ function Composer({
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, [draft]);
+
+  useEffect(() => {
+    if (autoFocus) ref.current?.focus();
+  }, [autoFocus]);
 
   const suggestions = matchComposerSuggestions(draft);
   const suggestionsOpen = suggestions.length > 0 && dismissedFor !== draft;
@@ -632,8 +394,8 @@ function Composer({
           images.add(Array.from(event.target.files ?? []));
           event.target.value = "";
         }} />
-        <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active} activity={activity} />
         <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
+          <ModelSelector selection={selection} onChange={onSelectionChange} onPreference={onPreference} busy={busy || submitting || cancelling} active={active} activity={activity} />
           <AttachmentStaging state={images} disabled={submitting || cancelling} />
           <div className="relative">
             {suggestionsOpen && (
@@ -745,64 +507,33 @@ function Composer({
             </p>
           )}
           <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    className="size-11 rounded-md sm:size-9"
-                    aria-label={t("chat.attachFile")}
-                    disabled={submitting || cancelling}
-                    onClick={() => fileInput.current?.click()}
-                  >
-                    <Paperclip className="size-4" />
-                  </Button>
-                }
-              />
-              <TooltipContent side="top">{t("chat.attachFile")}</TooltipContent>
-            </Tooltip>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              className="size-11 rounded-md sm:size-9"
+              aria-label={t("chat.attachFile")}
+              title={t("chat.attachFile")}
+              disabled={submitting || cancelling}
+              onClick={() => fileInput.current?.click()}
+            >
+              <Paperclip className="size-4" />
+            </Button>
             <span id="composer-hint" className="sr-only sm:ml-1 sm:not-sr-only sm:text-xs sm:text-muted-foreground">
               <span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span>
               <span className="pointer-coarse:hidden">{busy ? t("chat.queueHint") : t("chat.hint")}</span>
             </span>
             <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
-              {busy && onCancel && (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={submitting || cancelling} onClick={() => void cancel()}>
-                        {cancelling ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}{t("chat.cancel")}
-                      </Button>
-                    }
-                  />
-                  <TooltipContent side="top">{t("chat.cancel")}</TooltipContent>
-                </Tooltip>
-              )}
-              {busy && (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={!canSend || !chatReady || submitting || cancelling} onClick={() => void submit("steer")}>
-                        {t("chat.steer")}
-                      </Button>
-                    }
-                  />
-                  <TooltipContent side="top">{t("chat.steerHint")}</TooltipContent>
-                </Tooltip>
-              )}
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button type="submit" size={queueing ? "xs" : "icon-sm"} className={cn("h-11 rounded-md tracking-normal normal-case sm:h-9", !queueing && "w-11 sm:w-9")} disabled={!canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat")} aria-label={t(queueing ? "chat.queue" : "chat.send")}>
-                      {submitting ? <Loader2 className="size-4 animate-spin" /> : busy ? <ListPlus className="size-4" /> : <ArrowUp className="size-4" />}
-                      {queueing && t("chat.queue")}
-                    </Button>
-                  }
-                />
-                <TooltipContent side="top">{t(busy ? "chat.queueHint" : "chat.send")}</TooltipContent>
-              </Tooltip>
+              {busy && onCancel && <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={submitting || cancelling} onClick={() => void cancel()} title={t("chat.cancel")}>
+                {cancelling ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}{t("chat.cancel")}
+              </Button>}
+              {busy && <Button type="button" variant="outline" size="xs" className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9" disabled={!canSend || !chatReady || submitting || cancelling} onClick={() => void submit("steer")} title={t("chat.steerHint")}>
+                {t("chat.steer")}
+              </Button>}
+              <Button type="submit" size={queueing ? "xs" : "icon-sm"} className={cn("h-11 rounded-md tracking-normal normal-case sm:h-9", !queueing && "w-11 sm:w-9")} disabled={!canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat")} aria-label={t(queueing ? "chat.queue" : "chat.send")} title={t(busy ? "chat.queueHint" : "chat.send")}>
+                {submitting ? <Loader2 className="size-4 animate-spin" /> : busy ? <ListPlus className="size-4" /> : <ArrowUp className="size-4" />}
+                {queueing && t("chat.queue")}
+              </Button>
             </div>
           </div>
         </div>
@@ -1014,7 +745,7 @@ export function ChatView({
           </ol>
         </div>
       )}
-      <Composer
+              <ChatComposer
         key={`${session.id}:${session.projectId ?? ""}`}
         projectId={session.projectId}
         busy={busy}

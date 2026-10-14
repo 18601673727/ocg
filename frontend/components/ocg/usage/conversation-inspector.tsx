@@ -15,6 +15,7 @@ import { useI18n, runtimeStateLabel } from "../i18n";
 import { formatCount } from "@/lib/format";
 import type { UsageRead } from "./use-usage";
 import { ActivityMetrics, ContextMetrics, CostDetails, hasRecordedUsage, TokenMetrics, UsageBreakdownList, UsageMetric, UsageScopeNote, usageTimestamp } from "./usage-values";
+import { SpecSheet, type SpecRow } from "@/components/assistant-ui/elements/spec-sheet";
 
 export function ConversationInspector({ usage, execution, accounting, observability, mode, onModeChange, onClose, onOpenJobExecution }: {
   usage: UsageRead<ConversationUsageResponse>; execution: JobExecution | null; accounting: JobAccounting | null;
@@ -25,6 +26,10 @@ export function ConversationInspector({ usage, execution, accounting, observabil
   const [tab, setTab] = useState<"conversation" | "execution">("conversation");
   const data = usage.data;
   const initialLoading = usage.loading && data === null;
+  const activityRows: readonly SpecRow[] = data ? [
+    { label: t("usage.turns"), value: formatCount(data.totals.turns) },
+    { label: t("usage.jobs"), value: formatCount(data.totals.jobs) },
+  ] : [];
   return <div className="flex h-full min-w-0 flex-col">
     <nav className="shrink-0 border-b border-border p-2"><SegmentedTabs tabs={[{ id: "conversation", label: t("usage.conversation") }, { id: "execution", label: t("usage.execution") }]} value={tab} onSelect={setTab} ariaLabel={t("usage.inspector")} className="grid-cols-2" panelId="conversation-inspector-panel" /></nav>
     <div id="conversation-inspector-panel" role="tabpanel" aria-label={t(tab === "conversation" ? "usage.conversation" : "usage.execution")} className="flex min-h-0 flex-1 flex-col">
@@ -45,10 +50,14 @@ export function ConversationInspector({ usage, execution, accounting, observabil
               {hasRecordedUsage(data.totals) ? <>
                 <section><h3 className="text-xs font-semibold">{t("usage.cost")}</h3><CostDetails cost={data.totals.cost} /></section>
                 <section className="border-t border-border pt-3"><h3 className="text-xs font-semibold">{t("usage.tokens")}</h3><TokenMetrics totals={data.totals} /></section>
-                <section className="border-t border-border pt-3"><h3 className="text-xs font-semibold">{t("usage.activity")}</h3><dl>
-                  <UsageMetric label="usage.turns" field="turns">{formatCount(data.totals.turns)}</UsageMetric>
-                  <UsageMetric label="usage.jobs" field="jobs">{formatCount(data.totals.jobs)}</UsageMetric>
-                </dl><ActivityMetrics totals={data.totals} /></section>
+                <section className="border-t border-border pt-3"><h3 className="text-xs font-semibold">{t("usage.activity")}</h3>
+                 <SpecSheet
+                   title={t("usage.activity")}
+                   rows={activityRows}
+                   visibleCount={activityRows.length}
+                   className="mt-2 px-3 py-2"
+                 />
+                 <ActivityMetrics totals={data.totals} /></section>
                 <section className="border-t border-border pt-3"><h3 className="text-xs font-semibold">{t("usage.breakdown")}</h3><UsageBreakdownList rows={data.models} /></section>
                 <section className="border-t border-border pt-3"><h3 className="text-xs font-semibold">{t("usage.context")}</h3><ContextMetrics totals={data.totals} /><p className="mt-2 text-xs text-muted-foreground">{t("usage.efficiencyNote")}</p></section>
               </> : <p className="text-xs text-muted-foreground">{t("usage.noActivity")}</p>}
