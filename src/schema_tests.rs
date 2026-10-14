@@ -10636,7 +10636,7 @@ mod lifecycle_closure {
     /// A Provider endpoint that accepts connections and never answers, so a
     /// request to it stalls before any response head. The accepted
     /// connections stay open while the returned receiver holds them.
-    fn silent_provider(connections: usize) -> (String, flume::Receiver<TcpStream>) {
+    pub(super) fn silent_provider(connections: usize) -> (String, flume::Receiver<TcpStream>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
         let port = listener.local_addr().expect("local address").port();
         let (sender, accepted) = flume::unbounded();
@@ -10700,7 +10700,6 @@ mod lifecycle_closure {
                 ..ProviderExecutionConfig::default()
             },
             tools: None,
-            images: Vec::new(),
         }
     }
 
@@ -18202,6 +18201,1110 @@ mod requests_and_tool_loop {
             );
             assert!(blocking(&handle, llm).is_empty());
             worker.shutdown().expect("shutdown");
+        }
+    }
+
+    // ---- Durable attachments ---------------------------------------------------
+
+    mod durable_attachments {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        use std::time::Duration;
+
+        use super::*;
+        use crate::attachments::{AttachmentError, AttachmentStore, StoreError, publish_seam};
+        use crate::openai_compatible::image::tests::{PNG_BASE64, jpeg, png};
+        use crate::openai_compatible::image::{MAX_IMAGE_BYTES, MAX_REQUEST_IMAGES};
+        use crate::openai_compatible::{ImageError, ImageMime};
+        use crate::orchestration::execution_runtime::{AttachmentImageError, attachment_images};
+        use crate::persistence::{
+            AttachmentCleanup, AttachmentId, AttachmentOrigin, AttachmentRecord, CleanupKind,
+            ContentDigest, JobInputId, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_NAME_BYTES,
+            NewAttachment, sanitize_display_name,
+        };
+        use crate::provider_execution::{
+            CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,
+            objective_conversation, objective_conversation_with_images, request_body,
+        };
+
+        const OBJECTIVE: &str = "What does the image show?";
+
+        fn new_attachment(content: Vec<u8>, mime: &str, name: Option<&str>) -> NewAttachment {
+            NewAttachment {
+                content,
+                mime: mime.to_owned(),
+                display_name: name.map(str::to_owned),
+            }
+        }
+
+        fn attach(
+            handle: &DatabaseHandle,
+            content: Vec<u8>,
+            mime: &str,
+            name: &str,
+        ) -> AttachmentId {
+            wait(handle.create_user_attachment(new_attachment(content, mime, Some(name))))
+                .expect("create an Attachment")
+        }
+
+        /// A PNG other than [`png`]: only the signature is checked.
+        fn other_png() -> Vec<u8> {
+            let mut bytes = png();
+            bytes.extend_from_slice(b"another image");
+            bytes
+        }
+
+        fn data_url(mime: &str, bytes: &[u8]) -> String {
+            format!(
+                "data:{mime};base64,{}",
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+            )
+        }
+
+        fn attachment(handle: &DatabaseHandle, id: AttachmentId) -> AttachmentRecord {
+            wait(handle.attachment(id))
+                .expect("read")
+                .expect("the Attachment exists")
+        }
+
+        fn input_attachments(handle: &DatabaseHandle, input: JobInputId) -> Vec<AttachmentId> {
+            wait(handle.job_input(input))
+                .expect("read")
+                .expect("the input exists")
+                .attachments
+        }
+
+        /// The names in the attachment directory, sorted.
+        fn stored_names(directory: &DataDirectory) -> Vec<String> {
+            let mut names = std::fs::read_dir(directory.attachments_path())
+                .expect("list")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .into_string()
+                        .expect("UTF-8")
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+
+        fn content_path(
+            directory: &DataDirectory,
+            record: &AttachmentRecord,
+        ) -> std::path::PathBuf {
+            directory.attachments_path().join(record.sha256.to_string())
+        }
+
+        fn clean_up(handle: &DatabaseHandle, id: AttachmentId, cleanup: AttachmentCleanup) {
+            wait(handle.with_database(move |database| {
+                crate::storage::record_attachment_cleanup(database, id, cleanup)
+            }))
+            .expect("record the cleanup");
+        }
+
+        /// A configured Job submitted with `attachments` and started by this
+        /// process, as the runtime starts one.
+        fn run_with(
+            handle: &DatabaseHandle,
+            llm: ProfileId,
+            attachments: Vec<AttachmentId>,
+        ) -> TokenRun {
+            let executor =
+                executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+            let input = wait(handle.save_job_input(
+                None,
+                JobInputDraft {
+                    objective: Some(OBJECTIVE.to_owned()),
+                    attachments,
+                    ..JobInputDraft::default()
+                },
+            ))
+            .expect("save the input");
+            let job = wait(handle.create_local_job_with_input(
+                NewJob {
+                    configuration: llm_only(llm),
+                    ..new_job("vision", handle.genesis(), Vec::new())
+                },
+                input,
+            ))
+            .expect("submit the Job");
+            TokenRun {
+                executor,
+                job,
+                input,
+            }
+        }
+
+        /// What the execution sends for `job`: its conversation, built from
+        /// its persisted input and Attachments, as a request body.
+        fn persisted_body(
+            handle: &DatabaseHandle,
+            job: JobId,
+        ) -> Result<Value, AttachmentImageError> {
+            let input = wait(handle.job_input_for_job(job))
+                .expect("read")
+                .expect("the input");
+            let configuration = wait(handle.job_configuration(job))
+                .expect("read")
+                .expect("a frozen configuration");
+            let images = wait(attachment_images(handle, &input.attachments))?;
+            let conversation = objective_conversation_with_images(
+                &configuration.frozen,
+                input.objective.as_deref(),
+                &images,
+            );
+            conversation.validate().expect("a valid request");
+            let config = &configuration.frozen.llm.config;
+            Ok(request_body(&config.model, &config.parameters, &conversation).expect("a body"))
+        }
+
+        /// The exact body of an image request of `model-a`, see [`llm_config`].
+        fn image_body(urls: &[String]) -> Value {
+            let mut content = vec![json!({"type": "text", "text": OBJECTIVE})];
+            content.extend(
+                urls.iter()
+                    .map(|url| json!({"type": "image_url", "image_url": {"url": url}})),
+            );
+            json!({
+                "messages": [{"role": "user", "content": content}],
+                "model": "model-a",
+                "stream": true,
+                "stream_options": {"include_usage": true},
+                "temperature": 0.2,
+                "max_tokens": 256,
+            })
+        }
+
+        /// Settles `run` from one answered request of its persisted
+        /// conversation, as the execution sends it.
+        fn answer(handle: &DatabaseHandle, run: TokenRun, text: &str) -> ExecutionReceipt {
+            let input = wait(handle.job_input_for_job(run.job))
+                .expect("read")
+                .expect("the input");
+            let configuration = wait(handle.job_configuration(run.job))
+                .expect("read")
+                .expect("a frozen configuration");
+            let images = wait(attachment_images(handle, &input.attachments)).expect("images");
+            let conversation = objective_conversation_with_images(
+                &configuration.frozen,
+                input.objective.as_deref(),
+                &images,
+            );
+            let steps = answering(text, (85, 7));
+            let handle = handle.clone();
+            on_ntex(async move {
+                let config = ProviderExecutionConfig::default();
+                let mut steps = Some(steps);
+                run_provider_job(
+                    ProviderRun {
+                        database: handle,
+                        executor: run.executor,
+                        input: run.input,
+                        job: run.job,
+                    },
+                    conversation,
+                    None,
+                    &CancellationToken::default(),
+                    async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
+                        conversation
+                            .validate()
+                            .map_err(|error| ProviderExecutionError::Build {
+                                message: error.to_string(),
+                            })?;
+                        announce(Some(&mut *sink), ProviderFact::Delivered).await;
+                        read_response(
+                            payload(
+                                steps.take().expect("one request"),
+                                config.cancellation.clone(),
+                            ),
+                            200,
+                            Instant::now(),
+                            None,
+                            &config,
+                            Some(&mut *sink),
+                            conversation,
+                        )
+                        .await
+                    },
+                )
+                .await
+            })
+            .expect("settled")
+        }
+
+        #[test]
+        fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
+            let (_root, directory) = data_directory("attachment-entity");
+            assert_eq!(crate::storage::FORMAT_VERSION, 13);
+            let worker = DatabaseWorker::start(&directory).expect("a new format 13 database");
+            let handle = worker.handle();
+            let first = attach(&handle, png(), "image/png", "../shots/screen.png");
+            let second = attach(&handle, jpeg(), "image/jpeg", "photo.jpg");
+            assert_ne!(first, second);
+            let record = attachment(&handle, first);
+            assert_eq!(
+                (
+                    record.id,
+                    record.sha256,
+                    record.byte_length,
+                    record.mime.as_str(),
+                    record.display_name.as_deref(),
+                    record.origin,
+                    record.cleanup,
+                ),
+                (
+                    first,
+                    ContentDigest::of(&png()),
+                    png().len() as u64,
+                    "image/png",
+                    Some("screen.png"),
+                    AttachmentOrigin::UserProvided,
+                    None,
+                )
+            );
+            assert!(record.is_available());
+            let created = attachment(&handle, second).created_at;
+            assert!(record.created_at <= created);
+            let listed = wait(handle.attachments(None, 10)).expect("list");
+            assert_eq!(
+                listed.iter().map(|record| record.id).collect::<Vec<_>>(),
+                [second, first],
+                "newest first"
+            );
+            assert_eq!(
+                wait(handle.attachments(Some(second), 10)).expect("page"),
+                std::slice::from_ref(&record)
+            );
+            let marker = wait(handle.operation_markers(None, 1_000))
+                .expect("markers")
+                .into_iter()
+                .find(|marker| marker.kind == crate::persistence::OperationKind::CreateAttachment)
+                .expect("a marker");
+            assert_eq!(marker.created, Some(RecordRef::Attachment(first)));
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            assert_eq!(attachment(&handle, first), record);
+            assert_eq!(wait(handle.attachments(None, 10)).expect("list"), listed);
+            let content = wait(handle.attachment_content(first)).expect("content");
+            assert_eq!((content.record, content.bytes), (record, png()));
+            assert!(
+                wait(handle.attachment(AttachmentId::new(99)))
+                    .expect("read")
+                    .is_none()
+            );
+            assert!(matches!(
+                wait(handle.attachment_content(AttachmentId::new(99))),
+                Err(AttachmentError::NotFound(id)) if id == AttachmentId::new(99)
+            ));
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn identical_bytes_make_two_attachments_sharing_one_content_file() {
+            let (_root, directory) = data_directory("attachment-identity");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let first = attach(&handle, png(), "image/png", "a.png");
+            let path = content_path(&directory, &attachment(&handle, first));
+            let inode = std::fs::metadata(&path).expect("metadata").ino();
+            let second = attach(&handle, png(), "image/png", "b.png");
+            assert_ne!(first, second, "each upload is its own Attachment");
+            let (a, b) = (attachment(&handle, first), attachment(&handle, second));
+            assert_eq!(a.sha256, b.sha256);
+            assert_eq!(
+                (a.display_name.as_deref(), b.display_name.as_deref()),
+                (Some("a.png"), Some("b.png"))
+            );
+            assert_eq!(
+                stored_names(&directory),
+                [a.sha256.to_string()],
+                "one content file"
+            );
+            assert_eq!(std::fs::metadata(&path).expect("metadata").ino(), inode);
+            assert_eq!(
+                std::fs::metadata(&path).expect("metadata").mode() & 0o7777,
+                0o600
+            );
+
+            // Cleaning one up leaves the other available.
+            clean_up(
+                &handle,
+                first,
+                AttachmentCleanup {
+                    kind: CleanupKind::Manual,
+                    cleaned_at: Timestamp::from_unix_micros(1),
+                },
+            );
+            assert!(!attachment(&handle, first).is_available());
+            assert!(attachment(&handle, second).is_available());
+            assert_eq!(
+                wait(handle.attachment_content(second))
+                    .expect("content")
+                    .bytes,
+                png()
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn display_names_are_sanitized_to_a_file_name() {
+            for (given, kept) in [
+                ("shot.png", Some("shot.png")),
+                ("../../etc/passwd", Some("passwd")),
+                ("C:\\Users\\me\\scan.jpg", Some("scan.jpg")),
+                ("  spaced name.png  ", Some("spaced name.png")),
+                ("line\nbreak\u{7}.png", Some("linebreak.png")),
+                ("dir/", None),
+                ("   ", None),
+                ("..", None),
+                ("a/.", None),
+                ("", None),
+            ] {
+                assert_eq!(sanitize_display_name(given).as_deref(), kept, "{given:?}");
+            }
+            let long = format!("{}.png", "图".repeat(100));
+            let kept = sanitize_display_name(&long).expect("a name");
+            assert!(kept.len() <= MAX_ATTACHMENT_NAME_BYTES, "{}", kept.len());
+            assert!(long.starts_with(&kept), "cut on a character boundary");
+
+            let (_root, directory) = data_directory("attachment-name");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let named = attach(&handle, png(), "image/png", "/tmp/x\r\n/../shot.png");
+            assert_eq!(
+                attachment(&handle, named).display_name.as_deref(),
+                Some("shot.png")
+            );
+            let unnamed =
+                wait(handle.create_user_attachment(new_attachment(png(), "image/png", None)))
+                    .expect("create");
+            assert_eq!(attachment(&handle, unnamed).display_name, None);
+            let blank = attach(&handle, png(), "image/png", " \t ");
+            assert_eq!(attachment(&handle, blank).display_name, None);
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_new_attachment_is_checked_before_anything_is_published() {
+            let (_root, directory) = data_directory("attachment-checked");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let refused =
+                |attachment: NewAttachment| match wait(handle.create_user_attachment(attachment)) {
+                    Err(AttachmentError::Database(error)) => violation::<()>(Err(error)),
+                    other => panic!("expected a refusal, got {other:?}"),
+                };
+            assert_eq!(
+                refused(new_attachment(Vec::new(), "image/png", None)),
+                Violation::InvalidValue("content", "cannot be empty")
+            );
+            assert_eq!(
+                refused(new_attachment(
+                    vec![0; MAX_ATTACHMENT_BYTES + 1],
+                    "image/png",
+                    None
+                )),
+                Violation::ValueOutOfRange("content")
+            );
+            for mime in [
+                "",
+                "png",
+                "image/PNG",
+                "image/png; charset=x",
+                "image/",
+                "/png",
+                "image/png/x",
+            ] {
+                assert!(
+                    matches!(
+                        refused(new_attachment(png(), mime, None)),
+                        Violation::InvalidValue("mime", _)
+                    ),
+                    "{mime:?}"
+                );
+            }
+            assert!(stored_names(&directory).is_empty(), "nothing was published");
+            assert!(wait(handle.attachments(None, 10)).expect("list").is_empty());
+            // Any well-formed type is an Attachment; only sending checks images.
+            attach(&handle, b"plain text".to_vec(), "text/plain", "notes.txt");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn an_input_names_its_attachments_in_order_until_it_is_submitted() {
+            let (_root, directory) = data_directory("attachment-input");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let a = attach(&handle, png(), "image/png", "a.png");
+            let b = attach(&handle, jpeg(), "image/jpeg", "b.jpg");
+            let c = attach(&handle, other_png(), "image/png", "c.png");
+            let draft = |attachments: Vec<AttachmentId>| JobInputDraft {
+                objective: Some(OBJECTIVE.to_owned()),
+                attachments,
+                ..JobInputDraft::default()
+            };
+            let input = wait(handle.save_job_input(None, draft(vec![c, a, b]))).expect("save");
+            assert_eq!(
+                input_attachments(&handle, input),
+                [c, a, b],
+                "in the given order"
+            );
+            wait(handle.save_job_input(Some(input), draft(vec![b, c]))).expect("edit");
+            assert_eq!(input_attachments(&handle, input), [b, c]);
+            assert!(wait(handle.attachment_inputs(a)).expect("read").is_empty());
+            assert_eq!(wait(handle.attachment_inputs(b)).expect("read"), [input]);
+
+            let missing = AttachmentId::new(42);
+            assert_eq!(
+                violation(wait(
+                    handle.save_job_input(Some(input), draft(vec![a, missing]))
+                )),
+                Violation::NotFound(RecordRef::Attachment(missing))
+            );
+            assert_eq!(
+                violation(wait(handle.save_job_input(None, draft(vec![a, b, a])))),
+                Violation::DuplicateReference(RecordRef::Attachment(a))
+            );
+            clean_up(
+                &handle,
+                a,
+                AttachmentCleanup {
+                    kind: CleanupKind::Automatic,
+                    cleaned_at: Timestamp::from_unix_micros(5),
+                },
+            );
+            assert_eq!(
+                violation(wait(handle.save_job_input(Some(input), draft(vec![a])))),
+                Violation::AttachmentCleanedUp(a)
+            );
+            assert_eq!(
+                input_attachments(&handle, input),
+                [b, c],
+                "refusals changed nothing"
+            );
+
+            let job = wait(handle.create_job_with_input(
+                NewJob {
+                    configuration: llm_only(llm),
+                    ..new_job("vision", handle.genesis(), Vec::new())
+                },
+                input,
+            ))
+            .expect("submit");
+            assert_eq!(
+                violation(wait(handle.save_job_input(Some(input), draft(vec![c])))),
+                Violation::InputAlreadySubmitted(input)
+            );
+            let submitted = wait(handle.job_input_for_job(job))
+                .expect("read")
+                .expect("input");
+            assert_eq!((submitted.id, submitted.attachments), (input, vec![b, c]));
+            assert!(submitted.submitted_at.is_some());
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            assert_eq!(
+                input_attachments(&worker.handle(), input),
+                [b, c],
+                "frozen with the input"
+            );
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn cleanup_keeps_the_attachment_its_metadata_and_its_references() {
+            let (_root, directory) = data_directory("attachment-cleanup");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let manual = attach(&handle, png(), "image/png", "manual.png");
+            let automatic = attach(&handle, jpeg(), "image/jpeg", "automatic.jpg");
+            let run = run_with(&handle, llm, vec![manual, automatic]);
+            let before = (attachment(&handle, manual), attachment(&handle, automatic));
+            let cleanups = [
+                AttachmentCleanup {
+                    kind: CleanupKind::Manual,
+                    cleaned_at: Timestamp::from_unix_micros(1_760_538_720_000_000),
+                },
+                AttachmentCleanup {
+                    kind: CleanupKind::Automatic,
+                    cleaned_at: Timestamp::from_unix_micros(1_760_538_780_000_000),
+                },
+            ];
+            clean_up(&handle, manual, cleanups[0]);
+            clean_up(&handle, automatic, cleanups[1]);
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            for (id, earlier, cleanup) in [
+                (manual, &before.0, cleanups[0]),
+                (automatic, &before.1, cleanups[1]),
+            ] {
+                let record = attachment(&handle, id);
+                assert_eq!(
+                    record,
+                    AttachmentRecord {
+                        cleanup: Some(cleanup),
+                        ..earlier.clone()
+                    },
+                    "only the cleanup changed"
+                );
+                assert!(!record.is_available());
+                assert!(matches!(
+                    wait(handle.attachment_content(id)),
+                    Err(AttachmentError::CleanedUp { id: cleaned, cleanup: recorded })
+                        if cleaned == id && recorded == cleanup
+                ));
+            }
+            assert_eq!(
+                input_attachments(&handle, run.input),
+                [manual, automatic],
+                "the history keeps its references"
+            );
+            assert_eq!(
+                wait(handle.attachment_inputs(manual)).expect("read"),
+                [run.input]
+            );
+            // Unavailable is not erased: recording the state removes no bytes.
+            assert!(content_path(&directory, &before.0).exists());
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_failed_publication_commits_no_attachment() {
+            let (_root, directory) = data_directory("attachment-unpublished");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            publish_seam::install(|point| point != publish_seam::Point::Staged);
+            let staged =
+                wait(handle.create_user_attachment(new_attachment(png(), "image/png", None)));
+            publish_seam::clear();
+            assert!(matches!(
+                staged,
+                Err(AttachmentError::NotStored(StoreError::Io(_)))
+            ));
+            assert!(stored_names(&directory).is_empty());
+
+            // Renamed but not synced: the file stays, named by no record.
+            publish_seam::install(|point| point != publish_seam::Point::Published);
+            let published =
+                wait(handle.create_user_attachment(new_attachment(png(), "image/png", None)));
+            publish_seam::clear();
+            assert!(matches!(
+                published,
+                Err(AttachmentError::NotStored(StoreError::Io(_)))
+            ));
+            assert!(wait(handle.attachments(None, 10)).expect("list").is_empty());
+            let digest = ContentDigest::of(&png()).to_string();
+            assert_eq!(stored_names(&directory), std::slice::from_ref(&digest));
+
+            let id = attach(&handle, png(), "image/png", "shot.png");
+            assert_eq!(stored_names(&directory), [digest], "the orphan is reused");
+            assert_eq!(
+                wait(handle.attachment_content(id)).expect("content").bytes,
+                png()
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn startup_removes_interrupted_staging_files_and_keeps_published_content() {
+            let (_root, directory) = data_directory("attachment-recovery");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let referenced = attach(&handle, png(), "image/png", "kept.png");
+            let record = attachment(&handle, referenced);
+            worker.shutdown().expect("shutdown");
+
+            // A crash after a publication, before its record committed.
+            let orphan = AttachmentStore::open(directory.attachments_path())
+                .expect("open the store")
+                .publish(&jpeg())
+                .expect("publish");
+            // Crashes while staging: one partial, one complete.
+            let path = directory.attachments_path();
+            std::fs::write(path.join(".ocg-staging-1-2-3"), &png()[..4]).expect("write");
+            std::fs::write(path.join(".ocg-staging-4-5-6"), other_png()).expect("write");
+            let orphan_inode = std::fs::metadata(path.join(orphan.to_string()))
+                .expect("metadata")
+                .ino();
+
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            let mut expected = vec![record.sha256.to_string(), orphan.to_string()];
+            expected.sort();
+            assert_eq!(stored_names(&directory), expected);
+            assert_eq!(
+                wait(handle.attachments(None, 10)).expect("list"),
+                std::slice::from_ref(&record),
+                "the orphan has no record"
+            );
+            assert_eq!(
+                wait(handle.attachment_content(referenced))
+                    .expect("content")
+                    .bytes,
+                png()
+            );
+            let adopted = attach(&handle, jpeg(), "image/jpeg", "late.jpg");
+            assert_eq!(attachment(&handle, adopted).sha256, orphan);
+            assert_eq!(
+                std::fs::metadata(path.join(orphan.to_string()))
+                    .expect("metadata")
+                    .ino(),
+                orphan_inode,
+                "the published file is reused as it is"
+            );
+            worker.shutdown().expect("shutdown");
+
+            // A start that finds nothing to clean changes nothing.
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            assert_eq!(stored_names(&directory), expected);
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn an_untrusted_attachment_directory_stops_the_database_from_starting() {
+            let (_root, directory) = data_directory("attachment-untrusted");
+            let path = directory.attachments_path();
+            let refused = || match DatabaseWorker::start(&directory) {
+                Err(DatabaseError::AttachmentStore(error)) => error,
+                Err(other) => panic!("expected an attachment store refusal, got {other}"),
+                Ok(worker) => {
+                    worker.shutdown().ok();
+                    panic!("the database must not start")
+                }
+            };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            assert_eq!(refused(), StoreError::UntrustedDirectory);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            let elsewhere = directory.root().join("elsewhere");
+            std::fs::rename(path, &elsewhere).expect("move");
+            symlink(&elsewhere, path).expect("link");
+            std::fs::write(elsewhere.join(".ocg-staging-1-2-3"), b"x").expect("write");
+            assert_eq!(refused(), StoreError::UntrustedDirectory);
+            assert!(
+                elsewhere.join(".ocg-staging-1-2-3").exists(),
+                "nothing is cleaned through a link"
+            );
+            std::fs::remove_file(path).expect("unlink");
+            std::fs::rename(&elsewhere, path).expect("move back");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn an_attachment_directory_replaced_while_running_is_refused() {
+            let (_root, directory) = data_directory("attachment-replaced");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let existing = attach(&handle, png(), "image/png", "a.png");
+            let path = directory.attachments_path();
+            std::fs::rename(path, directory.root().join("moved")).expect("move away");
+            std::fs::create_dir(path).expect("replace");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            assert!(matches!(
+                wait(handle.create_user_attachment(new_attachment(jpeg(), "image/jpeg", None))),
+                Err(AttachmentError::NotStored(StoreError::DirectoryChanged))
+            ));
+            assert!(matches!(
+                wait(handle.attachment_content(existing)),
+                Err(AttachmentError::Content { id, error: StoreError::DirectoryChanged }) if id == existing
+            ));
+            assert!(
+                stored_names(&directory).is_empty(),
+                "the replacement gets nothing"
+            );
+            assert_eq!(wait(handle.attachments(None, 10)).expect("list").len(), 1);
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_format_12_database_is_refused_without_changing_it_or_its_attachments() {
+            let (_root, directory) = data_directory("attachment-format-12");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            worker.shutdown().expect("shutdown");
+            let file = crate::storage::database_file(directory.database_path());
+            {
+                let database = redb::Database::create(&file).expect("open the file");
+                let tx = database.begin_write().expect("write");
+                tx.open_table(redb::TableDefinition::<&str, &[u8]>::new("meta"))
+                    .expect("meta")
+                    .insert("format_version", 12u32.to_le_bytes().as_slice())
+                    .expect("set format 12");
+                tx.commit().expect("commit");
+            }
+            let staging = directory.attachments_path().join(".ocg-staging-1-2-3");
+            std::fs::write(&staging, b"x").expect("write");
+            let bytes = std::fs::read(&file).expect("read");
+            match DatabaseWorker::start(&directory) {
+                Err(DatabaseError::UnsupportedFormat { found, supported }) => {
+                    assert_eq!((found, supported), (12, 13));
+                }
+                Err(other) => panic!("expected a format refusal, got {other}"),
+                Ok(_) => panic!("a format 12 database must be refused"),
+            }
+            assert_eq!(std::fs::read(&file).expect("reread"), bytes, "unchanged");
+            assert!(
+                staging.exists(),
+                "nothing is cleaned for a refused database"
+            );
+        }
+
+        #[test]
+        fn images_are_rebuilt_from_the_persisted_input_in_order() {
+            let (_root, directory) = data_directory("attachment-images");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let first = attach(&handle, other_png(), "image/png", "first.png");
+            let second = attach(&handle, jpeg(), "image/jpeg", "second.jpg");
+            let third = attach(&handle, png(), "image/png", "third.png");
+            let run = run_with(&handle, llm, vec![second, third, first]);
+            assert_eq!(
+                persisted_body(&handle, run.job).expect("a body"),
+                image_body(&[
+                    data_url("image/jpeg", &jpeg()),
+                    format!("data:image/png;base64,{PNG_BASE64}"),
+                    data_url("image/png", &other_png()),
+                ])
+            );
+
+            // Without Attachments the request is the text one, unchanged.
+            let text = run_with(&handle, llm, Vec::new());
+            let configuration = wait(handle.job_configuration(text.job))
+                .expect("read")
+                .expect("configured");
+            let config = &configuration.frozen.llm.config;
+            assert_eq!(
+                persisted_body(&handle, text.job).expect("a body"),
+                request_body(
+                    &config.model,
+                    &config.parameters,
+                    &objective_conversation(&configuration.frozen, Some(OBJECTIVE))
+                )
+                .expect("a body")
+            );
+            assert_eq!(
+                persisted_body(&handle, text.job).expect("a body")["messages"],
+                json!([{"role": "user", "content": OBJECTIVE}])
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn image_limits_are_checked_from_the_records_before_content_is_read() {
+            let (_root, directory) = data_directory("attachment-limits");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let images =
+                |attachments: &[AttachmentId]| wait(attachment_images(&handle, attachments));
+            let one = attach(&handle, png(), "image/png", "a.png");
+            let many = (0..=MAX_REQUEST_IMAGES)
+                .map(|_| attach(&handle, png(), "image/png", "a.png"))
+                .collect::<Vec<_>>();
+            assert!(matches!(images(&many), Err(AttachmentImageError::TooMany)));
+            assert_eq!(
+                images(&many[..MAX_REQUEST_IMAGES])
+                    .expect("at the limit")
+                    .len(),
+                MAX_REQUEST_IMAGES
+            );
+
+            for (mime, content) in [
+                ("image/gif", b"GIF89a".to_vec()),
+                ("text/plain", b"text".to_vec()),
+            ] {
+                let other = attach(&handle, content, mime, "other");
+                assert!(matches!(
+                    images(&[one, other]),
+                    Err(AttachmentImageError::NotAnImage { attachment, error: ImageError::UnsupportedType })
+                        if attachment == other
+                ));
+            }
+            let mut largest = png();
+            largest.resize(MAX_IMAGE_BYTES, 0);
+            let mut large = largest.clone();
+            large.push(0);
+            let large = attach(&handle, large, "image/png", "large.png");
+            assert!(matches!(
+                images(&[large]),
+                Err(AttachmentImageError::NotAnImage { attachment, error: ImageError::TooLarge })
+                    if attachment == large
+            ));
+            let largest = (0..5)
+                .map(|_| attach(&handle, largest.clone(), "image/png", "largest.png"))
+                .collect::<Vec<_>>();
+            assert_eq!(images(&largest[..4]).expect("16 MiB together").len(), 4);
+            assert!(matches!(
+                images(&largest),
+                Err(AttachmentImageError::TooLarge)
+            ));
+            // A type its content does not match is refused once read.
+            let mislabeled = attach(&handle, jpeg(), "image/png", "fake.png");
+            assert!(matches!(
+                images(&[mislabeled]),
+                Err(AttachmentImageError::NotAnImage { attachment, error: ImageError::Mismatch("image/png") })
+                    if attachment == mislabeled
+            ));
+            assert_eq!(ImageMime::from_mime("image/png"), Some(ImageMime::Png));
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_job_is_rebuilt_after_a_restart_without_its_source_and_retried_unchanged() {
+            let (_root, directory) = data_directory("attachment-restart");
+            let (_workspace_root, workspace_path) =
+                crate::test_support::temporary_directory(SUITE, "attachment-restart-workspace");
+            std::fs::write(workspace_path.join("shot.png"), png()).expect("write the source");
+            let workspace = crate::orchestration::workspace_read::Workspace::authorize(
+                &workspace_path,
+                &directory,
+            )
+            .expect("authorize");
+            let source = workspace
+                .read_binary("shot.png", MAX_IMAGE_BYTES)
+                .expect("read the source");
+
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let id = attach(&handle, source.clone(), "image/png", "shot.png");
+            let run = run_with(&handle, llm, vec![id]);
+            let receipt = answer(&handle, run, "One transparent pixel.");
+            assert_eq!(receipt.job, run.job);
+            let job = job_record(&handle, run.job);
+            assert!(job.completed_at.is_some() && job.failed_at.is_none());
+            assert_eq!(
+                wait(handle.latest_output(run.job))
+                    .expect("read")
+                    .expect("result")
+                    .summary
+                    .as_deref(),
+                Some("One transparent pixel.")
+            );
+            worker.shutdown().expect("shutdown");
+
+            // The source goes away; nothing of the execution needs it.
+            std::fs::rename(
+                workspace_path.join("shot.png"),
+                workspace_path.join("renamed.png"),
+            )
+            .expect("rename the source");
+            std::fs::remove_file(workspace_path.join("renamed.png")).expect("remove the source");
+
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            let input = wait(handle.job_input_for_job(run.job))
+                .expect("read")
+                .expect("input");
+            assert_eq!((input.id, input.attachments.clone()), (run.input, vec![id]));
+            let content = wait(handle.attachment_content(id)).expect("content");
+            assert_eq!(content.bytes, source, "the exact bytes");
+            assert_eq!(ContentDigest::of(&content.bytes), content.record.sha256);
+            let expected = image_body(&[format!("data:image/png;base64,{PNG_BASE64}")]);
+            assert_eq!(persisted_body(&handle, run.job).expect("a body"), expected);
+
+            let retry = wait(handle.retry_job(JobRetry {
+                original: run.job,
+                input: RetryInput::Unchanged,
+                name: Some("retry".into()),
+                execution_mode: ExecutionMode::Once,
+                eligible_at: None,
+                scheduled_at: None,
+                next_due_at: None,
+                next_iteration_no: None,
+                iteration_no: None,
+                projects: Vec::new(),
+                dependencies: Vec::new(),
+                configuration: llm_only(llm),
+                assigned_executor: None,
+                acknowledge_repeated_effects: false,
+            }))
+            .expect("retry");
+            let retried = wait(handle.job_input_for_job(retry))
+                .expect("read")
+                .expect("input");
+            assert_eq!(retried, input, "the same input and Attachments");
+            assert_eq!(persisted_body(&handle, retry).expect("a body"), expected);
+            assert_eq!(
+                wait(handle.attachments(None, 10)).expect("list").len(),
+                1,
+                "no new Attachment"
+            );
+            assert_eq!(
+                wait(handle.attachment_inputs(id)).expect("read"),
+                [run.input]
+            );
+            assert_eq!(
+                wait(handle.input_jobs(run.input)).expect("read"),
+                [run.job, retry]
+            );
+            assert_eq!(stored_names(&directory).len(), 1);
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn an_unusable_attachment_fails_the_job_before_any_request() {
+            let (_root, directory) = data_directory("attachment-unusable");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (endpoint, accepted) = lifecycle_closure::silent_provider(1);
+            let provider = wait(handle.create_llm_provider(NewLlmProvider {
+                name: "silent".into(),
+                transport: OPENAI,
+                endpoint: Some(endpoint),
+                credential_ref: None,
+            }))
+            .expect("create provider");
+            let llm = llm_profile(
+                &handle,
+                provider,
+                llm_config("model-v", &[ModelCapability::Chat]),
+            );
+            let executor =
+                executor(&handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let schedule = |attachments: Vec<AttachmentId>, timeout: Duration| {
+                wait(
+                    runtime
+                        .scheduler()
+                        .schedule_provider(ProviderExecutionPlan {
+                            executor_id: executor,
+                            input: JobInputDraft {
+                                objective: Some(OBJECTIVE.to_owned()),
+                                attachments,
+                                ..JobInputDraft::default()
+                            },
+                            job: NewJob {
+                                configuration: llm_only(llm),
+                                ..new_job("vision", handle.genesis(), Vec::new())
+                            },
+                            credential_resolver: Arc::new(EnvironmentCredentialResolver),
+                            provider_config: ProviderExecutionConfig {
+                                timeout,
+                                ..ProviderExecutionConfig::default()
+                            },
+                            tools: None,
+                        }),
+                )
+            };
+            let usable = attach(&handle, png(), "image/png", "usable.png");
+            let missing = attach(
+                &handle,
+                b"\x89PNG\r\n\x1a\nmissing".to_vec(),
+                "image/png",
+                "m.png",
+            );
+            let corrupt = attach(
+                &handle,
+                b"\x89PNG\r\n\x1a\ncorrupt".to_vec(),
+                "image/png",
+                "c.png",
+            );
+            let gif = attach(&handle, b"GIF89a".to_vec(), "image/gif", "anim.gif");
+            std::fs::remove_file(content_path(&directory, &attachment(&handle, missing)))
+                .expect("remove");
+            std::fs::write(
+                content_path(&directory, &attachment(&handle, corrupt)),
+                b"\x89PNG\r\n\x1a\nCORRUPT",
+            )
+            .expect("corrupt");
+            for (bad, reason) in [
+                (missing, "the content file is missing"),
+                (
+                    corrupt,
+                    "the content file does not have the recorded SHA-256",
+                ),
+                (gif, "only image/png and image/jpeg"),
+            ] {
+                let receipt = schedule(vec![usable, bad], Duration::from_secs(5)).expect("settled");
+                let job = job_record(&handle, receipt.job);
+                assert!(
+                    job.failed_at.is_some() && job.completed_at.is_none(),
+                    "{reason}"
+                );
+                assert!(blocking(&handle, llm).is_empty(), "{reason}");
+                let summary = wait(handle.latest_output(receipt.job))
+                    .expect("read")
+                    .expect("a result")
+                    .summary
+                    .expect("a summary");
+                assert!(
+                    summary.starts_with("the input's attachments cannot be sent: ")
+                        && summary.contains(&bad.to_string())
+                        && summary.contains(reason),
+                    "{summary}"
+                );
+                assert_eq!(
+                    input_attachments(&handle, receipt.input),
+                    [usable, bad],
+                    "kept"
+                );
+                assert!(
+                    stats(&handle, receipt.job).is_empty(),
+                    "no request was observed"
+                );
+                assert!(accepted.try_recv().is_err(), "nothing reached the Provider");
+            }
+
+            // A cleaned-up Attachment cannot be named by a new input; one an
+            // earlier input carries is refused when its images are read.
+            let cleaned = attach(&handle, other_png(), "image/png", "cleaned.png");
+            let earlier = wait(handle.save_job_input(
+                None,
+                JobInputDraft {
+                    attachments: vec![cleaned],
+                    ..JobInputDraft::default()
+                },
+            ))
+            .expect("save");
+            clean_up(
+                &handle,
+                cleaned,
+                AttachmentCleanup {
+                    kind: CleanupKind::Manual,
+                    cleaned_at: Timestamp::from_unix_micros(1),
+                },
+            );
+            let jobs = wait(handle.jobs(None, 1_000)).expect("jobs").len();
+            assert!(matches!(
+                schedule(vec![usable, cleaned], Duration::from_secs(5)),
+                Err(ExecutionRuntimeError::Database(DatabaseError::Rejected(
+                    Violation::AttachmentCleanedUp(id)
+                ))) if id == cleaned
+            ));
+            assert_eq!(
+                wait(handle.jobs(None, 1_000)).expect("jobs").len(),
+                jobs,
+                "nothing submitted"
+            );
+            assert!(matches!(
+                wait(attachment_images(&handle, &input_attachments(&handle, earlier))),
+                Err(AttachmentImageError::Attachment(AttachmentError::CleanedUp { id, .. })) if id == cleaned
+            ));
+            assert!(accepted.try_recv().is_err(), "nothing reached the Provider");
+
+            // Usable Attachments are read back and the request goes out.
+            let receipt = schedule(vec![usable], Duration::from_millis(300)).expect("settled");
+            accepted
+                .recv_timeout(crate::test_support::WAIT)
+                .expect("the request reached the Provider");
+            assert!(
+                job_record(&handle, receipt.job).unknown_at.is_some(),
+                "it timed out"
+            );
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
         }
     }
 }

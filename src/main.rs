@@ -21,8 +21,9 @@ fn main() -> ExitCode {
 /// may read the authorized Workspace, `workspace-edit <objective>` one
 /// that may also create and conditionally update its files,
 /// `workspace-code <objective>` one that may also run its build and tests,
-/// and `workspace-vision <image-path> <objective>` one that sends an image
-/// of it with the objective, see `workspace_job`.
+/// and `workspace-vision <image-path> <objective>` one that stores an image
+/// of it as an Attachment and sends it with the objective, see
+/// `workspace_job`.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();

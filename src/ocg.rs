@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod data_directory;
 pub mod database;
 pub mod disk_protection;

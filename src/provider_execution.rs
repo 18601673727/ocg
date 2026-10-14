@@ -637,7 +637,7 @@ fn authorization(credential: &str) -> Result<HeaderValue, ProviderExecutionError
 
 /// The request body: the conversation as given, with the frozen model and
 /// parameters. Streaming with usage is always requested.
-fn request_body(
+pub(crate) fn request_body(
     model: &str,
     parameters: &LlmParameters,
     conversation: &ChatConversation,

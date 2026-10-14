@@ -40,19 +40,20 @@ use crate::openai_compatible::{
     ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
 };
 use crate::persistence::{
-    AgentConfig, AgentId, AgentRecord, AuthorizationBasis, AvailabilityObservation,
-    AvailabilityStatId, AvailabilityStatRecord, DependencyCondition, DependencyState,
+    AgentConfig, AgentId, AgentRecord, AttachmentCleanup, AttachmentId, AttachmentOrigin,
+    AttachmentRecord, AuthorizationBasis, AvailabilityObservation, AvailabilityStatId,
+    AvailabilityStatRecord, CleanupKind, ContentDigest, DependencyCondition, DependencyState,
     EffectConclusion, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorRecord,
-    ExecutorType, FrozenExecutionConfig, FrozenLlmConfig, JobId, JobInputId, JobOutputId,
-    JobOutputRecord, JobRecord, LlmConfig, LlmParameters, LlmProviderId, LlmProviderRecord,
-    LlmTarget, LlmTransport, Measurements, MetricsId, MetricsRecord, ModelCapability,
-    NotInvokedReason, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
-    ObservedModelChoice, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind,
-    OperationMarker, OutputKind, ProfileConfig, ProfileEditability, ProfileId, ProfileKind,
-    ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef, Recorded, RequestNumber,
-    RequestRef, SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
-    ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
-    Violation, WithheldReason, WrongProfileKind,
+    ExecutorType, FrozenExecutionConfig, FrozenLlmConfig, JobId, JobInputId, JobInputRecord,
+    JobOutputId, JobOutputRecord, JobRecord, LlmConfig, LlmParameters, LlmProviderId,
+    LlmProviderRecord, LlmTarget, LlmTransport, Measurements, MetricsId, MetricsRecord,
+    ModelCapability, NotInvokedReason, ObservationCursor, ObservationFilter, ObservationPage,
+    ObservedModel, ObservedModelChoice, ObservedModelFilter, ObservedModelPage, OperationId,
+    OperationKind, OperationMarker, OutputKind, ProfileConfig, ProfileEditability, ProfileId,
+    ProfileKind, ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef, Recorded,
+    RequestNumber, RequestRef, SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef,
+    ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation,
+    UncertainCause, Violation, WithheldReason, WrongProfileKind,
 };
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
@@ -86,9 +87,11 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// and AvailabilityStat record names its request, and the aggregation state
 /// is kept per request rather than per Job. Version 12 adds the evidence of
 /// each tool call a Provider request asked for; an older build would settle
-/// Jobs past their unresolved tool effects. Files of any other version are
-/// refused on open, before anything is written to them.
-pub(crate) const FORMAT_VERSION: u32 = 12;
+/// Jobs past their unresolved tool effects. Version 13 adds Attachments and
+/// the ordered Attachments of each JobInput; an older build would decode
+/// such an input without them. Files of any other version are refused on
+/// open, before anything is written to them.
+pub(crate) const FORMAT_VERSION: u32 = 13;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -118,10 +121,15 @@ const AGENTS: Records = TableDefinition::new("agent");
 const LLM_PROVIDERS: Records = TableDefinition::new("llm_provider");
 const METRICS: Records = TableDefinition::new("metrics");
 const AVAILABILITY_STATS: Records = TableDefinition::new("availability_stat");
+const ATTACHMENTS: Records = TableDefinition::new("attachment");
 /// job -> input, and its incoming index (input, job). A retry may run with
 /// its original's frozen input, so one input can serve several Jobs.
 const HAS_INPUT: Link = TableDefinition::new("has_input");
 const INPUT_JOBS: PairSet = TableDefinition::new("has_input_in");
+/// HAS_ATTACHMENT: an input's Attachments by their position in it, from 0,
+/// and the inputs that carry each Attachment.
+const HAS_ATTACHMENT: TableDefinition<(u64, u32), u64> = TableDefinition::new("has_attachment");
+const ATTACHMENT_INPUTS: PairSet = TableDefinition::new("has_attachment_in");
 /// (job, seq) -> output; ordered by seq within a Job.
 const HAS_OUTPUT: TableDefinition<(u64, u64), u64> = TableDefinition::new("has_output");
 /// job -> its highest-seq output, moved by every output insert.
@@ -321,6 +329,7 @@ const TAG_AGGREGATION_PROGRESS: u8 = 17;
 const TAG_TOKEN_REQUEST: u8 = 18;
 const TAG_TOKEN_MINUTE: u8 = 19;
 const TAG_TOOL_EVIDENCE: u8 = 20;
+const TAG_ATTACHMENT: u8 = 21;
 
 struct Enc(Vec<u8>);
 
@@ -400,6 +409,7 @@ impl Enc {
             // Tag 10 was the retired HealthCheck reference.
             RecordRef::Metrics(id) => (11, id.get()),
             RecordRef::AvailabilityStat(id) => (12, id.get()),
+            RecordRef::Attachment(id) => (13, id.get()),
         };
         self.u8(tag);
         self.u64(id);
@@ -602,6 +612,7 @@ impl<'a> Dec<'a> {
             9 => RecordRef::LlmProvider(LlmProviderId::new(id)),
             11 => RecordRef::Metrics(MetricsId::new(id)),
             12 => RecordRef::AvailabilityStat(AvailabilityStatId::new(id)),
+            13 => RecordRef::Attachment(AttachmentId::new(id)),
             _ => return Err(StorageError::corrupted("invalid record reference")),
         })
     }
@@ -733,7 +744,7 @@ codes!(OperationKind {
     OperationKind::ConsumeAvailability = 23, OperationKind::ConsumeTokenUsage = 24,
     OperationKind::StartLocalJob = 25, OperationKind::ReconcileAbandonedJob = 26,
     OperationKind::RecordToolDecision = 27, OperationKind::RecordToolOutcome = 28,
-    OperationKind::ReconcileToolEffect = 29,
+    OperationKind::ReconcileToolEffect = 29, OperationKind::CreateAttachment = 30,
 });
 codes!(ToolCallRefusal {
     ToolCallRefusal::Malformed = 1, ToolCallRefusal::ConflictingIdentity = 2, ToolCallRefusal::AmbiguousIdentity = 3,
@@ -745,6 +756,8 @@ codes!(AuthorizationBasis { AuthorizationBasis::RegistryGrant = 1 });
 codes!(WithheldReason { WithheldReason::TooLarge = 1, WithheldReason::Unserializable = 2 });
 codes!(UncertainCause { UncertainCause::TimedOut = 1, UncertainCause::Cancelled = 2, UncertainCause::HandlerReported = 3 });
 codes!(EffectConclusion { EffectConclusion::Applied = 1, EffectConclusion::NotApplied = 2 });
+codes!(AttachmentOrigin { AttachmentOrigin::UserProvided = 1, AttachmentOrigin::ModelProduced = 2 });
+codes!(CleanupKind { CleanupKind::Manual = 1, CleanupKind::Automatic = 2 });
 
 // ---- rows ------------------------------------------------------------------------
 
@@ -898,6 +911,44 @@ impl JobInputRow {
         d.end()?;
         Ok(row)
     }
+}
+
+fn encode_attachment(a: &AttachmentRecord) -> Vec<u8> {
+    let mut e = Enc::new(TAG_ATTACHMENT);
+    e.u64(a.id.get());
+    e.0.extend_from_slice(a.sha256.as_bytes());
+    e.u64(a.byte_length);
+    e.str(&a.mime);
+    e.ostr(&a.display_name);
+    e.u8(a.origin.code());
+    e.ts(a.created_at);
+    // Kind and time, together or not at all.
+    e.opt(&a.cleanup, |e, cleanup| {
+        e.u8(cleanup.kind.code());
+        e.ts(cleanup.cleaned_at);
+    });
+    e.0
+}
+
+fn decode_attachment(bytes: &[u8]) -> DecodeResult<AttachmentRecord> {
+    let mut d = Dec::new(bytes, TAG_ATTACHMENT)?;
+    let a = AttachmentRecord {
+        id: AttachmentId::new(d.u64()?),
+        sha256: ContentDigest::from_bytes(d.take(32)?.try_into().expect("32 bytes")),
+        byte_length: d.u64()?,
+        mime: d.str()?,
+        display_name: d.ostr()?,
+        origin: d.code(AttachmentOrigin::from_code)?,
+        created_at: d.ts()?,
+        cleanup: d.opt(|d| {
+            Ok(AttachmentCleanup {
+                kind: d.code(CleanupKind::from_code)?,
+                cleaned_at: d.ts()?,
+            })
+        })?,
+    };
+    d.end()?;
+    Ok(a)
 }
 
 fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
@@ -1422,6 +1473,7 @@ pub(crate) enum Sequence {
     LlmProvider,
     Metrics,
     AvailabilityStat,
+    Attachment,
 }
 
 impl Sequence {
@@ -1437,6 +1489,7 @@ impl Sequence {
             Self::LlmProvider => "llm_provider",
             Self::Metrics => "metrics",
             Self::AvailabilityStat => "availability_stat",
+            Self::Attachment => "attachment",
         }
     }
 }
@@ -1722,6 +1775,7 @@ fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
         LLM_PROVIDERS,
         METRICS,
         AVAILABILITY_STATS,
+        ATTACHMENTS,
     ] {
         tx.open_table(table)?;
     }
@@ -1756,6 +1810,7 @@ fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
         LLM_PROFILE_JOBS,
         JOB_METRICS,
         JOB_AVAILABILITY,
+        ATTACHMENT_INPUTS,
     ] {
         tx.open_table(table)?;
     }
@@ -1771,6 +1826,7 @@ fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(TOOL_CALL_IDS)?;
     tx.open_table(TRANSPORT_EXECUTORS)?;
     tx.open_table(HAS_OUTPUT)?;
+    tx.open_table(HAS_ATTACHMENT)?;
     tx.open_table(DEPENDS_ON)?;
     tx.open_table(OPERATIONS)?;
     tx.open_table(SEQUENCES)?;
@@ -2316,6 +2372,74 @@ impl Batch {
 
     pub(crate) fn put_input(&mut self, row: &JobInputRow) -> Result<(), BatchError> {
         self.overwrite(JOB_INPUTS, row.id.get(), row.encode())
+    }
+
+    pub(crate) fn require_attachment(
+        &mut self,
+        id: AttachmentId,
+    ) -> Result<AttachmentRecord, BatchError> {
+        match self.get_bytes(ATTACHMENTS, id.get())? {
+            Some(bytes) => {
+                let record = decode_attachment(&bytes);
+                self.decoded(record)
+            }
+            None => self.reject(Violation::NotFound(RecordRef::Attachment(id))),
+        }
+    }
+
+    pub(crate) fn insert_attachment(
+        &mut self,
+        record: &AttachmentRecord,
+    ) -> Result<(), BatchError> {
+        self.insert_new(
+            ATTACHMENTS,
+            record.id.get(),
+            encode_attachment(record),
+            RecordRef::Attachment(record.id),
+        )
+    }
+
+    /// Replaces the input's HAS_ATTACHMENT entries, and their incoming
+    /// index, with `attachments` in order. Each must exist.
+    pub(crate) fn set_input_attachments(
+        &mut self,
+        input: JobInputId,
+        attachments: &[AttachmentId],
+    ) -> Result<(), BatchError> {
+        self.require_input(input)?;
+        for attachment in attachments {
+            self.require_attachment(*attachment)?;
+        }
+        let Ok(count) = u32::try_from(attachments.len()) else {
+            return self.reject(Violation::ValueOutOfRange("attachments"));
+        };
+        let duplicate = self.step(|tx| {
+            let input = input.get();
+            let mut forward = tx.open_table(HAS_ATTACHMENT)?;
+            let mut incoming = tx.open_table(ATTACHMENT_INPUTS)?;
+            let mut previous = Vec::new();
+            for entry in forward.range((input, 0)..=(input, u32::MAX))? {
+                let (key, attachment) = entry?;
+                previous.push((key.value().1, attachment.value()));
+            }
+            for (position, attachment) in previous {
+                forward.remove((input, position))?;
+                incoming.remove((attachment, input))?;
+            }
+            for (position, attachment) in (0..count).zip(attachments) {
+                forward.insert((input, position), attachment.get())?;
+                if incoming.insert((attachment.get(), input), ())?.is_some() {
+                    return Ok(Some(*attachment));
+                }
+            }
+            Ok(None)
+        })?;
+        match duplicate {
+            Some(attachment) => self.reject(Violation::DuplicateReference(RecordRef::Attachment(
+                attachment,
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Inserts the output, its HAS_OUTPUT entry and moves LATEST_OUTPUT to it.
@@ -3862,16 +3986,48 @@ pub(crate) fn read_markers(
 pub(crate) fn read_job_input(
     database: &Database,
     id: JobInputId,
-) -> Result<Option<JobInputRow>, StorageError> {
+) -> Result<Option<JobInputRecord>, StorageError> {
     let rx = read(database)?;
-    rx.open_table(JOB_INPUTS)?
+    let Some(row) = rx
+        .open_table(JOB_INPUTS)?
         .get(id.get())?
         .map(|v| JobInputRow::decode(v.value()))
-        .transpose()
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    job_input_record(&rx, row).map(Some)
 }
 
-pub(crate) fn job_input_record(row: JobInputRow) -> crate::persistence::JobInputRecord {
-    crate::persistence::JobInputRecord {
+/// The record of an input, with its Attachments in order. Each must exist.
+fn job_input_record(
+    rx: &ReadTransaction,
+    row: JobInputRow,
+) -> Result<JobInputRecord, StorageError> {
+    let input = row.id.get();
+    let attachment_table = rx.open_table(ATTACHMENTS)?;
+    let mut attachments = Vec::new();
+    for entry in rx
+        .open_table(HAS_ATTACHMENT)?
+        .range((input, 0)..=(input, u32::MAX))?
+    {
+        let (key, attachment) = entry?;
+        let (position, attachment) = (key.value().1, attachment.value());
+        if usize::try_from(position).ok() != Some(attachments.len()) {
+            return Err(StorageError::corrupted(format!(
+                "the Attachments of {} are not numbered from 0 without gaps",
+                row.id
+            )));
+        }
+        if attachment_table.get(attachment)?.is_none() {
+            return Err(StorageError::corrupted(format!(
+                "{} names missing attachment {attachment}",
+                row.id
+            )));
+        }
+        attachments.push(AttachmentId::new(attachment));
+    }
+    Ok(JobInputRecord {
         id: row.id,
         submission_id: row.submission_id,
         objective: row.objective,
@@ -3882,14 +4038,15 @@ pub(crate) fn job_input_record(row: JobInputRow) -> crate::persistence::JobInput
         created_at: row.created_at,
         updated_at: row.updated_at,
         configuration: row.configuration,
-    }
+        attachments,
+    })
 }
 
 /// A Job's input.
 pub(crate) fn read_job_input_for_job(
     database: &Database,
     job: JobId,
-) -> Result<Option<JobInputRow>, StorageError> {
+) -> Result<Option<JobInputRecord>, StorageError> {
     let rx = read(database)?;
     let Some(input) = read_link(&rx, HAS_INPUT, job.get())? else {
         return Ok(None);
@@ -3898,7 +4055,73 @@ pub(crate) fn read_job_input_for_job(
         .open_table(JOB_INPUTS)?
         .get(input)?
         .ok_or_else(|| StorageError::corrupted(format!("HAS_INPUT names missing input {input}")))?;
-    JobInputRow::decode(bytes.value()).map(Some)
+    let row = JobInputRow::decode(bytes.value())?;
+    job_input_record(&rx, row).map(Some)
+}
+
+pub(crate) fn read_attachment(
+    database: &Database,
+    id: AttachmentId,
+) -> Result<Option<AttachmentRecord>, StorageError> {
+    let rx = read(database)?;
+    rx.open_table(ATTACHMENTS)?
+        .get(id.get())?
+        .map(|v| decode_attachment(v.value()))
+        .transpose()
+}
+
+/// Attachments in reverse ID order; newest first. Strictly before `before`
+/// when given; at most 1,000 per call.
+pub(crate) fn read_attachments(
+    database: &Database,
+    before: Option<AttachmentId>,
+    limit: usize,
+) -> Result<Vec<AttachmentRecord>, StorageError> {
+    let rx = read(database)?;
+    newest(
+        &rx,
+        ATTACHMENTS,
+        before.map(AttachmentId::get),
+        limit,
+        decode_attachment,
+    )
+}
+
+/// Test stand-in for the cleanup a later milestone adds: records `cleanup`
+/// on an Attachment in one transition, as that operation will, and touches
+/// nothing else, its content file included.
+#[cfg(test)]
+pub(crate) fn record_attachment_cleanup(
+    database: &Database,
+    id: AttachmentId,
+    cleanup: AttachmentCleanup,
+) -> Result<(), StorageError> {
+    let tx = database.begin_write()?;
+    {
+        let mut table = tx.open_table(ATTACHMENTS)?;
+        let mut record = match table.get(id.get())? {
+            Some(bytes) => decode_attachment(bytes.value())?,
+            None => return Err(StorageError::corrupted(format!("{id} is missing"))),
+        };
+        record.cleanup = Some(cleanup);
+        table.insert(id.get(), encode_attachment(&record).as_slice())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The inputs that carry an Attachment, oldest first, at most 1,000.
+pub(crate) fn read_attachment_inputs(
+    database: &Database,
+    attachment: AttachmentId,
+) -> Result<Vec<JobInputId>, StorageError> {
+    let rx = read(database)?;
+    Ok(
+        read_pairs(&rx, ATTACHMENT_INPUTS, attachment.get(), None, MAX_PAGE)?
+            .into_iter()
+            .map(JobInputId::new)
+            .collect(),
+    )
 }
 
 fn executor_record(row: ExecutorRow) -> ExecutorRecord {
@@ -4837,6 +5060,7 @@ pub(crate) fn relationship_inconsistencies(
     let providers = ids(&rx, LLM_PROVIDERS)?;
     let metrics = ids(&rx, METRICS)?;
     let availability_stats = ids(&rx, AVAILABILITY_STATS)?;
+    let attachments = ids(&rx, ATTACHMENTS)?;
     let mut profile_kinds = BTreeMap::new();
     for entry in rx.open_table(PROFILES)?.iter()? {
         let (id, bytes) = entry?;
@@ -4854,6 +5078,25 @@ pub(crate) fn relationship_inconsistencies(
         .collect();
 
     let mut problems = Vec::new();
+    let mut has_attachment = BTreeSet::new();
+    let mut positions: BTreeMap<u64, u32> = BTreeMap::new();
+    for entry in rx.open_table(HAS_ATTACHMENT)?.iter()? {
+        let (key, attachment) = entry?;
+        let (input, position) = key.value();
+        let next = positions.entry(input).or_default();
+        if position != *next {
+            problems.push(format!(
+                "the Attachments of input {input} are not numbered from 0 without gaps"
+            ));
+        }
+        *next = position.saturating_add(1);
+        if !has_attachment.insert((input, attachment.value())) {
+            problems.push(format!(
+                "input {input} names attachment {} more than once",
+                attachment.value()
+            ));
+        }
+    }
     let mut check_endpoints =
         |name: &str, pairs: &BTreeSet<(u64, u64)>, from: &BTreeSet<u64>, to: &BTreeSet<u64>| {
             for (source, target) in pairs {
@@ -4895,6 +5138,7 @@ pub(crate) fn relationship_inconsistencies(
     check_endpoints("TARGETS_LLM", &targets_llm, &agent_profiles, &llm_profiles);
     check_endpoints("APPLIES_PROFILE", &applies_profile, &jobs, &agent_profiles);
     check_endpoints("RUNS_LLM_PROFILE", &runs_llm_profile, &jobs, &llm_profiles);
+    check_endpoints("HAS_ATTACHMENT", &has_attachment, &inputs, &attachments);
 
     let mut executor_rows = BTreeMap::new();
     let mut expected_transports = BTreeSet::new();
@@ -4953,6 +5197,11 @@ pub(crate) fn relationship_inconsistencies(
             "RUNS_LLM_PROFILE",
             &runs_llm_profile,
             set_pairs(&rx, LLM_PROFILE_JOBS)?,
+        ),
+        (
+            "HAS_ATTACHMENT",
+            &has_attachment,
+            set_pairs(&rx, ATTACHMENT_INPUTS)?,
         ),
     ] {
         if reversed(forward) != incoming {

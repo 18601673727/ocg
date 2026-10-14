@@ -3,9 +3,9 @@
 //! `ocg workspace-edit <objective>`, its counterpart that may also create
 //! and conditionally update them, and `ocg workspace-code <objective>`, which
 //! may also build and test the Workspace. `ocg workspace-vision <image-path>
-//! <objective>` instead sends one PNG or JPEG image of the Workspace with the
-//! objective, offering no tool. This module belongs to the executable, not to
-//! the library.
+//! <objective>` instead stores one PNG or JPEG image of the Workspace as an
+//! Attachment and sends it with the objective, offering no tool. This module
+//! belongs to the executable, not to the library.
 //!
 //! It runs the ordinary host and submits exactly one Job through the host's
 //! scheduler, offering only `workspace_read_file`; for `workspace-edit`,
@@ -14,13 +14,16 @@
 //! [`WORKSPACE_ROOT_VARIABLE`]. Writing is offered by the last two commands
 //! alone, and running commands by `workspace-code` alone; every write is
 //! recorded, with its contents, and every command's output in plaintext tool
-//! evidence. An image is sent, never stored: the Job's input records the
-//! objective text only. The Provider and model are named by
-//! the environment too. The credential is named only by reference: the
-//! existing resolver reads it when the request is built, and it is never
-//! stored, printed or logged. Once the Job settles, what the database
-//! recorded of it is printed and the host stops. A signal while the Job runs
-//! cancels it, and the host stops once it has settled.
+//! evidence. An image is published to the attachment store of the data
+//! directory and recorded as a user-provided Attachment before the Job is
+//! submitted; the Job's input names it, and the execution reads it back from
+//! there, so the Workspace file is not needed once it is stored. The
+//! Provider and model are named by the environment too. The credential is
+//! named only by reference: the existing resolver reads it when the request
+//! is built, and it is never stored, printed or logged. Once the Job
+//! settles, what the database recorded of it is printed and the host stops.
+//! A signal while the Job runs cancels it, and the host stops once it has
+//! settled.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,8 +35,7 @@ use std::sync::Arc;
 
 use ntex::util::{Either, select};
 
-use aws_lc_rs::digest;
-
+use ocg::attachments::AttachmentError;
 use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseError, DatabaseHandle};
 use ocg::host::{self, HostContext, HostError};
@@ -47,10 +49,11 @@ use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceErro
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 use ocg::orchestration::{workspace_command, workspace_write};
 use ocg::persistence::{
-    AvailabilityStatRecord, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, JobId,
-    JobInputDraft, LlmConfig, LlmParameters, LlmTransport, MetricsRecord, ModelCapability,
-    NewExecutor, NewJob, NewLlmProvider, NewProfile, NewProfileConfig, OutputKind, ProfileConfig,
-    ProfileId, RequestNumber, ToolDecision, ToolOutcome,
+    AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, ExecutionMode, ExecutorId,
+    ExecutorType, JobId, JobInputDraft, LlmConfig, LlmParameters, LlmTransport, MetricsRecord,
+    ModelCapability, NewAttachment, NewExecutor, NewJob, NewLlmProvider, NewProfile,
+    NewProfileConfig, OutputKind, ProfileConfig, ProfileId, RequestNumber, ToolDecision,
+    ToolOutcome,
 };
 use ocg::provider_execution::{
     CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,
@@ -162,6 +165,8 @@ pub enum Error {
     ImageUsage(&'static str),
     #[error("the image cannot be sent: {0}")]
     Image(String),
+    #[error("the image was not stored: {0}")]
+    Attachment(#[from] AttachmentError),
     #[error("workspace_read_file is not enabled: {0}")]
     Workspace(#[from] WorkspaceError),
     #[error("workspace_read_file cannot be offered: {0}")]
@@ -244,7 +249,7 @@ impl Config {
 pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> {
     let workspace = Workspace::authorize(&config.workspace_root, data_directory)?;
     let root = workspace.root().display().to_string();
-    let mut images = Vec::new();
+    let mut image = None;
     let tools = match config.mode {
         Mode::Read => {
             eprintln!(
@@ -286,22 +291,26 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 .image
                 .as_deref()
                 .ok_or(Error::ImageUsage(VISION_COMMAND))?;
-            let image = load_image(&workspace, path)?;
+            let loaded = load_image(&workspace, path)?;
             eprintln!("OCG Workspace authorized for one image: {root}");
             eprintln!(
-                "OCG sends {path} ({}, {} bytes, sha256 {}) with the objective to the Provider; OCG's database records the objective text only, never the image",
-                image.mime().as_str(),
-                image.bytes().len(),
-                sha256(image.bytes())
+                "OCG stores {path} ({}, {} bytes, sha256 {}) as an Attachment in its data directory and sends it with the objective to the Provider",
+                loaded.mime().as_str(),
+                loaded.bytes().len(),
+                ContentDigest::of(loaded.bytes())
             );
-            images.push(image);
+            image = Some(NewAttachment {
+                mime: loaded.mime().as_str().to_owned(),
+                content: loaded.bytes().to_vec(),
+                display_name: Some(path.to_owned()),
+            });
             None
         }
     };
     let settled = Rc::new(RefCell::new(None));
     let slot = settled.clone();
     let hosted = host::run_hosted(data_directory, true, move |context| async move {
-        *slot.borrow_mut() = Some(submit(&context, config, tools, images).await);
+        *slot.borrow_mut() = Some(submit(&context, config, tools, image).await);
     });
     let settled = settled.borrow_mut().take();
     match (settled, hosted) {
@@ -340,35 +349,29 @@ fn declared_type(path: &str) -> Option<ImageMime> {
     }
 }
 
-/// The SHA-256 of `bytes`, in hexadecimal: how the report names an image
-/// without showing it.
-fn sha256(bytes: &[u8]) -> String {
-    digest::digest(&digest::SHA256, bytes)
-        .as_ref()
-        .iter()
-        .fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        })
-}
-
-/// Submits the Job, waits for it to settle, and prints what was recorded.
+/// Submits the Job, with `image` stored as its Attachment when given, waits
+/// for it to settle, and prints what was recorded.
 async fn submit(
     context: &HostContext,
     config: Config,
     tools: Option<ToolExecution>,
-    images: Vec<ImageInput>,
+    image: Option<NewAttachment>,
 ) -> Result<(), Error> {
     // Registered first, so a signal while the Job is prepared cancels it too.
     let signal = ntex::rt::signals::signal();
     let database = context.database();
     let (executor, llm_profile) = targets(database, &config).await?;
+    let mut attachments = Vec::new();
+    if let Some(image) = image {
+        attachments.push(database.create_user_attachment(image).await?);
+    }
     let command = config.mode.command();
     let cancellation = CancellationToken::default();
     let plan = ProviderExecutionPlan {
         executor_id: executor,
         input: JobInputDraft {
             objective: Some(config.objective),
+            attachments,
             ..JobInputDraft::default()
         },
         job: NewJob {
@@ -396,7 +399,6 @@ async fn submit(
             ..ProviderExecutionConfig::default()
         },
         tools,
-        images,
     };
     let mut scheduled = std::pin::pin!(context.scheduler().schedule_provider(plan));
     let settled = match select(signal, scheduled.as_mut()).await {
@@ -529,6 +531,32 @@ async fn report(
     let mut report = format!("Job {job}: {outcome}\n");
     if let Some(problem) = problem {
         let _ = writeln!(report, "Stopped: {problem}");
+    }
+    let attachments = database
+        .job_input_for_job(job)
+        .await?
+        .map(|input| input.attachments)
+        .unwrap_or_default();
+    if !attachments.is_empty() {
+        let _ = writeln!(report, "Attachments:");
+    }
+    for attachment in attachments {
+        let _ = match database.attachment(attachment).await? {
+            Some(record) => writeln!(
+                report,
+                "  {attachment} {:?}: {}, {} bytes, sha256 {}, {:?}, {}",
+                record.display_name.as_deref().unwrap_or(""),
+                record.mime,
+                record.byte_length,
+                record.sha256,
+                record.origin,
+                match record.cleanup {
+                    None => "available".to_owned(),
+                    Some(cleanup) => format!("cleaned up {:?}", cleanup.kind),
+                }
+            ),
+            None => writeln!(report, "  {attachment}: missing"),
+        };
     }
     if let Some(output) = database.latest_output(job).await?
         && output.kind == OutputKind::Result
@@ -1120,10 +1148,6 @@ mod tests {
         assert_eq!(
             refusal("../data/shot.png"),
             "the path is not a plain relative path inside the Workspace"
-        );
-        assert_eq!(
-            sha256(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

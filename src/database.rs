@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use redb::Database;
 
+use crate::attachments::{AttachmentContent, AttachmentError, AttachmentStore, StoreError};
 use crate::data_directory::DataDirectory;
 use crate::disk_protection::{
     self, DiskProtectionStatus, FilesystemConfig, FilesystemConfigError, ProtectedArea,
@@ -14,14 +15,15 @@ use crate::disk_protection::{
     RecoveryReport, ReopenFailure, SharedRequest, SpaceMeasurement, SpaceShortage,
 };
 use crate::persistence::{
-    self, AgentId, AgentRecord, AppendedOutput, AvailabilityAggregationProgress, AvailabilityBatch,
-    AvailabilityCounts, AvailabilityStatId, AvailabilityStatRecord, ExecutorId, JobFinalization,
-    JobId, JobInputDraft, JobInputId, JobOutputRecord, JobRecord, JobRetry, LlmProviderId,
-    LlmProviderRecord, MetricsId, MetricsRecord, NewAgent, NewAvailabilityStat, NewExecutor,
-    NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
-    NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
-    ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile,
-    ProfileId, ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, ReadSnapshot,
+    self, AgentId, AgentRecord, AppendedOutput, AttachmentId, AttachmentOrigin, AttachmentRecord,
+    AvailabilityAggregationProgress, AvailabilityBatch, AvailabilityCounts, AvailabilityStatId,
+    AvailabilityStatRecord, ExecutorId, JobFinalization, JobId, JobInputDraft, JobInputId,
+    JobOutputRecord, JobRecord, JobRetry, LlmProviderId, LlmProviderRecord, MetricsId,
+    MetricsRecord, NewAgent, NewAttachment, NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput,
+    NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject, NewToolEvidence,
+    ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelFilter,
+    ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile, ProfileId,
+    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, PublishedAttachment, ReadSnapshot,
     RequestNumber, RequestRef, RequestSampleRecord, Timestamp, ToolCallRef, ToolDecision,
     ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation, WrongProfileKind,
 };
@@ -203,6 +205,10 @@ pub enum DatabaseError {
         "the database uses storage format {found}; this build supports only format {supported}"
     )]
     UnsupportedFormat { found: u32, supported: u32 },
+    /// The attachment directory could not be trusted, or its interrupted
+    /// publications could not be cleaned up; the database was closed again.
+    #[error("the attachment store cannot be used: {0}")]
+    AttachmentStore(StoreError),
     #[error("database worker panicked")]
     WorkerPanicked,
 }
@@ -501,6 +507,10 @@ enum Command {
         agent: NewAgent,
         reply: Reply<AgentId>,
     },
+    CreateAttachment {
+        attachment: Box<PublishedAttachment>,
+        reply: Reply<AttachmentId>,
+    },
     ConfirmJobStopped {
         job: JobId,
         reply: Reply<()>,
@@ -725,6 +735,14 @@ impl Command {
                 reply,
                 |batch| persistence::create_agent(batch, agent),
             ),
+            Self::CreateAttachment { attachment, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateAttachment,
+                reply,
+                |batch| persistence::create_attachment(batch, *attachment),
+            ),
             Self::ConfirmJobStopped { job, reply } => run(
                 database,
                 operation,
@@ -843,6 +861,8 @@ impl Command {
                 })
             }
             Self::CreateAgent { agent, .. } => byte_count(agent.name.len()),
+            Self::CreateAttachment { attachment, .. } => byte_count(attachment.mime.len())
+                .saturating_add(text_bytes(&attachment.display_name)),
             Self::RecordMetrics { metrics, .. } => json_bytes(&metrics.measurements.usage.raw),
             Self::CommitAvailabilityAggregation { plan, .. } => plan.encoded_bytes(),
             Self::CommitTokenAggregation { plan, .. } => plan.encoded_bytes(),
@@ -905,6 +925,7 @@ impl Command {
             Self::CreateProfile { reply, .. } => refuse(reply, error),
             Self::UpdateProfile { reply, .. } => refuse(reply, error),
             Self::CreateAgent { reply, .. } => refuse(reply, error),
+            Self::CreateAttachment { reply, .. } => refuse(reply, error),
             Self::ConfirmJobStopped { reply, .. } => refuse(reply, error),
             Self::RecordMetrics { reply, .. } => refuse(reply, error),
             Self::RecordAvailabilityStat { reply, .. } => refuse(reply, error),
@@ -1084,6 +1105,15 @@ enum Admission {
     WorkerStopped,
 }
 
+/// Refuses a command unless admission is open.
+fn admitted(admission: &Admission) -> Result<(), DatabaseError> {
+    match admission {
+        Admission::Open => Ok(()),
+        Admission::Protected(lock) => Err(DatabaseError::DiskProtected(lock.clone())),
+        Admission::ShuttingDown | Admission::WorkerStopped => Err(DatabaseError::ShuttingDown),
+    }
+}
+
 struct Shared {
     active_policy: SystemPolicy,
     log_directory: PathBuf,
@@ -1124,6 +1154,8 @@ struct Shared {
     /// no read can be left in the queue unanswered.
     reads_stopped: RwLock<bool>,
     protection: Arc<ProtectionCell>,
+    /// The content files of Attachments, opened with the database.
+    attachments: AttachmentStore,
     /// `None` answers a check that the stopping worker will never run.
     space_check: SharedRequest<Option<DiskProtectionStatus>>,
     recovery: SharedRequest<Result<RecoveryReport, RecoveryError>>,
@@ -1392,6 +1424,7 @@ impl DatabaseWorker {
             .map_err(DatabaseError::StartupPolicy)?;
         let config = policy.filesystem_config;
         let log_directory = data_directory.logs_path().to_path_buf();
+        let attachment_directory = data_directory.attachments_path().to_path_buf();
         let directory = data_directory.database_path().to_path_buf();
         let paths = disk_protection::protected_paths(data_directory);
         let (sender, receiver) = flume::bounded(COMMAND_QUEUE_CAPACITY);
@@ -1428,6 +1461,20 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
+                // Opened only once the database file is known to be of this
+                // format and locked by this process, so no other OCG process
+                // publishes into the directory while it is cleaned up.
+                let attachments = match AttachmentStore::open(&attachment_directory)
+                    .and_then(|store| store.remove_staging_files().map(|_| store))
+                {
+                    Ok(store) => store,
+                    Err(error) => {
+                        ready_sender
+                            .send(Err(DatabaseError::AttachmentStore(error)))
+                            .ok();
+                        return Ok(());
+                    }
+                };
                 let shared = Arc::new(Shared {
                     active_policy: policy,
                     log_directory,
@@ -1444,6 +1491,7 @@ impl DatabaseWorker {
                     live_readers: AtomicUsize::new(0),
                     reads_stopped: RwLock::new(false),
                     protection: ProtectionCell::new(),
+                    attachments,
                     space_check: SharedRequest::new(),
                     recovery: SharedRequest::new(),
                     aggregation_host: AtomicBool::new(false),
@@ -2648,15 +2696,7 @@ impl DatabaseHandle {
                 .admission
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            match &*admission {
-                Admission::Open => {}
-                Admission::Protected(lock) => {
-                    return Err(DatabaseError::DiskProtected(lock.clone()));
-                }
-                Admission::ShuttingDown | Admission::WorkerStopped => {
-                    return Err(DatabaseError::ShuttingDown);
-                }
-            }
+            admitted(&admission)?;
             let epoch = self.shared.epoch.load(Ordering::SeqCst);
             let operation = OperationId::new(
                 epoch,
@@ -3013,21 +3053,16 @@ impl DatabaseHandle {
         &self,
         id: JobInputId,
     ) -> Result<Option<persistence::JobInputRecord>, DatabaseError> {
-        self.read(move |database| {
-            storage::read_job_input(database, id).map(|opt| opt.map(storage::job_input_record))
-        })
-        .await
+        self.read(move |database| storage::read_job_input(database, id))
+            .await
     }
 
     pub async fn job_input_for_job(
         &self,
         job: JobId,
     ) -> Result<Option<persistence::JobInputRecord>, DatabaseError> {
-        self.read(move |database| {
-            storage::read_job_input_for_job(database, job)
-                .map(|opt| opt.map(storage::job_input_record))
-        })
-        .await
+        self.read(move |database| storage::read_job_input_for_job(database, job))
+            .await
     }
 
     pub async fn executor(
@@ -3489,6 +3524,94 @@ impl DatabaseHandle {
     pub async fn create_agent(&self, agent: NewAgent) -> Result<AgentId, DatabaseError> {
         self.submit(|reply| Command::CreateAgent { agent, reply })
             .await
+    }
+
+    /// Stores `attachment` as a new user-provided Attachment. Its content is
+    /// published durably first, see [`crate::attachments`]; only then is the
+    /// record committed. When the commit fails, the published content stays,
+    /// named by no Attachment, and a later publication of the same bytes
+    /// reuses it. Nothing is published while commands are not admitted.
+    pub async fn create_user_attachment(
+        &self,
+        attachment: NewAttachment,
+    ) -> Result<AttachmentId, AttachmentError> {
+        persistence::check_new_attachment(&attachment).map_err(DatabaseError::Rejected)?;
+        admitted(
+            &self
+                .shared
+                .admission
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )?;
+        let sha256 = self
+            .shared
+            .attachments
+            .publish(&attachment.content)
+            .map_err(AttachmentError::NotStored)?;
+        let published = PublishedAttachment {
+            sha256,
+            byte_length: attachment.content.len() as u64,
+            mime: attachment.mime,
+            display_name: attachment.display_name,
+            origin: AttachmentOrigin::UserProvided,
+        };
+        Ok(self
+            .submit(|reply| Command::CreateAttachment {
+                attachment: Box::new(published),
+                reply,
+            })
+            .await?)
+    }
+
+    pub async fn attachment(
+        &self,
+        id: AttachmentId,
+    ) -> Result<Option<AttachmentRecord>, DatabaseError> {
+        self.read(move |database| storage::read_attachment(database, id))
+            .await
+    }
+
+    /// Attachments in reverse ID order; newest first, cleaned up or not.
+    /// Strictly before `before` when given; at most 1,000 per call.
+    pub async fn attachments(
+        &self,
+        before: Option<AttachmentId>,
+        limit: usize,
+    ) -> Result<Vec<AttachmentRecord>, DatabaseError> {
+        self.read(move |database| storage::read_attachments(database, before, limit))
+            .await
+    }
+
+    /// The inputs that carry an Attachment, oldest first; see
+    /// [`DatabaseHandle::input_jobs`] for the Jobs of each.
+    pub async fn attachment_inputs(
+        &self,
+        attachment: AttachmentId,
+    ) -> Result<Vec<JobInputId>, DatabaseError> {
+        self.read(move |database| storage::read_attachment_inputs(database, attachment))
+            .await
+    }
+
+    /// An available Attachment with its content, read from the attachment
+    /// store and verified against the record's length and SHA-256. Content
+    /// that is missing or does not match is refused, never replaced.
+    pub async fn attachment_content(
+        &self,
+        id: AttachmentId,
+    ) -> Result<AttachmentContent, AttachmentError> {
+        let record = self
+            .attachment(id)
+            .await?
+            .ok_or(AttachmentError::NotFound(id))?;
+        if let Some(cleanup) = record.cleanup {
+            return Err(AttachmentError::CleanedUp { id, cleanup });
+        }
+        let bytes = self
+            .shared
+            .attachments
+            .load(record.sha256, record.byte_length)
+            .map_err(|error| AttachmentError::Content { id, error })?;
+        Ok(AttachmentContent { record, bytes })
     }
 
     /// Records that an unknown-outcome Job's execution has actually stopped,

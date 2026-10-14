@@ -15,21 +15,25 @@ use std::time::Duration;
 
 use ntex::util::{Either, select};
 
+use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
+use crate::openai_compatible::image::{
+    MAX_IMAGE_BYTES, MAX_REQUEST_IMAGE_BYTES, MAX_REQUEST_IMAGES,
+};
 use crate::openai_compatible::{
-    ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, ImageInput,
-    InvalidToolCall, ToolCallRefusal,
+    ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, ImageError, ImageInput,
+    ImageMime, InvalidToolCall, ToolCallRefusal,
 };
 use crate::orchestration::tools::{
     FailureCertainty, ToolFailure, ToolFuture, ToolOffer, ToolRegistryError,
 };
 use crate::persistence::{
-    AppendedOutput, AuthorizationBasis, ExecutorId, FinalResult, IntermediateOutputKind,
-    JobFinalization, JobId, JobInputDraft, JobInputId, JobOutcome, MAX_STORED_TOOL_ARGUMENTS_BYTES,
-    MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements, NewAvailabilityStat, NewJob,
-    NewJobOutput, NewMetrics, NewToolEvidence, NotInvokedReason, RequestNumber, Timestamp,
-    ToolAdmission, ToolCallRef, ToolDecision, ToolOutcome, ToolOutcomeKind, ToolPayload,
-    UncertainCause, Violation, WithheldReason,
+    AppendedOutput, AttachmentId, AuthorizationBasis, ExecutorId, FinalResult,
+    IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobInputId, JobOutcome,
+    MAX_STORED_TOOL_ARGUMENTS_BYTES, MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements,
+    NewAvailabilityStat, NewJob, NewJobOutput, NewMetrics, NewToolEvidence, NotInvokedReason,
+    RequestNumber, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolOutcome,
+    ToolOutcomeKind, ToolPayload, UncertainCause, Violation, WithheldReason,
 };
 use crate::provider_execution::{
     self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
@@ -67,6 +71,13 @@ pub struct ExecutionPlan {
 
 /// A provider-backed execution request. Its LLM configuration is frozen when
 /// the Job is admitted; execution reads that snapshot after the durable start.
+///
+/// The Attachments of `input` are sent as images with the objective, in
+/// order, in its user message after its text; see
+/// [`provider_execution::objective_conversation_with_images`]. Each is read
+/// back from the database and the attachment store after the Job started,
+/// and verified, see [`attachment_images`]; nothing of an image is held by
+/// the plan. When any cannot be sent, the Job fails before any request.
 pub struct ProviderExecutionPlan {
     pub executor_id: ExecutorId,
     pub input: JobInputDraft,
@@ -76,12 +87,6 @@ pub struct ProviderExecutionPlan {
     /// The OCG tools offered to the Provider, if any. `None`, the default,
     /// offers none, and the execution is the single request it always was.
     pub tools: Option<ToolExecution>,
-    /// Images sent with the objective, in order, in its user message after
-    /// its text, see [`provider_execution::objective_conversation_with_images`].
-    /// They belong to this execution alone: the Job's input records the
-    /// objective text only, so nothing of an image is stored, and a retry or
-    /// a later reading of the Job does not have it.
-    pub images: Vec<ImageInput>,
 }
 
 /// Tools OCG offers one execution, and the limits of the tool loop. Only
@@ -279,7 +284,6 @@ impl ProviderExecutionPlan {
             credential_resolver: Arc::new(EnvironmentCredentialResolver),
             provider_config: ProviderExecutionConfig::default(),
             tools: None,
-            images: Vec::new(),
         }
     }
 }
@@ -810,56 +814,44 @@ async fn execute_provider_plan(
         .create_local_job_with_input(plan.job, input)
         .await?;
 
-    let configuration = match database.job_configuration(job).await? {
-        Some(configuration) => configuration,
-        None => {
-            let result = database
-                .finalize_job(
-                    job,
-                    JobFinalization::Failed(FinalResult {
-                        summary: Some(
-                            "provider execution requires frozen LLM configuration".to_owned(),
-                        ),
-                        code: None,
-                        goal_reached: Some(false),
-                        value: None,
-                    }),
-                )
-                .await?;
-            return Ok(ExecutionReceipt {
-                executor,
-                input,
-                job,
-                result,
-            });
-        }
+    // Settles the Job failed before anything was sent.
+    let refused = async |summary: String| -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+        let failed = FinalResult {
+            summary: Some(summary),
+            code: None,
+            goal_reached: Some(false),
+            value: None,
+        };
+        let result = database
+            .finalize_job(job, JobFinalization::Failed(failed))
+            .await?;
+        Ok(ExecutionReceipt {
+            executor,
+            input,
+            job,
+            result,
+        })
     };
-    let input_record = match database.job_input(input).await? {
-        Some(input) => input,
-        None => {
-            let result = database
-                .finalize_job(
-                    job,
-                    JobFinalization::Failed(FinalResult {
-                        summary: Some("submitted Job input disappeared".to_owned()),
-                        code: None,
-                        goal_reached: Some(false),
-                        value: None,
-                    }),
-                )
-                .await?;
-            return Ok(ExecutionReceipt {
-                executor,
-                input,
-                job,
-                result,
-            });
+    let Some(configuration) = database.job_configuration(job).await? else {
+        return refused("provider execution requires frozen LLM configuration".to_owned()).await;
+    };
+    let Some(input_record) = database.job_input(input).await? else {
+        return refused("submitted Job input disappeared".to_owned()).await;
+    };
+    // Nothing is sent unless every Attachment can be.
+    let images = match attachment_images(&database, &input_record.attachments).await {
+        Ok(images) => images,
+        Err(AttachmentImageError::Attachment(AttachmentError::Database(error))) => {
+            return Err(error.into());
+        }
+        Err(error) => {
+            return refused(format!("the input's attachments cannot be sent: {error}")).await;
         }
     };
     let mut conversation = provider_execution::objective_conversation_with_images(
         &configuration.frozen,
         input_record.objective.as_deref(),
-        &plan.images,
+        &images,
     );
     conversation.tools = offered.unwrap_or_default();
     let frozen = &configuration.frozen;
@@ -887,6 +879,77 @@ async fn execute_provider_plan(
         },
     )
     .await
+}
+
+/// Why an input's Attachments cannot be sent as images.
+#[derive(Debug, thiserror::Error)]
+pub enum AttachmentImageError {
+    #[error(transparent)]
+    Attachment(#[from] AttachmentError),
+    #[error("a request may carry at most {MAX_REQUEST_IMAGES} images")]
+    TooMany,
+    #[error("{attachment} cannot be sent as an image: {error}")]
+    NotAnImage {
+        attachment: AttachmentId,
+        error: ImageError,
+    },
+    #[error("the images may not exceed {MAX_REQUEST_IMAGE_BYTES} bytes together")]
+    TooLarge,
+}
+
+/// The images of `attachments`, in order. Each Attachment must exist, be
+/// available and be a PNG or JPEG within the image limits, as its record
+/// says, before any content is read; then its content is read from the
+/// attachment store, verified against the record's length and SHA-256, and
+/// checked again as the image its record declares. Nothing is substituted
+/// for an Attachment that fails, and nothing is skipped.
+///
+/// # Errors
+///
+/// Returns the first Attachment, or the limit, that fails.
+pub async fn attachment_images(
+    database: &DatabaseHandle,
+    attachments: &[AttachmentId],
+) -> Result<Vec<ImageInput>, AttachmentImageError> {
+    if attachments.len() > MAX_REQUEST_IMAGES {
+        return Err(AttachmentImageError::TooMany);
+    }
+    let mut declared = Vec::with_capacity(attachments.len());
+    let mut total = 0u64;
+    for &attachment in attachments {
+        let record = database
+            .attachment(attachment)
+            .await
+            .map_err(AttachmentError::Database)?
+            .ok_or(AttachmentError::NotFound(attachment))?;
+        if let Some(cleanup) = record.cleanup {
+            return Err(AttachmentError::CleanedUp {
+                id: attachment,
+                cleanup,
+            }
+            .into());
+        }
+        let not_an_image = |error| AttachmentImageError::NotAnImage { attachment, error };
+        let mime =
+            ImageMime::from_mime(&record.mime).ok_or(not_an_image(ImageError::UnsupportedType))?;
+        if record.byte_length > MAX_IMAGE_BYTES as u64 {
+            return Err(not_an_image(ImageError::TooLarge));
+        }
+        total += record.byte_length;
+        declared.push((attachment, mime));
+    }
+    if total > MAX_REQUEST_IMAGE_BYTES as u64 {
+        return Err(AttachmentImageError::TooLarge);
+    }
+    let mut images = Vec::with_capacity(declared.len());
+    for (attachment, mime) in declared {
+        let content = database.attachment_content(attachment).await?;
+        images.push(
+            ImageInput::new(mime, content.bytes)
+                .map_err(|error| AttachmentImageError::NotAnImage { attachment, error })?,
+        );
+    }
+    Ok(images)
 }
 
 /// The Job a provider execution settles.

@@ -71,6 +71,7 @@ record_id_type!(AgentId, "agent");
 record_id_type!(LlmProviderId, "llm_provider");
 record_id_type!(MetricsId, "metrics");
 record_id_type!(AvailabilityStatId, "availability_stat");
+record_id_type!(AttachmentId, "attachment");
 
 /// The number of one Provider request within the Job that sent it, from 1
 /// in the order the Job sent them. A Job may send several requests, such as
@@ -134,6 +135,7 @@ pub enum RecordRef {
     LlmProvider(LlmProviderId),
     Metrics(MetricsId),
     AvailabilityStat(AvailabilityStatId),
+    Attachment(AttachmentId),
 }
 
 impl fmt::Display for RecordRef {
@@ -149,6 +151,7 @@ impl fmt::Display for RecordRef {
             Self::LlmProvider(id) => id.fmt(f),
             Self::Metrics(id) => id.fmt(f),
             Self::AvailabilityStat(id) => id.fmt(f),
+            Self::Attachment(id) => id.fmt(f),
         }
     }
 }
@@ -221,6 +224,9 @@ pub struct JobInputDraft {
     pub max_depth: Option<u32>,
     pub max_children_per_job: Option<u32>,
     pub max_total_descendants: Option<u32>,
+    /// The Attachments the input carries, in order, each named once. Each
+    /// must exist and must not be cleaned up; see [`AttachmentRecord`].
+    pub attachments: Vec<AttachmentId>,
 }
 
 /// Every relationship here is fixed once the Job is submitted. Project
@@ -415,7 +421,136 @@ pub struct JobInputRecord {
     /// to execute, frozen with the input. `None` for unconfigured work and
     /// for an input not yet submitted.
     pub configuration: Option<FrozenExecutionConfig>,
+    /// The Attachments the input carries, in the order they were given.
+    /// Frozen with the input when it is submitted; a reference outlives the
+    /// cleanup of its Attachment's content.
+    pub attachments: Vec<AttachmentId>,
 }
+
+/// The SHA-256 of an Attachment's content. It names the immutable file
+/// that holds the content, never the Attachment: several Attachments may
+/// share one content file.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentDigest([u8; 32]);
+
+impl ContentDigest {
+    /// The SHA-256 of `bytes`.
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Self {
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+        Self(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
+    }
+
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Lowercase hexadecimal, 64 characters: the name of the content file.
+impl fmt::Display for ContentDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl fmt::Debug for ContentDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ContentDigest({self})")
+    }
+}
+
+/// Where an Attachment's content came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentOrigin {
+    /// Given to OCG by its user, such as an image sent with an objective.
+    UserProvided,
+    /// Produced by a model. No Provider output creates one yet.
+    ModelProduced,
+}
+
+/// Who removed an Attachment's content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupKind {
+    /// The user asked for it.
+    Manual,
+    /// A retention policy did.
+    Automatic,
+}
+
+/// That an Attachment's content was cleaned up: how, and when. Its kind and
+/// time are recorded together or not at all. Cleanup removes availability,
+/// never history: the Attachment, its metadata and every reference to it
+/// remain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachmentCleanup {
+    pub kind: CleanupKind,
+    pub cleaned_at: Timestamp,
+}
+
+/// A stored Attachment: a durable business entity with an identity of its
+/// own, independent of its content. Two Attachments of identical bytes are
+/// two Attachments with one [`ContentDigest`]; each keeps its own name,
+/// origin and cleanup. Attachments have no update path apart from cleanup,
+/// which no operation records yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentRecord {
+    pub id: AttachmentId,
+    pub sha256: ContentDigest,
+    /// The content's length in bytes, kept after its cleanup.
+    pub byte_length: u64,
+    /// A lowercase `type/subtype`, without parameters.
+    pub mime: String,
+    /// A sanitized file name, for display only; never a path.
+    pub display_name: Option<String>,
+    pub origin: AttachmentOrigin,
+    pub created_at: Timestamp,
+    /// `None` while the content is available.
+    pub cleanup: Option<AttachmentCleanup>,
+}
+
+impl AttachmentRecord {
+    /// Whether the Attachment's content may still be used. A file that is
+    /// missing or does not match is refused when it is read, see
+    /// [`crate::database::DatabaseHandle::attachment_content`].
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.cleanup.is_none()
+    }
+}
+
+/// Content to store as a new user-provided Attachment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewAttachment {
+    pub content: Vec<u8>,
+    /// A lowercase `type/subtype`, without parameters.
+    pub mime: String,
+    /// A file name to display. It is sanitized, see
+    /// [`sanitize_display_name`]; an empty result is no name.
+    pub display_name: Option<String>,
+}
+
+/// Shows the content by its size only.
+impl fmt::Debug for NewAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewAttachment")
+            .field("content", &self.content.len())
+            .field("mime", &self.mime)
+            .field("display_name", &self.display_name)
+            .finish()
+    }
+}
+
+/// The largest Attachment content OCG stores.
+pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+/// The longest MIME type and display name, in bytes.
+pub const MAX_ATTACHMENT_MIME_BYTES: usize = 255;
+pub const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 
 /// A stored Executor.
 #[derive(Clone, Debug, PartialEq)]
@@ -1602,6 +1737,8 @@ pub enum OperationKind {
     RecordToolOutcome,
     /// A verified conclusion about an uncertain tool execution.
     ReconcileToolEffect,
+    /// A new Attachment, recorded once its content was published.
+    CreateAttachment,
 }
 
 /// Written in the same transaction as every accepted mutation, so its
@@ -1746,6 +1883,9 @@ pub enum Violation {
         "{0} already had an effect that a retry could repeat, and the retry did not acknowledge it"
     )]
     RepeatedEffectNotAcknowledged(ToolCallRef),
+    /// A new input may not carry an Attachment whose content is gone.
+    #[error("{0} was cleaned up, so its content can no longer be used")]
+    AttachmentCleanedUp(AttachmentId),
 }
 
 pub(crate) type OpResult<T> = Result<(T, MarkerSubjects), BatchError>;
@@ -1796,6 +1936,11 @@ pub(crate) fn save_job_input(
     draft: JobInputDraft,
 ) -> OpResult<JobInputId> {
     let now = batch.now();
+    for attachment in &draft.attachments {
+        if !batch.require_attachment(*attachment)?.is_available() {
+            return batch.reject(Violation::AttachmentCleanedUp(*attachment));
+        }
+    }
     let row = match existing {
         None => {
             let id = JobInputId(batch.next_id(crate::storage::Sequence::JobInput)?);
@@ -1812,6 +1957,7 @@ pub(crate) fn save_job_input(
                 configuration: None,
             };
             batch.insert_input(&row)?;
+            batch.set_input_attachments(id, &draft.attachments)?;
             return Ok((id, MarkerSubjects::created(RecordRef::JobInput(id), RecordRef::JobInput(id))));
         }
         Some(id) => batch.require_input(id)?,
@@ -1829,6 +1975,7 @@ pub(crate) fn save_job_input(
         ..row
     };
     batch.put_input(&row)?;
+    batch.set_input_attachments(row.id, &draft.attachments)?;
     Ok((row.id, MarkerSubjects::addressed(RecordRef::JobInput(row.id))))
 }
 
@@ -2549,6 +2696,110 @@ pub(crate) fn create_executor(batch: &mut Batch, executor: NewExecutor) -> OpRes
         llm_transports: executor.llm_transports,
     })?;
     Ok((id, MarkerSubjects::created(RecordRef::Executor(id), RecordRef::Executor(id))))
+}
+
+/// A display name as OCG keeps it: the last component of a path, without
+/// control characters or surrounding whitespace, cut on a character
+/// boundary to [`MAX_ATTACHMENT_NAME_BYTES`]. `None` when nothing is left,
+/// or when it is `.` or `..`.
+#[must_use]
+pub fn sanitize_display_name(name: &str) -> Option<String> {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = last
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let mut cleaned = cleaned.trim();
+    while cleaned.len() > MAX_ATTACHMENT_NAME_BYTES {
+        let mut end = MAX_ATTACHMENT_NAME_BYTES;
+        while !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned = cleaned[..end].trim_end();
+    }
+    match cleaned {
+        "" | "." | ".." => None,
+        name => Some(name.to_owned()),
+    }
+}
+
+/// Whether `mime` is a lowercase `type/subtype` of RFC 6838 restricted-name
+/// characters, without parameters.
+fn is_mime_type(mime: &str) -> bool {
+    let name = |part: &str| {
+        (1..=127).contains(&part.len())
+            && part.starts_with(|first: char| first.is_ascii_lowercase() || first.is_ascii_digit())
+            && part.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"!#$&-^_.+".contains(&byte)
+            })
+    };
+    mime.len() <= MAX_ATTACHMENT_MIME_BYTES
+        && mime
+            .split_once('/')
+            .is_some_and(|(kind, subtype)| name(kind) && name(subtype))
+}
+
+/// Checks what [`create_attachment`] would refuse of `attachment`, so that
+/// nothing is published for an Attachment that cannot be recorded.
+pub(crate) fn check_new_attachment(attachment: &NewAttachment) -> Result<(), Violation> {
+    if attachment.content.is_empty() {
+        return Err(Violation::InvalidValue("content", "cannot be empty"));
+    }
+    if attachment.content.len() > MAX_ATTACHMENT_BYTES {
+        return Err(Violation::ValueOutOfRange("content"));
+    }
+    if !is_mime_type(&attachment.mime) {
+        return Err(Violation::InvalidValue(
+            "mime",
+            "must be a lowercase type/subtype without parameters",
+        ));
+    }
+    Ok(())
+}
+
+/// What a new Attachment records of its content, once that content is
+/// published under `sha256`.
+pub(crate) struct PublishedAttachment {
+    pub(crate) sha256: ContentDigest,
+    pub(crate) byte_length: u64,
+    pub(crate) mime: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) origin: AttachmentOrigin,
+}
+
+/// Records an Attachment whose content is already published. Its display
+/// name is sanitized here.
+pub(crate) fn create_attachment(
+    batch: &mut Batch,
+    attachment: PublishedAttachment,
+) -> OpResult<AttachmentId> {
+    if !is_mime_type(&attachment.mime) {
+        return batch.reject(Violation::InvalidValue(
+            "mime",
+            "must be a lowercase type/subtype without parameters",
+        ));
+    }
+    if attachment.byte_length == 0 {
+        return batch.reject(Violation::InvalidValue("content", "cannot be empty"));
+    }
+    let id = AttachmentId(batch.next_id(crate::storage::Sequence::Attachment)?);
+    batch.insert_attachment(&AttachmentRecord {
+        id,
+        sha256: attachment.sha256,
+        byte_length: attachment.byte_length,
+        mime: attachment.mime,
+        display_name: attachment
+            .display_name
+            .as_deref()
+            .and_then(sanitize_display_name),
+        origin: attachment.origin,
+        created_at: batch.now(),
+        cleanup: None,
+    })?;
+    Ok((
+        id,
+        MarkerSubjects::created(RecordRef::Attachment(id), RecordRef::Attachment(id)),
+    ))
 }
 
 pub(crate) fn create_project(batch: &mut Batch, project: NewProject) -> OpResult<ProjectId> {
