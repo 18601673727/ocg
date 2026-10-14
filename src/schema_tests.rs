@@ -18707,6 +18707,109 @@ mod requests_and_tool_loop {
         }
 
         #[test]
+        fn a_stop_reaches_one_job_of_plans_sharing_a_token() {
+            let (_root, directory) = data_directory("admission-shared-token");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (open, response) = gated(answering("b answered", (3, 1)));
+            let (target, requests) =
+                scripted(&handle, "admission-shared-token", vec![stalled(), response]);
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let scheduler = runtime.scheduler();
+            // Two plans of one cloned configuration share one token.
+            let upstream = CancellationToken::default();
+            let mut first = plan(&handle, &target, "job a", None);
+            first.provider_config.cancellation = upstream.clone();
+            let mut second = plan(&handle, &target, "job b", None);
+            second.provider_config = first.provider_config.clone();
+
+            let a = admitted(wait(scheduler.admit_provider(first)));
+            until(|| requests.load(Ordering::SeqCst) == 1);
+            let next = scheduler.clone();
+            let b = std::thread::spawn(move || wait(next.admit_provider(second)));
+            let stale = a.stop_handle();
+            stale.request();
+            let a_id = a.job();
+            let receipt = wait(a.settled()).expect("settled");
+            assert_eq!((receipt.job, receipt.result), (a_id, None));
+            let record = job_record(&handle, a_id);
+            assert!(record.unknown_at.is_some() && record.stop_confirmed_at.is_some());
+            assert!(record.cancelled_at.is_none());
+            assert!(
+                !upstream.is_cancelled(),
+                "a Job's stop is not its plan's token"
+            );
+
+            let b = admitted(b.join().expect("joined"));
+            until(|| requests.load(Ordering::SeqCst) == 2);
+            // The stale handle of Job A, while Job B waits for its answer.
+            stale.request();
+            open.send(()).expect("let the Provider answer");
+            let b_id = b.job();
+            wait(b.settled()).expect("settled");
+            stale.request();
+            let record = job_record(&handle, b_id);
+            assert!(record.completed_at.is_some() && record.unknown_at.is_none());
+            assert_eq!(summary(&handle, b_id).as_deref(), Some("b answered"));
+            assert!(!upstream.is_cancelled());
+
+            // The settled Jobs' cancellations are not kept by the token.
+            drop(stale);
+            let probe = upstream.child();
+            assert_eq!(upstream.registered_children(), 1);
+            drop(probe);
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn cancelling_a_shared_token_stops_each_job_by_its_own_rules() {
+            let (_root, directory) = data_directory("admission-upstream");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (target, requests) = scripted(&handle, "admission-upstream", vec![stalled()]);
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let scheduler = runtime.scheduler();
+            let upstream = CancellationToken::default();
+            let sharing = |name: &str| {
+                let mut plan = plan(&handle, &target, name, None);
+                plan.provider_config.cancellation = upstream.clone();
+                plan
+            };
+
+            let running = admitted(wait(scheduler.admit_provider(sharing("delivered"))));
+            until(|| requests.load(Ordering::SeqCst) == 1);
+            let next = scheduler.clone();
+            let queued_plan = sharing("queued");
+            let queued = std::thread::spawn(move || wait(next.admit_provider(queued_plan)));
+            upstream.cancel();
+
+            // The running request may have reached the Provider: Unknown.
+            let id = running.job();
+            wait(running.settled()).expect("settled");
+            let record = job_record(&handle, id);
+            assert!(record.unknown_at.is_some() && record.stop_confirmed_at.is_some());
+            assert!(record.cancelled_at.is_none());
+
+            // A Job started after the cancellation sends nothing: Failed.
+            let later = admitted(wait(scheduler.admit_provider(sharing("later"))));
+            for job in [admitted(queued.join().expect("joined")), later] {
+                let id = job.job();
+                wait(job.settled()).expect("settled");
+                let record = job_record(&handle, id);
+                assert!(
+                    record.failed_at.is_some()
+                        && record.unknown_at.is_none()
+                        && record.cancelled_at.is_none(),
+                    "{record:?}"
+                );
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 1, "nothing else was sent");
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
         fn a_stop_after_settlement_changes_nothing() {
             let (_root, directory) = data_directory("admission-late-stop");
             let worker = DatabaseWorker::start(&directory).expect("start database");
@@ -18857,8 +18960,10 @@ mod requests_and_tool_loop {
             let requests = Arc::new(AtomicUsize::new(0));
             let counted = requests.clone();
             let mut responses = vec![response, stalled()].into_iter();
+            let (delivered, reached) = flume::unbounded();
             provider_seam::install(&format!("https://{endpoint}.invalid/v1"), move |_| {
                 counted.fetch_add(1, Ordering::SeqCst);
+                delivered.send(()).ok();
                 responses.next().expect("a scripted response")
             });
             let jobs = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -18920,6 +19025,10 @@ mod requests_and_tool_loop {
                         .expect("admitted");
                     seen.lock().expect("lock").extend([id, left.job()]);
                     drop(left);
+                    // Its request reached the Provider before the host stops.
+                    for _ in 0..2 {
+                        reached.recv_async().await.expect("a request");
+                    }
                 });
             // The process-wide logger may already be another host's in this
             // test binary; that is reported, and nothing else may fail.

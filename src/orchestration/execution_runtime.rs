@@ -534,9 +534,9 @@ impl SchedulerHandle {
 
     /// Submits a provider execution and waits until it has settled: it is
     /// [`Self::admit_provider`] followed by [`AdmittedJob::settled`], with
-    /// an admission failure reported as its underlying error. Shutdown of
-    /// the runtime cancels `plan.provider_config.cancellation` if the plan
-    /// is executing then.
+    /// an admission failure reported as its underlying error. Cancelling
+    /// `plan.provider_config.cancellation` stops the execution; shutdown of
+    /// the runtime stops it too if it is executing then.
     pub async fn schedule_provider(
         &self,
         plan: ProviderExecutionPlan,
@@ -554,8 +554,10 @@ impl SchedulerHandle {
     /// Provider. The executor then owns the execution: it runs, and settles
     /// the Job, whatever becomes of the returned [`AdmittedJob`]; dropping
     /// it, or the future of its settlement, neither stops nor cancels the
-    /// Job. Its stop is requested through the plan's own cancellation, which
-    /// shutdown of the runtime cancels too.
+    /// Job. Its stop is requested through a cancellation of its own, a
+    /// child of the plan's token: cancelling that token, or shutdown of the
+    /// runtime, stops it too, but its stop reaches no other execution,
+    /// whatever tokens the plans share.
     ///
     /// Admission is bounded as [`Self::schedule_provider`]'s is: a full
     /// queue, a stopped scheduler or executor, shutdown, an unregistered
@@ -569,9 +571,12 @@ impl SchedulerHandle {
     /// Returns why no Job is known to have been admitted.
     pub async fn admit_provider(
         &self,
-        plan: ProviderExecutionPlan,
+        mut plan: ProviderExecutionPlan,
     ) -> Result<AdmittedJob, AdmissionError> {
-        let cancellation = plan.provider_config.cancellation.clone();
+        // The execution observes a cancellation of its own, which the
+        // plan's token, however widely it is shared, still cancels.
+        let cancellation = plan.provider_config.cancellation.child();
+        plan.provider_config.cancellation = cancellation.clone();
         let (started, admission) = flume::bounded(1);
         let (settled, settlement) = flume::bounded(1);
         self.submit(Submission::Provider(
@@ -682,14 +687,15 @@ impl JobStop {
         self.job
     }
 
-    /// Cancels the Job's execution: the cancellation of the plan it was
-    /// admitted from, the one its execution observes. It is a request, not
+    /// Cancels the Job's execution: the cancellation made for it at its
+    /// admission, the one its execution observes, and nothing else. It
+    /// cancels neither the token of the plan it was admitted from nor any
+    /// other Job's execution, sharing that token or not. It is a request, not
     /// an outcome: the Job settles as the execution then ends, which is
     /// Unknown, not Cancelled, when a request may have reached the Provider
     /// or a call may have had an effect, and may still be Completed when
     /// the execution had already finished. Once the execution has returned
-    /// it changes nothing. A token the submitter shared between plans is
-    /// cancelled for all of them.
+    /// it changes nothing.
     pub fn request(&self) {
         self.cancellation.cancel();
     }
@@ -1113,8 +1119,8 @@ async fn run_started_provider_job(
         &config.cancellation,
         async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
             #[cfg(test)]
-            if let Some(response) = provider_seam::response(frozen, conversation) {
-                return provider_seam::respond(response, config, conversation, sink).await;
+            if provider_seam::is_scripted(frozen) {
+                return provider_seam::exchange(frozen, config, conversation, sink).await;
             }
             provider_execution::execute_conversation(
                 frozen,
@@ -1195,25 +1201,40 @@ pub(crate) mod provider_seam {
         }
     }
 
-    pub(super) fn response(
-        frozen: &FrozenExecutionConfig,
-        conversation: &ChatConversation,
-    ) -> Option<Response> {
-        let endpoint = frozen.llm.provider.endpoint.as_deref()?;
-        SCRIPTS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(endpoint)
-            .map(|script| script(conversation))
+    fn endpoint(frozen: &FrozenExecutionConfig) -> Option<&str> {
+        frozen.llm.provider.endpoint.as_deref()
     }
 
-    /// Answers as a Provider that received the request would.
-    pub(super) async fn respond(
-        response: Response,
+    pub(super) fn is_scripted(frozen: &FrozenExecutionConfig) -> bool {
+        endpoint(frozen).is_some_and(|endpoint| {
+            SCRIPTS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(endpoint)
+        })
+    }
+
+    /// Answers as the scripted Provider would a request it received; as
+    /// the transport does, nothing is sent once the execution is cancelled.
+    pub(super) async fn exchange(
+        frozen: &FrozenExecutionConfig,
         config: &ProviderExecutionConfig,
         conversation: &ChatConversation,
         sink: &mut DatabaseOutputSink,
     ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        if config.cancellation.is_cancelled() {
+            provider_execution::announce(Some(&mut *sink), ProviderFact::NotDelivered).await;
+            return Err(ProviderExecutionError::NotDelivered {
+                message: "provider execution was cancelled before sending".to_owned(),
+            });
+        }
+        let response = {
+            let mut scripts = SCRIPTS.lock().unwrap_or_else(PoisonError::into_inner);
+            let script = endpoint(frozen)
+                .and_then(|endpoint| scripts.get_mut(endpoint))
+                .expect("a scripted Provider");
+            script(conversation)
+        };
         provider_execution::announce(Some(&mut *sink), ProviderFact::Delivered).await;
         if let Some(gate) = response.gate {
             select(config.cancellation.cancelled(), gate.recv_async()).await;

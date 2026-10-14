@@ -1,7 +1,7 @@
 //! OpenAI-compatible provider execution for an admitted Job.
 
 use std::sync::{
-    Arc, Mutex, PoisonError,
+    Arc, Mutex, PoisonError, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Poll, Waker};
@@ -136,7 +136,9 @@ impl Default for ProviderExecutionConfig {
 
 /// A cancellation shared by an execution and whoever may stop it. Cancelling
 /// wakes every task waiting in [`CancellationToken::cancelled`], so a wait on
-/// a stalled Provider ends at once instead of at its timeout.
+/// a stalled Provider ends at once instead of at its timeout. Clones share
+/// one cancellation; [`CancellationToken::child`] makes a distinct one that
+/// its parent's cancellation reaches.
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken(Arc<Cancellation>);
 
@@ -144,9 +146,16 @@ pub struct CancellationToken(Arc<Cancellation>);
 struct Cancellation {
     cancelled: AtomicBool,
     waiters: Mutex<Vec<Waker>>,
+    /// The children made since the last cancellation, held weakly so a
+    /// long-lived parent keeps none that was dropped. Registration and
+    /// cancellation both take this lock, so a child is either registered
+    /// before the parent's cancellation takes the list, and cancelled with
+    /// it, or sees the parent already cancelled.
+    children: Mutex<Vec<Weak<Cancellation>>>,
 }
 
 impl CancellationToken {
+    /// Cancels this token and every child made from it, and theirs.
     pub fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::Release);
         let waiters = std::mem::take(
@@ -159,6 +168,47 @@ impl CancellationToken {
         for waiter in waiters {
             waiter.wake();
         }
+        let children = std::mem::take(
+            &mut *self
+                .0
+                .children
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for child in children.iter().filter_map(Weak::upgrade) {
+            Self(child).cancel();
+        }
+    }
+
+    /// A new cancellation of its own, cancelled when this one is, already
+    /// if this one is now. Cancelling the child cancels neither this token
+    /// nor any other child of it.
+    pub fn child(&self) -> Self {
+        let child = Self::default();
+        let mut children = self
+            .0
+            .children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.is_cancelled() {
+            drop(children);
+            child.cancel();
+            return child;
+        }
+        children.retain(|registered| registered.strong_count() > 0);
+        children.push(Arc::downgrade(&child.0));
+        child
+    }
+
+    /// How many children this token still registers, live or not yet
+    /// pruned.
+    #[cfg(test)]
+    pub(crate) fn registered_children(&self) -> usize {
+        self.0
+            .children
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -2843,6 +2893,71 @@ pub(crate) mod tests {
             matches!(&result, Err(ProviderExecutionError::Stopped { facts: seen, .. }) if *seen == facts(Some(ChatFinishReason::Stop), Some("stop"))),
             "a cancellation before [DONE] is a local stop, got {result:?}"
         );
+    }
+
+    #[test]
+    fn a_child_is_cancelled_by_its_parent_and_by_nothing_else() {
+        let parent = CancellationToken::default();
+        let (first, second) = (parent.child(), parent.child());
+        let grandchild = first.child();
+        first.cancel();
+        assert!(first.is_cancelled() && grandchild.is_cancelled());
+        assert!(
+            !parent.is_cancelled() && !second.is_cancelled(),
+            "a child's cancellation reaches neither its parent nor a sibling"
+        );
+        let waiter = second.clone();
+        let waiting = std::thread::spawn(move || wait(waiter.cancelled()));
+        parent.cancel();
+        assert!(second.is_cancelled());
+        waiting.join().expect("the child's waiter was woken");
+        assert!(
+            parent.child().is_cancelled(),
+            "a child of a cancelled parent starts cancelled"
+        );
+        assert_eq!(parent.registered_children(), 0);
+    }
+
+    #[test]
+    fn a_cancellation_racing_child_creation_reaches_every_child() {
+        for _ in 0..200 {
+            let parent = CancellationToken::default();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let (making, maker_start) = (parent.clone(), start.clone());
+            let making = std::thread::spawn(move || {
+                maker_start.wait();
+                (0..50).map(|_| making.child()).collect::<Vec<_>>()
+            });
+            start.wait();
+            parent.cancel();
+            let children = making.join().expect("children made");
+            assert!(
+                children.iter().all(CancellationToken::is_cancelled),
+                "no child escapes a cancellation made while it was created"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_keeps_no_child_that_was_dropped() {
+        let parent = CancellationToken::default();
+        for _ in 0..1_000 {
+            drop(parent.child());
+        }
+        let live = parent.child();
+        assert_eq!(
+            parent.registered_children(),
+            1,
+            "dropped children are pruned when another registers"
+        );
+        let weak = Arc::downgrade(&live.0);
+        drop(live);
+        assert!(
+            weak.upgrade().is_none(),
+            "the parent holds its children weakly"
+        );
+        parent.cancel();
+        assert_eq!(parent.registered_children(), 0);
     }
 
     #[test]
