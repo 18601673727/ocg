@@ -44,7 +44,7 @@ use ocg::openai_compatible::image::MAX_IMAGE_BYTES;
 use ocg::openai_compatible::{ImageError, ImageInput, ImageMime};
 use ocg::orchestration::ToolRegistryError;
 use ocg::orchestration::execution_runtime::{
-    ExecutionRuntimeError, ProviderExecutionPlan, ToolExecution,
+    AdmissionError, ExecutionRuntimeError, ProviderExecutionPlan, ToolExecution,
 };
 use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceError};
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
@@ -354,8 +354,9 @@ fn declared_type(path: &str) -> Option<ImageMime> {
     }
 }
 
-/// Submits the Job, with `image` stored as its Attachment when given, waits
-/// for it to settle, and prints what was recorded.
+/// Submits the Job, with `image` stored as its Attachment when given,
+/// reports it once it has started, waits for it to settle, and prints what
+/// was recorded.
 async fn submit(
     context: &HostContext,
     config: Config,
@@ -405,7 +406,16 @@ async fn submit(
         },
         tools,
     };
-    let mut scheduled = std::pin::pin!(context.scheduler().schedule_provider(plan));
+    let scheduler = context.scheduler();
+    let execution = async {
+        let admitted = scheduler
+            .admit_provider(plan)
+            .await
+            .map_err(AdmissionError::into_inner)?;
+        eprintln!("OCG started Job {}", admitted.job());
+        admitted.settled().await
+    };
+    let mut scheduled = std::pin::pin!(execution);
     let settled = match select(signal, scheduled.as_mut()).await {
         Either::Right(settled) => settled,
         Either::Left(_) => {

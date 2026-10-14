@@ -16,13 +16,13 @@ use std::time::Duration;
 use ntex::util::{Either, select};
 
 use crate::attachments::AttachmentError;
-use crate::database::{DatabaseError, DatabaseHandle};
+use crate::database::{CommandOutcome, DatabaseError, DatabaseHandle};
 use crate::openai_compatible::image::{
     MAX_IMAGE_BYTES, MAX_REQUEST_IMAGE_BYTES, MAX_REQUEST_IMAGES,
 };
 use crate::openai_compatible::{
     ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, ImageError, ImageInput,
-    ImageMime, InvalidToolCall, ToolCallRefusal,
+    ImageMime, InvalidToolCall, ToolCallRefusal, ToolWire,
 };
 use crate::orchestration::tools::{
     FailureCertainty, ToolFailure, ToolFuture, ToolOffer, ToolRegistryError,
@@ -401,25 +401,79 @@ pub enum ExecutionRuntimeError {
     },
 }
 
+/// Why a provider plan was not acknowledged as an admitted Job, see
+/// [`SchedulerHandle::admit_provider`].
+#[derive(Debug, thiserror::Error)]
+pub enum AdmissionError {
+    /// The plan never started and no Job was created for it: it was refused
+    /// before its Job was created, or the creation is known not to have
+    /// committed. An input it saved, if any, belongs to no Job.
+    #[error("the plan was not admitted: {0}")]
+    NotAdmitted(ExecutionRuntimeError),
+    /// The creation and local start of the plan's Job was attempted, but
+    /// whether it committed is unknown: a Job may exist, started and
+    /// claimed by this runtime, which no longer executes it. It must not be
+    /// submitted again as if nothing happened. A
+    /// [`DatabaseError::OutcomeUnknown`] names the operation to reconcile;
+    /// a Job left started is settled as abandoned by a later start of the
+    /// database.
+    #[error("whether the plan's Job was created is unknown: {0}")]
+    Uncertain(ExecutionRuntimeError),
+}
+
+impl AdmissionError {
+    /// The underlying error, as [`SchedulerHandle::schedule_provider`]
+    /// reports it.
+    pub fn into_inner(self) -> ExecutionRuntimeError {
+        match self {
+            Self::NotAdmitted(error) | Self::Uncertain(error) => error,
+        }
+    }
+}
+
+/// The Job of a provider plan, created and locally started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartedJob {
+    executor: ExecutorId,
+    input: JobInputId,
+    job: JobId,
+}
+
 type ExecutionReply = flume::Sender<Result<ExecutionReceipt, ExecutionRuntimeError>>;
 
-enum Work {
-    Plan(ExecutionPlan),
-    Provider(ProviderExecutionPlan),
+/// Where the executor reports a provider plan: once when its Job has been
+/// created and locally started, or why it was not; and once more, for a
+/// started Job, when the execution has returned.
+struct ProviderReply {
+    started: flume::Sender<Result<StartedJob, AdmissionError>>,
+    settled: ExecutionReply,
 }
 
 /// One submitted plan with its caller's reply.
-struct Submission {
-    work: Work,
-    reply: ExecutionReply,
+enum Submission {
+    Plan(ExecutionPlan, ExecutionReply),
+    Provider(ProviderExecutionPlan, ProviderReply),
 }
 
 impl Submission {
     /// Answers a plan that will never start: nothing of it was persisted.
     fn refuse(self) {
-        self.reply
-            .send(Err(ExecutionRuntimeError::ShuttingDown))
-            .ok();
+        self.fail(ExecutionRuntimeError::ShuttingDown);
+    }
+
+    /// Answers a plan that never started, for `error`.
+    fn fail(self, error: ExecutionRuntimeError) {
+        match self {
+            Self::Plan(_, reply) => {
+                reply.send(Err(error)).ok();
+            }
+            Self::Provider(_, reply) => {
+                reply
+                    .started
+                    .send(Err(AdmissionError::NotAdmitted(error)))
+                    .ok();
+            }
+        }
     }
 }
 
@@ -470,48 +524,174 @@ impl SchedulerHandle {
         &self,
         plan: ExecutionPlan,
     ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-        self.submit(Work::Plan(plan)).await
+        let (reply, response) = flume::bounded(1);
+        self.submit(Submission::Plan(plan, reply))?;
+        response
+            .recv_async()
+            .await
+            .map_err(|_| ExecutionRuntimeError::SchedulerStopped)?
     }
 
-    /// Submits a provider execution. Shutdown of the runtime cancels
-    /// `plan.provider_config.cancellation` if the plan is executing then.
+    /// Submits a provider execution and waits until it has settled: it is
+    /// [`Self::admit_provider`] followed by [`AdmittedJob::settled`], with
+    /// an admission failure reported as its underlying error. Shutdown of
+    /// the runtime cancels `plan.provider_config.cancellation` if the plan
+    /// is executing then.
     pub async fn schedule_provider(
         &self,
         plan: ProviderExecutionPlan,
     ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-        self.submit(Work::Provider(plan)).await
+        self.admit_provider(plan)
+            .await
+            .map_err(AdmissionError::into_inner)?
+            .settled()
+            .await
+    }
+
+    /// Submits a provider execution and returns as soon as its one Job has
+    /// been created with its input and locally started by the executor, in
+    /// the one transaction that claims it, before anything is sent to the
+    /// Provider. The executor then owns the execution: it runs, and settles
+    /// the Job, whatever becomes of the returned [`AdmittedJob`]; dropping
+    /// it, or the future of its settlement, neither stops nor cancels the
+    /// Job. Its stop is requested through the plan's own cancellation, which
+    /// shutdown of the runtime cancels too.
+    ///
+    /// Admission is bounded as [`Self::schedule_provider`]'s is: a full
+    /// queue, a stopped scheduler or executor, shutdown, an unregistered
+    /// Executor, invalid tool limits, tools no longer offered, and a
+    /// creation known not to have committed are each
+    /// [`AdmissionError::NotAdmitted`]; a creation whose commit is unknown
+    /// is [`AdmissionError::Uncertain`], never a refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no Job is known to have been admitted.
+    pub async fn admit_provider(
+        &self,
+        plan: ProviderExecutionPlan,
+    ) -> Result<AdmittedJob, AdmissionError> {
+        let cancellation = plan.provider_config.cancellation.clone();
+        let (started, admission) = flume::bounded(1);
+        let (settled, settlement) = flume::bounded(1);
+        self.submit(Submission::Provider(
+            plan,
+            ProviderReply { started, settled },
+        ))
+        .map_err(AdmissionError::NotAdmitted)?;
+        // Every refusal is answered before the reply is dropped, so a
+        // reply dropped unanswered means a worker stopped without knowing
+        // whether the Job was created.
+        let started = admission
+            .recv_async()
+            .await
+            .map_err(|_| AdmissionError::Uncertain(ExecutionRuntimeError::SchedulerStopped))??;
+        Ok(AdmittedJob {
+            started,
+            stop: JobStop {
+                job: started.job,
+                cancellation,
+            },
+            settlement,
+        })
     }
 
     /// Once shutdown has begun, a plan is refused here without being queued.
     /// The check and the queueing happen under the state lock, which never
     /// waits for queue space, so a plan is either queued ahead of the
     /// scheduler's last drain or refused.
-    async fn submit(&self, work: Work) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-        let (reply, response) = flume::bounded(1);
-        {
-            let state = lock(&self.state);
-            if state.stopping {
-                return Err(ExecutionRuntimeError::ShuttingDown);
-            }
-            if state.closed {
-                return Err(ExecutionRuntimeError::SchedulerStopped);
-            }
-            #[cfg(test)]
-            tests::admitted();
-            self.sender
-                .try_send(SchedulerMessage::Schedule(Box::new(Submission {
-                    work,
-                    reply,
-                })))
-                .map_err(|error| match error {
-                    flume::TrySendError::Full(_) => ExecutionRuntimeError::SchedulerQueueFull,
-                    flume::TrySendError::Disconnected(_) => ExecutionRuntimeError::SchedulerStopped,
-                })?;
+    fn submit(&self, submission: Submission) -> Result<(), ExecutionRuntimeError> {
+        let state = lock(&self.state);
+        if state.stopping {
+            return Err(ExecutionRuntimeError::ShuttingDown);
         }
-        response
+        if state.closed {
+            return Err(ExecutionRuntimeError::SchedulerStopped);
+        }
+        #[cfg(test)]
+        tests::admitted();
+        self.sender
+            .try_send(SchedulerMessage::Schedule(Box::new(submission)))
+            .map_err(|error| match error {
+                flume::TrySendError::Full(_) => ExecutionRuntimeError::SchedulerQueueFull,
+                flume::TrySendError::Disconnected(_) => ExecutionRuntimeError::SchedulerStopped,
+            })
+    }
+}
+
+/// A provider plan's Job, created and locally started: an accepted,
+/// running Job, not a settled one. Its identity is the one the execution,
+/// its input, outputs, tool evidence and settlement are recorded under.
+/// The runtime owns its execution; this only observes its settlement and
+/// may request its stop. Dropping it changes nothing about the Job.
+#[derive(Debug)]
+pub struct AdmittedJob {
+    started: StartedJob,
+    stop: JobStop,
+    settlement: flume::Receiver<Result<ExecutionReceipt, ExecutionRuntimeError>>,
+}
+
+impl AdmittedJob {
+    pub fn job(&self) -> JobId {
+        self.started.job
+    }
+
+    pub fn input(&self) -> JobInputId {
+        self.started.input
+    }
+
+    pub fn executor(&self) -> ExecutorId {
+        self.started.executor
+    }
+
+    /// A handle that requests the stop of this Job and of nothing else.
+    pub fn stop_handle(&self) -> JobStop {
+        self.stop.clone()
+    }
+
+    /// Requests the stop of this Job's execution, see [`JobStop::request`].
+    pub fn request_stop(&self) {
+        self.stop.request();
+    }
+
+    /// Waits until the execution has returned, and answers what
+    /// [`SchedulerHandle::schedule_provider`] answers for it: the receipt
+    /// of the Job, or why it settled, or failed to settle, as it did.
+    ///
+    /// # Errors
+    ///
+    /// As [`SchedulerHandle::schedule_provider`] once the Job was started.
+    pub async fn settled(self) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+        self.settlement
             .recv_async()
             .await
             .map_err(|_| ExecutionRuntimeError::SchedulerStopped)?
+    }
+}
+
+/// Requests the stop of one admitted Job's execution. Cloneable; every
+/// clone addresses the same Job.
+#[derive(Clone, Debug)]
+pub struct JobStop {
+    job: JobId,
+    cancellation: CancellationToken,
+}
+
+impl JobStop {
+    pub fn job(&self) -> JobId {
+        self.job
+    }
+
+    /// Cancels the Job's execution: the cancellation of the plan it was
+    /// admitted from, the one its execution observes. It is a request, not
+    /// an outcome: the Job settles as the execution then ends, which is
+    /// Unknown, not Cancelled, when a request may have reached the Provider
+    /// or a call may have had an effect, and may still be Completed when
+    /// the execution had already finished. Once the execution has returned
+    /// it changes nothing. A token the submitter shared between plans is
+    /// cancelled for all of them.
+    pub fn request(&self) {
+        self.cancellation.cancel();
     }
 }
 
@@ -644,12 +824,7 @@ fn scheduler_loop(
         if let SchedulerMessage::Schedule(submission) = message {
             match result {
                 Ok(()) => submission.refuse(),
-                Err(_) => {
-                    submission
-                        .reply
-                        .send(Err(ExecutionRuntimeError::ExecutorStopped))
-                        .ok();
-                }
+                Err(_) => submission.fail(ExecutionRuntimeError::ExecutorStopped),
             }
         }
     }
@@ -673,16 +848,10 @@ fn schedule(
         match executor_sender.try_send(ExecutorMessage::Execute(submission)) {
             Ok(()) => {}
             Err(flume::TrySendError::Full(ExecutorMessage::Execute(submission))) => {
-                submission
-                    .reply
-                    .send(Err(ExecutionRuntimeError::ExecutorQueueFull))
-                    .ok();
+                submission.fail(ExecutionRuntimeError::ExecutorQueueFull);
             }
             Err(flume::TrySendError::Disconnected(ExecutorMessage::Execute(submission))) => {
-                submission
-                    .reply
-                    .send(Err(ExecutionRuntimeError::ExecutorStopped))
-                    .ok();
+                submission.fail(ExecutionRuntimeError::ExecutorStopped);
                 return Err(ExecutionRuntimeError::ExecutorStopped);
             }
             Err(
@@ -702,7 +871,7 @@ async fn executor_loop(
     state: SharedState,
 ) -> Result<(), ExecutionRuntimeError> {
     while let Ok(message) = receiver.recv_async().await {
-        let Submission { work, reply } = match message {
+        let submission = match message {
             ExecutorMessage::Execute(submission) => *submission,
             ExecutorMessage::Shutdown => break,
         };
@@ -710,20 +879,29 @@ async fn executor_loop(
             let mut state = lock(&state);
             if state.stopping {
                 drop(state);
-                Submission { work, reply }.refuse();
+                submission.refuse();
                 continue;
             }
-            state.current = match &work {
-                Work::Provider(plan) => Some(plan.provider_config.cancellation.clone()),
-                Work::Plan(_) => None,
+            state.current = match &submission {
+                Submission::Provider(plan, _) => Some(plan.provider_config.cancellation.clone()),
+                Submission::Plan(..) => None,
             };
         }
-        let result = match work {
-            Work::Plan(plan) => execute_plan(database.clone(), plan).await,
-            Work::Provider(plan) => execute_provider_plan(database.clone(), plan).await,
-        };
-        lock(&state).current = None;
-        reply.send(result).ok();
+        match submission {
+            Submission::Plan(plan, reply) => {
+                let result = execute_plan(database.clone(), plan).await;
+                lock(&state).current = None;
+                reply.send(result).ok();
+            }
+            Submission::Provider(plan, reply) => {
+                let result = execute_provider_plan(database.clone(), plan, &reply.started).await;
+                lock(&state).current = None;
+                // A plan that never started has had its answer.
+                if let Some(result) = result {
+                    reply.settled.send(result).ok();
+                }
+            }
+        }
     }
     for message in receiver.drain() {
         if let ExecutorMessage::Execute(submission) = message {
@@ -786,13 +964,45 @@ pub(crate) async fn confirm_stopped(
     }
 }
 
+/// Executes a provider plan: creates and locally starts its one Job,
+/// reports that on `started`, and runs it to its settlement, which is
+/// returned. A plan that does not start has why reported on `started`, and
+/// returns `None`.
 async fn execute_provider_plan(
     database: DatabaseHandle,
     mut plan: ProviderExecutionPlan,
-) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    started: &flume::Sender<Result<StartedJob, AdmissionError>>,
+) -> Option<Result<ExecutionReceipt, ExecutionRuntimeError>> {
+    let offered = match start_provider_job(&database, &mut plan).await {
+        Ok((job, offered)) => {
+            started.send(Ok(job)).ok();
+            (job, offered)
+        }
+        Err(error) => {
+            started.send(Err(error)).ok();
+            return None;
+        }
+    };
+    Some(run_started_provider_job(database, plan, offered).await)
+}
+
+/// Creates and locally starts the Job of a provider plan, once the plan is
+/// checked, and returns it with the tool definitions to offer. Nothing is
+/// persisted unless the Executor is registered, the tool limits are valid
+/// and the tools can still be offered.
+async fn start_provider_job(
+    database: &DatabaseHandle,
+    plan: &mut ProviderExecutionPlan,
+) -> Result<(StartedJob, Option<Vec<ToolWire>>), AdmissionError> {
+    let refused = AdmissionError::NotAdmitted;
     let executor = plan.executor_id;
-    if database.executor(executor).await?.is_none() {
-        return Err(ExecutionRuntimeError::ExecutorNotFound(executor));
+    if database
+        .executor(executor)
+        .await
+        .map_err(|error| refused(error.into()))?
+        .is_none()
+    {
+        return Err(refused(ExecutionRuntimeError::ExecutorNotFound(executor)));
     }
     plan.job.assigned_executor = Some(executor);
     // The limits are checked, and the offer read from the registry, before
@@ -801,18 +1011,52 @@ async fn execute_provider_plan(
         tools
             .limits
             .validate()
-            .map_err(ExecutionRuntimeError::InvalidToolLimits)?;
+            .map_err(|error| refused(ExecutionRuntimeError::InvalidToolLimits(error)))?;
     }
     let offered = plan
         .tools
         .as_ref()
         .map(|tools| tools.offer.wires())
         .transpose()
-        .map_err(ExecutionRuntimeError::ToolsUnavailable)?;
-    let input = database.save_job_input(None, plan.input).await?;
+        .map_err(|error| refused(ExecutionRuntimeError::ToolsUnavailable(error)))?;
+    // An input left unsubmitted by a refused or unknown creation belongs to
+    // no Job.
+    let input = database
+        .save_job_input(None, std::mem::take(&mut plan.input))
+        .await
+        .map_err(|error| refused(error.into()))?;
+    #[cfg(test)]
+    provider_seam::before_creation(plan.job.name.as_deref());
     let job = database
-        .create_local_job_with_input(plan.job, input)
-        .await?;
+        .create_local_job_with_input(plan.job.clone(), input)
+        .await
+        .map_err(|error| match error.command_outcome() {
+            Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted) => {
+                refused(error.into())
+            }
+            Some(CommandOutcome::Unknown) | None => AdmissionError::Uncertain(error.into()),
+        })?;
+    Ok((
+        StartedJob {
+            executor,
+            input,
+            job,
+        },
+        offered,
+    ))
+}
+
+/// Runs a provider plan whose Job was started to its settlement.
+async fn run_started_provider_job(
+    database: DatabaseHandle,
+    plan: ProviderExecutionPlan,
+    (started, offered): (StartedJob, Option<Vec<ToolWire>>),
+) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let StartedJob {
+        executor,
+        input,
+        job,
+    } = started;
 
     // Settles the Job failed before anything was sent.
     let refused = async |summary: String| -> Result<ExecutionReceipt, ExecutionRuntimeError> {
@@ -868,6 +1112,10 @@ async fn execute_provider_plan(
         plan.tools.as_ref(),
         &config.cancellation,
         async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
+            #[cfg(test)]
+            if let Some(response) = provider_seam::response(frozen, conversation) {
+                return provider_seam::respond(response, config, conversation, sink).await;
+            }
             provider_execution::execute_conversation(
                 frozen,
                 conversation,
@@ -879,6 +1127,108 @@ async fn execute_provider_plan(
         },
     )
     .await
+}
+
+/// A test stand-in for the Provider of a plan executed by the runtime, and a
+/// hook before a provider plan's Job is created. Both are keyed, by the
+/// Provider's endpoint and by the Job's name, so tests running at once do
+/// not see each other's.
+#[cfg(test)]
+pub(crate) mod provider_seam {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Instant;
+
+    use ntex::util::select;
+
+    use super::DatabaseOutputSink;
+    use crate::openai_compatible::ChatConversation;
+    use crate::persistence::FrozenExecutionConfig;
+    use crate::provider_execution::scripted::{Step, payload};
+    use crate::provider_execution::{
+        self, ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult,
+        ProviderFact,
+    };
+
+    /// One scripted response: the steps of its body, read once `gate`
+    /// yields, is dropped, or the execution is cancelled.
+    pub(crate) struct Response {
+        pub(crate) gate: Option<flume::Receiver<()>>,
+        pub(crate) steps: Vec<Step>,
+    }
+
+    type Script = Box<dyn FnMut(&ChatConversation) -> Response + Send>;
+    type Hook = Box<dyn FnMut() + Send>;
+
+    static SCRIPTS: Mutex<BTreeMap<String, Script>> = Mutex::new(BTreeMap::new());
+    static HOOKS: Mutex<BTreeMap<String, Hook>> = Mutex::new(BTreeMap::new());
+
+    /// Answers every request to `endpoint` with what `script` gives, instead
+    /// of sending it.
+    pub(crate) fn install(
+        endpoint: &str,
+        script: impl FnMut(&ChatConversation) -> Response + Send + 'static,
+    ) {
+        SCRIPTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(endpoint.to_owned(), Box::new(script));
+    }
+
+    /// Runs `hook` immediately before the Job of a provider plan named
+    /// `name` is created, once its input was saved.
+    pub(crate) fn before_creation_of(name: &str, hook: impl FnMut() + Send + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(name.to_owned(), Box::new(hook));
+    }
+
+    pub(super) fn before_creation(name: Option<&str>) {
+        let Some(name) = name else { return };
+        if let Some(hook) = HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(name)
+        {
+            hook();
+        }
+    }
+
+    pub(super) fn response(
+        frozen: &FrozenExecutionConfig,
+        conversation: &ChatConversation,
+    ) -> Option<Response> {
+        let endpoint = frozen.llm.provider.endpoint.as_deref()?;
+        SCRIPTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(endpoint)
+            .map(|script| script(conversation))
+    }
+
+    /// Answers as a Provider that received the request would.
+    pub(super) async fn respond(
+        response: Response,
+        config: &ProviderExecutionConfig,
+        conversation: &ChatConversation,
+        sink: &mut DatabaseOutputSink,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+        provider_execution::announce(Some(&mut *sink), ProviderFact::Delivered).await;
+        if let Some(gate) = response.gate {
+            select(config.cancellation.cancelled(), gate.recv_async()).await;
+        }
+        provider_execution::read_response(
+            payload(response.steps, config.cancellation.clone()),
+            200,
+            Instant::now(),
+            None,
+            config,
+            Some(sink),
+            conversation,
+        )
+        .await
+    }
 }
 
 /// Why an input's Attachments cannot be sent as images.
@@ -1914,12 +2264,9 @@ mod tests {
             while let Ok(message) = receiver.recv() {
                 match message {
                     ExecutorMessage::Execute(submission) => {
-                        submission
-                            .reply
-                            .send(Err(ExecutionRuntimeError::Provider(
-                                "the plan reached the executor".to_owned(),
-                            )))
-                            .ok();
+                        submission.fail(ExecutionRuntimeError::Provider(
+                            "the plan reached the executor".to_owned(),
+                        ));
                     }
                     ExecutorMessage::Shutdown => break,
                 }
@@ -2074,5 +2421,75 @@ mod tests {
             matches!(stopped, Err(ExecutionRuntimeError::WorkerPanicked)),
             "the executor's failure is reported, not its consequence: {stopped:?}"
         );
+    }
+
+    /// A provider plan that is never executed by these tests.
+    fn provider_plan() -> ProviderExecutionPlan {
+        let plan = plan();
+        ProviderExecutionPlan::environment_credentials(plan.executor_id, plan.input, plan.job)
+    }
+
+    fn not_admitted(result: Result<AdmittedJob, AdmissionError>) -> ExecutionRuntimeError {
+        match result {
+            Err(AdmissionError::NotAdmitted(error)) => error,
+            other => panic!("the plan must not be admitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_full_or_closed_scheduler_admits_nothing() {
+        let (scheduler, receiver, _executor_sender, _executor_receiver) = queues();
+        for _ in 0..SCHEDULER_QUEUE_CAPACITY {
+            scheduler
+                .sender
+                .try_send(SchedulerMessage::Shutdown)
+                .expect("fill the queue");
+        }
+        assert!(matches!(
+            not_admitted(wait(scheduler.admit_provider(provider_plan()))),
+            ExecutionRuntimeError::SchedulerQueueFull
+        ));
+        receiver.drain().for_each(drop);
+        lock(&scheduler.state).closed = true;
+        assert!(matches!(
+            not_admitted(wait(scheduler.admit_provider(provider_plan()))),
+            ExecutionRuntimeError::SchedulerStopped
+        ));
+        assert!(receiver.is_empty(), "nothing was queued");
+    }
+
+    #[test]
+    fn a_full_executor_queue_admits_nothing() {
+        let (scheduler, receiver, executor_sender, executor_receiver) = queues();
+        for _ in 0..EXECUTOR_QUEUE_CAPACITY {
+            executor_sender
+                .try_send(ExecutorMessage::Shutdown)
+                .expect("fill the executor queue");
+        }
+        let state = scheduler.state.clone();
+        let scheduling = thread::spawn(move || scheduler_loop(receiver, executor_sender, state));
+        assert!(matches!(
+            not_admitted(wait(scheduler.admit_provider(provider_plan()))),
+            ExecutionRuntimeError::ExecutorQueueFull
+        ));
+        assert_eq!(executor_receiver.len(), EXECUTOR_QUEUE_CAPACITY);
+        scheduler
+            .sender
+            .send(SchedulerMessage::Shutdown)
+            .expect("stop the scheduler");
+        finished(scheduling).expect("the scheduler stopped");
+    }
+
+    #[test]
+    fn a_plan_dropped_unanswered_is_uncertain_not_refused() {
+        let (scheduler, receiver, _executor_sender, _executor_receiver) = queues();
+        // A worker that stops without answering, as one that panicked does,
+        // cannot say whether the Job was created.
+        let dropping = thread::spawn(move || drop(receiver.recv()));
+        assert!(matches!(
+            wait(scheduler.admit_provider(provider_plan())),
+            Err(AdmissionError::Uncertain(_))
+        ));
+        finished(dropping);
     }
 }

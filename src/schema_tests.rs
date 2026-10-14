@@ -18271,6 +18271,683 @@ mod requests_and_tool_loop {
         }
     }
 
+    // ---- Native Job admission ---------------------------------------------------
+
+    mod native_admission {
+        use super::*;
+        use crate::database::CommandOutcome;
+        use crate::orchestration::execution_runtime::provider_seam::{self, Response};
+        use crate::orchestration::execution_runtime::{AdmissionError, AdmittedJob};
+        use crate::provider_execution::EnvironmentCredentialResolver;
+        use crate::provider_execution::scripted::Step;
+
+        /// A Provider answered by the test, its LLM Profile and an Executor.
+        struct Target {
+            executor: ExecutorId,
+            llm: ProfileId,
+        }
+
+        /// Registers a Provider named `name`, whose endpoint is unique to the
+        /// test, and answers every request to it with the next of
+        /// `responses`. Returns the target and the count of requests.
+        fn scripted(
+            handle: &DatabaseHandle,
+            name: &str,
+            responses: Vec<Response>,
+        ) -> (Target, Arc<AtomicUsize>) {
+            let provider = provider(handle, name);
+            let llm = llm_profile(
+                handle,
+                provider,
+                llm_config(name, &[ModelCapability::Chat, ModelCapability::Tools]),
+            );
+            let executor =
+                executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = requests.clone();
+            let mut responses = responses.into_iter();
+            provider_seam::install(&format!("https://{name}.invalid/v1"), move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                responses
+                    .next()
+                    .expect("a scripted response for every request")
+            });
+            (Target { executor, llm }, requests)
+        }
+
+        fn plan(
+            handle: &DatabaseHandle,
+            target: &Target,
+            name: &str,
+            tools: Option<ToolExecution>,
+        ) -> ProviderExecutionPlan {
+            ProviderExecutionPlan {
+                executor_id: target.executor,
+                input: JobInputDraft {
+                    objective: Some(format!("the objective of {name}")),
+                    ..JobInputDraft::default()
+                },
+                job: NewJob {
+                    configuration: llm_only(target.llm),
+                    ..new_job(name, handle.genesis(), Vec::new())
+                },
+                credential_resolver: Arc::new(EnvironmentCredentialResolver),
+                provider_config: ProviderExecutionConfig::default(),
+                tools,
+            }
+        }
+
+        fn now(steps: Vec<Step>) -> Response {
+            Response { gate: None, steps }
+        }
+
+        /// A response read only once the returned sender sends or drops.
+        fn gated(steps: Vec<Step>) -> (flume::Sender<()>, Response) {
+            let (open, gate) = flume::bounded(1);
+            (
+                open,
+                Response {
+                    gate: Some(gate),
+                    steps,
+                },
+            )
+        }
+
+        /// A response that never comes: only cancellation ends it.
+        fn stalled() -> Response {
+            now(vec![Step::Stall])
+        }
+
+        fn jobs_named(handle: &DatabaseHandle, name: &str) -> Vec<JobRecord> {
+            wait(handle.jobs(None, 1_000))
+                .expect("read Jobs")
+                .into_iter()
+                .filter(|job| job.name.as_deref() == Some(name))
+                .collect()
+        }
+
+        fn admitted(result: Result<AdmittedJob, AdmissionError>) -> AdmittedJob {
+            result.unwrap_or_else(|error| panic!("the plan must be admitted, got {error}"))
+        }
+
+        fn settled(record: &JobRecord) -> bool {
+            record.completed_at.is_some()
+                || record.failed_at.is_some()
+                || record.cancelled_at.is_some()
+                || record.unknown_at.is_some()
+        }
+
+        fn until(mut condition: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "not reached in time");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn summary(handle: &DatabaseHandle, job: JobId) -> Option<String> {
+            wait(handle.job_outputs(job, None, 100))
+                .expect("outputs")
+                .into_iter()
+                .rev()
+                .find(|output| output.kind == OutputKind::Result)
+                .and_then(|output| output.summary)
+        }
+
+        #[test]
+        fn admission_acknowledges_the_durably_started_job_before_the_provider_answers() {
+            let (_root, directory) = data_directory("admission-early");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (open, response) = gated(answering("the answer", (12, 3)));
+            let (target, requests) = scripted(&handle, "admission-early", vec![response]);
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+
+            let job = admitted(wait(
+                runtime
+                    .scheduler()
+                    .admit_provider(plan(&handle, &target, "early", None)),
+            ));
+            // Acknowledged: one durable Job, started and claimed, and not
+            // settled, while its Provider has not answered.
+            let [record] = jobs_named(&handle, "early").try_into().expect("one Job");
+            assert_eq!(record.id, job.job());
+            assert_eq!(record.input, job.input());
+            assert_eq!(job.executor(), target.executor);
+            assert_eq!(record.assigned_executor, Some(target.executor));
+            assert!(record.started_at.is_some() && !settled(&record));
+            let input = wait(handle.job_input(job.input()))
+                .expect("read")
+                .expect("the frozen input");
+            assert_eq!(input.objective.as_deref(), Some("the objective of early"));
+            assert!(
+                summary(&handle, job.job()).is_none(),
+                "nothing answered yet"
+            );
+            assert!(requests.load(Ordering::SeqCst) <= 1);
+
+            // Settlement is awaited apart, and is of the same Job.
+            open.send(()).expect("let the Provider answer");
+            let (id, input_id) = (job.job(), job.input());
+            let receipt = wait(job.settled()).expect("settled");
+            assert_eq!((receipt.job, receipt.input), (id, input_id));
+            assert!(job_record(&handle, id).completed_at.is_some());
+            assert_eq!(summary(&handle, id).as_deref(), Some("the answer"));
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                jobs_named(&handle, "early").len(),
+                1,
+                "one Job, created once"
+            );
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn one_submission_is_one_job_with_its_input_outputs_and_tool_evidence() {
+            let (_root, directory) = data_directory("admission-once");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (target, _) = scripted(
+                &handle,
+                "admission-once",
+                vec![
+                    now(calling(&[add(0, "call_add", 2, 3)], (10, 4))),
+                    now(answering("2 + 3 = 5", (20, 5))),
+                    now(answering("legacy answer", (5, 2))),
+                ],
+            );
+            let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let scheduler = runtime.scheduler();
+            let before = wait(handle.jobs(None, 1_000)).expect("read").len();
+
+            let tools = execution(&registry, &["add"], ToolLoopLimits::default());
+            let job = admitted(wait(scheduler.admit_provider(plan(
+                &handle,
+                &target,
+                "with tools",
+                Some(tools),
+            ))));
+            let id = job.job();
+            let receipt = wait(job.settled()).expect("settled");
+            assert_eq!(receipt.job, id);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let [record] = evidence(&handle, id).try_into().expect("one call");
+            assert_eq!(record.call, tool_call(id, 1, 0));
+            assert_eq!(outcome_of(&record), Some(completed(r#"{"sum":5}"#)));
+            assert_eq!(summary(&handle, id).as_deref(), Some("2 + 3 = 5"));
+            let [job_record] = jobs_named(&handle, "with tools")
+                .try_into()
+                .expect("one Job");
+            assert_eq!(job_record.input, receipt.input);
+
+            // The final-receipt API is the same path: one more Job, not two.
+            let receipt = wait(scheduler.schedule_provider(plan(&handle, &target, "legacy", None)))
+                .expect("settled");
+            let [legacy] = jobs_named(&handle, "legacy").try_into().expect("one Job");
+            assert_eq!((legacy.id, legacy.input), (receipt.job, receipt.input));
+            assert!(legacy.completed_at.is_some());
+            assert_eq!(
+                summary(&handle, legacy.id).as_deref(),
+                Some("legacy answer")
+            );
+            assert_eq!(
+                wait(handle.jobs(None, 1_000)).expect("read").len(),
+                before + 2
+            );
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn plans_that_never_start_are_refused_and_persist_no_job() {
+            let (_root, directory) = data_directory("admission-refused");
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+            let handle = worker.handle();
+            let (target, requests) = scripted(&handle, "admission-refused", Vec::new());
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let scheduler = runtime.scheduler();
+            let refused = |result: Result<AdmittedJob, AdmissionError>| match result {
+                Err(AdmissionError::NotAdmitted(error)) => error,
+                other => panic!("the plan must be refused, got {other:?}"),
+            };
+
+            let mut unknown_executor = plan(&handle, &target, "no executor", None);
+            unknown_executor.executor_id = ExecutorId::new(999);
+            assert!(matches!(
+                refused(wait(scheduler.admit_provider(unknown_executor))),
+                ExecutionRuntimeError::ExecutorNotFound(_)
+            ));
+
+            let (registry, _) = registered(vec![("add", Behavior::Add)]);
+            let invalid = ToolLoopLimits {
+                max_provider_requests: 0,
+                ..ToolLoopLimits::default()
+            };
+            assert!(matches!(
+                refused(wait(scheduler.admit_provider(plan(
+                    &handle,
+                    &target,
+                    "no requests",
+                    Some(execution(&registry, &["add"], invalid)),
+                )))),
+                ExecutionRuntimeError::InvalidToolLimits(_)
+            ));
+            let tools = execution(&registry, &["add"], ToolLoopLimits::default());
+            registry.revoke("add").expect("revoke");
+            assert!(matches!(
+                refused(wait(scheduler.admit_provider(plan(
+                    &handle,
+                    &target,
+                    "revoked",
+                    Some(tools),
+                )))),
+                ExecutionRuntimeError::ToolsUnavailable(_)
+            ));
+
+            // Storage refuses the creation itself, once the input was saved.
+            let (seam_handle, path) = (handle.clone(), directory.database_path().to_path_buf());
+            provider_seam::before_creation_of("refused by storage", move || {
+                protect(&seam_handle, &path);
+            });
+            let error = refused(wait(scheduler.admit_provider(plan(
+                &handle,
+                &target,
+                "refused by storage",
+                None,
+            ))));
+            let ExecutionRuntimeError::Database(error) = error else {
+                panic!("a storage refusal, got {error:?}");
+            };
+            assert!(matches!(
+                error.command_outcome(),
+                Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted)
+            ));
+
+            for name in [
+                "no executor",
+                "no requests",
+                "revoked",
+                "refused by storage",
+            ] {
+                assert!(
+                    jobs_named(&handle, name).is_empty(),
+                    "{name} created no Job"
+                );
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 0, "nothing was sent");
+
+            // Once shutdown has begun, nothing is admitted.
+            runtime.shutdown().expect("shutdown runtime");
+            assert!(matches!(
+                refused(wait(scheduler.admit_provider(plan(
+                    &handle,
+                    &target,
+                    "after shutdown",
+                    None,
+                )))),
+                ExecutionRuntimeError::ShuttingDown
+            ));
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn an_unknown_creation_commit_is_uncertain_and_never_resubmitted() {
+            let (_root, directory) = data_directory("admission-unknown");
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+            let handle = worker.handle();
+            let (target, requests) = scripted(&handle, "admission-unknown", Vec::new());
+            let companion_job = llm_job(&handle, target.llm);
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let failed_group = Arc::new(std::sync::Mutex::new(None));
+            let (group, seam_handle) = (failed_group.clone(), handle.clone());
+            provider_seam::before_creation_of("unknown commit", move || {
+                *group.lock().expect("lock") = Some(fail_next_commit(&seam_handle, companion_job));
+            });
+
+            let operation = match wait(runtime.scheduler().admit_provider(plan(
+                &handle,
+                &target,
+                "unknown commit",
+                None,
+            ))) {
+                Err(AdmissionError::Uncertain(ExecutionRuntimeError::Database(
+                    DatabaseError::OutcomeUnknown { operation, .. },
+                ))) => operation,
+                other => panic!("an unknown commit is uncertain, not refused, got {other:?}"),
+            };
+            let companion = failed_group
+                .lock()
+                .expect("lock")
+                .take()
+                .expect("the commit was failed");
+            assert!(matches!(
+                companion.join().expect("joined"),
+                Err(DatabaseError::OutcomeUnknown { .. })
+            ));
+            assert_eq!(requests.load(Ordering::SeqCst), 0, "nothing was sent");
+            runtime.shutdown().expect("shutdown runtime");
+
+            // Whatever the commit did, there is at most that one Job, and a
+            // later start settles it if it exists; nothing created another.
+            wait(handle.recover_storage()).expect("recover storage");
+            let status = wait(handle.reconcile_operation(operation)).expect("reconcile");
+            let jobs = jobs_named(&handle, "unknown commit");
+            match status {
+                crate::database::OperationStatus::Committed(_) => {
+                    let [record] = jobs.try_into().expect("the one Job");
+                    assert!(record.started_at.is_some() && !settled(&record));
+                    worker.shutdown().expect("shutdown");
+                    let worker = DatabaseWorker::start(&directory).expect("restart");
+                    assert_eq!(worker.handle().abandoned_at_open(), [record.id]);
+                    worker.shutdown().expect("shutdown");
+                }
+                _ => {
+                    assert!(jobs.is_empty(), "no Job: {jobs:?}");
+                    worker.shutdown().expect("shutdown");
+                }
+            }
+        }
+
+        #[test]
+        fn a_stop_request_reaches_only_the_acknowledged_job() {
+            let (_root, directory) = data_directory("admission-stop");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (target, requests) = scripted(
+                &handle,
+                "admission-stop",
+                vec![stalled(), now(answering("second answer", (3, 1)))],
+            );
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let scheduler = runtime.scheduler();
+
+            let first = admitted(wait(
+                scheduler.admit_provider(plan(&handle, &target, "stopped", None)),
+            ));
+            until(|| requests.load(Ordering::SeqCst) == 1);
+            // The next plan is admitted only once the executor is free.
+            let second_plan = plan(&handle, &target, "untouched", None);
+            let second_token = second_plan.provider_config.cancellation.clone();
+            let next = scheduler.clone();
+            let second = std::thread::spawn(move || wait(next.admit_provider(second_plan)));
+
+            let stop = first.stop_handle();
+            assert_eq!(stop.job(), first.job());
+            stop.request();
+            let first_id = first.job();
+            let receipt = wait(first.settled()).expect("settled");
+            assert_eq!((receipt.job, receipt.result), (first_id, None));
+            let record = job_record(&handle, first_id);
+            assert!(
+                record.unknown_at.is_some()
+                    && record.stop_confirmed_at.is_some()
+                    && record.cancelled_at.is_none(),
+                "a stopped request that reached the Provider is Unknown, not Cancelled"
+            );
+
+            let second = admitted(second.join().expect("joined"));
+            assert_ne!(second.job(), first_id);
+            // A repeated stop of the first Job reaches no other.
+            stop.request();
+            let second_id = second.job();
+            wait(second.settled()).expect("settled");
+            assert!(!second_token.is_cancelled());
+            assert!(job_record(&handle, second_id).completed_at.is_some());
+            assert_eq!(
+                summary(&handle, second_id).as_deref(),
+                Some("second answer")
+            );
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_stop_after_settlement_changes_nothing() {
+            let (_root, directory) = data_directory("admission-late-stop");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (target, _) = scripted(
+                &handle,
+                "admission-late-stop",
+                vec![now(answering("done", (3, 1)))],
+            );
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let job = admitted(wait(
+                runtime
+                    .scheduler()
+                    .admit_provider(plan(&handle, &target, "finished", None)),
+            ));
+            let (id, stop) = (job.job(), job.stop_handle());
+            wait(job.settled()).expect("settled");
+            let before = job_record(&handle, id);
+            stop.request();
+            runtime.shutdown().expect("shutdown runtime");
+            let after = job_record(&handle, id);
+            assert!(after.completed_at.is_some());
+            assert_eq!(before, after, "a completed Job is not cancelled afterwards");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_stop_during_a_non_idempotent_call_leaves_its_effect_uncertain() {
+            let (_root, directory) = data_directory("admission-tool-stop");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (target, _) = scripted(
+                &handle,
+                "admission-tool-stop",
+                vec![now(calling(
+                    &[call(0, "call_hang", "hang", r#"{"a":1,"b":2}"#)],
+                    (5, 2),
+                ))],
+            );
+            let (registry, calls) =
+                registered_as(ToolEffect::NonIdempotent, vec![("hang", Behavior::Hang)]);
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let tools = execution(&registry, &["hang"], ToolLoopLimits::default());
+            let job = admitted(wait(runtime.scheduler().admit_provider(plan(
+                &handle,
+                &target,
+                "effectful",
+                Some(tools),
+            ))));
+            until(|| calls.load(Ordering::SeqCst) == 1);
+            job.request_stop();
+            let id = job.job();
+            match wait(job.settled()) {
+                Err(ExecutionRuntimeError::ToolLoopStopped { receipt, stop, .. }) => {
+                    assert_eq!(receipt.job, id);
+                    assert_eq!(stop, ToolLoopStop::Cancelled);
+                }
+                other => panic!("the tool loop stops on the cancellation, got {other:?}"),
+            }
+            let [record] = evidence(&handle, id).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::Uncertain {
+                    cause: UncertainCause::Cancelled,
+                    message: None,
+                })
+            );
+            let job_record = job_record(&handle, id);
+            assert!(job_record.unknown_at.is_some() && job_record.cancelled_at.is_none());
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(id, target.llm, true)))),
+                Violation::UnresolvedToolEffect(record.call),
+                "the effect stays unresolved"
+            );
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn shutdown_and_a_stop_request_settle_the_job_once_and_refuse_queued_plans() {
+            let (_root, directory) = data_directory("admission-shutdown");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (target, requests) = scripted(&handle, "admission-shutdown", vec![stalled()]);
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let scheduler = runtime.scheduler();
+            let job = admitted(wait(
+                scheduler.admit_provider(plan(&handle, &target, "running", None)),
+            ));
+            until(|| requests.load(Ordering::SeqCst) == 1);
+            let queued = admit(scheduler.admit_provider(plan(&handle, &target, "queued", None)));
+
+            let stop = job.stop_handle();
+            let stopping = std::thread::spawn(move || stop.request());
+            runtime.shutdown().expect("shutdown runtime");
+            stopping.join().expect("joined");
+            assert!(matches!(
+                queued(),
+                Err(AdmissionError::NotAdmitted(
+                    ExecutionRuntimeError::ShuttingDown
+                ))
+            ));
+            assert!(jobs_named(&handle, "queued").is_empty());
+            let id = job.job();
+            let receipt = wait(job.settled()).expect("settled once, by the executor");
+            assert_eq!((receipt.job, receipt.result), (id, None));
+            let record = job_record(&handle, id);
+            assert!(record.unknown_at.is_some() && record.stop_confirmed_at.is_some());
+            assert!(record.completed_at.is_none() && record.failed_at.is_none());
+            assert!(record.cancelled_at.is_none());
+            worker.shutdown().expect("shutdown");
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            assert!(worker.handle().abandoned_at_open().is_empty());
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn dropping_the_admitted_job_neither_stops_nor_orphans_its_execution() {
+            let (_root, directory) = data_directory("admission-dropped");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (open, response) = gated(answering("finished alone", (4, 2)));
+            let (target, _) = scripted(&handle, "admission-dropped", vec![response]);
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let plan = plan(&handle, &target, "unwatched", None);
+            let token = plan.provider_config.cancellation.clone();
+            let job = admitted(wait(runtime.scheduler().admit_provider(plan)));
+            let id = job.job();
+            // Its settlement is waited for, then abandoned, then the handle dropped.
+            let mut waiting = Box::pin(job.settled());
+            assert!(poll_once(waiting.as_mut()).is_none());
+            drop(waiting);
+            assert!(!token.is_cancelled());
+            assert!(!settled(&job_record(&handle, id)));
+
+            open.send(()).expect("let the Provider answer");
+            until(|| job_record(&handle, id).completed_at.is_some());
+            assert_eq!(summary(&handle, id).as_deref(), Some("finished alone"));
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_hosted_caller_is_acknowledged_early_and_awaits_settlement_apart() {
+            let (_root, directory) = data_directory("admission-hosted");
+            let (open, response) = gated(answering("hosted answer", (6, 2)));
+            let endpoint = "admission-hosted";
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = requests.clone();
+            let mut responses = vec![response, stalled()].into_iter();
+            provider_seam::install(&format!("https://{endpoint}.invalid/v1"), move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                responses.next().expect("a scripted response")
+            });
+            let jobs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = jobs.clone();
+            let report =
+                crate::host::run_hosted_reporting(&directory, false, move |context| async move {
+                    let database = context.database();
+                    let provider = database
+                        .create_llm_provider(NewLlmProvider {
+                            name: endpoint.into(),
+                            transport: OPENAI,
+                            endpoint: Some(format!("https://{endpoint}.invalid/v1")),
+                            credential_ref: None,
+                        })
+                        .await
+                        .expect("create provider");
+                    let llm = database
+                        .create_profile(NewProfile {
+                            name: "hosted".into(),
+                            config: NewProfileConfig::Llm {
+                                provider,
+                                config: llm_config("hosted", &[ModelCapability::Chat]),
+                            },
+                        })
+                        .await
+                        .expect("create profile");
+                    let executor = database
+                        .create_executor(NewExecutor {
+                            name: "hosted worker".into(),
+                            executor_type: ExecutorType::Llm,
+                            concurrency_limit: NonZeroU32::MIN,
+                            llm_transports: BTreeSet::from([OPENAI]),
+                        })
+                        .await
+                        .expect("create executor");
+                    let target = Target { executor, llm };
+                    let job = context
+                        .scheduler()
+                        .admit_provider(plan(database, &target, "hosted", None))
+                        .await
+                        .expect("admitted");
+                    let record = database
+                        .job(job.job())
+                        .await
+                        .expect("read")
+                        .expect("the Job");
+                    assert!(record.started_at.is_some() && !settled(&record));
+                    assert_eq!(record.input, job.input());
+                    open.send(()).expect("let the Provider answer");
+                    let id = job.job();
+                    let receipt = job.settled().await.expect("settled");
+                    assert_eq!(receipt.job, id);
+                    // A second Job is admitted and left running when the host
+                    // stops; the host's shutdown, not its caller, settles it.
+                    let left = context
+                        .scheduler()
+                        .admit_provider(plan(database, &target, "left running", None))
+                        .await
+                        .expect("admitted");
+                    seen.lock().expect("lock").extend([id, left.job()]);
+                    drop(left);
+                });
+            // The process-wide logger may already be another host's in this
+            // test binary; that is reported, and nothing else may fail.
+            assert!(
+                report
+                    .failures
+                    .iter()
+                    .all(|failure| failure.phase == crate::host::Phase::Logger),
+                "{:?}",
+                report.failures
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+            let worker = DatabaseWorker::start(&directory).expect("reopen");
+            let handle = worker.handle();
+            assert!(
+                handle.abandoned_at_open().is_empty(),
+                "nothing was left unsettled"
+            );
+            let [answered, left] = jobs.lock().expect("lock").clone().try_into().expect("two");
+            assert!(job_record(&handle, answered).completed_at.is_some());
+            assert_eq!(summary(&handle, answered).as_deref(), Some("hosted answer"));
+            let record = job_record(&handle, left);
+            assert!(record.unknown_at.is_some() && record.stop_confirmed_at.is_some());
+            worker.shutdown().expect("shutdown");
+        }
+    }
+
     // ---- Image input ----------------------------------------------------------
 
     mod image_input {
