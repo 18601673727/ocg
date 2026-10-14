@@ -19,7 +19,9 @@
 //! OCG code that implements and registers it. Every call is recorded
 //! durably before its handler runs, and its outcome after, see
 //! [`crate::persistence::ToolEvidenceRecord`]. OCG registers no handler by
-//! default and implements no privileged one.
+//! default; its one handler, `workspace_read_file`, is registered only for an
+//! execution an operator enabled it for, see
+//! [`crate::orchestration::workspace_read`].
 //!
 //! A call is authorized for dispatch in [`ToolOffer::resolve`], under the
 //! registry's lock, which [`ToolRegistry::revoke`], `unregister` and
@@ -88,10 +90,6 @@ pub(crate) struct ToolFailure {
     pub(crate) certainty: FailureCertainty,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "OCG registers no tool outside its tests yet")
-)]
 impl ToolFailure {
     /// A failure the handler has evidence left no effect. Only a handler
     /// that can tell may report it.
@@ -148,10 +146,6 @@ struct Registration {
 }
 
 #[derive(Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "OCG registers no tool outside its tests yet")
-)]
 struct Registry {
     tools: BTreeMap<String, Registration>,
     generations: u64,
@@ -173,10 +167,6 @@ impl fmt::Debug for ToolRegistry {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "OCG registers no tool outside its tests yet")
-)]
 impl ToolRegistry {
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
@@ -240,6 +230,10 @@ impl ToolRegistry {
     }
 
     /// Removes a tool. A call to it that was offered is refused from now on.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "OCG withdraws no tool outside its tests yet")
+    )]
     pub(crate) fn unregister(&self, name: &str) -> Result<(), ToolRegistryError> {
         self.lock()
             .tools
@@ -254,6 +248,10 @@ impl ToolRegistry {
     }
 
     /// Withdraws the grant. A call to the tool not yet run is refused.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "OCG withdraws no tool outside its tests yet")
+    )]
     pub(crate) fn revoke(&self, name: &str) -> Result<(), ToolRegistryError> {
         self.set_authorized(name, false)
     }

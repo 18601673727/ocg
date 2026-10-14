@@ -33,3 +33,8 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 log = { version = "=0.4.34", default-features = false, features = ["std"] }
 time = { version = "=0.3.55", default-features = false, features = ["std"] }
+
+[target.'cfg(unix)'.dependencies]
+# Opens Workspace files component by component without following links; the
+# same rustix that fs4 already builds.
+rustix = { version = "1", features = ["fs"] }

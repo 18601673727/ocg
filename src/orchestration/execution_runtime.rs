@@ -5,7 +5,11 @@
 //! database handle. Every worker boundary is a bounded `flume` channel; the
 //! database handle itself has a separate bounded command channel.
 
+use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -16,7 +20,9 @@ use crate::openai_compatible::{
     ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, InvalidToolCall,
     ToolCallRefusal,
 };
-use crate::orchestration::tools::{FailureCertainty, ToolOffer, ToolRegistryError};
+use crate::orchestration::tools::{
+    FailureCertainty, ToolFailure, ToolFuture, ToolOffer, ToolRegistryError,
+};
 use crate::persistence::{
     AppendedOutput, AuthorizationBasis, ExecutorId, FinalResult, IntermediateOutputKind,
     JobFinalization, JobId, JobInputDraft, JobInputId, JobOutcome, MAX_STORED_TOOL_ARGUMENTS_BYTES,
@@ -1035,6 +1041,9 @@ pub(crate) mod dispatch_seam {
         /// Its admission is durable; its final authorization check and its
         /// handler have not run.
         Admitted,
+        /// Its handler has returned or was stopped; its outcome is not
+        /// recorded yet.
+        Ran,
     }
 
     type Seam = Box<dyn FnMut(Point, ToolCallRef)>;
@@ -1191,12 +1200,16 @@ async fn answer_calls(
         if cancellation.is_cancelled() {
             return Err(cancelled_before_invocation(site, reference).await);
         }
-        let invocation = dispatch.handler.call(dispatch.arguments);
+        let handler = dispatch.handler;
+        let arguments = dispatch.arguments;
+        let invocation = CatchPanic(Box::pin(async move { handler.call(arguments).await }));
         let ran = select(
             cancellation.cancelled(),
             ntex::time::timeout(limits.handler_timeout, invocation),
         )
         .await;
+        #[cfg(test)]
+        dispatch_seam::reach(dispatch_seam::Point::Ran, reference);
         let (outcome, stop) = match ran {
             Either::Left(()) => (
                 ToolOutcome::Uncertain {
@@ -1277,6 +1290,25 @@ async fn answer_calls(
         return Err(conclude(site, reference, outcome, stop).await);
     }
     Ok(answers)
+}
+
+/// A handler's call, created and polled so that a panic in the handler fails
+/// the call as an uncertain failure instead of unwinding through the
+/// executor worker. It only catches a panic: a handler that blocks without
+/// yielding still blocks the worker, and nothing here can stop it.
+struct CatchPanic(ToolFuture<'static>);
+
+impl Future for CatchPanic {
+    type Output = Result<serde_json::Value, ToolFailure>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let call = &mut self.0;
+        match catch_unwind(AssertUnwindSafe(|| call.as_mut().poll(context))) {
+            Ok(polled) => polled,
+            // The call is not polled again: it is dropped with this future.
+            Err(_) => Poll::Ready(Err(ToolFailure::uncertain("the tool handler panicked"))),
+        }
+    }
 }
 
 /// Records the refusal of a call that never ran, and stops on it. A

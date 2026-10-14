@@ -1280,6 +1280,7 @@ dependencies = [
  "ntex",
  "petgraph",
  "redb",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

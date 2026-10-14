@@ -2,6 +2,9 @@ use std::process::ExitCode;
 
 use ocg::data_directory::DataDirectory;
 
+#[cfg(unix)]
+mod workspace_job;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -12,9 +15,27 @@ fn main() -> ExitCode {
     }
 }
 
-/// Runs until a graceful shutdown signal (SIGINT, SIGTERM, SIGQUIT or SIGHUP),
-/// then stops in the reverse order of starting; see [`ocg::host`].
+/// Without arguments, runs until a graceful shutdown signal (SIGINT,
+/// SIGTERM, SIGQUIT or SIGHUP), then stops in the reverse order of starting;
+/// see [`ocg::host`]. `workspace-read <objective>` instead runs one Job that
+/// may read the authorized Workspace, see `workspace_job`.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut arguments = std::env::args().skip(1);
+    let command = arguments.next();
+    if let Some(command) = command.as_deref() {
+        #[cfg(unix)]
+        if command == workspace_job::COMMAND {
+            let objective = arguments.next();
+            if arguments.next().is_some() {
+                return Err(workspace_job::Error::Usage.into());
+            }
+            let config = workspace_job::Config::from_environment(objective)?;
+            let data_directory = DataDirectory::from_environment()?;
+            eprintln!("OCG data directory: {}", data_directory.root().display());
+            return Ok(workspace_job::run(&data_directory, config)?);
+        }
+        return Err(format!("unknown command `{command}`").into());
+    }
     let data_directory = DataDirectory::from_environment()?;
     eprintln!("OCG data directory: {}", data_directory.root().display());
     ocg::host::run(&data_directory, true, |_database| async {

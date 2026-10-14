@@ -61,3 +61,13 @@ pub(crate) fn data_directory(suite: &str, name: &str) -> (TestRoot, DataDirector
         DataDirectory::bootstrap(root.clone().into_os_string()).expect("bootstrap data directory");
     (TestRoot(root), directory)
 }
+
+/// Creates a fresh, empty directory under the system temp dir and returns its
+/// resolved path. `suite` namespaces it as in [`data_directory`].
+pub(crate) fn temporary_directory(suite: &str, name: &str) -> (TestRoot, PathBuf) {
+    let root = std::env::temp_dir().join(format!("{suite}-{}-{name}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).expect("create a temporary directory");
+    let resolved = root.canonicalize().expect("resolve a temporary directory");
+    (TestRoot(root), resolved)
+}

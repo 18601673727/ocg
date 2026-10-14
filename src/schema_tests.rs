@@ -12801,7 +12801,7 @@ mod requests_and_tool_loop {
         Revoke(ToolRegistry, &'static str),
         /// Fails without evidence that its effect did not happen.
         Uncertain,
-        /// Dies with the process while it runs.
+        /// Panics while it runs.
         Crash,
         /// Does this, then answers what it returns.
         Act(Box<dyn Fn() -> Value + Send + Sync>),
@@ -14894,7 +14894,12 @@ mod requests_and_tool_loop {
                 Some(Point::Admitted),
                 0,
             ),
-            ("while the handler runs", Behavior::Crash, None, 1),
+            (
+                "after the handler ran, before its outcome",
+                Behavior::Add,
+                Some(Point::Ran),
+                1,
+            ),
         ];
         for (case, behavior, crash_at, ran) in cases {
             let (_root, directory) = data_directory(&format!("tool-evidence-crash-{ran}"));
@@ -16268,6 +16273,409 @@ mod requests_and_tool_loop {
                 worker.shutdown().expect("shutdown");
             }
             assert_relationships_consistent(&directory);
+        }
+    }
+
+    // ---- workspace_read_file ------------------------------------------------
+
+    #[cfg(unix)]
+    mod workspace_read_file {
+        use super::*;
+        use crate::orchestration::workspace_read::{self, Workspace};
+
+        /// A Workspace holding `files`, beside the test's data directory.
+        fn workspace_with(name: &str, files: &[(&str, &str)]) -> (TestRoot, std::path::PathBuf) {
+            let (guard, root) = crate::test_support::temporary_directory(SUITE, name);
+            for (path, content) in files {
+                std::fs::write(root.join(path), content).expect("write a Workspace file");
+            }
+            (guard, root)
+        }
+
+        fn read_call(index: u32, id: &str, arguments: &str) -> String {
+            call(index, id, workspace_read::TOOL_NAME, arguments)
+        }
+
+        /// The text of every tool result a conversation sends.
+        fn tool_results(conversation: &ChatConversation) -> Vec<(String, String)> {
+            conversation
+                .messages
+                .iter()
+                .filter_map(|message| match (&message.tool_call_id, &message.content) {
+                    (Some(id), Some(MessageContentWire::Text(text))) => {
+                        Some((id.clone(), text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn workspace_read_file_reads_the_authorized_file_for_the_final_answer() {
+            let text = "# Demo\n\nA \"README\" with ünïcode, a tab\tand a backslash \\.\n";
+            let (_workspace_guard, root) =
+                workspace_with("workspace-read-files", &[("README.md", text)]);
+            let (_root, directory) = data_directory("workspace-read");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let tools = workspace_read::read_file_tools(
+                Workspace::authorize(&root, &directory).expect("authorize the Workspace"),
+            )
+            .expect("enable the tool");
+
+            let admitted_first = Arc::new(AtomicUsize::new(0));
+            let (seen, seam_handle) = (admitted_first.clone(), handle.clone());
+            dispatch_seam::install(move |point, call| {
+                let records = wait(seam_handle.tool_evidence(call.job, None, 10)).expect("read");
+                let [record] = records.as_slice() else {
+                    if point == Point::BeforeAdmission {
+                        return;
+                    }
+                    panic!("one call is admitted: {records:?}");
+                };
+                match point {
+                    Point::BeforeAdmission => panic!("nothing is recorded before the admission"),
+                    Point::Admitted => {
+                        assert!(record.admission().is_some() && record.outcome.is_none());
+                        seen.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Point::Ran => {
+                        assert_eq!(seen.load(Ordering::SeqCst), 1, "admitted before it ran");
+                        assert!(record.outcome.is_none(), "no outcome before it is recorded");
+                    }
+                }
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(tools),
+                vec![
+                    calling(
+                        &[read_call(0, "call_read", r#"{"path":"README.md"}"#)],
+                        (11, 4),
+                    ),
+                    answering("The README introduces a demo.", (40, 9)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            let receipt = looped.settled.expect("the loop settles");
+            assert_eq!(receipt.job, run.job);
+            assert_eq!(admitted_first.load(Ordering::SeqCst), 1);
+
+            let [first, second] = looped.sent.as_slice() else {
+                panic!("two Provider requests");
+            };
+            assert_eq!(
+                first
+                    .tools
+                    .iter()
+                    .map(|tool| tool.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                [workspace_read::TOOL_NAME],
+                "only the Workspace tool is offered"
+            );
+            let result = serde_json::to_string(&json!({"path": "README.md", "content": text}))
+                .expect("JSON");
+            assert_eq!(
+                tool_results(second),
+                [("call_read".to_owned(), result.clone())],
+                "the next request carries the exact, complete file"
+            );
+
+            let records = evidence(&handle, run.job);
+            let [record] = records.as_slice() else {
+                panic!("one call: {records:?}");
+            };
+            assert_eq!(record.call, tool_call(run.job, 1, 0));
+            assert_eq!(
+                (record.tool_call_id.as_str(), record.name.as_str()),
+                ("call_read", workspace_read::TOOL_NAME)
+            );
+            let admission = record.admission().expect("admitted");
+            assert_eq!(admission.handler_version, "workspace_read_file-1");
+            assert_eq!(admission.effect, ToolEffect::ReadOnly);
+            assert_eq!(admission.arguments.as_str(), r#"{"path":"README.md"}"#);
+            assert_eq!(admission.authorization, AuthorizationBasis::RegistryGrant);
+            assert_eq!(outcome_of(record), Some(completed(&result)));
+
+            let job = job_record(&handle, run.job);
+            assert!(job.completed_at.is_some());
+            let outputs = wait(handle.job_outputs(run.job, None, 100)).expect("outputs");
+            let final_output = outputs.last().expect("a result");
+            assert_eq!(final_output.kind, OutputKind::Result);
+            assert_eq!(
+                final_output.summary.as_deref(),
+                Some("The README introduces a demo.")
+            );
+            assert!(blocking(&handle, llm).is_empty(), "the Profile is released");
+
+            let requests = by_request(&handle, run.job);
+            assert_eq!(requests.keys().copied().collect::<Vec<_>>(), [1, 2]);
+            for (request, finish) in [
+                (1, ChatFinishReason::ToolCalls),
+                (2, ChatFinishReason::Stop),
+            ] {
+                let (_, stats) = &requests[&request];
+                assert_eq!(
+                    stats
+                        .iter()
+                        .map(|stat| stat.observation.finish_reason)
+                        .collect::<Vec<_>>(),
+                    [Some(finish)],
+                    "request {request} has its own AvailabilityStat"
+                );
+            }
+            let samples = TokenRequestSample::per_request(&job_metrics(&handle, run.job))
+                .expect("per request");
+            assert_eq!(
+                samples
+                    .iter()
+                    .map(|sample| (sample.request, sample.total))
+                    .collect::<Vec<_>>(),
+                [(number(1), Some(15)), (number(2), Some(49))],
+                "each request keeps its own usage"
+            );
+
+            // The evidence is what was read then; nothing reads the file again.
+            std::fs::write(root.join("README.md"), "changed").expect("change the file");
+            worker.shutdown().expect("shutdown");
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            assert!(handle.abandoned_at_open().is_empty());
+            assert_eq!(evidence(&handle, run.job), records);
+            assert!(job_record(&handle, run.job).completed_at.is_some());
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_failed_workspace_read_sends_no_result_and_fails_the_job() {
+            let (_outside_guard, outside) =
+                workspace_with("workspace-read-outside", &[("secret.txt", "outside")]);
+            let (_workspace_guard, root) =
+                workspace_with("workspace-read-failures-files", &[("README.md", "inside")]);
+            std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("linked.txt"))
+                .expect("link");
+            std::fs::write(
+                root.join("big.txt"),
+                "a".repeat(workspace_read::MAX_FILE_BYTES + 1),
+            )
+            .expect("write");
+            let (_root, directory) = data_directory("workspace-read-failures");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            for (path, message) in [
+                ("missing.md", "no such file in the Workspace"),
+                (
+                    "../workspace-read-outside/secret.txt",
+                    "the path is not a plain relative path inside the Workspace",
+                ),
+                ("linked.txt", "the path traverses a symbolic link"),
+                ("big.txt", "the file is larger than 8192 bytes"),
+            ] {
+                let run = local_run(&handle, llm);
+                let tools = workspace_read::read_file_tools(
+                    Workspace::authorize(&root, &directory).expect("authorize"),
+                )
+                .expect("enable the tool");
+                let arguments = json!({ "path": path }).to_string();
+                let looped = run_loop(
+                    &handle,
+                    run,
+                    Some(tools),
+                    vec![
+                        calling(&[read_call(0, "call_read", &arguments)], (1, 1)),
+                        answering("never sent", (1, 1)),
+                    ],
+                    CancellationToken::default(),
+                    |_| {},
+                );
+                assert_eq!(looped.sent.len(), 1, "{path}: no request carries a result");
+                let (receipt, stop) = stopped(looped);
+                assert_eq!(
+                    stop,
+                    ToolLoopStop::HandlerFailed {
+                        index: 0,
+                        message: message.to_owned()
+                    },
+                    "{path}"
+                );
+                assert!(
+                    !message.contains(path),
+                    "the refusal does not repeat the path"
+                );
+                assert!(receipt.result.is_some());
+                let records = evidence(&handle, run.job);
+                let [record] = records.as_slice() else {
+                    panic!("{path}: one call");
+                };
+                assert_eq!(
+                    outcome_of(record),
+                    Some(ToolOutcome::NotApplied {
+                        message: message.to_owned()
+                    }),
+                    "{path}: no completed result is recorded"
+                );
+                let job = job_record(&handle, run.job);
+                assert!(job.failed_at.is_some(), "{path}");
+                assert!(blocking(&handle, llm).is_empty(), "{path}");
+            }
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn the_provider_cannot_choose_the_workspace_or_run_the_tool_unauthorized() {
+            /// Where a call is refused: by the response reader, against the
+            /// request's own tools, or at dispatch, against the registry.
+            #[derive(Debug, PartialEq)]
+            enum Refused {
+                Stream,
+                Dispatch(ToolCallRefusal),
+            }
+            let (_workspace_guard, root) =
+                workspace_with("workspace-read-refusals-files", &[("README.md", "inside")]);
+            let (_root, directory) = data_directory("workspace-read-refusals");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let cases = [
+                (
+                    "a Workspace root of its own",
+                    r#"{"path":"README.md","root":"/"}"#,
+                    true,
+                    false,
+                    Refused::Stream,
+                ),
+                (
+                    "no path",
+                    r#"{"root":"/etc"}"#,
+                    true,
+                    false,
+                    Refused::Stream,
+                ),
+                (
+                    "a tool OCG did not offer",
+                    r#"{"path":"README.md"}"#,
+                    false,
+                    false,
+                    Refused::Stream,
+                ),
+                (
+                    "a grant withdrawn after the offer",
+                    r#"{"path":"README.md"}"#,
+                    true,
+                    true,
+                    Refused::Dispatch(ToolCallRefusal::Unauthorized),
+                ),
+            ];
+            for (case, arguments, offered, revoked, refused) in cases {
+                let run = local_run(&handle, llm);
+                let registry = ToolRegistry::default();
+                workspace_read::register(
+                    &registry,
+                    Workspace::authorize(&root, &directory).expect("authorize"),
+                )
+                .expect("register");
+                registry
+                    .authorize(workspace_read::TOOL_NAME)
+                    .expect("authorize the tool");
+                let tools = offered.then(|| {
+                    execution(
+                        &registry,
+                        &[workspace_read::TOOL_NAME],
+                        ToolLoopLimits::default(),
+                    )
+                });
+                let revoker = registry.clone();
+                let looped = run_loop(
+                    &handle,
+                    run,
+                    tools,
+                    vec![calling(&[read_call(0, "call_read", arguments)], (1, 1))],
+                    CancellationToken::default(),
+                    move |_| {
+                        if revoked {
+                            revoker.revoke(workspace_read::TOOL_NAME).expect("revoke");
+                        }
+                    },
+                );
+                assert_eq!(looped.sent.len(), 1, "{case}: no result is ever sent");
+                let records = evidence(&handle, run.job);
+                assert!(
+                    records.iter().all(|record| record.admission().is_none()),
+                    "{case}: the call was never admitted, so its handler never ran"
+                );
+                let job = job_record(&handle, run.job);
+                match refused {
+                    Refused::Stream => {
+                        let receipt = looped.settled.expect("settled");
+                        assert_eq!(receipt.result, None, "{case}");
+                        assert!(
+                            job.unknown_at.is_some() && job.stop_confirmed_at.is_some(),
+                            "{case}"
+                        );
+                        assert!(records.is_empty(), "{case}");
+                    }
+                    Refused::Dispatch(kind) => {
+                        let (_, stop) = stopped(looped);
+                        let ToolLoopStop::Refused(refusal) = stop else {
+                            panic!("{case}: expected a refusal, got {stop:?}");
+                        };
+                        assert_eq!(refusal.kind, kind, "{case}");
+                        assert_eq!(records.len(), 1, "{case}: the refusal is recorded");
+                        assert!(job.failed_at.is_some(), "{case}");
+                    }
+                }
+                assert!(blocking(&handle, llm).is_empty(), "{case}");
+            }
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_panicking_handler_fails_its_call_as_uncertain_and_the_loop_goes_on() {
+            let (_root, directory) = data_directory("tool-handler-panic");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let (registry, calls) = registered(vec![("add", Behavior::Crash)]);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+                vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let (receipt, stop) = stopped(looped);
+            assert_eq!(
+                stop,
+                ToolLoopStop::HandlerUncertain {
+                    index: 0,
+                    message: "the tool handler panicked".to_owned()
+                }
+            );
+            assert_eq!(receipt.result, None, "an unknown outcome publishes nothing");
+            let records = evidence(&handle, run.job);
+            let [record] = records.as_slice() else {
+                panic!("one call");
+            };
+            assert_eq!(
+                outcome_of(record),
+                Some(ToolOutcome::Uncertain {
+                    cause: UncertainCause::HandlerReported,
+                    message: Some("the tool handler panicked".to_owned()),
+                })
+            );
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            assert!(blocking(&handle, llm).is_empty(), "the Profile is released");
+            worker.shutdown().expect("shutdown");
         }
     }
 }
