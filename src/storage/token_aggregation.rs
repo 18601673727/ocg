@@ -1,5 +1,5 @@
-//! Incremental aggregation of annotated Metrics records into per-Job Token
-//! request state and sparse one-minute totals.
+//! Incremental aggregation of annotated Metrics records into per-request
+//! Token state and sparse one-minute totals.
 //!
 //! It follows the AvailabilityStat aggregation: one batch is prepared from
 //! one read snapshot, outside the worker's write transaction, and committed
@@ -8,18 +8,20 @@
 //! [`MAX_AGGREGATION_BATCH`] actual Metrics records after that progress,
 //! whatever their IDs.
 //!
-//! The per-Job state is the finite evidence of [`TokenEvidence`], the same
-//! reducer the pure sample uses; this module only stores it. A record
-//! without a Token annotation carries no trusted contract: it advances the
-//! progress and nothing else. An Excluded record is kept in the Job's
-//! evidence, so a later contradictory claim about the same request is still
-//! found, but it makes no sample and no contribution.
+//! The per-request state is the finite evidence of [`TokenEvidence`], the
+//! same reducer the pure sample uses; this module only stores it. Each
+//! Provider request of a Job has its own state, and evidence never crosses
+//! from one request to another. A record without a Token annotation carries
+//! no trusted contract: it advances the progress and nothing else. An
+//! Excluded record is kept in its request's evidence, so a later
+//! contradictory claim about the same request is still found, but it makes
+//! no sample and no contribution.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
 use super::availability_aggregation::{
-    MAX_AGGREGATION_BATCH, decode_progress, encode_progress, minute_key,
+    MAX_AGGREGATION_BATCH, decode_progress, encode_progress, minute_key, request_key,
 };
 use super::*;
 use crate::persistence::minute_of;
@@ -80,7 +82,7 @@ fn encode_request(identity: &Identity, evidence: &TokenEvidence) -> Vec<u8> {
     e.0
 }
 
-fn decode_request(job: JobId, bytes: &[u8]) -> DecodeResult<(Identity, TokenEvidence)> {
+fn decode_request(request: RequestRef, bytes: &[u8]) -> DecodeResult<(Identity, TokenEvidence)> {
     let mut d = Dec::new(bytes, TAG_TOKEN_REQUEST)?;
     let identity = Identity {
         llm_profile: ProfileId::new(d.u64()?),
@@ -113,11 +115,11 @@ fn decode_request(job: JobId, bytes: &[u8]) -> DecodeResult<(Identity, TokenEvid
     // An eligible request has its first record, and an excluded one has none.
     if first.is_some() != (eligibility == Some(RequestEligibility::Eligible)) {
         return Err(StorageError::corrupted(format!(
-            "the Token state of {job} disagrees with its eligibility"
+            "the Token state of {request} disagrees with its eligibility"
         )));
     }
     let evidence = TokenEvidence::from_parts(EvidenceParts {
-        job: Some(job),
+        request: Some(request),
         eligibility,
         first,
         fields,
@@ -220,7 +222,7 @@ fn progress_in(rx: &ReadTransaction) -> Result<TokenAggregationProgress, Storage
     })
 }
 
-/// One Job's stored state as the batch read it, and as the batch leaves it.
+/// One request's stored state as the batch read it, and as the batch leaves it.
 struct RequestState {
     expected: Option<Vec<u8>>,
     identity: Identity,
@@ -230,20 +232,21 @@ struct RequestState {
 
 fn load_request(
     rx: &ReadTransaction,
-    job: JobId,
+    request: RequestRef,
     target: &LlmTarget,
 ) -> Result<RequestState, StorageError> {
     let expected = rx
         .open_table(TOKEN_REQUESTS)?
-        .get(job.get())?
+        .get(request_key(request))?
         .map(|v| v.value().to_vec());
     let identity = Identity::of(target);
     let (before, evidence) = match &expected {
         Some(bytes) => {
-            let (stored, evidence) = decode_request(job, bytes)?;
+            let (stored, evidence) = decode_request(request, bytes)?;
             if stored != identity {
                 return Err(StorageError::corrupted(format!(
-                    "the frozen LLM target of {job} changed"
+                    "the frozen LLM target of {} changed",
+                    request.job
                 )));
             }
             (evidence.sample(), evidence)
@@ -293,7 +296,7 @@ fn out_of_range() -> StorageError {
 }
 
 struct RequestWrite {
-    job: JobId,
+    request: RequestRef,
     expected: Option<Vec<u8>>,
     row: Vec<u8>,
     /// Whether the row differs from `expected`. An unchanged row is still
@@ -311,7 +314,7 @@ struct BucketWrite {
     changed: bool,
 }
 
-/// Why a batch was refused: a Job's records contradict each other. Nothing
+/// Why a batch was refused: a request's records contradict each other. Nothing
 /// was written and the progress did not move, so the same refusal comes
 /// again until the raw facts are dealt with; that is outside this module.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -434,7 +437,7 @@ pub(crate) fn prepare_token_aggregation(
     };
 
     let mut targets = HashMap::new();
-    let mut requests: BTreeMap<JobId, RequestState> = BTreeMap::new();
+    let mut requests: BTreeMap<RequestRef, RequestState> = BTreeMap::new();
     let mut unannotated = 0;
     for id in &ids {
         let bytes = rx
@@ -458,15 +461,20 @@ pub(crate) fn prepare_token_aggregation(
         let record = MetricsRecord {
             id: row.id,
             job,
+            request: row.request,
             target: None,
             observed_at: row.observed_at,
             measurements: row.measurements,
             token: row.token,
             recorded_at: row.recorded_at,
         };
-        let state = match requests.entry(job) {
+        let request = RequestRef {
+            job,
+            request: record.request,
+        };
+        let state = match requests.entry(request) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(load_request(&rx, job, &target)?),
+            Entry::Vacant(entry) => entry.insert(load_request(&rx, request, &target)?),
         };
         let observation = TokenObservation::from_record(&record)
             .ok_or_else(|| StorageError::corrupted("an annotated record lost its annotation"))?;
@@ -505,10 +513,10 @@ pub(crate) fn prepare_token_aggregation(
 
     let requests = requests
         .into_iter()
-        .map(|(job, state)| {
+        .map(|(request, state)| {
             let row = encode_request(&state.identity, &state.evidence);
             RequestWrite {
-                job,
+                request,
                 changed: state.expected.as_deref() != Some(row.as_slice()),
                 expected: state.expected,
                 row,
@@ -593,7 +601,11 @@ fn apply(batch: &mut Batch, plan: TokenPlan) -> Result<Option<Timestamp>, Storag
     {
         let requests = tx.open_table(TOKEN_REQUESTS)?;
         for write in &plan.requests {
-            if requests.get(write.job.get())?.map(|v| v.value().to_vec()) != write.expected {
+            if requests
+                .get(request_key(write.request))?
+                .map(|v| v.value().to_vec())
+                != write.expected
+            {
                 return Ok(None);
             }
         }
@@ -614,7 +626,7 @@ fn apply(batch: &mut Batch, plan: TokenPlan) -> Result<Option<Timestamp>, Storag
     {
         let mut requests = tx.open_table(TOKEN_REQUESTS)?;
         for write in plan.requests.iter().filter(|write| write.changed) {
-            requests.insert(write.job.get(), write.row.as_slice())?;
+            requests.insert(request_key(write.request), write.row.as_slice())?;
             #[cfg(test)]
             if let Some(probe) = &plan.probe {
                 probe
@@ -681,23 +693,26 @@ pub(crate) fn replace_token_minute(
     Ok(())
 }
 
-/// Test fault: rewrites one Job's request state with an extra, valid piece of
+/// Test fault: rewrites one request's state with an extra, valid piece of
 /// evidence, without touching progress, so the guard on that row is the only
 /// thing that can notice.
 #[cfg(test)]
-pub(crate) fn replace_token_request(database: &Database, job: JobId) -> Result<(), StorageError> {
+pub(crate) fn replace_token_request(
+    database: &Database,
+    request: RequestRef,
+) -> Result<(), StorageError> {
     let tx = database.begin_write()?;
     {
         let mut table = tx.open_table(TOKEN_REQUESTS)?;
         let bytes = table
-            .get(job.get())?
+            .get(request_key(request))?
             .map(|v| v.value().to_vec())
             .ok_or_else(|| StorageError::corrupted("no Token request state to replace"))?;
-        let (identity, evidence) = decode_request(job, &bytes)?;
+        let (identity, evidence) = decode_request(request, &bytes)?;
         let mut parts = evidence.parts();
         parts.fields[3].cumulative_max = Some(9);
         let row = encode_request(&identity, &TokenEvidence::from_parts(parts));
-        table.insert(job.get(), row.as_slice())?;
+        table.insert(request_key(request), row.as_slice())?;
     }
     tx.commit()?;
     Ok(())
@@ -710,22 +725,23 @@ pub(crate) fn read_token_progress(
     progress_in(&read(database)?)
 }
 
-/// The request state of one Job, with the progress of the same snapshot.
+/// The state of one request, with the progress of the same snapshot.
 pub(crate) fn read_token_request(
     database: &Database,
-    job: JobId,
+    request: RequestRef,
 ) -> Result<TokenSnapshot<Option<TokenRequestRecord>>, StorageError> {
     let rx = read(database)?;
     let progress = progress_in(&rx)?;
     let bytes = rx
         .open_table(TOKEN_REQUESTS)?
-        .get(job.get())?
+        .get(request_key(request))?
         .map(|v| v.value().to_vec());
     let value = match bytes {
         Some(bytes) => {
-            let (identity, evidence) = decode_request(job, &bytes)?;
+            let (identity, evidence) = decode_request(request, &bytes)?;
             Some(TokenRequestRecord {
-                job,
+                job: request.job,
+                request: request.request,
                 llm_profile: identity.llm_profile,
                 provider: identity.provider,
                 model: identity.model,

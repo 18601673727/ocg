@@ -18,7 +18,7 @@ use ocg::persistence::{
     AvailabilityObservation, ExecutionConfiguration, ExecutionMode, JobId, JobInputDraft,
     LlmConfig, LlmParameters, LlmProviderId, LlmTransport, Measurements, ModelCapability,
     NewAvailabilityStat, NewJob, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig,
-    ProfileId, Timestamp,
+    ProfileId, RequestNumber, RequestRef, Timestamp,
 };
 use ocg::system_policy::SystemPolicy;
 use ocg::token_usage::{TokenAnnotation, TokenUsageState, UsageFinality};
@@ -88,6 +88,7 @@ fn seed(handle: &DatabaseHandle, provider: LlmProviderId, llm: ProfileId, micros
     let at = Timestamp::from_unix_micros(micros);
     wait(handle.record_availability_stat(NewAvailabilityStat {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at,
         observation: AvailabilityObservation {
             status_code: Some(200),
@@ -99,6 +100,7 @@ fn seed(handle: &DatabaseHandle, provider: LlmProviderId, llm: ProfileId, micros
     .expect("record AvailabilityStat");
     wait(handle.record_metrics(NewMetrics {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at,
         measurements: Measurements {
             usage: NormalizedUsage {
@@ -219,11 +221,14 @@ fn each_process_run_hosts_aggregation_and_ends_its_own_service_job() {
     );
     assert!(first_progress.0.consumed_through.is_some());
     assert!(first_progress.1.consumed_through.is_some());
-    let sample = wait(handle.token_request(first_job))
-        .expect("read")
-        .value
-        .and_then(|request| request.sample)
-        .expect("the request was aggregated");
+    let sample = wait(handle.token_request(RequestRef {
+        job: first_job,
+        request: RequestNumber::FIRST,
+    }))
+    .expect("read")
+    .value
+    .and_then(|request| request.sample)
+    .expect("the request was aggregated");
     assert_eq!(sample.usage, TokenUsageState::Complete);
     assert_eq!(sample.total, Some(30));
 
@@ -250,10 +255,13 @@ fn each_process_run_hosts_aggregation_and_ends_its_own_service_job() {
     assert!(progress.consumed_through > first_progress.0.consumed_through);
     for job in [first_job, second_job] {
         assert!(
-            wait(handle.token_request(job))
-                .expect("read")
-                .value
-                .is_some(),
+            wait(handle.token_request(RequestRef {
+                job,
+                request: RequestNumber::FIRST
+            }))
+            .expect("read")
+            .value
+            .is_some(),
             "{job} is aggregated"
         );
     }

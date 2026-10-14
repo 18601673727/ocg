@@ -44,7 +44,8 @@ use ocg::persistence::{
     ExecutionConfiguration, ExecutionMode, ExecutorType, FinalResult, IntermediateOutputKind,
     JobFinalization, JobId, JobInputDraft, LlmConfig, LlmParameters, LlmTransport, Measurements,
     ModelCapability, NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput, NewLlmProvider,
-    NewMetrics, NewProfile, NewProfileConfig, OutputKind, Timestamp, minute_of,
+    NewMetrics, NewProfile, NewProfileConfig, OutputKind, RequestNumber, RequestRef, Timestamp,
+    minute_of,
 };
 use ocg::provider_execution::{EnvironmentCredentialResolver, ProviderExecutionConfig};
 use ocg::system_policy::SystemPolicy;
@@ -279,9 +280,12 @@ fn observe_job(handle: &DatabaseHandle, job: JobId) -> Observed {
     let raw_metrics = wait(handle.job_metrics(job, None, 100)).expect("read Metrics");
     let stats = wait(handle.job_availability(job, None, 100)).expect("read AvailabilityStats");
     let sample = TokenRequestSample::from_metrics(&raw_metrics).expect("one Job");
-    let aggregated = wait(handle.token_request(job))
-        .expect("read Token state")
-        .value;
+    let aggregated = wait(handle.token_request(RequestRef {
+        job,
+        request: RequestNumber::FIRST,
+    }))
+    .expect("read Token state")
+    .value;
     let aggregated_sample = aggregated.as_ref().and_then(|state| state.sample.clone());
     let (provider, model) = match &configuration {
         Some(c) => (
@@ -300,9 +304,12 @@ fn observe_job(handle: &DatabaseHandle, job: JobId) -> Observed {
         }
         _ => None,
     };
-    let availability_sample = wait(handle.request_sample(job))
-        .expect("read the sample")
-        .value;
+    let availability_sample = wait(handle.request_sample(RequestRef {
+        job,
+        request: RequestNumber::FIRST,
+    }))
+    .expect("read the sample")
+    .value;
     let availability_bucket_requests = match (&availability_sample, provider, &model) {
         (Some(sample), Some(provider), Some(model)) => wait(handle.availability_minute(
             provider,
@@ -664,6 +671,7 @@ fn settle_fixture_job(handle: &DatabaseHandle, targets: &Targets) -> JobId {
     let anchor = TokenAnnotation::eligible(UsageFinality::Cumulative);
     wait(handle.record_metrics(NewMetrics {
         job,
+        request: RequestNumber::FIRST,
         observed_at: Timestamp::now(),
         measurements: Measurements::default(),
         token: Some(anchor),
@@ -684,6 +692,7 @@ fn settle_fixture_job(handle: &DatabaseHandle, targets: &Targets) -> JobId {
     }
     wait(handle.record_metrics(NewMetrics {
         job,
+        request: RequestNumber::FIRST,
         observed_at: Timestamp::now(),
         measurements: Measurements {
             usage: NormalizedUsage {
@@ -709,6 +718,7 @@ fn settle_fixture_job(handle: &DatabaseHandle, targets: &Targets) -> JobId {
     .expect("finalize the Job");
     wait(handle.record_availability_stat(NewAvailabilityStat {
         job,
+        request: RequestNumber::FIRST,
         observed_at: Timestamp::now(),
         observation: ocg::persistence::AvailabilityObservation {
             status_code: Some(200),
@@ -790,6 +800,7 @@ fn run_writer(mode: Mode, directory: &Path) {
                     timeout: config.timeout,
                     ..ProviderExecutionConfig::default()
                 },
+                tools: None,
             };
             // The one and only Provider request. Nothing below resends it.
             let outcome = wait_for(

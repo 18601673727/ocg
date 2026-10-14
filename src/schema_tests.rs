@@ -21,10 +21,11 @@ use crate::persistence::{
     DependencyState, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, FinalResult,
     IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobOutcome, JobRecord, JobRetry,
     LlmConfig, LlmParameters, LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsRecord,
-    MixedJobs, ModelCapability, NewAgent, NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput,
-    NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject, ObservationCursor,
-    ObservationFilter, OutputKind, ProfileId, ProfileKind, ProjectId, RecordRef, RejectionCause,
-    RetryInput, TimeRange, Timestamp, UnavailableCause, Violation, WrongProfileKind, minute_of,
+    MixedRequests, ModelCapability, NewAgent, NewAvailabilityStat, NewExecutor, NewJob,
+    NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
+    ObservationCursor, ObservationFilter, OutputKind, ProfileId, ProfileKind, ProjectId, RecordRef,
+    RejectionCause, RequestNumber, RequestRef, RetryInput, TimeRange, Timestamp, UnavailableCause,
+    Violation, WrongProfileKind, minute_of,
 };
 use crate::provider_execution::{ProviderExecutionError, ResponseFacts};
 use crate::test_support::{TestRoot, data_directory as test_data_directory, poll_once, wait};
@@ -324,6 +325,7 @@ fn nodes_and_relationships_round_trip_through_reopening() {
     let measured = wait(handle.record_metrics(NewMetrics {
         token: None,
         job: check,
+        request: RequestNumber::FIRST,
         observed_at: at(1_000),
         measurements: Measurements {
             ttfb_ms: Some(120),
@@ -339,6 +341,7 @@ fn nodes_and_relationships_round_trip_through_reopening() {
     .expect("record Metrics");
     let observed = wait(handle.record_availability_stat(NewAvailabilityStat {
         job: check,
+        request: RequestNumber::FIRST,
         observed_at: at(1_000),
         observation: response(200),
     }))
@@ -1672,6 +1675,7 @@ fn using_a_profile_never_changes_it() {
     let failed = provider_failure("invalid API key", Some(401), false);
     wait(handle.record_availability_stat(NewAvailabilityStat {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at(1_000),
         observation: failure(failed),
     }))
@@ -1679,6 +1683,7 @@ fn using_a_profile_never_changes_it() {
     wait(handle.record_metrics(NewMetrics {
         token: None,
         job,
+        request: RequestNumber::FIRST,
         observed_at: at(1_000),
         measurements: Measurements {
             request_finished_in_ms: Some(40),
@@ -2722,6 +2727,7 @@ fn metrics_and_availability_keep_raw_facts_about_the_llm_their_job_froze() {
         wait(handle.record_metrics(NewMetrics {
             token: None,
             job,
+            request: RequestNumber::FIRST,
             observed_at: at(observed_at),
             measurements,
         }))
@@ -2729,6 +2735,7 @@ fn metrics_and_availability_keep_raw_facts_about_the_llm_their_job_froze() {
     let observe = |job, observed_at, observation| {
         wait(handle.record_availability_stat(NewAvailabilityStat {
             job,
+            request: RequestNumber::FIRST,
             observed_at: at(observed_at),
             observation,
         }))
@@ -3046,6 +3053,7 @@ fn observation_queries_select_frozen_targets_in_stable_bounded_pages() {
     let observe = |job, observed_at| {
         wait(handle.record_availability_stat(NewAvailabilityStat {
             job,
+            request: RequestNumber::FIRST,
             observed_at: at(observed_at),
             observation: response(200),
         }))
@@ -3055,6 +3063,7 @@ fn observation_queries_select_frozen_targets_in_stable_bounded_pages() {
         wait(handle.record_metrics(NewMetrics {
             token: None,
             job,
+            request: RequestNumber::FIRST,
             observed_at: at(observed_at),
             measurements: Measurements {
                 request_finished_in_ms: Some(10),
@@ -3098,6 +3107,7 @@ fn observation_queries_select_frozen_targets_in_stable_bounded_pages() {
     assert_eq!(
         violation(wait(handle.record_availability_stat(NewAvailabilityStat {
             job: plain,
+            request: RequestNumber::FIRST,
             observed_at: at(100),
             observation: response(200),
         }))),
@@ -3107,6 +3117,7 @@ fn observation_queries_select_frozen_targets_in_stable_bounded_pages() {
         violation(wait(handle.record_metrics(NewMetrics {
             token: None,
             job: on_a,
+            request: RequestNumber::FIRST,
             observed_at: at(100),
             measurements: Measurements::default(),
         }))),
@@ -3375,6 +3386,7 @@ fn observed_model_choices_come_from_the_frozen_targets_of_actual_observations() 
     let observe = |job, observed_at| {
         wait(handle.record_availability_stat(NewAvailabilityStat {
             job,
+            request: RequestNumber::FIRST,
             observed_at: at(observed_at),
             observation: response(200),
         }))
@@ -3384,6 +3396,7 @@ fn observed_model_choices_come_from_the_frozen_targets_of_actual_observations() 
         wait(handle.record_metrics(NewMetrics {
             token: None,
             job,
+            request: RequestNumber::FIRST,
             observed_at: at(observed_at),
             measurements: Measurements {
                 request_finished_in_ms: Some(10),
@@ -3595,6 +3608,7 @@ fn statistics_target_lookup_reads_no_project_associations() {
         wait(handle.record_metrics(NewMetrics {
             token: None,
             job,
+            request: RequestNumber::FIRST,
             observed_at: at(100),
             measurements: Measurements {
                 request_finished_in_ms: Some(10),
@@ -3605,6 +3619,7 @@ fn statistics_target_lookup_reads_no_project_associations() {
     }
     wait(handle.record_availability_stat(NewAvailabilityStat {
         job: configured,
+        request: RequestNumber::FIRST,
         observed_at: at(100),
         observation: response(200),
     }))
@@ -3686,6 +3701,7 @@ fn job_observation_reads_are_empty_without_records_and_corrupt_only_when_danglin
     wait(handle.record_metrics(NewMetrics {
         token: None,
         job: measured,
+        request: RequestNumber::FIRST,
         observed_at: at(100),
         measurements: Measurements {
             request_finished_in_ms: Some(10),
@@ -3695,6 +3711,7 @@ fn job_observation_reads_are_empty_without_records_and_corrupt_only_when_danglin
     .expect("record Metrics");
     wait(handle.record_availability_stat(NewAvailabilityStat {
         job: measured,
+        request: RequestNumber::FIRST,
         observed_at: at(100),
         observation: response(200),
     }))
@@ -3758,6 +3775,7 @@ fn settled(
         executor,
         input,
         job,
+        RequestNumber::FIRST,
         error,
     ))
     .expect("settle the provider outcome");
@@ -3947,6 +3965,7 @@ fn provider_and_transport_failures_are_observed_and_refused_requests_are_not() {
 fn observe(handle: &DatabaseHandle, job: JobId, micros: i64, observation: AvailabilityObservation) {
     wait(handle.record_availability_stat(NewAvailabilityStat {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at(micros),
         observation,
     }))
@@ -4254,9 +4273,15 @@ fn request_samples_refuse_mixed_jobs_and_report_no_sample_without_records() {
 
     assert_eq!(
         AvailabilityRequestSample::from_records(first_records.iter().chain(&second_records)),
-        Err(MixedJobs {
-            first,
-            other: second
+        Err(MixedRequests {
+            first: RequestRef {
+                job: first,
+                request: RequestNumber::FIRST
+            },
+            other: RequestRef {
+                job: second,
+                request: RequestNumber::FIRST
+            }
         }),
         "evidence from two Jobs is never one request"
     );
@@ -5116,10 +5141,13 @@ fn a_failed_commit_leaves_samples_counts_and_progress_unchanged() {
     );
     assert_eq!(bucket(&handle, provider, "model-a", micros), None);
     assert!(
-        wait(handle.request_sample(job))
-            .expect("read sample")
-            .value
-            .is_none()
+        wait(handle.request_sample(RequestRef {
+            job,
+            request: RequestNumber::FIRST
+        }))
+        .expect("read sample")
+        .value
+        .is_none()
     );
     assert_eq!(drain(&handle), 2, "the records are still unconsumed");
     assert_eq!(
@@ -5248,7 +5276,11 @@ fn unchanged_derived_rows_are_not_rewritten_but_progress_still_advances() {
     let duplicated = llm_job(&handle, llm);
     observe(&handle, duplicated, micros, response(200));
     consume_batch(&handle, 10);
-    let sample = wait(handle.request_sample(duplicated)).expect("read sample");
+    let sample = wait(handle.request_sample(RequestRef {
+        job: duplicated,
+        request: RequestNumber::FIRST,
+    }))
+    .expect("read sample");
     observe(&handle, duplicated, micros + 1, response(200));
     let markers_before = markers(&handle).len();
     let (report, writes) = commit_probed(&handle, 10);
@@ -5274,9 +5306,12 @@ fn unchanged_derived_rows_are_not_rewritten_but_progress_still_advances() {
         "with its marker"
     );
     assert_eq!(
-        wait(handle.request_sample(duplicated))
-            .expect("read sample")
-            .value,
+        wait(handle.request_sample(RequestRef {
+            job: duplicated,
+            request: RequestNumber::FIRST
+        }))
+        .expect("read sample")
+        .value,
         sample.value
     );
     assert_eq!(requests(counts(&handle, provider, "model-a", micros)), 1);
@@ -5356,12 +5391,15 @@ fn counts_that_net_to_the_same_bytes_leave_their_bucket_alone() {
     assert_eq!(writes, [2, 0, 0]);
     assert_eq!(counts(&handle, provider, "model-a", micros), before);
     let class = |job| {
-        wait(handle.request_sample(job))
-            .expect("read sample")
-            .value
-            .expect("sample exists")
-            .sample
-            .classification
+        wait(handle.request_sample(RequestRef {
+            job,
+            request: RequestNumber::FIRST,
+        }))
+        .expect("read sample")
+        .value
+        .expect("sample exists")
+        .sample
+        .classification
     };
     assert_eq!(class(leaving), AvailabilityClassification::Unconfirmed);
     assert_eq!(class(arriving), AvailabilityClassification::Available);
@@ -5451,6 +5489,7 @@ fn the_batch_maximum_splits_one_requests_records_and_counts_it_once() {
                 };
                 admit(handle.record_availability_stat(NewAvailabilityStat {
                     job,
+                    request: RequestNumber::FIRST,
                     observed_at: at(micros + index as i64),
                     observation,
                 }))
@@ -5515,6 +5554,7 @@ fn grouping_worker(directory: &DataDirectory) -> DatabaseWorker {
 fn one_record(job: JobId, micros: i64) -> NewAvailabilityStat {
     NewAvailabilityStat {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at(micros),
         observation: response(200),
     }
@@ -5821,6 +5861,7 @@ fn token_metrics(
 ) -> NewMetrics {
     NewMetrics {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at(micros),
         measurements: TokenMeasurements {
             usage: NormalizedUsage {
@@ -7237,6 +7278,7 @@ fn a_failed_observation_write_is_local_and_changes_nothing_that_settled() {
         executor,
         input,
         plain,
+        RequestNumber::FIRST,
         ProviderExecutionError::Rejected { failure },
     )) {
         Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, .. }) => {
@@ -7567,6 +7609,7 @@ fn token_fact(
 ) -> crate::persistence::MetricsId {
     wait(handle.record_metrics(NewMetrics {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at(micros),
         measurements: TokenMeasurements {
             usage: NormalizedUsage {
@@ -7595,6 +7638,7 @@ fn preexisting_fact(
 ) -> crate::persistence::MetricsId {
     wait(handle.record_preexisting_metrics(NewMetrics {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at(micros),
         measurements: TokenMeasurements {
             usage: NormalizedUsage {
@@ -7649,10 +7693,13 @@ fn token_bucket(
 }
 
 fn token_sample(handle: &DatabaseHandle, job: JobId) -> Option<TokenRequestSample> {
-    wait(handle.token_request(job))
-        .expect("read the Token request")
-        .value
-        .and_then(|record| record.sample)
+    wait(handle.token_request(RequestRef {
+        job,
+        request: RequestNumber::FIRST,
+    }))
+    .expect("read the Token request")
+    .value
+    .and_then(|record| record.sample)
 }
 
 /// The stored state equals the pure reducer applied to each Job's records up to
@@ -7775,10 +7822,13 @@ fn an_empty_token_step_writes_nothing_and_a_skipped_batch_still_advances() {
         "excluded work has no sample"
     );
     assert_eq!(
-        wait(handle.token_request(job))
-            .expect("read")
-            .value
-            .map(|r| r.provider),
+        wait(handle.token_request(RequestRef {
+            job,
+            request: RequestNumber::FIRST
+        }))
+        .expect("read")
+        .value
+        .map(|r| r.provider),
         Some(provider),
         "but its evidence and target are kept"
     );
@@ -7831,6 +7881,7 @@ fn a_token_batch_takes_one_thousand_records_whatever_they_are() {
                 }
                 Some(admit(handle.record_metrics(NewMetrics {
                     job,
+                    request: RequestNumber::FIRST,
                     observed_at: at(at_minute(3)),
                     measurements: TokenMeasurements {
                         usage: NormalizedUsage {
@@ -8372,7 +8423,12 @@ fn contradictory_eligibility_refuses_the_whole_batch_and_keeps_excluded_evidence
     // Batch one consumes only the Excluded claim: its evidence is stored.
     assert_eq!(consume_tokens(&handle, 1).consumed_through, excluded);
     let progress = token_progress(&handle);
-    let state = wait(handle.token_request(bad)).expect("read").value;
+    let state = wait(handle.token_request(RequestRef {
+        job: bad,
+        request: RequestNumber::FIRST,
+    }))
+    .expect("read")
+    .value;
     assert!(state.is_some() && state.expect("state").sample.is_none());
 
     // A later eligible claim about the same request is a contradiction, and a
@@ -8390,7 +8446,10 @@ fn contradictory_eligibility_refuses_the_whole_batch_and_keeps_excluded_evidence
             assert_eq!((metrics, job), (eligible, bad));
             assert_eq!(
                 error,
-                crate::token_usage::TokenEvidenceError::ContradictoryEligibility(bad)
+                crate::token_usage::TokenEvidenceError::ContradictoryEligibility(RequestRef {
+                    job: bad,
+                    request: RequestNumber::FIRST
+                })
             );
         }
         other => panic!("expected the contradiction to refuse the batch, got {other:?}"),
@@ -8540,9 +8599,15 @@ fn token_plans_commit_only_physical_changes_and_decline_when_stale() {
     );
     let duplicate = token_plan(&handle, 10);
     assert_eq!(duplicate.requests_written(), 0);
-    wait(
-        handle.with_database(move |database| crate::storage::replace_token_request(database, job)),
-    )
+    wait(handle.with_database(move |database| {
+        crate::storage::replace_token_request(
+            database,
+            RequestRef {
+                job,
+                request: RequestNumber::FIRST,
+            },
+        )
+    }))
     .expect("change the guarded request row");
     let progress = token_progress(&handle);
     assert_eq!(wait(handle.commit_token(duplicate)).expect("commit"), None);
@@ -8609,10 +8674,13 @@ fn a_failed_token_commit_leaves_state_counts_and_progress_unchanged() {
     assert_eq!(token_progress(&handle), TokenAggregationProgress::default());
     assert_eq!(token_bucket(&handle, provider, "model-a", micros), None);
     assert!(
-        wait(handle.token_request(job))
-            .expect("read")
-            .value
-            .is_none()
+        wait(handle.token_request(RequestRef {
+            job,
+            request: RequestNumber::FIRST
+        }))
+        .expect("read")
+        .value
+        .is_none()
     );
     assert_eq!(drain_tokens(&handle), 2, "the records are still unconsumed");
     assert_matches_reducer(&handle, &[job]);
@@ -8708,11 +8776,13 @@ fn stale_token_declines_in_a_group_are_not_flushed_or_uncertain() {
         .expect("the worker holds the group's first command");
     let write_one = admit(handle.record_availability_stat(NewAvailabilityStat {
         job: first_write,
+        request: RequestNumber::FIRST,
         observed_at: at(micros + 4),
         observation: response(200),
     }));
     let write_two = admit(handle.record_availability_stat(NewAvailabilityStat {
         job: second_write,
+        request: RequestNumber::FIRST,
         observed_at: at(micros + 5),
         observation: response(200),
     }));
@@ -8772,10 +8842,13 @@ fn totals_that_would_leave_their_range_refuse_the_batch_without_writing() {
         Some(full)
     );
     assert!(
-        wait(handle.token_request(other))
-            .expect("read")
-            .value
-            .is_none()
+        wait(handle.token_request(RequestRef {
+            job: other,
+            request: RequestNumber::FIRST
+        }))
+        .expect("read")
+        .value
+        .is_none()
     );
 
     // Underflow: a bucket that no longer holds the request cannot give it up.
@@ -9048,6 +9121,7 @@ fn a_backlog_is_taken_a_batch_at_a_time_and_the_streams_take_turns() {
             .map(|offset| {
                 admit(handle.record_metrics(NewMetrics {
                     job,
+                    request: RequestNumber::FIRST,
                     observed_at: at(at_minute(2) + chunk * 100 + offset),
                     measurements: TokenMeasurements {
                         usage: NormalizedUsage {
@@ -9064,6 +9138,7 @@ fn a_backlog_is_taken_a_batch_at_a_time_and_the_streams_take_turns() {
             .map(|offset| {
                 admit(handle.record_availability_stat(NewAvailabilityStat {
                     job,
+                    request: RequestNumber::FIRST,
                     observed_at: at(at_minute(2) + chunk * 100 + offset),
                     observation: bare(200),
                 }))
@@ -9849,6 +9924,7 @@ fn a_run_whose_end_has_an_unknown_outcome_is_reported_as_unconfirmed() {
         .expect("the worker holds the Job's end");
     let companion = admit(handle.record_metrics(NewMetrics {
         job: bad,
+        request: RequestNumber::FIRST,
         observed_at: at(at_minute(32)),
         measurements: TokenMeasurements {
             ttfb_ms: Some(1),
@@ -10013,6 +10089,7 @@ fn an_uncertain_commit_pauses_the_live_service_and_resumes_from_what_was_committ
         .expect("the service's commit is the group's first command");
     let companion = admit(handle.record_availability_stat(NewAvailabilityStat {
         job,
+        request: RequestNumber::FIRST,
         observed_at: at(micros),
         observation: response(200),
     }));
@@ -10099,6 +10176,7 @@ fn a_host_run_keeps_stopping_after_a_failed_step_and_reports_every_failure() {
         database
             .record_metrics(NewMetrics {
                 job,
+                request: RequestNumber::FIRST,
                 observed_at: at(at_minute(35)),
                 measurements: TokenMeasurements::default(),
                 token: Some(ELIGIBLE),
@@ -10263,6 +10341,7 @@ mod lifecycle_closure {
                 executor,
                 input,
                 job,
+                RequestNumber::FIRST,
                 ending,
             ))
             .expect("settle the execution");
@@ -10335,6 +10414,7 @@ mod lifecycle_closure {
             executor,
             input,
             job,
+            RequestNumber::FIRST,
             ProviderExecutionError::Unknown {
                 message: "connection reset".into(),
                 facts: None,
@@ -10611,6 +10691,7 @@ mod lifecycle_closure {
                 cancellation: CancellationToken::default(),
                 ..ProviderExecutionConfig::default()
             },
+            tools: None,
         }
     }
 
@@ -11170,6 +11251,7 @@ mod lifecycle_closure {
                     .expect("the Failed settlement is held");
                 let companion = admit(handle.record_metrics(NewMetrics {
                     job: failed,
+                    request: RequestNumber::FIRST,
                     observed_at: at(1),
                     measurements: Measurements {
                         ttfb_ms: Some(1),
@@ -11248,6 +11330,7 @@ mod token_eligibility_at_ingest {
     fn fact(job: JobId, micros: i64, token: Option<TokenAnnotation>) -> NewMetrics {
         NewMetrics {
             job,
+            request: RequestNumber::FIRST,
             observed_at: at(micros),
             measurements: Measurements {
                 ttfb_ms: token.is_none().then_some(5),
@@ -11272,6 +11355,7 @@ mod token_eligibility_at_ingest {
         };
         Violation::ContradictoryTokenEligibility {
             job,
+            request: RequestNumber::FIRST,
             committed,
             refused,
         }
@@ -12426,5 +12510,1314 @@ mod settlement {
         }
         worker.shutdown().expect("shutdown");
         assert_relationships_consistent(&directory);
+    }
+}
+
+// ---- Request-level evidence and the tool loop ----------------------------------
+
+/// Format 11: every Provider request of a Job has its own evidence, a format
+/// 10 file is upgraded in place, and the tool loop runs OCG's own tools
+/// between requests.
+mod requests_and_tool_loop {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::Value;
+
+    use super::*;
+    use crate::openai_compatible::{ChatMessage, MessageContentWire, ToolCallRefusal};
+    use crate::orchestration::execution_runtime::{
+        DatabaseOutputSink, ExecutionReceipt, ProviderExecutionPlan, ProviderRun, ToolExecution,
+        ToolLoopLimits, ToolLoopStop, run_provider_job,
+    };
+    use crate::orchestration::tools::{ToolFailure, ToolFuture, ToolHandler, ToolRegistry};
+    use crate::persistence::AvailabilityBatch;
+    use crate::provider_execution::ProviderExecutionError;
+    use crate::token_usage::TokenBatch;
+
+    fn number(value: u32) -> RequestNumber {
+        RequestNumber::new(value).expect("a request number")
+    }
+
+    fn request(job: JobId, value: u32) -> RequestRef {
+        RequestRef {
+            job,
+            request: number(value),
+        }
+    }
+
+    /// What one answered request leaves: its delivery, its final usage and
+    /// its availability observation.
+    fn answered_request(
+        handle: &DatabaseHandle,
+        job: JobId,
+        value: u32,
+        micros: i64,
+        finish: ChatFinishReason,
+        (input, output): (u32, u32),
+    ) {
+        let request = number(value);
+        for (offset, usage, finality) in [
+            (0, NormalizedUsage::default(), UsageFinality::Cumulative),
+            (
+                1,
+                NormalizedUsage {
+                    input_tokens: Some(input),
+                    output_tokens: Some(output),
+                    ..NormalizedUsage::default()
+                },
+                UsageFinality::Final,
+            ),
+        ] {
+            wait(handle.record_metrics(NewMetrics {
+                job,
+                request,
+                observed_at: at(micros + offset),
+                measurements: Measurements {
+                    usage,
+                    ..Measurements::default()
+                },
+                token: Some(TokenAnnotation::eligible(finality)),
+            }))
+            .expect("record Metrics");
+        }
+        wait(handle.record_availability_stat(NewAvailabilityStat {
+            job,
+            request,
+            observed_at: at(micros),
+            observation: AvailabilityObservation {
+                status_code: Some(200),
+                finish_reason: Some(finish),
+                raw_finish_reason: Some(finish.as_openai_str().to_owned()),
+                failure: None,
+            },
+        }))
+        .expect("record an AvailabilityStat");
+    }
+
+    /// Consumes both evidence streams until neither has anything left.
+    fn drain(handle: &DatabaseHandle) {
+        while !matches!(
+            wait(handle.consume_availability(1_000)).expect("consume availability"),
+            AvailabilityBatch::Idle { .. }
+        ) {}
+        while !matches!(
+            wait(handle.consume_token_usage(1_000)).expect("consume Token usage"),
+            TokenBatch::Idle { .. }
+        ) {}
+    }
+
+    fn token_bucket(
+        handle: &DatabaseHandle,
+        provider: LlmProviderId,
+        minute: i64,
+    ) -> TokenMinuteTotals {
+        wait(handle.token_minutes(provider, "model-a".into(), minute, 1))
+            .expect("read Token minutes")
+            .value
+            .first()
+            .map_or_else(TokenMinuteTotals::default, |(_, totals)| *totals)
+    }
+
+    fn availability_bucket(
+        handle: &DatabaseHandle,
+        provider: LlmProviderId,
+        minute: i64,
+    ) -> AvailabilityCounts {
+        wait(handle.availability_minute(provider, "model-a".into(), minute))
+            .expect("read availability minute")
+            .value
+            .unwrap_or_default()
+    }
+
+    fn classification(handle: &DatabaseHandle, request: RequestRef) -> AvailabilityClassification {
+        wait(handle.request_sample(request))
+            .expect("read the request sample")
+            .value
+            .expect("a sample")
+            .sample
+            .classification
+    }
+
+    fn token_sample(handle: &DatabaseHandle, request: RequestRef) -> TokenRequestSample {
+        wait(handle.token_request(request))
+            .expect("read the Token request")
+            .value
+            .expect("a request state")
+            .sample
+            .expect("an eligible sample")
+    }
+
+    #[test]
+    fn the_requests_of_one_job_are_reduced_and_counted_apart() {
+        let (_root, directory) = data_directory("per-request-evidence");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (provider, llm) = llm_setup(&handle, "model-a");
+        let job = llm_job(&handle, llm);
+        let micros = at_minute(7);
+        answered_request(
+            &handle,
+            job,
+            1,
+            micros,
+            ChatFinishReason::ToolCalls,
+            (10, 5),
+        );
+        answered_request(
+            &handle,
+            job,
+            2,
+            micros + 10,
+            ChatFinishReason::Stop,
+            (20, 7),
+        );
+        // A request that was never sent may follow one that was.
+        wait(handle.record_metrics(NewMetrics {
+            job,
+            request: number(3),
+            observed_at: at(micros + 20),
+            measurements: Measurements::default(),
+            token: Some(TokenAnnotation::excluded()),
+        }))
+        .expect("another request of the Job is excluded on its own");
+        assert_eq!(
+            violation(wait(handle.record_metrics(NewMetrics {
+                job,
+                request: number(2),
+                observed_at: at(micros + 30),
+                measurements: Measurements::default(),
+                token: Some(TokenAnnotation::excluded()),
+            }))),
+            Violation::ContradictoryTokenEligibility {
+                job,
+                request: number(2),
+                committed: RequestEligibility::Eligible,
+                refused: RequestEligibility::Excluded,
+            },
+            "one request still cannot contradict itself"
+        );
+
+        let stats = stats(&handle, job);
+        assert!(
+            matches!(
+                AvailabilityRequestSample::from_records(&stats),
+                Err(MixedRequests { .. })
+            ),
+            "two requests are never reduced as one"
+        );
+        let of = |value| {
+            stats
+                .iter()
+                .filter(move |stat| stat.request == number(value))
+        };
+        assert_eq!(
+            AvailabilityRequestSample::from_records(of(1))
+                .expect("one request")
+                .map(|sample| sample.classification),
+            Some(AvailabilityClassification::Unconfirmed),
+            "a response asking for tools witnesses no normal termination"
+        );
+        assert_eq!(
+            AvailabilityRequestSample::from_records(of(2))
+                .expect("one request")
+                .map(|sample| sample.classification),
+            Some(AvailabilityClassification::Available),
+            "the final answer's evidence is not made contradictory by the request before it"
+        );
+        let metrics = job_metrics(&handle, job);
+        assert!(matches!(
+            TokenRequestSample::from_metrics(&metrics),
+            Err(crate::token_usage::TokenEvidenceError::MixedRequests(_))
+        ));
+        let samples = TokenRequestSample::per_request(&metrics).expect("per request");
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| (sample.request, sample.input, sample.output))
+                .collect::<Vec<_>>(),
+            [
+                (number(1), TokenCount::Final(10), TokenCount::Final(5)),
+                (number(2), TokenCount::Final(20), TokenCount::Final(7)),
+            ],
+            "each request keeps its own finals; the excluded one has no sample"
+        );
+        assert_eq!(
+            TokenRequestSample::job_total(&samples),
+            Some(42),
+            "a sum, never a maximum"
+        );
+
+        drain(&handle);
+        assert_eq!(
+            classification(&handle, request(job, 1)),
+            AvailabilityClassification::Unconfirmed
+        );
+        assert_eq!(
+            classification(&handle, request(job, 2)),
+            AvailabilityClassification::Available
+        );
+        assert_eq!(token_sample(&handle, request(job, 2)).total, Some(27));
+        let minute = minute_of(at(micros));
+        let totals = token_bucket(&handle, provider, minute);
+        assert_eq!(
+            (
+                totals.requests,
+                totals.input.final_sum,
+                totals.total.final_sum
+            ),
+            (2, 30, 42)
+        );
+        let counts = availability_bucket(&handle, provider, minute);
+        assert_eq!((counts.available, counts.unconfirmed), (1, 1));
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_format_10_file_is_upgraded_in_place_without_loss_or_double_counting() {
+        let (_root, directory) = data_directory("upgrade-from-10");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (provider, llm) = llm_setup(&handle, "model-a");
+        let micros = at_minute(3);
+        let minute = minute_of(at(micros));
+        let [first, second, late] = [0, 1, 2].map(|_| llm_job(&handle, llm));
+        answered_request(&handle, first, 1, micros, ChatFinishReason::Stop, (3, 4));
+        answered_request(&handle, second, 1, micros, ChatFinishReason::Length, (5, 6));
+        drain(&handle);
+        // Evidence the streams have not consumed when the file is upgraded.
+        answered_request(&handle, late, 1, micros, ChatFinishReason::Stop, (7, 8));
+        let capture = |handle: &DatabaseHandle| {
+            (
+                [first, second, late].map(|job| (job_metrics(handle, job), stats(handle, job))),
+                [first, second].map(|job| {
+                    (
+                        wait(handle.request_sample(request(job, 1)))
+                            .expect("sample")
+                            .value,
+                        wait(handle.token_request(request(job, 1)))
+                            .expect("state")
+                            .value,
+                    )
+                }),
+                token_bucket(handle, provider, minute),
+                availability_bucket(handle, provider, minute),
+                wait(handle.availability_progress()).expect("progress"),
+                wait(handle.token_progress()).expect("progress"),
+            )
+        };
+        let before = capture(&handle);
+        worker.shutdown().expect("shutdown");
+
+        crate::storage::downgrade_to_format_10(directory.database_path())
+            .expect("write the version 10 file");
+        assert_eq!(
+            crate::storage::recorded_format_version(directory.database_path()),
+            Ok(10)
+        );
+        crate::storage::FAIL_NEXT_UPGRADE.store(true, Ordering::SeqCst);
+        assert!(
+            DatabaseWorker::start(&directory).is_err(),
+            "an upgrade that fails does not open"
+        );
+        assert_eq!(
+            crate::storage::recorded_format_version(directory.database_path()),
+            Ok(10),
+            "a failed upgrade leaves the file as it was"
+        );
+
+        let worker = DatabaseWorker::start(&directory).expect("upgrade and open");
+        let handle = worker.handle();
+        assert_eq!(
+            capture(&handle),
+            before,
+            "every record and every aggregate is kept"
+        );
+        let (records, _, _, _, _, _) = &before;
+        assert!(
+            records
+                .iter()
+                .flat_map(|(metrics, stats)| metrics
+                    .iter()
+                    .map(|record| record.request)
+                    .chain(stats.iter().map(|stat| stat.request)))
+                .all(|request| request == RequestNumber::FIRST),
+            "a version 10 record is its Job's first request"
+        );
+        drain(&handle);
+        let totals = token_bucket(&handle, provider, minute);
+        assert_eq!(
+            (totals.requests, totals.input.final_sum),
+            (3, 15),
+            "the unconsumed request is counted once, the others not again"
+        );
+        assert_eq!(availability_bucket(&handle, provider, minute).available, 3);
+
+        // The upgraded Job's next request is evidence of its own.
+        answered_request(&handle, first, 2, micros, ChatFinishReason::Stop, (9, 1));
+        drain(&handle);
+        assert_eq!(token_sample(&handle, request(first, 1)).total, Some(7));
+        assert_eq!(token_sample(&handle, request(first, 2)).total, Some(10));
+        assert_eq!(token_bucket(&handle, provider, minute).requests, 4);
+        worker.shutdown().expect("shutdown");
+        assert_eq!(
+            crate::storage::recorded_format_version(directory.database_path()),
+            Ok(11)
+        );
+        assert_relationships_consistent(&directory);
+    }
+
+    // ---- The tool loop --------------------------------------------------------
+
+    /// How a test tool behaves. Every one is free of side effects outside
+    /// the test.
+    enum Behavior {
+        /// Adds integers `a` and `b`.
+        Add,
+        Fail,
+        /// Returns a string of this many bytes.
+        Big(usize),
+        /// Never finishes.
+        Hang,
+        /// Cancels the execution, then never finishes.
+        CancelThenHang(CancellationToken),
+        /// Withdraws the grant of another tool, then answers.
+        Revoke(ToolRegistry, &'static str),
+    }
+
+    struct TestTool {
+        behavior: Behavior,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for TestTool {
+        fn call(&self, arguments: Value) -> ToolFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                match &self.behavior {
+                    Behavior::Add => arguments["a"]
+                        .as_i64()
+                        .zip(arguments["b"].as_i64())
+                        .and_then(|(a, b)| a.checked_add(b))
+                        .map(|sum| json!({"sum": sum}))
+                        .ok_or_else(|| ToolFailure::new("no sum")),
+                    Behavior::Fail => Err(ToolFailure::new("the tool failed")),
+                    Behavior::Big(bytes) => Ok(Value::String("x".repeat(*bytes))),
+                    Behavior::Hang => std::future::pending().await,
+                    Behavior::CancelThenHang(token) => {
+                        token.cancel();
+                        std::future::pending().await
+                    }
+                    Behavior::Revoke(registry, name) => {
+                        registry.revoke(name).expect("revoke");
+                        Ok(json!({"revoked": name}))
+                    }
+                }
+            })
+        }
+    }
+
+    fn add_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+            "required": ["a", "b"],
+            "additionalProperties": false
+        })
+    }
+
+    /// Registers and authorizes the tools; their handlers share one count of
+    /// the calls they ran.
+    fn registered(tools: Vec<(&str, Behavior)>) -> (ToolRegistry, Arc<AtomicUsize>) {
+        let registry = ToolRegistry::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (name, behavior) in tools {
+            let handler = Arc::new(TestTool {
+                behavior,
+                calls: calls.clone(),
+            });
+            registry
+                .register(name, Some("a test tool"), add_schema(), handler)
+                .expect("register");
+            registry.authorize(name).expect("authorize");
+        }
+        (registry, calls)
+    }
+
+    fn execution(registry: &ToolRegistry, names: &[&str], limits: ToolLoopLimits) -> ToolExecution {
+        ToolExecution {
+            offer: registry.offer(names).expect("offer"),
+            limits,
+        }
+    }
+
+    fn chunk(text: String) -> Step {
+        Step::Chunk(Box::leak(text.into_boxed_str()))
+    }
+
+    fn usage_chunk((input, output): (u32, u32)) -> Step {
+        chunk(format!(
+            "data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{input},\"completion_tokens\":{output}}}}}\n\n"
+        ))
+    }
+
+    /// One tool-call delta of a response.
+    fn call(index: u32, id: &str, name: &str, arguments: &str) -> String {
+        format!(
+            r#"{{"index":{index},"id":"{id}","type":"function","function":{{"name":"{name}","arguments":{}}}}}"#,
+            serde_json::to_string(arguments).expect("JSON string")
+        )
+    }
+
+    /// A response that requests `calls` and finishes with `tool_calls`.
+    fn calling(calls: &[String], usage: (u32, u32)) -> Vec<Step> {
+        vec![
+            chunk(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{}]}}}}]}}\n\n",
+                calls.join(",")
+            )),
+            chunk(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n".into(),
+            ),
+            usage_chunk(usage),
+            Step::Chunk(DONE_CHUNK),
+        ]
+    }
+
+    /// A final answer.
+    fn answering(text: &str, usage: (u32, u32)) -> Vec<Step> {
+        vec![
+            chunk(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+                serde_json::to_string(text).expect("JSON string")
+            )),
+            Step::Chunk(STOP_CHUNK),
+            usage_chunk(usage),
+            Step::Chunk(DONE_CHUNK),
+        ]
+    }
+
+    fn add(index: u32, id: &str, a: i64, b: i64) -> String {
+        call(index, id, "add", &format!(r#"{{"a":{a},"b":{b}}}"#))
+    }
+
+    /// A Job that this process started itself, so its claim is observable.
+    fn local_run(handle: &DatabaseHandle, llm: ProfileId) -> TokenRun {
+        let executor =
+            executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+        let job = llm_job(handle, llm);
+        wait(handle.start_local_job(job)).expect("start the Job locally");
+        let input = wait(handle.job(job)).expect("read").expect("job").input;
+        TokenRun {
+            executor,
+            job,
+            input,
+        }
+    }
+
+    struct Looped {
+        settled: Result<ExecutionReceipt, ExecutionRuntimeError>,
+        /// Every conversation the loop sent, in order.
+        sent: Vec<ChatConversation>,
+    }
+
+    /// Runs the real tool loop, dispatcher and settlement on `run`. Each
+    /// request is checked as the transport checks it and answered by the
+    /// next scripted response, read by the real reader; `after` runs once a
+    /// response has been read, before anything is dispatched.
+    fn run_loop(
+        handle: &DatabaseHandle,
+        run: TokenRun,
+        tools: Option<ToolExecution>,
+        responses: Vec<Vec<Step>>,
+        cancellation: CancellationToken,
+        mut after: impl FnMut(usize) + 'static,
+    ) -> Looped {
+        let handle = handle.clone();
+        on_ntex(async move {
+            let config = ProviderExecutionConfig {
+                cancellation: cancellation.clone(),
+                ..ProviderExecutionConfig::default()
+            };
+            let conversation = ChatConversation {
+                messages: vec![ChatMessage::user("add the numbers")],
+                tools: tools
+                    .as_ref()
+                    .map(|tools| tools.offer.wires().expect("offer"))
+                    .unwrap_or_default(),
+                ..ChatConversation::default()
+            };
+            let mut responses = responses.into_iter();
+            let mut sent = Vec::new();
+            let settled = run_provider_job(
+                ProviderRun {
+                    database: handle,
+                    executor: run.executor,
+                    input: run.input,
+                    job: run.job,
+                },
+                conversation,
+                tools.as_ref(),
+                &cancellation,
+                async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
+                    sent.push(conversation.clone());
+                    conversation
+                        .validate()
+                        .map_err(|error| ProviderExecutionError::Build {
+                            message: error.to_string(),
+                        })?;
+                    let steps = responses.next().expect("a response for every request");
+                    announce(Some(&mut *sink), ProviderFact::Delivered).await;
+                    let response = read_response(
+                        payload(steps, config.cancellation.clone()),
+                        200,
+                        Instant::now(),
+                        None,
+                        &config,
+                        Some(&mut *sink),
+                        conversation,
+                    )
+                    .await;
+                    after(sent.len());
+                    response
+                },
+            )
+            .await;
+            Looped { settled, sent }
+        })
+    }
+
+    fn job_record(handle: &DatabaseHandle, job: JobId) -> JobRecord {
+        wait(handle.job(job))
+            .expect("read job")
+            .expect("job exists")
+    }
+
+    /// The Metrics and AvailabilityStats of each request of `job`.
+    fn by_request(
+        handle: &DatabaseHandle,
+        job: JobId,
+    ) -> BTreeMap<u32, (Vec<MetricsRecord>, Vec<AvailabilityStatRecord>)> {
+        let mut requests: BTreeMap<u32, (Vec<_>, Vec<_>)> = BTreeMap::new();
+        for record in job_metrics(handle, job) {
+            requests
+                .entry(record.request.get())
+                .or_default()
+                .0
+                .push(record);
+        }
+        for stat in stats(handle, job) {
+            requests.entry(stat.request.get()).or_default().1.push(stat);
+        }
+        requests
+    }
+
+    fn stopped(looped: Looped) -> (ExecutionReceipt, ToolLoopStop) {
+        match looped.settled {
+            Err(ExecutionRuntimeError::ToolLoopStopped {
+                receipt,
+                stop,
+                observations: None,
+            }) => (*receipt, stop),
+            other => panic!("expected the tool loop to stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_authorized_tool_runs_and_its_result_returns_for_the_final_answer() {
+        let (_root, directory) = data_directory("tool-loop");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+            vec![
+                calling(&[add(0, "call_1", 2, 3)], (11, 4)),
+                answering("The sum is 5.", (30, 6)),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        let receipt = looped.settled.expect("the loop settles");
+        assert_eq!(receipt.job, run.job);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler ran once");
+
+        assert_eq!(looped.sent.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&looped.sent[0]).expect("JSON"),
+            json!({
+                "messages": [{"role": "user", "content": "add the numbers"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "add", "description": "a test tool", "parameters": add_schema()
+                }}]
+            }),
+            "only the OCG tool is offered, with OCG's own schema"
+        );
+        assert_eq!(
+            serde_json::to_value(&looped.sent[1].messages).expect("JSON"),
+            json!([
+                {"role": "user", "content": "add the numbers"},
+                {"role": "assistant", "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "add", "arguments": "{\"a\":2,\"b\":3}"}}]},
+                {"role": "tool", "content": "{\"sum\":5}", "tool_call_id": "call_1"}
+            ]),
+            "the call and its result go back in order, with the call's id"
+        );
+
+        let job = job_record(&handle, run.job);
+        assert!(job.completed_at.is_some() && job.stop_confirmed_at.is_none());
+        let outputs = wait(handle.job_outputs(run.job, None, 100)).expect("outputs");
+        let result = outputs.last().expect("a result");
+        assert_eq!(result.kind, OutputKind::Result);
+        assert_eq!(result.summary.as_deref(), Some("The sum is 5."));
+        assert!(blocking(&handle, llm).is_empty(), "the Profile is released");
+
+        // Each request keeps its own facts.
+        let requests = by_request(&handle, run.job);
+        assert_eq!(requests.keys().copied().collect::<Vec<_>>(), [1, 2]);
+        for (request, finish) in [
+            (1, ChatFinishReason::ToolCalls),
+            (2, ChatFinishReason::Stop),
+        ] {
+            let (metrics, stats) = &requests[&request];
+            assert_eq!(
+                stats
+                    .iter()
+                    .map(|stat| (stat.observation.status_code, stat.observation.finish_reason))
+                    .collect::<Vec<_>>(),
+                [(Some(200), Some(finish))],
+                "request {request}"
+            );
+            assert!(stats.iter().all(|stat| stat.observation.failure.is_none()));
+            assert_eq!(
+                metrics
+                    .iter()
+                    .filter(|record| record.token.is_none()
+                        && record.measurements.ttfb_ms.is_some())
+                    .count(),
+                1,
+                "request {request} has its own timing"
+            );
+        }
+        let samples =
+            TokenRequestSample::per_request(&job_metrics(&handle, run.job)).expect("per request");
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.total)
+                .collect::<Vec<_>>(),
+            [Some(15), Some(36)]
+        );
+        assert_eq!(TokenRequestSample::job_total(&samples), Some(51));
+        drain(&handle);
+        assert_eq!(
+            classification(&handle, request(run.job, 2)),
+            AvailabilityClassification::Available
+        );
+        assert_eq!(token_sample(&handle, request(run.job, 1)).total, Some(15));
+        let _ = provider;
+        worker.shutdown().expect("shutdown");
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        assert!(
+            worker.handle().abandoned_at_open().is_empty(),
+            "the local claim was released"
+        );
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn sequential_calls_over_several_requests_keep_their_ids_and_order() {
+        let (_root, directory) = data_directory("tool-loop-rounds");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+            vec![
+                calling(&[add(0, "a", 1, 2), add(1, "b", 3, 4)], (1, 1)),
+                calling(&[add(0, "c", 5, 6)], (2, 2)),
+                answering("3, 7 and 11.", (3, 3)),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        looped.settled.expect("the loop settles");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let roles_and_ids = looped.sent[2]
+            .messages
+            .iter()
+            .map(|message| {
+                let ids = message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|call| call.id.clone())
+                    .chain(message.tool_call_id.clone())
+                    .collect::<Vec<_>>();
+                (format!("{:?}", message.role), ids)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles_and_ids,
+            [
+                ("User".to_owned(), vec![]),
+                ("Assistant".to_owned(), vec!["a".to_owned(), "b".to_owned()]),
+                ("Tool".to_owned(), vec!["a".to_owned()]),
+                ("Tool".to_owned(), vec!["b".to_owned()]),
+                ("Assistant".to_owned(), vec!["c".to_owned()]),
+                ("Tool".to_owned(), vec!["c".to_owned()]),
+            ]
+        );
+        let results = looped.sent[2]
+            .messages
+            .iter()
+            .filter_map(|message| match (&message.tool_call_id, &message.content) {
+                (Some(_), Some(MessageContentWire::Text(text))) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, [r#"{"sum":3}"#, r#"{"sum":7}"#, r#"{"sum":11}"#]);
+        assert_eq!(
+            by_request(&handle, run.job)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(job_record(&handle, run.job).completed_at.is_some());
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn calls_refused_at_dispatch_never_run_and_are_no_provider_failure() {
+        let (_root, directory) = data_directory("tool-loop-refusals");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        type Change = Box<dyn FnMut(&ToolRegistry)>;
+        let cases: Vec<(&str, Change, ToolCallRefusal)> = vec![
+            (
+                "a grant withdrawn before dispatch",
+                Box::new(|registry: &ToolRegistry| registry.revoke("add").expect("revoke")),
+                ToolCallRefusal::Unauthorized,
+            ),
+            (
+                "a tool registered again before dispatch",
+                Box::new(|registry: &ToolRegistry| {
+                    registry.unregister("add").expect("unregister");
+                    registry
+                        .register(
+                            "add",
+                            None,
+                            add_schema(),
+                            Arc::new(TestTool {
+                                behavior: Behavior::Add,
+                                calls: Arc::new(AtomicUsize::new(0)),
+                            }),
+                        )
+                        .expect("register again");
+                    registry.authorize("add").expect("authorize");
+                }),
+                ToolCallRefusal::Unauthorized,
+            ),
+        ];
+        for (case, mut change, kind) in cases {
+            let run = local_run(&handle, llm);
+            let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+            let tools = execution(&registry, &["add"], ToolLoopLimits::default());
+            let changed = registry.clone();
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(tools),
+                vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+                CancellationToken::default(),
+                move |_| change(&changed),
+            );
+            let (receipt, stop) = stopped(looped);
+            assert!(
+                matches!(&stop, ToolLoopStop::Refused(refusal) if refusal.kind == kind),
+                "{case}: {stop:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{case}: nothing ran");
+            assert!(receipt.result.is_some());
+            let job = job_record(&handle, run.job);
+            assert!(
+                job.failed_at.is_some() && job.completed_at.is_none(),
+                "{case}"
+            );
+            assert!(
+                stats(&handle, run.job)
+                    .iter()
+                    .all(|stat| stat.observation.failure.is_none()),
+                "{case}: a local refusal is no Provider failure"
+            );
+            assert!(blocking(&handle, llm).is_empty(), "{case}");
+        }
+
+        // A grant withdrawn between two calls of one response.
+        let run = local_run(&handle, llm);
+        let registry = ToolRegistry::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (name, behavior) in [
+            ("revoker", Behavior::Revoke(registry.clone(), "add")),
+            ("add", Behavior::Add),
+        ] {
+            registry
+                .register(
+                    name,
+                    None,
+                    add_schema(),
+                    Arc::new(TestTool {
+                        behavior,
+                        calls: calls.clone(),
+                    }),
+                )
+                .expect("register");
+            registry.authorize(name).expect("authorize");
+        }
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(
+                &registry,
+                &["revoker", "add"],
+                ToolLoopLimits::default(),
+            )),
+            vec![calling(
+                &[
+                    call(0, "r", "revoker", r#"{"a":0,"b":0}"#),
+                    add(1, "c", 1, 2),
+                ],
+                (1, 1),
+            )],
+            CancellationToken::default(),
+            |_| {},
+        );
+        let (_, stop) = stopped(looped);
+        assert!(matches!(stop, ToolLoopStop::Refused(ref refusal) if refusal.index == Some(1)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the call before the withdrawal ran"
+        );
+
+        // An id that repeats an earlier call's.
+        let run = local_run(&handle, llm);
+        let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+            vec![
+                calling(&[add(0, "same", 1, 2)], (1, 1)),
+                calling(&[add(0, "same", 3, 4)], (1, 1)),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        let (_, stop) = stopped(looped);
+        assert!(matches!(
+            stop,
+            ToolLoopStop::Refused(ref refusal) if refusal.kind == ToolCallRefusal::ConflictingIdentity
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn calls_the_request_did_not_admit_never_reach_a_handler() {
+        let (_root, directory) = data_directory("tool-loop-admission");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let ambiguous = r#"{"index":0,"id":"c","function":{"name":"add","arguments":"{\"a\":1,\"b\":2}"}},{"index":0,"function":{"name":"add"}}"#;
+        for (case, calls_sent) in [
+            (
+                "an unregistered tool",
+                vec![call(0, "c", "subtract", r#"{"a":1,"b":2}"#)],
+            ),
+            (
+                "arguments the schema refuses",
+                vec![call(0, "c", "add", r#"{"a":"1","b":2}"#)],
+            ),
+            (
+                "an unexpected argument",
+                vec![call(0, "c", "add", r#"{"a":1,"b":2,"c":3}"#)],
+            ),
+            ("an ambiguous name", vec![ambiguous.to_owned()]),
+        ] {
+            let run = local_run(&handle, llm);
+            let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+                vec![calling(&calls_sent, (1, 1))],
+                CancellationToken::default(),
+                |_| {},
+            );
+            let receipt = looped.settled.expect("the refused response settles");
+            assert_eq!(receipt.result, None, "{case}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{case}: nothing ran");
+            let job = job_record(&handle, run.job);
+            assert!(
+                job.unknown_at.is_some()
+                    && job.stop_confirmed_at.is_some()
+                    && job.completed_at.is_none(),
+                "{case}: an inadmissible response stays an unknown outcome, as before"
+            );
+            assert_eq!(looped.sent.len(), 1, "{case}: nothing was sent back");
+        }
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn handler_failures_and_limits_stop_the_loop_without_completing_the_job() {
+        let (_root, directory) = data_directory("tool-loop-limits");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let limits = |change: fn(&mut ToolLoopLimits)| {
+            let mut limits = ToolLoopLimits::default();
+            change(&mut limits);
+            limits
+        };
+        let one = || vec![calling(&[add(0, "c", 1, 2)], (1, 1))];
+        /// A case, its tool, its limits, its responses, the stop and the calls that ran.
+        type Case = (
+            &'static str,
+            Behavior,
+            ToolLoopLimits,
+            Vec<Vec<Step>>,
+            ToolLoopStop,
+            usize,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "a failing handler",
+                Behavior::Fail,
+                ToolLoopLimits::default(),
+                one(),
+                ToolLoopStop::HandlerFailed {
+                    index: 0,
+                    message: "the tool failed".into(),
+                },
+                1,
+            ),
+            (
+                "a result over its limit",
+                Behavior::Big(65),
+                limits(|limits| limits.max_tool_result_bytes = 66),
+                one(),
+                ToolLoopStop::ResultTooLarge { index: 0 },
+                1,
+            ),
+            (
+                "results over their accumulated limit",
+                Behavior::Add,
+                limits(|limits| limits.max_tool_results_bytes = 20),
+                vec![
+                    calling(&[add(0, "a", 1, 2), add(1, "b", 1, 2)], (1, 1)),
+                    calling(&[add(0, "c", 1, 2)], (1, 1)),
+                ],
+                ToolLoopStop::ResultTooLarge { index: 0 },
+                3,
+            ),
+            (
+                "tools requested in the last allowed request",
+                Behavior::Add,
+                limits(|limits| limits.max_provider_requests = 2),
+                vec![
+                    calling(&[add(0, "a", 1, 2)], (1, 1)),
+                    calling(&[add(0, "b", 1, 2)], (1, 1)),
+                ],
+                ToolLoopStop::RequestLimit,
+                1,
+            ),
+            (
+                "more calls than allowed",
+                Behavior::Add,
+                limits(|limits| limits.max_tool_calls = 2),
+                vec![calling(
+                    &[add(0, "a", 1, 2), add(1, "b", 1, 2), add(2, "c", 1, 2)],
+                    (1, 1),
+                )],
+                ToolLoopStop::CallLimit,
+                0,
+            ),
+        ];
+        for (case, behavior, limits, responses, expected, ran) in cases {
+            let run = local_run(&handle, llm);
+            let (registry, calls) = registered(vec![("add", behavior)]);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], limits)),
+                responses,
+                CancellationToken::default(),
+                |_| {},
+            );
+            let (receipt, stop) = stopped(looped);
+            assert_eq!(stop, expected, "{case}");
+            assert_eq!(calls.load(Ordering::SeqCst), ran, "{case}");
+            assert!(receipt.result.is_some(), "{case}: the failure is published");
+            let job = job_record(&handle, run.job);
+            assert!(
+                job.failed_at.is_some() && job.completed_at.is_none(),
+                "{case}"
+            );
+            assert!(blocking(&handle, llm).is_empty(), "{case}");
+            assert!(
+                stats(&handle, run.job)
+                    .iter()
+                    .all(|stat| stat.observation.failure.is_none()),
+                "{case}: no Provider failure"
+            );
+        }
+
+        // At their limits the loop still finishes.
+        for (limits, responses) in [
+            (
+                limits(|limits| limits.max_provider_requests = 2),
+                vec![
+                    calling(&[add(0, "a", 1, 2)], (1, 1)),
+                    answering("3", (1, 1)),
+                ],
+            ),
+            (
+                limits(|limits| limits.max_tool_calls = 2),
+                vec![
+                    calling(&[add(0, "a", 1, 2), add(1, "b", 1, 2)], (1, 1)),
+                    answering("3 and 3", (1, 1)),
+                ],
+            ),
+        ] {
+            let run = local_run(&handle, llm);
+            let (registry, _) = registered(vec![("add", Behavior::Add)]);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], limits)),
+                responses,
+                CancellationToken::default(),
+                |_| {},
+            );
+            looped.settled.expect("a loop within its limits completes");
+            assert!(job_record(&handle, run.job).completed_at.is_some());
+        }
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_stopped_handler_leaves_the_outcome_unknown_and_its_stop_confirmed() {
+        let (_root, directory) = data_directory("tool-loop-cancel");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let token = CancellationToken::default();
+        let cases: Vec<(
+            &str,
+            Behavior,
+            ToolLoopLimits,
+            CancellationToken,
+            bool,
+            ToolLoopStop,
+            usize,
+        )> = vec![
+            (
+                "cancelled before dispatch",
+                Behavior::Add,
+                ToolLoopLimits::default(),
+                CancellationToken::default(),
+                true,
+                ToolLoopStop::Cancelled,
+                0,
+            ),
+            (
+                "cancelled while the handler runs",
+                Behavior::CancelThenHang(token.clone()),
+                ToolLoopLimits::default(),
+                token,
+                false,
+                ToolLoopStop::Cancelled,
+                1,
+            ),
+        ];
+        for (case, behavior, limits, cancellation, cancel_after_read, expected, ran) in cases {
+            let run = local_run(&handle, llm);
+            let (registry, calls) = registered(vec![("add", behavior)]);
+            let canceller = cancellation.clone();
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], limits)),
+                vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+                cancellation,
+                move |_| {
+                    if cancel_after_read {
+                        canceller.cancel();
+                    }
+                },
+            );
+            let (receipt, stop) = stopped(looped);
+            assert_eq!(stop, expected, "{case}");
+            assert_eq!(calls.load(Ordering::SeqCst), ran, "{case}");
+            assert_eq!(
+                receipt.result, None,
+                "{case}: an unknown outcome publishes nothing"
+            );
+            let job = job_record(&handle, run.job);
+            assert!(
+                job.unknown_at.is_some() && job.stop_confirmed_at.is_some(),
+                "{case}"
+            );
+            assert!(
+                job.completed_at.is_none() && job.failed_at.is_none(),
+                "{case}"
+            );
+            assert!(blocking(&handle, llm).is_empty(), "{case}");
+        }
+        worker.shutdown().expect("shutdown");
+    }
+
+    /// Alone in its test: ntex runs the timers of only the first System a
+    /// thread creates, so this must be that System.
+    #[test]
+    fn a_handler_past_its_time_limit_is_stopped_and_its_outcome_unknown() {
+        let (_root, directory) = data_directory("tool-loop-timeout");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let (registry, calls) = registered(vec![("add", Behavior::Hang)]);
+        let limits = ToolLoopLimits {
+            handler_timeout: Duration::from_millis(50),
+            ..ToolLoopLimits::default()
+        };
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], limits)),
+            vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+            CancellationToken::default(),
+            |_| {},
+        );
+        let (receipt, stop) = stopped(looped);
+        assert_eq!(stop, ToolLoopStop::TimedOut { index: 0 });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(receipt.result, None);
+        let job = job_record(&handle, run.job);
+        assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+        assert!(blocking(&handle, llm).is_empty());
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn without_tools_one_request_settles_as_before() {
+        let (_root, directory) = data_directory("tool-loop-none");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let looped = run_loop(
+            &handle,
+            run,
+            None,
+            vec![answering("hello", (2, 1))],
+            CancellationToken::default(),
+            |_| {},
+        );
+        looped.settled.expect("settles");
+        assert_eq!(looped.sent.len(), 1);
+        assert!(
+            looped.sent[0].tools.is_empty(),
+            "no tool is ever offered by default"
+        );
+        assert!(job_record(&handle, run.job).completed_at.is_some());
+        assert_eq!(
+            by_request(&handle, run.job)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn the_runtime_offers_only_tools_still_authorized_and_persists_nothing_otherwise() {
+        let (_root, directory) = data_directory("tool-loop-offer");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let executor =
+            executor(&handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+        let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+        let offer = registry.offer(&["add"]).expect("offer");
+        registry.revoke("add").expect("revoke");
+        let jobs = wait(handle.jobs(None, 1_000)).expect("jobs").len();
+        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let mut plan = ProviderExecutionPlan::environment_credentials(
+            executor,
+            JobInputDraft::default(),
+            NewJob {
+                configuration: llm_only(llm),
+                ..new_job("tool plan", handle.genesis(), Vec::new())
+            },
+        );
+        assert!(
+            plan.tools.is_none(),
+            "a plan offers no tool unless OCG selects one"
+        );
+        plan.tools = Some(ToolExecution {
+            offer,
+            limits: ToolLoopLimits::default(),
+        });
+        assert!(matches!(
+            wait(runtime.scheduler().schedule_provider(plan)),
+            Err(ExecutionRuntimeError::ToolsUnavailable(_))
+        ));
+        assert_eq!(wait(handle.jobs(None, 1_000)).expect("jobs").len(), jobs);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        runtime.shutdown().expect("shutdown runtime");
+        assert!(matches!(
+            registry.register(
+                "add",
+                None,
+                add_schema(),
+                Arc::new(TestTool {
+                    behavior: Behavior::Add,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                })
+            ),
+            Err(crate::orchestration::tools::ToolRegistryError::Duplicate(_))
+        ));
+        assert!(matches!(
+            registry.register(
+                "open",
+                None,
+                json!({"type": "object", "requird": []}),
+                Arc::new(TestTool {
+                    behavior: Behavior::Add,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                })
+            ),
+            Err(crate::orchestration::tools::ToolRegistryError::UnsupportedSchema(..))
+        ));
+        assert!(matches!(
+            registry.offer(&["add"]),
+            Err(crate::orchestration::tools::ToolRegistryError::Unauthorized(_))
+        ));
+        worker.shutdown().expect("shutdown");
     }
 }

@@ -47,7 +47,7 @@ use crate::persistence::{
     ObservationPage, ObservedModel, ObservedModelChoice, ObservedModelFilter, ObservedModelPage,
     OperationId, OperationKind, OperationMarker, OutputKind, ProfileConfig, ProfileEditability,
     ProfileId, ProfileKind, ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef,
-    SubmittedConfiguration, Timestamp, Violation, WrongProfileKind,
+    RequestNumber, RequestRef, SubmittedConfiguration, Timestamp, Violation, WrongProfileKind,
 };
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
@@ -77,9 +77,14 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// tables, so it is refused rather than initialized in place. Version 10
 /// added the local execution claims of Jobs started by this process's own
 /// runtime; a version 9 build would leave them behind when it settled such
-/// a Job. Files of any other version are refused on open, before anything
-/// is written to them.
-pub(crate) const FORMAT_VERSION: u32 = 10;
+/// a Job. Version 11 numbers the Provider requests of a Job: every Metrics
+/// and AvailabilityStat record names its request, and the aggregation state
+/// is kept per request rather than per Job. A version 10 file is upgraded in
+/// place when it is opened, see [`upgrade_from_10`]. Files of any other
+/// version are refused on open, before anything is written to them.
+pub(crate) const FORMAT_VERSION: u32 = 11;
+/// The one earlier version an opening upgrades rather than refuses.
+const UPGRADABLE_VERSION: u32 = 10;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -93,6 +98,8 @@ type Records = TableDefinition<'static, u64, &'static [u8]>;
 type Link = TableDefinition<'static, u64, u64>;
 type PairSet = TableDefinition<'static, (u64, u64), ()>;
 type ScopeIndex = TableDefinition<'static, (&'static [u8], i64, u64), ()>;
+/// (job, request number) -> a request's encoded state.
+type RequestRecords = TableDefinition<'static, (u64, u32), &'static [u8]>;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const GENESIS_KEY: &str = "genesis";
@@ -171,9 +178,11 @@ const AVAILABILITY_BY_SCOPE: ScopeIndex = TableDefinition::new("availability_sta
 const LOCAL_EXECUTIONS: Link = TableDefinition::new("local_execution");
 /// (epoch, seq) -> operation marker.
 const OPERATIONS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("operation");
-/// Job -> its request sample as materialized. Rebuildable from the raw
-/// AvailabilityStat records; the sample is fixed by its lowest record.
-const AVAILABILITY_SAMPLES: Records = TableDefinition::new("availability_request_sample");
+/// (job, request) -> its request sample as materialized. Rebuildable from
+/// the raw AvailabilityStat records; the sample is fixed by its lowest record.
+const AVAILABILITY_SAMPLES: RequestRecords = TableDefinition::new("availability_request_sample");
+/// The same table keyed by Job alone, as a version 10 file holds it.
+const V10_AVAILABILITY_SAMPLES: Records = TableDefinition::new("availability_request_sample");
 /// (provider, minute, model) -> requests per classification, for the
 /// buckets that hold at least one request. Rebuildable like the samples.
 const AVAILABILITY_MINUTES: TableDefinition<&[u8], &[u8]> =
@@ -184,9 +193,12 @@ const AVAILABILITY_MINUTES: TableDefinition<&[u8], &[u8]> =
 const AGGREGATION_PROGRESS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("aggregation_progress");
 
-/// Job -> its Token request state: the frozen target and the finite evidence
-/// the request has so far. Rebuildable from the raw annotated Metrics.
-const TOKEN_REQUESTS: Records = TableDefinition::new("token_request");
+/// (job, request) -> its Token request state: the frozen target and the
+/// finite evidence the request has so far. Rebuildable from the raw
+/// annotated Metrics.
+const TOKEN_REQUESTS: RequestRecords = TableDefinition::new("token_request");
+/// The same table keyed by Job alone, as a version 10 file holds it.
+const V10_TOKEN_REQUESTS: Records = TableDefinition::new("token_request");
 /// (provider, minute, model) -> Token totals of the buckets that hold at
 /// least one eligible request. Rebuildable like the requests.
 const TOKEN_MINUTES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("token_minute");
@@ -512,6 +524,13 @@ impl<'a> Dec<'a> {
             _ => Err(StorageError::corrupted("invalid boolean")),
         }
     }
+    /// A stored request number, which is never 0.
+    fn request(&mut self) -> DecodeResult<RequestNumber> {
+        let number = self.u32()?;
+        RequestNumber::new(number)
+            .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))
+    }
+
     fn ts(&mut self) -> DecodeResult<Timestamp> {
         Ok(Timestamp::from_unix_micros(self.i64()?))
     }
@@ -1066,6 +1085,7 @@ impl AgentRow {
 #[derive(Clone, Debug)]
 pub(crate) struct MetricsRow {
     pub(crate) id: MetricsId,
+    pub(crate) request: RequestNumber,
     pub(crate) observed_at: Timestamp,
     pub(crate) measurements: Measurements,
     pub(crate) token: Option<TokenAnnotation>,
@@ -1076,6 +1096,7 @@ impl MetricsRow {
     fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_METRICS);
         e.u64(self.id.get());
+        e.u32(self.request.get());
         e.ts(self.observed_at);
         let m = &self.measurements;
         for ms in [
@@ -1102,9 +1123,20 @@ impl MetricsRow {
     }
 
     fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        Self::decode_as(bytes, FORMAT_VERSION)
+    }
+
+    /// Decodes a row as a file of `version` stores it. A version 10 row
+    /// names no request: it is its Job's first, and only, request.
+    fn decode_as(bytes: &[u8], version: u32) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_METRICS)?;
         let row = Self {
             id: MetricsId::new(d.u64()?),
+            request: if version == UPGRADABLE_VERSION {
+                RequestNumber::FIRST
+            } else {
+                d.request()?
+            },
             observed_at: d.ts()?,
             measurements: Measurements {
                 ttfb_ms: d.ou64()?,
@@ -1148,6 +1180,7 @@ impl MetricsRow {
 #[derive(Clone, Debug)]
 pub(crate) struct AvailabilityStatRow {
     pub(crate) id: AvailabilityStatId,
+    pub(crate) request: RequestNumber,
     pub(crate) observed_at: Timestamp,
     pub(crate) observation: AvailabilityObservation,
     pub(crate) recorded_at: Timestamp,
@@ -1157,6 +1190,7 @@ impl AvailabilityStatRow {
     fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_AVAILABILITY_STAT);
         e.u64(self.id.get());
+        e.u32(self.request.get());
         e.ts(self.observed_at);
         let o = &self.observation;
         e.opt(&o.status_code, |e, v| e.u16(*v));
@@ -1168,9 +1202,20 @@ impl AvailabilityStatRow {
     }
 
     fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        Self::decode_as(bytes, FORMAT_VERSION)
+    }
+
+    /// Decodes a row as a file of `version` stores it, like
+    /// [`MetricsRow::decode_as`].
+    fn decode_as(bytes: &[u8], version: u32) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_AVAILABILITY_STAT)?;
         let row = Self {
             id: AvailabilityStatId::new(d.u64()?),
+            request: if version == UPGRADABLE_VERSION {
+                RequestNumber::FIRST
+            } else {
+                d.request()?
+            },
             observed_at: d.ts()?,
             observation: AvailabilityObservation {
                 status_code: d.opt(Dec::u16)?,
@@ -1414,6 +1459,8 @@ enum FormatVerdict {
     /// A file with no tables, which this opening will initialize.
     New,
     Supported,
+    /// A version 10 file, which this opening upgrades before anything else.
+    Upgradable,
 }
 
 fn format_verdict(
@@ -1427,10 +1474,10 @@ fn format_verdict(
             let found = <[u8; 4]>::try_from(version.as_slice())
                 .map(u32::from_le_bytes)
                 .unwrap_or(u32::MAX);
-            if found == FORMAT_VERSION {
-                Ok(FormatVerdict::Supported)
-            } else {
-                Err(OpenError::UnsupportedFormat { found })
+            match found {
+                FORMAT_VERSION => Ok(FormatVerdict::Supported),
+                UPGRADABLE_VERSION => Ok(FormatVerdict::Upgradable),
+                _ => Err(OpenError::UnsupportedFormat { found }),
             }
         }
         _ => Err(OpenError::ForeignFile),
@@ -1471,22 +1518,27 @@ fn initialize(database: &Database) -> Result<(u64, JobId), OpenError> {
             .get("format_version")
             .map_err(StorageError::from)?
             .map(|v| v.value().to_vec());
-        let created = match format_verdict(format, version, existing_tables) {
-            Ok(FormatVerdict::New) => {
-                meta.insert("format", FORMAT_NAME)
-                    .map_err(StorageError::from)?;
-                meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
-                    .map_err(StorageError::from)?;
-                true
-            }
-            Ok(FormatVerdict::Supported) => false,
+        let verdict = match format_verdict(format, version, existing_tables) {
+            Ok(verdict) => verdict,
             Err(refusal) => {
                 drop(meta);
                 tx.abort().map_err(StorageError::from)?;
                 return Err(refusal);
             }
         };
+        if matches!(verdict, FormatVerdict::New) {
+            meta.insert("format", FORMAT_NAME)
+                .map_err(StorageError::from)?;
+        }
+        if !matches!(verdict, FormatVerdict::Supported) {
+            meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
+                .map_err(StorageError::from)?;
+        }
         drop(meta);
+        if matches!(verdict, FormatVerdict::Upgradable) {
+            upgrade_from_10(&tx)?;
+        }
+        let created = matches!(verdict, FormatVerdict::New);
         create_tables(&tx)?;
         let genesis = if created {
             create_genesis(&tx)?
@@ -1506,6 +1558,168 @@ fn initialize(database: &Database) -> Result<(u64, JobId), OpenError> {
     };
     tx.commit().map_err(StorageError::from)?;
     Ok(opened)
+}
+
+/// Records rewritten per read of one table during an upgrade.
+const UPGRADE_CHUNK: usize = 1_024;
+
+/// Test fault: fail the next upgrade after it rewrote everything and
+/// before the opening commits, as a crash or full disk would.
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_UPGRADE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: rewrites a closed version 11 file whose Jobs each sent only
+/// their first request as the version 10 file it would have been: each
+/// Metrics and AvailabilityStat row without its request number, which is
+/// the only difference of their encodings, each aggregation state keyed by
+/// its Job alone, and the recorded version 10.
+#[cfg(test)]
+pub(crate) fn downgrade_to_format_10(directory: &Path) -> Result<(), StorageError> {
+    // The tag and encoding version, then the ID, then the request number.
+    const REQUEST_AT: std::ops::Range<usize> = 10..14;
+    let database = Database::create(database_file(directory))?;
+    let tx = database.begin_write()?;
+    for table in [METRICS, AVAILABILITY_STATS] {
+        rewrite_rows(&tx, table, |bytes| {
+            if bytes.get(REQUEST_AT) != Some(RequestNumber::FIRST.get().to_le_bytes().as_slice()) {
+                return Err(StorageError::corrupted(
+                    "only a first request has a version 10 form",
+                ));
+            }
+            Ok([&bytes[..REQUEST_AT.start], &bytes[REQUEST_AT.end..]].concat())
+        })?;
+    }
+    for (new, old) in [
+        (AVAILABILITY_SAMPLES, V10_AVAILABILITY_SAMPLES),
+        (TOKEN_REQUESTS, V10_TOKEN_REQUESTS),
+    ] {
+        let rows = {
+            let table = tx.open_table(new)?;
+            let mut rows = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let (job, request) = key.value();
+                if request != RequestNumber::FIRST.get() {
+                    return Err(StorageError::corrupted(
+                        "only a first request has a version 10 form",
+                    ));
+                }
+                rows.push((job, value.value().to_vec()));
+            }
+            rows
+        };
+        tx.delete_table(new)?;
+        let mut table = tx.open_table(old)?;
+        for (job, value) in rows {
+            table.insert(job, value.as_slice())?;
+        }
+    }
+    tx.open_table(META)?.insert(
+        "format_version",
+        UPGRADABLE_VERSION.to_le_bytes().as_slice(),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Test seam: the format version a closed file records.
+#[cfg(test)]
+pub(crate) fn recorded_format_version(directory: &Path) -> Result<u32, StorageError> {
+    let database = Database::create(database_file(directory))?;
+    let rx = database.begin_read()?;
+    let bytes = rx
+        .open_table(META)?
+        .get("format_version")?
+        .map(|v| v.value().to_vec())
+        .ok_or_else(|| StorageError::corrupted("no recorded format version"))?;
+    <[u8; 4]>::try_from(bytes.as_slice())
+        .map(u32::from_le_bytes)
+        .map_err(|_| StorageError::corrupted("a malformed format version"))
+}
+
+/// Upgrades a version 10 file inside the opening's write transaction, so the
+/// file is either still version 10 or wholly version 11: a failure or crash
+/// before the commit leaves it as it was, and the next opening upgrades it
+/// again. A version 10 Job sent exactly one Provider request, so each of its
+/// Metrics and AvailabilityStat records is rewritten as its request 1, and
+/// each per-Job aggregation state becomes the state of that Job's request 1,
+/// byte for byte. The minute totals and the progress of both streams already
+/// count those requests once and are kept as they are, so nothing is counted
+/// again and nothing is lost.
+fn upgrade_from_10(tx: &WriteTransaction) -> Result<(), StorageError> {
+    rewrite_rows(tx, METRICS, |bytes| {
+        MetricsRow::decode_as(bytes, UPGRADABLE_VERSION).map(|row| row.encode())
+    })?;
+    rewrite_rows(tx, AVAILABILITY_STATS, |bytes| {
+        AvailabilityStatRow::decode_as(bytes, UPGRADABLE_VERSION).map(|row| row.encode())
+    })?;
+    rekey_to_first_request(tx, V10_AVAILABILITY_SAMPLES, AVAILABILITY_SAMPLES)?;
+    rekey_to_first_request(tx, V10_TOKEN_REQUESTS, TOKEN_REQUESTS)?;
+    #[cfg(test)]
+    if FAIL_NEXT_UPGRADE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(StorageError::corrupted("injected failure of the upgrade"));
+    }
+    Ok(())
+}
+
+/// Replaces every row of `table` with `rewrite` of it, under the same key.
+fn rewrite_rows(
+    tx: &WriteTransaction,
+    table: Records,
+    rewrite: impl Fn(&[u8]) -> DecodeResult<Vec<u8>>,
+) -> Result<(), StorageError> {
+    let mut next = Some(0_u64);
+    while let Some(from) = next {
+        let chunk = {
+            let rows = tx.open_table(table)?;
+            let mut chunk = Vec::with_capacity(UPGRADE_CHUNK);
+            for entry in rows.range(from..)?.take(UPGRADE_CHUNK) {
+                let (key, value) = entry?;
+                chunk.push((key.value(), rewrite(value.value())?));
+            }
+            chunk
+        };
+        let mut rows = tx.open_table(table)?;
+        for (key, value) in &chunk {
+            rows.insert(*key, value.as_slice())?;
+        }
+        next = match chunk.last() {
+            Some((last, _)) if chunk.len() == UPGRADE_CHUNK => last.checked_add(1),
+            _ => None,
+        };
+    }
+    Ok(())
+}
+
+/// Moves every per-Job row of `old` to the same name keyed by
+/// (job, request 1), through a scratch table, unchanged.
+fn rekey_to_first_request(
+    tx: &WriteTransaction,
+    old: Records,
+    new: RequestRecords,
+) -> Result<(), StorageError> {
+    let scratch: RequestRecords = TableDefinition::new("upgrade_scratch");
+    let first = RequestNumber::FIRST.get();
+    {
+        let rows = tx.open_table(old)?;
+        let mut moved = tx.open_table(scratch)?;
+        for entry in rows.iter()? {
+            let (job, value) = entry?;
+            moved.insert((job.value(), first), value.value())?;
+        }
+    }
+    tx.delete_table(old)?;
+    {
+        let rows = tx.open_table(scratch)?;
+        let mut moved = tx.open_table(new)?;
+        for entry in rows.iter()? {
+            let (key, value) = entry?;
+            moved.insert(key.value(), value.value())?;
+        }
+    }
+    tx.delete_table(scratch)?;
+    Ok(())
 }
 
 fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
@@ -2423,12 +2637,14 @@ impl Batch {
         Ok(())
     }
 
-    /// The Token eligibility the Job's committed Metrics state: that of its
-    /// first annotated record, which every later annotated record shares.
-    /// Reads only the Job's own Metrics, in ID order, up to that record.
-    pub(crate) fn job_token_eligibility(
+    /// The Token eligibility the committed Metrics of one request of the
+    /// Job state: that of its first annotated record, which every later
+    /// annotated record of the request shares. Reads only the Job's own
+    /// Metrics, in ID order, up to that record.
+    pub(crate) fn request_token_eligibility(
         &mut self,
         job: JobId,
+        request: RequestNumber,
     ) -> Result<Option<RequestEligibility>, BatchError> {
         self.step(|tx| {
             let index = tx.open_table(JOB_METRICS)?;
@@ -2440,7 +2656,10 @@ impl Batch {
                         "{job} is measured by missing metrics {metrics}"
                     ))
                 })?;
-                if let Some(token) = MetricsRow::decode(bytes.value())?.token {
+                let row = MetricsRow::decode(bytes.value())?;
+                if row.request == request
+                    && let Some(token) = row.token
+                {
                     return Ok(Some(token.eligibility));
                 }
             }
@@ -4001,6 +4220,7 @@ fn metrics_from(
     Ok(MetricsRecord {
         id: row.id,
         job,
+        request: row.request,
         target,
         observed_at: row.observed_at,
         measurements: row.measurements,
@@ -4028,6 +4248,7 @@ fn availability_from(
     Ok(AvailabilityStatRecord {
         id: row.id,
         job,
+        request: row.request,
         target,
         observed_at: row.observed_at,
         observation: row.observation,
@@ -5243,7 +5464,8 @@ mod tests {
                 .expect("write version");
             tx.commit().expect("commit version");
         };
-        let previous = FORMAT_VERSION - 1;
+        // A version neither supported nor upgraded in place.
+        let previous = UPGRADABLE_VERSION - 1;
         write_meta(&test.database, previous);
         let state = |database: &Database| {
             let rx = database.begin_read().expect("begin read");

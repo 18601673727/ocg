@@ -3,7 +3,7 @@
 //!
 //! One batch is prepared from one read snapshot: the progress, at most
 //! [`MAX_AGGREGATION_BATCH`] committed records after it, and the stored state
-//! of every Job, bucket and progress row the batch touches. The replacements
+//! of every request, bucket and progress row the batch touches. The replacements
 //! are computed outside the write transaction. The commit re-reads each of
 //! those rows, applies the replacements only if every one still holds the
 //! bytes the snapshot read, and writes the progress with the batch. A batch
@@ -30,7 +30,7 @@ pub(crate) const MAX_AGGREGATION_ATTEMPTS: u8 = 3;
 const PROGRESS_KEY: &str = "availability";
 
 /// A request sample as materialized: its Job's frozen target and the evidence
-/// its records have added so far.
+/// the request's records have added so far.
 #[derive(Clone)]
 struct SampleRow {
     llm_profile: ProfileId,
@@ -86,14 +86,14 @@ impl SampleRow {
         e.0
     }
 
-    fn decode(job: JobId, bytes: &[u8]) -> DecodeResult<Self> {
+    fn decode(request: RequestRef, bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_REQUEST_SAMPLE)?;
         let row = Self {
             llm_profile: ProfileId::new(d.u64()?),
             provider: LlmProviderId::new(d.u64()?),
             model: d.str()?,
             evidence: RequestEvidence {
-                job: Some(job),
+                request: Some(request),
                 first: d.opt(|d| Ok((AvailabilityStatId::new(d.u64()?), d.ts()?)))?,
                 observed_status: d.opt(|d| d.u16())?,
                 supplied_status: d.opt(|d| d.u16())?,
@@ -185,23 +185,29 @@ struct SampleState {
     after: SampleRow,
 }
 
+/// The key of one request's materialized state.
+pub(super) fn request_key(request: RequestRef) -> (u64, u32) {
+    (request.job.get(), request.request.get())
+}
+
 fn load_sample(
     rx: &ReadTransaction,
-    job: JobId,
+    request: RequestRef,
     target: &LlmTarget,
 ) -> Result<SampleState, StorageError> {
     let expected = rx
         .open_table(AVAILABILITY_SAMPLES)?
-        .get(job.get())?
+        .get(request_key(request))?
         .map(|v| v.value().to_vec());
     let before = match &expected {
-        Some(bytes) => Some(SampleRow::decode(job, bytes)?),
+        Some(bytes) => Some(SampleRow::decode(request, bytes)?),
         None => None,
     };
     let after = match &before {
         Some(row) if !row.has_target(target) => {
             return Err(StorageError::corrupted(format!(
-                "the frozen LLM target of {job} changed"
+                "the frozen LLM target of {} changed",
+                request.job
             )));
         }
         Some(row) => row.clone(),
@@ -253,7 +259,7 @@ fn adjust(
 }
 
 struct SampleWrite {
-    job: JobId,
+    request: RequestRef,
     expected: Option<Vec<u8>>,
     row: Vec<u8>,
     /// Whether the row differs from `expected`. An unchanged row is still
@@ -372,7 +378,7 @@ pub(crate) fn prepare_availability_aggregation(
     };
 
     let mut targets = HashMap::new();
-    let mut samples: BTreeMap<JobId, SampleState> = BTreeMap::new();
+    let mut samples: BTreeMap<RequestRef, SampleState> = BTreeMap::new();
     for id in &ids {
         let job = observation_job(&rx, OBSERVES, id.get())?;
         let target = job_target(&rx, &mut targets, job)?.ok_or_else(|| {
@@ -381,9 +387,13 @@ pub(crate) fn prepare_availability_aggregation(
             ))
         })?;
         let record = availability_from(&rx, id.get(), job, Some(target.clone()))?;
-        let state = match samples.entry(job) {
+        let request = RequestRef {
+            job,
+            request: record.request,
+        };
+        let state = match samples.entry(request) {
             Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(load_sample(&rx, job, &target)?),
+            Entry::Vacant(entry) => entry.insert(load_sample(&rx, request, &target)?),
         };
         state
             .after
@@ -411,10 +421,10 @@ pub(crate) fn prepare_availability_aggregation(
 
     let samples = samples
         .into_iter()
-        .map(|(job, state)| {
+        .map(|(request, state)| {
             let row = state.after.encode();
             SampleWrite {
-                job,
+                request,
                 changed: state.expected.as_deref() != Some(row.as_slice()),
                 expected: state.expected,
                 row,
@@ -527,7 +537,11 @@ fn apply(batch: &mut Batch, plan: AvailabilityPlan) -> Result<Option<Timestamp>,
     {
         let samples = tx.open_table(AVAILABILITY_SAMPLES)?;
         for write in &plan.samples {
-            if samples.get(write.job.get())?.map(|v| v.value().to_vec()) != write.expected {
+            if samples
+                .get(request_key(write.request))?
+                .map(|v| v.value().to_vec())
+                != write.expected
+            {
                 return Ok(None);
             }
         }
@@ -548,7 +562,7 @@ fn apply(batch: &mut Batch, plan: AvailabilityPlan) -> Result<Option<Timestamp>,
     {
         let mut samples = tx.open_table(AVAILABILITY_SAMPLES)?;
         for write in plan.samples.iter().filter(|write| write.changed) {
-            samples.insert(write.job.get(), write.row.as_slice())?;
+            samples.insert(request_key(write.request), write.row.as_slice())?;
             #[cfg(test)]
             if let Some(probe) = &plan.probe {
                 probe
@@ -622,26 +636,27 @@ pub(crate) fn read_availability_progress(
     progress_in(&read(database)?)
 }
 
-/// The request sample of one Job, with the progress of the same snapshot.
+/// The sample of one request, with the progress of the same snapshot.
 pub(crate) fn read_request_sample(
     database: &Database,
-    job: JobId,
+    request: RequestRef,
 ) -> Result<ReadSnapshot<Option<RequestSampleRecord>>, StorageError> {
     let rx = read(database)?;
     let progress = progress_in(&rx)?;
     let bytes = rx
         .open_table(AVAILABILITY_SAMPLES)?
-        .get(job.get())?
+        .get(request_key(request))?
         .map(|v| v.value().to_vec());
     let value = match bytes {
         Some(bytes) => {
-            let row = SampleRow::decode(job, &bytes)?;
+            let row = SampleRow::decode(request, &bytes)?;
             let sample = row
                 .evidence
                 .sample()
                 .ok_or_else(|| StorageError::corrupted("a stored request sample has no records"))?;
             Some(RequestSampleRecord {
-                job,
+                job: request.job,
+                request: request.request,
                 llm_profile: row.llm_profile,
                 provider: row.provider,
                 model: row.model,

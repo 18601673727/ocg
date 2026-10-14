@@ -18,7 +18,7 @@
 //! OpenAI-compatible endpoint
 //! ```
 
-mod admission;
+pub(crate) mod admission;
 pub mod error;
 pub mod normalize;
 pub mod request;

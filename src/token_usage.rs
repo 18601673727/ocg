@@ -16,12 +16,13 @@
 //! order, or with duplicates, reaches the same sample.
 
 use crate::persistence::{
-    JobId, LlmProviderId, MetricsId, MetricsRecord, MixedJobs, ProfileId, Timestamp,
+    JobId, LlmProviderId, MetricsId, MetricsRecord, MixedRequests, ProfileId, RequestNumber,
+    RequestRef, Timestamp,
 };
 
 /// Whether a request was ever issued to an LLM Provider. It is a trusted
-/// input of the caller. It is per request, so one Job's records may not
-/// disagree about it.
+/// input of the caller. It is per request, so the records of one request
+/// may not disagree about it; two requests of one Job may.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestEligibility {
     /// The request was issued or may have been delivered. It stays eligible
@@ -105,11 +106,11 @@ impl<'a> TokenObservation<'a> {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TokenEvidenceError {
     #[error("{0}")]
-    MixedJobs(MixedJobs),
-    /// Records of one Job disagree whether its request was issued. No
-    /// delivery report is preferred over another.
-    #[error("records of {0} disagree on whether its request was issued")]
-    ContradictoryEligibility(JobId),
+    MixedRequests(MixedRequests),
+    /// Records of one request disagree whether it was issued. No delivery
+    /// report is preferred over another.
+    #[error("records of {0} disagree on whether it was issued")]
+    ContradictoryEligibility(RequestRef),
 }
 
 /// What is known of one Token counter of a request.
@@ -202,7 +203,7 @@ impl FieldEvidence {
 /// matter.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TokenEvidence {
-    job: Option<JobId>,
+    request: Option<RequestRef>,
     eligibility: Option<RequestEligibility>,
     /// The lowest Metrics ID of an eligible record, with its observed time.
     /// An eligible record anchors it even when it reports no usage.
@@ -218,7 +219,7 @@ pub struct TokenEvidence {
 /// Storage encodes these parts; it never merges them itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EvidenceParts {
-    pub(crate) job: Option<JobId>,
+    pub(crate) request: Option<RequestRef>,
     pub(crate) eligibility: Option<RequestEligibility>,
     pub(crate) first: Option<(MetricsId, Timestamp)>,
     /// Input, output, cache read, cache write, reasoning.
@@ -228,7 +229,7 @@ pub(crate) struct EvidenceParts {
 impl TokenEvidence {
     pub(crate) fn parts(&self) -> EvidenceParts {
         EvidenceParts {
-            job: self.job,
+            request: self.request,
             eligibility: self.eligibility,
             first: self.first,
             fields: [
@@ -244,7 +245,7 @@ impl TokenEvidence {
     pub(crate) fn from_parts(parts: EvidenceParts) -> Self {
         let [input, output, cache_read, cache_write, reasoning] = parts.fields;
         Self {
-            job: parts.job,
+            request: parts.request,
             eligibility: parts.eligibility,
             first: parts.first,
             input,
@@ -259,21 +260,25 @@ impl TokenEvidence {
     /// not one request and the caller must not use the evidence.
     pub fn add(&mut self, observation: TokenObservation<'_>) -> Result<(), TokenEvidenceError> {
         let record = observation.metrics;
-        if let Some(first) = self.job
-            && first != record.job
+        let request = RequestRef {
+            job: record.job,
+            request: record.request,
+        };
+        if let Some(first) = self.request
+            && first != request
         {
-            return Err(TokenEvidenceError::MixedJobs(MixedJobs {
+            return Err(TokenEvidenceError::MixedRequests(MixedRequests {
                 first,
-                other: record.job,
+                other: request,
             }));
         }
         if self
             .eligibility
             .is_some_and(|known| known != observation.eligibility)
         {
-            return Err(TokenEvidenceError::ContradictoryEligibility(record.job));
+            return Err(TokenEvidenceError::ContradictoryEligibility(request));
         }
-        self.job = Some(record.job);
+        self.request = Some(request);
         self.eligibility = Some(observation.eligibility);
         if observation.eligibility == RequestEligibility::Excluded {
             return Ok(());
@@ -294,7 +299,7 @@ impl TokenEvidence {
     /// The request's sample; none when no eligible record was added.
     #[must_use]
     pub fn sample(&self) -> Option<TokenRequestSample> {
-        let (job, (first_metrics, observed_at)) = (self.job?, self.first?);
+        let (request, (first_metrics, observed_at)) = (self.request?, self.first?);
         let counts = [
             self.input.count(),
             self.output.count(),
@@ -317,7 +322,8 @@ impl TokenEvidence {
             _ => None,
         };
         Some(TokenRequestSample {
-            job,
+            job: request.job,
+            request: request.request,
             first_metrics,
             observed_at,
             usage,
@@ -331,10 +337,12 @@ impl TokenEvidence {
     }
 }
 
-/// The derived view of one eligible request. It is computed, never stored.
+/// The derived view of one eligible Provider request. It is computed, never
+/// stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenRequestSample {
     pub job: JobId,
+    pub request: RequestNumber,
     /// The lowest Metrics ID among the request's eligible records.
     pub first_metrics: MetricsId,
     /// `observed_at` of that record: the sample's time. Later or backdated
@@ -356,7 +364,8 @@ pub struct TokenRequestSample {
 impl TokenRequestSample {
     /// Reduces the stored Metrics records of one request, in any order.
     /// Records without a Token annotation carry no trusted contract and are
-    /// skipped, so they neither make nor exclude a request.
+    /// skipped, so they neither make nor exclude a request. Records of
+    /// several requests are refused; see [`Self::per_request`].
     pub fn from_metrics<'a>(
         records: impl IntoIterator<Item = &'a MetricsRecord>,
     ) -> Result<Option<Self>, TokenEvidenceError> {
@@ -378,6 +387,48 @@ impl TokenRequestSample {
             evidence.add(observation)?;
         }
         Ok(evidence.sample())
+    }
+
+    /// Reduces the stored Metrics records of one Job's requests, in any
+    /// order, to one sample per eligible request, ordered by request. Each
+    /// request is reduced on its own; nothing crosses from one to another.
+    pub fn per_request<'a>(
+        records: impl IntoIterator<Item = &'a MetricsRecord>,
+    ) -> Result<Vec<Self>, TokenEvidenceError> {
+        let mut requests: std::collections::BTreeMap<RequestRef, TokenEvidence> =
+            std::collections::BTreeMap::new();
+        for observation in records
+            .into_iter()
+            .filter_map(TokenObservation::from_record)
+        {
+            let request = RequestRef {
+                job: observation.metrics.job,
+                request: observation.metrics.request,
+            };
+            if let Some((first, _)) = requests.first_key_value()
+                && first.job != request.job
+            {
+                return Err(TokenEvidenceError::MixedRequests(MixedRequests {
+                    first: *first,
+                    other: request,
+                }));
+            }
+            requests.entry(request).or_default().add(observation)?;
+        }
+        Ok(requests
+            .values()
+            .filter_map(TokenEvidence::sample)
+            .collect())
+    }
+
+    /// The input plus output of one Job: the sum of its requests' own
+    /// totals, known only when every one of them is. No counter is taken
+    /// from one request for another, and none is a maximum across them.
+    #[must_use]
+    pub fn job_total(samples: &[Self]) -> Option<u64> {
+        samples
+            .iter()
+            .try_fold(0_u64, |sum, sample| sum.checked_add(sample.total?))
     }
 }
 
@@ -436,6 +487,7 @@ pub enum TokenBatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenRequestRecord {
     pub job: JobId,
+    pub request: RequestNumber,
     pub llm_profile: ProfileId,
     pub provider: LlmProviderId,
     pub model: String,
@@ -604,6 +656,7 @@ mod tests {
         MetricsRecord {
             id: MetricsId::new(id),
             job,
+            request: RequestNumber::FIRST,
             target: None,
             observed_at: Timestamp::from_unix_micros(observed_micros),
             measurements: Measurements {
@@ -707,14 +760,14 @@ mod tests {
         ] {
             assert!(matches!(
                 reduce(&records),
-                Err(TokenEvidenceError::MixedJobs(_))
+                Err(TokenEvidenceError::MixedRequests(_))
             ));
         }
         let excluded = metrics(3, JobId::new(2), 0, NONE);
         assert!(
             matches!(
                 reduce(&[(&a, Eligible, Final), (&excluded, Excluded, Final)]),
-                Err(TokenEvidenceError::MixedJobs(_))
+                Err(TokenEvidenceError::MixedRequests(_))
             ),
             "excluded records still belong to a Job"
         );
@@ -729,7 +782,10 @@ mod tests {
         ] {
             assert_eq!(
                 reduce(&records),
-                Err(TokenEvidenceError::ContradictoryEligibility(JOB))
+                Err(TokenEvidenceError::ContradictoryEligibility(RequestRef {
+                    job: JOB,
+                    request: RequestNumber::FIRST
+                }))
             );
         }
     }
@@ -1032,6 +1088,7 @@ mod tests {
     fn sample_with(input: TokenCount, output: TokenCount) -> TokenRequestSample {
         TokenRequestSample {
             job: JOB,
+            request: RequestNumber::FIRST,
             first_metrics: MetricsId::new(1),
             observed_at: Timestamp::from_unix_micros(0),
             usage: TokenUsageState::Incomplete,

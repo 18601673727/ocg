@@ -43,20 +43,25 @@ pub(crate) fn parameter_validator(
             format!("tool `{name}` was offered without a parameter schema"),
         ));
     };
-    let unsupported = |problem: String| {
+    compile_parameters(schema).map_err(|problem| {
         InvalidToolCall::at(
             ToolCallRefusal::UnsupportedSchema,
             index,
             format!("the parameter schema of `{name}` {problem}"),
         )
-    };
-    require_supported(schema, "", 0).map_err(unsupported)?;
+    })
+}
+
+/// Compiles a parameter schema as [`parameter_validator`] does, or says why
+/// it cannot be enforced.
+pub(crate) fn compile_parameters(schema: &Value) -> Result<Validator, String> {
+    require_supported(schema, "", 0)?;
     jsonschema::draft202012::options()
         .should_validate_formats(true)
         .should_ignore_unknown_formats(false)
         .with_pattern_options(jsonschema::PatternOptions::regex())
         .build(schema)
-        .map_err(|error| unsupported(format!("cannot be enforced: {error}")))
+        .map_err(|error| format!("cannot be enforced: {error}"))
 }
 
 /// Refuses a schema that uses anything not enforced as written: a keyword
@@ -136,16 +141,17 @@ fn require_supported(schema: &Value, at: &str, depth: usize) -> Result<(), Strin
 }
 
 /// Admits the arguments of the call at `index` to `name` when they are one
-/// strict JSON object, see [`parse_strict`], that `parameters` accepts. The
-/// arguments are only read: nothing is defaulted, removed, converted or
-/// repaired, and the call keeps them exactly as they were sent. A refusal
-/// names where the schema refused them, never what they held.
+/// strict JSON object, see [`parse_strict`], that `parameters` accepts, and
+/// returns them as parsed. The arguments are only read: nothing is
+/// defaulted, removed, converted or repaired, and the call keeps them exactly
+/// as they were sent. A refusal names where the schema refused them, never
+/// what they held.
 pub(crate) fn admit_arguments(
     index: u32,
     name: &str,
     arguments: &str,
     parameters: &Validator,
-) -> Result<(), InvalidToolCall> {
+) -> Result<Value, InvalidToolCall> {
     let invalid = |problem: String| {
         InvalidToolCall::at(
             ToolCallRefusal::InvalidArguments,
@@ -162,7 +168,8 @@ pub(crate) fn admit_arguments(
             "do not satisfy the parameter schema of `{name}` at `{}`",
             error.schema_path()
         ))
-    })
+    })?;
+    Ok(value)
 }
 
 /// Parses `text` as one I-JSON value (RFC 7493), so that what the schema

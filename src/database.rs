@@ -21,8 +21,8 @@ use crate::persistence::{
     NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
     ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelFilter,
     ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile, ProfileId,
-    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, ReadSnapshot, RequestSampleRecord,
-    Timestamp, Violation, WrongProfileKind,
+    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, ReadSnapshot, RequestRef,
+    RequestSampleRecord, Timestamp, Violation, WrongProfileKind,
 };
 use crate::storage::{
     self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile,
@@ -3451,12 +3451,13 @@ impl DatabaseHandle {
         self.read(storage::read_availability_progress).await
     }
 
-    /// The request sample of a Job, with the progress of the same snapshot.
+    /// The sample of one Provider request of a Job, with the progress of the
+    /// same snapshot.
     pub async fn request_sample(
         &self,
-        job: JobId,
+        request: RequestRef,
     ) -> Result<ReadSnapshot<Option<RequestSampleRecord>>, DatabaseError> {
-        self.read(move |database| storage::read_request_sample(database, job))
+        self.read(move |database| storage::read_request_sample(database, request))
             .await
     }
 
@@ -3542,13 +3543,13 @@ impl DatabaseHandle {
         self.read(storage::read_token_progress).await
     }
 
-    /// The Token request state of a Job, with the progress of the same
-    /// snapshot. A Job with no annotated record has none.
+    /// The Token state of one Provider request of a Job, with the progress
+    /// of the same snapshot. A request with no annotated record has none.
     pub async fn token_request(
         &self,
-        job: JobId,
+        request: RequestRef,
     ) -> Result<TokenSnapshot<Option<TokenRequestRecord>>, DatabaseError> {
-        self.read(move |database| storage::read_token_request(database, job))
+        self.read(move |database| storage::read_token_request(database, request))
             .await
     }
 

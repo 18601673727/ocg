@@ -7,12 +7,20 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use ntex::util::{Either, select};
 
 use crate::database::{DatabaseError, DatabaseHandle};
+use crate::openai_compatible::{
+    ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, InvalidToolCall,
+    ToolCallRefusal,
+};
+use crate::orchestration::tools::{ToolOffer, ToolRegistryError};
 use crate::persistence::{
     AppendedOutput, ExecutorId, FinalResult, IntermediateOutputKind, JobFinalization, JobId,
     JobInputDraft, JobInputId, JobOutcome, Measurements, NewAvailabilityStat, NewJob, NewJobOutput,
-    NewMetrics, Timestamp, Violation,
+    NewMetrics, RequestNumber, Timestamp, Violation,
 };
 use crate::provider_execution::{
     self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
@@ -56,6 +64,106 @@ pub struct ProviderExecutionPlan {
     pub job: NewJob,
     pub credential_resolver: Arc<dyn CredentialResolver>,
     pub provider_config: ProviderExecutionConfig,
+    /// The OCG tools offered to the Provider, if any. `None`, the default,
+    /// offers none, and the execution is the single request it always was.
+    pub tools: Option<ToolExecution>,
+}
+
+/// Tools OCG offers one execution, and the limits of the tool loop.
+#[derive(Clone, Debug)]
+pub struct ToolExecution {
+    pub offer: ToolOffer,
+    pub limits: ToolLoopLimits,
+}
+
+/// Bounds of one execution's tool loop. Each is a refusal, never a
+/// truncation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolLoopLimits {
+    /// Provider requests one Job may send, its first included. Tools a
+    /// response requests when no further request is allowed are not run.
+    pub max_provider_requests: u32,
+    /// Tool calls one Job may run. A response whose calls would exceed it
+    /// runs none of them.
+    pub max_tool_calls: usize,
+    /// Largest serialized result of one call.
+    pub max_tool_result_bytes: usize,
+    /// Largest sum of the serialized results of one Job's calls.
+    pub max_tool_results_bytes: usize,
+    /// Longest one handler may run. A handler that never yields cannot be
+    /// stopped by it.
+    pub handler_timeout: Duration,
+}
+
+impl Default for ToolLoopLimits {
+    fn default() -> Self {
+        Self {
+            max_provider_requests: 4,
+            max_tool_calls: 8,
+            max_tool_result_bytes: 16 * 1024,
+            max_tool_results_bytes: 64 * 1024,
+            handler_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Why a tool loop ended before a final answer, when the Provider did not
+/// end it. None of these is a Provider failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolLoopStop {
+    /// The Provider requested tools in the last request the limits allow.
+    /// None of them ran.
+    RequestLimit,
+    /// The calls of a response would exceed the call limit. None of them ran.
+    CallLimit,
+    /// A call was refused at dispatch: OCG did not offer it, it is no longer
+    /// the registration offered or no longer authorized, its id repeats an
+    /// earlier call's, or its registered schema refuses its arguments. It did
+    /// not run; calls of the response before it may have.
+    Refused(InvalidToolCall),
+    /// The handler of the call at this index reported a failure.
+    HandlerFailed { index: u32, message: String },
+    /// The result of the call at this index exceeds the per-call or the
+    /// accumulated limit. It was not sent.
+    ResultTooLarge { index: u32 },
+    /// The handler of the call at this index did not finish within its
+    /// limit. It was stopped; whatever it did is unknown.
+    TimedOut { index: u32 },
+    /// The execution was cancelled locally before every call was answered.
+    Cancelled,
+}
+
+impl ToolLoopStop {
+    /// Whether the stop leaves the Job's outcome unknown rather than known
+    /// to have failed: a handler stopped while it ran.
+    fn is_unknown(&self) -> bool {
+        matches!(self, Self::TimedOut { .. } | Self::Cancelled)
+    }
+}
+
+impl std::fmt::Display for ToolLoopStop {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RequestLimit => {
+                formatter.write_str("the Provider requested tools after the last allowed request")
+            }
+            Self::CallLimit => {
+                formatter.write_str("the requested tool calls exceed the call limit")
+            }
+            Self::Refused(refusal) => write!(formatter, "a tool call was refused: {refusal}"),
+            Self::HandlerFailed { index, message } => {
+                write!(formatter, "tool call {index} failed: {message}")
+            }
+            Self::ResultTooLarge { index } => {
+                write!(
+                    formatter,
+                    "the result of tool call {index} exceeds its limit"
+                )
+            }
+            Self::TimedOut { index } => write!(formatter, "tool call {index} timed out"),
+            Self::Cancelled => formatter.write_str("the tool loop was cancelled"),
+        }
+    }
 }
 
 impl ProviderExecutionPlan {
@@ -70,6 +178,7 @@ impl ProviderExecutionPlan {
             job,
             credential_resolver: Arc::new(EnvironmentCredentialResolver),
             provider_config: ProviderExecutionConfig::default(),
+            tools: None,
         }
     }
 }
@@ -126,6 +235,21 @@ pub enum ExecutionRuntimeError {
     CompletionRefused {
         receipt: Box<ExecutionReceipt>,
         source: Violation,
+        observations: Option<Box<DatabaseError>>,
+    },
+    /// The tools selected for the plan are no longer registered as selected,
+    /// or no longer authorized. Nothing of the plan was persisted.
+    #[error("the plan's tools cannot be offered: {0}")]
+    ToolsUnavailable(ToolRegistryError),
+    /// The tool loop ended on this side before a final answer, as `stop`
+    /// says, and the receipt shows how the Job settled: Failed when the stop
+    /// is known, Unknown, with its stop confirmed, when a handler was stopped
+    /// while it ran. Every Provider request's own observations were recorded,
+    /// apart from `observations`, the first that could not be written.
+    #[error("the tool loop stopped: {stop}")]
+    ToolLoopStopped {
+        receipt: Box<ExecutionReceipt>,
+        stop: ToolLoopStop,
         observations: Option<Box<DatabaseError>>,
     },
     /// The Provider answered, but the Job's outcome could not be recorded.
@@ -546,6 +670,13 @@ async fn execute_provider_plan(
         return Err(ExecutionRuntimeError::ExecutorNotFound(executor));
     }
     plan.job.assigned_executor = Some(executor);
+    // The offer is read from the registry before anything is persisted.
+    let offered = plan
+        .tools
+        .as_ref()
+        .map(|tools| tools.offer.wires())
+        .transpose()
+        .map_err(ExecutionRuntimeError::ToolsUnavailable)?;
     let input = database.save_job_input(None, plan.input).await?;
     let job = database
         .create_local_job_with_input(plan.job, input)
@@ -597,16 +728,300 @@ async fn execute_provider_plan(
             });
         }
     };
-    let mut output_sink = output_sink(database.clone(), job);
-    let execution = provider_execution::execute_chat_with_sink(
+    let mut conversation = provider_execution::objective_conversation(
         &configuration.frozen,
         input_record.objective.as_deref(),
-        plan.credential_resolver.as_ref(),
-        &plan.provider_config,
-        &mut output_sink,
+    );
+    conversation.tools = offered.unwrap_or_default();
+    let frozen = &configuration.frozen;
+    let resolver = plan.credential_resolver.as_ref();
+    let config = &plan.provider_config;
+    run_provider_job(
+        ProviderRun {
+            database,
+            executor,
+            input,
+            job,
+        },
+        conversation,
+        plan.tools.as_ref(),
+        &config.cancellation,
+        async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
+            provider_execution::execute_conversation(
+                frozen,
+                conversation,
+                resolver,
+                config,
+                Some(sink),
+            )
+            .await
+        },
     )
-    .await;
-    finish_provider_job(database, executor, input, job, output_sink, execution).await
+    .await
+}
+
+/// The Job a provider execution settles.
+pub(crate) struct ProviderRun {
+    pub(crate) database: DatabaseHandle,
+    pub(crate) executor: ExecutorId,
+    pub(crate) input: JobInputId,
+    pub(crate) job: JobId,
+}
+
+/// Sends `conversation` with `exchange` and settles the Job from where it
+/// ends. A response that requests no tool is the final answer candidate and
+/// is settled by [`finish_provider_job`], as is any Provider failure. A
+/// response that requests tools never completes the Job: its calls are run
+/// by [`answer_calls`], each answered in order, and the assistant message
+/// with every result is sent back as the next request, until a response
+/// requests none or the loop stops, see [`ToolLoopStop`]. Each request is
+/// numbered, and its observations are recorded as its own.
+pub(crate) async fn run_provider_job(
+    run: ProviderRun,
+    mut conversation: ChatConversation,
+    tools: Option<&ToolExecution>,
+    cancellation: &CancellationToken,
+    mut exchange: impl AsyncFnMut(
+        &ChatConversation,
+        &mut DatabaseOutputSink,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
+) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let mut sink = output_sink(run.database.clone(), run.job);
+    let mut budget = ToolBudget::default();
+    loop {
+        let result = match exchange(&conversation, &mut sink).await {
+            Ok(result) if result.requests_tools() => result,
+            execution => {
+                return finish_provider_job(
+                    run.database,
+                    run.executor,
+                    run.input,
+                    run.job,
+                    sink,
+                    execution,
+                )
+                .await;
+            }
+        };
+        // A response that requests tools is no answer, but its facts are
+        // this request's own.
+        if let Some(error) = record_answer(&run.database, run.job, sink.request, &result).await {
+            sink.gap.get_or_insert(error);
+        }
+        let next = sink.request.next().filter(|next| {
+            tools.is_some_and(|tools| next.get() <= tools.limits.max_provider_requests)
+        });
+        let answered = match (tools, next) {
+            (Some(tools), Some(_)) => {
+                answer_calls(
+                    tools,
+                    &conversation,
+                    &result.tool_calls,
+                    &mut budget,
+                    cancellation,
+                )
+                .await
+            }
+            (Some(_), None) => Err(ToolLoopStop::RequestLimit),
+            (None, _) => Err(ToolLoopStop::Refused(InvalidToolCall::new(
+                ToolCallRefusal::Unauthorized,
+                "the Provider requested tools that OCG did not offer",
+            ))),
+        };
+        let (answers, next) = match (answered, next) {
+            (Ok(answers), Some(next)) => (answers, next),
+            (Err(stop), _) => return stop_tool_loop(run, sink, &result, stop).await,
+            (Ok(_), None) => unreachable!("calls are answered only when a request may follow"),
+        };
+        let text = Some(result.text.clone()).filter(|text| !text.is_empty());
+        conversation.messages.push(ChatMessage::assistant(
+            text,
+            result
+                .tool_calls
+                .iter()
+                .map(ChatToolCallWire::from)
+                .collect(),
+        ));
+        for (call, content) in result.tool_calls.iter().zip(answers) {
+            conversation
+                .messages
+                .push(ChatMessage::tool(call.id.clone(), content));
+        }
+        sink.request = next;
+    }
+}
+
+/// What one Job's calls have used of their limits.
+#[derive(Default)]
+struct ToolBudget {
+    calls: usize,
+    result_bytes: usize,
+}
+
+/// Answers every call of one response, in order, or stops. The calls are
+/// checked together before any runs: against the call limit, against the
+/// ids already in the conversation, and each against the registry and its
+/// schema. Each is checked again immediately before it runs, so a grant
+/// withdrawn meanwhile refuses it. A handler runs under the time limit and
+/// the execution's cancellation; its result, serialized, is the answer, and
+/// it is never truncated.
+async fn answer_calls(
+    tools: &ToolExecution,
+    conversation: &ChatConversation,
+    calls: &[CompletedToolCall],
+    budget: &mut ToolBudget,
+    cancellation: &CancellationToken,
+) -> Result<Vec<String>, ToolLoopStop> {
+    let limits = &tools.limits;
+    if cancellation.is_cancelled() {
+        return Err(ToolLoopStop::Cancelled);
+    }
+    if budget.calls.saturating_add(calls.len()) > limits.max_tool_calls {
+        return Err(ToolLoopStop::CallLimit);
+    }
+    let earlier = conversation
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_deref())
+        .flatten()
+        .map(|call| call.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for call in calls {
+        if earlier.contains(call.id.as_str()) {
+            return Err(ToolLoopStop::Refused(InvalidToolCall::at(
+                ToolCallRefusal::ConflictingIdentity,
+                call.index,
+                format!("tool call {} repeats the id of an earlier call", call.index),
+            )));
+        }
+        tools.offer.resolve(call).map_err(ToolLoopStop::Refused)?;
+    }
+
+    let mut answers = Vec::with_capacity(calls.len());
+    for call in calls {
+        if cancellation.is_cancelled() {
+            return Err(ToolLoopStop::Cancelled);
+        }
+        let dispatch = tools.offer.resolve(call).map_err(ToolLoopStop::Refused)?;
+        budget.calls += 1;
+        let index = call.index;
+        let ran = select(
+            cancellation.cancelled(),
+            ntex::time::timeout(
+                limits.handler_timeout,
+                dispatch.handler.call(dispatch.arguments),
+            ),
+        )
+        .await;
+        let value = match ran {
+            Either::Left(()) => return Err(ToolLoopStop::Cancelled),
+            Either::Right(Err(())) => return Err(ToolLoopStop::TimedOut { index }),
+            Either::Right(Ok(Err(failure))) => {
+                return Err(ToolLoopStop::HandlerFailed {
+                    index,
+                    message: failure.message,
+                });
+            }
+            Either::Right(Ok(Ok(value))) => value,
+        };
+        let content =
+            serde_json::to_string(&value).map_err(|error| ToolLoopStop::HandlerFailed {
+                index,
+                message: format!("its result cannot be serialized: {error}"),
+            })?;
+        let total = budget.result_bytes.saturating_add(content.len());
+        if content.len() > limits.max_tool_result_bytes || total > limits.max_tool_results_bytes {
+            return Err(ToolLoopStop::ResultTooLarge { index });
+        }
+        budget.result_bytes = total;
+        answers.push(content);
+    }
+    Ok(answers)
+}
+
+/// Settles a Job whose tool loop stopped on this side. A known stop fails
+/// the Job, a local orchestration failure that keeps the Provider's last
+/// response as its value; a handler stopped while it ran leaves the outcome
+/// unknown, and the stop of the execution is then confirmed. No Provider
+/// failure is recorded for either.
+async fn stop_tool_loop(
+    run: ProviderRun,
+    sink: DatabaseOutputSink,
+    last: &ProviderExecutionResult,
+    stop: ToolLoopStop,
+) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let database = run.database;
+    let job = run.job;
+    let finalization = if stop.is_unknown() {
+        JobFinalization::Unknown
+    } else {
+        JobFinalization::Failed(FinalResult {
+            summary: Some(stop.to_string()),
+            code: None,
+            goal_reached: Some(false),
+            value: Some(provider_execution::result_value(last)),
+        })
+    };
+    let observations = sink.gap.map(Box::new);
+    let result = match database.finalize_job(job, finalization).await {
+        Ok(result) => result,
+        Err(source) => {
+            return Err(ExecutionRuntimeError::NotSettled {
+                source,
+                observations,
+            });
+        }
+    };
+    let receipt = Box::new(ExecutionReceipt {
+        executor: run.executor,
+        input: run.input,
+        job,
+        result,
+    });
+    if stop.is_unknown()
+        && let Err(source) = confirm_stopped(&database, job).await
+    {
+        return Err(ExecutionRuntimeError::StopNotConfirmed {
+            receipt,
+            source,
+            observations,
+        });
+    }
+    Err(ExecutionRuntimeError::ToolLoopStopped {
+        receipt,
+        stop,
+        observations,
+    })
+}
+
+/// Records the facts of one answered request: its timing and its
+/// availability observation. Returns the first write that failed.
+async fn record_answer(
+    database: &DatabaseHandle,
+    job: JobId,
+    request: RequestNumber,
+    result: &ProviderExecutionResult,
+) -> Option<DatabaseError> {
+    let timing = database
+        .record_metrics(NewMetrics {
+            job,
+            request,
+            observed_at: Timestamp::now(),
+            measurements: provider_execution::metrics(result),
+            token: None,
+        })
+        .await
+        .map(|_| ());
+    let availability = database
+        .record_availability_stat(NewAvailabilityStat {
+            job,
+            request,
+            observed_at: Timestamp::now(),
+            observation: provider_execution::success_observation(result),
+        })
+        .await
+        .map(|_| ());
+    timing.err().or(availability.err())
 }
 
 /// Settles the Job from a finished execution, then records what the run
@@ -627,6 +1042,7 @@ pub(crate) async fn finish_provider_job(
     sink: DatabaseOutputSink,
     execution: Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let request = sink.request;
     let mut gap = sink.gap;
     let receipt = match execution {
         Ok(result) => {
@@ -664,24 +1080,7 @@ pub(crate) async fn finish_provider_job(
                 }
                 settled => settled,
             };
-            let timing = database
-                .record_metrics(NewMetrics {
-                    job,
-                    observed_at: Timestamp::now(),
-                    measurements: provider_execution::metrics(&result),
-                    token: None,
-                })
-                .await
-                .map(|_| ());
-            let availability = database
-                .record_availability_stat(NewAvailabilityStat {
-                    job,
-                    observed_at: Timestamp::now(),
-                    observation: provider_execution::success_observation(&result),
-                })
-                .await
-                .map(|_| ());
-            for error in [timing, availability].into_iter().filter_map(Result::err) {
+            if let Some(error) = record_answer(&database, job, request, &result).await {
                 gap.get_or_insert(error);
             }
             let final_output = match settled {
@@ -708,25 +1107,27 @@ pub(crate) async fn finish_provider_job(
             }
             receipt
         }
-        Err(error) => match settle_provider_error(database, executor, input, job, error).await {
-            Ok(receipt) => receipt,
-            Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
-                gap.get_or_insert(source);
-                *receipt
-            }
-            Err(ExecutionRuntimeError::StopNotConfirmed {
-                receipt,
-                source,
-                observations,
-            }) => {
-                return Err(ExecutionRuntimeError::StopNotConfirmed {
+        Err(error) => {
+            match settle_provider_error(database, executor, input, job, request, error).await {
+                Ok(receipt) => receipt,
+                Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
+                    gap.get_or_insert(source);
+                    *receipt
+                }
+                Err(ExecutionRuntimeError::StopNotConfirmed {
                     receipt,
                     source,
-                    observations: gap.map(Box::new).or(observations),
-                });
+                    observations,
+                }) => {
+                    return Err(ExecutionRuntimeError::StopNotConfirmed {
+                        receipt,
+                        source,
+                        observations: gap.map(Box::new).or(observations),
+                    });
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
-        },
+        }
     };
     match gap {
         None => Ok(receipt),
@@ -743,6 +1144,8 @@ pub(crate) async fn finish_provider_job(
 pub(crate) struct DatabaseOutputSink {
     database: DatabaseHandle,
     job: JobId,
+    /// The Provider request whose observations the sink records now.
+    request: RequestNumber,
     /// The first observation that could not be written. The execution goes on
     /// regardless, see [`ProviderOutputSink::observe`].
     gap: Option<DatabaseError>,
@@ -752,6 +1155,7 @@ pub(crate) fn output_sink(database: DatabaseHandle, job: JobId) -> DatabaseOutpu
     DatabaseOutputSink {
         database,
         job,
+        request: RequestNumber::FIRST,
         gap: None,
     }
 }
@@ -807,6 +1211,7 @@ impl ProviderOutputSink for DatabaseOutputSink {
                 .database
                 .record_metrics(NewMetrics {
                     job: self.job,
+                    request: self.request,
                     observed_at: observation.observed_at,
                     measurements,
                     token: Some(token),
@@ -831,6 +1236,7 @@ pub(crate) async fn settle_provider_error(
     executor: ExecutorId,
     input: JobInputId,
     job: JobId,
+    request: RequestNumber,
     error: ProviderExecutionError,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let unknown = matches!(
@@ -873,6 +1279,7 @@ pub(crate) async fn settle_provider_error(
         let recorded = database
             .record_availability_stat(NewAvailabilityStat {
                 job,
+                request,
                 observed_at,
                 observation,
             })

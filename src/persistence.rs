@@ -69,6 +69,56 @@ record_id_type!(LlmProviderId, "llm_provider");
 record_id_type!(MetricsId, "metrics");
 record_id_type!(AvailabilityStatId, "availability_stat");
 
+/// The number of one Provider request within the Job that sent it, from 1
+/// in the order the Job sent them. A Job may send several requests, such as
+/// the rounds of a tool loop; every Metrics and AvailabilityStat record
+/// belongs to exactly one of them, and evidence is reduced per request,
+/// never across the requests of a Job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestNumber(u32);
+
+impl RequestNumber {
+    /// A Job's first request, and the only request of a Job recorded before
+    /// requests were numbered.
+    pub const FIRST: Self = Self(1);
+
+    /// `None` for 0, which numbers no request.
+    #[must_use]
+    pub const fn new(value: u32) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The request after this one; `None` when numbers ran out.
+    #[must_use]
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+impl fmt::Display for RequestNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "request {}", self.0)
+    }
+}
+
+/// One Provider request: the Job that sent it and its number in that Job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestRef {
+    pub job: JobId,
+    pub request: RequestNumber,
+}
+
+impl fmt::Display for RequestRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} of {}", self.request, self.job)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecordRef {
     Job(JobId),
@@ -702,6 +752,8 @@ impl Measurements {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewMetrics {
     pub job: JobId,
+    /// The Provider request of the Job the record measures.
+    pub request: RequestNumber,
     /// When the measured activity happened, as its producer reports it.
     /// Observation queries filter and order by this time.
     pub observed_at: Timestamp,
@@ -729,6 +781,8 @@ pub struct MetricsRecord {
     pub id: MetricsId,
     /// Assembled from MEASURES.
     pub job: JobId,
+    /// See [`NewMetrics::request`].
+    pub request: RequestNumber,
     /// Read from the Job's frozen input; `None` for a Job without an LLM.
     pub target: Option<LlmTarget>,
     /// The producer's time, see [`NewMetrics::observed_at`].
@@ -845,26 +899,29 @@ fn classify_status(status_code: Option<u16>) -> AvailabilityClassification {
     }
 }
 
-/// One request sample: the evidence that one independent LLM execution Job
-/// produced, reduced to one classification. It is derived on demand from
-/// committed AvailabilityStat records. It is never stored, and no record is
-/// changed. Several records of one Job add facts, not requests.
+/// One request sample: the evidence of one Provider request, reduced to one
+/// classification. It is derived on demand from committed AvailabilityStat
+/// records. It is never stored, and no record is changed. Several records of
+/// one request add facts, not requests; each request of a Job is a sample of
+/// its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AvailabilityRequestSample {
     pub job: JobId,
-    /// The lowest committed AvailabilityStat ID of the Job.
+    pub request: RequestNumber,
+    /// The lowest committed AvailabilityStat ID of the request.
     pub first_record: AvailabilityStatId,
     /// `observed_at` of `first_record`. Later records never move it.
     pub observed_at: Timestamp,
     pub classification: AvailabilityClassification,
 }
 
-/// Records of two different Jobs were given to one request sample.
+/// Records of two different requests, of one Job or of two, were given to
+/// the reduction of one request.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("availability evidence mixes {first} and {other}")]
-pub struct MixedJobs {
-    pub first: JobId,
-    pub other: JobId,
+#[error("evidence mixes {first} and {other}")]
+pub struct MixedRequests {
+    pub first: RequestRef,
+    pub other: RequestRef,
 }
 
 impl AvailabilityRequestSample {
@@ -890,7 +947,7 @@ impl AvailabilityRequestSample {
     /// classifies, and neither does a raw finish reason without a typed one.
     pub fn from_records<'a>(
         records: impl IntoIterator<Item = &'a AvailabilityStatRecord>,
-    ) -> Result<Option<Self>, MixedJobs> {
+    ) -> Result<Option<Self>, MixedRequests> {
         let mut evidence = RequestEvidence::default();
         for record in records {
             evidence.add(record)?;
@@ -903,7 +960,7 @@ impl AvailabilityRequestSample {
 /// It keeps claims, not records, so replay in any order reaches the same state.
 #[derive(Clone, Default)]
 pub(crate) struct RequestEvidence {
-    pub(crate) job: Option<JobId>,
+    pub(crate) request: Option<RequestRef>,
     /// The lowest record ID seen, with its observed time.
     pub(crate) first: Option<(AvailabilityStatId, Timestamp)>,
     /// The first HTTP status a record observed. Only an observed status
@@ -922,15 +979,19 @@ pub(crate) struct RequestEvidence {
 impl RequestEvidence {
     /// Adds one record's facts. The reducer and incremental aggregation both
     /// use it, so their classifications cannot differ.
-    pub(crate) fn add(&mut self, record: &AvailabilityStatRecord) -> Result<(), MixedJobs> {
-        match self.job {
-            Some(first) if first != record.job => {
-                return Err(MixedJobs {
+    pub(crate) fn add(&mut self, record: &AvailabilityStatRecord) -> Result<(), MixedRequests> {
+        let request = RequestRef {
+            job: record.job,
+            request: record.request,
+        };
+        match self.request {
+            Some(first) if first != request => {
+                return Err(MixedRequests {
                     first,
-                    other: record.job,
+                    other: request,
                 });
             }
-            _ => self.job = Some(record.job),
+            _ => self.request = Some(request),
         }
         self.first = match self.first {
             Some((id, observed_at)) if id <= record.id => Some((id, observed_at)),
@@ -966,7 +1027,7 @@ impl RequestEvidence {
     }
 
     pub(crate) fn sample(&self) -> Option<AvailabilityRequestSample> {
-        let (job, (first_record, observed_at)) = (self.job?, self.first?);
+        let (request, (first_record, observed_at)) = (self.request?, self.first?);
         let classification = if self.contradictory {
             AvailabilityClassification::Unconfirmed
         } else if self.witness && self.observed_status == Some(200) {
@@ -975,7 +1036,8 @@ impl RequestEvidence {
             classify_status(self.observed_status)
         };
         Some(AvailabilityRequestSample {
-            job,
+            job: request.job,
+            request: request.request,
             first_record,
             observed_at,
             classification,
@@ -995,7 +1057,8 @@ pub fn minute_of(at: Timestamp) -> i64 {
 }
 
 /// Requests per classification in one (Provider, model, minute) bucket.
-/// Every count is of requests, one per Job, never of raw observations.
+/// Every count is of Provider requests, each counted once whichever Job sent
+/// it, never of raw observations.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AvailabilityCounts {
     pub available: u64,
@@ -1026,6 +1089,7 @@ impl AvailabilityCounts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestSampleRecord {
     pub job: JobId,
+    pub request: RequestNumber,
     pub llm_profile: ProfileId,
     pub provider: LlmProviderId,
     pub model: String,
@@ -1083,6 +1147,8 @@ pub enum AvailabilityBatch {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewAvailabilityStat {
     pub job: JobId,
+    /// The Provider request of the Job the record observes.
+    pub request: RequestNumber,
     /// When the request was observed, as its producer reports it.
     /// Observation queries filter and order by this time.
     pub observed_at: Timestamp,
@@ -1094,6 +1160,8 @@ pub struct AvailabilityStatRecord {
     pub id: AvailabilityStatId,
     /// Assembled from OBSERVES.
     pub job: JobId,
+    /// See [`NewAvailabilityStat::request`].
+    pub request: RequestNumber,
     /// Read from the Job's frozen input.
     pub target: LlmTarget,
     /// The producer's time, see [`NewAvailabilityStat::observed_at`].
@@ -1342,13 +1410,15 @@ pub enum Violation {
     StopAlreadyConfirmed(JobId),
     #[error("{0} was submitted without an LLM configuration")]
     NotAnLlmExecution(JobId),
-    /// Every Token annotation of one Job states the same eligibility: its
-    /// request was either issued or not. The committed records keep theirs.
+    /// Every Token annotation of one Provider request states the same
+    /// eligibility: the request was either issued or not. The committed
+    /// records keep theirs. Two requests of one Job may differ.
     #[error(
-        "the Metrics of {job} already state that its request is {committed:?}; an annotation stating {refused:?} contradicts them"
+        "the Metrics of {request} of {job} already state that it is {committed:?}; an annotation stating {refused:?} contradicts them"
     )]
     ContradictoryTokenEligibility {
         job: JobId,
+        request: RequestNumber,
         committed: RequestEligibility,
         refused: RequestEligibility,
     },
@@ -2089,11 +2159,12 @@ fn record_metrics_checked(
             return batch.reject(Violation::InvalidValue("token", "a request that was never sent reports no usage"));
         }
         if consistent
-            && let Some(committed) = batch.job_token_eligibility(metrics.job)?
+            && let Some(committed) = batch.request_token_eligibility(metrics.job, metrics.request)?
             && committed != token.eligibility
         {
             return batch.reject(Violation::ContradictoryTokenEligibility {
                 job: metrics.job,
+                request: metrics.request,
                 committed,
                 refused: token.eligibility,
             });
@@ -2101,7 +2172,7 @@ fn record_metrics_checked(
     }
     let id = MetricsId(batch.next_id(crate::storage::Sequence::Metrics)?);
     batch.insert_metrics(
-        &MetricsRow { id, observed_at: metrics.observed_at, measurements: metrics.measurements, token: metrics.token, recorded_at: batch.now() },
+        &MetricsRow { id, request: metrics.request, observed_at: metrics.observed_at, measurements: metrics.measurements, token: metrics.token, recorded_at: batch.now() },
         metrics.job,
     )?;
     Ok((id, MarkerSubjects::created(RecordRef::Job(metrics.job), RecordRef::Metrics(id))))
@@ -2120,7 +2191,7 @@ pub(crate) fn record_availability_stat(batch: &mut Batch, stat: NewAvailabilityS
     }
     let id = AvailabilityStatId(batch.next_id(crate::storage::Sequence::AvailabilityStat)?);
     batch.insert_availability_stat(
-        &AvailabilityStatRow { id, observed_at: stat.observed_at, observation: stat.observation, recorded_at: batch.now() },
+        &AvailabilityStatRow { id, request: stat.request, observed_at: stat.observed_at, observation: stat.observation, recorded_at: batch.now() },
         stat.job,
     )?;
     Ok((id, MarkerSubjects::created(RecordRef::Job(stat.job), RecordRef::AvailabilityStat(id))))
