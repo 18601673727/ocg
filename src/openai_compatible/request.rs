@@ -290,6 +290,17 @@ impl ChatConversation {
         self.tools.iter().any(|tool| tool.function.name == name)
     }
 
+    /// Whether any message carries an image part. A conversation that once
+    /// did keeps doing so in every continuation that resends it, tool turns
+    /// included.
+    #[must_use]
+    pub fn carries_images(&self) -> bool {
+        self.messages.iter().any(|message| {
+            matches!(&message.content, Some(MessageContentWire::Parts(parts))
+                if parts.iter().any(|part| matches!(part, ContentPartWire::ImageUrl { .. })))
+        })
+    }
+
     /// Admits the completed tool calls a Provider returned for this
     /// conversation only as far as this request allowed them. Each call must
     /// name exactly one function tool offered here, under that exact name;

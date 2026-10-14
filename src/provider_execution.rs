@@ -527,6 +527,13 @@ async fn exchange(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     if response.status() != StatusCode::OK {
+        // Nothing of a refused image-bearing request's body is kept, so it is
+        // not read; see `rejected_failure`.
+        if conversation.carries_images() {
+            return Err(ProviderExecutionError::Rejected {
+                failure: rejected_failure(conversation, status, request_id, None),
+            });
+        }
         // A cancelled read keeps the status the Provider answered with.
         let body = match select(
             config.cancellation.cancelled(),
@@ -542,7 +549,7 @@ async fn exchange(
             Either::Right(Err(())) => None,
         };
         return Err(ProviderExecutionError::Rejected {
-            failure: provider_failure(status, request_id, body),
+            failure: rejected_failure(conversation, status, request_id, body),
         });
     }
 
@@ -1256,6 +1263,34 @@ async fn bounded_body(response: ClientResponse, limit: usize) -> Option<String> 
         .and_then(|body| String::from_utf8(body.to_vec()).ok())
 }
 
+/// What OCG keeps of a non-200 response to `conversation`. A Provider or
+/// gateway may echo the request it refuses, and an image-bearing request
+/// carries whole images, so of a refusal of one only the HTTP status, and
+/// the retryability it implies, is kept: never its body, nor the message or
+/// code read from it, nor its request id header. Nothing is redacted; all
+/// of it is dropped. A text-only refusal is kept as the Provider gave it.
+pub(crate) fn rejected_failure(
+    conversation: &ChatConversation,
+    status_code: u16,
+    request_id: Option<String>,
+    response_body: Option<String>,
+) -> ProviderFailure {
+    if !conversation.carries_images() {
+        return provider_failure(status_code, request_id, response_body);
+    }
+    ProviderFailure {
+        message: format!("provider rejected image request (HTTP {status_code})"),
+        status_code: Some(status_code),
+        retryable: retryable_status(status_code),
+        ..ProviderFailure::default()
+    }
+}
+
+/// Whether a refusal with this status may succeed when sent again.
+fn retryable_status(status_code: u16) -> bool {
+    matches!(status_code, 408 | 409 | 425 | 429 | 500..=599)
+}
+
 fn provider_failure(
     status_code: u16,
     request_id: Option<String>,
@@ -1272,7 +1307,7 @@ fn provider_failure(
         response_body,
         request_id,
         retry_after_ms: None,
-        retryable: matches!(status_code, 408 | 409 | 425 | 429 | 500..=599),
+        retryable: retryable_status(status_code),
     }
 }
 
@@ -1502,7 +1537,7 @@ pub(crate) mod scripted {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Instant;
 
     use super::scripted::{Step, payload};
@@ -4770,5 +4805,190 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ProviderFact::NotDelivered]
         );
+    }
+
+    /// Conversations whose refusals must keep nothing the Provider said:
+    /// one PNG, a PNG and a JPEG, and an image in an earlier turn followed
+    /// by a tool call and its answer.
+    pub(crate) fn image_conversations() -> Vec<(&'static str, ChatConversation)> {
+        use crate::openai_compatible::image::tests::{jpeg, png};
+        use crate::openai_compatible::{ChatFunctionCallWire, ChatToolCallWire};
+        use crate::openai_compatible::{ImageInput, ImageMime};
+
+        let png = ImageInput::new(ImageMime::Png, png()).expect("a PNG");
+        let jpeg = ImageInput::new(ImageMime::Jpeg, jpeg()).expect("a JPEG");
+        let text = |text: &str| ContentPartWire::Text {
+            text: text.to_owned(),
+        };
+        let call = ChatToolCallWire {
+            id: "call_1".to_owned(),
+            tool_type: Some("function".to_owned()),
+            function: ChatFunctionCallWire {
+                name: "f".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        };
+        let user = |parts| ChatConversation {
+            messages: vec![ChatMessage::user_parts(parts)],
+            ..ChatConversation::default()
+        };
+        vec![
+            ("one PNG", user(vec![text("Read it."), png.part()])),
+            (
+                "a PNG and a JPEG",
+                user(vec![png.part(), text("and"), jpeg.part()]),
+            ),
+            (
+                "an image before a tool continuation",
+                ChatConversation {
+                    messages: vec![
+                        ChatMessage::user_parts(vec![text("Read it."), jpeg.part()]),
+                        ChatMessage::assistant(None, vec![call]),
+                        ChatMessage::tool("call_1", "{\"ok\":true}"),
+                        ChatMessage::user("Go on."),
+                    ],
+                    ..offering(&["f"])
+                },
+            ),
+        ]
+    }
+
+    /// The `data:` URLs of a conversation's images.
+    pub(crate) fn image_urls(conversation: &ChatConversation) -> Vec<String> {
+        conversation
+            .messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                Some(crate::openai_compatible::MessageContentWire::Parts(parts)) => Some(parts),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|part| match part {
+                ContentPartWire::ImageUrl { image_url } => Some(image_url.url.clone()),
+                ContentPartWire::Text { .. } => None,
+            })
+            .collect()
+    }
+
+    /// A refusal that echoes every image of the request: in its message,
+    /// its code and an extra field, raw and with JSON's optional escapes.
+    pub(crate) fn echoing_body(urls: &[String]) -> String {
+        let all = urls.join(" ");
+        let escaped = all.replace('/', "\\/").replace('+', "\\u002b");
+        format!(
+            r#"{{"error":{{"message":"invalid image: {all}","code":"{escaped}","type":"invalid_request_error","param":"{escaped}"}}}}"#
+        )
+    }
+
+    /// Whether `text` holds any part of an image's base64, written raw or
+    /// with JSON's escapes.
+    pub(crate) fn discloses(text: &str, urls: &[String]) -> bool {
+        let text = text.replace("\\/", "/").replace("\\u002b", "+");
+        urls.iter().any(|url| {
+            let (_, data) = url.split_once(',').expect("a data URL");
+            data.as_bytes()
+                .chunks(16)
+                .filter(|window| window.len() == 16)
+                .any(|window| text.contains(std::str::from_utf8(window).expect("ASCII")))
+        })
+    }
+
+    #[test]
+    fn a_refused_image_request_keeps_only_its_status() {
+        for (case, conversation) in image_conversations() {
+            assert!(conversation.carries_images(), "{case}");
+            conversation.validate().expect(case);
+            let urls = image_urls(&conversation);
+            let body = echoing_body(&urls);
+            assert!(discloses(&body, &urls), "the fixture echoes the images");
+            for (status, retryable) in [
+                (400, false),
+                (401, false),
+                (413, false),
+                (408, true),
+                (429, true),
+                (500, true),
+                (503, true),
+            ] {
+                let failure = rejected_failure(
+                    &conversation,
+                    status,
+                    Some(urls.join(",")),
+                    Some(body.clone()),
+                );
+                assert_eq!(
+                    failure,
+                    ProviderFailure {
+                        message: format!("provider rejected image request (HTTP {status})"),
+                        status_code: Some(status),
+                        provider_code: None,
+                        response_body: None,
+                        request_id: None,
+                        retry_after_ms: None,
+                        retryable,
+                    },
+                    "{case}, HTTP {status}"
+                );
+                let error = ProviderExecutionError::Rejected { failure };
+                assert!(!discloses(&error.to_string(), &urls), "{case}");
+                for observation in error_observations(&error) {
+                    assert!(!discloses(&format!("{observation:?}"), &urls), "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_text_request_keeps_what_the_provider_said() {
+        let body =
+            r#"{"error":{"message":"The model `m` does not exist","code":"model_not_found"}}"#;
+        for conversation in [
+            ChatConversation {
+                messages: vec![ChatMessage::user("hi")],
+                ..ChatConversation::default()
+            },
+            ChatConversation {
+                messages: vec![ChatMessage::user_parts(vec![ContentPartWire::Text {
+                    text: "hi".to_owned(),
+                }])],
+                ..ChatConversation::default()
+            },
+        ] {
+            assert!(!conversation.carries_images());
+            for (status, retryable) in [(404, false), (503, true)] {
+                assert_eq!(
+                    rejected_failure(
+                        &conversation,
+                        status,
+                        Some("req_123".to_owned()),
+                        Some(body.to_owned())
+                    ),
+                    ProviderFailure {
+                        message: "The model `m` does not exist".to_owned(),
+                        status_code: Some(status),
+                        provider_code: Some("model_not_found".to_owned()),
+                        response_body: Some(body.to_owned()),
+                        request_id: Some("req_123".to_owned()),
+                        retry_after_ms: None,
+                        retryable,
+                    }
+                );
+            }
+            assert_eq!(
+                rejected_failure(
+                    &conversation,
+                    502,
+                    None,
+                    Some("<html>bad gateway</html>".into())
+                ),
+                ProviderFailure {
+                    message: "provider returned HTTP 502".to_owned(),
+                    status_code: Some(502),
+                    response_body: Some("<html>bad gateway</html>".to_owned()),
+                    retryable: true,
+                    ..ProviderFailure::default()
+                }
+            );
+        }
     }
 }

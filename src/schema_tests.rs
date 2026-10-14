@@ -18002,6 +18002,170 @@ mod requests_and_tool_loop {
             worker.shutdown().expect("shutdown");
         }
 
+        /// Every file of the data directory, as bytes, once its database is
+        /// closed.
+        fn stored_bytes(directory: &DataDirectory) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+            let mut files = Vec::new();
+            let mut pending = vec![directory.root().to_path_buf()];
+            while let Some(path) = pending.pop() {
+                for entry in std::fs::read_dir(&path).expect("list") {
+                    let path = entry.expect("entry").path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else {
+                        let bytes = std::fs::read(&path).expect("read");
+                        files.push((path, bytes));
+                    }
+                }
+            }
+            files
+        }
+
+        #[test]
+        fn a_refusal_that_echoes_the_images_persists_none_of_them() {
+            use crate::provider_execution::rejected_failure;
+            use crate::provider_execution::tests::{
+                discloses, echoing_body, image_conversations, image_urls,
+            };
+
+            let (_root, directory) = data_directory("image-refusal-echo");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let mut echoed = Vec::new();
+            for ((case, conversation), (status, retryable)) in image_conversations()
+                .into_iter()
+                .zip([(400, false), (500, true), (400, false)])
+            {
+                let run = local_run(&handle, llm);
+                let urls = image_urls(&conversation);
+                let failure = rejected_failure(
+                    &conversation,
+                    status,
+                    Some(urls.join(",")),
+                    Some(echoing_body(&urls)),
+                );
+                wait(settle_provider_error(
+                    handle.clone(),
+                    run.executor,
+                    run.input,
+                    run.job,
+                    RequestNumber::FIRST,
+                    ProviderExecutionError::Rejected { failure },
+                ))
+                .expect("settled");
+
+                let job = job_record(&handle, run.job);
+                assert!(
+                    job.failed_at.is_some() && job.completed_at.is_none(),
+                    "{case}"
+                );
+                let output = wait(handle.latest_output(run.job))
+                    .expect("read")
+                    .expect("a result");
+                assert_eq!(
+                    output.summary.as_deref(),
+                    Some(
+                        format!(
+                            "provider rejected the request: HTTP {status}: \
+                             provider rejected image request (HTTP {status})"
+                        )
+                        .as_str()
+                    ),
+                    "{case}"
+                );
+                assert!(!discloses(&format!("{output:?}"), &urls), "{case}");
+                let [stat] = stats(&handle, run.job).try_into().expect("one observation");
+                assert_eq!(stat.observation.status_code, Some(status), "{case}");
+                let failure = stat.observation.failure.expect("a failure");
+                assert_eq!(failure.status_code, Some(status), "{case}");
+                assert_eq!(failure.retryable, retryable, "{case}");
+                assert_eq!(
+                    (
+                        failure.provider_code,
+                        failure.response_body,
+                        failure.request_id
+                    ),
+                    (None, None, None),
+                    "{case}"
+                );
+                assert_eq!(
+                    failure.message,
+                    format!("provider rejected image request (HTTP {status})")
+                );
+                assert!(blocking(&handle, llm).is_empty(), "{case}");
+                echoed.extend(urls);
+            }
+
+            // The Provider's text of a text-only refusal is kept.
+            let run = local_run(&handle, llm);
+            let body =
+                r#"{"error":{"message":"The model `m` does not exist","code":"model_not_found"}}"#;
+            let failure = rejected_failure(
+                &ChatConversation {
+                    messages: vec![ChatMessage::user("hi")],
+                    ..ChatConversation::default()
+                },
+                404,
+                Some("req_123".to_owned()),
+                Some(body.to_owned()),
+            );
+            wait(settle_provider_error(
+                handle.clone(),
+                run.executor,
+                run.input,
+                run.job,
+                RequestNumber::FIRST,
+                ProviderExecutionError::Rejected { failure },
+            ))
+            .expect("settled");
+            let output = wait(handle.latest_output(run.job))
+                .expect("read")
+                .expect("a result");
+            assert_eq!(
+                output.summary.as_deref(),
+                Some("provider rejected the request: HTTP 404: The model `m` does not exist")
+            );
+            let [stat] = stats(&handle, run.job).try_into().expect("one observation");
+            let failure = stat.observation.failure.expect("a failure");
+            assert_eq!(
+                (
+                    failure.provider_code.as_deref(),
+                    failure.response_body.as_deref(),
+                    failure.request_id.as_deref(),
+                    failure.retryable
+                ),
+                (Some("model_not_found"), Some(body), Some("req_123"), false)
+            );
+            worker.shutdown().expect("shutdown");
+
+            // Nothing of any echoed image is anywhere in the data directory,
+            // the database file included, while the text refusal is.
+            let files = stored_bytes(&directory);
+            let database = String::from_utf8_lossy(
+                &files
+                    .iter()
+                    .find(|(path, _)| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "redb")
+                    })
+                    .expect("the database file")
+                    .1,
+            )
+            .into_owned();
+            assert!(
+                database.contains("model_not_found"),
+                "the probe can see stored text"
+            );
+            for (path, bytes) in &files {
+                assert!(
+                    !discloses(&String::from_utf8_lossy(bytes), &echoed),
+                    "{} holds image data",
+                    path.display()
+                );
+            }
+        }
+
         #[test]
         fn a_provider_that_refuses_the_image_fails_the_job_with_its_own_error() {
             let (_root, directory) = data_directory("image-refused");
