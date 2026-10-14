@@ -10550,6 +10550,9 @@ mod control_plane {
             let bearer = format!("Bearer {TOKEN}");
             let health = "GET /api/v1/health";
             let origin = format!("http://127.0.0.1:{port}");
+            let localhost_origin = format!("http://localhost:{port}");
+            let mixed = format!("Localhost:{port}");
+            let mixed_origin = format!("HTTP://LOCALHOST:{port}");
             let mut responses = Vec::new();
             let mut refused = |status: u16, code: &str, request: &str, headers: &[(&str, &str)]| {
                 let response = send(address, request, headers);
@@ -10686,6 +10689,39 @@ mod control_plane {
                     ("Authorization", &bearer),
                 ],
             );
+            // A loopback Origin must name the Host's own loopback host and
+            // port: another allowed loopback name, or another port, is foreign.
+            let other_port = port.wrapping_add(1);
+            for (host, origin) in [
+                (&host, localhost_origin.clone()),
+                (&localhost, origin.clone()),
+                (&mixed, origin.clone()),
+                (&host, format!("HTTP://LOCALHOST:{port}")),
+                (&localhost, format!("http://localhost:{other_port}")),
+            ] {
+                refused(
+                    403,
+                    "forbidden_origin",
+                    health,
+                    &[
+                        ("Host", host),
+                        ("Origin", &origin),
+                        ("Authorization", &bearer),
+                    ],
+                );
+            }
+            // One Origin only, even when it matches.
+            refused(
+                403,
+                "forbidden_origin",
+                health,
+                &[
+                    ("Host", &host),
+                    ("Origin", &origin),
+                    ("Origin", &origin),
+                    ("Authorization", &bearer),
+                ],
+            );
             // Only GET; no CORS preflight is answered.
             for method in ["POST", "OPTIONS", "DELETE", "PUT"] {
                 refused(
@@ -10719,8 +10755,14 @@ mod control_plane {
                 ],
             );
 
-            // The same request from the listener's own origin is answered.
-            for (host, origin) in [(&host, Some(origin.as_str())), (&localhost, None)] {
+            // The same request from the listener's own origin is answered:
+            // each loopback name with its own origin, Host matched case-blind.
+            for (host, origin) in [
+                (&host, Some(origin.as_str())),
+                (&localhost, Some(localhost_origin.as_str())),
+                (&mixed, Some(mixed_origin.as_str())),
+                (&localhost, None),
+            ] {
                 let mut headers = vec![
                     ("Host", host.as_str()),
                     ("Authorization", bearer.as_str()),

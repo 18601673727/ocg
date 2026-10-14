@@ -506,10 +506,10 @@ fn admit(request: &HttpRequest, shared: &Shared) -> Result<(), Refusal> {
     if request.method() != Method::GET {
         return Err(METHOD_NOT_ALLOWED);
     }
-    if !names_listener(headers, shared.port) {
+    let Some(host) = names_listener(headers, shared.port) else {
         return Err(FORBIDDEN_HOST);
-    }
-    if !same_origin(headers, shared.port) {
+    };
+    if !same_origin(headers, &host) {
         return Err(FORBIDDEN_ORIGIN);
     }
     if !authenticated(headers, &shared.token) {
@@ -534,27 +534,24 @@ fn single<'a>(headers: &'a HeaderMap, name: &header::HeaderName) -> Option<&'a H
     values.next().is_none().then_some(value)
 }
 
-/// Whether the request's one `Host` names this listener exactly.
-fn names_listener(headers: &HeaderMap, port: u16) -> bool {
-    let Some(host) = single(headers, &header::HOST).and_then(|host| host.to_str().ok()) else {
-        return false;
-    };
-    let host = host.to_ascii_lowercase();
-    host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")
+/// The request's one `Host`, lowercased, if it names this listener exactly.
+fn names_listener(headers: &HeaderMap, port: u16) -> Option<String> {
+    let host = single(headers, &header::HOST)?
+        .to_str()
+        .ok()?
+        .to_ascii_lowercase();
+    (host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")).then_some(host)
 }
 
-/// Whether the request comes from this listener's own origin, or says
-/// nothing of one.
-fn same_origin(headers: &HeaderMap, port: u16) -> bool {
+/// Whether the request says nothing of an origin, or its one `Origin` is
+/// the `http` origin of the `host` it names.
+fn same_origin(headers: &HeaderMap, host: &str) -> bool {
     let origin_allowed = match headers.get_all(header::ORIGIN).count() {
         0 => true,
         1 => single(headers, &header::ORIGIN)
             .and_then(|origin| origin.to_str().ok())
             .map(str::to_ascii_lowercase)
-            .is_some_and(|origin| {
-                origin == format!("http://127.0.0.1:{port}")
-                    || origin == format!("http://localhost:{port}")
-            }),
+            .is_some_and(|origin| origin == format!("http://{host}")),
         _ => false,
     };
     let site_allowed = match headers.get_all("sec-fetch-site").count() {
