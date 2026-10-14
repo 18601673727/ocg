@@ -157,7 +157,7 @@ function AvoidedSchemaHelp() {
   );
 }
 
-export function TokenMetrics({ totals }: { totals: UsageTotals }) {
+export function TokenMetrics({ totals }: { totals: Pick<UsageTotals, "tokens"> }) {
   return <dl>
     <UsageMetric label="usage.total" field="tokens.total"><UsageNumber quantity={totals.tokens.total} /></UsageMetric>
     <UsageMetric label="usage.input" field="tokens.input"><UsageNumber quantity={totals.tokens.input} /></UsageMetric>
@@ -168,7 +168,7 @@ export function TokenMetrics({ totals }: { totals: UsageTotals }) {
   </dl>;
 }
 
-export function ContextMetrics({ totals, full = false, avoidedHelp = false }: { totals: UsageTotals; full?: boolean; avoidedHelp?: boolean }) {
+export function ContextMetrics({ totals, full = false, avoidedHelp = false }: { totals: Pick<UsageTotals, "tokens" | "context_costs">; full?: boolean; avoidedHelp?: boolean }) {
   const c = totals.context_costs;
   return <dl>
     <UsageMetric label="usage.wire" field="context.wire"><UsageNumber quantity={c.wire_bytes} bytes /></UsageMetric>

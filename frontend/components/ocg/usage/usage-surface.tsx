@@ -1,46 +1,16 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
+import { useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { RefreshCw } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { PageSurface, SegmentedTabs } from "../primitives";
-import { STATUS_TEXT } from "../primitives/tone";
+import { SegmentedTabs } from "../primitives";
 import { formatCount } from "@/lib/format";
-import type { UsageBreakdown, UsageWindow } from "../contracts";
-import { useI18n, type I18nKey } from "../i18n";
+import type { UsageWindow } from "../contracts";
+import { useI18n } from "../i18n";
 import { useProjectUsage } from "./use-usage";
-import { ActivityMetrics, ContextMetrics, CostDetails, hasRecordedUsage, TokenMetrics, UsageMoney, UsageNumber, UsageMetric, UsageScopeNote, usageTimestamp } from "./usage-values";
+import { ActivityMetrics, hasRecordedUsage, UsageMoney, UsageNumber, UsageMetric, UsageScopeNote, usageTimestamp } from "./usage-values";
+import { UsageSection as Section, UsageView } from "./usage-view";
 
-const WINDOWS: readonly { id: UsageWindow; label: I18nKey }[] = [
-  { id: "today", label: "usage.today" }, { id: "7d", label: "usage.sevenDays" },
-  { id: "30d", label: "usage.thirtyDays" }, { id: "all", label: "usage.allTime" },
-];
 function windowFrom(value: string | null): UsageWindow { return value === "all" || value === "today" || value === "7d" ? value : "30d"; }
-
-function Section({ title, children }: { title: string; children: ReactNode }) {
-  return <section className="min-w-0 rounded-md border border-border p-3 sm:p-4">
-    <h2 className="mb-2 text-xs font-semibold tracking-tight">{title}</h2>{children}
-  </section>;
-}
-
-function BreakdownTable({ rows, models = false }: { rows: UsageBreakdown[]; models?: boolean }) {
-  const { t } = useI18n();
-  return <div className="overflow-x-auto"><table className="w-full text-left text-xs">
-    <thead className="text-xs text-muted-foreground"><tr>
-      <th className="pb-2 font-medium">{t(models ? "usage.providerModel" : "usage.providers")}</th>
-      {(["usage.requests", "usage.input", "usage.output", "usage.total", "usage.cost"] as const).map(key => <th key={key} className="pb-2 pl-3 text-right font-medium">{t(key)}</th>)}
-    </tr></thead>
-    <tbody>{rows.map((row, index) => <tr key={`${row.provider}:${row.model}:${index}`} className="border-t border-border/60">
-      <td className="max-w-56 break-all py-2.5 pr-3 font-medium">{row.provider ?? t("common.notReported")}{models ? <span className="block font-normal text-muted-foreground">{row.model ?? t("common.notReported")}</span> : null}</td>
-      <td className="pl-3 text-right"><UsageNumber quantity={row.totals.provider_requests} /></td>
-      <td className="pl-3 text-right"><UsageNumber quantity={row.totals.tokens.input} /></td>
-      <td className="pl-3 text-right"><UsageNumber quantity={row.totals.tokens.output} /></td>
-      <td className="pl-3 text-right"><UsageNumber quantity={row.totals.tokens.total} /></td>
-      <td className="pl-3 text-right"><UsageMoney cost={row.totals.cost} /></td>
-    </tr>)}</tbody>
-  </table></div>;
-}
 
 export function UsageSurface({ baseUrl, projectId, onSelectSession }: { baseUrl: string | null; projectId: string; onSelectSession: (id: string) => void }) {
   const { t, locale } = useI18n();
@@ -56,35 +26,28 @@ export function UsageSurface({ baseUrl, projectId, onSelectSession }: { baseUrl:
     globalThis.window.history.replaceState(null, "", `${url.pathname}${url.search}`);
   };
   const rows = data ? order === "recent" ? data.conversation_rows : [...data.conversation_rows].sort((a, b) => (b.totals.tokens.total.value ?? -1) - (a.totals.tokens.total.value ?? -1) || a.conversation_id.localeCompare(b.conversation_id)) : [];
-  return <PageSurface>
-    <div className="mx-auto max-w-6xl space-y-5" data-usage-surface="project">
-      <header className="flex flex-wrap items-start justify-between gap-3">
-        <div><h1 className="text-lg font-semibold tracking-tight">{t("nav.usage")}</h1><p className="mt-1 text-xs text-muted-foreground">{t("usage.subtitle")}</p></div>
-        <Button variant="outline" size="sm" disabled={!baseUrl || usage.loading} onClick={usage.refresh}><RefreshCw className="size-3.5" />{t("common.refresh")}</Button>
-      </header>
-      <div className="max-w-md"><SegmentedTabs tabs={WINDOWS.map(value => ({ id: value.id, label: t(value.label) }))} value={window} onSelect={selectWindow} ariaLabel={t("usage.window")} className="grid-cols-4" /></div>
-      {!baseUrl || !projectId ? <p className="text-sm text-muted-foreground">{t("usage.noEndpoint")}</p> : usage.error ? <div role="alert" className="text-sm text-destructive">{t("usage.failed", { error: usage.error })}</div> : usage.loading ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
-      {data ? <>
-        <div className="max-w-3xl"><UsageScopeNote scope="project" generatedAt={data.generated_at} /></div>
-        {data.truncated ? <p className={`text-xs ${STATUS_TEXT['warning']}`}>{t("usage.limited")}</p> : null}
-        {!hasRecordedUsage(data.totals) ? <p className="text-xs text-muted-foreground">{t("usage.noProjectUsage")}</p> : null}
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          <Section title={t("usage.cost")}><CostDetails cost={data.totals.cost} /></Section>
-          <Section title={t("usage.tokens")}><TokenMetrics totals={data.totals} /></Section>
-          <Section title={t("usage.activity")}><dl>
-            <UsageMetric label="usage.conversations">{formatCount(data.conversations)}</UsageMetric>
-            <UsageMetric label="usage.turns">{formatCount(data.totals.turns)}</UsageMetric>
-            <UsageMetric label="usage.jobs">{formatCount(data.totals.jobs)}</UsageMetric>
-          </dl><ActivityMetrics totals={data.totals} /></Section>
-        </div>
-        <div className="grid gap-3 xl:grid-cols-2">
-          <Section title={t("usage.providers")}><BreakdownTable rows={data.providers} /></Section>
-          <Section title={t("usage.models")}><BreakdownTable rows={data.models} models /></Section>
-        </div>
-        <Section title={t("usage.efficiency")}>
-          <div className="max-w-xl"><ContextMetrics totals={data.totals} full /></div>
-          <p className="mt-3 max-w-3xl text-xs text-muted-foreground">{t("usage.efficiencyNote")}</p>
-        </Section>
+  return <UsageView
+    data={data ? {
+      totals: data.totals,
+      providers: data.providers,
+      models: data.models,
+      truncated: data.truncated,
+      hasRecordedUsage: hasRecordedUsage(data.totals),
+    } : null}
+    loading={usage.loading}
+    error={usage.error}
+    unavailable={!baseUrl || !projectId}
+    window={window}
+    onWindowChange={selectWindow}
+    onRefresh={usage.refresh}
+    scopeNote={data ? <UsageScopeNote scope="project" generatedAt={data.generated_at} /> : null}
+    activity={data ? <><dl>
+      <UsageMetric label="usage.conversations">{formatCount(data.conversations)}</UsageMetric>
+      <UsageMetric label="usage.turns">{formatCount(data.totals.turns)}</UsageMetric>
+      <UsageMetric label="usage.jobs">{formatCount(data.totals.jobs)}</UsageMetric>
+    </dl><ActivityMetrics totals={data.totals} /></> : null}
+  >
+    {data ? <>
         <Section title={t("usage.conversations")}>
           <div className="mb-3 max-w-xs"><SegmentedTabs tabs={[{ id: "recent", label: t("usage.recent") }, { id: "tokens", label: t("usage.mostTokens") }]} value={order} onSelect={setOrder} ariaLabel={t("usage.conversationOrder")} className="grid-cols-2" /></div>
           {rows.length ? <div className="overflow-x-auto"><table className="w-full text-left text-xs">
@@ -108,7 +71,6 @@ export function UsageSurface({ baseUrl, projectId, onSelectSession }: { baseUrl:
             </tr>)}</tbody>
           </table></div> : <p className="py-4 text-xs text-muted-foreground">{t("usage.empty")}</p>}
         </Section>
-      </> : null}
-    </div>
-  </PageSurface>;
+    </> : null}
+  </UsageView>;
 }
