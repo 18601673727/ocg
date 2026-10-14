@@ -127,6 +127,13 @@ function longMessagesFold() {
   assert.equal(boundedToggle(false, true), "collapse");
   assert.match(BOUNDED_MESSAGE_CLASS, /max-h-\[5\dvh\]/);
   assert.match(BOUNDED_MESSAGE_CLASS, /overflow-y-auto/);
+  assert.match(BOUNDED_MESSAGE_CLASS, /ocg-subtle-scrollbar/);
+  const threadSource = fs.readFileSync(path.join(frontend, "components/assistant-ui/elements/thread.aui.tsx"), "utf8");
+  const viewportStart = threadSource.indexOf('data-slot="aui_thread-viewport"');
+  const viewportSlice = threadSource.slice(viewportStart, viewportStart + 220);
+  assert.match(viewportSlice, /overflow-y-auto/, "thread viewport scrolls only when content overflows");
+  assert.ok(!viewportSlice.includes("overflow-y-scroll"), "thread viewport does not force a permanent vertical scrollbar track");
+  assert.match(viewportSlice, /ocg-subtle-scrollbar/, "thread viewport uses the subdued scrollbar styling");
   const metrics = (scrollTop) => ({ scrollTop, scrollHeight: 2000, clientHeight: 500 });
   assert.equal(followAfterScroll(true, 1500, metrics(1200)), false, "scrolling up stops following");
   assert.equal(followAfterScroll(false, 1200, metrics(1300)), false, "reading downward does not force following");
@@ -629,6 +636,38 @@ function conversationInspectorRemainsStableDuringPolling() {
   // Manual refresh button works and becomes disabled during read.
   assert.ok(!loaded.match(/disabled["\s]/), "refresh button enabled when not loading");
   assert.ok(refreshing.includes("disabled"), "refresh button disabled while reading");
+
+  // Context section: the efficiency note is no longer permanently rendered below
+  // the metrics; the "Schema bytes avoided" label itself carries a subtle dashed
+  // underline trigger that opens a non-modal explanatory popover on demand.
+  const q = (value) => ({ value, completeness: "complete" });
+  const recordedData = {
+    ...sampleData,
+    totals: {
+      ...sampleData.totals,
+      attempts: 1, provider_calls: 1, native_calls: 0,
+      provider_requests: q(1), provider_rounds: q(1),
+      cost: { currencies: [{ currency: "USD", actual_micros: 30000 }], completeness: "complete", settled_calls: 1, unresolved_calls: 0, unavailable_calls: 0 },
+      tokens: { total: q(300), input: q(100), output: q(200), cache_read: q(0), cache_write: q(0), reasoning: { value: null, completeness: "complete" } },
+      context_costs: {
+        wire_bytes: q(2048), tool_schema_bytes: q(512), full_schema_baseline_bytes: q(4096),
+        schema_bytes_saved: q(3584), capsule_bytes: q(0), capsule_injected_requests: q(0),
+        canonical_message_bytes: q(1024), tool_result_bytes: q(512),
+      },
+    },
+  };
+  const closedContext = renderToStaticMarkup(React.createElement(I18nProvider, null,
+    React.createElement(ConversationInspector, {
+      usage: usage(recordedData, false), execution: null, accounting: null, mode: "docked",
+      onClose: () => undefined, onOpenJobExecution: () => undefined,
+    })));
+  assert.ok(closedContext.includes("data-context-help-trigger"), "Schema bytes avoided label is an interactive help trigger");
+  assert.match(closedContext, /<button[^>]*data-context-help-trigger=""[^>]*aria-expanded="false"[^>]*decoration-dashed[^>]*>\s*Schema bytes avoided\s*<\/button>/,
+    "only the Schema bytes avoided label text carries the dashed-underline trigger");
+  assert.ok(!closedContext.includes('aria-haspopup="menu"'), "the explanatory trigger does not claim menu semantics");
+  assert.ok(!closedContext.includes("data-context-help-popover"), "the popover is not rendered while closed");
+  assert.ok(!closedContext.includes("Schema bytes avoided = recorded full baseline"),
+    "the efficiency note paragraph is not permanently visible when the popover is closed");
 }
 
 /**
@@ -737,17 +776,42 @@ function markdownNestingMatchesDepth() {
   const render = (text) => renderToStaticMarkup(React.createElement(I18nProvider, null,
     React.createElement(MarkdownText, { text })));
 
-  // A nested list with a later sibling: the sibling returns to the top level.
+  // A nested tight list with a later sibling: hidden paragraph tokens are
+  // honored (no <p> wrapper inside tight <li>), markers sit outside with
+  // indentation, and the sibling returns to the top level.
   const branch = render("- a\n  - b\n- c");
   assert.equal((branch.match(/<ul/g) ?? []).length, 2, "a nested list with a later sibling nests exactly one level");
-  assert.match(branch, /<li[^>]*>\s*<p[^>]*>a<\/p>\s*<ul[^>]*>\s*<li[^>]*>\s*<p[^>]*>b<\/p>\s*<\/li>\s*<\/ul>\s*<\/li>\s*<li[^>]*>\s*<p[^>]*>c<\/p>\s*<\/li>/,
-    "the later sibling closes the nesting and stays a top-level item");
+  assert.match(branch, /<ul[^>]*class="[^"]*list-disc list-outside pl-6[^"]*"/, "unordered lists place markers outside with left padding");
+  assert.ok(!branch.includes("list-inside"), "tight unordered lists do not use list-inside");
+  assert.match(branch, /<li[^>]*>a<ul[^>]*><li[^>]*>b<\/li><\/ul><\/li><li[^>]*>c<\/li>/,
+    "tight list items render inline without <p> wrappers and the later sibling closes the nesting");
 
   // Deep nesting with an outer sibling after the nested blocks close.
   const deep = render("- a\n  - b\n    - c\n- d");
   assert.equal((deep.match(/<ul/g) ?? []).length, 3, "three levels nest");
-  assert.match(deep, /<\/ul>\s*<\/li>\s*<li[^>]*>\s*<p[^>]*>d<\/p>/,
+  assert.match(deep, /<\/ul><\/li><li[^>]*>d<\/li>/,
     "the outer sibling is a top-level item after the nested blocks close");
+
+  // Loose lists and multi-paragraph items keep their <p> wrappers.
+  const loose = render("- first\n\n  second\n\n- third");
+  assert.match(loose, /<li[^>]*><p[^>]*>first<\/p><p[^>]*>second<\/p><\/li><li[^>]*><p[^>]*>third<\/p><\/li>/,
+    "loose list items and multi-paragraph items preserve paragraph wrappers");
+
+  // Ordered lists preserve start attributes and place markers outside.
+  const ordered = render("3. third\n4. fourth");
+  assert.match(ordered, /<ol[^>]*start="3"[^>]*class="[^"]*list-decimal list-outside pl-6[^"]*"|<ol[^>]*class="[^"]*list-decimal list-outside pl-6[^"]*"[^>]*start="3"/,
+    "ordered lists preserve non-default start attributes and use outside markers");
+  assert.match(ordered, /<li[^>]*>third<\/li><li[^>]*>fourth<\/li>/,
+    "tight ordered list items render inline without <p> wrappers");
+
+  // Task lists keep list-none and place checkboxes in the left gutter of pl-6 task items
+  // so wrapped lines and multi-paragraph task items align with the first line of text.
+  const tasks = render("- [x] done\n- [ ] todo");
+  assert.match(tasks, /<ul[^>]*class="[^"]*list-none[^"]*"/, "task lists keep list-none");
+  assert.equal((tasks.match(/type="checkbox"/g) ?? []).length, 2, "task list checkboxes render");
+  assert.match(tasks, /<li class="leading-relaxed task-list-item relative pl-6"><input type="checkbox"[^>]*class="task-list-item-checkbox absolute top-1\.5 left-0 m-0"[^>]*\/>done<\/li>/,
+    "task list items indent text with pl-6, place checkboxes in the gutter, and strip the leading space after the checkbox");
+  assert.ok(!branch.includes("task-list-item"), "non-task lists do not receive task-list-item styling");
 
   // A nested blockquote with trailing content: the trailing paragraph is a sibling.
   const quote = render("> outer\n> > inner\n\ntrailing");
@@ -805,16 +869,27 @@ function sidebarWorkbenchPreservesDestinations() {
   }
   // The active destination (health) is still marked.
   assert.ok(html.includes('aria-current="page"'), "the active destination is marked");
-  // Chat is the one primary destination outside the menu, and the menu is a
-  // primary control: it sits above the conversation list, not below it.
-  const chatIdx = html.indexOf(">Chat<");
+  // The expanded canonical sidebar omits the redundant standalone Chat row
+  // between the Workbench menu and the conversation list, and does not move
+  // Chat into the Workbench menu.
   const workbenchIdx = html.indexOf("data-workbench-menu");
   const sessionsIdx = html.indexOf('aria-label="Chat sessions grouped by work type"');
-  assert.ok(chatIdx >= 0 && workbenchIdx >= 0 && sessionsIdx >= 0,
-    "the primary destination, the Workbench menu and the conversation list all render");
+  assert.ok(workbenchIdx >= 0 && sessionsIdx >= 0,
+    "the Workbench menu and the conversation list both render");
   assert.ok(workbenchIdx < sessionsIdx,
     "the Workbench menu sits with the primary controls above the conversation list");
-  assert.equal((html.match(/>Chat</g) ?? []).length, 1, "Chat is not duplicated inside the Workbench menu");
+  assert.equal((html.match(/>Chat</g) ?? []).length, 0,
+    "the redundant standalone Chat row is removed and not duplicated inside the Workbench menu");
+  // The collapsed rail still offers its Chat destination icon.
+  const railHtml = renderToStaticMarkup(React.createElement(I18nProvider, null,
+    React.createElement(OcgSidebar, {
+      sessions: [], activeSessionId: "", collapsed: true, onToggle: () => undefined,
+      onSelect: () => undefined, onNewChat: () => undefined,
+      runtimeStatus: { state: "connected", detailCode: "provider-ready", detail: "" },
+      runtimeAuthority: "canonical", activeView: "health", attentionCount: 0,
+      onNavigate: () => undefined,
+    })));
+  assert.ok(railHtml.includes('aria-label="Chat"'), "the collapsed rail preserves its Chat destination control");
   // The Project selector is no longer a sidebar control, and neither is a
   // second copy of New chat or the account control.
   const sidebar = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/ocg-sidebar.tsx"), "utf8");
@@ -903,22 +978,27 @@ function accountMenuOrderAndForm() {
 
   const remote = render({ open: true, email: "operator@example.com", onLogout: () => undefined, onSettingsClick: () => undefined });
   assert.deepEqual(items(remote), [
-    { disabled: true, text: "operator@example.com" },
     { disabled: false, text: "Log out" },
     { disabled: false, text: "Open settings" },
-  ], "remote: identity (non-actionable), then Log out, then Open settings");
-  assert.ok(remote.includes(">operator@example.com<"), "the trigger and the identity row name the signed-in operator");
+  ], "remote: Log out, then Open settings, with no duplicate identity row inside the popup");
+  assert.ok(remote.slice(0, remote.indexOf('role="menu"')).includes(">operator@example.com<"),
+    "the expanded trigger names the signed-in operator");
+  assert.ok(!remote.slice(remote.indexOf('role="menu"')).includes("operator@example.com"),
+    "the popup omits the duplicate identity row");
 
   const local = render({ open: true, email: null, onSettingsClick: () => undefined });
   assert.deepEqual(items(local), [
-    { disabled: true, text: "Local operator" },
     { disabled: false, text: "Open settings" },
-  ], "local: identity (non-actionable), then Open settings, and no logout item");
+  ], "local: Open settings only, with no duplicate identity row and no logout item");
+  assert.ok(local.slice(0, local.indexOf('role="menu"')).includes(">Local operator<"),
+    "the expanded trigger names the local operator");
+  assert.ok(!local.slice(local.indexOf('role="menu"')).includes("Local operator"),
+    "the popup omits the duplicate local-operator row");
   assert.ok(!local.includes("Log out"), "local mode offers nothing to log out of");
 
   // The collapsed rail renders the same menu, reachable from its own icon.
   const rail = render({ open: true, variant: "rail", email: "operator@example.com", onLogout: () => undefined, onSettingsClick: () => undefined });
-  assert.deepEqual(items(rail), items(remote), "the rail menu carries the identical identity and actions");
+  assert.deepEqual(items(rail), items(remote), "the rail menu carries the identical actions");
   const railTrigger = rail.slice(0, rail.indexOf('role="menu"'));
   assert.ok(railTrigger.includes('aria-label="Account"'), "the rail account icon is named for assistive technology");
   const triggerMarkup = railTrigger.slice(railTrigger.indexOf("<button"));
@@ -931,7 +1011,7 @@ function accountMenuOrderAndForm() {
 
   // Ordering and actions are declared once, not per placement.
   const account = fs.readFileSync(path.join(frontend, "components/ocg/sidebar/account-menu.tsx"), "utf8");
-  assert.equal((account.match(/<DropdownMenuItem/g) ?? []).length, 3, "there is exactly one definition of the three rows");
+  assert.equal((account.match(/<DropdownMenuItem/g) ?? []).length, 2, "there is one definition of the two action rows");
 }
 
 /**
@@ -1483,6 +1563,233 @@ async function boundedMessagesExpandAndCollapseForBothRoles() {
   }
 }
 
+/**
+ * Context efficiency help opens and dismisses through its real interaction
+ * handlers without forced-open test props or menu semantics.
+ */
+async function contextHelpOpensAndDismissesThroughRealHandlers() {
+  const Fragment = Symbol("fragment");
+  const rt = { slots: [], cursor: 0, effects: [], refs: new WeakMap() };
+  const reactStub = {
+    Fragment,
+    useState(initial) {
+      const i = rt.cursor++;
+      if (!(i in rt.slots)) rt.slots[i] = { value: typeof initial === "function" ? initial() : initial };
+      const slot = rt.slots[i];
+      const set = (nextValue) => {
+        const next = typeof nextValue === "function" ? nextValue(slot.value) : nextValue;
+        if (next !== slot.value) slot.value = next;
+      };
+      return [slot.value, set];
+    },
+    useRef(initial) {
+      const i = rt.cursor++;
+      if (!(i in rt.slots)) rt.slots[i] = { value: { current: initial } };
+      return rt.slots[i].value;
+    },
+    useId() {
+      const i = rt.cursor++;
+      if (!(i in rt.slots)) rt.slots[i] = { value: `context-help-${i}` };
+      return rt.slots[i].value;
+    },
+    useEffect(fn, deps) {
+      const i = rt.cursor++;
+      const slot = rt.slots[i] ?? (rt.slots[i] = {});
+      const changed = !deps || !slot.deps || deps.length !== slot.deps.length
+        || deps.some((depth, index) => depth !== slot.deps[index]);
+      slot.deps = deps;
+      if (changed) rt.effects.push({ i, fn });
+    },
+  };
+  const jsxRuntime = {
+    Fragment,
+    jsx: (type, props, key) => ({ type, props: props || {}, key }),
+    jsxs: (type, props, key) => ({ type, props: props || {}, key }),
+  };
+
+  let triggerFocusCount = 0;
+  let triggerRect = { top: 200, bottom: 220, left: 1100, right: 1240, width: 140, height: 20 };
+  let scrollParentRect = { top: 60, bottom: 860, left: 1080, right: 1440, width: 360, height: 800 };
+  const scrollParentNode = {
+    getBoundingClientRect() { return scrollParentRect; },
+  };
+  const triggerNode = {
+    contains(target) { return target === triggerNode; },
+    focus() { triggerFocusCount += 1; },
+    getBoundingClientRect() { return triggerRect; },
+    closest(selector) { return selector === "[data-usage-surface]" ? scrollParentNode : null; },
+  };
+  const contentNode = {
+    contains(target) { return target === contentNode; },
+    getBoundingClientRect() { return { top: 0, bottom: 80, left: 1100, right: 1420, width: 320, height: 80 }; },
+  };
+
+  const expandTree = (node) => {
+    if (!node || typeof node !== "object") return node;
+    if (Array.isArray(node)) return node.map(expandTree);
+    if (typeof node.type === "function") return expandTree(node.type(node.props));
+    const ref = node.props && node.props.ref;
+    if (ref && typeof ref === "object") {
+      if (node.props["data-context-help-trigger"] !== undefined) ref.current = triggerNode;
+      else if (node.props["data-context-help-popover"] !== undefined) ref.current = contentNode;
+    }
+    const children = node.props && node.props.children !== undefined
+      ? expandTree(node.props.children)
+      : undefined;
+    return { ...node, props: { ...node.props, children } };
+  };
+
+  const findAttr = (node, attr) => {
+    if (!node || typeof node !== "object") return null;
+    if (Array.isArray(node)) { for (const child of node) { const hit = findAttr(child, attr); if (hit) return hit; } return null; }
+    if (node.props && node.props[attr] !== undefined) return node;
+    return findAttr(node.props && node.props.children, attr);
+  };
+  const textOf = (node) => {
+    if (node === null || node === undefined || typeof node === "boolean") return "";
+    if (typeof node === "string" || typeof node === "number") return String(node);
+    if (Array.isArray(node)) return node.map(textOf).join("");
+    if (node.props && node.props.children) return textOf(node.props.children);
+    return "";
+  };
+
+  const listeners = new Map();
+  const OriginalDocument = global.document;
+  const OriginalWindow = global.window;
+  global.document = {
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      listeners.get(type)?.delete(fn);
+    },
+  };
+  global.window = {
+    innerHeight: 900,
+    innerWidth: 1440,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+
+  const usageValuesPath = path.join(frontend, "components/ocg/usage/usage-values.tsx");
+  const savedStubs = moduleStubs;
+  const savedUsageValues = require.cache[usageValuesPath];
+  moduleStubs = {
+    react: reactStub,
+    "react/jsx-runtime": jsxRuntime,
+    "@/lib/utils": { cn: (...parts) => parts.flat().filter(Boolean).join(" ") },
+    "../i18n": {
+      useI18n: () => ({
+        t: (key) => key === "usage.avoided"
+          ? "Schema bytes avoided"
+          : key === "usage.efficiencyNote"
+            ? "Schema bytes avoided = recorded full baseline − actual schemas. Cache counters and capsule bytes are not token or dollar savings."
+            : key,
+      }),
+    },
+  };
+  delete require.cache[usageValuesPath];
+
+  try {
+    const { ContextMetrics } = require(usageValuesPath);
+    const q = (value) => ({ value, completeness: "complete" });
+    const totals = {
+      context_costs: {
+        wire_bytes: q(2048), tool_schema_bytes: q(512), full_schema_baseline_bytes: q(4096),
+        schema_bytes_saved: q(3584), capsule_bytes: q(0), capsule_injected_requests: q(0),
+        canonical_message_bytes: q(1024), tool_result_bytes: q(512),
+      },
+      tokens: { cache_read: q(0) },
+    };
+
+    const render = () => {
+      rt.cursor = 0;
+      rt.effects = [];
+      return expandTree(ContextMetrics({ totals, avoidedHelp: true }));
+    };
+    const flush = () => {
+      const run = rt.effects;
+      rt.effects = [];
+      for (const { i, fn } of run) {
+        const slot = rt.slots[i];
+        if (slot.cleanup) { slot.cleanup(); slot.cleanup = undefined; }
+        const cleanup = fn();
+        if (typeof cleanup === "function") slot.cleanup = cleanup;
+      }
+    };
+
+    // 1. Initial closed state
+    let tree = render();
+    flush();
+    let trigger = findAttr(tree, "data-context-help-trigger");
+    assert.ok(trigger, "the avoided-schema trigger renders");
+    assert.equal(trigger.props["aria-expanded"], false, "starts collapsed");
+    assert.equal(trigger.props["aria-haspopup"], undefined, "does not emit menu semantics");
+    assert.equal(trigger.props["aria-describedby"], undefined, "no describedby while closed");
+    assert.equal(findAttr(tree, "data-context-help-popover"), null, "popover is absent while closed");
+
+    // 2. Open via real onClick handler (ample space below -> data-side="bottom")
+    trigger.props.onClick();
+    tree = render();
+    flush();
+    trigger = findAttr(tree, "data-context-help-trigger");
+    let popover = findAttr(tree, "data-context-help-popover");
+    assert.equal(trigger.props["aria-expanded"], true, "reports expanded when opened");
+    assert.ok(popover, "popover renders when opened");
+    assert.equal(popover.props.role, "note", "uses non-modal explanatory note semantics");
+    assert.equal(popover.props["data-side"], "bottom", "opens below when ample space exists below");
+    assert.match(popover.props.className, /\btop-full\b/, "positions below trigger when ample space exists");
+    assert.equal(trigger.props["aria-controls"], popover.props.id, "trigger controls the popover id");
+    assert.equal(trigger.props["aria-describedby"], popover.props.id, "trigger associates with the explanation id");
+    assert.equal(textOf(popover), "Schema bytes avoided = recorded full baseline − actual schemas. Cache counters and capsule bytes are not token or dollar savings.");
+
+    // 3. Dismiss via Escape key and restore focus to trigger
+    let escapePrevented = false;
+    for (const fn of listeners.get("keydown") ?? []) {
+      fn({ key: "Escape", defaultPrevented: false, preventDefault() { escapePrevented = true; } });
+    }
+    assert.equal(escapePrevented, true, "Escape prevents default");
+    assert.equal(triggerFocusCount, 1, "Escape restores focus to the trigger");
+    tree = render();
+    flush();
+    assert.equal(findAttr(tree, "data-context-help-trigger").props["aria-expanded"], false, "Escape closes the popover");
+    assert.equal(findAttr(tree, "data-context-help-popover"), null, "popover unmounts after Escape");
+
+    // 4. Re-open near the bottom of the scroll viewport (flips to data-side="top") and dismiss via outside pointer interaction
+    triggerRect = { top: 820, bottom: 840, left: 1100, right: 1240, width: 140, height: 20 };
+    findAttr(tree, "data-context-help-trigger").props.onClick();
+    tree = render();
+    flush();
+    popover = findAttr(tree, "data-context-help-popover");
+    assert.ok(popover, "re-opens on click");
+    assert.equal(popover.props["data-side"], "top", "flips above trigger when near the bottom of the scroll viewport");
+    assert.match(popover.props.className, /\bbottom-full\b/, "positions above trigger when space below is insufficient");
+    for (const fn of listeners.get("mousedown") ?? []) {
+      fn({ target: contentNode });
+    }
+    tree = render();
+    flush();
+    assert.ok(findAttr(tree, "data-context-help-popover"), "clicking inside the popover keeps it open");
+    for (const fn of listeners.get("mousedown") ?? []) {
+      fn({ target: {} });
+    }
+    tree = render();
+    flush();
+    assert.equal(findAttr(tree, "data-context-help-trigger").props["aria-expanded"], false, "clicking outside closes the popover");
+    assert.equal(findAttr(tree, "data-context-help-popover"), null, "popover unmounts on outside click");
+  } finally {
+    global.document = OriginalDocument;
+    global.window = OriginalWindow;
+    moduleStubs = savedStubs;
+    if (savedUsageValues) require.cache[usageValuesPath] = savedUsageValues;
+    else delete require.cache[usageValuesPath];
+    for (const key of Object.keys(require.cache)) {
+      if (key.startsWith(path.join(frontend, "components"))) delete require.cache[key];
+    }
+  }
+}
+
 (async () => {
   for (const check of [
     conversationUsageGateChecksCanonicalIdentity,
@@ -1513,6 +1820,7 @@ async function boundedMessagesExpandAndCollapseForBothRoles() {
     highlightingThemeIsScoped,
     markdownStreamingRecoveryProbe,
     boundedMessagesExpandAndCollapseForBothRoles,
+    contextHelpOpensAndDismissesThroughRealHandlers,
   ]) {
     await check();
   }

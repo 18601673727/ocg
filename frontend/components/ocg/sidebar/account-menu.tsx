@@ -2,12 +2,14 @@
 
 /**
  * The one account menu, shared by the expanded sidebar footer and the collapsed
- * rail so both offer the same identity and actions in the same order:
+ * rail so both offer the same actions in the same order:
  *
- * 1. who is signed in — the signed Access email, or the local-operator label
- *    where there is no signed identity. Never actionable, never a `user_id`.
- * 2. Log out, where signing out is a real operation (remote sessions only).
- * 3. Open settings, where Settings is offered.
+ * 1. Log out, where signing out is a real operation (remote sessions only).
+ * 2. Open settings, where Settings is offered.
+ *
+ * The expanded trigger names who is signed in — the signed Access email, or the
+ * local-operator label where there is no signed identity — and the popup omits
+ * a duplicate disabled identity row.
  *
  * Signing out precedes Settings because it ends the session this menu names,
  * while Settings stays a workspace destination.
@@ -88,9 +90,6 @@ export function AccountMenu({
             : "top-auto right-0 bottom-full left-0 mb-1 mt-0"
         }
       >
-        <DropdownMenuItem disabled className="font-medium">
-          <span className="min-w-0 flex-1 truncate">{label}</span>
-        </DropdownMenuItem>
         {onLogout && (
           <DropdownMenuItem onSelect={onLogout}>
             <LogOut className="size-3.5 shrink-0" aria-hidden="true" />

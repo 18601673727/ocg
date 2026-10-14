@@ -59,7 +59,7 @@ export function ConversationInspector({ usage, execution, accounting, observabil
                  />
                  <ActivityMetrics totals={data.totals} /></section>
                 <section className="border-t border-border pt-3"><h3 className="text-xs font-semibold">{t("usage.breakdown")}</h3><UsageBreakdownList rows={data.models} /></section>
-                <section className="border-t border-border pt-3"><h3 className="text-xs font-semibold">{t("usage.context")}</h3><ContextMetrics totals={data.totals} /><p className="mt-2 text-xs text-muted-foreground">{t("usage.efficiencyNote")}</p></section>
+                <section className="border-t border-border pt-3"><h3 className="text-xs font-semibold">{t("usage.context")}</h3><ContextMetrics totals={data.totals} avoidedHelp /></section>
               </> : <p className="text-xs text-muted-foreground">{t("usage.noActivity")}</p>}
               <section className="border-t border-border pt-3"><dl>
                 <UsageMetric label="usage.created">{usageTimestamp(data.created_at, locale)}</UsageMetric>

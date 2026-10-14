@@ -158,9 +158,8 @@ export function OcgSidebar({
   const workspaceNav = canonicalMode
     ? WORKSPACE_NAV.filter(item => ["home", "chat", "job-execution", "health", "attention", "usage", "control-center"].includes(item.target))
     : WORKSPACE_NAV;
-  // In canonical mode Chat is the one primary destination; every other
-  // destination moves into the Workbench menu so none is lost.
-  const primaryNav = canonicalMode ? workspaceNav.filter(item => item.target === "chat") : workspaceNav;
+  // In canonical mode every non-Chat destination lives in the Workbench menu
+  // while the conversation list and New chat serve Chat directly.
   const workbenchNav = canonicalMode ? workspaceNav.filter(item => item.target !== "chat") : [];
   const hasNav = Boolean(onNavigate);
   const navLabel = (item: (typeof WORKSPACE_NAV)[number]) => t(item.labelKey);
@@ -372,10 +371,10 @@ export function OcgSidebar({
 
         {primaryControls}
 
-        {hasNav && (
+        {hasNav && !canonicalMode && (
           <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
             <ul className="flex flex-col gap-px">
-              {(canonicalMode ? primaryNav : workspaceNav.slice(0, 4)).map(renderWorkspaceItem)}
+              {workspaceNav.slice(0, 4).map(renderWorkspaceItem)}
             </ul>
             {runtimeAuthority === "mock" && <details open={workspaceNav.slice(4).some((item) => item.target === activeView) || undefined} className="mt-1">
               <summary className={cn("cursor-pointer rounded-md px-2 py-1.5", TYPOGRAPHY_SCALE.caption, "text-muted-foreground hover:bg-muted/60")}>{t("nav.tools")}</summary>

@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { STATUS_TEXT } from "../primitives/tone";
 import { formatCount, UNKNOWN } from "@/lib/format";
@@ -32,12 +32,129 @@ export function UsageMoney({ cost }: { cost: UsageCost }) {
   </span>;
 }
 
-export function UsageMetric({ label, children, field }: { label: I18nKey; children: ReactNode; field?: string }) {
+export function UsageMetric({ label, labelNode, children, field }: { label: I18nKey; labelNode?: ReactNode; children: ReactNode; field?: string }) {
   const { t } = useI18n();
-  return <div className="flex min-w-0 items-baseline justify-between gap-3 py-1.5" data-usage-field={field}>
-    <dt className="text-xs text-muted-foreground">{t(label)}</dt>
+  return <div className="relative flex min-w-0 items-baseline justify-between gap-3 py-1.5" data-usage-field={field}>
+    <dt className="text-xs text-muted-foreground">{labelNode ?? t(label)}</dt>
     <dd className="m-0 break-words text-right text-xs font-medium tabular-nums">{children}</dd>
   </div>;
+}
+
+function AvoidedSchemaHelp() {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const [placement, setPlacement] = useState<"bottom" | "top">("bottom");
+  const popoverId = useId();
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+
+  const computePlacement = (estimatedHeight = 96): "bottom" | "top" => {
+    const trigger = triggerRef.current;
+    if (!trigger || typeof trigger.getBoundingClientRect !== "function" || typeof window === "undefined") {
+      return "bottom";
+    }
+    const triggerRect = trigger.getBoundingClientRect();
+    const scrollParent = typeof trigger.closest === "function"
+      ? (trigger.closest("[data-usage-surface]") as HTMLElement | null)
+      : null;
+    const parentRect = scrollParent && typeof scrollParent.getBoundingClientRect === "function"
+      ? scrollParent.getBoundingClientRect()
+      : null;
+    const visibleTop = parentRect ? Math.max(0, parentRect.top) : 0;
+    const visibleBottom = parentRect ? Math.min(window.innerHeight, parentRect.bottom) : window.innerHeight;
+    const popoverHeight = contentRef.current && typeof contentRef.current.getBoundingClientRect === "function"
+      ? contentRef.current.getBoundingClientRect().height || estimatedHeight
+      : estimatedHeight;
+    const spaceBelow = visibleBottom - triggerRect.bottom;
+    const spaceAbove = triggerRect.top - visibleTop;
+    return spaceBelow < popoverHeight + 8 && spaceAbove > spaceBelow ? "top" : "bottom";
+  };
+
+  useEffect(() => {
+    if (!open) return;
+
+    const updatePlacement = () => {
+      setPlacement(computePlacement());
+    };
+    updatePlacement();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) {
+        event.preventDefault();
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+
+    const handlePointerOutside = (event: MouseEvent | TouchEvent) => {
+      const target = event.target as Node | null;
+      if (
+        target &&
+        !contentRef.current?.contains(target) &&
+        !triggerRef.current?.contains(target)
+      ) {
+        setOpen(false);
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("mousedown", handlePointerOutside);
+    document.addEventListener("touchstart", handlePointerOutside);
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("resize", updatePlacement);
+      window.addEventListener("scroll", updatePlacement, true);
+    }
+
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("mousedown", handlePointerOutside);
+      document.removeEventListener("touchstart", handlePointerOutside);
+      if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
+        window.removeEventListener("resize", updatePlacement);
+        window.removeEventListener("scroll", updatePlacement, true);
+      }
+    };
+  }, [open]);
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        data-context-help-trigger=""
+        aria-expanded={open}
+        aria-controls={popoverId}
+        aria-describedby={open ? popoverId : undefined}
+        onClick={() => {
+          setOpen((value) => {
+            const next = !value;
+            if (next) {
+              setPlacement(computePlacement());
+            }
+            return next;
+          });
+        }}
+        className="cursor-pointer text-left text-xs text-muted-foreground underline decoration-muted-foreground/60 decoration-dashed underline-offset-4 transition-colors hover:text-foreground hover:decoration-foreground focus-visible:rounded-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30"
+      >
+        {t("usage.avoided")}
+      </button>
+      {open ? (
+        <div
+          ref={contentRef}
+          id={popoverId}
+          role="note"
+          data-context-help-popover=""
+          data-side={placement}
+          className={cn(
+            "absolute right-0 left-0 z-50 max-w-xs rounded-md border border-border bg-popover p-2.5 text-xs leading-relaxed font-normal text-popover-foreground shadow-md",
+            placement === "top" ? "bottom-full mb-1" : "top-full mt-1",
+          )}
+        >
+          <p className="m-0">{t("usage.efficiencyNote")}</p>
+        </div>
+      ) : null}
+    </>
+  );
 }
 
 export function TokenMetrics({ totals }: { totals: UsageTotals }) {
@@ -51,13 +168,13 @@ export function TokenMetrics({ totals }: { totals: UsageTotals }) {
   </dl>;
 }
 
-export function ContextMetrics({ totals, full = false }: { totals: UsageTotals; full?: boolean }) {
+export function ContextMetrics({ totals, full = false, avoidedHelp = false }: { totals: UsageTotals; full?: boolean; avoidedHelp?: boolean }) {
   const c = totals.context_costs;
   return <dl>
     <UsageMetric label="usage.wire" field="context.wire"><UsageNumber quantity={c.wire_bytes} bytes /></UsageMetric>
     <UsageMetric label="usage.schemas" field="context.schemas"><UsageNumber quantity={c.tool_schema_bytes} bytes /></UsageMetric>
     {full ? <UsageMetric label="usage.baseline" field="context.baseline"><UsageNumber quantity={c.full_schema_baseline_bytes} bytes /></UsageMetric> : null}
-    <UsageMetric label="usage.avoided" field="context.avoided"><UsageNumber quantity={c.schema_bytes_saved} bytes /></UsageMetric>
+    <UsageMetric label="usage.avoided" labelNode={avoidedHelp ? <AvoidedSchemaHelp /> : undefined} field="context.avoided"><UsageNumber quantity={c.schema_bytes_saved} bytes /></UsageMetric>
     <UsageMetric label="usage.capsule" field="context.capsule"><UsageNumber quantity={c.capsule_bytes} bytes /></UsageMetric>
     {full ? <>
       <UsageMetric label="usage.capsuleRequests"><UsageNumber quantity={c.capsule_injected_requests} /></UsageMetric>

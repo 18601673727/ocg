@@ -379,9 +379,16 @@ function inline(ctx: WalkContext, tokens: Token[], from = 0, to = tokens.length)
               checked={token.content.includes("checked")}
               disabled
               readOnly
-              className="mr-2 align-middle"
+              className="task-list-item-checkbox absolute top-1.5 left-0 m-0"
             />,
           );
+          if (i + 1 < to && tokens[i + 1].type === "text" && tokens[i + 1].content.startsWith(" ")) {
+            const trimmed = tokens[i + 1].content.slice(1);
+            if (trimmed) {
+              out.push(<Fragment key={key(ctx)}>{trimmed}</Fragment>);
+            }
+            i += 1;
+          }
         }
         break;
       }
@@ -458,7 +465,7 @@ function listItem(ctx: WalkContext, tokens: Token[], open: number, limit: number
   const isTask = attr(tokens[open], "class").includes("task-list-item");
 
   return [
-    <li key={key(ctx)} className={cn("leading-relaxed", isTask && "task-list-item")}>
+    <li key={key(ctx)} className={cn("leading-relaxed", isTask && "task-list-item relative pl-6")}>
       {children}
     </li>,
     close,
@@ -490,7 +497,11 @@ function walk(ctx: WalkContext, tokens: Token[], from = 0, to = tokens.length): 
             ? inline(ctx, content.children)
             : [];
         i += 2;
-        out.push(<p key={key(ctx)} className="mb-3">{body}</p>);
+        if (token.hidden) {
+          out.push(<Fragment key={key(ctx)}>{body}</Fragment>);
+        } else {
+          out.push(<p key={key(ctx)} className="mb-3">{body}</p>);
+        }
         break;
       }
       case "bullet_list_open":
@@ -514,8 +525,8 @@ function walk(ctx: WalkContext, tokens: Token[], from = 0, to = tokens.length): 
         const listClass = taskList
           ? "mb-3 space-y-1 list-none"
           : ordered
-            ? "list-decimal list-inside mb-3 space-y-1"
-            : "list-disc list-inside mb-3 space-y-1";
+            ? "list-decimal list-outside pl-6 mb-3 space-y-1"
+            : "list-disc list-outside pl-6 mb-3 space-y-1";
 
         out.push(
           ordered ? (

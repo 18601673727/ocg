@@ -4,7 +4,7 @@
  */
 
 /** Bounded height of a collapsed message: about half the viewport. */
-export const BOUNDED_MESSAGE_CLASS = "max-h-[55vh] overflow-y-auto";
+export const BOUNDED_MESSAGE_CLASS = "ocg-subtle-scrollbar max-h-[55vh] overflow-y-auto";
 
 /** Which toggle a message offers: none for content that fits. */
 export function boundedToggle(overflowing: boolean, expanded: boolean): "expand" | "collapse" | null {
