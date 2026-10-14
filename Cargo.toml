@@ -36,5 +36,6 @@ time = { version = "=0.3.55", default-features = false, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 # Opens Workspace files component by component without following links; the
-# same rustix that fs4 already builds.
-rustix = { version = "1", features = ["fs"] }
+# same rustix that fs4 already builds. `process` waits for, and kills the
+# process group of, a Workspace command.
+rustix = { version = "1", features = ["fs", "process"] }

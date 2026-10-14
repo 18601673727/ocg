@@ -1,14 +1,17 @@
 //! `ocg workspace-read <objective>`: the executable's opt-in, one-shot Job
 //! that may read files of a Workspace the operator authorized, and
 //! `ocg workspace-edit <objective>`, its counterpart that may also create
-//! and conditionally update them. This module belongs to the executable, not
-//! to the library.
+//! and conditionally update them, and `ocg workspace-code <objective>`, which
+//! may also build and test the Workspace. This module belongs to the
+//! executable, not to the library.
 //!
 //! It runs the ordinary host and submits exactly one Job through the host's
-//! scheduler, offering only `workspace_read_file`, or, for `workspace-edit`,
-//! `workspace_read_file` and `workspace_write_file`, bound to the Workspace
-//! named by [`WORKSPACE_ROOT_VARIABLE`]. Writing is offered by that command
-//! alone; every write is recorded, with its contents, in plaintext tool
+//! scheduler, offering only `workspace_read_file`; for `workspace-edit`,
+//! `workspace_read_file` and `workspace_write_file`; for `workspace-code`,
+//! those and `workspace_run_command`; all bound to the Workspace named by
+//! [`WORKSPACE_ROOT_VARIABLE`]. Writing is offered by the last two commands
+//! alone, and running commands by `workspace-code` alone; every write is
+//! recorded, with its contents, and every command's output in plaintext tool
 //! evidence. The Provider and model are named by
 //! the environment too. The credential is named only by reference: the
 //! existing resolver reads it when the request is built, and it is never
@@ -35,7 +38,7 @@ use ocg::orchestration::execution_runtime::{
 };
 use ocg::orchestration::workspace_read::{self, Workspace, WorkspaceError};
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-use ocg::orchestration::workspace_write;
+use ocg::orchestration::{workspace_command, workspace_write};
 use ocg::persistence::{
     AvailabilityStatRecord, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorType, JobId,
     JobInputDraft, LlmConfig, LlmParameters, LlmTransport, MetricsRecord, ModelCapability,
@@ -53,6 +56,10 @@ pub const COMMAND: &str = "workspace-read";
 /// The command that selects the mode that may also write files.
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 pub const EDIT_COMMAND: &str = "workspace-edit";
+/// The command that selects the mode that may also run build and test
+/// commands.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+pub const CODE_COMMAND: &str = "workspace-code";
 /// The Workspace the Job may read from: an absolute path to a directory.
 pub const WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
 /// The Provider's OpenAI-compatible endpoint, an `https://` URL.
@@ -70,6 +77,10 @@ pub enum Mode {
     /// and `workspace_write_file`.
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     Edit,
+    /// Read, write, and build and test: `workspace_read_file`,
+    /// `workspace_write_file` and `workspace_run_command`.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    Code,
 }
 
 impl Mode {
@@ -79,6 +90,8 @@ impl Mode {
             COMMAND => Some(Self::Read),
             #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
             EDIT_COMMAND => Some(Self::Edit),
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            CODE_COMMAND => Some(Self::Code),
             _ => None,
         }
     }
@@ -91,6 +104,8 @@ impl Mode {
             Self::Read => COMMAND,
             #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
             Self::Edit => EDIT_COMMAND,
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            Self::Code => CODE_COMMAND,
         }
     }
 }
@@ -194,6 +209,22 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 "OCG records the path and complete content of every write, and an update's expected content, in plaintext tool evidence"
             );
             workspace_write::edit_file_tools(workspace)?
+        }
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        Mode::Code => {
+            eprintln!(
+                "OCG Workspace authorized for {}, {} and {}: {root}",
+                workspace_read::TOOL_NAME,
+                workspace_write::TOOL_NAME,
+                workspace_command::TOOL_NAME
+            );
+            eprintln!(
+                "OCG records the path and complete content of every write, an update's expected content, and every command's output in plaintext tool evidence, and sends command output to the Provider"
+            );
+            eprintln!(
+                "OCG runs `cargo check` and `cargo test` in the Workspace with its own permissions; build scripts and tests run project code unsandboxed, so authorize only a Workspace you trust"
+            );
+            workspace_command::code_tools(workspace)?
         }
     };
     let settled = Rc::new(RefCell::new(None));
@@ -411,9 +442,12 @@ async fn report(
         };
         let _ = match evidence.outcome.as_ref().map(|outcome| &outcome.fact) {
             None => writeln!(report),
-            Some(ToolOutcome::Completed { result }) => {
-                writeln!(report, "; completed, {} result bytes", result.len())
-            }
+            Some(ToolOutcome::Completed { result }) => writeln!(
+                report,
+                "; completed, {}{} result bytes",
+                shown_result(&evidence.name, result.as_str()),
+                result.len()
+            ),
             Some(ToolOutcome::NotApplied { message }) => {
                 writeln!(report, "; not applied: {message}")
             }
@@ -456,6 +490,30 @@ fn shown_arguments(tool: &str, arguments: &str) -> String {
     }
     let _ = tool;
     arguments.to_owned()
+}
+
+/// What the report shows of a completed call's result besides its size: a
+/// command's exit and whether its output was truncated, never the output.
+fn shown_result(tool: &str, result: &str) -> String {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    if tool == workspace_command::TOOL_NAME {
+        let Ok(result) = serde_json::from_str::<serde_json::Value>(result) else {
+            return String::new();
+        };
+        let exit = match (&result["exit_code"], &result["signal"]) {
+            (serde_json::Value::Number(code), _) => format!("exit code {code}"),
+            (_, serde_json::Value::Number(signal)) => format!("ended by signal {signal}"),
+            _ => "no exit code".to_owned(),
+        };
+        let truncated = if result["truncated"] == serde_json::Value::Bool(true) {
+            ", output truncated"
+        } else {
+            ""
+        };
+        return format!("{exit}{truncated}, ");
+    }
+    let _ = (tool, result);
+    String::new()
 }
 
 /// One line per Provider request: what it answered and the Token usage its
@@ -814,5 +872,50 @@ mod tests {
             read,
             "a read is shown as recorded"
         );
+    }
+
+    #[test]
+    fn the_coding_mode_is_selected_by_its_own_command_only() {
+        assert_eq!(Mode::of("workspace-code"), Some(Mode::Code));
+        assert_eq!(Mode::Code.command(), CODE_COMMAND);
+        for other in [
+            "workspace-run",
+            "workspace-command",
+            "Workspace-Code",
+            "code",
+        ] {
+            assert_eq!(Mode::of(other), None, "{other:?}");
+        }
+        assert_eq!(
+            Error::Usage(Mode::Code.command()).to_string(),
+            "usage: ocg workspace-code <objective>"
+        );
+    }
+
+    #[test]
+    fn a_command_is_reported_by_its_exit_never_its_output() {
+        let failed = serde_json::json!({
+            "command": "cargo_test",
+            "exit_code": 101,
+            "stdout": "secret test output",
+            "stderr": "secret diagnostics",
+            "truncated": true,
+        })
+        .to_string();
+        let shown = shown_result("workspace_run_command", &failed);
+        assert_eq!(shown, "exit code 101, output truncated, ");
+        let signalled = r#"{"command":"cargo_test","exit_code":null,"signal":9,"stdout":"","stderr":"","truncated":false}"#;
+        assert_eq!(
+            shown_result("workspace_run_command", signalled),
+            "ended by signal 9, "
+        );
+        assert_eq!(shown_result("workspace_run_command", "not JSON"), "");
+        assert_eq!(
+            shown_result("workspace_read_file", r#"{"exit_code":1}"#),
+            "",
+            "only a command's result is described"
+        );
+        let command = r#"{"command":"cargo_test"}"#;
+        assert_eq!(shown_arguments("workspace_run_command", command), command);
     }
 }

@@ -174,13 +174,7 @@ impl Workspace {
     pub(super) fn parent<'a>(&self, path: &'a str) -> Result<(File, &'a str), Refusal> {
         let components = components(path)?;
         let (name, parents) = components.split_last().ok_or(Refusal::InvalidPath)?;
-        let mut directory = open_directory(&self.root).map_err(|_| Refusal::WorkspaceChanged)?;
-        let metadata = directory
-            .metadata()
-            .map_err(|_| Refusal::WorkspaceChanged)?;
-        if Identity::of(&metadata) != self.identity {
-            return Err(Refusal::WorkspaceChanged);
-        }
+        let mut directory = self.open_root()?;
         for parent in parents {
             directory = open_at(&directory, parent, Step::Directory)?;
             let metadata = directory.metadata().map_err(|_| Refusal::Unreadable)?;
@@ -189,6 +183,19 @@ impl Workspace {
             }
         }
         Ok((directory, *name))
+    }
+
+    /// The root, opened, when it still exists and is still the directory
+    /// that was authorized.
+    pub(super) fn open_root(&self) -> Result<File, Refusal> {
+        let directory = open_directory(&self.root).map_err(|_| Refusal::WorkspaceChanged)?;
+        let metadata = directory
+            .metadata()
+            .map_err(|_| Refusal::WorkspaceChanged)?;
+        if Identity::of(&metadata) != self.identity {
+            return Err(Refusal::WorkspaceChanged);
+        }
+        Ok(directory)
     }
 }
 

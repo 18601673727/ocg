@@ -17230,4 +17230,654 @@ mod requests_and_tool_loop {
             assert_relationships_consistent(&directory);
         }
     }
+
+    // ---- workspace_run_command ----------------------------------------------
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    mod workspace_run_command {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        use super::*;
+        use crate::orchestration::workspace_command::{self, CommandEnvironment};
+        use crate::orchestration::workspace_read::{self, Workspace};
+        use crate::orchestration::workspace_write;
+
+        const BUGGY: &str = "pub fn add(a: i32, b: i32) -> i32 {\n    a - b\n}\n";
+        const FIXED: &str = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+
+        /// A fake `cargo` that fails its test until `src/lib.rs` adds, and
+        /// logs every run beside itself, outside the Workspace.
+        const TESTING: &str = "echo run >> \"$0.log\"\n\
+            if grep -q 'a + b' src/lib.rs; then\n\
+              echo 'test tests::adds_two_numbers ... ok'\n\
+              echo 'test result: ok. 1 passed; 0 failed'\n\
+              exit 0\n\
+            fi\n\
+            echo 'test tests::adds_two_numbers ... FAILED'\n\
+            echo 'test result: FAILED. 0 passed; 1 failed'\n\
+            echo 'error: test failed, to rerun pass `--lib`' >&2\n\
+            exit 101";
+
+        /// A fake `cargo` that never finishes, with a process of its group.
+        const HANGING: &str = "echo run >> \"$0.log\"\n\
+            echo $$ > leader.tmp && mv leader.tmp leader.pid\n\
+            sleep 60 &\n\
+            echo $! > child.tmp && mv child.tmp child.pid\n\
+            touch ready\n\
+            wait";
+
+        /// A Workspace holding a buggy `src/lib.rs`, and a directory holding
+        /// a fake `cargo` that runs `script`.
+        struct Project {
+            root: PathBuf,
+            bin: PathBuf,
+            _guards: [TestRoot; 2],
+        }
+
+        fn setup(name: &str, script: &str) -> Project {
+            let (workspace_guard, root) =
+                crate::test_support::temporary_directory(SUITE, &format!("{name}-files"));
+            let (bin_guard, bin) =
+                crate::test_support::temporary_directory(SUITE, &format!("{name}-bin"));
+            std::fs::create_dir(root.join("src")).expect("create src");
+            std::fs::write(root.join("src/lib.rs"), BUGGY).expect("write src/lib.rs");
+            let cargo = bin.join("cargo");
+            std::fs::write(
+                &cargo,
+                format!("#!/bin/sh\n[ \"$1\" = warm ] && exit 0\n{script}\n"),
+            )
+            .expect("write cargo");
+            std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755))
+                .expect("make it executable");
+            // A new executable's first start may be slow, as on macOS; it
+            // must not count against a limit.
+            let warmed = std::process::Command::new(&cargo)
+                .arg("warm")
+                .status()
+                .expect("start it");
+            assert!(warmed.success());
+            Project {
+                root,
+                bin,
+                _guards: [workspace_guard, bin_guard],
+            }
+        }
+
+        impl Project {
+            fn tools(&self, directory: &DataDirectory, timeout: Duration) -> ToolExecution {
+                let path = format!("{}:/usr/bin:/bin", self.bin.display());
+                workspace_command::code_tools_with(
+                    Workspace::authorize(&self.root, directory).expect("authorize"),
+                    CommandEnvironment::from_source(move |name| {
+                        (name == "PATH").then(|| path.clone().into())
+                    }),
+                    timeout,
+                )
+                .expect("enable the tools")
+            }
+
+            /// How many times the fake `cargo` ran.
+            fn runs(&self) -> usize {
+                std::fs::read_to_string(self.bin.join("cargo.log"))
+                    .map_or(0, |log| log.lines().count())
+            }
+
+            fn source(&self) -> Option<String> {
+                std::fs::read_to_string(self.root.join("src/lib.rs")).ok()
+            }
+
+            /// Whether every process the hanging `cargo` started is gone.
+            fn stopped(&self) -> bool {
+                ["leader.pid", "child.pid"].iter().all(|file| {
+                    let text = std::fs::read_to_string(self.root.join(file)).expect("a pid");
+                    let pid = rustix::process::Pid::from_raw(text.trim().parse().expect("a pid"))
+                        .expect("a positive pid");
+                    rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)
+                })
+            }
+        }
+
+        fn until(mut condition: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "not reached in time");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn test_call(index: u32, id: &str) -> String {
+            call(
+                index,
+                id,
+                workspace_command::TOOL_NAME,
+                r#"{"command":"cargo_test"}"#,
+            )
+        }
+
+        fn test_result(passed: bool) -> Value {
+            if passed {
+                json!({
+                    "command": "cargo_test",
+                    "exit_code": 0,
+                    "stdout": "test tests::adds_two_numbers ... ok\ntest result: ok. 1 passed; 0 failed\n",
+                    "stderr": "",
+                    "truncated": false,
+                })
+            } else {
+                json!({
+                    "command": "cargo_test",
+                    "exit_code": 101,
+                    "stdout": "test tests::adds_two_numbers ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n",
+                    "stderr": "error: test failed, to rerun pass `--lib`\n",
+                    "truncated": false,
+                })
+            }
+        }
+
+        fn parsed(text: &str) -> Value {
+            serde_json::from_str(text).expect("JSON")
+        }
+
+        /// One Job that runs the hanging `cargo` and is stopped.
+        fn hanging_run(
+            handle: &DatabaseHandle,
+            llm: ProfileId,
+            tools: ToolExecution,
+            cancellation: CancellationToken,
+        ) -> (TokenRun, Looped) {
+            let run = local_run(handle, llm);
+            let looped = run_loop(
+                handle,
+                run,
+                Some(tools),
+                vec![
+                    calling(&[test_call(0, "call_test")], (10, 5)),
+                    answering("never sent", (1, 1)),
+                ],
+                cancellation,
+                |_| {},
+            );
+            (run, looped)
+        }
+
+        #[test]
+        fn a_provider_reads_sees_a_failing_test_fixes_the_code_and_sees_it_pass() {
+            let project = setup("command-loop", TESTING);
+            let (_root, directory) = data_directory("command-loop");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let first_test = tool_call(run.job, 2, 0);
+
+            // The command is admitted durably before it runs, and runs
+            // before its outcome is recorded.
+            let (seam_handle, log) = (handle.clone(), project.bin.join("cargo.log"));
+            let points = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let reached = points.clone();
+            dispatch_seam::install(move |point, call| {
+                if call != first_test {
+                    return;
+                }
+                let records = wait(seam_handle.tool_evidence(call.job, None, 10)).expect("read");
+                let record = records.iter().find(|record| record.call == first_test);
+                let runs = std::fs::read_to_string(&log).map_or(0, |log| log.lines().count());
+                match point {
+                    Point::BeforeAdmission => assert!(record.is_none() && runs == 0),
+                    Point::Admitted => {
+                        let record = record.expect("admitted");
+                        assert!(record.admission().is_some() && record.outcome.is_none());
+                        assert_eq!(runs, 0, "nothing ran yet");
+                    }
+                    Point::Ran => {
+                        assert!(record.expect("admitted").outcome.is_none());
+                        assert_eq!(runs, 1, "ran, not recorded");
+                    }
+                }
+                reached.lock().expect("lock").push(point);
+            });
+            let fix = json!({
+                "operation": "update",
+                "path": "src/lib.rs",
+                "expected_content": BUGGY,
+                "content": FIXED,
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(project.tools(&directory, crate::test_support::WAIT)),
+                vec![
+                    calling(
+                        &[call(
+                            0,
+                            "call_read",
+                            workspace_read::TOOL_NAME,
+                            r#"{"path":"src/lib.rs"}"#,
+                        )],
+                        (20, 5),
+                    ),
+                    calling(&[test_call(0, "call_test_1")], (60, 10)),
+                    calling(
+                        &[call(
+                            0,
+                            "call_fix",
+                            workspace_write::TOOL_NAME,
+                            &fix.to_string(),
+                        )],
+                        (120, 40),
+                    ),
+                    calling(&[test_call(0, "call_test_2")], (200, 10)),
+                    answering(
+                        "add subtracted; it adds now and cargo test passes.",
+                        (260, 12),
+                    ),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            let receipt = looped.settled.expect("the loop settles");
+            assert_eq!(receipt.job, run.job);
+            assert_eq!(
+                *points.lock().expect("lock"),
+                [Point::BeforeAdmission, Point::Admitted, Point::Ran]
+            );
+            assert_eq!(project.source().as_deref(), Some(FIXED));
+            assert_eq!(project.runs(), 2);
+
+            // The failing test is read by the Provider, and the Job goes on.
+            let [first, .., third, _, fifth] = looped.sent.as_slice() else {
+                panic!("five Provider requests: {}", looped.sent.len());
+            };
+            assert_eq!(
+                first
+                    .tools
+                    .iter()
+                    .map(|tool| tool.function.name.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    workspace_read::TOOL_NAME,
+                    workspace_write::TOOL_NAME,
+                    workspace_command::TOOL_NAME
+                ]
+            );
+            let failed = answer_to(third, "call_test_1").expect("answered");
+            assert_eq!(parsed(&failed), test_result(false));
+            let passed = answer_to(fifth, "call_test_2").expect("answered");
+            assert_eq!(parsed(&passed), test_result(true));
+
+            let records = evidence(&handle, run.job);
+            let [read, test_1, write, test_2] = records.as_slice() else {
+                panic!("four calls: {records:?}");
+            };
+            assert_eq!(
+                read.admission().expect("admitted").effect,
+                ToolEffect::ReadOnly
+            );
+            assert_eq!(
+                write.admission().expect("admitted").effect,
+                ToolEffect::NonIdempotent
+            );
+            for (record, request, id, result) in [
+                (test_1, 2, "call_test_1", &failed),
+                (test_2, 4, "call_test_2", &passed),
+            ] {
+                assert_eq!(record.call, tool_call(run.job, request, 0));
+                assert_eq!(
+                    (record.tool_call_id.as_str(), record.name.as_str()),
+                    (id, workspace_command::TOOL_NAME)
+                );
+                let admission = record.admission().expect("admitted");
+                assert_eq!(admission.handler_version, "workspace_run_command-1");
+                assert_eq!(admission.effect, ToolEffect::NonIdempotent);
+                assert_eq!(admission.arguments.as_str(), r#"{"command":"cargo_test"}"#);
+                assert_eq!(
+                    outcome_of(record),
+                    Some(completed(result)),
+                    "the result sent is the result recorded"
+                );
+                assert!(record.is_applied() && !record.is_unresolved());
+            }
+
+            let job = job_record(&handle, run.job);
+            assert!(job.completed_at.is_some());
+            let outputs = wait(handle.job_outputs(run.job, None, 100)).expect("outputs");
+            assert_eq!(
+                outputs.last().and_then(|output| output.summary.as_deref()),
+                Some("add subtracted; it adds now and cargo test passes.")
+            );
+            assert!(blocking(&handle, llm).is_empty(), "the Profile is released");
+            let samples = TokenRequestSample::per_request(&job_metrics(&handle, run.job))
+                .expect("per request");
+            assert_eq!(
+                samples
+                    .iter()
+                    .map(|sample| (sample.request, sample.total))
+                    .collect::<Vec<_>>(),
+                [
+                    (number(1), Some(25)),
+                    (number(2), Some(70)),
+                    (number(3), Some(160)),
+                    (number(4), Some(210)),
+                    (number(5), Some(272)),
+                ]
+            );
+
+            // Running the commands again needs an explicit acknowledgement.
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(run.job, llm, false)))),
+                Violation::RepeatedEffectNotAcknowledged(tool_call(run.job, 2, 0))
+            );
+            // A restart replays nothing and keeps what was recorded.
+            worker.shutdown().expect("shutdown");
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            assert!(handle.abandoned_at_open().is_empty());
+            assert_eq!(evidence(&handle, run.job), records);
+            assert_eq!(project.runs(), 2);
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_command_past_its_own_limit_is_stopped_uncertain_and_blocks_a_retry() {
+            let project = setup("command-own-limit", HANGING);
+            let (_root, directory) = data_directory("command-own-limit");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let tools = project.tools(&directory, Duration::from_secs(1));
+            let (run, looped) = hanging_run(&handle, llm, tools, CancellationToken::default());
+            assert_eq!(looped.sent.len(), 1, "an uncertain command sends no result");
+            let (receipt, stop) = stopped(looped);
+            let message = "the command did not finish within 1s and was stopped";
+            assert_eq!(
+                stop,
+                ToolLoopStop::HandlerUncertain {
+                    index: 0,
+                    message: message.to_owned()
+                }
+            );
+            assert_eq!(receipt.result, None);
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::Uncertain {
+                    cause: UncertainCause::HandlerReported,
+                    message: Some(message.to_owned()),
+                })
+            );
+            assert!(record.is_unresolved());
+            until(|| project.stopped());
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            assert!(blocking(&handle, llm).is_empty());
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                Violation::UnresolvedToolEffect(record.call)
+            );
+            assert_eq!(project.runs(), 1);
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_command_past_the_tool_loop_limit_is_stopped_uncertain_and_blocks_a_retry() {
+            let project = setup("command-loop-limit", HANGING);
+            let (_root, directory) = data_directory("command-loop-limit");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let mut tools = project.tools(&directory, crate::test_support::WAIT);
+            tools.limits.handler_timeout = Duration::from_secs(1);
+            let (run, looped) = hanging_run(&handle, llm, tools, CancellationToken::default());
+            let (_, stop) = stopped(looped);
+            assert_eq!(stop, ToolLoopStop::TimedOut { index: 0 });
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::Uncertain {
+                    cause: UncertainCause::TimedOut,
+                    message: None,
+                })
+            );
+            until(|| project.stopped());
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                Violation::UnresolvedToolEffect(record.call)
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_cancellation_while_a_command_runs_stops_it_and_leaves_it_uncertain() {
+            let project = setup("command-cancelled", HANGING);
+            let (_root, directory) = data_directory("command-cancelled");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let cancellation = CancellationToken::default();
+            let (canceller, ready) = (cancellation.clone(), project.root.join("ready"));
+            let cancelling = std::thread::spawn(move || {
+                until(|| ready.exists());
+                canceller.cancel();
+            });
+            let tools = project.tools(&directory, crate::test_support::WAIT);
+            let (run, looped) = hanging_run(&handle, llm, tools, cancellation);
+            cancelling.join().expect("cancelled");
+            let (_, stop) = stopped(looped);
+            assert_eq!(stop, ToolLoopStop::Cancelled);
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::Uncertain {
+                    cause: UncertainCause::Cancelled,
+                    message: None,
+                })
+            );
+            until(|| project.stopped());
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                Violation::UnresolvedToolEffect(record.call)
+            );
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_command_refused_before_it_starts_runs_nothing() {
+            let project = setup("command-refused", TESTING);
+            let (_root, directory) = data_directory("command-refused");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+
+            // Arguments the schema refuses are never a command.
+            let run = local_run(&handle, llm);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(project.tools(&directory, crate::test_support::WAIT)),
+                vec![
+                    calling(
+                        &[call(
+                            0,
+                            "call_shell",
+                            workspace_command::TOOL_NAME,
+                            r#"{"command":"cargo_test","args":["; touch ran"]}"#,
+                        )],
+                        (10, 5),
+                    ),
+                    answering("never sent", (1, 1)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            // The response is refused whole, before any call is admitted.
+            let receipt = looped.settled.expect("settled");
+            assert_eq!(receipt.result, None);
+            assert!(job_record(&handle, run.job).unknown_at.is_some());
+            assert!(
+                evidence(&handle, run.job).is_empty(),
+                "nothing was admitted"
+            );
+
+            // A program that is not found is refused before anything starts.
+            let run = local_run(&handle, llm);
+            let (_empty_guard, empty) =
+                crate::test_support::temporary_directory(SUITE, "command-refused-empty");
+            let path = empty.display().to_string();
+            let tools = workspace_command::code_tools_with(
+                Workspace::authorize(&project.root, &directory).expect("authorize"),
+                CommandEnvironment::from_source(move |name| {
+                    (name == "PATH").then(|| path.clone().into())
+                }),
+                crate::test_support::WAIT,
+            )
+            .expect("enable the tools");
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(tools),
+                vec![
+                    calling(&[test_call(0, "call_test")], (10, 5)),
+                    answering("never sent", (1, 1)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            let (_, stop) = stopped(looped);
+            let message = "the command's program was not found on OCG's PATH".to_owned();
+            assert_eq!(
+                stop,
+                ToolLoopStop::HandlerFailed {
+                    index: 0,
+                    message: message.clone()
+                }
+            );
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(
+                outcome_of(&record),
+                Some(ToolOutcome::NotApplied { message })
+            );
+            assert!(!record.is_applied() && !record.is_unresolved());
+            assert!(job_record(&handle, run.job).failed_at.is_some());
+            wait(handle.retry_job(retry_of(run.job, llm, false))).expect("nothing ran");
+            assert_eq!(project.runs(), 0);
+            assert!(!project.root.join("ran").exists());
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn a_command_whose_outcome_cannot_be_recorded_is_never_reported_as_done() {
+            let project = setup("command-unrecorded", TESTING);
+            let (_root, directory) = data_directory("command-unrecorded");
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let (seam_handle, path) = (handle.clone(), directory.database_path().to_path_buf());
+            dispatch_seam::install(move |point, _| {
+                if point == Point::Ran {
+                    protect(&seam_handle, &path);
+                }
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(project.tools(&directory, crate::test_support::WAIT)),
+                vec![
+                    calling(&[test_call(0, "call_test")], (10, 5)),
+                    answering("never sent", (1, 1)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert_eq!(looped.sent.len(), 1, "an unrecorded result is never sent");
+            match looped.settled {
+                Err(ExecutionRuntimeError::ToolLoopNotSettled { stop, .. }) => assert_eq!(
+                    *stop,
+                    ToolLoopStop::EvidenceNotRecorded {
+                        index: 0,
+                        outcome: Some(ToolOutcomeKind::Completed),
+                    }
+                ),
+                other => panic!("the unrecorded outcome must be reported, got {other:?}"),
+            }
+            assert_eq!(project.runs(), 1);
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("restart");
+            let handle = worker.handle();
+            assert_eq!(handle.abandoned_at_open(), [run.job]);
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.completed_at.is_none());
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert!(record.outcome.is_none() && record.is_unresolved());
+            assert_eq!(
+                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                Violation::UnresolvedToolEffect(record.call)
+            );
+            assert_eq!(project.runs(), 1, "nothing ran again");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_crash_after_a_command_ran_leaves_it_unresolved_and_a_restart_replays_nothing() {
+            let project = setup("command-crash", TESTING);
+            let (_root, directory) = data_directory("command-crash");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let tools = project.tools(&directory, crate::test_support::WAIT);
+            let loop_handle = handle.clone();
+            let died = std::thread::spawn(move || {
+                dispatch_seam::install(|point, _| {
+                    assert_ne!(point, Point::Ran, "the process died here");
+                });
+                run_loop(
+                    &loop_handle,
+                    run,
+                    Some(tools),
+                    vec![
+                        calling(&[test_call(0, "call_test")], (10, 5)),
+                        answering("never sent", (1, 1)),
+                    ],
+                    CancellationToken::default(),
+                    |_| {},
+                );
+            })
+            .join();
+            assert!(died.is_err(), "the process died after the command ran");
+            assert_eq!(project.runs(), 1);
+            worker.shutdown().expect("shutdown");
+
+            for _ in 0..2 {
+                let worker = DatabaseWorker::start(&directory).expect("restart");
+                let handle = worker.handle();
+                let job = job_record(&handle, run.job);
+                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+                assert!(blocking(&handle, llm).is_empty());
+                let [record] = evidence(&handle, run.job).try_into().expect("one call");
+                assert!(
+                    record.admission().is_some()
+                        && record.outcome.is_none()
+                        && record.is_unresolved()
+                );
+                assert_eq!(
+                    violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                    Violation::UnresolvedToolEffect(record.call)
+                );
+                worker.shutdown().expect("shutdown");
+                assert_eq!(project.runs(), 1, "no restart runs it again");
+            }
+            assert_eq!(project.source().as_deref(), Some(BUGGY));
+            assert_relationships_consistent(&directory);
+        }
+    }
 }

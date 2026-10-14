@@ -18,9 +18,10 @@ fn main() -> ExitCode {
 /// Without arguments, runs until a graceful shutdown signal (SIGINT,
 /// SIGTERM, SIGQUIT or SIGHUP), then stops in the reverse order of starting;
 /// see [`ocg::host`]. `workspace-read <objective>` instead runs one Job that
-/// may read the authorized Workspace, and `workspace-edit <objective>` one
-/// that may also create and conditionally update its files, see
-/// `workspace_job`.
+/// may read the authorized Workspace, `workspace-edit <objective>` one
+/// that may also create and conditionally update its files, and
+/// `workspace-code <objective>` one that may also run its build and tests,
+/// see `workspace_job`.
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
