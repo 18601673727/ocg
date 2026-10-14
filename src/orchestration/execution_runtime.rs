@@ -21,9 +21,9 @@ use crate::persistence::{
     AppendedOutput, AuthorizationBasis, ExecutorId, FinalResult, IntermediateOutputKind,
     JobFinalization, JobId, JobInputDraft, JobInputId, JobOutcome, MAX_STORED_TOOL_ARGUMENTS_BYTES,
     MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements, NewAvailabilityStat, NewJob,
-    NewJobOutput, NewMetrics, NewToolEvidence, RequestNumber, Timestamp, ToolAdmission,
-    ToolCallRef, ToolDecision, ToolOutcome, ToolOutcomeKind, ToolPayload, UncertainCause,
-    Violation, WithheldReason,
+    NewJobOutput, NewMetrics, NewToolEvidence, NotInvokedReason, RequestNumber, Timestamp,
+    ToolAdmission, ToolCallRef, ToolDecision, ToolOutcome, ToolOutcomeKind, ToolPayload,
+    UncertainCause, Violation, WithheldReason,
 };
 use crate::provider_execution::{
     self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
@@ -1169,23 +1169,32 @@ async fn answer_calls(
         budget.argument_bytes = budget.argument_bytes.saturating_add(call.arguments.len());
         #[cfg(test)]
         dispatch_seam::reach(dispatch_seam::Point::Admitted, reference);
+        // The execution may have been cancelled while the admission was
+        // recorded.
+        if cancellation.is_cancelled() {
+            return Err(cancelled_before_invocation(site, reference).await);
+        }
         let dispatch = match tools.offer.resolve(call) {
             Ok(dispatch) => dispatch,
             Err(refusal) => {
                 let outcome = ToolOutcome::NotInvoked {
-                    reason: refusal.kind,
+                    reason: NotInvokedReason::Refused(refusal.kind),
                 };
                 return Err(
                     conclude(site, reference, outcome, ToolLoopStop::Refused(refusal)).await,
                 );
             }
         };
+        // The invocation boundary. A cancellation seen here keeps the handler
+        // from being invoked; one that comes later, even before the handler
+        // is first polled, leaves its outcome uncertain.
+        if cancellation.is_cancelled() {
+            return Err(cancelled_before_invocation(site, reference).await);
+        }
+        let invocation = dispatch.handler.call(dispatch.arguments);
         let ran = select(
             cancellation.cancelled(),
-            ntex::time::timeout(
-                limits.handler_timeout,
-                dispatch.handler.call(dispatch.arguments),
-            ),
+            ntex::time::timeout(limits.handler_timeout, invocation),
         )
         .await;
         let (outcome, stop) = match ran {
@@ -1291,6 +1300,16 @@ async fn refuse(
         stop: ToolLoopStop::Refused(refusal),
         evidence: recorded.err(),
     }
+}
+
+/// Records that an admitted call's handler was never invoked because the
+/// execution was cancelled first, and stops as a cancellation. If that
+/// cannot be recorded, the call stays as uncertain as its admission left it.
+async fn cancelled_before_invocation(site: &CallSite<'_>, call: ToolCallRef) -> Stopped {
+    let outcome = ToolOutcome::NotInvoked {
+        reason: NotInvokedReason::Cancelled,
+    };
+    conclude(site, call, outcome, ToolLoopStop::Cancelled).await
 }
 
 /// Records the outcome of an admitted call that stops the loop. When it

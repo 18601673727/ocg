@@ -46,13 +46,13 @@ use crate::persistence::{
     ExecutorType, FrozenExecutionConfig, FrozenLlmConfig, JobId, JobInputId, JobOutputId,
     JobOutputRecord, JobRecord, LlmConfig, LlmParameters, LlmProviderId, LlmProviderRecord,
     LlmTarget, LlmTransport, Measurements, MetricsId, MetricsRecord, ModelCapability,
-    ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelChoice,
-    ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, OperationMarker,
-    OutputKind, ProfileConfig, ProfileEditability, ProfileId, ProfileKind, ProfileRecord,
-    ProjectId, ProjectRecord, ProviderSnapshot, RecordRef, Recorded, RequestNumber, RequestRef,
-    SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
-    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause, Violation,
-    WithheldReason, WrongProfileKind,
+    NotInvokedReason, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
+    ObservedModelChoice, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind,
+    OperationMarker, OutputKind, ProfileConfig, ProfileEditability, ProfileId, ProfileKind,
+    ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef, Recorded, RequestNumber,
+    RequestRef, SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
+    ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
+    Violation, WithheldReason, WrongProfileKind,
 };
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
@@ -1277,10 +1277,15 @@ fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
                 e.u8(3);
                 e.str(message);
             }
-            ToolOutcome::NotInvoked { reason } => {
+            ToolOutcome::NotInvoked {
+                reason: NotInvokedReason::Refused(refusal),
+            } => {
                 e.u8(4);
-                e.u8(reason.code());
+                e.u8(refusal.code());
             }
+            ToolOutcome::NotInvoked {
+                reason: NotInvokedReason::Cancelled,
+            } => e.u8(6),
             ToolOutcome::Uncertain { cause, message } => {
                 e.u8(5);
                 e.u8(cause.code());
@@ -1326,11 +1331,14 @@ fn decode_tool_evidence(call: ToolCallRef, bytes: &[u8]) -> DecodeResult<ToolEvi
             },
             3 => ToolOutcome::NotApplied { message: d.str()? },
             4 => ToolOutcome::NotInvoked {
-                reason: d.code(ToolCallRefusal::from_code)?,
+                reason: NotInvokedReason::Refused(d.code(ToolCallRefusal::from_code)?),
             },
             5 => ToolOutcome::Uncertain {
                 cause: d.code(UncertainCause::from_code)?,
                 message: d.ostr()?,
+            },
+            6 => ToolOutcome::NotInvoked {
+                reason: NotInvokedReason::Cancelled,
             },
             _ => return Err(StorageError::corrupted("invalid tool outcome")),
         };
@@ -3108,6 +3116,26 @@ impl Batch {
     }
 
     /// RETRY_OF: one original per retry Job, fixed at creation.
+    /// `job` and every Job it retries through RETRY_OF, nearest first. A
+    /// RETRY_OF edge to a missing Job, or one that leads back into the chain,
+    /// is corruption: the chain is never cut short.
+    pub(crate) fn retry_lineage(&mut self, job: JobId) -> Result<Vec<JobId>, BatchError> {
+        let mut lineage = vec![job];
+        let mut current = job;
+        while let Some(original) = self.link_target(RETRY_OF, current.get())? {
+            let original = JobId::new(original);
+            if lineage.contains(&original) {
+                return self.corrupted(format!("the retry lineage of {job} returns to {original}"));
+            }
+            if self.job(original)?.is_none() {
+                return self.corrupted(format!("{current} retries the missing {original}"));
+            }
+            lineage.push(original);
+            current = original;
+        }
+        Ok(lineage)
+    }
+
     pub(crate) fn link_retry(&mut self, retry: JobId, original: JobId) -> Result<(), BatchError> {
         self.require_job(retry)?;
         self.require_job(original)?;
@@ -5681,5 +5709,139 @@ mod tests {
             open(&root.0).is_ok(),
             "the untouched file still opens at the supported version"
         );
+    }
+
+    fn retry(original: JobId, acknowledge_repeated_effects: bool) -> persistence::JobRetry {
+        persistence::JobRetry {
+            original,
+            input: persistence::RetryInput::Unchanged,
+            name: None,
+            execution_mode: ExecutionMode::Once,
+            eligible_at: None,
+            scheduled_at: None,
+            next_due_at: None,
+            next_iteration_no: None,
+            iteration_no: None,
+            projects: Vec::new(),
+            dependencies: Vec::new(),
+            configuration: None,
+            assigned_executor: None,
+            acknowledge_repeated_effects,
+        }
+    }
+
+    fn fail(test: &TestDatabase, sequence: u64, job: JobId) {
+        test.batch(sequence, |batch| {
+            persistence::finalize_job(
+                batch,
+                job,
+                persistence::JobFinalization::Failed(persistence::FinalResult {
+                    summary: None,
+                    code: None,
+                    goal_reached: Some(false),
+                    value: None,
+                }),
+            )
+        })
+        .expect("fail the Job");
+    }
+
+    /// Three Jobs created as they would be and linked by `edges` as
+    /// (retry, original) directly.
+    fn retry_chain(test: &TestDatabase, edges: &[(usize, usize)]) -> [JobId; 3] {
+        let jobs = [1, 2, 3].map(|sequence| {
+            create_job(test, sequence, new_job("job", test.genesis, Vec::new())).expect("create")
+        });
+        test.batch(4, |batch| {
+            for (retry, original) in edges {
+                batch.link_retry(jobs[*retry], jobs[*original])?;
+            }
+            Ok(((), MarkerSubjects::addressed(RecordRef::Job(jobs[0]))))
+        })
+        .expect("link the retries");
+        jobs
+    }
+
+    #[test]
+    fn a_retry_is_refused_over_an_unresolved_effect_anywhere_in_its_lineage() {
+        let test = TestDatabase::new("retry-lineage-unresolved");
+        // The first Job's effect is unresolved; the two retries after it
+        // ran no tool and failed.
+        let [first, second, third] = retry_chain(&test, &[(1, 0), (2, 1)]);
+        let call = ToolCallRef {
+            job: first,
+            request: RequestNumber::FIRST,
+            index: 0,
+        };
+        test.batch(8, |batch| {
+            batch.insert_tool_evidence(&ToolEvidenceRecord {
+                call,
+                tool_call_id: "c".into(),
+                name: "add".into(),
+                decision: Recorded {
+                    fact: ToolDecision::Admitted(ToolAdmission {
+                        handler_version: "test-1".into(),
+                        effect: ToolEffect::NonIdempotent,
+                        parameters: "{}".into(),
+                        arguments: ToolPayload::new("{}"),
+                        authorization: AuthorizationBasis::RegistryGrant,
+                    }),
+                    at: batch.now(),
+                },
+                outcome: None,
+                reconciliation: None,
+            })?;
+            Ok(((), MarkerSubjects::addressed(RecordRef::Job(first))))
+        })
+        .expect("record the unresolved admission");
+        test.batch(9, |batch| {
+            persistence::finalize_job(batch, first, persistence::JobFinalization::Unknown)?;
+            persistence::confirm_job_stopped(batch, first)
+        })
+        .expect("settle the first Job unknown");
+        fail(&test, 10, second);
+        fail(&test, 11, third);
+        for acknowledge in [false, true] {
+            assert!(
+                matches!(
+                    test.batch(12, |batch| persistence::retry_job(batch, retry(third, acknowledge))),
+                    Err(BatchFailure::Rejected(Violation::UnresolvedToolEffect(found))) if found == call
+                ),
+                "acknowledged: {acknowledge}"
+            );
+        }
+        test.assert_consistent();
+    }
+
+    #[test]
+    fn a_malformed_retry_lineage_refuses_the_retry() {
+        // A cycle of retries.
+        let test = TestDatabase::new("retry-lineage-cycle");
+        let [first, second, _] = retry_chain(&test, &[(0, 1), (1, 0)]);
+        fail(&test, 5, first);
+        fail(&test, 6, second);
+        assert!(matches!(
+            test.batch(9, |batch| persistence::retry_job(batch, retry(first, true))),
+            Err(BatchFailure::NotCommitted(error)) if error.kind == StorageErrorKind::Corrupted
+        ));
+        assert!(
+            test.batch(10, |batch| batch.retries(first).map(|retries| (
+                retries,
+                MarkerSubjects::addressed(RecordRef::Job(first))
+            )))
+            .expect("read the retries")
+                == [second],
+            "no retry was added"
+        );
+
+        // A retry of a Job that is gone.
+        let test = TestDatabase::new("retry-lineage-missing");
+        let [first, second, _] = retry_chain(&test, &[(1, 0)]);
+        fail(&test, 5, second);
+        remove_job_row(&test.database, first).expect("remove the original's row");
+        assert!(matches!(
+            test.batch(9, |batch| persistence::retry_job(batch, retry(second, true))),
+            Err(BatchFailure::NotCommitted(error)) if error.kind == StorageErrorKind::Corrupted
+        ));
     }
 }

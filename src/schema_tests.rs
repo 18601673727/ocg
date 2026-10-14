@@ -14228,8 +14228,8 @@ mod requests_and_tool_loop {
     use crate::orchestration::execution_runtime::dispatch_seam::{self, Point};
     use crate::persistence::{
         AuthorizationBasis, EffectConclusion, MAX_STORED_TOOL_ARGUMENTS_BYTES,
-        MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, NewToolEvidence, ToolAdmission, ToolCallRef,
-        ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind, ToolPayload,
+        MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, NewToolEvidence, NotInvokedReason, ToolAdmission,
+        ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind, ToolPayload,
         ToolReconciliation, UncertainCause, WithheldReason,
     };
 
@@ -15276,7 +15276,7 @@ mod requests_and_tool_loop {
                 assert_eq!(
                     outcome_of(record),
                     Some(ToolOutcome::NotInvoked {
-                        reason: ToolCallRefusal::Unauthorized
+                        reason: NotInvokedReason::Refused(ToolCallRefusal::Unauthorized)
                     })
                 );
                 assert!(!record.is_unresolved() && !record.is_applied());
@@ -15355,7 +15355,7 @@ mod requests_and_tool_loop {
                 message: "no effect".into(),
             },
             ToolOutcome::NotInvoked {
-                reason: ToolCallRefusal::Unauthorized,
+                reason: NotInvokedReason::Refused(ToolCallRefusal::Unauthorized),
             },
         ] {
             for finalization in [
@@ -15414,7 +15414,7 @@ mod requests_and_tool_loop {
             reason: WithheldReason::TooLarge,
         };
         let not_invoked = ToolOutcome::NotInvoked {
-            reason: ToolCallRefusal::Unauthorized,
+            reason: NotInvokedReason::Refused(ToolCallRefusal::Unauthorized),
         };
         type Expected = Option<fn(ToolCallRef) -> Violation>;
         let unresolved: Expected = Some(Violation::UnresolvedToolEffect);
@@ -15948,5 +15948,326 @@ mod requests_and_tool_loop {
             Err(ToolRegistryError::Unauthorized("tool".into())),
             "registering still grants nothing"
         );
+    }
+
+    /// A settled Job whose one call, if any, had this effect and outcome.
+    fn settled_original(
+        handle: &DatabaseHandle,
+        llm: ProfileId,
+        effect: Option<ToolEffect>,
+        outcome: Option<ToolOutcome>,
+    ) -> (JobId, ToolCallRef) {
+        let run = observed_run(handle, llm, 1);
+        let call = tool_call(run.job, 1, 0);
+        if let Some(effect) = effect {
+            wait(handle.record_tool_decision(admitted(call, "c", effect))).expect("admit");
+            if let Some(outcome) = outcome.clone() {
+                wait(handle.record_tool_outcome(call, outcome)).expect("record");
+            }
+        }
+        if effect.is_none() || outcome.as_ref().is_some_and(ToolOutcome::is_definite) {
+            wait(handle.finalize_job(run.job, JobFinalization::Completed(result("done"))))
+                .expect("complete");
+        } else {
+            settle_unknown(handle, run.job);
+        }
+        (run.job, call)
+    }
+
+    /// A retry of `original` that ran no tool and failed, so it is settled.
+    fn failed_retry(
+        handle: &DatabaseHandle,
+        llm: ProfileId,
+        original: JobId,
+        acknowledge: bool,
+    ) -> JobId {
+        let retry = wait(handle.retry_job(retry_of(original, llm, acknowledge))).expect("retry");
+        wait(handle.finalize_job(retry, JobFinalization::Failed(result("no tool ran"))))
+            .expect("fail the retry");
+        retry
+    }
+
+    /// A retry of `original` with a fresh input, which must be refused for
+    /// `expected` and leave nothing behind: no Job, no submitted input and no
+    /// RETRY_OF edge.
+    fn assert_retry_refused(
+        handle: &DatabaseHandle,
+        llm: ProfileId,
+        original: JobId,
+        acknowledge: bool,
+        expected: Violation,
+    ) {
+        let jobs = wait(handle.jobs(None, 1_000)).expect("jobs").len();
+        let input = wait(handle.save_job_input(None, JobInputDraft::default())).expect("input");
+        let retry = JobRetry {
+            input: RetryInput::Changed(input),
+            ..retry_of(original, llm, acknowledge)
+        };
+        assert_eq!(violation(wait(handle.retry_job(retry))), expected);
+        assert_eq!(wait(handle.jobs(None, 1_000)).expect("jobs").len(), jobs);
+        assert!(wait(handle.retries(original)).expect("retries").is_empty());
+        let input = wait(handle.job_input(input))
+            .expect("read the input")
+            .expect("the input");
+        assert!(input.submitted_at.is_none() && input.configuration.is_none());
+        assert!(wait(handle.input_jobs(input.id)).expect("jobs").is_empty());
+    }
+
+    #[test]
+    fn a_retry_answers_for_the_tool_effects_of_its_whole_retry_lineage() {
+        let (_root, directory) = data_directory("tool-evidence-retry-lineage");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        use ToolEffect::{Idempotent, NonIdempotent, ReadOnly};
+
+        // An acknowledgement covers only the retry that gave it, however far
+        // down the chain the effect happened.
+        let (first, effect) =
+            settled_original(&handle, llm, Some(NonIdempotent), Some(completed("{}")));
+        let second = failed_retry(&handle, llm, first, true);
+        assert_retry_refused(
+            &handle,
+            llm,
+            second,
+            false,
+            Violation::RepeatedEffectNotAcknowledged(effect),
+        );
+        let third = failed_retry(&handle, llm, second, true);
+        assert_retry_refused(
+            &handle,
+            llm,
+            third,
+            false,
+            Violation::RepeatedEffectNotAcknowledged(effect),
+        );
+        let fourth =
+            wait(handle.retry_job(retry_of(third, llm, true))).expect("an acknowledged retry");
+        assert_eq!(job_record(&handle, fourth).retry_of, Some(third));
+
+        // An unresolved effect is refused whatever the retry acknowledges.
+        let (original, unresolved) = settled_original(&handle, llm, Some(NonIdempotent), None);
+        for acknowledge in [false, true] {
+            assert_retry_refused(
+                &handle,
+                llm,
+                original,
+                acknowledge,
+                Violation::UnresolvedToolEffect(unresolved),
+            );
+        }
+
+        // Effects that can be repeated, or that did not happen, ask for no
+        // acknowledgement anywhere in the chain; a reconciliation counts as
+        // what it found.
+        let reconciled = |conclusion| {
+            let (job, call) = settled_original(&handle, llm, Some(NonIdempotent), None);
+            wait(handle.reconcile_tool_effect(call, verified(conclusion))).expect("reconcile");
+            (job, call)
+        };
+        let unacknowledged = [
+            settled_original(&handle, llm, Some(Idempotent), Some(completed("{}"))).0,
+            settled_original(
+                &handle,
+                llm,
+                Some(NonIdempotent),
+                Some(ToolOutcome::NotApplied {
+                    message: "no effect".into(),
+                }),
+            )
+            .0,
+            settled_original(
+                &handle,
+                llm,
+                Some(NonIdempotent),
+                Some(ToolOutcome::NotInvoked {
+                    reason: NotInvokedReason::Refused(ToolCallRefusal::Unauthorized),
+                }),
+            )
+            .0,
+            settled_original(
+                &handle,
+                llm,
+                Some(NonIdempotent),
+                Some(ToolOutcome::NotInvoked {
+                    reason: NotInvokedReason::Cancelled,
+                }),
+            )
+            .0,
+            reconciled(EffectConclusion::NotApplied).0,
+            settled_original(&handle, llm, Some(ReadOnly), None).0,
+        ];
+        for original in unacknowledged {
+            let middle = failed_retry(&handle, llm, original, false);
+            let retry = wait(handle.retry_job(retry_of(middle, llm, false)))
+                .unwrap_or_else(|error| panic!("a retry of {original}'s chain: {error}"));
+            assert_eq!(job_record(&handle, retry).retry_of, Some(middle));
+        }
+        let (original, applied) = reconciled(EffectConclusion::Applied);
+        let middle = failed_retry(&handle, llm, original, true);
+        assert_retry_refused(
+            &handle,
+            llm,
+            middle,
+            false,
+            Violation::RepeatedEffectNotAcknowledged(applied),
+        );
+        wait(handle.retry_job(retry_of(middle, llm, true))).expect("an acknowledged retry");
+
+        // Concurrent retries of a chain meet the same gate, and at most one
+        // becomes active.
+        let (original, effect) =
+            settled_original(&handle, llm, Some(NonIdempotent), Some(completed("{}")));
+        let middle = failed_retry(&handle, llm, original, true);
+        let concurrently = |acknowledge: bool| {
+            [0, 1]
+                .map(|_| {
+                    let handle = handle.clone();
+                    std::thread::spawn(move || {
+                        wait(handle.retry_job(retry_of(middle, llm, acknowledge)))
+                    })
+                })
+                .map(|attempt| attempt.join().expect("the attempt finished"))
+        };
+        for attempt in concurrently(false) {
+            assert_eq!(
+                violation(attempt),
+                Violation::RepeatedEffectNotAcknowledged(effect)
+            );
+        }
+        assert!(wait(handle.retries(middle)).expect("retries").is_empty());
+        let (created, refused): (Vec<_>, Vec<_>) =
+            concurrently(true).into_iter().partition(Result::is_ok);
+        assert_eq!(created.len(), 1, "one acknowledged retry becomes active");
+        assert!(matches!(
+            violation(refused.into_iter().next().expect("the other")),
+            Violation::ActiveRetry { original, .. } if original == middle
+        ));
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_cancellation_before_the_handler_is_invoked_keeps_it_from_running() {
+        for unstored in [false, true] {
+            let (_root, directory) = data_directory(if unstored {
+                "tool-evidence-cancelled-unstored"
+            } else {
+                "tool-evidence-cancelled-admission"
+            });
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let (registry, calls) =
+                registered_as(ToolEffect::NonIdempotent, vec![("add", Behavior::Add)]);
+            let cancellation = CancellationToken::default();
+            let (canceller, seam_handle, path) = (
+                cancellation.clone(),
+                handle.clone(),
+                directory.database_path().to_path_buf(),
+            );
+            let pending = Arc::new(std::sync::Mutex::new(None));
+            let held = pending.clone();
+            dispatch_seam::install(move |point, _| match point {
+                // The cancellation arrives while the admission's write is
+                // held in the database, which then commits it.
+                Point::BeforeAdmission if !unstored => {
+                    let (entered, release) = seam_handle.group_probe().hold_next_group();
+                    let canceller = canceller.clone();
+                    *held.lock().expect("lock") = Some(std::thread::spawn(move || {
+                        entered
+                            .recv_timeout(crate::test_support::WAIT)
+                            .expect("the admission is held");
+                        canceller.cancel();
+                        release.send(()).expect("release the admission");
+                    }));
+                }
+                Point::Admitted if unstored => {
+                    canceller.cancel();
+                    protect(&seam_handle, &path);
+                }
+                _ => {}
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+                vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+                cancellation,
+                |_| {},
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the handler was never invoked"
+            );
+            let call = tool_call(run.job, 1, 0);
+            if unstored {
+                match looped.settled {
+                    Err(ExecutionRuntimeError::ToolLoopNotSettled {
+                        stop,
+                        evidence: Some(evidence),
+                        ..
+                    }) => {
+                        assert_eq!(*stop, ToolLoopStop::Cancelled);
+                        assert!(
+                            !matches!(*evidence, DatabaseError::Rejected(_)),
+                            "the database's own error is kept: {evidence:?}"
+                        );
+                    }
+                    other => panic!("expected an unsettled cancellation, got {other:?}"),
+                }
+                worker.shutdown().expect("shutdown");
+                let worker =
+                    DatabaseWorker::start_with_config(&directory, lenient()).expect("restart");
+                let handle = worker.handle();
+                let job = job_record(&handle, run.job);
+                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+                let records = evidence(&handle, run.job);
+                assert!(
+                    records.len() == 1
+                        && records[0].outcome.is_none()
+                        && records[0].is_unresolved(),
+                    "an unrecorded NotInvoked is not claimed: {records:?}"
+                );
+                assert_eq!(
+                    violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                    Violation::UnresolvedToolEffect(call)
+                );
+                worker.shutdown().expect("shutdown");
+            } else {
+                pending
+                    .lock()
+                    .expect("lock")
+                    .take()
+                    .expect("the admission was held")
+                    .join()
+                    .expect("the cancellation was sent");
+                let (receipt, stop) = stopped(looped);
+                assert_eq!(stop, ToolLoopStop::Cancelled);
+                assert_eq!(receipt.result, None);
+                let job = job_record(&handle, run.job);
+                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+                assert!(blocking(&handle, llm).is_empty());
+                let records = evidence(&handle, run.job);
+                let [record] = records.as_slice() else {
+                    panic!("one admission");
+                };
+                assert!(record.admission().is_some(), "the admission committed");
+                assert_eq!(
+                    outcome_of(record),
+                    Some(ToolOutcome::NotInvoked {
+                        reason: NotInvokedReason::Cancelled
+                    }),
+                    "a definite outcome: the handler never ran"
+                );
+                assert!(!record.is_unresolved() && !record.is_applied());
+                wait(handle.retry_job(retry_of(run.job, llm, false)))
+                    .expect("nothing to repeat and nothing unresolved");
+                worker.shutdown().expect("shutdown");
+            }
+            assert_relationships_consistent(&directory);
+        }
     }
 }

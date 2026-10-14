@@ -289,7 +289,8 @@ pub struct JobRetry {
     pub configuration: Option<ExecutionConfiguration>,
     pub assigned_executor: Option<ExecutorId>,
     /// Accepts that the retry may repeat a non-idempotent tool effect the
-    /// original is known to have had. It promises no deduplication, grants
+    /// original, or any Job it retries in turn, is known to have had. It
+    /// covers this retry only. It promises no deduplication, grants
     /// no tool anything, and never admits a retry over an effect that is
     /// still unresolved. Leave it `false` unless the user accepted that.
     pub acknowledge_repeated_effects: bool,
@@ -1415,14 +1416,22 @@ pub enum ToolOutcome {
     CompletedWithheld { reason: WithheldReason },
     /// The handler established that its effect did not happen.
     NotApplied { message: String },
-    /// OCG never invoked the handler: its final authorization check refused
-    /// the call after the admission.
-    NotInvoked { reason: ToolCallRefusal },
+    /// OCG never invoked the handler, for `reason`, after the admission.
+    NotInvoked { reason: NotInvokedReason },
     /// The handler may have run and may have had its effect.
     Uncertain {
         cause: UncertainCause,
         message: Option<String>,
     },
+}
+
+/// Why OCG never invoked an admitted call's handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotInvokedReason {
+    /// Its final authorization check refused the call.
+    Refused(ToolCallRefusal),
+    /// The execution was cancelled before the handler's invocation.
+    Cancelled,
 }
 
 /// The kind of a [`ToolOutcome`], without what it carries.
@@ -2283,27 +2292,35 @@ fn require_resolved_tool_effects(batch: &mut Batch, job: JobId) -> Result<(), Ba
     Ok(())
 }
 
-/// Refuses a retry of `original` while one of its tool calls that may
-/// change something outside OCG is unresolved, whatever the retry
-/// acknowledges, and a retry that could repeat a non-idempotent effect the
-/// original is known to have had unless the retry acknowledges that.
+/// Refuses a retry of `original` while a tool call of it, or of any Job it
+/// retries in turn through RETRY_OF, that may change something outside OCG
+/// is unresolved, whatever the retry acknowledges; and a retry that could
+/// repeat a non-idempotent effect one of them is known to have had unless
+/// this retry acknowledges that. An earlier retry's acknowledgement is its
+/// own: a retry of a retry repeats the effects of the whole chain.
 fn require_repeatable_tool_effects(
     batch: &mut Batch,
     original: JobId,
     acknowledged: bool,
 ) -> Result<(), BatchError> {
-    for record in batch.job_tool_evidence(original)? {
-        let Some(effect) = record.admission().map(|admission| admission.effect) else {
-            continue;
-        };
-        if record.is_unresolved() && effect != ToolEffect::ReadOnly {
-            return batch.reject(Violation::UnresolvedToolEffect(record.call));
-        }
-        if record.is_applied() && effect == ToolEffect::NonIdempotent && !acknowledged {
-            return batch.reject(Violation::RepeatedEffectNotAcknowledged(record.call));
+    let mut unacknowledged = None;
+    for job in batch.retry_lineage(original)? {
+        for record in batch.job_tool_evidence(job)? {
+            let Some(effect) = record.admission().map(|admission| admission.effect) else {
+                continue;
+            };
+            if record.is_unresolved() && effect != ToolEffect::ReadOnly {
+                return batch.reject(Violation::UnresolvedToolEffect(record.call));
+            }
+            if record.is_applied() && effect == ToolEffect::NonIdempotent && !acknowledged {
+                unacknowledged.get_or_insert(record.call);
+            }
         }
     }
-    Ok(())
+    match unacknowledged {
+        Some(call) => batch.reject(Violation::RepeatedEffectNotAcknowledged(call)),
+        None => Ok(()),
+    }
 }
 
 /// Refuses unless the Job is being executed by this process: started
