@@ -489,6 +489,7 @@ fn genesis_is_one_protected_root_that_is_never_its_own_child() {
         dependencies: Vec::new(),
         configuration: None,
         assigned_executor: None,
+        acknowledge_repeated_effects: false,
     };
     assert_eq!(
         violation(wait(handle.retry_job(retry))),
@@ -998,6 +999,7 @@ fn capability_checks_are_ordinary_llm_only_jobs_kept_apart_from_declarations() {
         dependencies: Vec::new(),
         configuration: llm_only(llm),
         assigned_executor: Some(checker),
+        acknowledge_repeated_effects: false,
     }))
     .expect("retry the check");
     let again_record = wait(handle.job(again))
@@ -1107,6 +1109,7 @@ fn frozen_inputs_stay_immutable_and_a_retry_is_a_new_job() {
         dependencies: Vec::new(),
         configuration: None,
         assigned_executor: None,
+        acknowledge_repeated_effects: false,
     };
     let unchanged = wait(handle.retry_job(retry(RetryInput::Unchanged, vec![beta])))
         .expect("retry with the frozen input");
@@ -2032,6 +2035,7 @@ fn retries_share_one_frozen_input_without_overwriting_it() {
         dependencies: Vec::new(),
         configuration: None,
         assigned_executor: None,
+        acknowledge_repeated_effects: false,
     };
     let fail = |job| {
         wait(handle.finalize_job(job, JobFinalization::Failed(result("failed"))))
@@ -4331,6 +4335,7 @@ fn a_retry_is_its_own_request_sample_even_with_a_shared_input() {
         dependencies: Vec::new(),
         configuration: configuration(agent, targeted),
         assigned_executor: None,
+        acknowledge_repeated_effects: false,
     }))
     .expect("retry with the same configuration");
     observe(&handle, retry, 200, response(200));
@@ -4990,6 +4995,7 @@ fn a_retry_is_a_separate_request_in_the_counts() {
         dependencies: Vec::new(),
         configuration: configuration(agent, targeted),
         assigned_executor: None,
+        acknowledge_repeated_effects: false,
     }))
     .expect("retry with the same configuration");
     observe(&handle, retry, micros + 1, response(200));
@@ -5740,6 +5746,7 @@ fn a_retry_shares_a_frozen_input_only_with_the_same_configuration() {
         dependencies: Vec::new(),
         configuration,
         assigned_executor: None,
+        acknowledge_repeated_effects: false,
     };
     let same = wait(handle.retry_job(retry(
         original,
@@ -8364,6 +8371,7 @@ fn targets_merge_by_provider_and_exact_model_and_retries_stay_separate() {
         dependencies: Vec::new(),
         configuration: configuration(configured_set.agent, configured_set.targeted),
         assigned_executor: None,
+        acknowledge_repeated_effects: false,
     }))
     .expect("retry");
     assert_eq!(
@@ -12224,6 +12232,7 @@ mod settlement {
             dependencies: Vec::new(),
             configuration,
             assigned_executor: None,
+            acknowledge_repeated_effects: false,
         }
     }
 
@@ -12532,7 +12541,7 @@ mod requests_and_tool_loop {
         ToolLoopLimits, ToolLoopStop, run_provider_job,
     };
     use crate::orchestration::tools::{ToolFailure, ToolFuture, ToolHandler, ToolRegistry};
-    use crate::persistence::AvailabilityBatch;
+    use crate::persistence::{AvailabilityBatch, ToolEffect};
     use crate::provider_execution::ProviderExecutionError;
     use crate::token_usage::TokenBatch;
 
@@ -12774,100 +12783,6 @@ mod requests_and_tool_loop {
         worker.shutdown().expect("shutdown");
     }
 
-    #[test]
-    fn a_format_10_file_is_upgraded_in_place_without_loss_or_double_counting() {
-        let (_root, directory) = data_directory("upgrade-from-10");
-        let worker = DatabaseWorker::start(&directory).expect("start database");
-        let handle = worker.handle();
-        let (provider, llm) = llm_setup(&handle, "model-a");
-        let micros = at_minute(3);
-        let minute = minute_of(at(micros));
-        let [first, second, late] = [0, 1, 2].map(|_| llm_job(&handle, llm));
-        answered_request(&handle, first, 1, micros, ChatFinishReason::Stop, (3, 4));
-        answered_request(&handle, second, 1, micros, ChatFinishReason::Length, (5, 6));
-        drain(&handle);
-        // Evidence the streams have not consumed when the file is upgraded.
-        answered_request(&handle, late, 1, micros, ChatFinishReason::Stop, (7, 8));
-        let capture = |handle: &DatabaseHandle| {
-            (
-                [first, second, late].map(|job| (job_metrics(handle, job), stats(handle, job))),
-                [first, second].map(|job| {
-                    (
-                        wait(handle.request_sample(request(job, 1)))
-                            .expect("sample")
-                            .value,
-                        wait(handle.token_request(request(job, 1)))
-                            .expect("state")
-                            .value,
-                    )
-                }),
-                token_bucket(handle, provider, minute),
-                availability_bucket(handle, provider, minute),
-                wait(handle.availability_progress()).expect("progress"),
-                wait(handle.token_progress()).expect("progress"),
-            )
-        };
-        let before = capture(&handle);
-        worker.shutdown().expect("shutdown");
-
-        crate::storage::downgrade_to_format_10(directory.database_path())
-            .expect("write the version 10 file");
-        assert_eq!(
-            crate::storage::recorded_format_version(directory.database_path()),
-            Ok(10)
-        );
-        crate::storage::FAIL_NEXT_UPGRADE.store(true, Ordering::SeqCst);
-        assert!(
-            DatabaseWorker::start(&directory).is_err(),
-            "an upgrade that fails does not open"
-        );
-        assert_eq!(
-            crate::storage::recorded_format_version(directory.database_path()),
-            Ok(10),
-            "a failed upgrade leaves the file as it was"
-        );
-
-        let worker = DatabaseWorker::start(&directory).expect("upgrade and open");
-        let handle = worker.handle();
-        assert_eq!(
-            capture(&handle),
-            before,
-            "every record and every aggregate is kept"
-        );
-        let (records, _, _, _, _, _) = &before;
-        assert!(
-            records
-                .iter()
-                .flat_map(|(metrics, stats)| metrics
-                    .iter()
-                    .map(|record| record.request)
-                    .chain(stats.iter().map(|stat| stat.request)))
-                .all(|request| request == RequestNumber::FIRST),
-            "a version 10 record is its Job's first request"
-        );
-        drain(&handle);
-        let totals = token_bucket(&handle, provider, minute);
-        assert_eq!(
-            (totals.requests, totals.input.final_sum),
-            (3, 15),
-            "the unconsumed request is counted once, the others not again"
-        );
-        assert_eq!(availability_bucket(&handle, provider, minute).available, 3);
-
-        // The upgraded Job's next request is evidence of its own.
-        answered_request(&handle, first, 2, micros, ChatFinishReason::Stop, (9, 1));
-        drain(&handle);
-        assert_eq!(token_sample(&handle, request(first, 1)).total, Some(7));
-        assert_eq!(token_sample(&handle, request(first, 2)).total, Some(10));
-        assert_eq!(token_bucket(&handle, provider, minute).requests, 4);
-        worker.shutdown().expect("shutdown");
-        assert_eq!(
-            crate::storage::recorded_format_version(directory.database_path()),
-            Ok(11)
-        );
-        assert_relationships_consistent(&directory);
-    }
-
     // ---- The tool loop --------------------------------------------------------
 
     /// How a test tool behaves. Every one is free of side effects outside
@@ -12884,14 +12799,29 @@ mod requests_and_tool_loop {
         CancelThenHang(CancellationToken),
         /// Withdraws the grant of another tool, then answers.
         Revoke(ToolRegistry, &'static str),
+        /// Fails without evidence that its effect did not happen.
+        Uncertain,
+        /// Dies with the process while it runs.
+        Crash,
+        /// Does this, then answers what it returns.
+        Act(Box<dyn Fn() -> Value + Send + Sync>),
     }
 
     struct TestTool {
         behavior: Behavior,
         calls: Arc<AtomicUsize>,
+        effect: ToolEffect,
     }
 
     impl ToolHandler for TestTool {
+        fn version(&self) -> &str {
+            "test-1"
+        }
+
+        fn effect(&self) -> ToolEffect {
+            self.effect
+        }
+
         fn call(&self, arguments: Value) -> ToolFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
@@ -12901,8 +12831,8 @@ mod requests_and_tool_loop {
                         .zip(arguments["b"].as_i64())
                         .and_then(|(a, b)| a.checked_add(b))
                         .map(|sum| json!({"sum": sum}))
-                        .ok_or_else(|| ToolFailure::new("no sum")),
-                    Behavior::Fail => Err(ToolFailure::new("the tool failed")),
+                        .ok_or_else(|| ToolFailure::not_applied("no sum")),
+                    Behavior::Fail => Err(ToolFailure::not_applied("the tool failed")),
                     Behavior::Big(bytes) => Ok(Value::String("x".repeat(*bytes))),
                     Behavior::Hang => std::future::pending().await,
                     Behavior::CancelThenHang(token) => {
@@ -12913,6 +12843,9 @@ mod requests_and_tool_loop {
                         registry.revoke(name).expect("revoke");
                         Ok(json!({"revoked": name}))
                     }
+                    Behavior::Uncertain => Err(ToolFailure::uncertain("the connection dropped")),
+                    Behavior::Crash => panic!("the process died while the handler ran"),
+                    Behavior::Act(act) => Ok(act()),
                 }
             })
         }
@@ -12927,15 +12860,24 @@ mod requests_and_tool_loop {
         })
     }
 
-    /// Registers and authorizes the tools; their handlers share one count of
-    /// the calls they ran.
+    /// Registers and authorizes the tools as read-only; their handlers share
+    /// one count of the calls they ran.
     fn registered(tools: Vec<(&str, Behavior)>) -> (ToolRegistry, Arc<AtomicUsize>) {
+        registered_as(ToolEffect::ReadOnly, tools)
+    }
+
+    /// Like [`registered`], with every handler declaring `effect`.
+    fn registered_as(
+        effect: ToolEffect,
+        tools: Vec<(&str, Behavior)>,
+    ) -> (ToolRegistry, Arc<AtomicUsize>) {
         let registry = ToolRegistry::default();
         let calls = Arc::new(AtomicUsize::new(0));
         for (name, behavior) in tools {
             let handler = Arc::new(TestTool {
                 behavior,
                 calls: calls.clone(),
+                effect,
             });
             registry
                 .register(name, Some("a test tool"), add_schema(), handler)
@@ -13119,6 +13061,8 @@ mod requests_and_tool_loop {
                 receipt,
                 stop,
                 observations: None,
+                evidence: None,
+                stop_unconfirmed: None,
             }) => (*receipt, stop),
             other => panic!("expected the tool loop to stop, got {other:?}"),
         }
@@ -13287,6 +13231,34 @@ mod requests_and_tool_loop {
             .collect::<Vec<_>>();
         assert_eq!(results, [r#"{"sum":3}"#, r#"{"sum":7}"#, r#"{"sum":11}"#]);
         assert_eq!(
+            evidence(&handle, run.job)
+                .iter()
+                .map(|record| (
+                    record.call,
+                    record.tool_call_id.as_str(),
+                    outcome_of(record)
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    tool_call(run.job, 1, 0),
+                    "a",
+                    Some(completed(r#"{"sum":3}"#))
+                ),
+                (
+                    tool_call(run.job, 1, 1),
+                    "b",
+                    Some(completed(r#"{"sum":7}"#))
+                ),
+                (
+                    tool_call(run.job, 2, 0),
+                    "c",
+                    Some(completed(r#"{"sum":11}"#))
+                ),
+            ],
+            "each call's evidence is its own, under its request"
+        );
+        assert_eq!(
             by_request(&handle, run.job)
                 .keys()
                 .copied()
@@ -13322,6 +13294,7 @@ mod requests_and_tool_loop {
                             Arc::new(TestTool {
                                 behavior: Behavior::Add,
                                 calls: Arc::new(AtomicUsize::new(0)),
+                                effect: ToolEffect::ReadOnly,
                             }),
                         )
                         .expect("register again");
@@ -13380,6 +13353,7 @@ mod requests_and_tool_loop {
                     Arc::new(TestTool {
                         behavior,
                         calls: calls.clone(),
+                        effect: ToolEffect::ReadOnly,
                     }),
                 )
                 .expect("register");
@@ -13686,6 +13660,23 @@ mod requests_and_tool_loop {
                 "{case}"
             );
             assert!(blocking(&handle, llm).is_empty(), "{case}");
+            let records = evidence(&handle, run.job);
+            if ran == 0 {
+                assert!(records.is_empty(), "{case}: nothing was admitted");
+            } else {
+                assert_eq!(
+                    records.iter().map(outcome_of).collect::<Vec<_>>(),
+                    [Some(ToolOutcome::Uncertain {
+                        cause: UncertainCause::Cancelled,
+                        message: None,
+                    })],
+                    "{case}"
+                );
+                assert!(
+                    records[0].is_unresolved(),
+                    "{case}: the stop resolves nothing"
+                );
+            }
         }
         worker.shutdown().expect("shutdown");
     }
@@ -13719,6 +13710,18 @@ mod requests_and_tool_loop {
         let job = job_record(&handle, run.job);
         assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
         assert!(blocking(&handle, llm).is_empty());
+        let records = evidence(&handle, run.job);
+        assert_eq!(
+            records.iter().map(outcome_of).collect::<Vec<_>>(),
+            [Some(ToolOutcome::Uncertain {
+                cause: UncertainCause::TimedOut,
+                message: None,
+            })]
+        );
+        assert!(
+            records[0].is_unresolved(),
+            "a stopped handler's effect stays open"
+        );
         worker.shutdown().expect("shutdown");
     }
 
@@ -13726,6 +13729,7 @@ mod requests_and_tool_loop {
         Arc::new(TestTool {
             behavior: Behavior::Add,
             calls: Arc::new(AtomicUsize::new(0)),
+            effect: ToolEffect::ReadOnly,
         })
     }
 
@@ -13810,6 +13814,7 @@ mod requests_and_tool_loop {
                 Arc::new(TestTool {
                     behavior: Behavior::Revoke(registry.clone(), "add"),
                     calls: calls.clone(),
+                    effect: ToolEffect::ReadOnly,
                 }),
             )
             .expect("register");
@@ -13846,6 +13851,31 @@ mod requests_and_tool_loop {
             1,
             "no call was admitted after the revocation"
         );
+        let records = evidence(&handle, run.job);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.call,
+                    record.decision.fact.clone(),
+                    outcome_of(record)
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    tool_call(run.job, 1, 0),
+                    records[0].decision.fact.clone(),
+                    Some(completed(r#"{"revoked":"add"}"#))
+                ),
+                (
+                    tool_call(run.job, 2, 0),
+                    ToolDecision::Refused(ToolCallRefusal::Unauthorized),
+                    None
+                ),
+            ],
+            "the call that passed its final check completed; the later one was refused"
+        );
+        assert!(records[0].admission().is_some());
         worker.shutdown().expect("shutdown");
     }
 
@@ -14059,13 +14089,24 @@ mod requests_and_tool_loop {
         );
         assert!(looped.sent.is_empty());
         match looped.settled {
-            Err(ExecutionRuntimeError::NotSettled {
+            Err(ExecutionRuntimeError::ToolLoopNotSettled {
+                stop,
                 source,
+                evidence: None,
                 observations: None,
-            }) => assert!(
-                !matches!(source, DatabaseError::Rejected(_)),
-                "storage refused it, not a rule: {source:?}"
-            ),
+            }) => {
+                assert_eq!(
+                    *stop,
+                    ToolLoopStop::InvalidLimits(
+                        crate::orchestration::execution_runtime::ToolLimitsError::NoProviderRequest
+                    ),
+                    "the stop is reported with the failed settlement"
+                );
+                assert!(
+                    !matches!(source, DatabaseError::Rejected(_)),
+                    "storage refused it, not a rule: {source:?}"
+                );
+            }
             other => panic!("the failed settlement must be reported, got {other:?}"),
         }
         wait(handle.recover_storage()).expect("recover");
@@ -14154,6 +14195,7 @@ mod requests_and_tool_loop {
                 Arc::new(TestTool {
                     behavior: Behavior::Add,
                     calls: Arc::new(AtomicUsize::new(0)),
+                    effect: ToolEffect::ReadOnly,
                 })
             ),
             Err(crate::orchestration::tools::ToolRegistryError::Duplicate(_))
@@ -14166,6 +14208,7 @@ mod requests_and_tool_loop {
                 Arc::new(TestTool {
                     behavior: Behavior::Add,
                     calls: Arc::new(AtomicUsize::new(0)),
+                    effect: ToolEffect::ReadOnly,
                 })
             ),
             Err(crate::orchestration::tools::ToolRegistryError::UnsupportedSchema(..))
@@ -14175,5 +14218,1735 @@ mod requests_and_tool_loop {
             Err(crate::orchestration::tools::ToolRegistryError::Unauthorized(_))
         ));
         worker.shutdown().expect("shutdown");
+    }
+
+    // ---- Durable tool evidence ------------------------------------------------
+
+    use crate::disk_protection::{
+        CleanupConfig, FilesystemConfig, ProtectedArea, ProtectionReason, SpaceShortage,
+    };
+    use crate::orchestration::execution_runtime::dispatch_seam::{self, Point};
+    use crate::persistence::{
+        AuthorizationBasis, EffectConclusion, MAX_STORED_TOOL_ARGUMENTS_BYTES,
+        MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, NewToolEvidence, ToolAdmission, ToolCallRef,
+        ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind, ToolPayload,
+        ToolReconciliation, UncertainCause, WithheldReason,
+    };
+
+    fn evidence(handle: &DatabaseHandle, job: JobId) -> Vec<ToolEvidenceRecord> {
+        wait(handle.tool_evidence(job, None, 1_000)).expect("read tool evidence")
+    }
+
+    fn tool_call(job: JobId, request: u32, index: u32) -> ToolCallRef {
+        ToolCallRef {
+            job,
+            request: number(request),
+            index,
+        }
+    }
+
+    /// A Job this process executes, whose first `requests` Provider requests
+    /// were delivered.
+    fn observed_run(handle: &DatabaseHandle, llm: ProfileId, requests: u32) -> TokenRun {
+        let run = local_run(handle, llm);
+        for request in 1..=requests {
+            wait(handle.record_metrics(NewMetrics {
+                job: run.job,
+                request: number(request),
+                observed_at: Timestamp::now(),
+                measurements: Measurements::default(),
+                token: Some(TokenAnnotation::eligible(UsageFinality::Cumulative)),
+            }))
+            .expect("record the delivery");
+        }
+        run
+    }
+
+    fn admitted_with(
+        call: ToolCallRef,
+        id: &str,
+        effect: ToolEffect,
+        arguments: &str,
+    ) -> NewToolEvidence {
+        NewToolEvidence {
+            call,
+            tool_call_id: id.into(),
+            name: "add".into(),
+            decision: ToolDecision::Admitted(ToolAdmission {
+                handler_version: "test-1".into(),
+                effect,
+                parameters: add_schema().to_string(),
+                arguments: ToolPayload::new(arguments),
+                authorization: AuthorizationBasis::RegistryGrant,
+            }),
+        }
+    }
+
+    fn admitted(call: ToolCallRef, id: &str, effect: ToolEffect) -> NewToolEvidence {
+        admitted_with(call, id, effect, r#"{"a":1,"b":2}"#)
+    }
+
+    fn refused(call: ToolCallRef, id: &str) -> NewToolEvidence {
+        NewToolEvidence {
+            call,
+            tool_call_id: id.into(),
+            name: "add".into(),
+            decision: ToolDecision::Refused(ToolCallRefusal::Unauthorized),
+        }
+    }
+
+    fn completed(result: &str) -> ToolOutcome {
+        ToolOutcome::Completed {
+            result: ToolPayload::new(result),
+        }
+    }
+
+    fn uncertain() -> ToolOutcome {
+        ToolOutcome::Uncertain {
+            cause: UncertainCause::HandlerReported,
+            message: Some("the connection dropped".into()),
+        }
+    }
+
+    fn verified(conclusion: EffectConclusion) -> ToolReconciliation {
+        ToolReconciliation {
+            conclusion,
+            reconciler: "test reconciler".into(),
+            evidence: "external record 42".into(),
+            explanation: "the external system was checked".into(),
+        }
+    }
+
+    fn outcome_of(record: &ToolEvidenceRecord) -> Option<ToolOutcome> {
+        record.outcome.as_ref().map(|outcome| outcome.fact.clone())
+    }
+
+    fn settle_unknown(handle: &DatabaseHandle, job: JobId) {
+        wait(handle.finalize_job(job, JobFinalization::Unknown)).expect("an unknown outcome");
+        wait(handle.confirm_job_stopped(job)).expect("confirm the stop");
+    }
+
+    fn retry_of(original: JobId, llm: ProfileId, acknowledge_repeated_effects: bool) -> JobRetry {
+        JobRetry {
+            original,
+            input: RetryInput::Unchanged,
+            name: Some("retry".into()),
+            execution_mode: ExecutionMode::Once,
+            eligible_at: None,
+            scheduled_at: None,
+            next_due_at: None,
+            next_iteration_no: None,
+            iteration_no: None,
+            projects: Vec::new(),
+            dependencies: Vec::new(),
+            configuration: llm_only(llm),
+            assigned_executor: None,
+            acknowledge_repeated_effects,
+        }
+    }
+
+    /// A configuration whose disk checks never lock, so only the protection
+    /// a test activates refuses commands.
+    fn lenient() -> FilesystemConfig {
+        FilesystemConfig {
+            disk_lock_threshold_bytes: 1,
+            disk_resume_threshold_bytes: 2,
+            disk_check_interval_ms: 3_600_000,
+            cleanup_config: CleanupConfig::default(),
+        }
+    }
+
+    /// Makes storage refuse every command from now on, as a full disk would.
+    fn protect(handle: &DatabaseHandle, directory: &std::path::Path) {
+        assert!(
+            handle.activate_filesystem_protection(ProtectionReason::InsufficientSpace(
+                SpaceShortage {
+                    area: ProtectedArea::Database,
+                    path: directory.to_path_buf(),
+                    available_bytes: 0,
+                    expected_write_bytes: 0,
+                    threshold_bytes: 1,
+                }
+            ))
+        );
+    }
+
+    /// Makes the commit of the next command fail after it may have become
+    /// durable: the command is held as the first of a group, a write of the
+    /// Job's joins the group, and the group's durable flush fails. Returns
+    /// what that companion write was answered.
+    fn fail_next_commit(
+        handle: &DatabaseHandle,
+        job: JobId,
+    ) -> std::thread::JoinHandle<Result<crate::persistence::MetricsId, DatabaseError>> {
+        let handle = handle.clone();
+        let (held, release) = handle.group_probe().hold_next_group();
+        std::thread::spawn(move || {
+            held.recv_timeout(crate::test_support::WAIT)
+                .expect("the next command is held");
+            let companion = admit(handle.record_metrics(NewMetrics {
+                job,
+                request: number(1),
+                observed_at: Timestamp::now(),
+                measurements: Measurements::default(),
+                token: Some(TokenAnnotation::eligible(UsageFinality::Cumulative)),
+            }));
+            handle
+                .group_probe()
+                .fail_next_flush
+                .store(true, Ordering::SeqCst);
+            release.send(()).expect("release the group");
+            companion()
+        })
+    }
+
+    /// The tool message that answered `id` in a sent conversation.
+    fn answer_to(conversation: &ChatConversation, id: &str) -> Option<String> {
+        conversation.messages.iter().find_map(|message| {
+            match (&message.tool_call_id, &message.content) {
+                (Some(answered), Some(MessageContentWire::Text(text))) if answered == id => {
+                    Some(text.clone())
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// A response that requests `calls`, each with its arguments sent in
+    /// fragments small enough for one stream line each.
+    fn calling_in_fragments(calls: &[(u32, &str, &str, String)]) -> Vec<Step> {
+        let delta = |delta: String| {
+            chunk(format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{delta}]}}}}]}}\n\n"
+            ))
+        };
+        let mut steps = Vec::new();
+        for (index, id, name, arguments) in calls {
+            let fragments = arguments
+                .as_bytes()
+                .chunks(16 * 1024)
+                .map(|fragment| std::str::from_utf8(fragment).expect("ASCII arguments"));
+            for (position, fragment) in fragments.enumerate() {
+                steps.push(delta(if position == 0 {
+                    call(*index, id, name, fragment)
+                } else {
+                    format!(
+                        r#"{{"index":{index},"function":{{"arguments":{}}}}}"#,
+                        serde_json::to_string(fragment).expect("JSON string")
+                    )
+                }));
+            }
+        }
+        steps.push(chunk(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n".into(),
+        ));
+        steps.push(usage_chunk((1, 1)));
+        steps.push(Step::Chunk(DONE_CHUNK));
+        steps
+    }
+
+    fn text_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": false
+        })
+    }
+
+    /// Arguments for [`text_schema`] of exactly `bytes` bytes.
+    fn text_arguments(prefix: &str, bytes: usize) -> String {
+        let padding = bytes - r#"{"text":""}"#.len() - prefix.len();
+        format!(r#"{{"text":"{prefix}{}"}}"#, "x".repeat(padding))
+    }
+
+    /// Registers and authorizes `echo`, which takes [`text_schema`].
+    fn echo_registry(effect: ToolEffect, answer: Value) -> (ToolRegistry, Arc<AtomicUsize>) {
+        let registry = ToolRegistry::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        registry
+            .register(
+                "echo",
+                None,
+                text_schema(),
+                Arc::new(TestTool {
+                    behavior: Behavior::Act(Box::new(move || answer.clone())),
+                    calls: calls.clone(),
+                    effect,
+                }),
+            )
+            .expect("register");
+        registry.authorize("echo").expect("authorize");
+        (registry, calls)
+    }
+
+    #[test]
+    fn tool_evidence_is_keyed_by_its_call_and_each_fact_is_written_once() {
+        let (_root, directory) = data_directory("tool-evidence-keys");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = observed_run(&handle, llm, 2);
+        let other = observed_run(&handle, llm, 1);
+        let job = run.job;
+        let effect = ToolEffect::NonIdempotent;
+        let decide = |evidence: NewToolEvidence| wait(handle.record_tool_decision(evidence));
+        let conclude = |call: ToolCallRef, outcome: ToolOutcome| {
+            wait(handle.record_tool_outcome(call, outcome))
+        };
+
+        // Calls of one request, of a later request and of another Job.
+        for (call, id) in [
+            (tool_call(job, 1, 0), "x"),
+            (tool_call(job, 1, 1), "y"),
+            (tool_call(job, 2, 0), "z"),
+            (tool_call(other.job, 1, 0), "x"),
+        ] {
+            decide(admitted(call, id, effect)).expect("admit");
+        }
+        decide(refused(tool_call(job, 2, 1), "r")).expect("refuse");
+        assert_eq!(
+            evidence(&handle, other.job).len(),
+            1,
+            "another Job may use the same Provider id"
+        );
+
+        let before = evidence(&handle, job);
+        for (result, expected) in [
+            (
+                decide(admitted(tool_call(job, 1, 0), "w", effect)),
+                Violation::DuplicateToolCall(tool_call(job, 1, 0)),
+            ),
+            (
+                decide(refused(tool_call(job, 1, 0), "w")),
+                Violation::DuplicateToolCall(tool_call(job, 1, 0)),
+            ),
+            (
+                decide(admitted(tool_call(job, 2, 2), "x", effect)),
+                Violation::DuplicateToolCallId {
+                    call: tool_call(job, 2, 2),
+                    existing: tool_call(job, 1, 0),
+                },
+            ),
+            (
+                decide(admitted(tool_call(job, 3, 0), "q", effect)),
+                Violation::RequestNotObserved {
+                    job,
+                    request: number(3),
+                },
+            ),
+            (
+                decide(admitted(tool_call(JobId::new(999_999), 1, 0), "q", effect)),
+                Violation::NotFound(RecordRef::Job(JobId::new(999_999))),
+            ),
+            (
+                conclude(tool_call(job, 3, 0), completed("{}")),
+                Violation::ToolCallNotFound(tool_call(job, 3, 0)),
+            ),
+            (
+                conclude(tool_call(job, 2, 1), completed("{}")),
+                Violation::ToolCallNotAdmitted(tool_call(job, 2, 1)),
+            ),
+        ] {
+            assert_eq!(violation(result), expected);
+        }
+        let not_started = llm_job(&handle, llm);
+        assert_eq!(
+            violation(decide(admitted(tool_call(not_started, 1, 0), "q", effect))),
+            Violation::NotExecutingLocally(not_started),
+            "only the Job's own execution records its calls"
+        );
+
+        // Malformed facts.
+        type Change = Box<dyn Fn(&mut NewToolEvidence)>;
+        let malformed: Vec<(&str, Change)> = vec![
+            (
+                "tool_call_id",
+                Box::new(|evidence| evidence.tool_call_id.clear()),
+            ),
+            (
+                "name",
+                Box::new(|evidence| evidence.name = "no such name!".into()),
+            ),
+            (
+                "handler_version",
+                Box::new(|evidence| {
+                    if let ToolDecision::Admitted(admission) = &mut evidence.decision {
+                        admission.handler_version = "a version with spaces".into();
+                    }
+                }),
+            ),
+            (
+                "arguments",
+                Box::new(|evidence| {
+                    if let ToolDecision::Admitted(admission) = &mut evidence.decision {
+                        admission.arguments = ToolPayload::new("[1, 2]");
+                    }
+                }),
+            ),
+            (
+                "parameters",
+                Box::new(|evidence| {
+                    if let ToolDecision::Admitted(admission) = &mut evidence.decision {
+                        admission.parameters = "{".into();
+                    }
+                }),
+            ),
+        ];
+        for (field, change) in malformed {
+            let mut evidence = admitted(tool_call(job, 2, 3), "m", effect);
+            change(&mut evidence);
+            assert!(
+                matches!(violation(decide(evidence)), Violation::InvalidValue(found, _) if found == field),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            evidence(&handle, job),
+            before,
+            "nothing refused was written"
+        );
+
+        // An outcome is written once, and never over an uncertain one.
+        conclude(tool_call(job, 1, 0), completed(r#"{"sum":3}"#)).expect("complete");
+        conclude(tool_call(job, 1, 1), uncertain()).expect("record the uncertainty");
+        for call in [tool_call(job, 1, 0), tool_call(job, 1, 1)] {
+            assert_eq!(
+                violation(conclude(call, completed("{}"))),
+                Violation::ToolOutcomeAlreadyRecorded(call)
+            );
+        }
+        let records = evidence(&handle, job);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.call,
+                    record.tool_call_id.as_str(),
+                    outcome_of(record)
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (tool_call(job, 1, 0), "x", Some(completed(r#"{"sum":3}"#))),
+                (tool_call(job, 1, 1), "y", Some(uncertain())),
+                (tool_call(job, 2, 0), "z", None),
+                (tool_call(job, 2, 1), "r", None),
+            ]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(ToolEvidenceRecord::is_unresolved)
+                .collect::<Vec<_>>(),
+            [false, true, true, false],
+            "an admission without a definite outcome is unresolved; a refusal never is"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(ToolEvidenceRecord::is_applied)
+                .collect::<Vec<_>>(),
+            [true, false, false, false]
+        );
+        assert_eq!(
+            records[3].decision.fact,
+            ToolDecision::Refused(ToolCallRefusal::Unauthorized)
+        );
+        assert!(records.iter().all(|record| {
+            record
+                .outcome
+                .as_ref()
+                .is_none_or(|outcome| outcome.at >= record.decision.at)
+        }));
+        for after in [(number(1), 1), (number(1), u32::MAX)] {
+            assert_eq!(
+                wait(handle.tool_evidence(job, Some(after), 10)).expect("page"),
+                records[2..],
+                "the page after {after:?}"
+            );
+        }
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_handler_runs_only_once_its_admission_is_durable_and_its_result_is_recorded_before_it_is_sent()
+     {
+        let (_root, directory) = data_directory("tool-evidence-write-ahead");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = {
+            let (handle, seen, job) = (handle.clone(), seen.clone(), run.job);
+            Behavior::Act(Box::new(move || {
+                seen.lock().expect("lock").push(evidence(&handle, job));
+                json!({"sum": 5})
+            }))
+        };
+        let (registry, calls) = registered_as(ToolEffect::NonIdempotent, vec![("add", observer)]);
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+            vec![
+                calling(&[add(0, "call_1", 2, 3)], (1, 1)),
+                answering("The sum is 5.", (1, 1)),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        let sent = looped.sent.clone();
+        looped.settled.expect("the loop settles");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let seen = seen.lock().expect("lock");
+        let [at_invocation] = seen.as_slice() else {
+            panic!("the handler ran once");
+        };
+        let call = tool_call(run.job, 1, 0);
+        let expected = ToolAdmission {
+            handler_version: "test-1".into(),
+            effect: ToolEffect::NonIdempotent,
+            parameters: add_schema().to_string(),
+            arguments: ToolPayload::new(r#"{"a":2,"b":3}"#),
+            authorization: AuthorizationBasis::RegistryGrant,
+        };
+        match at_invocation.as_slice() {
+            [record] => {
+                assert_eq!(record.call, call);
+                assert_eq!(
+                    record.admission(),
+                    Some(&expected),
+                    "admitted before it ran"
+                );
+                assert_eq!(record.outcome, None, "and nothing of its outcome yet");
+            }
+            other => panic!("expected the one admission, found {other:?}"),
+        }
+
+        let records = evidence(&handle, run.job);
+        let [record] = records.as_slice() else {
+            panic!("one call, one record");
+        };
+        assert_eq!(record.tool_call_id, "call_1");
+        assert_eq!(record.name, "add");
+        assert_eq!(record.admission(), Some(&expected));
+        assert_eq!(outcome_of(record), Some(completed(r#"{"sum":5}"#)));
+        assert_eq!(
+            answer_to(&sent[1], "call_1").as_deref(),
+            Some(r#"{"sum":5}"#),
+            "what was sent is what was recorded"
+        );
+        assert!(record.is_applied() && !record.is_unresolved());
+        assert!(job_record(&handle, run.job).completed_at.is_some());
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn an_admission_the_database_refuses_runs_nothing() {
+        let (_root, directory) = data_directory("tool-evidence-admission-refused");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let (registry, calls) =
+            registered_as(ToolEffect::NonIdempotent, vec![("add", Behavior::Add)]);
+        let writer = handle.clone();
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+            vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+            CancellationToken::default(),
+            move |_| {
+                // Another decision took the call's identity first.
+                wait(writer.record_tool_decision(refused(tool_call(run.job, 1, 0), "elsewhere")))
+                    .expect("take the call's identity");
+            },
+        );
+        let (receipt, stop) = stopped(looped);
+        assert_eq!(
+            stop,
+            ToolLoopStop::AdmissionRefused {
+                index: 0,
+                violation: Violation::DuplicateToolCall(tool_call(run.job, 1, 0)),
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing ran");
+        assert!(receipt.result.is_some());
+        assert!(job_record(&handle, run.job).failed_at.is_some());
+        let records = evidence(&handle, run.job);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.tool_call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["elsewhere"]
+        );
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn an_admission_storage_refuses_or_leaves_unknown_runs_nothing() {
+        for unknown in [false, true] {
+            let (_root, directory) = data_directory(if unknown {
+                "tool-evidence-admission-unknown"
+            } else {
+                "tool-evidence-admission-unstored"
+            });
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let (registry, calls) =
+                registered_as(ToolEffect::NonIdempotent, vec![("add", Behavior::Add)]);
+            let (seam_handle, path) = (handle.clone(), directory.database_path().to_path_buf());
+            let failed_group = Arc::new(std::sync::Mutex::new(None));
+            let group = failed_group.clone();
+            dispatch_seam::install(move |point, call| {
+                if point == Point::BeforeAdmission {
+                    if unknown {
+                        *group.lock().expect("lock") =
+                            Some(fail_next_commit(&seam_handle, call.job));
+                    } else {
+                        protect(&seam_handle, &path);
+                    }
+                }
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+                vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+                CancellationToken::default(),
+                |_| {},
+            );
+            match looped.settled {
+                Err(ExecutionRuntimeError::ToolLoopNotSettled {
+                    stop,
+                    evidence: Some(evidence),
+                    ..
+                }) => {
+                    assert_eq!(
+                        *stop,
+                        ToolLoopStop::EvidenceNotRecorded {
+                            index: 0,
+                            outcome: None
+                        }
+                    );
+                    assert_eq!(
+                        matches!(*evidence, DatabaseError::OutcomeUnknown { .. }),
+                        unknown,
+                        "the database's own classification is kept: {evidence:?}"
+                    );
+                }
+                other => panic!("the unrecorded admission must be reported, got {other:?}"),
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing ran");
+            if unknown {
+                let companion = failed_group
+                    .lock()
+                    .expect("lock")
+                    .take()
+                    .expect("the group was failed")
+                    .join()
+                    .expect("the companion finished");
+                assert!(matches!(
+                    companion,
+                    Err(DatabaseError::OutcomeUnknown { .. })
+                ));
+                wait(handle.recover_storage()).expect("recover");
+            }
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("restart");
+            let handle = worker.handle();
+            assert_eq!(handle.abandoned_at_open(), [run.job]);
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            assert!(blocking(&handle, llm).is_empty());
+            let records = evidence(&handle, run.job);
+            if unknown {
+                assert!(
+                    records.len() <= 1
+                        && records
+                            .iter()
+                            .all(|record| record.outcome.is_none() && record.is_unresolved()),
+                    "an admission that may have committed stays unresolved: {records:?}"
+                );
+            } else {
+                assert!(records.is_empty(), "a refused write committed nothing");
+            }
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+    }
+
+    #[test]
+    fn a_crash_after_the_admission_or_while_the_handler_runs_leaves_the_call_unresolved() {
+        let cases = [
+            (
+                "after the admission",
+                Behavior::Add,
+                Some(Point::Admitted),
+                0,
+            ),
+            ("while the handler runs", Behavior::Crash, None, 1),
+        ];
+        for (case, behavior, crash_at, ran) in cases {
+            let (_root, directory) = data_directory(&format!("tool-evidence-crash-{ran}"));
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let (registry, calls) =
+                registered_as(ToolEffect::NonIdempotent, vec![("add", behavior)]);
+            let tools = execution(&registry, &["add"], ToolLoopLimits::default());
+            let loop_handle = handle.clone();
+            let died = std::thread::spawn(move || {
+                if let Some(crash_at) = crash_at {
+                    dispatch_seam::install(move |point, _| {
+                        assert_ne!(point, crash_at, "the process died here");
+                    });
+                }
+                run_loop(
+                    &loop_handle,
+                    run,
+                    Some(tools),
+                    vec![
+                        calling(&[add(0, "c", 1, 2)], (1, 1)),
+                        answering("3", (1, 1)),
+                    ],
+                    CancellationToken::default(),
+                    |_| {},
+                );
+            })
+            .join();
+            assert!(died.is_err(), "{case}: the process died");
+            assert_eq!(calls.load(Ordering::SeqCst), ran, "{case}");
+            assert!(
+                !has_outcome(&job_record(&handle, run.job)),
+                "{case}: nothing settled the Job before the restart"
+            );
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start(&directory).expect("restart");
+            let handle = worker.handle();
+            assert_eq!(handle.abandoned_at_open(), [run.job], "{case}");
+            let job = job_record(&handle, run.job);
+            assert!(
+                job.unknown_at.is_some() && job.stop_confirmed_at.is_some(),
+                "{case}"
+            );
+            assert!(
+                blocking(&handle, llm).is_empty(),
+                "{case}: the Profile is released"
+            );
+            let records = evidence(&handle, run.job);
+            let [record] = records.as_slice() else {
+                panic!("{case}: one admission");
+            };
+            assert!(
+                record.admission().is_some()
+                    && record.outcome.is_none()
+                    && record.is_unresolved()
+                    && !record.is_applied(),
+                "{case}: an admission without an outcome stays unresolved after the restart"
+            );
+            for acknowledge in [false, true] {
+                assert_eq!(
+                    violation(wait(handle.retry_job(retry_of(run.job, llm, acknowledge)))),
+                    Violation::UnresolvedToolEffect(tool_call(run.job, 1, 0)),
+                    "{case}: no retry repeats an unresolved effect"
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                ran,
+                "{case}: nothing ran again"
+            );
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+    }
+
+    /// Whether any outcome, confirmed or unknown, was recorded for the Job.
+    fn has_outcome(job: &JobRecord) -> bool {
+        job.completed_at.is_some()
+            || job.failed_at.is_some()
+            || job.cancelled_at.is_some()
+            || job.unknown_at.is_some()
+    }
+
+    #[test]
+    fn a_completed_call_whose_outcome_cannot_be_recorded_stays_uncertain() {
+        for unknown in [false, true] {
+            let (_root, directory) = data_directory(if unknown {
+                "tool-evidence-outcome-unknown"
+            } else {
+                "tool-evidence-outcome-unstored"
+            });
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            // The handler completes its effect, then storage fails before its
+            // outcome can be recorded.
+            let failed_group = Arc::new(std::sync::Mutex::new(None));
+            let failing = {
+                let (handle, path) = (handle.clone(), directory.database_path().to_path_buf());
+                let (group, job) = (failed_group.clone(), run.job);
+                Behavior::Act(Box::new(move || {
+                    if unknown {
+                        *group.lock().expect("lock") = Some(fail_next_commit(&handle, job));
+                    } else {
+                        protect(&handle, &path);
+                    }
+                    json!({"sum": 3})
+                }))
+            };
+            let (registry, calls) =
+                registered_as(ToolEffect::NonIdempotent, vec![("add", failing)]);
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+                vec![
+                    calling(&[add(0, "c", 1, 2)], (1, 1)),
+                    answering("3", (1, 1)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert_eq!(looped.sent.len(), 1, "an unrecorded result is never sent");
+            match looped.settled {
+                Err(ExecutionRuntimeError::ToolLoopNotSettled {
+                    stop,
+                    source,
+                    evidence: Some(evidence),
+                    ..
+                }) => {
+                    assert_eq!(
+                        *stop,
+                        ToolLoopStop::EvidenceNotRecorded {
+                            index: 0,
+                            outcome: Some(ToolOutcomeKind::Completed),
+                        },
+                        "what the handler did is kept in the report"
+                    );
+                    assert_eq!(
+                        matches!(*evidence, DatabaseError::OutcomeUnknown { .. }),
+                        unknown
+                    );
+                    assert!(!matches!(source, DatabaseError::Rejected(_)));
+                }
+                other => panic!("the unrecorded outcome must be reported, got {other:?}"),
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if unknown {
+                let companion = failed_group
+                    .lock()
+                    .expect("lock")
+                    .take()
+                    .expect("the group was failed")
+                    .join()
+                    .expect("the companion finished");
+                assert!(matches!(
+                    companion,
+                    Err(DatabaseError::OutcomeUnknown { .. })
+                ));
+                wait(handle.recover_storage()).expect("recover");
+            }
+            let job = job_record(&handle, run.job);
+            assert!(
+                !has_outcome(&job),
+                "neither Completed nor Failed was claimed"
+            );
+            worker.shutdown().expect("shutdown");
+
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("restart");
+            let handle = worker.handle();
+            let job = job_record(&handle, run.job);
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            let records = evidence(&handle, run.job);
+            let [record] = records.as_slice() else {
+                panic!("one admission");
+            };
+            assert!(record.admission().is_some());
+            if unknown {
+                // The outcome's commit may or may not have become durable.
+                assert!(
+                    matches!(
+                        outcome_of(record),
+                        None | Some(ToolOutcome::Completed { .. })
+                    ),
+                    "{record:?}"
+                );
+            } else {
+                assert_eq!(record.outcome, None);
+                assert!(record.is_unresolved(), "never taken as not applied");
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing ran again");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+    }
+
+    #[test]
+    fn an_earlier_call_keeps_its_recorded_outcome_when_a_later_call_fails() {
+        let (_root, directory) = data_directory("tool-evidence-later-failure");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let cases = [
+            (
+                "fail",
+                ToolLoopStop::HandlerFailed {
+                    index: 1,
+                    message: "the tool failed".into(),
+                },
+                ToolOutcomeKind::NotApplied,
+            ),
+            (
+                "unsure",
+                ToolLoopStop::HandlerUncertain {
+                    index: 1,
+                    message: "the connection dropped".into(),
+                },
+                ToolOutcomeKind::Uncertain,
+            ),
+            (
+                "big",
+                ToolLoopStop::ResultTooLarge { index: 1 },
+                ToolOutcomeKind::CompletedWithheld,
+            ),
+        ];
+        for (second, expected, kind) in cases {
+            let run = local_run(&handle, llm);
+            let (registry, calls) = registered_as(
+                ToolEffect::NonIdempotent,
+                vec![
+                    ("add", Behavior::Add),
+                    ("fail", Behavior::Fail),
+                    ("unsure", Behavior::Uncertain),
+                    ("big", Behavior::Big(20_000)),
+                ],
+            );
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(
+                    &registry,
+                    &["add", "fail", "unsure", "big"],
+                    ToolLoopLimits::default(),
+                )),
+                vec![calling(
+                    &[add(0, "a", 1, 2), call(1, "b", second, r#"{"a":1,"b":2}"#)],
+                    (1, 1),
+                )],
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert_eq!(looped.sent.len(), 1, "{second}: nothing was sent back");
+            let (receipt, stop) = stopped(looped);
+            assert_eq!(stop, expected, "{second}");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{second}");
+            let records = evidence(&handle, run.job);
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.outcome.as_ref().map(|outcome| outcome.fact.kind()))
+                    .collect::<Vec<_>>(),
+                [Some(ToolOutcomeKind::Completed), Some(kind)],
+                "{second}"
+            );
+            assert_eq!(outcome_of(&records[0]), Some(completed(r#"{"sum":3}"#)));
+            if kind == ToolOutcomeKind::CompletedWithheld {
+                assert_eq!(
+                    outcome_of(&records[1]),
+                    Some(ToolOutcome::CompletedWithheld {
+                        reason: WithheldReason::TooLarge
+                    }),
+                    "the completed handler is recorded as such, without its result"
+                );
+            }
+            let job = job_record(&handle, run.job);
+            if kind == ToolOutcomeKind::Uncertain {
+                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+                assert_eq!(receipt.result, None);
+                assert_eq!(
+                    violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
+                    Violation::UnresolvedToolEffect(tool_call(run.job, 1, 1)),
+                    "{second}"
+                );
+            } else {
+                assert!(job.failed_at.is_some(), "{second}");
+                assert_eq!(
+                    violation(wait(handle.retry_job(retry_of(run.job, llm, false)))),
+                    Violation::RepeatedEffectNotAcknowledged(tool_call(run.job, 1, 0)),
+                    "{second}: the first call's effect happened"
+                );
+                wait(handle.retry_job(retry_of(run.job, llm, true)))
+                    .expect("an acknowledged retry");
+            }
+            assert!(blocking(&handle, llm).iter().all(|held| *held != run.job));
+        }
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_grant_withdrawn_after_the_admission_refuses_the_invocation_and_is_recorded() {
+        for unstored in [false, true] {
+            let (_root, directory) = data_directory(if unstored {
+                "tool-evidence-revoked-unstored"
+            } else {
+                "tool-evidence-revoked"
+            });
+            let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let (registry, calls) =
+                registered_as(ToolEffect::NonIdempotent, vec![("add", Behavior::Add)]);
+            let (revoker, seam_handle, path) = (
+                registry.clone(),
+                handle.clone(),
+                directory.database_path().to_path_buf(),
+            );
+            dispatch_seam::install(move |point, _| {
+                if point == Point::Admitted {
+                    revoker.revoke("add").expect("revoke");
+                    if unstored {
+                        protect(&seam_handle, &path);
+                    }
+                }
+            });
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+                vec![calling(&[add(0, "c", 1, 2)], (1, 1))],
+                CancellationToken::default(),
+                |_| {},
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the handler was never invoked"
+            );
+            if unstored {
+                match looped.settled {
+                    Err(ExecutionRuntimeError::ToolLoopNotSettled { stop, .. }) => assert_eq!(
+                        *stop,
+                        ToolLoopStop::EvidenceNotRecorded {
+                            index: 0,
+                            outcome: Some(ToolOutcomeKind::NotInvoked),
+                        }
+                    ),
+                    other => panic!("expected an unsettled stop, got {other:?}"),
+                }
+                worker.shutdown().expect("shutdown");
+                let worker =
+                    DatabaseWorker::start_with_config(&directory, lenient()).expect("restart");
+                let handle = worker.handle();
+                let records = evidence(&handle, run.job);
+                assert!(
+                    records.len() == 1
+                        && records[0].outcome.is_none()
+                        && records[0].is_unresolved(),
+                    "an unrecorded refusal keeps the call uncertain: {records:?}"
+                );
+                worker.shutdown().expect("shutdown");
+            } else {
+                let (_, stop) = stopped(looped);
+                assert!(
+                    matches!(&stop, ToolLoopStop::Refused(refusal)
+                        if refusal.kind == ToolCallRefusal::Unauthorized && refusal.index == Some(0)),
+                    "{stop:?}"
+                );
+                let records = evidence(&handle, run.job);
+                let [record] = records.as_slice() else {
+                    panic!("one admission");
+                };
+                assert!(record.admission().is_some());
+                assert_eq!(
+                    outcome_of(record),
+                    Some(ToolOutcome::NotInvoked {
+                        reason: ToolCallRefusal::Unauthorized
+                    })
+                );
+                assert!(!record.is_unresolved() && !record.is_applied());
+                assert!(job_record(&handle, run.job).failed_at.is_some());
+                wait(handle.retry_job(retry_of(run.job, llm, false)))
+                    .expect("a call never invoked repeats nothing");
+                worker.shutdown().expect("shutdown");
+            }
+            assert_relationships_consistent(&directory);
+        }
+    }
+
+    #[test]
+    fn a_job_with_an_unresolved_tool_effect_can_only_become_unknown() {
+        let (_root, directory) = data_directory("tool-evidence-settlement");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+
+        for recorded in [None, Some(uncertain())] {
+            let run = observed_run(&handle, llm, 1);
+            let call = tool_call(run.job, 1, 0);
+            wait(handle.record_tool_decision(admitted(call, "c", ToolEffect::ReadOnly)))
+                .expect("admit");
+            if let Some(outcome) = recorded.clone() {
+                wait(handle.record_tool_outcome(call, outcome)).expect("record");
+            }
+            for finalization in [
+                JobFinalization::Completed(result("done")),
+                JobFinalization::Failed(result("failed")),
+                JobFinalization::Cancelled(result("cancelled")),
+            ] {
+                assert_eq!(
+                    violation(wait(handle.finalize_job(run.job, finalization))),
+                    Violation::UnresolvedToolEffect(call),
+                    "{recorded:?}"
+                );
+            }
+            assert!(
+                blocking(&handle, llm).contains(&run.job),
+                "it still holds its Profile"
+            );
+            settle_unknown(&handle, run.job);
+            assert!(
+                !blocking(&handle, llm).contains(&run.job),
+                "its confirmed stop releases it"
+            );
+            let records = evidence(&handle, run.job);
+            assert_eq!(
+                outcome_of(&records[0]),
+                recorded,
+                "the stop changes no outcome"
+            );
+            assert!(
+                records[0].is_unresolved(),
+                "a confirmed stop is not a resolution"
+            );
+            assert_eq!(
+                violation(wait(handle.record_tool_outcome(
+                    call,
+                    ToolOutcome::NotApplied {
+                        message: "after the fact".into()
+                    }
+                ))),
+                Violation::NotExecutingLocally(run.job),
+                "nothing rewrites the history of a settled Job"
+            );
+        }
+
+        for outcome in [
+            completed("{}"),
+            ToolOutcome::CompletedWithheld {
+                reason: WithheldReason::TooLarge,
+            },
+            ToolOutcome::NotApplied {
+                message: "no effect".into(),
+            },
+            ToolOutcome::NotInvoked {
+                reason: ToolCallRefusal::Unauthorized,
+            },
+        ] {
+            for finalization in [
+                JobFinalization::Completed(result("done")),
+                JobFinalization::Failed(result("failed")),
+            ] {
+                let run = observed_run(&handle, llm, 1);
+                let call = tool_call(run.job, 1, 0);
+                wait(handle.record_tool_decision(admitted(call, "c", ToolEffect::NonIdempotent)))
+                    .expect("admit");
+                wait(handle.record_tool_outcome(call, outcome.clone())).expect("record");
+                wait(handle.finalize_job(run.job, finalization))
+                    .expect("a definite outcome settles normally");
+                assert!(!blocking(&handle, llm).contains(&run.job));
+            }
+        }
+        worker.shutdown().expect("shutdown");
+        let worker = DatabaseWorker::start(&directory).expect("restart");
+        assert!(
+            worker.handle().abandoned_at_open().is_empty(),
+            "every local claim was released"
+        );
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_retry_never_repeats_an_unresolved_effect_and_repeats_a_known_one_only_when_acknowledged() {
+        let (_root, directory) = data_directory("tool-evidence-retry");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        // A settled original whose one call, if any, had this effect and outcome.
+        let original = |effect: Option<ToolEffect>, outcome: Option<ToolOutcome>| {
+            let run = observed_run(&handle, llm, 1);
+            let call = tool_call(run.job, 1, 0);
+            if let Some(effect) = effect {
+                wait(handle.record_tool_decision(admitted(call, "c", effect))).expect("admit");
+                if let Some(outcome) = outcome.clone() {
+                    wait(handle.record_tool_outcome(call, outcome)).expect("record");
+                }
+            }
+            if effect.is_none() || outcome.as_ref().is_some_and(ToolOutcome::is_definite) {
+                wait(handle.finalize_job(run.job, JobFinalization::Completed(result("done"))))
+                    .expect("complete");
+            } else {
+                settle_unknown(&handle, run.job);
+            }
+            (run.job, call)
+        };
+        use ToolEffect::{Idempotent, NonIdempotent, ReadOnly};
+        let not_applied = ToolOutcome::NotApplied {
+            message: "no effect".into(),
+        };
+        let withheld = ToolOutcome::CompletedWithheld {
+            reason: WithheldReason::TooLarge,
+        };
+        let not_invoked = ToolOutcome::NotInvoked {
+            reason: ToolCallRefusal::Unauthorized,
+        };
+        type Expected = Option<fn(ToolCallRef) -> Violation>;
+        let unresolved: Expected = Some(Violation::UnresolvedToolEffect);
+        let unacknowledged: Expected = Some(Violation::RepeatedEffectNotAcknowledged);
+        /// A case, its original's call, if any, and its outcome, whether the
+        /// retry acknowledges repeated effects, and its expected refusal.
+        type Case = (
+            &'static str,
+            Option<ToolEffect>,
+            Option<ToolOutcome>,
+            bool,
+            Expected,
+        );
+        let cases: Vec<Case> = vec![
+            ("no tool effect", None, None, false, None),
+            (
+                "a read-only call",
+                Some(ReadOnly),
+                Some(completed("{}")),
+                false,
+                None,
+            ),
+            (
+                "an uncertain read-only call",
+                Some(ReadOnly),
+                None,
+                false,
+                None,
+            ),
+            (
+                "an idempotent call",
+                Some(Idempotent),
+                Some(completed("{}")),
+                false,
+                None,
+            ),
+            (
+                "an unresolved idempotent call",
+                Some(Idempotent),
+                None,
+                true,
+                unresolved,
+            ),
+            (
+                "an uncertain idempotent call",
+                Some(Idempotent),
+                Some(uncertain()),
+                true,
+                unresolved,
+            ),
+            (
+                "a completed effect",
+                Some(NonIdempotent),
+                Some(completed("{}")),
+                false,
+                unacknowledged,
+            ),
+            (
+                "an acknowledged effect",
+                Some(NonIdempotent),
+                Some(completed("{}")),
+                true,
+                None,
+            ),
+            (
+                "a withheld result",
+                Some(NonIdempotent),
+                Some(withheld),
+                false,
+                unacknowledged,
+            ),
+            (
+                "an effect not applied",
+                Some(NonIdempotent),
+                Some(not_applied),
+                false,
+                None,
+            ),
+            (
+                "a call never invoked",
+                Some(NonIdempotent),
+                Some(not_invoked),
+                false,
+                None,
+            ),
+            (
+                "an acknowledged unresolved effect",
+                Some(NonIdempotent),
+                None,
+                true,
+                unresolved,
+            ),
+            (
+                "an acknowledged uncertain effect",
+                Some(NonIdempotent),
+                Some(uncertain()),
+                true,
+                unresolved,
+            ),
+        ];
+        for (case, effect, outcome, acknowledge, expected) in cases {
+            let (job, call) = original(effect, outcome);
+            let retried = wait(handle.retry_job(retry_of(job, llm, acknowledge)));
+            match expected {
+                None => {
+                    let retry = retried.unwrap_or_else(|error| panic!("{case}: {error}"));
+                    assert_eq!(job_record(&handle, retry).retry_of, Some(job), "{case}");
+                }
+                Some(refusal) => {
+                    assert_eq!(violation(retried), refusal(call), "{case}");
+                    assert!(
+                        wait(handle.retries(job)).expect("retries").is_empty(),
+                        "{case}: no retry was created"
+                    );
+                }
+            }
+        }
+
+        // A verified reconciliation resolves the effect as it found it.
+        for (conclusion, expected) in [
+            (EffectConclusion::Applied, unacknowledged),
+            (EffectConclusion::NotApplied, None),
+        ] {
+            let (job, call) = original(Some(NonIdempotent), None);
+            wait(handle.reconcile_tool_effect(call, verified(conclusion))).expect("reconcile");
+            let retried = wait(handle.retry_job(retry_of(job, llm, false)));
+            match expected {
+                None => {
+                    retried.expect("nothing to repeat");
+                }
+                Some(refusal) => {
+                    assert_eq!(violation(retried), refusal(call));
+                    wait(handle.retry_job(retry_of(job, llm, true)))
+                        .expect("an acknowledged retry");
+                }
+            }
+        }
+
+        // Concurrent retries meet the same gate in their own transactions.
+        let concurrently = |job: JobId, acknowledge: bool| {
+            let attempts = [0, 1].map(|_| {
+                let handle = handle.clone();
+                std::thread::spawn(move || wait(handle.retry_job(retry_of(job, llm, acknowledge))))
+            });
+            attempts.map(|attempt| attempt.join().expect("the attempt finished"))
+        };
+        let (job, _) = original(Some(NonIdempotent), Some(completed("{}")));
+        let [first, second] = concurrently(job, true);
+        let (created, refused): (Vec<_>, Vec<_>) =
+            [first, second].into_iter().partition(Result::is_ok);
+        assert_eq!(created.len(), 1, "one acknowledged retry becomes active");
+        assert!(matches!(
+            violation(refused.into_iter().next().expect("the other")),
+            Violation::ActiveRetry { original, .. } if original == job
+        ));
+        for (outcome, acknowledge, refusal) in [
+            (
+                Some(completed("{}")),
+                false,
+                Violation::RepeatedEffectNotAcknowledged as fn(_) -> _,
+            ),
+            (None, true, Violation::UnresolvedToolEffect),
+        ] {
+            let (job, call) = original(Some(NonIdempotent), outcome);
+            for attempt in concurrently(job, acknowledge) {
+                assert_eq!(violation(attempt), refusal(call));
+            }
+            assert!(wait(handle.retries(job)).expect("retries").is_empty());
+        }
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn a_reconciliation_is_verified_once_and_keeps_the_uncertainty_it_resolves() {
+        let (_root, directory) = data_directory("tool-evidence-reconciliation");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = observed_run(&handle, llm, 1);
+        let job = run.job;
+        let [uncertain_call, refused_call, resolved_call] =
+            [0, 1, 2].map(|index| tool_call(job, 1, index));
+        let decide = |evidence| wait(handle.record_tool_decision(evidence)).expect("decide");
+        decide(admitted(uncertain_call, "u", ToolEffect::NonIdempotent));
+        decide(refused(refused_call, "r"));
+        decide(admitted(resolved_call, "d", ToolEffect::NonIdempotent));
+        wait(handle.record_tool_outcome(uncertain_call, uncertain())).expect("record");
+        wait(handle.record_tool_outcome(resolved_call, completed("{}"))).expect("record");
+        let reconcile =
+            |call, reconciliation| wait(handle.reconcile_tool_effect(call, reconciliation));
+
+        assert_eq!(
+            violation(reconcile(
+                uncertain_call,
+                verified(EffectConclusion::Applied)
+            )),
+            Violation::ToolEffectStillExecuting(job),
+            "nothing is reconciled while the Job may still act"
+        );
+        settle_unknown(&handle, job);
+        let before = evidence(&handle, job);
+        for (call, expected) in [
+            (
+                tool_call(job, 1, 9),
+                Violation::ToolCallNotFound(tool_call(job, 1, 9)),
+            ),
+            (refused_call, Violation::ToolCallNotAdmitted(refused_call)),
+            (
+                resolved_call,
+                Violation::ToolEffectAlreadyResolved(resolved_call),
+            ),
+        ] {
+            assert_eq!(
+                violation(reconcile(call, verified(EffectConclusion::NotApplied))),
+                expected
+            );
+        }
+        for field in ["reconciler", "evidence", "explanation"] {
+            let mut unverified = verified(EffectConclusion::NotApplied);
+            match field {
+                "reconciler" => unverified.reconciler.clear(),
+                "evidence" => unverified.evidence.clear(),
+                _ => unverified.explanation.clear(),
+            }
+            assert!(
+                matches!(violation(reconcile(uncertain_call, unverified)), Violation::InvalidValue(found, _) if found == field),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            evidence(&handle, job),
+            before,
+            "nothing refused was written"
+        );
+
+        reconcile(uncertain_call, verified(EffectConclusion::Applied)).expect("reconcile");
+        for again in [EffectConclusion::Applied, EffectConclusion::NotApplied] {
+            assert_eq!(
+                violation(reconcile(uncertain_call, verified(again))),
+                Violation::ToolEffectAlreadyReconciled(uncertain_call),
+                "{again:?}"
+            );
+        }
+        let records = evidence(&handle, job);
+        let record = &records[0];
+        assert_eq!(record.decision, before[0].decision, "the admission is kept");
+        assert_eq!(
+            outcome_of(record),
+            Some(uncertain()),
+            "so is the uncertainty"
+        );
+        assert_eq!(
+            record
+                .reconciliation
+                .as_ref()
+                .map(|recorded| &recorded.fact),
+            Some(&verified(EffectConclusion::Applied))
+        );
+        assert!(!record.is_unresolved() && record.is_applied());
+        assert_eq!(&records[1..], &before[1..]);
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn arguments_beyond_the_recorded_limits_are_refused_before_anything_runs() {
+        let (_root, directory) = data_directory("tool-evidence-bounds");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+
+        // The database refuses them as well.
+        let run = observed_run(&handle, llm, 1);
+        let call = |index| tool_call(run.job, 1, index);
+        let at_limit = text_arguments("", MAX_STORED_TOOL_ARGUMENTS_BYTES);
+        assert_eq!(
+            violation(wait(handle.record_tool_decision(admitted_with(
+                call(0),
+                "c0",
+                ToolEffect::ReadOnly,
+                &text_arguments("", MAX_STORED_TOOL_ARGUMENTS_BYTES + 1),
+            )))),
+            Violation::ToolEvidenceLimit {
+                call: call(0),
+                limit: "the arguments of one call"
+            }
+        );
+        let fitting = MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES / MAX_STORED_TOOL_ARGUMENTS_BYTES;
+        for index in 0..fitting {
+            wait(handle.record_tool_decision(admitted_with(
+                call(index as u32),
+                &format!("c{index}"),
+                ToolEffect::ReadOnly,
+                &at_limit,
+            )))
+            .expect("within the Job's limit");
+        }
+        assert_eq!(
+            violation(wait(handle.record_tool_decision(admitted(
+                call(fitting as u32),
+                "over",
+                ToolEffect::ReadOnly,
+            )))),
+            Violation::ToolEvidenceLimit {
+                call: call(fitting as u32),
+                limit: "the arguments of one Job"
+            }
+        );
+
+        // Through the loop: one call over its limit.
+        let run = local_run(&handle, llm);
+        let (registry, calls) = echo_registry(ToolEffect::NonIdempotent, json!({"echoed": true}));
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["echo"], ToolLoopLimits::default())),
+            vec![calling_in_fragments(&[(
+                0,
+                "big",
+                "echo",
+                text_arguments("", MAX_STORED_TOOL_ARGUMENTS_BYTES + 1),
+            )])],
+            CancellationToken::default(),
+            |_| {},
+        );
+        assert_eq!(looped.sent.len(), 1);
+        let (_, stop) = stopped(looped);
+        assert!(
+            matches!(&stop, ToolLoopStop::Refused(refusal)
+                if refusal.kind == ToolCallRefusal::LimitExceeded && refusal.index == Some(0)),
+            "{stop:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let records = evidence(&handle, run.job);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| &record.decision.fact)
+                .collect::<Vec<_>>(),
+            [&ToolDecision::Refused(ToolCallRefusal::LimitExceeded)],
+            "the refusal is recorded, its arguments are not"
+        );
+        assert!(job_record(&handle, run.job).failed_at.is_some());
+
+        // Through the loop: calls within their own limit, over the Job's.
+        let run = local_run(&handle, llm);
+        let (registry, calls) = echo_registry(ToolEffect::NonIdempotent, json!({"echoed": true}));
+        let sixty = || text_arguments("", 60 * 1024);
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["echo"], ToolLoopLimits::default())),
+            vec![
+                calling_in_fragments(&[(0, "a", "echo", sixty()), (1, "b", "echo", sixty())]),
+                calling_in_fragments(&[
+                    (0, "c", "echo", sixty()),
+                    (1, "d", "echo", sixty()),
+                    (2, "e", "echo", sixty()),
+                ]),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        let (_, stop) = stopped(looped);
+        assert!(
+            matches!(&stop, ToolLoopStop::Refused(refusal)
+                if refusal.kind == ToolCallRefusal::LimitExceeded && refusal.index == Some(2)),
+            "{stop:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "no call of the response over the limit ran"
+        );
+        let records = evidence(&handle, run.job);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record.call,
+                    record.outcome.as_ref().map(|outcome| outcome.fact.kind())
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (tool_call(run.job, 1, 0), Some(ToolOutcomeKind::Completed)),
+                (tool_call(run.job, 1, 1), Some(ToolOutcomeKind::Completed)),
+                (tool_call(run.job, 2, 2), None),
+            ]
+        );
+        assert_eq!(
+            records[2].decision.fact,
+            ToolDecision::Refused(ToolCallRefusal::LimitExceeded)
+        );
+        worker.shutdown().expect("shutdown");
+        assert_relationships_consistent(&directory);
+    }
+
+    #[test]
+    fn recorded_arguments_and_results_stay_out_of_refusals_and_debug_output() {
+        const MARKER: &str = "s3cr3t-7f1c";
+        let (_root, directory) = data_directory("tool-evidence-confidential");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let leaks = |text: String| text.contains(MARKER);
+
+        // A call that ran: its arguments and result are recorded, and shown
+        // nowhere but in the record's own fields.
+        let run = local_run(&handle, llm);
+        let (registry, _) = echo_registry(ToolEffect::ReadOnly, json!({"echo": MARKER}));
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["echo"], ToolLoopLimits::default())),
+            vec![
+                calling(
+                    &[call(0, "c", "echo", &format!(r#"{{"text":"{MARKER}"}}"#))],
+                    (1, 1),
+                ),
+                answering("done", (1, 1)),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        looped.settled.expect("settles");
+        let records = evidence(&handle, run.job);
+        let admission = records[0].admission().expect("admitted");
+        assert!(leaks(admission.arguments.as_str().to_owned()));
+        assert!(matches!(
+            outcome_of(&records[0]),
+            Some(ToolOutcome::Completed { result }) if leaks(result.as_str().to_owned())
+        ));
+        assert!(!leaks(format!("{records:?}")), "Debug shows only sizes");
+
+        // A call refused for its arguments.
+        let run = local_run(&handle, llm);
+        let (registry, calls) = echo_registry(ToolEffect::ReadOnly, json!({}));
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["echo"], ToolLoopLimits::default())),
+            vec![calling_in_fragments(&[(
+                0,
+                "c",
+                "echo",
+                text_arguments(MARKER, MAX_STORED_TOOL_ARGUMENTS_BYTES + 1),
+            )])],
+            CancellationToken::default(),
+            |_| {},
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let error = looped.settled.expect_err("refused");
+        assert!(!leaks(format!("{error} {error:?}")));
+        let outputs = wait(handle.job_outputs(run.job, None, 100)).expect("outputs");
+        assert!(!leaks(format!("{outputs:?}")), "nor does the Job's result");
+        assert!(!leaks(format!("{:?}", evidence(&handle, run.job))));
+
+        // The database's own refusal of such arguments.
+        let run = observed_run(&handle, llm, 1);
+        let refused = wait(handle.record_tool_decision(admitted_with(
+            tool_call(run.job, 1, 0),
+            "c",
+            ToolEffect::ReadOnly,
+            &text_arguments(MARKER, MAX_STORED_TOOL_ARGUMENTS_BYTES + 1),
+        )))
+        .expect_err("refused");
+        assert!(!leaks(format!("{refused} {refused:?}")));
+        worker.shutdown().expect("shutdown");
+    }
+
+    /// A handler that only declares a version.
+    struct Versioned(&'static str);
+
+    impl ToolHandler for Versioned {
+        fn version(&self) -> &str {
+            self.0
+        }
+
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::ReadOnly
+        }
+
+        fn call(&self, _arguments: Value) -> ToolFuture<'_> {
+            Box::pin(async { Ok(json!({})) })
+        }
+    }
+
+    #[test]
+    fn a_registration_declares_a_stable_handler_version_and_a_recordable_schema() {
+        use crate::orchestration::tools::ToolRegistryError;
+
+        let registry = ToolRegistry::default();
+        assert!(
+            registry
+                .offer(&[])
+                .expect("nothing")
+                .wires()
+                .expect("none")
+                .is_empty(),
+            "no tool is registered by default"
+        );
+        for version in ["", "has space", &"v".repeat(65)] {
+            let version: &'static str = Box::leak(version.to_owned().into_boxed_str());
+            assert_eq!(
+                registry
+                    .register("tool", None, add_schema(), Arc::new(Versioned(version)))
+                    .map(|_| ()),
+                Err(ToolRegistryError::InvalidVersion("tool".into())),
+                "{version:?}"
+            );
+        }
+        let huge = json!({
+            "type": "object",
+            "description": "x".repeat(crate::openai_compatible::MAX_TOOL_DEFINITION_BYTES),
+        });
+        assert!(matches!(
+            registry.register("tool", None, huge, Arc::new(Versioned("1.0.0"))),
+            Err(ToolRegistryError::UnsupportedSchema(..))
+        ));
+        registry
+            .register(
+                "tool",
+                None,
+                add_schema(),
+                Arc::new(Versioned("1.0.0+build-7")),
+            )
+            .expect("a valid version");
+        assert_eq!(
+            registry.offer(&["tool"]).map(|_| ()),
+            Err(ToolRegistryError::Unauthorized("tool".into())),
+            "registering still grants nothing"
+        );
     }
 }

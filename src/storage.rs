@@ -36,18 +36,23 @@ use redb::{
     TableDefinition, WriteTransaction,
 };
 
-use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure};
+use crate::openai_compatible::{
+    ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
+};
 use crate::persistence::{
-    AgentConfig, AgentId, AgentRecord, AvailabilityObservation, AvailabilityStatId,
-    AvailabilityStatRecord, DependencyCondition, DependencyState, ExecutionConfiguration,
-    ExecutionMode, ExecutorId, ExecutorRecord, ExecutorType, FrozenExecutionConfig,
-    FrozenLlmConfig, JobId, JobInputId, JobOutputId, JobOutputRecord, JobRecord, LlmConfig,
-    LlmParameters, LlmProviderId, LlmProviderRecord, LlmTarget, LlmTransport, Measurements,
-    MetricsId, MetricsRecord, ModelCapability, ObservationCursor, ObservationFilter,
-    ObservationPage, ObservedModel, ObservedModelChoice, ObservedModelFilter, ObservedModelPage,
-    OperationId, OperationKind, OperationMarker, OutputKind, ProfileConfig, ProfileEditability,
-    ProfileId, ProfileKind, ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef,
-    RequestNumber, RequestRef, SubmittedConfiguration, Timestamp, Violation, WrongProfileKind,
+    AgentConfig, AgentId, AgentRecord, AuthorizationBasis, AvailabilityObservation,
+    AvailabilityStatId, AvailabilityStatRecord, DependencyCondition, DependencyState,
+    EffectConclusion, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorRecord,
+    ExecutorType, FrozenExecutionConfig, FrozenLlmConfig, JobId, JobInputId, JobOutputId,
+    JobOutputRecord, JobRecord, LlmConfig, LlmParameters, LlmProviderId, LlmProviderRecord,
+    LlmTarget, LlmTransport, Measurements, MetricsId, MetricsRecord, ModelCapability,
+    ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelChoice,
+    ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, OperationMarker,
+    OutputKind, ProfileConfig, ProfileEditability, ProfileId, ProfileKind, ProfileRecord,
+    ProjectId, ProjectRecord, ProviderSnapshot, RecordRef, Recorded, RequestNumber, RequestRef,
+    SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
+    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause, Violation,
+    WithheldReason, WrongProfileKind,
 };
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
@@ -79,12 +84,11 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// runtime; a version 9 build would leave them behind when it settled such
 /// a Job. Version 11 numbers the Provider requests of a Job: every Metrics
 /// and AvailabilityStat record names its request, and the aggregation state
-/// is kept per request rather than per Job. A version 10 file is upgraded in
-/// place when it is opened, see [`upgrade_from_10`]. Files of any other
-/// version are refused on open, before anything is written to them.
-pub(crate) const FORMAT_VERSION: u32 = 11;
-/// The one earlier version an opening upgrades rather than refuses.
-const UPGRADABLE_VERSION: u32 = 10;
+/// is kept per request rather than per Job. Version 12 adds the evidence of
+/// each tool call a Provider request asked for; an older build would settle
+/// Jobs past their unresolved tool effects. Files of any other version are
+/// refused on open, before anything is written to them.
+pub(crate) const FORMAT_VERSION: u32 = 12;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -181,8 +185,6 @@ const OPERATIONS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("ope
 /// (job, request) -> its request sample as materialized. Rebuildable from
 /// the raw AvailabilityStat records; the sample is fixed by its lowest record.
 const AVAILABILITY_SAMPLES: RequestRecords = TableDefinition::new("availability_request_sample");
-/// The same table keyed by Job alone, as a version 10 file holds it.
-const V10_AVAILABILITY_SAMPLES: Records = TableDefinition::new("availability_request_sample");
 /// (provider, minute, model) -> requests per classification, for the
 /// buckets that hold at least one request. Rebuildable like the samples.
 const AVAILABILITY_MINUTES: TableDefinition<&[u8], &[u8]> =
@@ -197,11 +199,19 @@ const AGGREGATION_PROGRESS: TableDefinition<&str, &[u8]> =
 /// finite evidence the request has so far. Rebuildable from the raw
 /// annotated Metrics.
 const TOKEN_REQUESTS: RequestRecords = TableDefinition::new("token_request");
-/// The same table keyed by Job alone, as a version 10 file holds it.
-const V10_TOKEN_REQUESTS: Records = TableDefinition::new("token_request");
 /// (provider, minute, model) -> Token totals of the buckets that hold at
 /// least one eligible request. Rebuildable like the requests.
 const TOKEN_MINUTES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("token_minute");
+
+/// (job, request, index) -> the evidence of the tool call at that wire index
+/// of the Job's Provider request. The key is the call's identity, so a call
+/// has one record. Not rebuildable: it is the only record of these facts.
+const TOOL_EVIDENCE: TableDefinition<(u64, u32, u32), &[u8]> =
+    TableDefinition::new("tool_evidence");
+/// (job, Provider tool call id) -> (request, index) of the one evidence
+/// record of the Job that uses the id, written with that record.
+const TOOL_CALL_IDS: TableDefinition<(u64, &str), (u32, u32)> =
+    TableDefinition::new("tool_call_id");
 
 mod availability_aggregation;
 mod token_aggregation;
@@ -310,6 +320,7 @@ const TAG_MINUTE_COUNTS: u8 = 16;
 const TAG_AGGREGATION_PROGRESS: u8 = 17;
 const TAG_TOKEN_REQUEST: u8 = 18;
 const TAG_TOKEN_MINUTE: u8 = 19;
+const TAG_TOOL_EVIDENCE: u8 = 20;
 
 struct Enc(Vec<u8>);
 
@@ -721,7 +732,19 @@ codes!(OperationKind {
     OperationKind::ConfirmJobStopped = 20, OperationKind::RecordMetrics = 21, OperationKind::RecordAvailabilityStat = 22,
     OperationKind::ConsumeAvailability = 23, OperationKind::ConsumeTokenUsage = 24,
     OperationKind::StartLocalJob = 25, OperationKind::ReconcileAbandonedJob = 26,
+    OperationKind::RecordToolDecision = 27, OperationKind::RecordToolOutcome = 28,
+    OperationKind::ReconcileToolEffect = 29,
 });
+codes!(ToolCallRefusal {
+    ToolCallRefusal::Malformed = 1, ToolCallRefusal::ConflictingIdentity = 2, ToolCallRefusal::AmbiguousIdentity = 3,
+    ToolCallRefusal::LimitExceeded = 4, ToolCallRefusal::Incomplete = 5, ToolCallRefusal::Unauthorized = 6,
+    ToolCallRefusal::MissingSchema = 7, ToolCallRefusal::UnsupportedSchema = 8, ToolCallRefusal::InvalidArguments = 9,
+});
+codes!(ToolEffect { ToolEffect::ReadOnly = 1, ToolEffect::Idempotent = 2, ToolEffect::NonIdempotent = 3 });
+codes!(AuthorizationBasis { AuthorizationBasis::RegistryGrant = 1 });
+codes!(WithheldReason { WithheldReason::TooLarge = 1, WithheldReason::Unserializable = 2 });
+codes!(UncertainCause { UncertainCause::TimedOut = 1, UncertainCause::Cancelled = 2, UncertainCause::HandlerReported = 3 });
+codes!(EffectConclusion { EffectConclusion::Applied = 1, EffectConclusion::NotApplied = 2 });
 
 // ---- rows ------------------------------------------------------------------------
 
@@ -1123,20 +1146,10 @@ impl MetricsRow {
     }
 
     fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        Self::decode_as(bytes, FORMAT_VERSION)
-    }
-
-    /// Decodes a row as a file of `version` stores it. A version 10 row
-    /// names no request: it is its Job's first, and only, request.
-    fn decode_as(bytes: &[u8], version: u32) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_METRICS)?;
         let row = Self {
             id: MetricsId::new(d.u64()?),
-            request: if version == UPGRADABLE_VERSION {
-                RequestNumber::FIRST
-            } else {
-                d.request()?
-            },
+            request: d.request()?,
             observed_at: d.ts()?,
             measurements: Measurements {
                 ttfb_ms: d.ou64()?,
@@ -1202,20 +1215,10 @@ impl AvailabilityStatRow {
     }
 
     fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        Self::decode_as(bytes, FORMAT_VERSION)
-    }
-
-    /// Decodes a row as a file of `version` stores it, like
-    /// [`MetricsRow::decode_as`].
-    fn decode_as(bytes: &[u8], version: u32) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_AVAILABILITY_STAT)?;
         let row = Self {
             id: AvailabilityStatId::new(d.u64()?),
-            request: if version == UPGRADABLE_VERSION {
-                RequestNumber::FIRST
-            } else {
-                d.request()?
-            },
+            request: d.request()?,
             observed_at: d.ts()?,
             observation: AvailabilityObservation {
                 status_code: d.opt(Dec::u16)?,
@@ -1237,6 +1240,153 @@ fn encode_marker(m: &OperationMarker) -> Vec<u8> {
     e.opt(&m.created, |e, r| e.record_ref(*r));
     e.ts(m.committed_at);
     e.0
+}
+
+/// The record without its call, which is its key.
+fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
+    let mut e = Enc::new(TAG_TOOL_EVIDENCE);
+    e.str(&record.tool_call_id);
+    e.str(&record.name);
+    e.ts(record.decision.at);
+    match &record.decision.fact {
+        ToolDecision::Refused(refusal) => {
+            e.u8(1);
+            e.u8(refusal.code());
+        }
+        ToolDecision::Admitted(admission) => {
+            e.u8(2);
+            e.str(&admission.handler_version);
+            e.u8(admission.effect.code());
+            e.str(&admission.parameters);
+            e.str(admission.arguments.as_str());
+            e.u8(admission.authorization.code());
+        }
+    }
+    e.opt(&record.outcome, |e, outcome| {
+        e.ts(outcome.at);
+        match &outcome.fact {
+            ToolOutcome::Completed { result } => {
+                e.u8(1);
+                e.str(result.as_str());
+            }
+            ToolOutcome::CompletedWithheld { reason } => {
+                e.u8(2);
+                e.u8(reason.code());
+            }
+            ToolOutcome::NotApplied { message } => {
+                e.u8(3);
+                e.str(message);
+            }
+            ToolOutcome::NotInvoked { reason } => {
+                e.u8(4);
+                e.u8(reason.code());
+            }
+            ToolOutcome::Uncertain { cause, message } => {
+                e.u8(5);
+                e.u8(cause.code());
+                e.ostr(message);
+            }
+        }
+    });
+    e.opt(&record.reconciliation, |e, reconciliation| {
+        e.ts(reconciliation.at);
+        let fact = &reconciliation.fact;
+        e.u8(fact.conclusion.code());
+        e.str(&fact.reconciler);
+        e.str(&fact.evidence);
+        e.str(&fact.explanation);
+    });
+    e.0
+}
+
+fn decode_tool_evidence(call: ToolCallRef, bytes: &[u8]) -> DecodeResult<ToolEvidenceRecord> {
+    let mut d = Dec::new(bytes, TAG_TOOL_EVIDENCE)?;
+    let tool_call_id = d.str()?;
+    let name = d.str()?;
+    let decided_at = d.ts()?;
+    let decision = match d.u8()? {
+        1 => ToolDecision::Refused(d.code(ToolCallRefusal::from_code)?),
+        2 => ToolDecision::Admitted(ToolAdmission {
+            handler_version: d.str()?,
+            effect: d.code(ToolEffect::from_code)?,
+            parameters: d.str()?,
+            arguments: ToolPayload::new(d.str()?),
+            authorization: d.code(AuthorizationBasis::from_code)?,
+        }),
+        _ => return Err(StorageError::corrupted("invalid tool decision")),
+    };
+    let outcome = d.opt(|d| {
+        let at = d.ts()?;
+        let fact = match d.u8()? {
+            1 => ToolOutcome::Completed {
+                result: ToolPayload::new(d.str()?),
+            },
+            2 => ToolOutcome::CompletedWithheld {
+                reason: d.code(WithheldReason::from_code)?,
+            },
+            3 => ToolOutcome::NotApplied { message: d.str()? },
+            4 => ToolOutcome::NotInvoked {
+                reason: d.code(ToolCallRefusal::from_code)?,
+            },
+            5 => ToolOutcome::Uncertain {
+                cause: d.code(UncertainCause::from_code)?,
+                message: d.ostr()?,
+            },
+            _ => return Err(StorageError::corrupted("invalid tool outcome")),
+        };
+        Ok(Recorded { fact, at })
+    })?;
+    let reconciliation = d.opt(|d| {
+        let at = d.ts()?;
+        let fact = ToolReconciliation {
+            conclusion: d.code(EffectConclusion::from_code)?,
+            reconciler: d.str()?,
+            evidence: d.str()?,
+            explanation: d.str()?,
+        };
+        Ok(Recorded { fact, at })
+    })?;
+    d.end()?;
+    Ok(ToolEvidenceRecord {
+        call,
+        tool_call_id,
+        name,
+        decision: Recorded {
+            fact: decision,
+            at: decided_at,
+        },
+        outcome,
+        reconciliation,
+    })
+}
+
+/// Every tool evidence record of `job` in `table`, in call order.
+fn job_tool_evidence(
+    table: &impl ReadableTable<(u64, u32, u32), &'static [u8]>,
+    job: JobId,
+) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
+    let mut records = Vec::new();
+    for entry in table.range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))? {
+        let (key, bytes) = entry?;
+        records.push(decode_tool_evidence(
+            tool_call_ref(key.value())?,
+            bytes.value(),
+        )?);
+    }
+    Ok(records)
+}
+
+fn tool_call_ref((job, request, index): (u64, u32, u32)) -> DecodeResult<ToolCallRef> {
+    Ok(ToolCallRef {
+        job: JobId::new(job),
+        request: RequestNumber::new(request)
+            .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?,
+        index,
+    })
+}
+
+fn tool_call_key(call: ToolCallRef) -> (u64, u32, u32) {
+    (call.job.get(), call.request.get(), call.index)
 }
 
 fn decode_marker(operation: OperationId, bytes: &[u8]) -> DecodeResult<OperationMarker> {
@@ -1459,8 +1609,6 @@ enum FormatVerdict {
     /// A file with no tables, which this opening will initialize.
     New,
     Supported,
-    /// A version 10 file, which this opening upgrades before anything else.
-    Upgradable,
 }
 
 fn format_verdict(
@@ -1476,7 +1624,6 @@ fn format_verdict(
                 .unwrap_or(u32::MAX);
             match found {
                 FORMAT_VERSION => Ok(FormatVerdict::Supported),
-                UPGRADABLE_VERSION => Ok(FormatVerdict::Upgradable),
                 _ => Err(OpenError::UnsupportedFormat { found }),
             }
         }
@@ -1526,19 +1673,14 @@ fn initialize(database: &Database) -> Result<(u64, JobId), OpenError> {
                 return Err(refusal);
             }
         };
-        if matches!(verdict, FormatVerdict::New) {
+        let created = matches!(verdict, FormatVerdict::New);
+        if created {
             meta.insert("format", FORMAT_NAME)
                 .map_err(StorageError::from)?;
-        }
-        if !matches!(verdict, FormatVerdict::Supported) {
             meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                 .map_err(StorageError::from)?;
         }
         drop(meta);
-        if matches!(verdict, FormatVerdict::Upgradable) {
-            upgrade_from_10(&tx)?;
-        }
-        let created = matches!(verdict, FormatVerdict::New);
         create_tables(&tx)?;
         let genesis = if created {
             create_genesis(&tx)?
@@ -1558,168 +1700,6 @@ fn initialize(database: &Database) -> Result<(u64, JobId), OpenError> {
     };
     tx.commit().map_err(StorageError::from)?;
     Ok(opened)
-}
-
-/// Records rewritten per read of one table during an upgrade.
-const UPGRADE_CHUNK: usize = 1_024;
-
-/// Test fault: fail the next upgrade after it rewrote everything and
-/// before the opening commits, as a crash or full disk would.
-#[cfg(test)]
-pub(crate) static FAIL_NEXT_UPGRADE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Test seam: rewrites a closed version 11 file whose Jobs each sent only
-/// their first request as the version 10 file it would have been: each
-/// Metrics and AvailabilityStat row without its request number, which is
-/// the only difference of their encodings, each aggregation state keyed by
-/// its Job alone, and the recorded version 10.
-#[cfg(test)]
-pub(crate) fn downgrade_to_format_10(directory: &Path) -> Result<(), StorageError> {
-    // The tag and encoding version, then the ID, then the request number.
-    const REQUEST_AT: std::ops::Range<usize> = 10..14;
-    let database = Database::create(database_file(directory))?;
-    let tx = database.begin_write()?;
-    for table in [METRICS, AVAILABILITY_STATS] {
-        rewrite_rows(&tx, table, |bytes| {
-            if bytes.get(REQUEST_AT) != Some(RequestNumber::FIRST.get().to_le_bytes().as_slice()) {
-                return Err(StorageError::corrupted(
-                    "only a first request has a version 10 form",
-                ));
-            }
-            Ok([&bytes[..REQUEST_AT.start], &bytes[REQUEST_AT.end..]].concat())
-        })?;
-    }
-    for (new, old) in [
-        (AVAILABILITY_SAMPLES, V10_AVAILABILITY_SAMPLES),
-        (TOKEN_REQUESTS, V10_TOKEN_REQUESTS),
-    ] {
-        let rows = {
-            let table = tx.open_table(new)?;
-            let mut rows = Vec::new();
-            for entry in table.iter()? {
-                let (key, value) = entry?;
-                let (job, request) = key.value();
-                if request != RequestNumber::FIRST.get() {
-                    return Err(StorageError::corrupted(
-                        "only a first request has a version 10 form",
-                    ));
-                }
-                rows.push((job, value.value().to_vec()));
-            }
-            rows
-        };
-        tx.delete_table(new)?;
-        let mut table = tx.open_table(old)?;
-        for (job, value) in rows {
-            table.insert(job, value.as_slice())?;
-        }
-    }
-    tx.open_table(META)?.insert(
-        "format_version",
-        UPGRADABLE_VERSION.to_le_bytes().as_slice(),
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-/// Test seam: the format version a closed file records.
-#[cfg(test)]
-pub(crate) fn recorded_format_version(directory: &Path) -> Result<u32, StorageError> {
-    let database = Database::create(database_file(directory))?;
-    let rx = database.begin_read()?;
-    let bytes = rx
-        .open_table(META)?
-        .get("format_version")?
-        .map(|v| v.value().to_vec())
-        .ok_or_else(|| StorageError::corrupted("no recorded format version"))?;
-    <[u8; 4]>::try_from(bytes.as_slice())
-        .map(u32::from_le_bytes)
-        .map_err(|_| StorageError::corrupted("a malformed format version"))
-}
-
-/// Upgrades a version 10 file inside the opening's write transaction, so the
-/// file is either still version 10 or wholly version 11: a failure or crash
-/// before the commit leaves it as it was, and the next opening upgrades it
-/// again. A version 10 Job sent exactly one Provider request, so each of its
-/// Metrics and AvailabilityStat records is rewritten as its request 1, and
-/// each per-Job aggregation state becomes the state of that Job's request 1,
-/// byte for byte. The minute totals and the progress of both streams already
-/// count those requests once and are kept as they are, so nothing is counted
-/// again and nothing is lost.
-fn upgrade_from_10(tx: &WriteTransaction) -> Result<(), StorageError> {
-    rewrite_rows(tx, METRICS, |bytes| {
-        MetricsRow::decode_as(bytes, UPGRADABLE_VERSION).map(|row| row.encode())
-    })?;
-    rewrite_rows(tx, AVAILABILITY_STATS, |bytes| {
-        AvailabilityStatRow::decode_as(bytes, UPGRADABLE_VERSION).map(|row| row.encode())
-    })?;
-    rekey_to_first_request(tx, V10_AVAILABILITY_SAMPLES, AVAILABILITY_SAMPLES)?;
-    rekey_to_first_request(tx, V10_TOKEN_REQUESTS, TOKEN_REQUESTS)?;
-    #[cfg(test)]
-    if FAIL_NEXT_UPGRADE.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        return Err(StorageError::corrupted("injected failure of the upgrade"));
-    }
-    Ok(())
-}
-
-/// Replaces every row of `table` with `rewrite` of it, under the same key.
-fn rewrite_rows(
-    tx: &WriteTransaction,
-    table: Records,
-    rewrite: impl Fn(&[u8]) -> DecodeResult<Vec<u8>>,
-) -> Result<(), StorageError> {
-    let mut next = Some(0_u64);
-    while let Some(from) = next {
-        let chunk = {
-            let rows = tx.open_table(table)?;
-            let mut chunk = Vec::with_capacity(UPGRADE_CHUNK);
-            for entry in rows.range(from..)?.take(UPGRADE_CHUNK) {
-                let (key, value) = entry?;
-                chunk.push((key.value(), rewrite(value.value())?));
-            }
-            chunk
-        };
-        let mut rows = tx.open_table(table)?;
-        for (key, value) in &chunk {
-            rows.insert(*key, value.as_slice())?;
-        }
-        next = match chunk.last() {
-            Some((last, _)) if chunk.len() == UPGRADE_CHUNK => last.checked_add(1),
-            _ => None,
-        };
-    }
-    Ok(())
-}
-
-/// Moves every per-Job row of `old` to the same name keyed by
-/// (job, request 1), through a scratch table, unchanged.
-fn rekey_to_first_request(
-    tx: &WriteTransaction,
-    old: Records,
-    new: RequestRecords,
-) -> Result<(), StorageError> {
-    let scratch: RequestRecords = TableDefinition::new("upgrade_scratch");
-    let first = RequestNumber::FIRST.get();
-    {
-        let rows = tx.open_table(old)?;
-        let mut moved = tx.open_table(scratch)?;
-        for entry in rows.iter()? {
-            let (job, value) = entry?;
-            moved.insert((job.value(), first), value.value())?;
-        }
-    }
-    tx.delete_table(old)?;
-    {
-        let rows = tx.open_table(scratch)?;
-        let mut moved = tx.open_table(new)?;
-        for entry in rows.iter()? {
-            let (key, value) = entry?;
-            moved.insert(key.value(), value.value())?;
-        }
-    }
-    tx.delete_table(scratch)?;
-    Ok(())
 }
 
 fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
@@ -1779,6 +1759,8 @@ fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(AGGREGATION_PROGRESS)?;
     tx.open_table(TOKEN_REQUESTS)?;
     tx.open_table(TOKEN_MINUTES)?;
+    tx.open_table(TOOL_EVIDENCE)?;
+    tx.open_table(TOOL_CALL_IDS)?;
     tx.open_table(TRANSPORT_EXECUTORS)?;
     tx.open_table(HAS_OUTPUT)?;
     tx.open_table(DEPENDS_ON)?;
@@ -2665,6 +2647,124 @@ impl Batch {
             }
             Ok(None)
         })
+    }
+
+    /// Whether the Job has a Metrics or AvailabilityStat record of the
+    /// request: the observation that makes the request a recorded one.
+    pub(crate) fn request_observed(
+        &mut self,
+        job: JobId,
+        request: RequestNumber,
+    ) -> Result<bool, BatchError> {
+        self.step(|tx| {
+            for (index, records, decode) in [
+                (
+                    JOB_AVAILABILITY,
+                    AVAILABILITY_STATS,
+                    (|bytes| AvailabilityStatRow::decode(bytes).map(|row| row.request))
+                        as fn(&[u8]) -> DecodeResult<RequestNumber>,
+                ),
+                (JOB_METRICS, METRICS, |bytes| {
+                    MetricsRow::decode(bytes).map(|row| row.request)
+                }),
+            ] {
+                let index = tx.open_table(index)?;
+                let records = tx.open_table(records)?;
+                for entry in index.range((job.get(), 0)..=(job.get(), u64::MAX))? {
+                    let record = entry?.0.value().1;
+                    let bytes = records.get(record)?.ok_or_else(|| {
+                        StorageError::corrupted(format!(
+                            "{job} is linked to missing observation {record}"
+                        ))
+                    })?;
+                    if decode(bytes.value())? == request {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })
+    }
+
+    pub(crate) fn tool_evidence(
+        &mut self,
+        call: ToolCallRef,
+    ) -> Result<Option<ToolEvidenceRecord>, BatchError> {
+        self.step(|tx| {
+            tx.open_table(TOOL_EVIDENCE)?
+                .get(tool_call_key(call))?
+                .map(|bytes| decode_tool_evidence(call, bytes.value()))
+                .transpose()
+        })
+    }
+
+    /// Every tool evidence record of the Job, in call order.
+    pub(crate) fn job_tool_evidence(
+        &mut self,
+        job: JobId,
+    ) -> Result<Vec<ToolEvidenceRecord>, BatchError> {
+        self.step(|tx| job_tool_evidence(&tx.open_table(TOOL_EVIDENCE)?, job))
+    }
+
+    /// Inserts a new record with its Provider id. Refuses a call that
+    /// already has a record, and an id another record of the Job uses.
+    pub(crate) fn insert_tool_evidence(
+        &mut self,
+        record: &ToolEvidenceRecord,
+    ) -> Result<(), BatchError> {
+        let call = record.call;
+        let key = tool_call_key(call);
+        let job = call.job.get();
+        let id = record.tool_call_id.as_str();
+        let taken = self.step(|tx| {
+            if tx.open_table(TOOL_EVIDENCE)?.get(key)?.is_some() {
+                return Ok(Some(None));
+            }
+            let mut ids = tx.open_table(TOOL_CALL_IDS)?;
+            if let Some(existing) = ids.get((job, id))? {
+                return Ok(Some(Some(existing.value())));
+            }
+            ids.insert((job, id), (key.1, key.2))?;
+            tx.open_table(TOOL_EVIDENCE)?
+                .insert(key, encode_tool_evidence(record).as_slice())?;
+            Ok(None)
+        })?;
+        match taken {
+            None => Ok(()),
+            Some(None) => self.reject(Violation::DuplicateToolCall(call)),
+            Some(Some((request, index))) => {
+                let Some(request) = RequestNumber::new(request) else {
+                    return self.corrupted(format!("{call}: an indexed request number is 0"));
+                };
+                self.reject(Violation::DuplicateToolCallId {
+                    call,
+                    existing: ToolCallRef {
+                        job: call.job,
+                        request,
+                        index,
+                    },
+                })
+            }
+        }
+    }
+
+    /// Replaces an existing record, which keeps its call and Provider id.
+    pub(crate) fn put_tool_evidence(
+        &mut self,
+        record: &ToolEvidenceRecord,
+    ) -> Result<(), BatchError> {
+        let key = tool_call_key(record.call);
+        let replaced = self.step(|tx| {
+            Ok(tx
+                .open_table(TOOL_EVIDENCE)?
+                .insert(key, encode_tool_evidence(record).as_slice())?
+                .is_some())
+        })?;
+        if replaced {
+            Ok(())
+        } else {
+            self.corrupted(format!("{} was replaced without a record", record.call))
+        }
     }
 
     /// Inserts the AvailabilityStat with its OBSERVES edge, the edge's
@@ -3628,6 +3728,38 @@ pub(crate) fn read_outputs(
             StorageError::corrupted(format!("HAS_OUTPUT names missing output {output}"))
         })?;
         records.push(decode_output(bytes.value())?);
+    }
+    Ok(records)
+}
+
+/// A Job's tool evidence in call order, after the call `after` names by its
+/// request and index when given.
+pub(crate) fn read_tool_evidence(
+    database: &Database,
+    job: JobId,
+    after: Option<(RequestNumber, u32)>,
+    limit: usize,
+) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
+    let rx = read(database)?;
+    let table = rx.open_table(TOOL_EVIDENCE)?;
+    let start = match after {
+        None => (job.get(), 0, 0),
+        Some((request, u32::MAX)) => match request.get().checked_add(1) {
+            Some(next) => (job.get(), next, 0),
+            None => return Ok(Vec::new()),
+        },
+        Some((request, index)) => (job.get(), request.get(), index + 1),
+    };
+    let mut records = Vec::new();
+    for entry in table
+        .range(start..=(job.get(), u32::MAX, u32::MAX))?
+        .take(limit.min(MAX_PAGE))
+    {
+        let (key, bytes) = entry?;
+        records.push(decode_tool_evidence(
+            tool_call_ref(key.value())?,
+            bytes.value(),
+        )?);
     }
     Ok(records)
 }
@@ -4951,6 +5083,41 @@ pub(crate) fn relationship_inconsistencies(
             )),
         }
     }
+    let mut indexed_tool_call_ids = BTreeSet::new();
+    for entry in rx.open_table(TOOL_CALL_IDS)?.iter()? {
+        let (key, value) = entry?;
+        let (job, id) = key.value();
+        let (request, index) = value.value();
+        indexed_tool_call_ids.insert((job, id.to_owned(), request, index));
+    }
+    let mut expected_tool_call_ids = BTreeSet::new();
+    for entry in rx.open_table(TOOL_EVIDENCE)?.iter()? {
+        let (key, bytes) = entry?;
+        let call = tool_call_ref(key.value())?;
+        let record = decode_tool_evidence(call, bytes.value())?;
+        let job = jobs_table
+            .get(call.job.get())?
+            .map(|v| JobRow::decode(v.value()))
+            .transpose()?;
+        match job {
+            None => problems.push(format!("{call} belongs to a missing Job")),
+            Some(job) if record.is_unresolved() && job.confirmed_terminal() => {
+                problems.push(format!(
+                    "{call} is unresolved but its Job has a confirmed outcome"
+                ));
+            }
+            Some(_) => {}
+        }
+        expected_tool_call_ids.insert((
+            call.job.get(),
+            record.tool_call_id,
+            call.request.get(),
+            call.index,
+        ));
+    }
+    if indexed_tool_call_ids != expected_tool_call_ids {
+        problems.push("the tool call id index and the tool evidence disagree".into());
+    }
     for (profile, kind) in &profile_kinds {
         let has_provider = uses_provider.iter().any(|(source, _)| source == profile);
         if (*kind == ProfileKind::Llm) != has_provider {
@@ -5464,8 +5631,8 @@ mod tests {
                 .expect("write version");
             tx.commit().expect("commit version");
         };
-        // A version neither supported nor upgraded in place.
-        let previous = UPGRADABLE_VERSION - 1;
+        // The version before this build's, which is refused like any other.
+        let previous = FORMAT_VERSION - 1;
         write_meta(&test.database, previous);
         let state = |database: &Database| {
             let rx = database.begin_read().expect("begin read");

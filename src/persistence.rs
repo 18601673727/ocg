@@ -3,7 +3,10 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::openai_compatible::{ChatFinishReason, NormalizedUsage, ProviderFailure};
+use crate::openai_compatible::{
+    ChatFinishReason, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_DEFINITION_BYTES, NormalizedUsage,
+    ProviderFailure, ToolCallRefusal, is_function_name,
+};
 use crate::storage::{
     AgentRow, AvailabilityStatRow, Batch, BatchError, ExecutorRow, JobInputRow, JobRow,
     MarkerSubjects, MetricsRow, ProfileLinks, ProfileRow, dependency_state,
@@ -285,6 +288,11 @@ pub struct JobRetry {
     /// retry cannot silently switch model or Provider.
     pub configuration: Option<ExecutionConfiguration>,
     pub assigned_executor: Option<ExecutorId>,
+    /// Accepts that the retry may repeat a non-idempotent tool effect the
+    /// original is known to have had. It promises no deduplication, grants
+    /// no tool anything, and never admits a retry over an effect that is
+    /// still unresolved. Leave it `false` unless the user accepted that.
+    pub acknowledge_repeated_effects: bool,
 }
 
 /// `value` carries a machine-readable payload, such as the conclusion of a
@@ -1254,6 +1262,270 @@ pub struct ObservedModelPage {
     pub next: Option<ObservedModel>,
 }
 
+/// The largest arguments of one tool call that OCG records, and so runs.
+/// It is stricter than the transport's own argument limit,
+/// [`crate::openai_compatible::MAX_TOOL_ARGUMENTS_BYTES`].
+pub const MAX_STORED_TOOL_ARGUMENTS_BYTES: usize = 64 * 1024;
+/// The largest sum of the recorded arguments of one Job's admitted calls.
+pub const MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES: usize = 256 * 1024;
+/// The largest sum of the parameter schemas recorded with one Job's
+/// admitted calls. Each admission records the schema its arguments were
+/// checked against, so this bounds what repeated calls of a tool store.
+pub const MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES: usize = 1024 * 1024;
+/// The longest handler version a tool may declare.
+pub const MAX_HANDLER_VERSION_BYTES: usize = 64;
+const MAX_RECONCILER_BYTES: usize = 256;
+const MAX_RECONCILIATION_TEXT_BYTES: usize = 4 * 1024;
+
+/// One tool call a Provider request asked for: the request of the Job that
+/// sent it and the call's wire index in that request's response. It keys the
+/// call's [`ToolEvidenceRecord`], so a call has at most one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ToolCallRef {
+    pub job: JobId,
+    pub request: RequestNumber,
+    pub index: u32,
+}
+
+impl fmt::Display for ToolCallRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "tool call {} of {} of {}",
+            self.index, self.request, self.job
+        )
+    }
+}
+
+/// What a tool's handler may change outside OCG, as the trusted code that
+/// implements and registers it declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolEffect {
+    /// Changes nothing outside OCG, so running it again repeats nothing.
+    ReadOnly,
+    /// Running it again with the same arguments leaves what one run left.
+    /// This must hold without an idempotency key: nothing OCG could derive
+    /// from a call stays the same in a retry, which is another Job.
+    Idempotent,
+    /// Running it again may repeat its effect.
+    NonIdempotent,
+}
+
+/// Why OCG let an admitted call run. OCG has no persistent permission
+/// system: the tool registry's explicit grant is the only basis there is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizationBasis {
+    RegistryGrant,
+}
+
+/// Tool arguments or a tool result, exactly as they were sent. Its `Debug`
+/// shows only its size, so that neither reaches a log or an error message
+/// by accident.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ToolPayload(String);
+
+impl ToolPayload {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl fmt::Debug for ToolPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ToolPayload({} bytes)", self.0.len())
+    }
+}
+
+/// The first durable fact about a call the Provider requested: whether OCG
+/// refused it or admitted it to run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolDecision {
+    /// OCG did not authorize the call, and never ran it.
+    Refused(ToolCallRefusal),
+    /// OCG accepted the call for execution. The handler may have been
+    /// invoked only once this was durable.
+    Admitted(ToolAdmission),
+}
+
+/// What OCG accepted for one execution: the exact registration, the
+/// arguments as checked and why it was authorized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolAdmission {
+    /// The version the handler's registration declared.
+    pub handler_version: String,
+    pub effect: ToolEffect,
+    /// The parameter schema the registration declared, serialized as it is
+    /// offered. The arguments were checked against it.
+    pub parameters: String,
+    /// The arguments exactly as the Provider sent them.
+    pub arguments: ToolPayload,
+    pub authorization: AuthorizationBasis,
+}
+
+/// A call the Provider requested, as OCG identified it, with OCG's decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewToolEvidence {
+    pub call: ToolCallRef,
+    /// The id the Provider gave the call; unique within the Job.
+    pub tool_call_id: String,
+    /// The tool the call named.
+    pub name: String,
+    pub decision: ToolDecision,
+}
+
+/// Why a completed handler's result was not sent to the Provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WithheldReason {
+    TooLarge,
+    Unserializable,
+}
+
+/// Why an admitted call's outcome cannot be established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UncertainCause {
+    /// The handler was stopped at its time limit.
+    TimedOut,
+    /// The execution was cancelled while the handler ran.
+    Cancelled,
+    /// The handler reported a failure without evidence that its effect
+    /// did not happen.
+    HandlerReported,
+}
+
+/// What is known of an admitted call's execution. Only `Uncertain` leaves
+/// the effect open; a missing outcome means the same.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolOutcome {
+    /// The handler returned this result, which is the one sent on.
+    Completed { result: ToolPayload },
+    /// The handler returned, so its effect happened, but its result was not
+    /// sent on.
+    CompletedWithheld { reason: WithheldReason },
+    /// The handler established that its effect did not happen.
+    NotApplied { message: String },
+    /// OCG never invoked the handler: its final authorization check refused
+    /// the call after the admission.
+    NotInvoked { reason: ToolCallRefusal },
+    /// The handler may have run and may have had its effect.
+    Uncertain {
+        cause: UncertainCause,
+        message: Option<String>,
+    },
+}
+
+/// The kind of a [`ToolOutcome`], without what it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutcomeKind {
+    Completed,
+    CompletedWithheld,
+    NotApplied,
+    NotInvoked,
+    Uncertain,
+}
+
+impl ToolOutcome {
+    pub fn kind(&self) -> ToolOutcomeKind {
+        match self {
+            Self::Completed { .. } => ToolOutcomeKind::Completed,
+            Self::CompletedWithheld { .. } => ToolOutcomeKind::CompletedWithheld,
+            Self::NotApplied { .. } => ToolOutcomeKind::NotApplied,
+            Self::NotInvoked { .. } => ToolOutcomeKind::NotInvoked,
+            Self::Uncertain { .. } => ToolOutcomeKind::Uncertain,
+        }
+    }
+
+    /// Whether the outcome settles whether the effect happened.
+    pub fn is_definite(&self) -> bool {
+        !matches!(self, Self::Uncertain { .. })
+    }
+}
+
+/// What a reconciliation established about an uncertain execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectConclusion {
+    Applied,
+    NotApplied,
+}
+
+/// A verified conclusion about an admitted call whose outcome was left
+/// uncertain. Only trusted OCG code that verified it against the external
+/// system may record one; OCG has none yet, so nothing outside the crate
+/// can record one and no uncertainty is resolved in production.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolReconciliation {
+    pub conclusion: EffectConclusion,
+    /// The trusted reconciler that verified it.
+    pub reconciler: String,
+    /// What it was verified against, such as the external system's record.
+    pub evidence: String,
+    pub explanation: String,
+}
+
+/// A fact and when its transaction recorded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recorded<T> {
+    pub fact: T,
+    pub at: Timestamp,
+}
+
+/// Everything recorded about one call a Provider requested. Each part is
+/// written once and never changed or removed, whatever the Job's outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolEvidenceRecord {
+    pub call: ToolCallRef,
+    pub tool_call_id: String,
+    pub name: String,
+    pub decision: Recorded<ToolDecision>,
+    pub outcome: Option<Recorded<ToolOutcome>>,
+    pub reconciliation: Option<Recorded<ToolReconciliation>>,
+}
+
+impl ToolEvidenceRecord {
+    pub fn admission(&self) -> Option<&ToolAdmission> {
+        match &self.decision.fact {
+            ToolDecision::Admitted(admission) => Some(admission),
+            ToolDecision::Refused(_) => None,
+        }
+    }
+
+    /// Whether the call was admitted and whether its effect happened is
+    /// still open: no definite outcome and no reconciliation.
+    pub fn is_unresolved(&self) -> bool {
+        self.admission().is_some()
+            && self.reconciliation.is_none()
+            && !self
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.fact.is_definite())
+    }
+
+    /// Whether the call's effect is known to have happened.
+    pub fn is_applied(&self) -> bool {
+        let completed = self.outcome.as_ref().is_some_and(|outcome| {
+            matches!(
+                outcome.fact,
+                ToolOutcome::Completed { .. } | ToolOutcome::CompletedWithheld { .. }
+            )
+        });
+        let reconciled = self.reconciliation.as_ref().is_some_and(|reconciliation| {
+            reconciliation.fact.conclusion == EffectConclusion::Applied
+        });
+        self.admission().is_some() && (completed || reconciled)
+    }
+}
+
 /// Identifies one submitted command. `epoch` is allocated durably each time
 /// the database is opened, so an identifier is never reused across openings,
 /// even when its command never committed.
@@ -1315,6 +1587,12 @@ pub enum OperationKind {
     /// The settlement, when the database is opened, of a Job that an
     /// earlier opening started locally and never settled.
     ReconcileAbandonedJob,
+    /// OCG's refusal or admission of a tool call a Provider requested.
+    RecordToolDecision,
+    /// What is known of an admitted tool call's execution.
+    RecordToolOutcome,
+    /// A verified conclusion about an uncertain tool execution.
+    ReconcileToolEffect,
 }
 
 /// Written in the same transaction as every accepted mutation, so its
@@ -1422,6 +1700,43 @@ pub enum Violation {
         committed: RequestEligibility,
         refused: RequestEligibility,
     },
+    #[error("{0} is not being executed by this process, so it records no tool evidence")]
+    NotExecutingLocally(JobId),
+    #[error("{request} of {job} has no recorded Provider observation")]
+    RequestNotObserved { job: JobId, request: RequestNumber },
+    #[error("{0} already has evidence")]
+    DuplicateToolCall(ToolCallRef),
+    #[error("the Provider id of {call} is already used by {existing}")]
+    DuplicateToolCallId {
+        call: ToolCallRef,
+        existing: ToolCallRef,
+    },
+    #[error("{0} has no evidence")]
+    ToolCallNotFound(ToolCallRef),
+    #[error("{0} was not admitted")]
+    ToolCallNotAdmitted(ToolCallRef),
+    #[error("{0} already has a recorded outcome")]
+    ToolOutcomeAlreadyRecorded(ToolCallRef),
+    #[error("{0} already has a definite outcome")]
+    ToolEffectAlreadyResolved(ToolCallRef),
+    #[error("{0} was already reconciled")]
+    ToolEffectAlreadyReconciled(ToolCallRef),
+    #[error("{0} is not settled, so its tool executions cannot be reconciled yet")]
+    ToolEffectStillExecuting(JobId),
+    #[error("{call} exceeds the stored tool evidence limit on {limit}")]
+    ToolEvidenceLimit {
+        call: ToolCallRef,
+        limit: &'static str,
+    },
+    /// An admitted call's effect is neither known nor reconciled.
+    #[error("whether {0} had its effect is unresolved")]
+    UnresolvedToolEffect(ToolCallRef),
+    /// A retry could repeat an effect that already happened, and the retry
+    /// did not acknowledge that.
+    #[error(
+        "{0} already had an effect that a retry could repeat, and the retry did not acknowledge it"
+    )]
+    RepeatedEffectNotAcknowledged(ToolCallRef),
 }
 
 pub(crate) type OpResult<T> = Result<(T, MarkerSubjects), BatchError>;
@@ -1682,7 +1997,9 @@ pub(crate) fn create_local_job_with_input(
 ///
 /// Only a settled original may be retried, and only while none of its
 /// direct retries is unsettled; both are checked in the transaction that
-/// creates the retry, so concurrent retries cannot both become active.
+/// creates the retry, so concurrent retries cannot both become active. The
+/// original's tool effects are checked in the same transaction, see
+/// [`require_repeatable_tool_effects`].
 ///
 /// The retry's configuration is frozen from its Profiles as they are now. It
 /// may share the original's input only when that equals what the input
@@ -1704,6 +2021,7 @@ pub(crate) fn retry_job(batch: &mut Batch, retry: JobRetry) -> OpResult<JobId> {
             });
         }
     }
+    require_repeatable_tool_effects(batch, original, retry.acknowledge_repeated_effects)?;
     let parent = batch.parent_of(original)?;
     let frozen = match retry.configuration {
         Some(configuration) => Some(batch.freeze_configuration(configuration)?),
@@ -1800,7 +2118,9 @@ pub(crate) fn start_preexisting_local_job(
 /// Job. An unsettled Job's outcome becomes unknown, never a claimed result,
 /// and its stop is confirmed, which releases the Profiles it holds and
 /// settles it. An unknown outcome only has its stop confirmed. Children are
-/// not touched: a parent still needs each of them to be settled.
+/// not touched: a parent still needs each of them to be settled. Neither is
+/// the Job's tool evidence: a call admitted without an outcome stays
+/// unresolved, never taken as not applied.
 ///
 /// Declines when the Job no longer has that claim, so running it again
 /// changes nothing.
@@ -1902,6 +2222,10 @@ fn publish_output(
 /// not. The Job is then sterilized, its final result published, and the
 /// terminal timestamp set in one transaction.
 ///
+/// A confirmed outcome also requires every tool call the Job admitted to
+/// have a definite outcome or a reconciliation: a Job whose tool effects
+/// are unresolved can only become unknown.
+///
 /// An unknown outcome publishes no result and claims nothing about children;
 /// it stops further child creation.
 ///
@@ -1933,6 +2257,7 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
             return batch.reject(Violation::UnfinishedChild(job));
         }
     }
+    require_resolved_tool_effects(batch, job)?;
     if completes {
         require_satisfied_dependencies(batch, job)?;
     }
@@ -1945,6 +2270,230 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
     batch.release_local_execution(job)?;
     let output_id = appended.output;
     Ok((Some(appended), MarkerSubjects::created(RecordRef::Job(job), RecordRef::JobOutput(output_id))))
+}
+
+/// Refuses unless every tool call the Job admitted has a definite outcome
+/// or a reconciliation.
+fn require_resolved_tool_effects(batch: &mut Batch, job: JobId) -> Result<(), BatchError> {
+    for record in batch.job_tool_evidence(job)? {
+        if record.is_unresolved() {
+            return batch.reject(Violation::UnresolvedToolEffect(record.call));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a retry of `original` while one of its tool calls that may
+/// change something outside OCG is unresolved, whatever the retry
+/// acknowledges, and a retry that could repeat a non-idempotent effect the
+/// original is known to have had unless the retry acknowledges that.
+fn require_repeatable_tool_effects(
+    batch: &mut Batch,
+    original: JobId,
+    acknowledged: bool,
+) -> Result<(), BatchError> {
+    for record in batch.job_tool_evidence(original)? {
+        let Some(effect) = record.admission().map(|admission| admission.effect) else {
+            continue;
+        };
+        if record.is_unresolved() && effect != ToolEffect::ReadOnly {
+            return batch.reject(Violation::UnresolvedToolEffect(record.call));
+        }
+        if record.is_applied() && effect == ToolEffect::NonIdempotent && !acknowledged {
+            return batch.reject(Violation::RepeatedEffectNotAcknowledged(record.call));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses unless the Job is being executed by this process: started
+/// locally, so it holds a local execution claim, and without any outcome.
+fn require_executing_locally(batch: &mut Batch, job: JobId) -> Result<(), BatchError> {
+    let row = batch.require_job(job)?;
+    if row.any_terminal() || batch.local_execution(job)?.is_none() {
+        return batch.reject(Violation::NotExecutingLocally(job));
+    }
+    Ok(())
+}
+
+/// Whether `version` can identify a handler's behavior: 1 to
+/// [`MAX_HANDLER_VERSION_BYTES`] ASCII letters, digits or `.`, `-`, `_`, `+`.
+pub fn is_handler_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= MAX_HANDLER_VERSION_BYTES
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+'))
+}
+
+/// Whether `text` is one JSON object.
+fn is_json_object(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| value.is_object())
+}
+
+/// Records OCG's decision about a call a Provider requested, before
+/// anything about the call can run: its refusal, or its admission with the
+/// exact registration, arguments and authorization it runs under. The call
+/// is identified by its Job's Provider request, which must have a recorded
+/// observation, and its wire index there; the Provider's id for it must be
+/// unused in the Job. A call has one decision, never replaced.
+///
+/// Only the trusted execution path of the Job, while it executes it, may
+/// record one. An admission is refused beyond the stored evidence limits:
+/// [`MAX_STORED_TOOL_ARGUMENTS_BYTES`] per call, and
+/// [`MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES`] and
+/// [`MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES`] per Job.
+pub(crate) fn record_tool_decision(batch: &mut Batch, evidence: NewToolEvidence) -> OpResult<()> {
+    let call = evidence.call;
+    require_executing_locally(batch, call.job)?;
+    if evidence.tool_call_id.is_empty() || evidence.tool_call_id.len() > MAX_TOOL_CALL_ID_BYTES {
+        return batch.reject(Violation::InvalidValue(
+            "tool_call_id",
+            "must be 1 to 256 bytes",
+        ));
+    }
+    if !is_function_name(&evidence.name) {
+        return batch.reject(Violation::InvalidValue("name", "is not a function name"));
+    }
+    if !batch.request_observed(call.job, call.request)? {
+        return batch.reject(Violation::RequestNotObserved {
+            job: call.job,
+            request: call.request,
+        });
+    }
+    if let ToolDecision::Admitted(admission) = &evidence.decision {
+        if !is_handler_version(&admission.handler_version) {
+            return batch.reject(Violation::InvalidValue(
+                "handler_version",
+                "is not a handler version",
+            ));
+        }
+        if serde_json::from_str::<serde_json::Value>(&admission.parameters).is_err() {
+            return batch.reject(Violation::InvalidValue("parameters", "is not JSON"));
+        }
+        if !is_json_object(admission.arguments.as_str()) {
+            return batch.reject(Violation::InvalidValue("arguments", "is not a JSON object"));
+        }
+        if admission.parameters.len() > MAX_TOOL_DEFINITION_BYTES {
+            return batch.reject(Violation::ToolEvidenceLimit {
+                call,
+                limit: "the schema of one call",
+            });
+        }
+        if admission.arguments.len() > MAX_STORED_TOOL_ARGUMENTS_BYTES {
+            return batch.reject(Violation::ToolEvidenceLimit {
+                call,
+                limit: "the arguments of one call",
+            });
+        }
+        let (mut arguments, mut schemas) = (admission.arguments.len(), admission.parameters.len());
+        for record in batch.job_tool_evidence(call.job)? {
+            if let Some(earlier) = record.admission() {
+                arguments = arguments.saturating_add(earlier.arguments.len());
+                schemas = schemas.saturating_add(earlier.parameters.len());
+            }
+        }
+        if arguments > MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES {
+            return batch.reject(Violation::ToolEvidenceLimit {
+                call,
+                limit: "the arguments of one Job",
+            });
+        }
+        if schemas > MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES {
+            return batch.reject(Violation::ToolEvidenceLimit {
+                call,
+                limit: "the schemas of one Job",
+            });
+        }
+    }
+    let record = ToolEvidenceRecord {
+        call,
+        tool_call_id: evidence.tool_call_id,
+        name: evidence.name,
+        decision: Recorded {
+            fact: evidence.decision,
+            at: batch.now(),
+        },
+        outcome: None,
+        reconciliation: None,
+    };
+    batch.insert_tool_evidence(&record)?;
+    Ok(((), MarkerSubjects::addressed(RecordRef::Job(call.job))))
+}
+
+/// Records what is known of an admitted call's execution, once. Only the
+/// trusted execution path of the Job, while it executes it, may record it,
+/// and only after the call's admission. An uncertain outcome stays
+/// uncertain: no later outcome replaces it.
+pub(crate) fn record_tool_outcome(
+    batch: &mut Batch,
+    call: ToolCallRef,
+    outcome: ToolOutcome,
+) -> OpResult<()> {
+    require_executing_locally(batch, call.job)?;
+    let Some(mut record) = batch.tool_evidence(call)? else {
+        return batch.reject(Violation::ToolCallNotFound(call));
+    };
+    if record.admission().is_none() {
+        return batch.reject(Violation::ToolCallNotAdmitted(call));
+    }
+    if record.outcome.is_some() {
+        return batch.reject(Violation::ToolOutcomeAlreadyRecorded(call));
+    }
+    record.outcome = Some(Recorded {
+        fact: outcome,
+        at: batch.now(),
+    });
+    batch.put_tool_evidence(&record)?;
+    Ok(((), MarkerSubjects::addressed(RecordRef::Job(call.job))))
+}
+
+/// Records a verified conclusion about an admitted call whose outcome is
+/// uncertain, once, keeping the admission and the uncertain outcome as
+/// they are. The Job must be settled, so nothing still executes for it.
+/// The reconciler, its evidence and its explanation must each be given.
+pub(crate) fn reconcile_tool_effect(
+    batch: &mut Batch,
+    call: ToolCallRef,
+    reconciliation: ToolReconciliation,
+) -> OpResult<()> {
+    if !batch.require_job(call.job)?.settled() {
+        return batch.reject(Violation::ToolEffectStillExecuting(call.job));
+    }
+    let Some(mut record) = batch.tool_evidence(call)? else {
+        return batch.reject(Violation::ToolCallNotFound(call));
+    };
+    if record.admission().is_none() {
+        return batch.reject(Violation::ToolCallNotAdmitted(call));
+    }
+    if record.reconciliation.is_some() {
+        return batch.reject(Violation::ToolEffectAlreadyReconciled(call));
+    }
+    if !record.is_unresolved() {
+        return batch.reject(Violation::ToolEffectAlreadyResolved(call));
+    }
+    if reconciliation.reconciler.is_empty()
+        || reconciliation.reconciler.len() > MAX_RECONCILER_BYTES
+    {
+        return batch.reject(Violation::InvalidValue(
+            "reconciler",
+            "must be 1 to 256 bytes",
+        ));
+    }
+    for (field, text) in [
+        ("evidence", &reconciliation.evidence),
+        ("explanation", &reconciliation.explanation),
+    ] {
+        if text.is_empty() || text.len() > MAX_RECONCILIATION_TEXT_BYTES {
+            return batch.reject(Violation::InvalidValue(field, "must be 1 to 4096 bytes"));
+        }
+    }
+    record.reconciliation = Some(Recorded {
+        fact: reconciliation,
+        at: batch.now(),
+    });
+    batch.put_tool_evidence(&record)?;
+    Ok(((), MarkerSubjects::addressed(RecordRef::Job(call.job))))
 }
 
 /// Refuses unless every explicit dependency of the Job is satisfied.
@@ -2104,6 +2653,8 @@ pub(crate) fn create_agent(batch: &mut Batch, agent: NewAgent) -> OpResult<Agent
 /// that ran the Job may call this, and only once it has observed the
 /// termination; a timeout, a cancel request, a disabled Executor or a
 /// restart is not such an observation. The unknown outcome stays as it is.
+/// The stop is local: it says nothing of an effect a tool call had outside
+/// OCG, and leaves the Job's tool evidence as it is.
 pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId) -> OpResult<()> {
     let now = batch.now();
     let mut row = batch.require_job(job)?;

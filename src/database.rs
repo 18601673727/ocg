@@ -19,10 +19,11 @@ use crate::persistence::{
     JobId, JobInputDraft, JobInputId, JobOutputRecord, JobRecord, JobRetry, LlmProviderId,
     LlmProviderRecord, MetricsId, MetricsRecord, NewAgent, NewAvailabilityStat, NewExecutor,
     NewJob, NewJobOutput, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
-    ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelFilter,
-    ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile, ProfileId,
-    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, ReadSnapshot, RequestRef,
-    RequestSampleRecord, Timestamp, Violation, WrongProfileKind,
+    NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
+    ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile,
+    ProfileId, ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, ReadSnapshot,
+    RequestNumber, RequestRef, RequestSampleRecord, Timestamp, ToolCallRef, ToolDecision,
+    ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation, WrongProfileKind,
 };
 use crate::storage::{
     self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile,
@@ -513,6 +514,27 @@ enum Command {
         stat: Box<NewAvailabilityStat>,
         reply: Reply<AvailabilityStatId>,
     },
+    RecordToolDecision {
+        evidence: Box<NewToolEvidence>,
+        reply: Reply<()>,
+    },
+    RecordToolOutcome {
+        call: ToolCallRef,
+        outcome: Box<ToolOutcome>,
+        reply: Reply<()>,
+    },
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "OCG has no trusted reconciler outside its tests yet"
+        )
+    )]
+    ReconcileToolEffect {
+        call: ToolCallRef,
+        reconciliation: Box<ToolReconciliation>,
+        reply: Reply<()>,
+    },
     /// Commits one prepared AvailabilityStat aggregation batch. Its reply is
     /// `None` when the preparation was stale and nothing was applied.
     CommitAvailabilityAggregation {
@@ -727,6 +749,38 @@ impl Command {
                 reply,
                 |batch| persistence::record_availability_stat(batch, *stat),
             ),
+            Self::RecordToolDecision { evidence, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::RecordToolDecision,
+                reply,
+                |batch| persistence::record_tool_decision(batch, *evidence),
+            ),
+            Self::RecordToolOutcome {
+                call,
+                outcome,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::RecordToolOutcome,
+                reply,
+                |batch| persistence::record_tool_outcome(batch, call, *outcome),
+            ),
+            Self::ReconcileToolEffect {
+                call,
+                reconciliation,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::ReconcileToolEffect,
+                reply,
+                |batch| persistence::reconcile_tool_effect(batch, call, *reconciliation),
+            ),
             Self::CommitAvailabilityAggregation { plan, reply } => {
                 let outcome =
                     storage::commit_availability_aggregation(database, operation, commit, *plan);
@@ -802,6 +856,28 @@ impl Command {
                 });
                 failure.saturating_add(text_bytes(&observation.raw_finish_reason))
             }
+            Self::RecordToolDecision { evidence, .. } => {
+                let identity = byte_count(evidence.tool_call_id.len())
+                    .saturating_add(byte_count(evidence.name.len()));
+                match &evidence.decision {
+                    ToolDecision::Refused(_) => identity,
+                    ToolDecision::Admitted(admission) => identity
+                        .saturating_add(byte_count(admission.handler_version.len()))
+                        .saturating_add(byte_count(admission.parameters.len()))
+                        .saturating_add(byte_count(admission.arguments.len())),
+                }
+            }
+            Self::RecordToolOutcome { outcome, .. } => match outcome.as_ref() {
+                ToolOutcome::Completed { result } => byte_count(result.len()),
+                ToolOutcome::NotApplied { message } => byte_count(message.len()),
+                ToolOutcome::Uncertain { message, .. } => text_bytes(message),
+                ToolOutcome::CompletedWithheld { .. } | ToolOutcome::NotInvoked { .. } => 0,
+            },
+            Self::ReconcileToolEffect { reconciliation, .. } => {
+                byte_count(reconciliation.reconciler.len())
+                    .saturating_add(byte_count(reconciliation.evidence.len()))
+                    .saturating_add(byte_count(reconciliation.explanation.len()))
+            }
         };
         payload
             .saturating_mul(2)
@@ -832,6 +908,9 @@ impl Command {
             Self::ConfirmJobStopped { reply, .. } => refuse(reply, error),
             Self::RecordMetrics { reply, .. } => refuse(reply, error),
             Self::RecordAvailabilityStat { reply, .. } => refuse(reply, error),
+            Self::RecordToolDecision { reply, .. }
+            | Self::RecordToolOutcome { reply, .. }
+            | Self::ReconcileToolEffect { reply, .. } => refuse(reply, error),
             Self::CommitAvailabilityAggregation { reply, .. } => refuse(reply, error),
             Self::CommitTokenAggregation { reply, .. } => refuse(reply, error),
         }
@@ -3441,6 +3520,75 @@ impl DatabaseHandle {
             reply,
         })
         .await
+    }
+
+    /// Records OCG's refusal or admission of a tool call a Provider
+    /// requested, before anything about the call can run. Only the trusted
+    /// execution path of the Job, while it executes it, may record it; a
+    /// handler is invoked only once its admission is durable, which is when
+    /// this returns `Ok`. See [`persistence::record_tool_decision`].
+    pub(crate) async fn record_tool_decision(
+        &self,
+        evidence: NewToolEvidence,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::RecordToolDecision {
+            evidence: Box::new(evidence),
+            reply,
+        })
+        .await
+    }
+
+    /// Records, once, what is known of an admitted call's execution. Only
+    /// the trusted execution path of the Job, while it executes it, may
+    /// record it.
+    pub(crate) async fn record_tool_outcome(
+        &self,
+        call: ToolCallRef,
+        outcome: ToolOutcome,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::RecordToolOutcome {
+            call,
+            outcome: Box::new(outcome),
+            reply,
+        })
+        .await
+    }
+
+    /// Records, once, a verified conclusion about an admitted call whose
+    /// outcome is uncertain, once its Job is settled. Only trusted OCG code
+    /// that verified the conclusion against the external system may call
+    /// it; OCG has no such reconciler yet, so it is not part of the public
+    /// API.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "OCG has no trusted reconciler outside its tests yet"
+        )
+    )]
+    pub(crate) async fn reconcile_tool_effect(
+        &self,
+        call: ToolCallRef,
+        reconciliation: ToolReconciliation,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::ReconcileToolEffect {
+            call,
+            reconciliation: Box::new(reconciliation),
+            reply,
+        })
+        .await
+    }
+
+    /// A Job's tool evidence in call order, after the call named by its
+    /// request and index when given; at most 1,000 per call.
+    pub async fn tool_evidence(
+        &self,
+        job: JobId,
+        after: Option<(RequestNumber, u32)>,
+        limit: usize,
+    ) -> Result<Vec<ToolEvidenceRecord>, DatabaseError> {
+        self.read(move |database| storage::read_tool_evidence(database, job, after, limit))
+            .await
     }
 
     /// Aggregation progress: the last AvailabilityStat ID consumed and the

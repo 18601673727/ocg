@@ -16,11 +16,14 @@ use crate::openai_compatible::{
     ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, InvalidToolCall,
     ToolCallRefusal,
 };
-use crate::orchestration::tools::{ToolOffer, ToolRegistryError};
+use crate::orchestration::tools::{FailureCertainty, ToolOffer, ToolRegistryError};
 use crate::persistence::{
-    AppendedOutput, ExecutorId, FinalResult, IntermediateOutputKind, JobFinalization, JobId,
-    JobInputDraft, JobInputId, JobOutcome, Measurements, NewAvailabilityStat, NewJob, NewJobOutput,
-    NewMetrics, RequestNumber, Timestamp, Violation,
+    AppendedOutput, AuthorizationBasis, ExecutorId, FinalResult, IntermediateOutputKind,
+    JobFinalization, JobId, JobInputDraft, JobInputId, JobOutcome, MAX_STORED_TOOL_ARGUMENTS_BYTES,
+    MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements, NewAvailabilityStat, NewJob,
+    NewJobOutput, NewMetrics, NewToolEvidence, RequestNumber, Timestamp, ToolAdmission,
+    ToolCallRef, ToolDecision, ToolOutcome, ToolOutcomeKind, ToolPayload, UncertainCause,
+    Violation, WithheldReason,
 };
 use crate::provider_execution::{
     self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
@@ -153,26 +156,51 @@ pub enum ToolLoopStop {
     CallLimit,
     /// A call was refused at dispatch: OCG did not offer it, it is no longer
     /// the registration offered or no longer authorized, its id repeats an
-    /// earlier call's, or its registered schema refuses its arguments. It did
-    /// not run; calls of the response before it may have.
+    /// earlier call's, its registered schema refuses its arguments, or its
+    /// arguments exceed what OCG records. It did not run; calls of the
+    /// response before it may have, and their outcomes are recorded.
     Refused(InvalidToolCall),
-    /// The handler of the call at this index reported a failure.
+    /// The database refused to record the admission of the call at this
+    /// index, so its handler was not invoked.
+    AdmissionRefused { index: u32, violation: Violation },
+    /// The handler of the call at this index reported a failure, with
+    /// evidence that its effect did not happen.
     HandlerFailed { index: u32, message: String },
+    /// The handler of the call at this index reported a failure without
+    /// evidence that its effect did not happen.
+    HandlerUncertain { index: u32, message: String },
     /// The result of the call at this index exceeds the per-call or the
-    /// accumulated limit. It was not sent.
+    /// accumulated limit. The handler completed; its result was not sent.
     ResultTooLarge { index: u32 },
+    /// The result of the call at this index cannot be serialized. The
+    /// handler completed; its result was not sent.
+    ResultUnserializable { index: u32 },
     /// The handler of the call at this index did not finish within its
     /// limit. It was stopped; whatever it did is unknown.
     TimedOut { index: u32 },
     /// The execution was cancelled locally before every call was answered.
     Cancelled,
+    /// The admission of the call at this index, or what its handler was
+    /// observed to do, `outcome`, could not be recorded. Either way the
+    /// call's effect is not known from what was recorded.
+    EvidenceNotRecorded {
+        index: u32,
+        outcome: Option<ToolOutcomeKind>,
+    },
 }
 
 impl ToolLoopStop {
     /// Whether the stop leaves the Job's outcome unknown rather than known
-    /// to have failed: a handler stopped while it ran.
+    /// to have failed: a handler stopped while it ran, reported an
+    /// uncertain failure, or may have run without its evidence recorded.
     fn is_unknown(&self) -> bool {
-        matches!(self, Self::TimedOut { .. } | Self::Cancelled)
+        matches!(
+            self,
+            Self::TimedOut { .. }
+                | Self::Cancelled
+                | Self::HandlerUncertain { .. }
+                | Self::EvidenceNotRecorded { .. }
+        )
     }
 }
 
@@ -187,8 +215,20 @@ impl std::fmt::Display for ToolLoopStop {
                 formatter.write_str("the requested tool calls exceed the call limit")
             }
             Self::Refused(refusal) => write!(formatter, "a tool call was refused: {refusal}"),
+            Self::AdmissionRefused { index, violation } => {
+                write!(
+                    formatter,
+                    "the admission of tool call {index} was refused: {violation}"
+                )
+            }
             Self::HandlerFailed { index, message } => {
                 write!(formatter, "tool call {index} failed: {message}")
+            }
+            Self::HandlerUncertain { index, message } => {
+                write!(
+                    formatter,
+                    "tool call {index} failed and its effect is uncertain: {message}"
+                )
             }
             Self::ResultTooLarge { index } => {
                 write!(
@@ -196,8 +236,20 @@ impl std::fmt::Display for ToolLoopStop {
                     "the result of tool call {index} exceeds its limit"
                 )
             }
+            Self::ResultUnserializable { index } => {
+                write!(
+                    formatter,
+                    "the result of tool call {index} cannot be serialized"
+                )
+            }
             Self::TimedOut { index } => write!(formatter, "tool call {index} timed out"),
             Self::Cancelled => formatter.write_str("the tool loop was cancelled"),
+            Self::EvidenceNotRecorded { index, .. } => {
+                write!(
+                    formatter,
+                    "the evidence of tool call {index} could not be recorded"
+                )
+            }
         }
     }
 }
@@ -283,13 +335,29 @@ pub enum ExecutionRuntimeError {
     InvalidToolLimits(ToolLimitsError),
     /// The tool loop ended on this side before a final answer, as `stop`
     /// says, and the receipt shows how the Job settled: Failed when the stop
-    /// is known, Unknown, with its stop confirmed, when a handler was stopped
-    /// while it ran. Every Provider request's own observations were recorded,
-    /// apart from `observations`, the first that could not be written.
+    /// is known, Unknown, with its stop confirmed, when a call's effect is
+    /// uncertain. Every Provider request's own observations were recorded,
+    /// apart from `observations`, the first that could not be written, and
+    /// every call's evidence, apart from `evidence`, the write that failed.
+    /// `stop_unconfirmed` is set when the outcome was recorded as unknown but
+    /// the stop of the execution could not be confirmed; the Job then keeps
+    /// its Profiles until a later start of the database settles it.
     #[error("the tool loop stopped: {stop}")]
     ToolLoopStopped {
         receipt: Box<ExecutionReceipt>,
         stop: ToolLoopStop,
+        observations: Option<Box<DatabaseError>>,
+        evidence: Option<Box<DatabaseError>>,
+        stop_unconfirmed: Option<Box<DatabaseError>>,
+    },
+    /// The tool loop stopped, as `stop` says, but the Job's outcome could
+    /// not be recorded, see [`ExecutionRuntimeError::NotSettled`]. `evidence`
+    /// is the call evidence that could not be recorded, if any.
+    #[error("the tool loop stopped ({stop}) but the Job was not settled: {source}")]
+    ToolLoopNotSettled {
+        stop: Box<ToolLoopStop>,
+        source: DatabaseError,
+        evidence: Option<Box<DatabaseError>>,
         observations: Option<Box<DatabaseError>>,
     },
     /// The Provider answered, but the Job's outcome could not be recorded.
@@ -836,7 +904,8 @@ pub(crate) async fn run_provider_job(
     let mut sink = output_sink(run.database.clone(), run.job);
     if let Some(Err(error)) = tools.map(|tools| tools.limits.validate()) {
         // Nothing was sent, so nothing of a Provider is recorded.
-        return stop_tool_loop(run, sink, None, ToolLoopStop::InvalidLimits(error)).await;
+        let stopped = Stopped::from(ToolLoopStop::InvalidLimits(error));
+        return stop_tool_loop(run, sink, None, stopped).await;
     }
     let mut budget = ToolBudget::default();
     loop {
@@ -864,8 +933,14 @@ pub(crate) async fn run_provider_job(
         });
         let answered = match (tools, next) {
             (Some(tools), Some(_)) => {
+                let site = CallSite {
+                    database: &run.database,
+                    job: run.job,
+                    request: sink.request,
+                };
                 answer_calls(
                     tools,
+                    &site,
                     &conversation,
                     &result.tool_calls,
                     &mut budget,
@@ -873,15 +948,16 @@ pub(crate) async fn run_provider_job(
                 )
                 .await
             }
-            (Some(_), None) => Err(ToolLoopStop::RequestLimit),
+            (Some(_), None) => Err(ToolLoopStop::RequestLimit.into()),
             (None, _) => Err(ToolLoopStop::Refused(InvalidToolCall::new(
                 ToolCallRefusal::Unauthorized,
                 "the Provider requested tools that OCG did not offer",
-            ))),
+            ))
+            .into()),
         };
         let (answers, next) = match (answered, next) {
             (Ok(answers), Some(next)) => (answers, next),
-            (Err(stop), _) => return stop_tool_loop(run, sink, Some(&result), stop).await,
+            (Err(stopped), _) => return stop_tool_loop(run, sink, Some(&result), stopped).await,
             (Ok(_), None) => unreachable!("calls are answered only when a request may follow"),
         };
         let text = Some(result.text.clone()).filter(|text| !text.is_empty());
@@ -906,29 +982,109 @@ pub(crate) async fn run_provider_job(
 #[derive(Default)]
 struct ToolBudget {
     calls: usize,
+    argument_bytes: usize,
     result_bytes: usize,
+}
+
+/// The Provider request whose calls are answered, and where their evidence
+/// is recorded.
+struct CallSite<'a> {
+    database: &'a DatabaseHandle,
+    job: JobId,
+    request: RequestNumber,
+}
+
+impl CallSite<'_> {
+    fn call(&self, call: &CompletedToolCall) -> ToolCallRef {
+        ToolCallRef {
+            job: self.job,
+            request: self.request,
+            index: call.index,
+        }
+    }
+}
+
+/// Why a tool loop stopped, with the call evidence that could not be
+/// recorded, if any.
+struct Stopped {
+    stop: ToolLoopStop,
+    evidence: Option<DatabaseError>,
+}
+
+impl From<ToolLoopStop> for Stopped {
+    fn from(stop: ToolLoopStop) -> Self {
+        Self {
+            stop,
+            evidence: None,
+        }
+    }
+}
+
+/// Test seams of the dispatch of tool calls.
+#[cfg(test)]
+pub(crate) mod dispatch_seam {
+    use std::cell::RefCell;
+
+    use crate::persistence::ToolCallRef;
+
+    /// Where in a call's dispatch a seam runs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// Its admission is about to be recorded.
+        BeforeAdmission,
+        /// Its admission is durable; its final authorization check and its
+        /// handler have not run.
+        Admitted,
+    }
+
+    type Seam = Box<dyn FnMut(Point, ToolCallRef)>;
+
+    thread_local! {
+        static SEAM: RefCell<Option<Seam>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `seam` at every dispatch point of this thread's tool loops.
+    pub(crate) fn install(seam: impl FnMut(Point, ToolCallRef) + 'static) {
+        SEAM.with(|installed| *installed.borrow_mut() = Some(Box::new(seam)));
+    }
+
+    pub(super) fn reach(point: Point, call: ToolCallRef) {
+        let seam = SEAM.with(|installed| installed.borrow_mut().take());
+        if let Some(mut seam) = seam {
+            seam(point, call);
+            SEAM.with(|installed| {
+                installed.borrow_mut().get_or_insert(seam);
+            });
+        }
+    }
 }
 
 /// Answers every call of one response, in order, or stops. The calls are
 /// checked together before any runs: against the call limit, against the
-/// ids already in the conversation, and each against the registry and its
-/// schema. Each is checked again immediately before it runs, so a grant
-/// withdrawn meanwhile refuses it. A handler runs under the time limit and
-/// the execution's cancellation; its result, serialized, is the answer, and
-/// it is never truncated.
+/// ids already in the conversation, each against the registry and its
+/// schema, and their arguments against what OCG records. A call refused
+/// then, or when it is checked again before its admission, never runs, and
+/// its refusal is recorded. Each call that passes is admitted durably
+/// before anything of it runs; its authorization is then checked once more,
+/// with nothing awaited between that check and the handler's invocation, so
+/// a grant withdrawn while the admission was recorded refuses it. A handler
+/// runs under the time limit and the execution's cancellation, and what is
+/// known of its outcome is recorded before its result can be sent on. Its
+/// result, serialized, is the answer, and it is never truncated.
 async fn answer_calls(
     tools: &ToolExecution,
+    site: &CallSite<'_>,
     conversation: &ChatConversation,
     calls: &[CompletedToolCall],
     budget: &mut ToolBudget,
     cancellation: &CancellationToken,
-) -> Result<Vec<String>, ToolLoopStop> {
+) -> Result<Vec<String>, Stopped> {
     let limits = &tools.limits;
     if cancellation.is_cancelled() {
-        return Err(ToolLoopStop::Cancelled);
+        return Err(ToolLoopStop::Cancelled.into());
     }
     if budget.calls.saturating_add(calls.len()) > limits.max_tool_calls {
-        return Err(ToolLoopStop::CallLimit);
+        return Err(ToolLoopStop::CallLimit.into());
     }
     let earlier = conversation
         .messages
@@ -937,25 +1093,93 @@ async fn answer_calls(
         .flatten()
         .map(|call| call.id.as_str())
         .collect::<std::collections::HashSet<_>>();
+    let mut argument_bytes = budget.argument_bytes;
     for call in calls {
         if earlier.contains(call.id.as_str()) {
             return Err(ToolLoopStop::Refused(InvalidToolCall::at(
                 ToolCallRefusal::ConflictingIdentity,
                 call.index,
                 format!("tool call {} repeats the id of an earlier call", call.index),
-            )));
+            ))
+            .into());
         }
-        tools.offer.resolve(call).map_err(ToolLoopStop::Refused)?;
+        if let Err(refusal) = tools.offer.resolve(call) {
+            return Err(refuse(site, call, refusal).await);
+        }
+        argument_bytes = argument_bytes.saturating_add(call.arguments.len());
+        if call.arguments.len() > MAX_STORED_TOOL_ARGUMENTS_BYTES
+            || argument_bytes > MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES
+        {
+            let refusal = InvalidToolCall::at(
+                ToolCallRefusal::LimitExceeded,
+                call.index,
+                format!(
+                    "tool call {} has arguments beyond what OCG records",
+                    call.index
+                ),
+            );
+            return Err(refuse(site, call, refusal).await);
+        }
     }
 
     let mut answers = Vec::with_capacity(calls.len());
     for call in calls {
         if cancellation.is_cancelled() {
-            return Err(ToolLoopStop::Cancelled);
+            return Err(ToolLoopStop::Cancelled.into());
         }
-        let dispatch = tools.offer.resolve(call).map_err(ToolLoopStop::Refused)?;
-        budget.calls += 1;
+        let dispatch = match tools.offer.resolve(call) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => return Err(refuse(site, call, refusal).await),
+        };
         let index = call.index;
+        let reference = site.call(call);
+        let admission = NewToolEvidence {
+            call: reference,
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+            decision: ToolDecision::Admitted(ToolAdmission {
+                handler_version: dispatch.version,
+                effect: dispatch.effect,
+                parameters: dispatch.schema,
+                arguments: ToolPayload::new(call.arguments.clone()),
+                authorization: AuthorizationBasis::RegistryGrant,
+            }),
+        };
+        #[cfg(test)]
+        dispatch_seam::reach(dispatch_seam::Point::BeforeAdmission, reference);
+        match site.database.record_tool_decision(admission).await {
+            Ok(()) => {}
+            // Nothing was committed, and nothing runs.
+            Err(DatabaseError::Rejected(violation)) => {
+                return Err(ToolLoopStop::AdmissionRefused { index, violation }.into());
+            }
+            // The admission may have committed, so the call is as uncertain
+            // as one that ran, though nothing runs.
+            Err(error) => {
+                return Err(Stopped {
+                    stop: ToolLoopStop::EvidenceNotRecorded {
+                        index,
+                        outcome: None,
+                    },
+                    evidence: Some(error),
+                });
+            }
+        }
+        budget.calls += 1;
+        budget.argument_bytes = budget.argument_bytes.saturating_add(call.arguments.len());
+        #[cfg(test)]
+        dispatch_seam::reach(dispatch_seam::Point::Admitted, reference);
+        let dispatch = match tools.offer.resolve(call) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => {
+                let outcome = ToolOutcome::NotInvoked {
+                    reason: refusal.kind,
+                };
+                return Err(
+                    conclude(site, reference, outcome, ToolLoopStop::Refused(refusal)).await,
+                );
+            }
+        };
         let ran = select(
             cancellation.cancelled(),
             ntex::time::timeout(
@@ -964,45 +1188,152 @@ async fn answer_calls(
             ),
         )
         .await;
-        let value = match ran {
-            Either::Left(()) => return Err(ToolLoopStop::Cancelled),
-            Either::Right(Err(())) => return Err(ToolLoopStop::TimedOut { index }),
-            Either::Right(Ok(Err(failure))) => {
-                return Err(ToolLoopStop::HandlerFailed {
-                    index,
-                    message: failure.message,
-                });
-            }
-            Either::Right(Ok(Ok(value))) => value,
+        let (outcome, stop) = match ran {
+            Either::Left(()) => (
+                ToolOutcome::Uncertain {
+                    cause: UncertainCause::Cancelled,
+                    message: None,
+                },
+                ToolLoopStop::Cancelled,
+            ),
+            Either::Right(Err(())) => (
+                ToolOutcome::Uncertain {
+                    cause: UncertainCause::TimedOut,
+                    message: None,
+                },
+                ToolLoopStop::TimedOut { index },
+            ),
+            Either::Right(Ok(Err(failure))) => match failure.certainty {
+                FailureCertainty::NotApplied => (
+                    ToolOutcome::NotApplied {
+                        message: failure.message.clone(),
+                    },
+                    ToolLoopStop::HandlerFailed {
+                        index,
+                        message: failure.message,
+                    },
+                ),
+                FailureCertainty::Uncertain => (
+                    ToolOutcome::Uncertain {
+                        cause: UncertainCause::HandlerReported,
+                        message: Some(failure.message.clone()),
+                    },
+                    ToolLoopStop::HandlerUncertain {
+                        index,
+                        message: failure.message,
+                    },
+                ),
+            },
+            Either::Right(Ok(Ok(value))) => match serde_json::to_string(&value) {
+                Err(_) => (
+                    ToolOutcome::CompletedWithheld {
+                        reason: WithheldReason::Unserializable,
+                    },
+                    ToolLoopStop::ResultUnserializable { index },
+                ),
+                Ok(content) => {
+                    let total = budget.result_bytes.saturating_add(content.len());
+                    if content.len() > limits.max_tool_result_bytes
+                        || total > limits.max_tool_results_bytes
+                    {
+                        (
+                            ToolOutcome::CompletedWithheld {
+                                reason: WithheldReason::TooLarge,
+                            },
+                            ToolLoopStop::ResultTooLarge { index },
+                        )
+                    } else {
+                        let outcome = ToolOutcome::Completed {
+                            result: ToolPayload::new(content.clone()),
+                        };
+                        // The result is sent on only once it is recorded.
+                        if let Err(error) =
+                            site.database.record_tool_outcome(reference, outcome).await
+                        {
+                            return Err(Stopped {
+                                stop: ToolLoopStop::EvidenceNotRecorded {
+                                    index,
+                                    outcome: Some(ToolOutcomeKind::Completed),
+                                },
+                                evidence: Some(error),
+                            });
+                        }
+                        budget.result_bytes = total;
+                        answers.push(content);
+                        continue;
+                    }
+                }
+            },
         };
-        let content =
-            serde_json::to_string(&value).map_err(|error| ToolLoopStop::HandlerFailed {
-                index,
-                message: format!("its result cannot be serialized: {error}"),
-            })?;
-        let total = budget.result_bytes.saturating_add(content.len());
-        if content.len() > limits.max_tool_result_bytes || total > limits.max_tool_results_bytes {
-            return Err(ToolLoopStop::ResultTooLarge { index });
-        }
-        budget.result_bytes = total;
-        answers.push(content);
+        return Err(conclude(site, reference, outcome, stop).await);
     }
     Ok(answers)
 }
 
+/// Records the refusal of a call that never ran, and stops on it. A
+/// refusal that cannot be recorded changes nothing about the call, which
+/// did not run, so the stop stays the refusal.
+async fn refuse(
+    site: &CallSite<'_>,
+    call: &CompletedToolCall,
+    refusal: InvalidToolCall,
+) -> Stopped {
+    let recorded = site
+        .database
+        .record_tool_decision(NewToolEvidence {
+            call: site.call(call),
+            tool_call_id: call.id.clone(),
+            name: call.name.clone(),
+            decision: ToolDecision::Refused(refusal.kind),
+        })
+        .await;
+    Stopped {
+        stop: ToolLoopStop::Refused(refusal),
+        evidence: recorded.err(),
+    }
+}
+
+/// Records the outcome of an admitted call that stops the loop. When it
+/// cannot be recorded, the call's effect is not known from what was
+/// recorded, so a stop that would be known becomes an unknown one.
+async fn conclude(
+    site: &CallSite<'_>,
+    call: ToolCallRef,
+    outcome: ToolOutcome,
+    stop: ToolLoopStop,
+) -> Stopped {
+    let kind = outcome.kind();
+    match site.database.record_tool_outcome(call, outcome).await {
+        Ok(()) => stop.into(),
+        Err(error) if stop.is_unknown() => Stopped {
+            stop,
+            evidence: Some(error),
+        },
+        Err(error) => Stopped {
+            stop: ToolLoopStop::EvidenceNotRecorded {
+                index: call.index,
+                outcome: Some(kind),
+            },
+            evidence: Some(error),
+        },
+    }
+}
+
 /// Settles a Job whose tool loop stopped on this side. A known stop fails
 /// the Job, a local orchestration failure that keeps the Provider's last
-/// response, if there was one, as its value; a handler stopped while it ran
-/// leaves the outcome unknown, and the stop of the execution is then
-/// confirmed. No Provider failure is recorded for either.
+/// response, if there was one, as its value; a stop that leaves a call's
+/// effect uncertain leaves the outcome unknown, and the stop of the
+/// execution is then confirmed. No Provider failure is recorded for either.
 async fn stop_tool_loop(
     run: ProviderRun,
     sink: DatabaseOutputSink,
     last: Option<&ProviderExecutionResult>,
-    stop: ToolLoopStop,
+    stopped: Stopped,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let database = run.database;
     let job = run.job;
+    let Stopped { stop, evidence } = stopped;
+    let evidence = evidence.map(Box::new);
     let finalization = if stop.is_unknown() {
         JobFinalization::Unknown
     } else {
@@ -1017,8 +1348,10 @@ async fn stop_tool_loop(
     let result = match database.finalize_job(job, finalization).await {
         Ok(result) => result,
         Err(source) => {
-            return Err(ExecutionRuntimeError::NotSettled {
+            return Err(ExecutionRuntimeError::ToolLoopNotSettled {
+                stop: Box::new(stop),
                 source,
+                evidence,
                 observations,
             });
         }
@@ -1029,19 +1362,17 @@ async fn stop_tool_loop(
         job,
         result,
     });
-    if stop.is_unknown()
-        && let Err(source) = confirm_stopped(&database, job).await
-    {
-        return Err(ExecutionRuntimeError::StopNotConfirmed {
-            receipt,
-            source,
-            observations,
-        });
-    }
+    let stop_unconfirmed = if stop.is_unknown() {
+        confirm_stopped(&database, job).await.err().map(Box::new)
+    } else {
+        None
+    };
     Err(ExecutionRuntimeError::ToolLoopStopped {
         receipt,
         stop,
         observations,
+        evidence,
+        stop_unconfirmed,
     })
 }
 

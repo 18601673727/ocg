@@ -13,18 +13,21 @@
 //! Registration is a trusted-code boundary. Everything here is visible only
 //! inside the crate, so no consumer of the library can register, authorize
 //! or offer a handler, and a plan built outside the crate offers no tools.
-//! Visibility restricts who may register a handler; it cannot prove that a
-//! handler OCG registers is free of side effects, which stays the duty of
-//! the OCG code that registers it. OCG registers no handler by default and
-//! implements no privileged one: tools with side effects need durable call
-//! records and a permission contract that do not exist yet.
+//! Visibility restricts who may register a handler; it cannot prove what a
+//! handler OCG registers does, so its declared version and effect, and the
+//! fitness of its arguments and results to be recorded, stay the duty of the
+//! OCG code that implements and registers it. Every call is recorded
+//! durably before its handler runs, and its outcome after, see
+//! [`crate::persistence::ToolEvidenceRecord`]. OCG registers no handler by
+//! default and implements no privileged one.
 //!
-//! A call is admitted for dispatch in [`ToolOffer::resolve`], under the
+//! A call is authorized for dispatch in [`ToolOffer::resolve`], under the
 //! registry's lock, which [`ToolRegistry::revoke`], `unregister` and
-//! `register` take too, so each admission is ordered before or after each of
-//! them. An admission ordered after a revocation is refused; a handler
-//! admitted before it runs to its end, as the lock is released before the
-//! handler is awaited. A registration is a new generation and starts
+//! `register` take too, so each authorization is ordered before or after
+//! each of them. The runtime resolves a call before its durable admission
+//! and again immediately before its handler runs; an authorization ordered
+//! after a revocation is refused, and a handler authorized before it runs to
+//! its end, as the lock is released before the handler is awaited. A registration is a new generation and starts
 //! unauthorized, so it never inherits an earlier registration's grant.
 
 use std::collections::BTreeMap;
@@ -38,30 +41,51 @@ use serde_json::Value;
 
 use crate::openai_compatible::admission;
 use crate::openai_compatible::{
-    CompletedToolCall, FunctionDefinitionWire, InvalidToolCall, ToolCallRefusal, ToolWire,
-    is_function_name,
+    CompletedToolCall, FunctionDefinitionWire, InvalidToolCall, MAX_TOOL_DEFINITION_BYTES,
+    ToolCallRefusal, ToolWire, is_function_name,
 };
+use crate::persistence::{ToolEffect, is_handler_version};
 
 /// A tool call's result, or its handler's failure.
 pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolFailure>> + 'a>>;
 
 /// Runs the calls of one registered tool. Only OCG's own code implements and
-/// registers it.
+/// registers it, and only when its arguments and results may be recorded:
+/// every call is recorded with its arguments, and every result with it, so
+/// neither may carry a credential or other secret.
 pub(crate) trait ToolHandler: Send + Sync {
+    /// Identifies what the handler does, to be recorded with each of its
+    /// calls, see [`is_handler_version`]. A change of behavior is a new
+    /// version. It is read once, when the handler is registered.
+    fn version(&self) -> &str;
+
+    /// What a call may change outside OCG. It is read once, when the
+    /// handler is registered.
+    fn effect(&self) -> ToolEffect;
+
     /// Runs one call with arguments its registered schema accepted, exactly
-    /// as the Provider sent them. A handler OCG registers must be free of
-    /// side effects: no call of it is durably recorded, so one whose outcome
-    /// is unknown, or that ran in an execution that never settled, cannot be
-    /// reconciled. It should finish promptly and yield while it waits, so
-    /// that its time limit and cancellation can stop it.
+    /// as the Provider sent them. It should finish promptly and yield while
+    /// it waits, so that its time limit and cancellation can stop it; a
+    /// handler stopped either way leaves its outcome uncertain.
     fn call(&self, arguments: Value) -> ToolFuture<'_>;
 }
 
-/// A failure a handler reports.
+/// What a failing handler knows of its effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailureCertainty {
+    /// The handler has evidence that the call's effect did not happen.
+    NotApplied,
+    /// The effect may have happened, wholly or in part.
+    Uncertain,
+}
+
+/// A failure a handler reports. Its message is recorded and may reach the
+/// Job's result, so it must not repeat the call's arguments.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub(crate) struct ToolFailure {
     pub(crate) message: String,
+    pub(crate) certainty: FailureCertainty,
 }
 
 #[cfg_attr(
@@ -69,9 +93,21 @@ pub(crate) struct ToolFailure {
     expect(dead_code, reason = "OCG registers no tool outside its tests yet")
 )]
 impl ToolFailure {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    /// A failure the handler has evidence left no effect. Only a handler
+    /// that can tell may report it.
+    pub(crate) fn not_applied(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            certainty: FailureCertainty::NotApplied,
+        }
+    }
+
+    /// A failure that may have left an effect: any error, interruption or
+    /// partial operation the handler cannot rule out an effect for.
+    pub(crate) fn uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            certainty: FailureCertainty::Uncertain,
         }
     }
 }
@@ -80,6 +116,8 @@ impl ToolFailure {
 pub enum ToolRegistryError {
     #[error("`{0}` is not a valid function name")]
     InvalidName(String),
+    #[error("tool `{0}` declares an invalid handler version")]
+    InvalidVersion(String),
     #[error("a tool named `{0}` is already registered")]
     Duplicate(String),
     #[error("tool `{0}` has a parameter schema that cannot be enforced: {1}")]
@@ -100,6 +138,10 @@ struct Registration {
     generation: u64,
     description: Option<String>,
     parameters: Value,
+    /// `parameters` serialized as it is offered and recorded.
+    schema: String,
+    version: String,
+    effect: ToolEffect,
     validator: Arc<Validator>,
     handler: Arc<dyn ToolHandler>,
     authorized: bool,
@@ -140,14 +182,16 @@ impl ToolRegistry {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Registers a tool under its exact `name`, unauthorized. The parameter
-    /// schema is required, and must be one that call admission enforces as
-    /// written; a parameterless tool declares an empty-object schema.
+    /// Registers a tool under its exact `name`, unauthorized, with the
+    /// version and effect its handler declares. The parameter schema is
+    /// required, and must be one that call admission enforces as written; a
+    /// parameterless tool declares an empty-object schema.
     ///
     /// # Errors
     ///
-    /// Refuses an invalid name, a name already registered, and a schema
-    /// that cannot be enforced.
+    /// Refuses an invalid name, an invalid handler version, a name already
+    /// registered, and a schema that cannot be enforced or is larger than a
+    /// tool definition may be.
     pub(crate) fn register(
         &self,
         name: &str,
@@ -157,6 +201,18 @@ impl ToolRegistry {
     ) -> Result<(), ToolRegistryError> {
         if !is_function_name(name) {
             return Err(ToolRegistryError::InvalidName(name.to_owned()));
+        }
+        let version = handler.version().to_owned();
+        if !is_handler_version(&version) {
+            return Err(ToolRegistryError::InvalidVersion(name.to_owned()));
+        }
+        let effect = handler.effect();
+        let schema = parameters.to_string();
+        if schema.len() > MAX_TOOL_DEFINITION_BYTES {
+            return Err(ToolRegistryError::UnsupportedSchema(
+                name.to_owned(),
+                format!("is larger than {MAX_TOOL_DEFINITION_BYTES} bytes"),
+            ));
         }
         let validator = admission::compile_parameters(&parameters)
             .map_err(|problem| ToolRegistryError::UnsupportedSchema(name.to_owned(), problem))?;
@@ -172,6 +228,9 @@ impl ToolRegistry {
                 generation,
                 description: description.map(str::to_owned),
                 parameters,
+                schema,
+                version,
+                effect,
                 validator: Arc::new(validator),
                 handler,
                 authorized: false,
@@ -247,11 +306,15 @@ pub(crate) struct ToolOffer {
     tools: Vec<(String, u64)>,
 }
 
-/// A call resolved for dispatch: the handler to run and its admitted
-/// arguments.
+/// A call resolved for dispatch: the handler to run, its admitted
+/// arguments, and the registration's identity to record with the call.
 pub(crate) struct Dispatch {
     pub(crate) handler: Arc<dyn ToolHandler>,
     pub(crate) arguments: Value,
+    pub(crate) version: String,
+    pub(crate) effect: ToolEffect,
+    /// The parameter schema the arguments were checked against, serialized.
+    pub(crate) schema: String,
 }
 
 impl ToolOffer {
@@ -295,14 +358,26 @@ impl ToolOffer {
                 call.name
             )));
         };
-        let (validator, handler) = {
+        let (validator, handler, version, effect, schema) = {
             let registry = self.registry.lock();
             let tool = current(&registry, name, *generation)
                 .map_err(|error| refused(format!("tool call {index} cannot run: {error}")))?;
-            (tool.validator.clone(), tool.handler.clone())
+            (
+                tool.validator.clone(),
+                tool.handler.clone(),
+                tool.version.clone(),
+                tool.effect,
+                tool.schema.clone(),
+            )
         };
         let arguments = admission::admit_arguments(index, name, &call.arguments, &validator)?;
-        Ok(Dispatch { handler, arguments })
+        Ok(Dispatch {
+            handler,
+            arguments,
+            version,
+            effect,
+            schema,
+        })
     }
 }
 
