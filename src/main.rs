@@ -1,5 +1,6 @@
 use std::process::ExitCode;
 
+use ocg::control_plane::ControlPlaneConfig;
 use ocg::data_directory::DataDirectory;
 
 #[cfg(unix)]
@@ -23,7 +24,8 @@ fn main() -> ExitCode {
 /// `workspace-code <objective>` one that may also run its build and tests,
 /// and `workspace-vision <image-path> <objective>` one that stores an image
 /// of it as an Attachment and sends it with the objective, see
-/// `workspace_job`.
+/// `workspace_job`. Without arguments, the local Control Plane is served
+/// too when it is configured, see [`ocg::control_plane`].
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
@@ -46,11 +48,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Err(format!("unknown command `{command}`").into());
     }
+    // Refused before anything starts when it is given but invalid.
+    let control = ControlPlaneConfig::from_environment()?;
     let data_directory = DataDirectory::from_environment()?;
     eprintln!("OCG data directory: {}", data_directory.root().display());
-    ocg::host::run(&data_directory, true, |_database| async {
-        let signals = ntex::rt::signals::signal().await;
-        log::info!("OCG received {signals:?}; shutting down");
-    })?;
+    match control {
+        None => ocg::host::run(&data_directory, true, |_database| until_signalled())?,
+        Some(control) => {
+            ocg::host::run_controlled(&data_directory, true, Some(control), |_context| {
+                until_signalled()
+            })?;
+        }
+    }
     Ok(())
+}
+
+async fn until_signalled() {
+    let signals = ntex::rt::signals::signal().await;
+    log::info!("OCG received {signals:?}; shutting down");
 }

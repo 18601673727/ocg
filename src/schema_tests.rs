@@ -10230,6 +10230,730 @@ fn a_host_run_keeps_stopping_after_a_failed_step_and_reports_every_failure() {
     );
 }
 
+// ---- local Control Plane ------------------------------------------------------
+
+mod control_plane {
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::Value;
+
+    use super::*;
+    use crate::control_plane::ControlPlaneConfig;
+    use crate::host::{HostContext, Phase, run_controlled_reporting};
+    use crate::persistence::{IntermediateOutputKind, JobFinalization, NewJobOutput};
+
+    const TOKEN: &str = "T0k3n-For-The-Control-Plane_Tests.0123456789~abc";
+
+    fn config() -> ControlPlaneConfig {
+        ControlPlaneConfig::new(0, TOKEN).expect("a valid configuration")
+    }
+
+    /// One HTTP/1.1 response: its status, headers (lowercase names) and body.
+    struct Response {
+        status: u16,
+        headers: BTreeMap<String, String>,
+        body: String,
+    }
+
+    impl Response {
+        fn json(&self) -> Value {
+            serde_json::from_str(&self.body).expect("a JSON body")
+        }
+
+        fn error(&self) -> String {
+            self.json()["error"]["code"]
+                .as_str()
+                .expect("an error code")
+                .to_owned()
+        }
+    }
+
+    /// Sends `GET path` with exactly `headers`, over a new connection, and
+    /// reads the whole response.
+    fn send(address: SocketAddr, request_line: &str, headers: &[(&str, &str)]) -> Response {
+        let mut stream = TcpStream::connect(address).expect("connect");
+        stream
+            .set_read_timeout(Some(crate::test_support::WAIT))
+            .expect("timeout");
+        let mut request = format!("{request_line} HTTP/1.1\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).expect("send");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read");
+        let raw = String::from_utf8(raw).expect("UTF-8");
+        let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("a status");
+        let headers = lines
+            .filter_map(|line| line.split_once(": "))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.to_owned()))
+            .collect();
+        Response {
+            status,
+            headers,
+            body: body.to_owned(),
+        }
+    }
+
+    /// An authenticated request from a well-behaved local client.
+    fn get(address: SocketAddr, path: &str) -> Response {
+        let host = format!("127.0.0.1:{}", address.port());
+        let bearer = format!("Bearer {TOKEN}");
+        send(
+            address,
+            &format!("GET {path}"),
+            &[("Host", &host), ("Authorization", &bearer)],
+        )
+    }
+
+    /// Runs the host with the Control Plane, runs `client` on a thread of
+    /// its own against the bound address, then stops the host. Returns the
+    /// host's report and what `client` returned.
+    fn hosted<T: Send + 'static>(
+        directory: &DataDirectory,
+        control: Option<ControlPlaneConfig>,
+        client: impl FnOnce(Option<SocketAddr>) -> T + Send + 'static,
+    ) -> (crate::host::HostReport, Option<T>) {
+        let returned = Arc::new(Mutex::new(None));
+        let slot = returned.clone();
+        let report =
+            run_controlled_reporting(directory, false, control, move |context: HostContext| {
+                let address = context.control_plane();
+                async move {
+                    let value = std::thread::spawn(move || client(address))
+                        .join()
+                        .expect("the client did not panic");
+                    *slot.lock().expect("lock") = Some(value);
+                }
+            });
+        // The process-wide logger may already be another host's in this
+        // test binary; that is reported, and nothing else may fail.
+        let returned = returned.lock().expect("lock").take();
+        (report, returned)
+    }
+
+    fn only_logger_failures(report: &crate::host::HostReport) {
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|failure| failure.phase == Phase::Logger),
+            "{:?}",
+            report.failures
+        );
+    }
+
+    /// Opens the database as the host does, runs `seed`, and closes it.
+    fn seeded<T>(directory: &DataDirectory, seed: impl FnOnce(&DatabaseHandle) -> T) -> T {
+        let policy =
+            crate::system_policy::SystemPolicy::load_for_startup(directory).expect("policy");
+        let worker = DatabaseWorker::start_with_policy(directory, policy).expect("start database");
+        let seeded = seed(&worker.handle());
+        worker.shutdown().expect("shutdown");
+        seeded
+    }
+
+    fn progress(handle: &DatabaseHandle, job: JobId, text: &str) {
+        wait(handle.append_job_output(
+            job,
+            NewJobOutput {
+                kind: IntermediateOutputKind::Progress,
+                summary: Some(text.to_owned()),
+                code: None,
+                goal_reached: None,
+                value: None,
+            },
+        ))
+        .expect("append an output");
+    }
+
+    #[test]
+    fn a_local_client_reads_each_job_as_it_was_recorded() {
+        let (_root, directory) = data_directory("control-jobs");
+        let jobs = seeded(&directory, |handle| {
+            let (_provider, llm) = llm_setup(handle, "model-a");
+            let submitted = llm_job(handle, llm);
+            let running = llm_job(handle, llm);
+            wait(handle.start_job(running)).expect("start");
+            let mut settled = Vec::new();
+            for finalization in [
+                JobFinalization::Completed(result("done")),
+                JobFinalization::Failed(result("failed")),
+                JobFinalization::Cancelled(result("cancelled")),
+            ] {
+                let job = llm_job(handle, llm);
+                wait(handle.start_job(job)).expect("start");
+                wait(handle.finalize_job(job, finalization)).expect("settle");
+                settled.push(job);
+            }
+            // Unknown, its local execution confirmed stopped.
+            let confirmed = llm_job(handle, llm);
+            wait(handle.start_local_job(confirmed)).expect("start");
+            progress(handle, confirmed, "partial answer");
+            wait(handle.finalize_job(confirmed, JobFinalization::Unknown)).expect("unknown");
+            wait(handle.confirm_job_stopped(confirmed)).expect("confirm");
+            // Unknown, its stop never confirmed.
+            let unconfirmed = llm_job(handle, llm);
+            wait(handle.start_job(unconfirmed)).expect("start");
+            wait(handle.finalize_job(unconfirmed, JobFinalization::Unknown)).expect("unknown");
+            [
+                submitted,
+                running,
+                settled[0],
+                settled[1],
+                settled[2],
+                confirmed,
+                unconfirmed,
+            ]
+            .map(|job| wait(handle.job(job)).expect("read").expect("a Job"))
+        });
+        let expected = jobs.clone();
+        let (report, checked) = hosted(&directory, Some(config()), move |address| {
+            let address = address.expect("the control plane listens");
+            assert!(address.ip().is_loopback());
+            let health = get(address, "/api/v1/health");
+            assert_eq!(health.status, 200);
+            assert_eq!(
+                health.json(),
+                json!({
+                    "api_version": 1,
+                    "host": "running",
+                    "database": {"status": "open", "accepting_commands": true, "readable": true},
+                })
+            );
+            let states = [
+                "unsettled",
+                "unsettled",
+                "completed",
+                "failed",
+                "cancelled",
+                "unknown",
+                "unknown",
+            ];
+            for (record, state) in expected.iter().zip(states) {
+                let response = get(address, &format!("/api/v1/jobs/{}", record.id));
+                assert_eq!(response.status, 200, "{}", response.body);
+                assert_eq!(
+                    response.headers.get("cache-control").map(String::as_str),
+                    Some("no-store")
+                );
+                let job = &response.json()["job"];
+                assert_eq!(job["id"], record.id.to_string());
+                assert_eq!(job["input"], record.input.to_string());
+                assert_eq!(job["settlement"]["state"], state, "{}", record.id);
+                let settled_at = [
+                    record.completed_at,
+                    record.failed_at,
+                    record.cancelled_at,
+                    record.unknown_at,
+                ]
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|at| at.as_unix_micros());
+                assert_eq!(job["settlement"]["settled_at_us"], json!(settled_at));
+                assert_eq!(
+                    job["started_at_us"],
+                    json!(record.started_at.map(|at| at.as_unix_micros()))
+                );
+                assert_eq!(
+                    job["stop_confirmed_at_us"],
+                    json!(record.stop_confirmed_at.map(|at| at.as_unix_micros()))
+                );
+                assert_eq!(job["created_at_us"], record.created_at.as_unix_micros());
+            }
+            // The Unknown Job's stop is confirmed or not, as recorded, and
+            // it has no final Result: only the progress it recorded.
+            let confirmed = &expected[5];
+            let unconfirmed = &expected[6];
+            assert!(
+                confirmed.stop_confirmed_at.is_some() && unconfirmed.stop_confirmed_at.is_none()
+            );
+            let outputs = get(address, &format!("/api/v1/jobs/{}/outputs", confirmed.id)).json();
+            let kinds = outputs["outputs"]
+                .as_array()
+                .expect("outputs")
+                .iter()
+                .map(|output| output["kind"].as_str().expect("a kind").to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(kinds, ["progress"]);
+            assert_eq!(outputs["outputs"][0]["summary"], "partial answer");
+            // A completed Job's final Result is its own stored output.
+            let completed =
+                get(address, &format!("/api/v1/jobs/{}/outputs", expected[2].id)).json();
+            assert_eq!(completed["outputs"][0]["kind"], "result");
+            assert_eq!(completed["outputs"][0]["summary"], "done");
+
+            for (path, status, code) in [
+                ("/api/v1/jobs/job:999999", 404, "job_not_found"),
+                ("/api/v1/jobs/job:999999/outputs", 404, "job_not_found"),
+                ("/api/v1/jobs/7", 400, "invalid_request"),
+                ("/api/v1/jobs/job:01", 400, "invalid_request"),
+                ("/api/v1/jobs/job%3A1", 400, "invalid_request"),
+                ("/api/v1/jobs/job:1?x=1", 400, "invalid_request"),
+                ("/api/v1/jobs/job:1/", 404, "not_found"),
+                ("/api/v1/jobs", 404, "not_found"),
+                ("/", 404, "not_found"),
+                ("/ocg_db/ocg.redb", 404, "not_found"),
+                ("/api/v1/../../ocg.key", 404, "not_found"),
+            ] {
+                let response = get(address, path);
+                assert_eq!(
+                    (response.status, response.error().as_str()),
+                    (status, code),
+                    "{path}"
+                );
+            }
+        });
+        only_logger_failures(&report);
+        assert!(checked.is_some(), "the client ran");
+        let position = |phase| {
+            report
+                .attempted
+                .iter()
+                .position(|attempted| *attempted == phase)
+        };
+        assert!(
+            position(Phase::ControlPlane) < position(Phase::ExecutionRuntime),
+            "the listener stops before the execution runtime: {:?}",
+            report.attempted
+        );
+        assert_eq!(report.attempted.last(), Some(&Phase::Database));
+        // Reads changed nothing.
+        let after = seeded(&directory, |handle| {
+            jobs.clone()
+                .map(|job| wait(handle.job(job.id)).expect("read").expect("a Job"))
+        });
+        for (before, after) in jobs.iter().zip(after.iter()) {
+            assert_eq!(before.updated_at, after.updated_at);
+        }
+    }
+
+    #[test]
+    fn requests_without_the_token_or_from_another_origin_are_refused() {
+        let (_root, directory) = data_directory("control-boundary");
+        let (report, checked) = hosted(&directory, Some(config()), move |address| {
+            let address = address.expect("listening");
+            let port = address.port();
+            let host = format!("127.0.0.1:{port}");
+            let localhost = format!("localhost:{port}");
+            let bearer = format!("Bearer {TOKEN}");
+            let health = "GET /api/v1/health";
+            let origin = format!("http://127.0.0.1:{port}");
+            let mut responses = Vec::new();
+            let mut refused = |status: u16, code: &str, request: &str, headers: &[(&str, &str)]| {
+                let response = send(address, request, headers);
+                assert_eq!(
+                    (response.status, response.error().as_str()),
+                    (status, code),
+                    "{headers:?}"
+                );
+                responses.push(response);
+            };
+            // Authentication.
+            refused(401, "unauthenticated", health, &[("Host", &host)]);
+            refused(
+                401,
+                "unauthenticated",
+                health,
+                &[
+                    ("Host", &host),
+                    (
+                        "Authorization",
+                        "Bearer wrong-token-of-the-right-shape-0123456789",
+                    ),
+                ],
+            );
+            refused(
+                401,
+                "unauthenticated",
+                health,
+                &[("Host", &host), ("Authorization", TOKEN)],
+            );
+            refused(
+                401,
+                "unauthenticated",
+                health,
+                &[
+                    ("Host", &host),
+                    ("Authorization", &format!("Basic {TOKEN}")),
+                ],
+            );
+            refused(
+                401,
+                "unauthenticated",
+                health,
+                &[
+                    ("Host", &host),
+                    ("Authorization", &format!("Bearer {}", &TOKEN[1..])),
+                ],
+            );
+            refused(
+                401,
+                "unauthenticated",
+                health,
+                &[
+                    ("Host", &host),
+                    ("Authorization", &bearer),
+                    ("Authorization", &bearer),
+                ],
+            );
+            refused(
+                401,
+                "unauthenticated",
+                &format!("GET /api/v1/health?access_token={TOKEN}"),
+                &[("Host", &host)],
+            );
+            refused(
+                400,
+                "invalid_request",
+                &format!("GET /api/v1/health?access_token={TOKEN}"),
+                &[("Host", &host), ("Authorization", &bearer)],
+            );
+            // Host: the listener's own name and port only, even with the token.
+            for hostile in [
+                "evil.example".to_owned(),
+                format!("evil.example:{port}"),
+                "127.0.0.1".to_owned(),
+                format!("127.0.0.1:{}", port.wrapping_add(1)),
+                format!("0.0.0.0:{port}"),
+                format!("[::1]:{port}"),
+                format!("127.0.0.1:{port}.evil.example"),
+            ] {
+                refused(
+                    403,
+                    "forbidden_host",
+                    health,
+                    &[("Host", &hostile), ("Authorization", &bearer)],
+                );
+            }
+            refused(
+                403,
+                "forbidden_host",
+                health,
+                &[
+                    ("Host", &host),
+                    ("Host", "evil.example"),
+                    ("Authorization", &bearer),
+                ],
+            );
+            // Origin and fetch metadata.
+            for hostile in [
+                "http://evil.example",
+                "null",
+                "https://127.0.0.1",
+                &format!("https://127.0.0.1:{port}"),
+                &format!("http://127.0.0.1:{port}.evil.example"),
+            ] {
+                refused(
+                    403,
+                    "forbidden_origin",
+                    health,
+                    &[
+                        ("Host", &host),
+                        ("Origin", hostile),
+                        ("Authorization", &bearer),
+                    ],
+                );
+            }
+            refused(
+                403,
+                "forbidden_origin",
+                health,
+                &[
+                    ("Host", &host),
+                    ("Sec-Fetch-Site", "cross-site"),
+                    ("Authorization", &bearer),
+                ],
+            );
+            refused(
+                403,
+                "forbidden_origin",
+                health,
+                &[
+                    ("Host", &host),
+                    ("Sec-Fetch-Site", "same-site"),
+                    ("Authorization", &bearer),
+                ],
+            );
+            // Only GET; no CORS preflight is answered.
+            for method in ["POST", "OPTIONS", "DELETE", "PUT"] {
+                refused(
+                    405,
+                    "method_not_allowed",
+                    &format!("{method} /api/v1/health"),
+                    &[
+                        ("Host", &host),
+                        ("Authorization", &bearer),
+                        ("Origin", "http://evil.example"),
+                        ("Access-Control-Request-Method", "GET"),
+                    ],
+                );
+            }
+            // Oversized requests.
+            refused(
+                414,
+                "uri_too_long",
+                &format!("GET /api/v1/{}", "a".repeat(300)),
+                &[("Host", &host), ("Authorization", &bearer)],
+            );
+            let big = "x".repeat(9 * 1024);
+            refused(
+                431,
+                "headers_too_large",
+                health,
+                &[
+                    ("Host", &host),
+                    ("Authorization", &bearer),
+                    ("X-Padding", &big),
+                ],
+            );
+
+            // The same request from the listener's own origin is answered.
+            for (host, origin) in [(&host, Some(origin.as_str())), (&localhost, None)] {
+                let mut headers = vec![
+                    ("Host", host.as_str()),
+                    ("Authorization", bearer.as_str()),
+                    ("Sec-Fetch-Site", "same-origin"),
+                ];
+                if let Some(origin) = origin {
+                    headers.push(("Origin", origin));
+                }
+                let response = send(address, health, &headers);
+                assert_eq!(response.status, 200, "{}", response.body);
+                responses.push(response);
+            }
+            for response in &responses {
+                assert!(
+                    !response.body.contains(TOKEN),
+                    "the token is never reflected"
+                );
+                assert!(!response.headers.values().any(|value| value.contains(TOKEN)));
+                assert!(
+                    !response
+                        .headers
+                        .keys()
+                        .any(|name| name.starts_with("access-control-")),
+                    "no CORS header: {:?}",
+                    response.headers
+                );
+                assert!(!response.headers.contains_key("set-cookie"));
+            }
+            assert_eq!(
+                responses[0]
+                    .headers
+                    .get("www-authenticate")
+                    .map(String::as_str),
+                Some("Bearer")
+            );
+        });
+        only_logger_failures(&report);
+        assert!(checked.is_some());
+        // Nothing the run logged repeats the token.
+        if let Ok(entries) = std::fs::read_dir(directory.logs_path()) {
+            for entry in entries.flatten() {
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                assert!(!text.contains(TOKEN), "{}", entry.path().display());
+            }
+        }
+    }
+
+    #[test]
+    fn outputs_are_paged_in_their_stored_sequence() {
+        let (_root, directory) = data_directory("control-outputs");
+        let (job, empty, large) = seeded(&directory, |handle| {
+            let (_provider, llm) = llm_setup(handle, "model-a");
+            let job = llm_job(handle, llm);
+            wait(handle.start_job(job)).expect("start");
+            for index in 0..7 {
+                progress(handle, job, &format!("chunk {index} \"quoted\" ünïcødé\n"));
+            }
+            wait(handle.finalize_job(job, JobFinalization::Completed(result("final answer"))))
+                .expect("complete");
+            let empty = llm_job(handle, llm);
+            let large = llm_job(handle, llm);
+            wait(handle.start_job(large)).expect("start");
+            progress(handle, large, "small");
+            progress(handle, large, &"L".repeat(4_000));
+            (job, empty, large)
+        });
+        let stored = seeded(&directory, move |handle| {
+            wait(handle.job_outputs(job, None, 1_000)).expect("read outputs")
+        });
+        assert_eq!(stored.len(), 8);
+        let (report, checked) = hosted(&directory, Some(config()), move |address| {
+            let address = address.expect("listening");
+            let page = |query: &str| {
+                let response = get(address, &format!("/api/v1/jobs/{job}/outputs{query}"));
+                assert_eq!(response.status, 200, "{}", response.body);
+                response.json()
+            };
+            // Every output, page by page, exactly once and in order.
+            let mut seen = Vec::new();
+            let mut cursor: Option<i64> = None;
+            loop {
+                let query = match cursor {
+                    None => "?limit=3".to_owned(),
+                    Some(after) => format!("?after_seq={after}&limit=3"),
+                };
+                let body = page(&query);
+                assert_eq!(body["after_seq"], json!(cursor));
+                let outputs = body["outputs"].as_array().expect("outputs").clone();
+                assert!(outputs.len() <= 3);
+                seen.extend(outputs);
+                assert_eq!(
+                    body["next_after_seq"],
+                    seen.last()
+                        .map_or(json!(cursor), |last| last["seq"].clone())
+                );
+                cursor = body["next_after_seq"].as_i64();
+                if body["has_more"] == false {
+                    break;
+                }
+            }
+            assert_eq!(seen.len(), stored.len());
+            for (shown, record) in seen.iter().zip(&stored) {
+                assert_eq!(shown["seq"], record.seq);
+                assert_eq!(shown["id"], record.id.to_string());
+                assert_eq!(
+                    shown["summary"],
+                    json!(record.summary),
+                    "stored content, exactly"
+                );
+                assert_eq!(shown["created_at_us"], record.created_at.as_unix_micros());
+            }
+            assert_eq!(seen.last().expect("an output")["kind"], "result");
+            // A cursor at the last output is an empty tail.
+            let last = stored.last().expect("an output").seq;
+            let tail = page(&format!("?after_seq={last}"));
+            assert_eq!(tail["outputs"], json!([]));
+            assert_eq!(
+                (&tail["next_after_seq"], &tail["has_more"]),
+                (&json!(last), &json!(false))
+            );
+            // A cursor in the middle starts strictly after it.
+            let middle = stored[3].seq;
+            let rest = page(&format!("?after_seq={middle}"));
+            assert_eq!(rest["outputs"][0]["seq"], stored[4].seq);
+            assert_eq!(rest["outputs"].as_array().expect("outputs").len(), 4);
+            // A Job with no output.
+            let none = get(address, &format!("/api/v1/jobs/{empty}/outputs")).json();
+            assert_eq!(
+                (&none["outputs"], &none["next_after_seq"], &none["has_more"]),
+                (&json!([]), &Value::Null, &json!(false))
+            );
+            for query in [
+                "?limit=0",
+                "?limit=101",
+                "?after_seq=-1",
+                "?after_seq=a",
+                "?limit=2&limit=3",
+                "?cursor=1",
+            ] {
+                let response = get(address, &format!("/api/v1/jobs/{job}/outputs{query}"));
+                assert_eq!(
+                    (response.status, response.error().as_str()),
+                    (400, "invalid_request"),
+                    "{query}"
+                );
+            }
+            let large_page = get(address, &format!("/api/v1/jobs/{large}/outputs"));
+            assert_eq!(large_page.status, 200);
+            assert_eq!(
+                large_page.json()["outputs"][1]["summary"],
+                "L".repeat(4_000)
+            );
+        });
+        only_logger_failures(&report);
+        assert!(checked.is_some());
+
+        // With a smaller response limit, a page stops before an output that
+        // does not fit, and an output that alone does not fit is refused,
+        // never cut.
+        let small = config().with_response_bytes(1_024);
+        let (report, checked) = hosted(&directory, Some(small), move |address| {
+            let address = address.expect("listening");
+            let first = get(address, &format!("/api/v1/jobs/{large}/outputs"));
+            assert_eq!(first.status, 200);
+            let body = first.json();
+            let outputs = body["outputs"].as_array().expect("outputs");
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0]["summary"], "small");
+            assert_eq!(body["has_more"], true);
+            assert!(first.body.len() <= 1_024);
+            let next = body["next_after_seq"].as_i64().expect("a cursor");
+            let refused = get(
+                address,
+                &format!("/api/v1/jobs/{large}/outputs?after_seq={next}"),
+            );
+            assert_eq!(
+                (refused.status, refused.error().as_str()),
+                (422, "output_too_large")
+            );
+            assert!(!refused.body.contains("LLLL"), "no part of it is sent");
+        });
+        only_logger_failures(&report);
+        assert!(checked.is_some());
+    }
+
+    #[test]
+    fn the_control_plane_runs_only_when_configured_and_releases_its_port() {
+        let (_root, directory) = data_directory("control-lifecycle");
+        // Off by default: nothing listens, and the run is as it was.
+        let (report, address) = hosted(&directory, None, |address| address);
+        only_logger_failures(&report);
+        assert_eq!(address, Some(None));
+        assert!(!report.attempted.contains(&Phase::ControlPlane));
+
+        // A port that cannot be bound fails the run before its caller runs.
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy a port");
+        let port = occupied.local_addr().expect("address").port();
+        let busy = ControlPlaneConfig::new(port, TOKEN).expect("valid");
+        let (report, ran) = hosted(&directory, Some(busy), |_| ());
+        assert!(ran.is_none(), "the caller is not run without its listener");
+        let failures = report
+            .failures
+            .iter()
+            .filter(|failure| failure.phase == Phase::ControlPlane)
+            .collect::<Vec<_>>();
+        let [failure] = failures.as_slice() else {
+            panic!("one control plane failure: {:?}", report.failures);
+        };
+        assert!(failure.error.contains(&format!("127.0.0.1:{port}")));
+        assert!(!failure.error.contains(TOKEN));
+        assert_eq!(
+            report.attempted.last(),
+            Some(&Phase::Database),
+            "the host still stopped"
+        );
+        drop(occupied);
+
+        // Once the host stopped, its port is free again.
+        let (report, address) = hosted(&directory, Some(config()), |address| {
+            let address = address.expect("listening");
+            assert_eq!(get(address, "/api/v1/health").status, 200);
+            address
+        });
+        only_logger_failures(&report);
+        let address = address.expect("ran");
+        TcpListener::bind(address).expect("the listener's port was released");
+        assert!(
+            TcpStream::connect(address).is_err(),
+            "nothing answers there"
+        );
+    }
+}
+
 // ---- runtime lifecycle closure -----------------------------------------------------
 
 /// Local execution claims, stop confirmation, abandoned-work settlement and

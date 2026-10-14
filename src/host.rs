@@ -6,7 +6,9 @@
 //! database is closed last, after everything that may still write to it.
 
 use std::future::Future;
+use std::net::SocketAddr;
 
+use crate::control_plane::{ControlPlane, ControlPlaneConfig};
 use crate::data_directory::DataDirectory;
 use crate::database::{DatabaseHandle, DatabaseWorker};
 use crate::disk_protection::{ProtectionLock, ProtectionWatch};
@@ -26,6 +28,7 @@ pub enum Phase {
     AggregationService,
     LogCleanup,
     ExecutionRuntime,
+    ControlPlane,
     Database,
 }
 
@@ -37,6 +40,7 @@ impl std::fmt::Display for Phase {
             Self::AggregationService => "aggregation service",
             Self::LogCleanup => "log cleanup",
             Self::ExecutionRuntime => "execution runtime",
+            Self::ControlPlane => "control plane",
             Self::Database => "database",
         })
     }
@@ -104,6 +108,7 @@ impl HostReport {
 pub struct HostContext {
     database: DatabaseHandle,
     scheduler: SchedulerHandle,
+    control_plane: Option<SocketAddr>,
 }
 
 impl HostContext {
@@ -114,6 +119,12 @@ impl HostContext {
     /// Submits work to the host's execution runtime; see [`SchedulerHandle`].
     pub fn scheduler(&self) -> &SchedulerHandle {
         &self.scheduler
+    }
+
+    /// Where the Control Plane listens, when the run was given one; it
+    /// answers from before the caller is called until the caller returns.
+    pub fn control_plane(&self) -> Option<SocketAddr> {
+        self.control_plane
     }
 }
 
@@ -163,6 +174,36 @@ pub(crate) fn run_hosted_reporting<F>(
 where
     F: Future<Output = ()> + 'static,
 {
+    run_controlled_reporting(data_directory, signals, None, until_stopped)
+}
+
+/// Like [`run_hosted`], also serving the local Control Plane `control`
+/// describes, when given, for as long as `until_stopped` runs; see
+/// [`crate::control_plane`]. It starts only once every service the host
+/// waits for runs; a listener that cannot start fails the run, and
+/// `until_stopped` is then not called. It is stopped first, before the
+/// execution runtime.
+pub fn run_controlled<F>(
+    data_directory: &DataDirectory,
+    signals: bool,
+    control: Option<ControlPlaneConfig>,
+    until_stopped: impl FnOnce(HostContext) -> F + 'static,
+) -> Result<(), HostError>
+where
+    F: Future<Output = ()> + 'static,
+{
+    run_controlled_reporting(data_directory, signals, control, until_stopped).into_result()
+}
+
+pub(crate) fn run_controlled_reporting<F>(
+    data_directory: &DataDirectory,
+    signals: bool,
+    control: Option<ControlPlaneConfig>,
+    until_stopped: impl FnOnce(HostContext) -> F + 'static,
+) -> HostReport
+where
+    F: Future<Output = ()> + 'static,
+{
     let mut report = HostReport::default();
     let policy = match SystemPolicy::load_for_startup(data_directory) {
         Ok(policy) => policy,
@@ -192,7 +233,7 @@ where
         .name("ocg")
         .signals(signals)
         .build(ntex::rt::DefaultRuntime)
-        .block_on(serve(database.handle(), execution, until_stopped));
+        .block_on(serve(database.handle(), execution, control, until_stopped));
     report.attempted.extend(served.attempted);
     report.failures.extend(served.failures);
     report.attempt(Phase::Database, database.shutdown());
@@ -233,12 +274,14 @@ fn protection_notice(
 
 /// Runs the components that need the host's async runtime, waits for
 /// `until_stopped`, then stops everything it was given, in this order: the
+/// Control Plane, if any, so no request reads past this point; the
 /// execution runtime, so no submission starts once stopping begins; log
 /// cleanup; the aggregation service; the logger. The caller closes the
 /// database after it.
 async fn serve<F>(
     handle: DatabaseHandle,
     execution: ExecutionRuntime,
+    control: Option<ControlPlaneConfig>,
     until_stopped: impl FnOnce(HostContext) -> F,
 ) -> HostReport
 where
@@ -248,9 +291,10 @@ where
     // Started first: a lock also blocks the file log, so it is reported on
     // standard error for as long as the process runs.
     ntex::rt::spawn(report_protection(handle.watch_disk_protection()));
-    let context = HostContext {
+    let mut context = HostContext {
         database: handle.clone(),
         scheduler: execution.scheduler(),
+        control_plane: None,
     };
     let logger = match RuntimeLogger::start(handle.clone()) {
         Ok(logger) => logger,
@@ -331,9 +375,37 @@ where
         None => None,
     };
     if let (Some(service), Some(_)) = (&service, &cleanup) {
-        // Announced only once everything runs, right before waiting to stop.
-        eprintln!("OCG aggregation service running as {}", service.job());
-        until_stopped(context).await;
+        // Started only beside the running services, and the run does not
+        // wait to be stopped when it cannot start.
+        let listener = match control {
+            None => Some(None),
+            Some(config) => {
+                report.attempted.push(Phase::ControlPlane);
+                match ControlPlane::start(config, handle.clone()) {
+                    Ok(listener) => Some(Some(listener)),
+                    Err(error) => {
+                        log::error!("{error}");
+                        report.fail(Phase::ControlPlane, error);
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(listener) = listener {
+            context.control_plane = listener.as_ref().map(ControlPlane::address);
+            // Announced only once everything runs, right before waiting to stop.
+            if let Some(address) = context.control_plane {
+                log::info!("control plane listening on http://{address}");
+                eprintln!("OCG control plane listening on http://{address}");
+            }
+            eprintln!("OCG aggregation service running as {}", service.job());
+            until_stopped(context).await;
+            if let Some(listener) = listener
+                && let Err(error) = listener.stop().await
+            {
+                report.fail(Phase::ControlPlane, error);
+            }
+        }
     }
 
     report.attempt(Phase::ExecutionRuntime, execution.shutdown());

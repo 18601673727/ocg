@@ -1,4 +1,5 @@
 pub mod attachments;
+pub mod control_plane;
 pub mod data_directory;
 pub mod database;
 pub mod disk_protection;
