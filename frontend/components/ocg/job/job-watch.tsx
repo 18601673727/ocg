@@ -3,6 +3,8 @@
 import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { JobTranscript } from "@/components/ocg/chat/job-transcript";
+import { jobTranscript } from "@/components/ocg/chat/job-transcript-model";
 import {
   ControlTransportError,
   type HttpCanonicalControlClient,
@@ -259,6 +261,14 @@ export function JobWatch({
           <dt>Settled</dt>
           <dd>{formatMicros(settlement?.settled_at_us ?? null)}</dd>
         </div>
+        {job ? (
+          <div className="flex justify-between gap-2">
+            <dt>Input</dt>
+            <dd>
+              <code className="font-geist-mono">{job.input}</code>
+            </dd>
+          </div>
+        ) : null}
         {settlement?.state === "unknown" ? (
           <div className="flex justify-between gap-2">
             <dt>Stop confirmed</dt>
@@ -266,21 +276,14 @@ export function JobWatch({
           </div>
         ) : null}
       </dl>
-      {job?.input ? (
-        <details className="text-xs text-muted-foreground">
-          <summary className="cursor-pointer font-semibold tracking-widest uppercase">
-            Objective
-          </summary>
-          <pre className="ocg-subtle-scrollbar mt-2 overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-geist-mono">
-            {job.input}
-          </pre>
-        </details>
-      ) : null}
-      <div className="flex flex-col gap-2">
-        <h3 className="text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-          Outputs ({outputs.length})
-        </h3>
-        <ol className="flex flex-col gap-2">
+      <JobTranscript
+        turns={jobTranscript(jobId, outputs, settlement, stream === "live" || stream === "reconnecting")}
+      />
+      <details className="flex flex-col gap-2">
+        <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+          Stored outputs ({outputs.length})
+        </summary>
+        <ol className="mt-2 flex flex-col gap-2">
           {outputs.map((output) => (
             <li
               key={output.seq}
@@ -310,7 +313,7 @@ export function JobWatch({
             </li>
           ))}
         </ol>
-      </div>
+      </details>
     </section>
   );
 }

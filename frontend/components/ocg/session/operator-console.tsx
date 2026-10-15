@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   ControlTransportError,
   createHttpCanonicalControlClient,
@@ -11,8 +10,7 @@ import {
 } from "@/components/ocg/runtime/canonical-client";
 import { decodeHealth } from "@/components/ocg/contracts";
 import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/operator-login";
-import { JobSubmissionForm } from "@/components/ocg/job/job-submission-form";
-import { JobWatch } from "@/components/ocg/job/job-watch";
+import { AppShell } from "@/components/ocg/layout/app-shell";
 
 type Phase = "checking" | "out" | "in" | "unreachable";
 
@@ -24,8 +22,6 @@ export function OperatorConsole() {
   const [phase, setPhase] = useState<Phase>("checking");
   const [session, setSession] = useState<OperatorSession | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
-  const [watched, setWatched] = useState<string | null>(null);
-  const [inspect, setInspect] = useState("");
   const [signingOut, setSigningOut] = useState(false);
   const [signOutError, setSignOutError] = useState<string | null>(null);
   const csrf = useRef("");
@@ -113,7 +109,6 @@ export function OperatorConsole() {
     csrf.current = "";
     setSession(null);
     setHealth(null);
-    setWatched(null);
     setPhase("out");
   }
 
@@ -142,69 +137,14 @@ export function OperatorConsole() {
     return client ? <OperatorLogin client={client} onSignedIn={signedIn} /> : null;
   }
 
-  const database = health?.database;
-
   return (
-    <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-4 px-6 py-8">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-col gap-1">
-          <h1 className="font-heading text-2xl tracking-tight">OCG</h1>
-          <p className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            <span
-              className={`rounded-full px-2.5 py-0.5 font-semibold tracking-widest uppercase ${
-                database?.accepting_commands ? "bg-primary/10 text-primary" : "bg-destructive/10 text-destructive"
-              }`}
-            >
-              {health ? `host ${health.host}` : "host unreachable"}
-            </span>
-            <span
-              className={`rounded-full px-2.5 py-0.5 font-semibold tracking-widest uppercase ${
-                database?.readable ? "bg-primary/10 text-primary" : "bg-destructive/10 text-destructive"
-              }`}
-            >
-              database {database?.status ?? "unknown"}
-            </span>
-            <span className="rounded-full bg-muted px-2.5 py-0.5 font-semibold tracking-widest uppercase">
-              {database?.accepting_commands ? "accepting commands" : "not accepting commands"}
-            </span>
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground">
-            signed in until {session ? new Date(session.expiresAtUs / 1000).toLocaleTimeString() : "—"}
-          </span>
-          <Button variant="outline" size="sm" disabled={signingOut} onClick={() => void signOut()}>
-            {signingOut ? "Signing out…" : "Sign out"}
-          </Button>
-        </div>
-      </header>
-      {signOutError ? <p role="alert" className="text-sm text-destructive">{signOutError}</p> : null}
-      <JobSubmissionForm client={client} onJob={setWatched} />
-      <section className="flex flex-col gap-3 rounded-lg border border-border bg-card p-5 text-card-foreground">
-        <h2 className="font-heading text-lg">Inspect a Job</h2>
-        <form
-          className="flex flex-wrap items-end gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            const job = inspect.trim();
-            if (/^job:(0|[1-9][0-9]*)$/.test(job)) setWatched(job);
-          }}
-        >
-          <label className="flex flex-1 flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-            Job
-            <Input
-              value={inspect}
-              onChange={(event) => setInspect(event.target.value)}
-              placeholder="job:<n>"
-              spellCheck={false}
-            />
-          </label>
-          <Button type="submit" variant="outline">
-            Watch
-          </Button>
-        </form>
-      </section>
-      {watched ? <JobWatch key={watched} client={client} jobId={watched} /> : null}
-    </main>
+    <AppShell
+      client={client}
+      health={health}
+      sessionExpiresAtUs={session?.expiresAtUs ?? null}
+      signingOut={signingOut}
+      signOutError={signOutError}
+      onSignOut={() => void signOut()}
+    />
   );
 }
