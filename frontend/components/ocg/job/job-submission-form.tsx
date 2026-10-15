@@ -134,7 +134,7 @@ export function JobSubmissionForm({
       }
     } catch (error) {
       if (!mounted.current || keyRef.current !== held) return;
-      const outcome = outcomeOf(error);
+      const outcome = phase === "uncertain" ? "uncertain" : outcomeOf(error);
       setPhase(outcome);
       const code =
         error instanceof ControlTransportError
@@ -159,6 +159,7 @@ export function JobSubmissionForm({
   }
 
   function fresh() {
+    if (phase !== "admitted" && phase !== "refused") return;
     clearReconciliation();
     keyRef.current = null;
     setKey(null);
@@ -223,8 +224,13 @@ export function JobSubmissionForm({
         </p>
       ) : null}
       {message ? <p className="text-sm text-muted-foreground">{message}</p> : null}
+      {settled ? (
+        <p className="text-xs text-muted-foreground">
+          Resolve this submission before starting a new Job intent. Retries and lookups keep this key.
+        </p>
+      ) : null}
       <div className="flex flex-wrap gap-2">
-        {phase !== "admitted" && phase !== "pending" && phase !== "submitting" ? (
+        {phase === "editing" || phase === "refused" ? (
           <Button onClick={() => void submit()} disabled={objective.trim().length === 0}>
             {phase === "editing" ? "Submit Job" : "Submit again"}
           </Button>
@@ -248,7 +254,7 @@ export function JobSubmissionForm({
           </Button>
         ) : null}
         {phase !== "editing" ? (
-          <Button variant="ghost" onClick={fresh}>
+          <Button variant="ghost" disabled={settled} onClick={fresh}>
             New submission
           </Button>
         ) : null}

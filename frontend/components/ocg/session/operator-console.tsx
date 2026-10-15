@@ -26,6 +26,8 @@ export function OperatorConsole() {
   const [health, setHealth] = useState<Health | null>(null);
   const [watched, setWatched] = useState<string | null>(null);
   const [inspect, setInspect] = useState("");
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
   const csrf = useRef("");
 
   useEffect(() => {
@@ -84,17 +86,29 @@ export function OperatorConsole() {
   }, [client, phase]);
 
   function signedIn(next: OperatorSession) {
+    setSignOutError(null);
     csrf.current = next.csrfToken;
     setSession(next);
     setPhase("in");
   }
 
   async function signOut() {
-    if (!client) return;
+    if (!client || signingOut) return;
+    setSigningOut(true);
+    setSignOutError(null);
     try {
       await client.deleteSession();
-    } catch {
-      // The session may already be gone; the browser ends it either way.
+    } catch (error: unknown) {
+      // A server rejection of this session confirms it is no longer authorized.
+      if (!(error instanceof ControlTransportError && error.status === 401)) {
+        const code = error instanceof ControlTransportError ? error.code : "invalid_response";
+        setSignOutError(
+          `Sign out could not be confirmed (${code}). Your session may still be active. Retry Sign out when the Control Plane is reachable; do not assume this browser is signed out.`,
+        );
+        return;
+      }
+    } finally {
+      setSigningOut(false);
     }
     csrf.current = "";
     setSession(null);
@@ -159,11 +173,12 @@ export function OperatorConsole() {
           <span className="text-xs text-muted-foreground">
             signed in until {session ? new Date(session.expiresAtUs / 1000).toLocaleTimeString() : "—"}
           </span>
-          <Button variant="outline" size="sm" onClick={() => void signOut()}>
-            Sign out
+          <Button variant="outline" size="sm" disabled={signingOut} onClick={() => void signOut()}>
+            {signingOut ? "Signing out…" : "Sign out"}
           </Button>
         </div>
       </header>
+      {signOutError ? <p role="alert" className="text-sm text-destructive">{signOutError}</p> : null}
       <JobSubmissionForm client={client} onJob={setWatched} />
       <section className="flex flex-col gap-3 rounded-lg border border-border bg-card p-5 text-card-foreground">
         <h2 className="font-heading text-lg">Inspect a Job</h2>
