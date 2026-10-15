@@ -589,9 +589,11 @@ impl ToolHandler for RunCommand {
             let stopping = StopOnDrop(control.clone());
             let (report, reported) = flume::bounded(1);
             let supervised = control.clone();
+            let mutation = workspace_read::WorkspaceMutation::begin();
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
+                    let _mutation = mutation;
                     report.send(supervise(invocation, &supervised)).ok();
                 })
                 .map_err(|_| Failure::from(Refusal::NotStarted))?;
@@ -685,14 +687,32 @@ pub(crate) fn code_tools_with(
     environment: CommandEnvironment,
     timeout: Duration,
 ) -> Result<ToolExecution, ToolRegistryError> {
+    code_tools_with_index(workspace, environment, timeout, fts_opted_in())
+}
+
+fn fts_opted_in() -> bool {
+    std::env::var_os(super::workspace_fts::EXPERIMENTAL_FTS_VARIABLE)
+        .is_some_and(|value| value == "1")
+}
+
+pub(crate) fn code_tools_with_index(
+    workspace: Workspace,
+    environment: CommandEnvironment,
+    timeout: Duration,
+    indexed: bool,
+) -> Result<ToolExecution, ToolRegistryError> {
     let registry = ToolRegistry::default();
     let limits = coding_limits(timeout);
     workspace_read::register(&registry, workspace.clone())?;
     workspace_write::register(&registry, workspace.clone())?;
     register(&registry, workspace.clone(), environment, timeout)?;
     workspace_discovery::register(&registry, workspace.clone())?;
-    crate::orchestration::workspace_index_query::register(&registry, workspace, limits.max_tool_result_bytes)?;
-    let names = [
+    crate::orchestration::workspace_index_query::register(
+        &registry,
+        workspace.clone(),
+        limits.max_tool_result_bytes,
+    )?;
+    let mut names = vec![
         workspace_read::TOOL_NAME,
         workspace_write::TOOL_NAME,
         TOOL_NAME,
@@ -700,7 +720,11 @@ pub(crate) fn code_tools_with(
         workspace_discovery::SEARCH_TOOL_NAME,
         crate::orchestration::workspace_index_query::TOOL_NAME,
     ];
-    for name in names {
+    if indexed {
+        super::workspace_fts::register(&registry, workspace)?;
+        names.push(super::workspace_fts::TOOL_NAME);
+    }
+    for name in &names {
         registry.authorize(name)?;
     }
     Ok(ToolExecution {
@@ -890,6 +914,26 @@ mod tests {
     }
 
     #[test]
+    fn a_command_invalidates_indexes_and_refresh_observes_indirect_writes() {
+        use crate::orchestration::workspace_fts::{FtsLimits, WorkspaceFts};
+        let setup = setup(
+            "command-index-dirty",
+            "printf 'changedneedle\\n' > source.rs",
+        );
+        std::fs::write(setup.root.join("source.rs"), "oldneedle\n").expect("source");
+        let workspace = Workspace::authorize(&setup.root, &setup.directory).expect("authorize");
+        let index = WorkspaceFts::new(workspace, FtsLimits::default());
+        index.build().expect("build");
+        run(setup.handler(Duration::from_secs(2)), test_command()).expect("command");
+        let stale = index.search("oldneedle", 10).expect("old snapshot");
+        assert_eq!(stale["index"]["freshness"], "known_dirty");
+        index.rebuild().expect("refresh");
+        let updated = index.search("changedneedle", 10).expect("updated");
+        assert_eq!(updated["results"].as_array().expect("results").len(), 1);
+        assert_eq!(updated["index"]["external_modifications"], "unverified");
+    }
+
+    #[test]
     fn the_coding_tools_are_offered_only_together_and_only_when_asked() {
         let setup = setup("registration", "exit 0");
         let authorize = || Workspace::authorize(&setup.root, &setup.directory).expect("authorize");
@@ -910,7 +954,8 @@ mod tests {
                 workspace_write::TOOL_NAME,
                 TOOL_NAME,
                 workspace_discovery::LIST_TOOL_NAME,
-                workspace_discovery::SEARCH_TOOL_NAME
+                workspace_discovery::SEARCH_TOOL_NAME,
+                crate::orchestration::workspace_index_query::TOOL_NAME,
             ]
         );
         assert_eq!(
@@ -957,6 +1002,117 @@ mod tests {
             ),
             "registering authorizes nothing"
         );
+    }
+
+    #[test]
+    fn workspace_index_query_and_search_tools_coexist_with_fts_opt_in() {
+        use crate::openai_compatible::CompletedToolCall;
+        use crate::orchestration::{workspace_fts, workspace_index_query};
+
+        const CHILD: &str = "OCG_TEST_FTS_REGISTRATION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for value in [None, Some(""), Some("0"), Some("true"), Some("1")] {
+                let mut command = Command::new(std::env::current_exe().expect("test executable"));
+                command
+                    .args([
+                        "--exact",
+                        "orchestration::workspace_command::tests::workspace_index_query_and_search_tools_coexist_with_fts_opt_in",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1");
+                match value {
+                    Some(value) => command.env(workspace_fts::EXPERIMENTAL_FTS_VARIABLE, value),
+                    None => command.env_remove(workspace_fts::EXPERIMENTAL_FTS_VARIABLE),
+                };
+                let output = command.output().expect("registration subprocess");
+                assert!(
+                    output.status.success(),
+                    "FTS setting {value:?}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        }
+
+        let setup = setup("search-coexistence", "exit 0");
+        std::fs::write(setup.root.join("source.rs"), "pub fn needle() {}\n").expect("source");
+        let workspace = Workspace::authorize(&setup.root, &setup.directory).expect("authorize");
+        let coding = code_tools(workspace).expect("coding tools");
+        let names = coding
+            .offer
+            .wires()
+            .expect("offered")
+            .into_iter()
+            .map(|wire| wire.function.name)
+            .collect::<Vec<_>>();
+        let opted_in = std::env::var_os(workspace_fts::EXPERIMENTAL_FTS_VARIABLE)
+            .is_some_and(|value| value == "1");
+        assert!(
+            names
+                .iter()
+                .any(|name| name == workspace_discovery::SEARCH_TOOL_NAME)
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == workspace_index_query::TOOL_NAME)
+        );
+        assert_eq!(
+            names.iter().any(|name| name == workspace_fts::TOOL_NAME),
+            opted_in
+        );
+        assert_eq!(names.len(), if opted_in { 7 } else { 6 });
+        for (name, arguments, version) in [
+            (
+                workspace_discovery::SEARCH_TOOL_NAME,
+                json!({"text": "needle"}),
+                "workspace_search-1",
+            ),
+            (
+                workspace_index_query::TOOL_NAME,
+                json!({"path": "source.rs", "operation": "outline"}),
+                "workspace_index_query-1",
+            ),
+            (
+                workspace_index_query::TOOL_NAME,
+                json!({"path": "source.rs", "operation": "syntax_errors"}),
+                "workspace_index_query-1",
+            ),
+            (
+                workspace_fts::TOOL_NAME,
+                json!({"query": "needle"}),
+                "workspace_fts_search-2",
+            ),
+        ] {
+            let call = CompletedToolCall {
+                index: 0,
+                id: "coexistence".to_owned(),
+                name: name.to_owned(),
+                arguments: arguments.to_string(),
+            };
+            let dispatch = coding.offer.resolve(&call);
+            if name == workspace_fts::TOOL_NAME && !opted_in {
+                assert!(dispatch.is_err(), "FTS cannot be dispatched without opt-in");
+                continue;
+            }
+            let dispatch = dispatch.expect("authorized dispatch");
+            assert_eq!(dispatch.version, version);
+            assert_eq!(dispatch.effect, ToolEffect::ReadOnly);
+            let result = on_ntex(async move { dispatch.handler.call(dispatch.arguments).await })
+                .expect("tool result");
+            if name == workspace_index_query::TOOL_NAME {
+                if result["operation"] == "outline" {
+                    assert_eq!(result["symbols"][0]["name"], "needle");
+                } else {
+                    assert!(result["errors"].as_array().expect("errors").is_empty());
+                }
+            } else if name == workspace_discovery::SEARCH_TOOL_NAME {
+                assert_eq!(result["files"][0]["path"], "source.rs");
+            } else {
+                assert!(!result["results"].as_array().expect("results").is_empty());
+            }
+        }
     }
 
     #[test]

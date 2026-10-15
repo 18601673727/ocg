@@ -503,6 +503,7 @@ impl ToolHandler for WriteFile {
         Box::pin(async move {
             let (path, content, operation) = parse(&arguments)
                 .map_err(|refusal| ToolFailure::not_applied(refusal.to_string()))?;
+            let _mutation = workspace_read::WorkspaceMutation::begin();
             match operation {
                 Operation::Create => create(&self.workspace, path, content),
                 Operation::Update { expected } => update(&self.workspace, path, expected, content),
