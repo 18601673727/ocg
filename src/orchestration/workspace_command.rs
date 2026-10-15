@@ -589,9 +589,11 @@ impl ToolHandler for RunCommand {
             let stopping = StopOnDrop(control.clone());
             let (report, reported) = flume::bounded(1);
             let supervised = control.clone();
+            let mutation = workspace_read::WorkspaceMutation::begin();
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
+                    let _mutation = mutation;
                     report.send(supervise(invocation, &supervised)).ok();
                 })
                 .map_err(|_| Failure::from(Refusal::NotStarted))?;
@@ -685,19 +687,37 @@ pub(crate) fn code_tools_with(
     environment: CommandEnvironment,
     timeout: Duration,
 ) -> Result<ToolExecution, ToolRegistryError> {
+    code_tools_with_index(workspace, environment, timeout, fts_opted_in())
+}
+
+fn fts_opted_in() -> bool {
+    std::env::var_os(super::workspace_fts::EXPERIMENTAL_FTS_VARIABLE)
+        .is_some_and(|value| value == "1")
+}
+
+pub(crate) fn code_tools_with_index(
+    workspace: Workspace,
+    environment: CommandEnvironment,
+    timeout: Duration,
+    indexed: bool,
+) -> Result<ToolExecution, ToolRegistryError> {
     let registry = ToolRegistry::default();
     workspace_read::register(&registry, workspace.clone())?;
     workspace_write::register(&registry, workspace.clone())?;
     register(&registry, workspace.clone(), environment, timeout)?;
-    workspace_discovery::register(&registry, workspace)?;
-    let names = [
+    workspace_discovery::register(&registry, workspace.clone())?;
+    let mut names = vec![
         workspace_read::TOOL_NAME,
         workspace_write::TOOL_NAME,
         TOOL_NAME,
         workspace_discovery::LIST_TOOL_NAME,
         workspace_discovery::SEARCH_TOOL_NAME,
     ];
-    for name in names {
+    if indexed {
+        super::workspace_fts::register(&registry, workspace)?;
+        names.push(super::workspace_fts::TOOL_NAME);
+    }
+    for name in &names {
         registry.authorize(name)?;
     }
     Ok(ToolExecution {
@@ -884,6 +904,26 @@ mod tests {
             );
         }
         assert!(!setup.ran(), "nothing was started");
+    }
+
+    #[test]
+    fn a_command_invalidates_indexes_and_refresh_observes_indirect_writes() {
+        use crate::orchestration::workspace_fts::{FtsLimits, WorkspaceFts};
+        let setup = setup(
+            "command-index-dirty",
+            "printf 'changedneedle\\n' > source.rs",
+        );
+        std::fs::write(setup.root.join("source.rs"), "oldneedle\n").expect("source");
+        let workspace = Workspace::authorize(&setup.root, &setup.directory).expect("authorize");
+        let index = WorkspaceFts::new(workspace, FtsLimits::default());
+        index.build().expect("build");
+        run(setup.handler(Duration::from_secs(2)), test_command()).expect("command");
+        let stale = index.search("oldneedle", 10).expect("old snapshot");
+        assert_eq!(stale["index"]["freshness"], "known_dirty");
+        index.rebuild().expect("refresh");
+        let updated = index.search("changedneedle", 10).expect("updated");
+        assert_eq!(updated["results"].as_array().expect("results").len(), 1);
+        assert_eq!(updated["index"]["external_modifications"], "unverified");
     }
 
     #[test]

@@ -18842,6 +18842,60 @@ mod requests_and_tool_loop {
         }
 
         #[test]
+        fn indexed_search_records_the_real_handler_result_as_tool_evidence() {
+            use crate::orchestration::workspace_fts;
+            let (_files, root, _) = project("indexed-tool-evidence");
+            let (_root, directory) = data_directory("indexed-tool-evidence");
+            let worker = DatabaseWorker::start(&directory).expect("database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let tools = workspace_command::code_tools_with_index(
+                authorize(&root, &directory),
+                workspace_command::CommandEnvironment::of_process(),
+                std::time::Duration::from_secs(10),
+                true,
+            )
+            .expect("explicit opt-in");
+            let looped = run_agent(&handle, run, tools, "Find the timeout", |conversation| {
+                if conversation
+                    .messages
+                    .iter()
+                    .any(|message| message.tool_calls.is_some())
+                {
+                    let result = last_result(conversation);
+                    assert_eq!(result["index"]["external_modifications"], "unverified");
+                    assert!(!result["results"].as_array().expect("results").is_empty());
+                    answering("found the indexed timeout", (20, 5))
+                } else {
+                    calling(
+                        &[call(
+                            0,
+                            "call_fts",
+                            workspace_fts::TOOL_NAME,
+                            &json!({"query":"CONNECT_TIMEOUT_MS"}).to_string(),
+                        )],
+                        (20, 5),
+                    )
+                }
+            });
+            looped.settled.expect("settled");
+            let [record] = evidence(&handle, run.job).try_into().expect("one call");
+            assert_eq!(record.name, workspace_fts::TOOL_NAME);
+            let admission = record.admission().expect("admitted");
+            assert_eq!(admission.handler_version, "workspace_fts_search-2");
+            assert_eq!(admission.effect, ToolEffect::ReadOnly);
+            assert_eq!(admission.authorization, AuthorizationBasis::RegistryGrant);
+            let ToolOutcome::Completed { result } = outcome_of(&record).expect("outcome") else {
+                panic!("completed search");
+            };
+            assert_eq!(parsed(result.as_str()), last_result(&looped.sent[1]));
+            assert!(!record.is_unresolved());
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
         fn a_coding_agent_discovers_searches_and_reads_a_file_it_was_never_named() {
             let (_files, root, client) = project("discovery-agent");
             let (_root, directory) = data_directory("discovery-agent");

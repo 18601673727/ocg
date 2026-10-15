@@ -100,6 +100,56 @@ const PROTECTED_EXTENSIONS: &[&str] = &[
     "env", "jks", "kdbx", "key", "keystore", "p12", "pem", "pfx", "ppk",
 ];
 
+// Commands can execute arbitrary project code, including writes outside their
+// declared root. Conservatively invalidate every local snapshot for any OCG
+// workspace mutation, and keep it dirty for the entire operation's lifetime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct MutationStamp {
+    revision: u128,
+    active: usize,
+}
+
+static MUTATIONS: std::sync::Mutex<MutationStamp> = std::sync::Mutex::new(MutationStamp {
+    revision: 0,
+    active: 0,
+});
+
+pub(super) fn mutation_stamp() -> MutationStamp {
+    *MUTATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl MutationStamp {
+    pub(super) fn is_dirty(self) -> bool {
+        let current = mutation_stamp();
+        self.active != 0 || current.active != 0 || self.revision != current.revision
+    }
+}
+
+pub(super) struct WorkspaceMutation;
+
+impl WorkspaceMutation {
+    pub(super) fn begin() -> Self {
+        let mut state = MUTATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.revision += 1;
+        state.active += 1;
+        Self
+    }
+}
+
+impl Drop for WorkspaceMutation {
+    fn drop(&mut self) {
+        let mut state = MUTATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.revision += 1;
+        state.active -= 1;
+    }
+}
+
 /// A directory's identity, which a later open can be compared against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Identity {
