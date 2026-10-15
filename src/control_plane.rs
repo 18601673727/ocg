@@ -44,6 +44,11 @@
 //! - `GET /api/v1/jobs/{job}/outputs?after_seq=N&limit=M`: the Job's
 //!   outputs as stored, in `seq` order, strictly after `after_seq`, at most
 //!   `limit` ([`MAX_OUTPUT_PAGE`]) of them, with the cursor of the next page.
+//! - `GET /api/v1/jobs/{job}/events`: the same outputs as Server-Sent
+//!   Events, those stored strictly after the cursor the request names with
+//!   `Last-Event-ID` or `?after_seq=N`, then each one as it is stored, then
+//!   how the Job settled. A browser's `EventSource` cannot send the token;
+//!   a client reads it with an authenticated `fetch`. See [`events`].
 //! - `POST /api/v1/jobs`: submits one Provider Job, under the request's one
 //!   `Idempotency-Key`, of `{"llm_profile": "profile:<n>", "executor":
 //!   "executor:<n>", "objective": "...", "name": "..."}`, `name` optional:
@@ -70,6 +75,7 @@
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aws_lc_rs::constant_time::verify_slices_are_equal;
@@ -87,8 +93,11 @@ use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::orchestration::execution_runtime::SchedulerHandle;
 use crate::persistence::{ExecutionMode, JobId, JobOutputRecord, JobRecord, OutputKind};
 
+mod events;
 mod submissions;
 
+#[cfg(test)]
+pub(crate) use events::events_seam;
 #[cfg(test)]
 pub(crate) use submissions::resolution_seam;
 
@@ -176,6 +185,8 @@ pub struct ControlPlaneConfig {
     response_bytes: usize,
     /// How long a submission waits for its admission.
     admission_wait: Duration,
+    /// The bounds of event streams.
+    stream_limits: events::StreamLimits,
 }
 
 impl ControlPlaneConfig {
@@ -239,6 +250,7 @@ impl ControlPlaneConfig {
             token: Token(token.into()),
             response_bytes: RESPONSE_BYTES,
             admission_wait: ADMISSION_WAIT,
+            stream_limits: events::StreamLimits::default(),
         })
     }
 
@@ -256,6 +268,28 @@ impl ControlPlaneConfig {
     #[cfg(test)]
     pub(crate) fn with_admission_wait(mut self, wait: Duration) -> Self {
         self.admission_wait = wait;
+        self
+    }
+
+    /// At most `streams` event streams, each reading again every `poll`,
+    /// silent at most `heartbeat`, disconnected once its client took
+    /// nothing for `stall`, and lasting at most `lifetime`.
+    #[cfg(test)]
+    pub(crate) fn with_streams(
+        mut self,
+        streams: usize,
+        poll: Duration,
+        heartbeat: Duration,
+        stall: Duration,
+        lifetime: Duration,
+    ) -> Self {
+        self.stream_limits = events::StreamLimits {
+            streams,
+            poll,
+            heartbeat,
+            stall,
+            lifetime,
+        };
         self
     }
 }
@@ -285,7 +319,6 @@ pub struct ControlPlane {
     address: SocketAddr,
     server: Server,
     thread: std::thread::JoinHandle<()>,
-    #[cfg(test)]
     shared: Arc<Shared>,
 }
 
@@ -316,8 +349,12 @@ impl ControlPlane {
             port: address.port(),
             response_bytes: config.response_bytes,
             admission_wait: config.admission_wait,
+            stream_limits: config.stream_limits,
+            streams: AtomicUsize::new(0),
+            closing: AtomicBool::new(false),
+            #[cfg(test)]
+            fetched: AtomicUsize::new(0),
         });
-        #[cfg(test)]
         let kept = shared.clone();
         let (started, starting) = flume::bounded(1);
         let thread = std::thread::Builder::new()
@@ -377,7 +414,6 @@ impl ControlPlane {
             address,
             server,
             thread,
-            #[cfg(test)]
             shared: kept,
         })
     }
@@ -397,16 +433,37 @@ impl ControlPlane {
         )
     }
 
+    /// How many event streams are open, and how many outputs they have
+    /// read in all.
+    #[cfg(test)]
+    pub(crate) fn streams(&self) -> (usize, usize) {
+        (
+            self.shared.streams.load(Ordering::SeqCst),
+            self.shared.fetched.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Counts what still holds the listener's shared state, the database
+    /// handle among it, after the listener is gone.
+    #[cfg(test)]
+    pub(crate) fn holders(&self) -> impl Fn() -> usize + Send + 'static {
+        let shared = Arc::downgrade(&self.shared);
+        move || shared.strong_count()
+    }
+
     /// Stops accepting, lets requests in flight finish within a bounded
     /// time, then closes them and the listening socket, and joins the
-    /// listener's thread. Admissions still running are dropped with it:
-    /// none of them owns its Job, which the execution runtime settles or
-    /// refuses as it stops, and whose record a later lookup reads.
+    /// listener's thread. Event streams end at their next read, without a
+    /// settlement, for their clients to resume. Admissions still running
+    /// are dropped with it: none of them owns its Job, which the execution
+    /// runtime settles or refuses as it stops, and whose record a later
+    /// lookup reads.
     ///
     /// # Errors
     ///
     /// Returns [`StopError::Panicked`] when the listener's thread panicked.
     pub async fn stop(self) -> Result<(), StopError> {
+        self.shared.closing.store(true, Ordering::SeqCst);
         self.server.stop(true).await;
         self.thread.join().map_err(|_| StopError::Panicked)
     }
@@ -421,6 +478,13 @@ struct Shared {
     port: u16,
     response_bytes: usize,
     admission_wait: Duration,
+    stream_limits: events::StreamLimits,
+    /// How many event streams are open.
+    streams: AtomicUsize,
+    /// Set once the listener stops.
+    closing: AtomicBool,
+    #[cfg(test)]
+    fetched: AtomicUsize,
 }
 
 /// A refused or failed request: its status and a fixed code and message.
@@ -606,6 +670,11 @@ async fn answer(
     shared: web::types::State<Arc<Shared>>,
 ) -> HttpResponse {
     match admit(&request, &shared).and_then(|()| route(&request)) {
+        Ok(Route::Events { job, after_seq }) => {
+            events::open(&shared, request.io().cloned(), job, after_seq)
+                .await
+                .unwrap_or_else(|refusal| refusal.response())
+        }
         Ok(route) => match respond(route, &request, payload, &shared).await {
             Ok(reply) => json_response(reply.status, &reply.body),
             Err(refusal) => refusal.response(),
@@ -775,6 +844,10 @@ enum Route {
         after_seq: Option<i64>,
         limit: usize,
     },
+    Events {
+        job: JobId,
+        after_seq: Option<i64>,
+    },
     Submit,
     Admission,
     Stop(JobId),
@@ -813,6 +886,11 @@ fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 after_seq,
                 limit,
             })
+        }
+        ["jobs", job, "events"] => {
+            let job = job_id(job)?;
+            let after_seq = events::cursor(query, request.headers())?;
+            Ok(Route::Events { job, after_seq })
         }
         _ => Err(NOT_FOUND),
     }
@@ -898,6 +976,8 @@ async fn respond(
             submissions::lookup(shared, key).await
         }
         Route::Stop(job) => submissions::stop(shared, job).await,
+        // Answered as a stream, before any reply.
+        Route::Events { .. } => Err(INTERNAL),
     }
 }
 
@@ -927,10 +1007,9 @@ fn micros(timestamp: Option<crate::persistence::Timestamp>) -> Value {
     timestamp.map_or(Value::Null, |timestamp| json!(timestamp.as_unix_micros()))
 }
 
-/// The Job's lifecycle as recorded: its settlement is the one outcome its
-/// record holds, or none yet; a record holding more than one is not
-/// described at all.
-fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
+/// The Job's settlement: the one outcome its record holds, or none yet; a
+/// record holding more than one is not described at all.
+fn settlement_json(record: &JobRecord) -> Result<Value, Refusal> {
     let outcomes = [
         ("completed", record.completed_at),
         ("failed", record.failed_at),
@@ -940,11 +1019,16 @@ fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
     .into_iter()
     .filter_map(|(state, at)| at.map(|at| (state, at)))
     .collect::<Vec<_>>();
-    let settlement = match outcomes.as_slice() {
-        [] => json!({"state": "unsettled", "settled_at_us": null}),
-        [(state, at)] => json!({"state": state, "settled_at_us": at.as_unix_micros()}),
-        _ => return Err(INCONSISTENT_RECORD),
-    };
+    match outcomes.as_slice() {
+        [] => Ok(json!({"state": "unsettled", "settled_at_us": null})),
+        [(state, at)] => Ok(json!({"state": state, "settled_at_us": at.as_unix_micros()})),
+        _ => Err(INCONSISTENT_RECORD),
+    }
+}
+
+/// The Job's lifecycle as recorded, with its [`settlement_json`].
+fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
+    let settlement = settlement_json(record)?;
     let execution_mode = match record.execution_mode {
         ExecutionMode::Once => "once",
         ExecutionMode::Continuous => "continuous",

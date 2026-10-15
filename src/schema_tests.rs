@@ -21392,6 +21392,1135 @@ mod requests_and_tool_loop {
         }
     }
 
+    // ---- Control Plane event streams --------------------------------------
+
+    mod control_plane_events {
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        use std::time::Instant;
+
+        use super::*;
+        use crate::control_plane::events_seam::{self, Point};
+        use crate::control_plane::{ControlPlane, ControlPlaneConfig};
+        use crate::orchestration::execution_runtime::provider_seam::{self, Response};
+        use crate::persistence::{IntermediateOutputKind, NewJobOutput};
+
+        const TOKEN: &str = "C3-Event-Stream-Token_0123456789.abcdefghij~";
+
+        /// Limits small enough to observe: 4 streams, read every 10 ms,
+        /// silent at most 100 ms, a 2 s stall and a 60 s lifetime.
+        fn config() -> ControlPlaneConfig {
+            limited(Duration::from_secs(2), Duration::from_secs(60))
+        }
+
+        fn limited(stall: Duration, lifetime: Duration) -> ControlPlaneConfig {
+            ControlPlaneConfig::new(0, TOKEN)
+                .expect("a valid configuration")
+                .with_streams(
+                    4,
+                    Duration::from_millis(10),
+                    Duration::from_millis(100),
+                    stall,
+                    lifetime,
+                )
+        }
+
+        /// The real database, execution runtime and listener, started and
+        /// stopped as the host starts and stops them.
+        struct Running {
+            worker: DatabaseWorker,
+            handle: DatabaseHandle,
+            runtime: ExecutionRuntime,
+            control: ControlPlane,
+        }
+
+        impl Running {
+            fn start(directory: &DataDirectory, config: ControlPlaneConfig) -> Self {
+                let worker =
+                    DatabaseWorker::start_with_config(directory, lenient()).expect("start");
+                let handle = worker.handle();
+                let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+                let control = ControlPlane::start(config, handle.clone(), runtime.scheduler())
+                    .expect("start listener");
+                Self {
+                    worker,
+                    handle,
+                    runtime,
+                    control,
+                }
+            }
+
+            fn address(&self) -> SocketAddr {
+                self.control.address()
+            }
+
+            fn open_streams(&self) -> usize {
+                self.control.streams().0
+            }
+
+            fn stop(self) {
+                wait(self.control.stop()).expect("stop the listener");
+                self.runtime.shutdown().expect("shutdown runtime");
+                self.worker.shutdown().expect("shutdown");
+            }
+        }
+
+        /// One SSE event, or a comment.
+        #[derive(Clone, Debug, Default, PartialEq)]
+        struct Event {
+            id: Option<String>,
+            name: Option<String>,
+            data: Option<String>,
+            comment: Option<String>,
+        }
+
+        impl Event {
+            fn json(&self) -> Value {
+                serde_json::from_str(self.data.as_deref().expect("data"))
+                    .unwrap_or_else(|_| panic!("JSON data: {self:?}"))
+            }
+
+            fn name(&self) -> &str {
+                self.name.as_deref().unwrap_or("")
+            }
+
+            /// An output event's output, checked against its envelope.
+            fn output(&self, job: JobId) -> Value {
+                assert_eq!(self.name(), "output", "{self:?}");
+                let data = self.json();
+                assert_eq!(data["api_version"], 1);
+                assert_eq!(data["job"], job.to_string());
+                let output = data["output"].clone();
+                assert_eq!(
+                    self.id.as_deref(),
+                    Some(output["seq"].to_string().as_str()),
+                    "its id is its stored seq"
+                );
+                output
+            }
+
+            fn settlement(&self, job: JobId) -> Value {
+                assert_eq!(self.name(), "settlement", "{self:?}");
+                assert_eq!(self.id, None);
+                let data = self.json();
+                assert_eq!(data["job"], job.to_string());
+                data
+            }
+
+            fn job(&self) -> Value {
+                assert_eq!(self.name(), "job", "{self:?}");
+                assert_eq!(self.id, None);
+                self.json()["job"].clone()
+            }
+        }
+
+        /// A response read as it arrives: an event stream, or the whole of
+        /// any other answer.
+        struct Stream {
+            status: u16,
+            headers: BTreeMap<String, String>,
+            reader: BufReader<TcpStream>,
+            /// Decoded bytes not yet parsed into events.
+            text: Vec<u8>,
+            /// Every decoded byte, for what must never be sent.
+            raw: Vec<u8>,
+            ended: bool,
+        }
+
+        fn stream_with(address: SocketAddr, line: &str, headers: &[(&str, &str)]) -> Stream {
+            let connection = TcpStream::connect(address).expect("connect");
+            connection
+                .set_read_timeout(Some(crate::test_support::WAIT))
+                .expect("timeout");
+            let mut request = format!("{line} HTTP/1.1\r\n");
+            for (name, value) in headers {
+                request.push_str(&format!("{name}: {value}\r\n"));
+            }
+            request.push_str("Connection: close\r\n\r\n");
+            (&connection).write_all(request.as_bytes()).expect("send");
+            let mut reader = BufReader::new(connection);
+            let mut status_line = String::new();
+            reader.read_line(&mut status_line).expect("a status line");
+            let status = status_line
+                .split(' ')
+                .nth(1)
+                .and_then(|code| code.parse().ok())
+                .unwrap_or_else(|| panic!("a status: {status_line:?}"));
+            let mut headers = BTreeMap::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("a header");
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                let (name, value) = line.split_once(": ").expect("a header");
+                headers.insert(name.to_ascii_lowercase(), value.to_owned());
+            }
+            Stream {
+                status,
+                headers,
+                reader,
+                text: Vec::new(),
+                raw: Vec::new(),
+                ended: false,
+            }
+        }
+
+        fn authorized(address: SocketAddr) -> (String, String) {
+            (
+                format!("127.0.0.1:{}", address.port()),
+                format!("Bearer {TOKEN}"),
+            )
+        }
+
+        /// A well-behaved client's stream of `job`'s events, after `last`
+        /// by `Last-Event-ID` when given.
+        fn events(address: SocketAddr, job: JobId, last: Option<i64>) -> Stream {
+            let (host, bearer) = authorized(address);
+            let last = last.map(|seq| seq.to_string());
+            let mut headers = vec![("Host", host.as_str()), ("Authorization", bearer.as_str())];
+            if let Some(last) = &last {
+                headers.push(("Last-Event-ID", last));
+            }
+            let stream = stream_with(address, &format!("GET /api/v1/jobs/{job}/events"), &headers);
+            assert_eq!(stream.status, 200, "{:?}", stream.headers);
+            stream
+        }
+
+        /// The same, with the cursor in the query.
+        fn events_after(address: SocketAddr, job: JobId, after_seq: i64) -> Stream {
+            let (host, bearer) = authorized(address);
+            let stream = stream_with(
+                address,
+                &format!("GET /api/v1/jobs/{job}/events?after_seq={after_seq}"),
+                &[("Host", &host), ("Authorization", &bearer)],
+            );
+            assert_eq!(stream.status, 200, "{:?}", stream.headers);
+            stream
+        }
+
+        impl Stream {
+            /// Decodes the next chunk; false at the end of the body.
+            fn chunk(&mut self) -> bool {
+                if self.ended {
+                    return false;
+                }
+                let mut size = Vec::new();
+                if self
+                    .reader
+                    .read_until(b'\n', &mut size)
+                    .expect("a chunk size")
+                    == 0
+                {
+                    self.ended = true;
+                    return false;
+                }
+                let size = std::str::from_utf8(&size)
+                    .ok()
+                    .and_then(|size| usize::from_str_radix(size.trim_end(), 16).ok())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "a chunk size: {:?}",
+                            String::from_utf8_lossy(&size[..size.len().min(200)])
+                        )
+                    });
+                let mut chunk = vec![0; size + 2];
+                self.reader.read_exact(&mut chunk).expect("a chunk");
+                assert_eq!(&chunk[size..], b"\r\n");
+                chunk.truncate(size);
+                if size == 0 {
+                    self.ended = true;
+                    return false;
+                }
+                self.raw.extend_from_slice(&chunk);
+                self.text.extend_from_slice(&chunk);
+                true
+            }
+
+            /// The next event or comment, `None` at the end of the stream.
+            fn next_any(&mut self) -> Option<Event> {
+                loop {
+                    if let Some(end) = self.text.windows(2).position(|pair| pair == b"\n\n") {
+                        let block = self.text.drain(..end + 2).collect::<Vec<_>>();
+                        let block = String::from_utf8(block).expect("UTF-8 events");
+                        let mut event = Event::default();
+                        for line in block.trim_end_matches('\n').split('\n') {
+                            if let Some(comment) = line.strip_prefix(':') {
+                                event.comment = Some(comment.trim().to_owned());
+                                continue;
+                            }
+                            let (field, value) = line.split_once(": ").expect("a field");
+                            let slot = match field {
+                                "id" => &mut event.id,
+                                "event" => &mut event.name,
+                                "data" => &mut event.data,
+                                _ => panic!("an unexpected field {field:?}"),
+                            };
+                            assert!(slot.is_none(), "{field} once per event");
+                            *slot = Some(value.to_owned());
+                        }
+                        return Some(event);
+                    }
+                    if !self.chunk() {
+                        assert!(self.text.is_empty(), "no partial event");
+                        return None;
+                    }
+                }
+            }
+
+            /// The next event, past heartbeats; `None` at the end.
+            fn next(&mut self) -> Option<Event> {
+                loop {
+                    let event = self.next_any()?;
+                    if event.comment.is_none() {
+                        return Some(event);
+                    }
+                    assert_eq!(event.comment.as_deref(), Some("heartbeat"));
+                    assert_eq!((&event.id, &event.name, &event.data), (&None, &None, &None));
+                }
+            }
+
+            fn event(&mut self) -> Event {
+                self.next().expect("an event")
+            }
+
+            /// Every event left, to the end of the stream.
+            fn rest(&mut self) -> Vec<Event> {
+                std::iter::from_fn(|| self.next()).collect()
+            }
+
+            /// The body of a response that is not a stream.
+            fn answer(mut self) -> Value {
+                let mut body = Vec::new();
+                self.reader.read_to_end(&mut body).expect("read");
+                serde_json::from_slice(&body).expect("a JSON body")
+            }
+
+            fn error(self) -> (u16, String) {
+                let status = self.status;
+                let body = self.answer();
+                (
+                    status,
+                    body["error"]["code"].as_str().expect("a code").to_owned(),
+                )
+            }
+        }
+
+        fn get(address: SocketAddr, path: &str) -> Value {
+            let (host, bearer) = authorized(address);
+            let response = stream_with(
+                address,
+                &format!("GET {path}"),
+                &[("Host", &host), ("Authorization", &bearer)],
+            );
+            assert_eq!(response.status, 200, "{path}");
+            response.answer()
+        }
+
+        /// The Job's outputs as the outputs route serves them.
+        fn stored(address: SocketAddr, job: JobId) -> Vec<Value> {
+            get(address, &format!("/api/v1/jobs/{job}/outputs?limit=100"))["outputs"]
+                .as_array()
+                .expect("outputs")
+                .clone()
+        }
+
+        fn until(mut condition: impl FnMut() -> bool) {
+            let deadline = Instant::now() + crate::test_support::WAIT;
+            while !condition() {
+                assert!(Instant::now() < deadline, "not reached in time");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn progress(handle: &DatabaseHandle, job: JobId, text: &str) -> i64 {
+            wait(handle.append_job_output(
+                job,
+                NewJobOutput {
+                    kind: IntermediateOutputKind::Progress,
+                    summary: Some(text.to_owned()),
+                    code: None,
+                    goal_reached: None,
+                    value: None,
+                },
+            ))
+            .expect("append an output")
+            .seq
+        }
+
+        /// A Job this test runs by hand: started locally, no Provider.
+        fn running_job(handle: &DatabaseHandle) -> JobId {
+            let (_provider, llm) = llm_setup(handle, "c3-model");
+            let job = llm_job(handle, llm);
+            wait(handle.start_local_job(job)).expect("start");
+            job
+        }
+
+        fn record(handle: &DatabaseHandle, job: JobId) -> JobRecord {
+            wait(handle.job(job)).expect("read").expect("a Job")
+        }
+
+        fn seqs(outputs: &[Value]) -> Vec<i64> {
+            outputs
+                .iter()
+                .map(|output| output["seq"].as_i64().expect("a seq"))
+                .collect()
+        }
+
+        #[test]
+        fn a_jobs_history_is_replayed_as_stored_then_its_settlement() {
+            let (_root, directory) = data_directory("c3-replay");
+            let running = Running::start(&directory, config());
+            let handle = running.handle.clone();
+            let address = running.address();
+            let job = running_job(&handle);
+            for index in 0..5 {
+                progress(
+                    &handle,
+                    job,
+                    &format!("part {index}\n\"quoted\" ünïcødé\n\ndata: x"),
+                );
+            }
+            wait(handle.finalize_job(job, JobFinalization::Completed(result("final\nanswer"))))
+                .expect("complete");
+            let expected = stored(address, job);
+            assert_eq!(expected.len(), 6);
+
+            let mut stream = events(address, job, None);
+            assert_eq!(
+                stream.headers.get("content-type").map(String::as_str),
+                Some("text/event-stream; charset=utf-8")
+            );
+            assert_eq!(
+                stream.headers.get("cache-control").map(String::as_str),
+                Some("no-store")
+            );
+            assert_eq!(
+                stream
+                    .headers
+                    .get("x-content-type-options")
+                    .map(String::as_str),
+                Some("nosniff")
+            );
+            assert!(!stream.headers.contains_key("content-length"));
+            assert!(!stream.headers.contains_key("content-encoding"));
+            assert!(!stream.headers.contains_key("set-cookie"));
+            assert!(
+                !stream
+                    .headers
+                    .keys()
+                    .any(|name| name.starts_with("access-control-"))
+            );
+            // A snapshot of the record, then each stored output exactly as
+            // the outputs route serves it, numbered by its seq, then how
+            // the Job settled, and the end.
+            let snapshot = stream.event().job();
+            assert_eq!(
+                snapshot,
+                get(address, &format!("/api/v1/jobs/{job}"))["job"]
+            );
+            for output in &expected {
+                assert_eq!(&stream.event().output(job), output);
+            }
+            let settled = record(&handle, job);
+            let settlement = stream.event().settlement(job);
+            assert_eq!(
+                settlement,
+                json!({
+                    "api_version": 1,
+                    "job": job.to_string(),
+                    "settlement": {
+                        "state": "completed",
+                        "settled_at_us": settled.completed_at.expect("completed").as_unix_micros(),
+                    },
+                    "stop_confirmed_at_us": null,
+                })
+            );
+            assert_eq!(stream.next(), None, "nothing follows the settlement");
+            assert_eq!(seqs(&expected), (1..=6).collect::<Vec<_>>());
+            assert_eq!(expected[5]["kind"], "result");
+            assert!(!String::from_utf8_lossy(&stream.raw).contains(TOKEN));
+            until(|| running.open_streams() == 0);
+
+            // A cursor past every output fabricates nothing, and changes
+            // nothing: the record, then the settlement.
+            let before = record(&handle, job);
+            let mut beyond = events(address, job, Some(1_000));
+            assert_eq!(beyond.event().name(), "job");
+            assert_eq!(beyond.event().name(), "settlement");
+            assert_eq!(beyond.next(), None);
+            assert_eq!(record(&handle, job), before);
+            assert_eq!(stored(address, job), expected);
+            running.stop();
+        }
+
+        #[test]
+        fn outputs_stored_while_a_client_listens_reach_it_on_the_same_stream() {
+            let (_root, directory) = data_directory("c3-live");
+            let running = Running::start(&directory, config());
+            let handle = running.handle.clone();
+            let address = running.address();
+
+            // Outputs stored by hand, one by one, while the stream is open.
+            let job = running_job(&handle);
+            progress(&handle, job, "before");
+            let mut stream = events(address, job, None);
+            assert_eq!(stream.event().job()["settlement"]["state"], "unsettled");
+            assert_eq!(stream.event().output(job)["summary"], "before");
+            for text in ["first live", "second live"] {
+                let seq = progress(&handle, job, text);
+                let output = stream.event().output(job);
+                assert_eq!(
+                    (output["seq"].as_i64(), &output["summary"]),
+                    (Some(seq), &json!(text))
+                );
+            }
+            wait(handle.finalize_job(job, JobFinalization::Failed(result("gave up"))))
+                .expect("fail");
+            let output = stream.event().output(job);
+            assert_eq!(
+                (&output["kind"], &output["summary"]),
+                (&json!("result"), &json!("gave up"))
+            );
+            assert_eq!(
+                stream.event().settlement(job)["settlement"]["state"],
+                "failed"
+            );
+            assert_eq!(stream.next(), None);
+            assert_eq!(seqs(&stored(address, job)), vec![1, 2, 3, 4]);
+
+            // A Job admitted over HTTP and run by the execution runtime: its
+            // Provider answers only once the stream is open.
+            let (open, gate) = flume::bounded(1);
+            let target = submissions_target(
+                &handle,
+                "c3-live",
+                vec![Response {
+                    gate: Some(gate),
+                    steps: answering("streamed answer", (4, 2)),
+                }],
+            );
+            let job = admit(address, "c3-live-key-000000001", &target);
+            let mut stream = events(address, job, None);
+            assert_eq!(stream.event().job()["settlement"]["state"], "unsettled");
+            open.send(()).expect("let the Provider answer");
+            let mut delivered = Vec::new();
+            let settlement = loop {
+                let event = stream.event();
+                if event.name() == "settlement" {
+                    break event.settlement(job);
+                }
+                if event.name() == "output" {
+                    delivered.push(event.output(job));
+                }
+            };
+            assert_eq!(settlement["settlement"]["state"], "completed");
+            assert_eq!(
+                delivered,
+                stored(address, job),
+                "every output, live, in order"
+            );
+            assert_eq!(delivered.last().expect("a result")["kind"], "result");
+            assert_eq!(
+                delivered.last().expect("a result")["summary"],
+                "streamed answer"
+            );
+            assert_eq!(stream.next(), None);
+            running.stop();
+        }
+
+        /// An LLM Profile on a Provider scripted by the test, and an
+        /// Executor that runs it.
+        fn submissions_target(
+            handle: &DatabaseHandle,
+            name: &str,
+            responses: Vec<Response>,
+        ) -> (ProfileId, ExecutorId) {
+            let provider = provider(handle, name);
+            let llm = llm_profile(handle, provider, llm_config(name, &[ModelCapability::Chat]));
+            let executor =
+                executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+            let mut responses = responses.into_iter();
+            provider_seam::install(&format!("https://{name}.invalid/v1"), move |_| {
+                responses
+                    .next()
+                    .expect("a scripted response for every request")
+            });
+            (llm, executor)
+        }
+
+        /// Submits a Job to `target` under `key` and returns it.
+        fn admit(
+            address: SocketAddr,
+            key: &str,
+            (llm, executor): &(ProfileId, ExecutorId),
+        ) -> JobId {
+            let body = json!({
+                "llm_profile": llm.to_string(),
+                "executor": executor.to_string(),
+                "objective": "Say something",
+                "name": key,
+            })
+            .to_string();
+            let (host, bearer) = authorized(address);
+            let length = body.len().to_string();
+            let mut connection = TcpStream::connect(address).expect("connect");
+            connection
+                .set_read_timeout(Some(crate::test_support::WAIT))
+                .expect("timeout");
+            write!(
+                connection,
+                "POST /api/v1/jobs HTTP/1.1\r\nHost: {host}\r\nAuthorization: {bearer}\r\n\
+                 Idempotency-Key: {key}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {length}\r\nConnection: close\r\n\r\n{body}"
+            )
+            .expect("send");
+            let mut raw = String::new();
+            connection.read_to_string(&mut raw).expect("read");
+            let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+            assert!(head.starts_with("HTTP/1.1 201"), "{raw}");
+            let answer: Value = serde_json::from_str(body).expect("JSON");
+            let job = answer["admission"]["job"].as_str().expect("a Job");
+            JobId::new(job["job:".len()..].parse().expect("a number"))
+        }
+
+        #[test]
+        fn a_client_resumes_after_the_last_output_it_processed() {
+            let (_root, directory) = data_directory("c3-resume");
+            let running = Running::start(&directory, config());
+            let handle = running.handle.clone();
+            let address = running.address();
+            let job = running_job(&handle);
+            for text in ["one", "two", "three"] {
+                progress(&handle, job, text);
+            }
+            let mut stream = events(address, job, None);
+            stream.event().job();
+            let processed = (0..3)
+                .map(|_| stream.event().output(job)["seq"].as_i64().expect("a seq"))
+                .collect::<Vec<_>>();
+            assert_eq!(processed, vec![1, 2, 3]);
+            drop(stream);
+            until(|| running.open_streams() == 0);
+            // Disconnecting changed nothing about the Job.
+            let unchanged = record(&handle, job);
+            assert!(unchanged.started_at.is_some() && unchanged.unknown_at.is_none());
+
+            for text in ["four", "five"] {
+                progress(&handle, job, text);
+            }
+            let mut resumed = events(address, job, Some(3));
+            resumed.event().job();
+            assert_eq!(resumed.event().output(job)["summary"], "four");
+            assert_eq!(resumed.event().output(job)["summary"], "five");
+            drop(resumed);
+
+            progress(&handle, job, "six");
+            let mut queried = events_after(address, job, 5);
+            queried.event().job();
+            assert_eq!(queried.event().output(job)["summary"], "six");
+            wait(handle.finalize_job(job, JobFinalization::Cancelled(result("cancelled"))))
+                .expect("cancel");
+            let output = queried.event().output(job);
+            assert_eq!(
+                (output["seq"].as_i64(), &output["kind"]),
+                (Some(7), &json!("result"))
+            );
+            assert_eq!(
+                queried.event().settlement(job)["settlement"]["state"],
+                "cancelled"
+            );
+            assert_eq!(queried.next(), None);
+            // A settled Job is replayed from the record alone, from any point.
+            let mut tail = events_after(address, job, 6);
+            tail.event().job();
+            assert_eq!(tail.event().output(job)["seq"], 7);
+            assert_eq!(tail.event().name(), "settlement");
+
+            // A client that leaves while the Provider has not answered
+            // leaves the Job running to its end.
+            let (open, gate) = flume::bounded(1);
+            let target = submissions_target(
+                &handle,
+                "c3-resume",
+                vec![Response {
+                    gate: Some(gate),
+                    steps: answering("after you left", (4, 2)),
+                }],
+            );
+            let admitted = admit(address, "c3-resume-key-0000001", &target);
+            let mut left = events(address, admitted, None);
+            left.event().job();
+            drop(left);
+            until(|| running.open_streams() == 0);
+            open.send(()).expect("let the Provider answer");
+            until(|| record(&handle, admitted).completed_at.is_some());
+            let all = stored(address, admitted);
+            let mut back = events(address, admitted, Some(0));
+            back.event().job();
+            let replayed = std::iter::from_fn(|| {
+                let event = back.event();
+                (event.name() == "output").then(|| event.output(admitted))
+            })
+            .collect::<Vec<_>>();
+            assert_eq!(replayed, all);
+            assert_eq!(all.last().expect("a result")["summary"], "after you left");
+            running.stop();
+        }
+
+        #[test]
+        fn pages_are_crossed_in_order_and_a_resume_at_a_page_boundary_skips_nothing() {
+            let (_root, directory) = data_directory("c3-pages");
+            let running = Running::start(&directory, config());
+            let handle = running.handle.clone();
+            let address = running.address();
+            let job = running_job(&handle);
+            for index in 1..=40 {
+                progress(&handle, job, &format!("output {index}"));
+            }
+            wait(handle.finalize_job(job, JobFinalization::Completed(result("done"))))
+                .expect("complete");
+            // A stream reads 16 outputs at a time.
+            for (after, first) in [(None, 1), (Some(16), 17), (Some(32), 33), (Some(40), 41)] {
+                let mut stream = events(address, job, after);
+                stream.event().job();
+                let rest = stream.rest();
+                let (settlement, outputs) = rest.split_last().expect("events");
+                settlement.settlement(job);
+                let outputs = outputs
+                    .iter()
+                    .map(|event| event.output(job)["seq"].as_i64().expect("a seq"))
+                    .collect::<Vec<_>>();
+                assert_eq!(outputs, (first..=41).collect::<Vec<_>>(), "after {after:?}");
+            }
+            running.stop();
+        }
+
+        #[test]
+        fn a_settlement_committed_between_reads_follows_every_output() {
+            let (_root, directory) = data_directory("c3-race");
+            let running = Running::start(&directory, config());
+            let handle = running.handle.clone();
+            let address = running.address();
+            // The stream has read every output and is about to look at the
+            // Job again, or has read the Job and is about to read its
+            // outputs, when the Job's final result is committed.
+            for point in [Point::OutputsRead, Point::RecordRead] {
+                let job = running_job(&handle);
+                progress(&handle, job, "early");
+                let (reached, release) = events_seam::hold(address.port(), job, point);
+                let mut stream = events(address, job, None);
+                stream.event().job();
+                assert_eq!(stream.event().output(job)["summary"], "early");
+                reached
+                    .recv_timeout(crate::test_support::WAIT)
+                    .expect("the stream holds between its reads");
+                wait(handle.finalize_job(job, JobFinalization::Completed(result("the end"))))
+                    .expect("complete");
+                release.send(()).expect("release");
+                let output = stream.event().output(job);
+                assert_eq!(
+                    (&output["kind"], &output["summary"]),
+                    (&json!("result"), &json!("the end")),
+                    "{point:?}"
+                );
+                assert_eq!(
+                    stream.event().settlement(job)["settlement"]["state"],
+                    "completed"
+                );
+                assert_eq!(stream.next(), None);
+            }
+            running.stop();
+        }
+
+        #[test]
+        fn a_settlement_is_announced_only_as_the_record_concludes_it() {
+            let (_root, directory) = data_directory("c3-settlements");
+            let running = Running::start(&directory, config());
+            let handle = running.handle.clone();
+            let address = running.address();
+
+            // Unknown, its local execution confirmed stopped: concluded,
+            // with no result it never had.
+            let confirmed = running_job(&handle);
+            progress(&handle, confirmed, "partial");
+            wait(handle.finalize_job(confirmed, JobFinalization::Unknown)).expect("unknown");
+            wait(handle.confirm_job_stopped(confirmed)).expect("confirm");
+            let mut stream = events(address, confirmed, None);
+            stream.event().job();
+            assert_eq!(stream.event().output(confirmed)["kind"], "progress");
+            let settlement = stream.event().settlement(confirmed);
+            let settled = record(&handle, confirmed);
+            assert_eq!(settlement["settlement"]["state"], "unknown");
+            assert_eq!(
+                settlement["stop_confirmed_at_us"],
+                settled
+                    .stop_confirmed_at
+                    .expect("confirmed")
+                    .as_unix_micros()
+            );
+            assert_eq!(stream.next(), None);
+
+            // Unknown, its stop not confirmed: its outputs are all there,
+            // but the stream does not say it ended; once the stop is
+            // confirmed, it does.
+            let unconfirmed = running_job(&handle);
+            progress(&handle, unconfirmed, "partial");
+            let mut stream = events(address, unconfirmed, None);
+            assert_eq!(stream.event().job()["settlement"]["state"], "unsettled");
+            stream.event().output(unconfirmed);
+            wait(handle.finalize_job(unconfirmed, JobFinalization::Unknown)).expect("unknown");
+            let observed = stream.event().job();
+            assert_eq!(observed["settlement"]["state"], "unknown");
+            assert_eq!(observed["stop_confirmed_at_us"], Value::Null);
+            // Heartbeats only, while the stop is not confirmed.
+            let mut heartbeats = 0;
+            while heartbeats < 3 {
+                let event = stream.next_any().expect("the stream stays open");
+                assert_eq!(event.comment.as_deref(), Some("heartbeat"), "{event:?}");
+                heartbeats += 1;
+            }
+            wait(handle.confirm_job_stopped(unconfirmed)).expect("confirm");
+            let settlement = stream.event().settlement(unconfirmed);
+            assert_eq!(settlement["settlement"]["state"], "unknown");
+            assert!(settlement["stop_confirmed_at_us"].is_i64());
+            assert_eq!(stream.next(), None);
+            running.stop();
+
+            // A stream lasts its lifetime at most, and one that never saw a
+            // conclusion ends without a settlement: an unsettled Job, and an
+            // unknown one whose stop is never confirmed.
+            let running = Running::start(
+                &directory,
+                limited(Duration::from_secs(2), Duration::from_millis(400)),
+            );
+            let handle = running.handle.clone();
+            let address = running.address();
+            let unsettled = running_job(&handle);
+            let unknown = running_job(&handle);
+            wait(handle.finalize_job(unknown, JobFinalization::Unknown)).expect("unknown");
+            for (job, state) in [(unsettled, "unsettled"), (unknown, "unknown")] {
+                let started = Instant::now();
+                let mut stream = events(address, job, None);
+                assert_eq!(stream.event().job()["settlement"]["state"], state);
+                assert_eq!(stream.rest(), Vec::new(), "no settlement for {state}");
+                assert!(started.elapsed() >= Duration::from_millis(400));
+                assert_eq!(record(&handle, job).stop_confirmed_at, None);
+            }
+            until(|| running.open_streams() == 0);
+            running.stop();
+        }
+
+        #[test]
+        fn slow_and_vanished_clients_hold_nothing_and_slow_no_one() {
+            let (_root, directory) = data_directory("c3-slow");
+            let running = Running::start(
+                &directory,
+                limited(Duration::from_millis(500), Duration::from_secs(60)),
+            );
+            let handle = running.handle.clone();
+            let address = running.address();
+            // A long history: 600 outputs of 16 KiB, far more than the
+            // connection and the sockets hold.
+            let job = running_job(&handle);
+            let text = "x".repeat(16 * 1024);
+            for _ in 0..600 {
+                progress(&handle, job, &text);
+            }
+            let other = running_job(&handle);
+
+            // A client that takes nothing: the stream reads only what the
+            // connection asks for, and the client is disconnected once it
+            // took nothing for the stall limit. Others are answered all the
+            // while.
+            let (fetched_before, started) = (running.control.streams().1, Instant::now());
+            let stalled = events(address, job, None);
+            until(|| running.open_streams() == 0);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            let fetched = running.control.streams().1 - fetched_before;
+            assert!(
+                fetched < 600,
+                "{fetched} outputs were read for a client that took none"
+            );
+            assert_eq!(get(address, "/api/v1/health")["host"], "running");
+            drop(stalled);
+
+            // Clients that come and go leave nothing open, and the Jobs as
+            // they were.
+            let before = (record(&handle, job), record(&handle, other));
+            for round in 0..20 {
+                let mut stream = events(address, if round % 2 == 0 { job } else { other }, None);
+                stream.event().job();
+                drop(stream);
+                until(|| running.open_streams() == 0);
+            }
+            assert_eq!((record(&handle, job), record(&handle, other)), before);
+            // A client that reads everything, slowly, is served it all.
+            let mut slow = events(address, job, Some(590));
+            slow.event().job();
+            for seq in 591..=600 {
+                std::thread::sleep(Duration::from_millis(20));
+                assert_eq!(slow.event().output(job)["seq"], seq);
+            }
+            drop(slow);
+            running.stop();
+        }
+
+        #[test]
+        fn an_output_too_large_for_an_event_is_refused_whole() {
+            let (_root, directory) = data_directory("c3-large");
+            let running = Running::start(&directory, config().with_response_bytes(1_024));
+            let handle = running.handle.clone();
+            let address = running.address();
+            let job = running_job(&handle);
+            let small = progress(&handle, job, "small");
+            let large = progress(&handle, job, &"L".repeat(4_000));
+            progress(&handle, job, "after");
+            // Found while streaming: an error, never the output or a part
+            // of it, and nothing after it.
+            let mut stream = events(address, job, None);
+            stream.event().job();
+            assert_eq!(stream.event().output(job)["summary"], "small");
+            let error = stream.event();
+            assert_eq!((error.name(), &error.id), ("stream_error", &None));
+            assert_eq!(error.json()["error"]["code"], "output_too_large");
+            assert_eq!(stream.next(), None);
+            assert!(!String::from_utf8_lossy(&stream.raw).contains("LLLL"));
+            assert!(!String::from_utf8_lossy(&stream.raw).contains("after"));
+            // Found before streaming: refused as the outputs route refuses
+            // it, before anything is sent.
+            let (host, bearer) = authorized(address);
+            let refused = stream_with(
+                address,
+                &format!("GET /api/v1/jobs/{job}/events"),
+                &[
+                    ("Host", &host),
+                    ("Authorization", &bearer),
+                    ("Last-Event-ID", &small.to_string()),
+                ],
+            );
+            assert_eq!(refused.error(), (422, "output_too_large".to_owned()));
+            let paged = stream_with(
+                address,
+                &format!("GET /api/v1/jobs/{job}/outputs?after_seq={small}"),
+                &[("Host", &host), ("Authorization", &bearer)],
+            );
+            assert_eq!(paged.error(), (422, "output_too_large".to_owned()));
+            // A client that knowingly moves past it reads on.
+            let mut past = events(address, job, Some(large));
+            past.event().job();
+            assert_eq!(past.event().output(job)["summary"], "after");
+            drop(past);
+            until(|| running.open_streams() == 0);
+            running.stop();
+        }
+
+        #[test]
+        fn event_streams_are_refused_as_every_route_is() {
+            let (_root, directory) = data_directory("c3-security");
+            let running = Running::start(&directory, config());
+            let handle = running.handle.clone();
+            let address = running.address();
+            let job = running_job(&handle);
+            let path = format!("/api/v1/jobs/{job}/events");
+            let line = format!("GET {path}");
+            let (host, bearer) = authorized(address);
+            let refused =
+                |line: &str, headers: &[(&str, &str)]| stream_with(address, line, headers).error();
+            let wrong = format!("Bearer {}", TOKEN.replace('C', "D"));
+            let other_origin = "http://127.0.0.1:1".to_owned();
+            type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, (u16, &'a str));
+            let cases: Vec<Case> = vec![
+                ("no token", vec![("Host", &host)], (401, "unauthenticated")),
+                (
+                    "wrong token",
+                    vec![("Host", &host), ("Authorization", &wrong)],
+                    (401, "unauthenticated"),
+                ),
+                (
+                    "foreign host",
+                    vec![("Host", "example.com"), ("Authorization", &bearer)],
+                    (403, "forbidden_host"),
+                ),
+                (
+                    "other origin",
+                    vec![
+                        ("Host", &host),
+                        ("Authorization", &bearer),
+                        ("Origin", &other_origin),
+                    ],
+                    (403, "forbidden_origin"),
+                ),
+                (
+                    "cross site",
+                    vec![
+                        ("Host", &host),
+                        ("Authorization", &bearer),
+                        ("Sec-Fetch-Site", "cross-site"),
+                    ],
+                    (403, "forbidden_origin"),
+                ),
+                (
+                    "negative cursor",
+                    vec![
+                        ("Host", &host),
+                        ("Authorization", &bearer),
+                        ("Last-Event-ID", "-1"),
+                    ],
+                    (400, "invalid_cursor"),
+                ),
+                (
+                    "padded cursor",
+                    vec![
+                        ("Host", &host),
+                        ("Authorization", &bearer),
+                        ("Last-Event-ID", "03"),
+                    ],
+                    (400, "invalid_cursor"),
+                ),
+                (
+                    "overflowing cursor",
+                    vec![
+                        ("Host", &host),
+                        ("Authorization", &bearer),
+                        ("Last-Event-ID", "92233720368547758070"),
+                    ],
+                    (400, "invalid_cursor"),
+                ),
+                (
+                    "two cursors",
+                    vec![
+                        ("Host", &host),
+                        ("Authorization", &bearer),
+                        ("Last-Event-ID", "1"),
+                        ("Last-Event-ID", "2"),
+                    ],
+                    (400, "invalid_cursor"),
+                ),
+            ];
+            for (case, headers, (status, code)) in cases {
+                assert_eq!(
+                    refused(&line, &headers),
+                    (status, code.to_owned()),
+                    "{case}"
+                );
+            }
+            let with_cursor = [("Host", host.as_str()), ("Authorization", bearer.as_str())];
+            for (query, code) in [
+                ("?after_seq=1&after_seq=2", "invalid_cursor"),
+                ("?after_seq=x", "invalid_cursor"),
+                ("?after_seq=1&limit=2", "invalid_cursor"),
+                ("?access_token=abc", "invalid_request"),
+            ] {
+                assert_eq!(
+                    refused(&format!("{line}{query}"), &with_cursor),
+                    (400, code.to_owned()),
+                    "{query}"
+                );
+            }
+            assert_eq!(
+                refused(
+                    &format!("{line}?after_seq=1"),
+                    &[
+                        ("Host", &host),
+                        ("Authorization", &bearer),
+                        ("Last-Event-ID", "1"),
+                    ],
+                ),
+                (400, "ambiguous_cursor".to_owned())
+            );
+            assert_eq!(
+                refused("GET /api/v1/jobs/job:999999/events", &with_cursor),
+                (404, "job_not_found".to_owned())
+            );
+            assert_eq!(
+                refused("GET /api/v1/jobs/job:01/events", &with_cursor),
+                (400, "invalid_request".to_owned())
+            );
+            let posted = stream_with(address, &format!("POST {path}"), &with_cursor);
+            assert_eq!(posted.headers.get("allow").map(String::as_str), Some("GET"));
+            assert_eq!(posted.error(), (405, "method_not_allowed".to_owned()));
+            // A same-origin client is served.
+            let origin = format!("http://{host}");
+            let mut same = stream_with(
+                address,
+                &line,
+                &[
+                    ("Host", &host),
+                    ("Authorization", &bearer),
+                    ("Origin", &origin),
+                ],
+            );
+            assert_eq!(same.status, 200);
+            same.event().job();
+            drop(same);
+            until(|| running.open_streams() == 0);
+
+            // At most four streams at once; a fifth is refused before
+            // anything is read, and served once one has closed.
+            let open = (0..4)
+                .map(|_| {
+                    let mut stream = events(address, job, None);
+                    stream.event().job();
+                    stream
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(running.open_streams(), 4);
+            assert_eq!(
+                refused(&line, &with_cursor),
+                (503, "too_many_streams".to_owned())
+            );
+            assert_eq!(get(address, "/api/v1/health")["host"], "running");
+            drop(open);
+            until(|| running.open_streams() == 0);
+            events(address, job, None).event().job();
+            running.stop();
+        }
+
+        #[test]
+        fn stopping_the_listener_ends_its_streams_and_frees_their_resources() {
+            let (_root, directory) = data_directory("c3-stop");
+            let running = Running::start(&directory, config());
+            let handle = running.handle.clone();
+            let address = running.address();
+            let job = running_job(&handle);
+            progress(&handle, job, "before the stop");
+            let holders = running.control.holders();
+            let mut reading = events(address, job, None);
+            reading.event().job();
+            reading.event().output(job);
+            // Another client asks and then reads nothing.
+            let mut silent = events(address, job, None);
+            silent.chunk();
+            assert_eq!(running.open_streams(), 2);
+
+            let Running {
+                worker,
+                handle,
+                runtime,
+                control,
+            } = running;
+            let stopping = Instant::now();
+            wait(control.stop()).expect("stop the listener");
+            let stopped = stopping.elapsed();
+            assert!(stopped < Duration::from_secs(8), "stopped in {stopped:?}");
+            // The stream ends without a settlement, for its client to resume.
+            assert_eq!(reading.rest(), Vec::new());
+            assert_eq!(holders(), 0, "nothing of the listener is left");
+            TcpListener::bind(address).expect("the listener's port was released");
+            assert!(TcpStream::connect(address).is_err());
+            // Then, in the host's order, the runtime and the database; the
+            // Job was left as it was.
+            let left = record(&handle, job);
+            assert!(left.started_at.is_some() && left.unknown_at.is_none());
+            runtime.shutdown().expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+            drop(silent);
+        }
+    }
+
     // ---- Image input ----------------------------------------------------------
 
     mod image_input {
