@@ -1,7 +1,7 @@
-//! `workspace_fts_search`: opt-in indexed full-text search over an
+//! `workspace_fts_search`: indexed full-text search over an
 //! authorized Workspace, and the bounded in-memory index behind it.
 //!
-//! The scan-based workspace_search remains available. Indexes are opt-in,
+//! The scan-based workspace_search remains available. Indexes are lazy,
 //! immutable, and owned by their registered handler.
 //!
 //! # What searching means here
@@ -69,11 +69,6 @@ use crate::persistence::ToolEffect;
 
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_fts_search";
-
-/// The environment variable an operator sets to `1` to opt in to the
-/// experiment, offering [`TOOL_NAME`] alongside the coding tools. Without
-/// it the tool is registered nowhere and no code path builds its index.
-pub const EXPERIMENTAL_FTS_VARIABLE: &str = "OCG_EXPERIMENTAL_WORKSPACE_FTS";
 
 /// Identifies this handler's behavior in every call it records.
 const HANDLER_VERSION: &str = "workspace_fts_search-2";
@@ -1758,8 +1753,8 @@ fn refused(refusal: impl std::fmt::Display) -> ToolFailure {
 }
 
 /// Registers `workspace_fts_search` for `workspace` in `registry`, without
-/// authorizing it. Nothing registers it by default: an execution offers it
-/// only where OCG explicitly opts in to the experiment.
+/// authorizing it. Coding executions offer it by default; its first query
+/// builds the bounded index, and refresh remains explicit.
 pub(crate) fn register(
     registry: &ToolRegistry,
     workspace: Workspace,

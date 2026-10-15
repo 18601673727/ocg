@@ -667,9 +667,9 @@ pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
 }
 
 /// The tools of an execution that may read, write and build `workspace`:
-/// exactly `workspace_read_file`, `workspace_write_file`,
-/// `workspace_run_command`, `workspace_list_directory` and
-/// `workspace_search`, registered in a registry of their own and authorized
+/// `workspace_read_file`, `workspace_write_file`, `workspace_run_command`,
+/// `workspace_list_directory`, `workspace_search`, `workspace_index_query` and
+/// lazy `workspace_fts_search`, registered in a registry of their own and authorized
 /// there, with [`coding_limits`]. Commands get the environment
 /// OCG was started with, filtered, and run for at most [`COMMAND_TIMEOUT`].
 ///
@@ -686,20 +686,6 @@ pub(crate) fn code_tools_with(
     workspace: Workspace,
     environment: CommandEnvironment,
     timeout: Duration,
-) -> Result<ToolExecution, ToolRegistryError> {
-    code_tools_with_index(workspace, environment, timeout, fts_opted_in())
-}
-
-fn fts_opted_in() -> bool {
-    std::env::var_os(super::workspace_fts::EXPERIMENTAL_FTS_VARIABLE)
-        .is_some_and(|value| value == "1")
-}
-
-pub(crate) fn code_tools_with_index(
-    workspace: Workspace,
-    environment: CommandEnvironment,
-    timeout: Duration,
-    indexed: bool,
 ) -> Result<ToolExecution, ToolRegistryError> {
     let registry = ToolRegistry::default();
     let limits = coding_limits(timeout);
@@ -720,10 +706,8 @@ pub(crate) fn code_tools_with_index(
         workspace_discovery::SEARCH_TOOL_NAME,
         crate::orchestration::workspace_index_query::TOOL_NAME,
     ];
-    if indexed {
-        super::workspace_fts::register(&registry, workspace)?;
-        names.push(super::workspace_fts::TOOL_NAME);
-    }
+    super::workspace_fts::register(&registry, workspace)?;
+    names.push(super::workspace_fts::TOOL_NAME);
     for name in &names {
         registry.authorize(name)?;
     }
@@ -956,6 +940,7 @@ mod tests {
                 workspace_discovery::LIST_TOOL_NAME,
                 workspace_discovery::SEARCH_TOOL_NAME,
                 crate::orchestration::workspace_index_query::TOOL_NAME,
+                super::super::workspace_fts::TOOL_NAME,
             ]
         );
         assert_eq!(
@@ -1005,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_index_query_and_search_tools_coexist_with_fts_opt_in() {
+    fn workspace_index_query_and_search_tools_coexist_with_default_fts() {
         use crate::openai_compatible::CompletedToolCall;
         use crate::orchestration::{workspace_fts, workspace_index_query};
 
@@ -1016,13 +1001,13 @@ mod tests {
                 command
                     .args([
                         "--exact",
-                        "orchestration::workspace_command::tests::workspace_index_query_and_search_tools_coexist_with_fts_opt_in",
+                        "orchestration::workspace_command::tests::workspace_index_query_and_search_tools_coexist_with_default_fts",
                         "--nocapture",
                     ])
                     .env(CHILD, "1");
                 match value {
-                    Some(value) => command.env(workspace_fts::EXPERIMENTAL_FTS_VARIABLE, value),
-                    None => command.env_remove(workspace_fts::EXPERIMENTAL_FTS_VARIABLE),
+                    Some(value) => command.env("OCG_EXPERIMENTAL_WORKSPACE_FTS", value),
+                    None => command.env_remove("OCG_EXPERIMENTAL_WORKSPACE_FTS"),
                 };
                 let output = command.output().expect("registration subprocess");
                 assert!(
@@ -1046,8 +1031,6 @@ mod tests {
             .into_iter()
             .map(|wire| wire.function.name)
             .collect::<Vec<_>>();
-        let opted_in = std::env::var_os(workspace_fts::EXPERIMENTAL_FTS_VARIABLE)
-            .is_some_and(|value| value == "1");
         assert!(
             names
                 .iter()
@@ -1058,11 +1041,8 @@ mod tests {
                 .iter()
                 .any(|name| name == workspace_index_query::TOOL_NAME)
         );
-        assert_eq!(
-            names.iter().any(|name| name == workspace_fts::TOOL_NAME),
-            opted_in
-        );
-        assert_eq!(names.len(), if opted_in { 7 } else { 6 });
+        assert!(names.iter().any(|name| name == workspace_fts::TOOL_NAME));
+        assert_eq!(names.len(), 7);
         for (name, arguments, version) in [
             (
                 workspace_discovery::SEARCH_TOOL_NAME,
@@ -1092,10 +1072,6 @@ mod tests {
                 arguments: arguments.to_string(),
             };
             let dispatch = coding.offer.resolve(&call);
-            if name == workspace_fts::TOOL_NAME && !opted_in {
-                assert!(dispatch.is_err(), "FTS cannot be dispatched without opt-in");
-                continue;
-            }
             let dispatch = dispatch.expect("authorized dispatch");
             assert_eq!(dispatch.version, version);
             assert_eq!(dispatch.effect, ToolEffect::ReadOnly);

@@ -18269,6 +18269,7 @@ mod requests_and_tool_loop {
                     crate::orchestration::workspace_discovery::LIST_TOOL_NAME,
                     crate::orchestration::workspace_discovery::SEARCH_TOOL_NAME,
                     crate::orchestration::workspace_index_query::TOOL_NAME,
+                    crate::orchestration::workspace_fts::TOOL_NAME,
                 ]
             );
             let failed = answer_to(third, "call_test_1").expect("answered");
@@ -18851,13 +18852,12 @@ mod requests_and_tool_loop {
             let handle = worker.handle();
             let (_provider, llm) = llm_setup(&handle, "model-a");
             let run = local_run(&handle, llm);
-            let tools = workspace_command::code_tools_with_index(
+            let tools = workspace_command::code_tools_with(
                 authorize(&root, &directory),
                 workspace_command::CommandEnvironment::of_process(),
                 std::time::Duration::from_secs(10),
-                true,
             )
-            .expect("explicit opt-in");
+            .expect("default indexed coding tools");
             let looped = run_agent(&handle, run, tools, "Find the timeout", |conversation| {
                 if conversation
                     .messages
