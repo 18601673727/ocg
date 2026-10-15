@@ -167,7 +167,7 @@ fn parse_and_extract(
 
     let tree = parser
         .parse_with_options(
-            &mut |offset: usize, _point| source[offset.min(source.len())..].as_bytes(),
+            &mut |offset: usize, _point| &source.as_bytes()[offset.min(source.len())..],
             None,
             Some(options),
         )
@@ -203,7 +203,7 @@ fn point_to_position(
     point: Point,
     line_starts: &[usize],
 ) -> Result<(u64, u64), ToolFailure> {
-    let line = point.row as usize + 1;
+    let line = point.row + 1;
     if point.row >= line_starts.len() {
         return Err(ToolFailure::not_applied("invalid tree-sitter position"));
     }
@@ -397,12 +397,11 @@ fn process_typescript_node(
                 if class_child.kind() == "class_body" {
                     let mut body_cursor = class_child.walk();
                     for body_child in class_child.children(&mut body_cursor) {
-                        if body_child.kind() == "method_definition" {
-                            if let Some(sym) =
+                        if body_child.kind() == "method_definition"
+                            && let Some(sym) =
                                 extract_symbol(source, body_child, "method", line_starts)?
-                            {
-                                symbols.push(sym);
-                            }
+                        {
+                            symbols.push(sym);
                         }
                     }
                 }
@@ -428,10 +427,10 @@ fn process_typescript_node(
 
             let mut decl_cursor = node.walk();
             for decl_child in node.children(&mut decl_cursor) {
-                if decl_child.kind() == "variable_declarator" {
-                    if let Some(sym) = extract_symbol(source, decl_child, kind, line_starts)? {
-                        symbols.push(sym);
-                    }
+                if decl_child.kind() == "variable_declarator"
+                    && let Some(sym) = extract_symbol(source, decl_child, kind, line_starts)?
+                {
+                    symbols.push(sym);
                 }
             }
         }
@@ -468,12 +467,11 @@ fn extract_python_symbols(
                     if class_child.kind() == "block" {
                         let mut block_cursor = class_child.walk();
                         for block_child in class_child.children(&mut block_cursor) {
-                            if block_child.kind() == "function_definition" {
-                                if let Some(sym) =
+                            if block_child.kind() == "function_definition"
+                                && let Some(sym) =
                                     extract_symbol(source, block_child, "method", line_starts)?
-                                {
-                                    symbols.push(sym);
-                                }
+                            {
+                                symbols.push(sym);
                             }
                         }
                     }
