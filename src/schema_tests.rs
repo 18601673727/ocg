@@ -18270,6 +18270,7 @@ mod requests_and_tool_loop {
                     crate::orchestration::workspace_discovery::SEARCH_TOOL_NAME,
                     crate::orchestration::workspace_index_query::TOOL_NAME,
                     crate::orchestration::workspace_fts::TOOL_NAME,
+                    crate::orchestration::workspace_lsp::TOOL_NAME,
                 ]
             );
             let failed = answer_to(third, "call_test_1").expect("answered");

@@ -284,6 +284,9 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
             eprintln!(
                 "OCG runs `cargo check` and `cargo test` in the Workspace with its own permissions; build scripts and tests run project code unsandboxed, so authorize only a Workspace you trust"
             );
+            eprintln!(
+                "OCG additionally offers lazy bounded FTS and semantic LSP queries; language servers run native project code with OCG permissions, without a sandbox. Missing servers are reported unavailable."
+            );
             Some(workspace_command::code_tools(workspace)?)
         }
         Mode::Vision => {
