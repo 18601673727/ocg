@@ -77,11 +77,12 @@ const LAST_EVENT_ID: &str = "last-event-id";
 /// The most outputs read, and held, at once.
 const PAGE: usize = 16;
 
-/// The most bytes of an event given to the connection at once. ntex 3.12
-/// copies a body chunk of up to 4 KiB into its write buffer, and adds a
-/// larger one as a page of its own, splitting the page being written
-/// around it; under that split, the size line of a following chunk was
-/// seen overwritten. An event is therefore given in pieces it copies.
+/// Verified 4 KiB mitigation for confirmed HTTP/1.1 streamed-response corruption
+/// with ntex 3.12.3 / ntex-bytes 1.11.0; ntex-bytes 1.12.0 also reproduces it.
+/// This is not an upstream fix. https://github.com/ntex-rs/ntex/issues/1121
+/// currently requests a private security-reporting channel, not confirmed fix
+/// tracking. Do not remove on dependency upgrades: removal requires a verified
+/// upstream fix and successful raw-wire regression testing.
 const PIECE: usize = 4 * 1024;
 
 /// The bounds of every stream.
