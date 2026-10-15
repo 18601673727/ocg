@@ -10,9 +10,15 @@
 //! What only this process knows is kept in a [`Registry`] owned by the
 //! listener, and dies with it:
 //!
-//! - a key being admitted, from its first request until its admission ends:
-//!   every other request with the key waits for that one admission and is
-//!   answered from it, so a key is never submitted twice at once;
+//! - a key being resolved, from its first request until its record is
+//!   read: it reserves the key without deciding anything, so every other
+//!   request with the key, whatever its request, waits for that read and is
+//!   answered from the record; a committed key is never displaced, even for
+//!   a moment, by a request that has not been checked against it;
+//! - a key being admitted, once its record was found missing, until its
+//!   admission ends: every other request with the key waits for that one
+//!   admission and is answered from it, so a key is never submitted twice
+//!   at once;
 //! - a key whose creation may have committed, but did not say so: it is
 //!   never submitted again while that is possible. It is settled by the
 //!   record, once a read finds it, or by a reopening of the database, after
@@ -231,10 +237,14 @@ pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<SubmissionKey, Refu
     {
         return Err(INVALID_KEY);
     }
+    Ok(digest_key(key))
+}
+
+fn digest_key(key: &[u8]) -> SubmissionKey {
     let mut context = Context::new(&SHA256);
     context.update(KEY_DOMAIN);
     context.update(key);
-    Ok(SubmissionKey::from_digest(sha256(context)))
+    SubmissionKey::from_digest(sha256(context))
 }
 
 /// How one admission ended, for every request waiting on it.
@@ -252,17 +262,42 @@ enum Outcome {
 
 /// A key this process has not resolved.
 struct Unresolved {
+    /// The request of the claim that owns it; authoritative only once the
+    /// key is known not to be recorded, from [`Phase::Admitting`] on.
     fingerprint: RequestFingerprint,
     /// Tells this entry apart from a later one of the same key.
     generation: u64,
     phase: Phase,
 }
 
+/// A request waiting for how a key is resolved, answered by its own request.
+struct Waiter {
+    fingerprint: RequestFingerprint,
+    outcome: flume::Sender<Outcome>,
+}
+
 enum Phase {
-    /// Its admission runs; these wait for its outcome.
-    Admitting(Vec<flume::Sender<Outcome>>),
+    /// Its record is being read: whether, and by which request, the key is
+    /// bound is not known yet, so these wait for the read, whatever their
+    /// request.
+    Resolving(Vec<Waiter>),
+    /// It is not recorded, and its owner's admission runs; these, all of
+    /// the owner's request, wait for its outcome.
+    Admitting(Vec<Waiter>),
     /// Its creation may have committed in the opening of `epoch` or before.
     Uncertain { epoch: u64 },
+}
+
+/// Adds a waiter of `fingerprint` to `waiters`, forgetting those that
+/// stopped waiting, so a client retrying a long admission adds no garbage.
+fn join(waiters: &mut Vec<Waiter>, fingerprint: RequestFingerprint) -> flume::Receiver<Outcome> {
+    waiters.retain(|waiter| !waiter.outcome.is_disconnected());
+    let (sender, outcome) = flume::bounded(1);
+    waiters.push(Waiter {
+        fingerprint,
+        outcome: sender,
+    });
+    outcome
 }
 
 #[derive(Default)]
@@ -282,12 +317,13 @@ pub(super) struct Registry {
 
 /// What a request finds for its key.
 enum Claim {
-    /// It owns the key's admission and waits for it like any other.
+    /// It owns the key's resolution and admission, and waits for them like
+    /// any other.
     Owner {
         generation: u64,
         outcome: flume::Receiver<Outcome>,
     },
-    /// Another request's admission runs; it waits for that one.
+    /// Another request resolves or admits the key; it waits for that one.
     Waiting(flume::Receiver<Outcome>),
     Conflict,
     Uncertain {
@@ -299,6 +335,7 @@ enum Claim {
 
 /// What this process knows of a key, for a lookup.
 enum Local {
+    Resolving,
     Admitting,
     Uncertain { generation: u64, epoch: u64 },
 }
@@ -308,21 +345,18 @@ impl Registry {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// What `fingerprint` finds for `key`. The first claim reserves the key
+    /// in [`Phase::Resolving`], under this lock, before its record is read,
+    /// so no other request of this process can admit the key until that
+    /// read has ended.
     fn claim(&self, key: SubmissionKey, fingerprint: RequestFingerprint) -> Claim {
         let mut state = self.state();
         if let Some(entry) = state.unresolved.get_mut(&key) {
-            if entry.fingerprint != fingerprint {
-                return Claim::Conflict;
-            }
             return match &mut entry.phase {
-                Phase::Admitting(waiters) => {
-                    // Requests that stopped waiting are forgotten, so a
-                    // client retrying a long admission adds no garbage.
-                    waiters.retain(|waiter| !waiter.is_disconnected());
-                    let (sender, outcome) = flume::bounded(1);
-                    waiters.push(sender);
-                    Claim::Waiting(outcome)
-                }
+                // Nothing is known yet that could refuse it.
+                Phase::Resolving(waiters) => Claim::Waiting(join(waiters, fingerprint)),
+                _ if entry.fingerprint != fingerprint => Claim::Conflict,
+                Phase::Admitting(waiters) => Claim::Waiting(join(waiters, fingerprint)),
                 Phase::Uncertain { epoch } => Claim::Uncertain {
                     generation: entry.generation,
                     epoch: *epoch,
@@ -334,13 +368,14 @@ impl Registry {
         }
         state.next_generation += 1;
         let generation = state.next_generation;
-        let (sender, outcome) = flume::bounded(1);
+        let mut waiters = Vec::new();
+        let outcome = join(&mut waiters, fingerprint);
         state.unresolved.insert(
             key,
             Unresolved {
                 fingerprint,
                 generation,
-                phase: Phase::Admitting(vec![sender]),
+                phase: Phase::Resolving(waiters),
             },
         );
         Claim::Owner {
@@ -354,6 +389,7 @@ impl Registry {
             .unresolved
             .get(&key)
             .map(|entry| match entry.phase {
+                Phase::Resolving(_) => Local::Resolving,
                 Phase::Admitting(_) => Local::Admitting,
                 Phase::Uncertain { epoch } => Local::Uncertain {
                     generation: entry.generation,
@@ -362,21 +398,53 @@ impl Registry {
             })
     }
 
-    /// Ends the admission of `generation`: the key is resolved, by the
-    /// database or as refused, and every waiting request is told how.
-    fn finish(&self, key: SubmissionKey, generation: u64, outcome: Outcome) {
+    /// Ends the resolution or admission of `generation`: the key is
+    /// resolved, by the database or as refused, and every waiting request is
+    /// told how, for its own request.
+    fn finish(
+        &self,
+        key: SubmissionKey,
+        generation: u64,
+        outcome: impl Fn(RequestFingerprint) -> Outcome,
+    ) {
         let mut state = self.state();
         if state
             .unresolved
             .get(&key)
             .is_some_and(|entry| entry.generation == generation)
             && let Some(entry) = state.unresolved.remove(&key)
-            && let Phase::Admitting(waiters) = entry.phase
+            && let Phase::Resolving(waiters) | Phase::Admitting(waiters) = entry.phase
         {
             for waiter in waiters {
-                waiter.try_send(outcome).ok();
+                waiter.outcome.try_send(outcome(waiter.fingerprint)).ok();
             }
         }
+    }
+
+    /// Moves the key of `generation` from [`Phase::Resolving`] to
+    /// [`Phase::Admitting`] once its record was found missing: its owner's
+    /// request now holds it, and every waiter of another request is refused.
+    /// Returns whether it did.
+    fn admitting(&self, key: SubmissionKey, generation: u64) -> bool {
+        let mut state = self.state();
+        let Some(entry) = state.unresolved.get_mut(&key) else {
+            return false;
+        };
+        if entry.generation != generation {
+            return false;
+        }
+        let Phase::Resolving(waiters) = &mut entry.phase else {
+            return false;
+        };
+        let owner = entry.fingerprint;
+        let (kept, refused): (Vec<_>, Vec<_>) = std::mem::take(waiters)
+            .into_iter()
+            .partition(|waiter| waiter.fingerprint == owner);
+        for waiter in refused {
+            waiter.outcome.try_send(Outcome::Conflict).ok();
+        }
+        entry.phase = Phase::Admitting(kept);
+        true
     }
 
     /// Keeps the key of `generation` unresolved: its creation may have
@@ -387,9 +455,9 @@ impl Registry {
             && entry.generation == generation
         {
             let phase = std::mem::replace(&mut entry.phase, Phase::Uncertain { epoch });
-            if let Phase::Admitting(waiters) = phase {
+            if let Phase::Resolving(waiters) | Phase::Admitting(waiters) = phase {
                 for waiter in waiters {
-                    waiter.try_send(Outcome::Uncertain).ok();
+                    waiter.outcome.try_send(Outcome::Uncertain).ok();
                 }
             }
         }
@@ -430,6 +498,73 @@ impl Registry {
     #[cfg(test)]
     pub(super) fn unresolved(&self) -> usize {
         self.state().unresolved.len()
+    }
+
+    /// How many requests still wait on `key`, its owner's included.
+    #[cfg(test)]
+    fn waiting(&self, key: SubmissionKey) -> usize {
+        self.state()
+            .unresolved
+            .get(&key)
+            .map_or(0, |entry| match &entry.phase {
+                Phase::Resolving(waiters) | Phase::Admitting(waiters) => waiters
+                    .iter()
+                    .filter(|waiter| !waiter.outcome.is_disconnected())
+                    .count(),
+                Phase::Uncertain { .. } => 0,
+            })
+    }
+}
+
+#[cfg(test)]
+impl super::ControlPlane {
+    /// How many requests wait on the key a client sends as `key`.
+    pub(crate) fn waiting(&self, key: &str) -> usize {
+        self.shared.submissions.waiting(digest_key(key.as_bytes()))
+    }
+}
+
+/// A test hold of a key's resolution, once its record was read and before
+/// anything is decided from it. Keyed by the client's key, so tests running
+/// at once do not see each other's.
+#[cfg(test)]
+pub(crate) mod resolution_seam {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::persistence::SubmissionKey;
+
+    type Hold = (flume::Sender<()>, flume::Receiver<()>);
+
+    static HOLDS: Mutex<BTreeMap<SubmissionKey, Hold>> = Mutex::new(BTreeMap::new());
+
+    /// The digest the client's `key` is recorded under.
+    pub(crate) fn key(key: &str) -> SubmissionKey {
+        super::digest_key(key.as_bytes())
+    }
+
+    /// Holds the next resolution of `key` once its record was read: the
+    /// first receiver is told when it holds, and it goes on once the second
+    /// sender sends or is dropped. The listener's runtime is not blocked.
+    pub(crate) fn hold(key: &str) -> (flume::Receiver<()>, flume::Sender<()>) {
+        let (reached, held) = flume::bounded(1);
+        let (release, released) = flume::bounded(1);
+        HOLDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self::key(key), (reached, released));
+        (held, release)
+    }
+
+    pub(super) async fn reach(key: SubmissionKey) {
+        let hold = HOLDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        if let Some((reached, released)) = hold {
+            reached.send(()).ok();
+            released.recv_async().await.ok();
+        }
     }
 }
 
@@ -511,6 +646,12 @@ pub(super) async fn submit(
 /// error, never `not_found`.
 pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply, Refusal> {
     let found = match shared.submissions.local(key) {
+        // Its owner's read has not ended; the record answers for itself,
+        // and its absence means the owner may still admit it.
+        Some(Local::Resolving) => match shared.database.submission(key).await? {
+            Some(record) => Some(record),
+            None => return Ok(Reply::ok(admission("pending", None))),
+        },
         Some(Local::Admitting) => return Ok(Reply::ok(admission("pending", None))),
         Some(Local::Uncertain { generation, epoch }) => {
             match reconcile(shared, key, generation, epoch).await {
@@ -553,10 +694,12 @@ async fn reconcile(shared: &Shared, key: SubmissionKey, generation: u64, epoch: 
     }
 }
 
-/// The admission of one key, owned by the listener's runtime: checks the
-/// record, then the configuration, then admits the Job with its submission.
-/// Once admitted, the Job's stop is registered before anyone is told, and
-/// released once its execution returns.
+/// The resolution and admission of one key, owned by the listener's
+/// runtime: reads the record, which answers every waiting request by its
+/// own request; only when it is missing does the key become its owner's,
+/// then the configuration is checked and the Job admitted with its
+/// submission. Once admitted, the Job's stop is registered before anyone is
+/// told, and released once its execution returns.
 async fn admit(
     shared: Arc<Shared>,
     key: SubmissionKey,
@@ -565,20 +708,35 @@ async fn admit(
     request: JobRequest,
 ) {
     let registry = &shared.submissions;
-    let finish = |outcome| registry.finish(key, generation, outcome);
-    match shared.database.submission(key).await {
+    // Every waiter of an admission that ran is of the owner's request.
+    let finish = |outcome: Outcome| registry.finish(key, generation, |_| outcome);
+    let recorded = shared.database.submission(key).await;
+    #[cfg(test)]
+    resolution_seam::reach(key).await;
+    match recorded {
         Ok(Some(record)) => {
-            return finish(if record.fingerprint == fingerprint {
-                Outcome::Admitted {
-                    job: record.job,
-                    created: false,
+            return registry.finish(key, generation, |request| {
+                if request == record.fingerprint {
+                    Outcome::Admitted {
+                        job: record.job,
+                        created: false,
+                    }
+                } else {
+                    Outcome::Conflict
                 }
-            } else {
-                Outcome::Conflict
             });
         }
-        Ok(None) => {}
-        Err(error) => return finish(Outcome::Refused(error.into())),
+        // Reserved since before the read, so no admission of this process
+        // can have recorded the key since.
+        Ok(None) => {
+            if !registry.admitting(key, generation) {
+                return;
+            }
+        }
+        Err(error) => {
+            let refusal = Refusal::from(error);
+            return finish(Outcome::Refused(refusal));
+        }
     }
     if let Err(refusal) = check_configuration(&shared.database, &request).await {
         return finish(Outcome::Refused(refusal));

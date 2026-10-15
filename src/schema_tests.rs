@@ -19831,7 +19831,9 @@ mod requests_and_tool_loop {
         use std::net::{SocketAddr, TcpStream};
 
         use super::*;
-        use crate::control_plane::{ControlPlane, ControlPlaneConfig, MAX_SUBMISSION_BYTES};
+        use crate::control_plane::{
+            ControlPlane, ControlPlaneConfig, MAX_SUBMISSION_BYTES, resolution_seam,
+        };
         use crate::host::{HostContext, Phase, run_controlled_reporting};
         use crate::orchestration::execution_runtime::provider_seam::{self, Response};
         use crate::provider_execution::scripted::Step;
@@ -21080,6 +21082,232 @@ mod requests_and_tool_loop {
             );
             assert_eq!(lookup(address, protected_key).admission().0, "not_found");
             assert!(jobs_named(&handle, "c2 protected").is_empty());
+            running.stop();
+        }
+
+        /// Submits on a thread of its own, so the test can go on while the
+        /// request waits.
+        fn submitting(
+            address: SocketAddr,
+            key: &'static str,
+            body: String,
+        ) -> std::thread::JoinHandle<Answer> {
+            std::thread::spawn(move || submit(address, key, &body))
+        }
+
+        #[test]
+        fn a_conflicting_replay_never_displaces_a_committed_key() {
+            let (_root, directory) = data_directory("c2f1-committed");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let target = target(
+                &handle,
+                "c2f1-committed",
+                vec![now(answering("bound", (2, 1)))],
+            );
+            let address = running.address();
+            let key = "c2f1-committed-0000001";
+            let body = target.body("Bind it", "c2f1 committed");
+            let created = submit(address, key, &body);
+            assert_eq!(created.status, 201, "{}", created.body);
+            let job = created.job();
+            until(|| state(address, job) == "completed");
+            until(|| running.control.held() == (0, 0));
+            let admitted = ("admitted".to_owned(), Some(job.to_string()));
+
+            // A conflicting replay is held once it has read the record and
+            // before anything is decided from it.
+            let (reached, release) = resolution_seam::hold(key);
+            let conflicting = submitting(address, key, target.body("Other", "c2f1 committed"));
+            reached
+                .recv_timeout(crate::test_support::WAIT)
+                .expect("the conflicting replay reads the record");
+            assert_eq!(running.control.held(), (0, 1), "it reserves the key");
+            assert_eq!(lookup(address, key).admission(), admitted);
+            // A valid replay meanwhile waits on that resolution; it is not
+            // refused by the conflicting request.
+            let valid = submitting(address, key, body.clone());
+            until(|| running.control.waiting(key) == 2);
+            assert_eq!(lookup(address, key).admission(), admitted);
+            release.send(()).expect("release the conflicting replay");
+
+            let conflicting = conflicting.join().expect("joined");
+            assert_eq!(
+                (conflicting.status, conflicting.error().as_str()),
+                (409, "idempotency_key_conflict")
+            );
+            let valid = valid.join().expect("joined");
+            assert_eq!((valid.status, valid.job()), (200, job));
+            assert_eq!(lookup(address, key).admission(), admitted);
+            assert_eq!(jobs_named(&handle, "c2f1 committed").len(), 1);
+            assert_eq!(target.requests(), 1, "one Provider execution");
+            assert_eq!(running.control.held(), (0, 0), "nothing is left held");
+            running.stop();
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn the_first_claim_of_a_key_owns_it_until_its_record_is_read() {
+            let (_root, directory) = data_directory("c2f1-claim");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let target = target(&handle, "c2f1-claim", vec![now(answering("first", (2, 1)))]);
+            let address = running.address();
+            let key = "c2f1-claim-0000000001";
+            let first = target.body("First", "c2f1 first");
+            let second = target.body("Second", "c2f1 second");
+
+            // The first request has read that the key is not recorded.
+            let (reached, release) = resolution_seam::hold(key);
+            let owner = submitting(address, key, first.clone());
+            reached
+                .recv_timeout(crate::test_support::WAIT)
+                .expect("the first request reads the record");
+            // Another request, of either request, cannot bind the key
+            // meanwhile: it waits on that read instead of admitting.
+            let other = submitting(address, key, second.clone());
+            let same = submitting(address, key, first.clone());
+            until(|| running.control.waiting(key) == 3);
+            assert_eq!(
+                lookup(address, key).admission(),
+                ("pending".to_owned(), None)
+            );
+            assert!(jobs_named(&handle, "c2f1 first").is_empty());
+            assert!(jobs_named(&handle, "c2f1 second").is_empty());
+            release.send(()).expect("release the first request");
+
+            let owner = owner.join().expect("joined");
+            assert_eq!(owner.status, 201, "{}", owner.body);
+            let job = owner.job();
+            let same = same.join().expect("joined");
+            assert_eq!((same.status, same.job()), (200, job));
+            let other = other.join().expect("joined");
+            assert_eq!(other.error(), "idempotency_key_conflict");
+            until(|| state(address, job) == "completed");
+            assert_eq!(
+                lookup(address, key).admission(),
+                ("admitted".to_owned(), Some(job.to_string()))
+            );
+            assert_eq!(jobs_named(&handle, "c2f1 first").len(), 1);
+            assert!(jobs_named(&handle, "c2f1 second").is_empty());
+            assert_eq!(target.requests(), 1);
+            until(|| running.control.held() == (0, 0));
+            running.stop();
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_binding_made_past_the_listener_during_a_read_stays_authoritative() {
+            use crate::persistence::{NewSubmission, RequestFingerprint};
+
+            let (_root, directory) = data_directory("c2f1-stale");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let target = target(&handle, "c2f1-stale", Vec::new());
+            let address = running.address();
+            let key = "c2f1-stale-read-000001";
+            let body = target.body("Stale", "c2f1 stale");
+
+            // The request reads a miss and is held; another writer, past
+            // this listener, binds the key before it goes on.
+            let (reached, release) = resolution_seam::hold(key);
+            let stale = submitting(address, key, body.clone());
+            reached
+                .recv_timeout(crate::test_support::WAIT)
+                .expect("the request reads the record");
+            let input = wait(handle.save_job_input(
+                None,
+                JobInputDraft {
+                    objective: Some("bound elsewhere".into()),
+                    ..JobInputDraft::default()
+                },
+            ))
+            .expect("save input");
+            let bound = wait(handle.create_submitted_local_job(
+                NewJob {
+                    configuration: llm_only(target.llm),
+                    ..new_job("c2f1 bound elsewhere", handle.genesis(), Vec::new())
+                },
+                input,
+                NewSubmission {
+                    key: resolution_seam::key(key),
+                    fingerprint: RequestFingerprint::from_digest([9; 32]),
+                },
+            ))
+            .expect("bound elsewhere");
+            release.send(()).expect("release the request");
+
+            // Its stale read installs nothing over the binding: the creation
+            // refuses the key, and the binding answers from then on.
+            let stale = stale.join().expect("joined");
+            assert_eq!(stale.error(), "idempotency_key_conflict");
+            assert_eq!(
+                lookup(address, key).admission(),
+                ("admitted".to_owned(), Some(bound.to_string()))
+            );
+            assert_eq!(
+                submit(address, key, &body).error(),
+                "idempotency_key_conflict"
+            );
+            assert!(jobs_named(&handle, "c2f1 stale").is_empty());
+            assert_eq!(target.requests(), 0, "nothing ran");
+            assert_eq!(running.control.held(), (0, 0));
+            running.stop();
+        }
+
+        #[test]
+        fn a_refused_resolution_releases_its_key_and_every_waiter() {
+            let (_root, directory) = data_directory("c2f1-refused");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let target = target(
+                &handle,
+                "c2f1-refused",
+                vec![now(answering("later", (2, 1)))],
+            );
+            let address = running.address();
+            let key = "c2f1-refused-00000001";
+            let unrunnable = json!({
+                "llm_profile": target.llm.to_string(),
+                "executor": "executor:999999",
+                "objective": "Never",
+                "name": "c2f1 refused",
+            })
+            .to_string();
+            let (reached, release) = resolution_seam::hold(key);
+            let owner = submitting(address, key, unrunnable.clone());
+            reached
+                .recv_timeout(crate::test_support::WAIT)
+                .expect("the request reads the record");
+            let joined = submitting(address, key, unrunnable.clone());
+            // A waiter that disconnects is not kept.
+            let gone = submission(address, key, &unrunnable);
+            until(|| running.control.waiting(key) == 3);
+            drop(gone);
+            until(|| running.control.waiting(key) == 2);
+            release.send(()).expect("release the request");
+            for answer in [
+                owner.join().expect("joined"),
+                joined.join().expect("joined"),
+            ] {
+                assert_eq!(
+                    (answer.status, answer.error().as_str()),
+                    (422, "executor_not_found")
+                );
+            }
+            assert_eq!(running.control.held(), (0, 0), "the key is released");
+            assert_eq!(
+                lookup(address, key).admission(),
+                ("not_found".to_owned(), None)
+            );
+            // The key is free: a runnable request is admitted once.
+            let created = submit(address, key, &target.body("Later", "c2f1 refused"));
+            assert_eq!(created.status, 201, "{}", created.body);
+            let job = created.job();
+            until(|| state(address, job) == "completed");
+            until(|| running.control.held() == (0, 0));
+            assert_eq!(jobs_named(&handle, "c2f1 refused").len(), 1);
+            assert_eq!(target.requests(), 1);
             running.stop();
         }
 

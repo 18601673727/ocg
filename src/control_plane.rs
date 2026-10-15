@@ -89,6 +89,9 @@ use crate::persistence::{ExecutionMode, JobId, JobOutputRecord, JobRecord, Outpu
 
 mod submissions;
 
+#[cfg(test)]
+pub(crate) use submissions::resolution_seam;
+
 /// The loopback TCP port the listener binds, from 1 to 65535.
 pub const PORT_VARIABLE: &str = "OCG_CONTROL_PORT";
 /// The bearer token every request must present. It is never logged.
