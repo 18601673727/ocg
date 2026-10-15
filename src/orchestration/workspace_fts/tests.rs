@@ -1215,9 +1215,14 @@ fn sparse_phrase_verification_agrees_with_exhaustive_token_streams() {
             "HTTPServer snake_case café École 東京\nalpha\nbeta gamma\n".as_bytes(),
         ),
         ("d.rs", b"beta alpha alpha gamma beta\n"),
+        (
+            "e.rs",
+            "α CAFÉ\nÉCOLE café école\nbeta beta beta\n".as_bytes(),
+        ),
     ];
     let setup = setup("sparse-oracle", files);
     let fts = indexed(&setup);
+    let index = fts.lock().index.clone().expect("snapshot");
     let pieces = [
         "alpha",
         "beta",
@@ -1225,6 +1230,9 @@ fn sparse_phrase_verification_agrees_with_exhaustive_token_streams() {
         "\"alpha gamma\"",
         "\"alpha beta\"",
         "\"beta beta\"",
+        "\"beta beta beta\"",
+        "\"CAFÉ ÉCOLE\"",
+        "missing",
         "HTTPServer",
         "snake_case",
         "CAFÉ",
@@ -1235,6 +1243,35 @@ fn sparse_phrase_verification_agrees_with_exhaustive_token_streams() {
         for second in pieces {
             let query = format!("{first} {second}");
             let parsed = parse(&query).expect("query");
+            let stop = AtomicBool::new(false);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for document in &index.documents {
+                let mut full = Vec::new();
+                tokenize(&document.text, &mut |lower, start, _| {
+                    full.push((lower.to_owned(), start));
+                });
+                let exhaustive = Scanned {
+                    tokens: full
+                        .iter()
+                        .enumerate()
+                        .map(|(position, (lower, start))| ScannedToken {
+                            lower,
+                            start: *start,
+                            line: line_of(&document.line_starts, *start),
+                            position: position as u32,
+                        })
+                        .collect(),
+                };
+                let sparse = scan_document(document, &parsed, &stop, deadline).expect("scan");
+                assert_eq!(
+                    matching_lines(document, &sparse, &parsed, &stop, deadline)
+                        .expect("sparse lines"),
+                    matching_lines(document, &exhaustive, &parsed, &stop, deadline)
+                        .expect("exhaustive lines"),
+                    "exact line counts, terms and byte offsets: {query} in {}",
+                    document.path,
+                );
+            }
             let mut expected = files
                 .iter()
                 .filter_map(|(path, text)| {
@@ -1291,4 +1328,32 @@ fn excerpt_keeps_a_maximum_length_token_after_multibyte_padding() {
         hit["offset"].as_u64().expect("offset") - hit["excerpt_offset"].as_u64().expect("window");
     assert!(excerpt.len() <= MAX_EXCERPT_BYTES);
     assert!(excerpt[start as usize..].starts_with(&term));
+}
+
+#[test]
+fn phrase_scan_and_matching_respect_cancellation_and_deadlines() {
+    let setup = setup(
+        "phrase-query-stop",
+        &[("a.rs", b"alpha gap beta alpha\nbeta beta\n")],
+    );
+    let fts = indexed(&setup);
+    let index = fts.lock().index.clone().expect("snapshot");
+    let document = &index.documents[0];
+    let query = parse("\"alpha beta\"").expect("query");
+    let stop = AtomicBool::new(false);
+    let future = Instant::now() + Duration::from_secs(10);
+    let scanned = scan_document(document, &query, &stop, future).expect("scan");
+    for (cancelled, deadline, expected) in [
+        (true, future, SearchRefusal::Stopped),
+        (false, Instant::now(), SearchRefusal::QueryTime),
+    ] {
+        stop.store(cancelled, Ordering::Relaxed);
+        assert!(
+            matches!(scan_document(document, &query, &stop, deadline), Err(reason) if reason == expected)
+        );
+        assert_eq!(
+            matching_lines(document, &scanned, &query, &stop, deadline),
+            Err(expected)
+        );
+    }
 }

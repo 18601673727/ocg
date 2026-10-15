@@ -426,16 +426,16 @@ struct ParsedQuery {
 /// One scanned subtoken: its lowercased form, the byte offset where it
 /// starts in the text, and its line.
 #[derive(Debug)]
-struct ScannedToken {
-    lower: String,
+struct ScannedToken<'query> {
+    lower: &'query str,
     start: u32,
     line: u32,
     position: u32,
 }
 
 /// Every subtoken occurrence of one document, in stream order.
-struct Scanned {
-    tokens: Vec<ScannedToken>,
+struct Scanned<'query> {
+    tokens: Vec<ScannedToken<'query>>,
 }
 
 /// Splits `text` into lowercased subtokens and hands each to `sink` with its
@@ -1176,12 +1176,12 @@ fn search_index(
 
 /// Every subtoken occurrence of `document`, with its line, in stream order.
 /// Phrase adjacency is over `position`, so a phrase may span lines.
-fn scan_document(
+fn scan_document<'query>(
     document: &Document,
-    query: &ParsedQuery,
+    query: &'query ParsedQuery,
     stop: &AtomicBool,
     deadline: Instant,
-) -> Result<Scanned, SearchRefusal> {
+) -> Result<Scanned<'query>, SearchRefusal> {
     let mut tokens = Vec::new();
     let mut position = 0u32;
     let mut interrupted = false;
@@ -1199,9 +1199,9 @@ fn scan_document(
             }
             // Keep only query terms. Positions preserve adjacency across omitted
             // tokens, without allocating a String and line lookup for every word.
-            if query.subtokens.iter().any(|term| term == lower) {
+            if let Some(term) = query.subtokens.iter().find(|term| *term == lower) {
                 tokens.push(ScannedToken {
-                    lower: lower.to_owned(),
+                    lower: term,
                     start,
                     line: line_of(&document.line_starts, start),
                     position,
@@ -1231,7 +1231,7 @@ type MatchingLine = (usize, u32, u32, Vec<String>);
 
 fn matching_lines(
     document: &Document,
-    scanned: &Scanned,
+    scanned: &Scanned<'_>,
     query: &ParsedQuery,
     stop: &AtomicBool,
     deadline: Instant,
