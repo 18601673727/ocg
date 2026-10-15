@@ -12,8 +12,8 @@ use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseError, DatabaseHandle};
 use ocg::host::{self, HostError};
 use ocg::persistence::{
-    ExecutorId, ExecutorType, LlmConfig, LlmParameters, LlmTransport, ModelCapability, NewExecutor,
-    NewLlmProvider, NewProfile, NewProfileConfig, ProfileConfig, ProfileId,
+    AgentConfig, ExecutorId, ExecutorType, LlmConfig, LlmParameters, LlmTransport, ModelCapability,
+    NewExecutor, NewLlmProvider, NewProfile, NewProfileConfig, ProfileConfig, ProfileId,
 };
 
 /// The command that registers the Control Plane's LLM target.
@@ -163,6 +163,36 @@ pub async fn targets(
     Ok((executor, profile))
 }
 
+/// The Agent Profile that targets `llm_profile` with no instructions of its
+/// own, found by what it is, or registered, so a submission can name an
+/// Agent Profile without the operator configuring one first.
+pub async fn agent_profile(
+    database: &DatabaseHandle,
+    llm_profile: ProfileId,
+) -> Result<ProfileId, DatabaseError> {
+    let existing = database
+        .profiles(None, 1_000)
+        .await?
+        .into_iter()
+        .find(|record| {
+            record.name == CONTROL_PLANE
+                && record.config == ProfileConfig::Agent(AgentConfig::default())
+                && record.llm_targets == [llm_profile]
+        });
+    if let Some(record) = existing {
+        return Ok(record.id);
+    }
+    database
+        .create_profile(NewProfile {
+            name: CONTROL_PLANE.to_owned(),
+            config: NewProfileConfig::Agent {
+                config: AgentConfig::default(),
+                llm_targets: vec![llm_profile],
+            },
+        })
+        .await
+}
+
 /// `ocg register-llm`: registers, or finds, the Control Plane's chat target
 /// named by the environment, and prints the identities a submission names,
 /// as one JSON object on standard output.
@@ -170,14 +200,23 @@ pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Er
     let registered = std::rc::Rc::new(std::cell::RefCell::new(None));
     let slot = registered.clone();
     host::run_hosted(data_directory, false, move |context| async move {
-        *slot.borrow_mut() = Some(targets(context.database(), &target).await);
+        let database = context.database();
+        let outcome = match targets(database, &target).await {
+            Ok((executor, llm_profile)) => agent_profile(database, llm_profile)
+                .await
+                .map(|agent_profile| (executor, llm_profile, agent_profile)),
+            Err(error) => Err(error),
+        };
+        *slot.borrow_mut() = Some(outcome);
     })?;
-    let (executor, llm_profile) = registered.borrow_mut().take().ok_or(Error::NotRun)??;
+    let (executor, llm_profile, agent_profile) =
+        registered.borrow_mut().take().ok_or(Error::NotRun)??;
     println!(
         "{}",
         serde_json::json!({
             "executor": executor.to_string(),
             "llm_profile": llm_profile.to_string(),
+            "agent_profile": agent_profile.to_string(),
         })
     );
     Ok(())

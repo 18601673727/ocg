@@ -48,6 +48,14 @@
 //!   Providers or credentials.
 //! - `GET /api/v1/jobs/{job}`: the Job's persisted lifecycle, with `job`
 //!   written as OCG writes it, `job:<n>`.
+//! - `GET /api/v1/jobs/{job}/input`: the Job's frozen input as stored: its
+//!   objective as text, which the Job record names only by identity, its
+//!   Attachments by identity, and the Profiles and model it was frozen with.
+//!   Nothing of a Provider's endpoint or credential. See [`catalog`].
+//! - `GET /api/v1/agent-profiles?before=profile:N&limit=M`: Agent Profiles,
+//!   newest first, each with the LLM Profiles it may run with and the
+//!   Executors that can run each now. A page reads `limit` Profiles of either
+//!   kind, so it may list fewer; `next_before` continues it. See [`catalog`].
 //! - `GET /api/v1/jobs/{job}/outputs?after_seq=N&limit=M`: the Job's
 //!   outputs as stored, in `seq` order, strictly after `after_seq`, at most
 //!   `limit` ([`MAX_OUTPUT_PAGE`]) of them, with the cursor of the next page.
@@ -58,9 +66,11 @@
 //!   a client reads it with an authenticated `fetch`. See [`events`].
 //! - `POST /api/v1/jobs`: submits one Provider Job, under the request's one
 //!   `Idempotency-Key`, of `{"llm_profile": "profile:<n>", "executor":
-//!   "executor:<n>", "objective": "...", "name": "..."}`, `name` optional:
-//!   an existing LLM Profile and an Executor that can run it, both checked
-//!   here and again when the Job is created. No tool is offered, and
+//!   "executor:<n>", "objective": "...", "name": "...", "agent_profile":
+//!   "profile:<n>"}`, `name` and `agent_profile` optional: an existing LLM
+//!   Profile and an Executor that can run it, and an Agent Profile that
+//!   targets that LLM Profile, all checked here and again when the Job is
+//!   created. No tool is offered, and
 //!   nothing of a Provider, credential or command is accepted. The answer
 //!   is `{"admission": {"status", "job"}}`: `201` when this request created
 //!   the Job, `200` when the key already named it, `202` with `pending`
@@ -109,10 +119,11 @@ use serde_json::{Value, json};
 
 use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::orchestration::execution_runtime::SchedulerHandle;
-use crate::persistence::{ExecutionMode, JobId, JobOutputRecord, JobRecord, OutputKind};
+use crate::persistence::{ExecutionMode, JobId, JobOutputRecord, JobRecord, OutputKind, ProfileId};
 
 mod assets;
 mod browser;
+mod catalog;
 mod events;
 mod submissions;
 
@@ -1041,6 +1052,11 @@ fn authenticated(headers: &HeaderMap, token: &Token) -> bool {
 enum Route {
     Health,
     Job(JobId),
+    JobInput(JobId),
+    AgentProfiles {
+        before: Option<ProfileId>,
+        limit: usize,
+    },
     Outputs {
         job: JobId,
         after_seq: Option<i64>,
@@ -1073,6 +1089,8 @@ fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal> {
             Caller::Operator(_),
             Route::Health
             | Route::Job(_)
+            | Route::JobInput(_)
+            | Route::AgentProfiles { .. }
             | Route::Outputs { .. }
             | Route::Events { .. }
             | Route::Admission
@@ -1119,6 +1137,12 @@ fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
         }
+        ["jobs", job, "input"] => {
+            let job = job_id(job)?;
+            no_query(query).map(|()| Route::JobInput(job))
+        }
+        ["agent-profiles"] => catalog::agent_profile_query(query)
+            .map(|(before, limit)| Route::AgentProfiles { before, limit }),
         ["jobs", job, "outputs"] => {
             let job = job_id(job)?;
             let (after_seq, limit) = output_query(query)?;
@@ -1201,6 +1225,10 @@ async fn respond(
             Ok(Reply::ok(
                 json!({"api_version": API_VERSION, "job": job_json(&record)?}),
             ))
+        }
+        Route::JobInput(job) => catalog::job_input(database, job).await,
+        Route::AgentProfiles { before, limit } => {
+            catalog::agent_profiles(database, before, limit).await
         }
         Route::Outputs {
             job,

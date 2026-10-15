@@ -20237,6 +20237,303 @@ mod requests_and_tool_loop {
         const LONG: Duration = Duration::from_secs(5);
         const SHORT: Duration = Duration::from_millis(200);
 
+        /// One Provider with two LLM Profiles, an Agent Profile that targets
+        /// only the first and an Executor, with every request the Provider
+        /// received recorded as sent.
+        struct Agented {
+            targeted: ProfileId,
+            untargeted: ProfileId,
+            agent: ProfileId,
+            executor: ExecutorId,
+            conversations: Arc<std::sync::Mutex<Vec<Value>>>,
+        }
+
+        fn agented(handle: &DatabaseHandle, name: &str) -> Agented {
+            let provider = provider(handle, name);
+            let targeted =
+                llm_profile(handle, provider, llm_config(name, &[ModelCapability::Chat]));
+            let untargeted = llm_profile(
+                handle,
+                provider,
+                llm_config(&format!("{name}-other"), &[ModelCapability::Chat]),
+            );
+            let agent = agent_profile(handle, "Answer in one sentence.", vec![targeted]);
+            let executor =
+                executor(handle, "llm worker", ExecutorType::Llm, &[OPENAI]).expect("register");
+            let conversations = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = conversations.clone();
+            provider_seam::install(&format!("https://{name}.invalid/v1"), move |conversation| {
+                recorded
+                    .lock()
+                    .expect("lock")
+                    .push(serde_json::to_value(conversation).expect("a serializable request"));
+                now(answering("Hello from the Agent", (5, 2)))
+            });
+            Agented {
+                targeted,
+                untargeted,
+                agent,
+                executor,
+                conversations,
+            }
+        }
+
+        #[test]
+        fn a_submission_may_name_an_agent_profile_that_targets_its_llm_profile() {
+            let (_root, directory) = data_directory("c2-agent-submission");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let configured = agented(&handle, "c2-agent");
+            let address = running.address();
+            let body = |agent: &str, llm: ProfileId, name: &str| {
+                json!({
+                    "agent_profile": agent,
+                    "llm_profile": llm.to_string(),
+                    "executor": configured.executor.to_string(),
+                    "objective": "Say hello",
+                    "name": name,
+                })
+                .to_string()
+            };
+
+            let job = admitted(
+                address,
+                "c2-agent-0000000000001",
+                &body(
+                    &configured.agent.to_string(),
+                    configured.targeted,
+                    "c2 agent job",
+                ),
+            );
+            until(|| state(address, job) == "completed");
+            let submitted = wait(handle.job_configuration(job))
+                .expect("read")
+                .expect("a configured Job");
+            assert_eq!(submitted.agent_profile, Some(configured.agent));
+            assert_eq!(submitted.llm_profile, configured.targeted);
+            assert_eq!(
+                submitted
+                    .frozen
+                    .agent
+                    .and_then(|agent| agent.instructions)
+                    .as_deref(),
+                Some("Answer in one sentence.")
+            );
+            let sent = configured.conversations.lock().expect("lock").clone();
+            let [request] = sent.as_slice() else {
+                panic!("one Provider request, got {}", sent.len());
+            };
+            let sent = request.to_string();
+            assert!(sent.contains("Answer in one sentence."), "{sent}");
+            assert!(sent.contains("Say hello"), "{sent}");
+
+            // The same key and request replay the Job; the Agent Profile is part of the request.
+            let replay = submit(
+                address,
+                "c2-agent-0000000000001",
+                &body(
+                    &configured.agent.to_string(),
+                    configured.targeted,
+                    "c2 agent job",
+                ),
+            );
+            assert_eq!((replay.status, replay.job()), (200, job), "{}", replay.body);
+            let conflict = submit(
+                address,
+                "c2-agent-0000000000001",
+                &body("profile:999999", configured.targeted, "c2 agent job"),
+            );
+            assert_eq!(conflict.error(), "idempotency_key_conflict");
+
+            let refusals = [
+                (
+                    "c2-agent-0000000000002",
+                    "profile:999999".to_owned(),
+                    configured.targeted,
+                    "agent_profile_not_found",
+                ),
+                (
+                    "c2-agent-0000000000003",
+                    configured.targeted.to_string(),
+                    configured.targeted,
+                    "agent_profile_not_found",
+                ),
+                (
+                    "c2-agent-0000000000004",
+                    configured.agent.to_string(),
+                    configured.untargeted,
+                    "llm_profile_not_targeted",
+                ),
+            ];
+            for (key, agent, llm, code) in refusals {
+                let refused = submit(address, key, &body(&agent, llm, "c2 refused"));
+                assert_eq!(refused.status, 422, "{}", refused.body);
+                assert_eq!(refused.error(), code);
+            }
+            assert!(jobs_named(&handle, "c2 refused").is_empty());
+            assert_eq!(configured.conversations.lock().expect("lock").len(), 1);
+            running.stop();
+        }
+
+        #[test]
+        fn a_jobs_input_is_read_as_text_and_names_no_provider_or_credential() {
+            let (_root, directory) = data_directory("c2-job-input");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let configured = agented(&handle, "c2-input");
+            let address = running.address();
+            let objective = "Line one\nLine two with é and \"quotes\"";
+            let with_agent = admitted(
+                address,
+                "c2-input-00000000001",
+                &json!({
+                    "agent_profile": configured.agent.to_string(),
+                    "llm_profile": configured.targeted.to_string(),
+                    "executor": configured.executor.to_string(),
+                    "objective": objective,
+                })
+                .to_string(),
+            );
+            let without_agent = admitted(
+                address,
+                "c2-input-00000000002",
+                &json!({
+                    "llm_profile": configured.targeted.to_string(),
+                    "executor": configured.executor.to_string(),
+                    "objective": "Plain",
+                })
+                .to_string(),
+            );
+            until(|| state(address, with_agent) == "completed");
+            until(|| state(address, without_agent) == "completed");
+
+            let answer = get(address, &format!("/api/v1/jobs/{with_agent}/input"));
+            assert_eq!(answer.status, 200, "{}", answer.body);
+            let input = answer.json()["input"].clone();
+            assert_eq!(input["objective"], objective);
+            assert_eq!(input["attachments"], json!([]));
+            assert_eq!(
+                input["configuration"],
+                json!({
+                    "agent_profile": configured.agent.to_string(),
+                    "llm_profile": configured.targeted.to_string(),
+                    "model": "c2-input",
+                })
+            );
+            let record = wait(handle.job(with_agent)).expect("read").expect("a Job");
+            assert_eq!(input["id"], record.input.to_string());
+            for secret in ["invalid", "C2-INPUT_KEY", "endpoint", "credential"] {
+                assert!(!answer.body.contains(secret), "{secret}: {}", answer.body);
+            }
+            let plain = get(address, &format!("/api/v1/jobs/{without_agent}/input")).json();
+            assert_eq!(plain["input"]["objective"], "Plain");
+            assert_eq!(
+                plain["input"]["configuration"]["agent_profile"],
+                Value::Null
+            );
+
+            let genesis = get(
+                address,
+                &format!("/api/v1/jobs/{}/input", running.handle.genesis()),
+            );
+            assert_eq!(genesis.status, 200, "{}", genesis.body);
+            assert_eq!(genesis.json()["input"]["configuration"], Value::Null);
+            assert_eq!(get(address, "/api/v1/jobs/job:999999/input").status, 404);
+            assert_eq!(get(address, "/api/v1/jobs/job:1/input?x=1").status, 400);
+            running.stop();
+        }
+
+        #[test]
+        fn agent_profiles_are_listed_with_their_llm_targets_and_executors() {
+            let (_root, directory) = data_directory("c2-agent-list");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let configured = agented(&handle, "c2-list");
+            let second = agent_profile(
+                &handle,
+                "Another.",
+                vec![configured.targeted, configured.untargeted],
+            );
+            let address = running.address();
+
+            let listed = get(address, "/api/v1/agent-profiles");
+            assert_eq!(listed.status, 200, "{}", listed.body);
+            let page = listed.json();
+            assert_eq!(page["has_more"], false);
+            let agents = page["agent_profiles"].as_array().expect("a list");
+            // Newest first; the LLM Profiles are not Agent Profiles.
+            let ids = agents
+                .iter()
+                .map(|agent| agent["id"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids,
+                [
+                    json!(second.to_string()),
+                    json!(configured.agent.to_string())
+                ]
+            );
+            let targets = agents[0]["llm_targets"].as_array().expect("targets");
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0]["id"], configured.targeted.to_string());
+            assert_eq!(targets[0]["model"], "c2-list");
+            assert_eq!(targets[0]["declared_capabilities"], json!(["chat"]));
+            assert_eq!(
+                targets[0]["executors"],
+                json!([configured.executor.to_string()])
+            );
+            for secret in ["invalid", "C2-LIST_KEY", "endpoint", "credential"] {
+                assert!(!listed.body.contains(secret), "{secret}: {}", listed.body);
+            }
+
+            // A page reads `limit` Profiles of either kind, newest first, and continues from its oldest.
+            let first = get(address, "/api/v1/agent-profiles?limit=1").json();
+            assert_eq!(first["agent_profiles"][0]["id"], second.to_string());
+            assert_eq!(first["has_more"], true);
+            let cursor = first["next_before"].as_str().expect("a cursor").to_owned();
+            let mut seen = vec![second.to_string()];
+            let mut before = cursor;
+            for _ in 0..8 {
+                let next = get(
+                    address,
+                    &format!("/api/v1/agent-profiles?limit=1&before={before}"),
+                )
+                .json();
+                for agent in next["agent_profiles"].as_array().expect("a list") {
+                    seen.push(agent["id"].as_str().expect("an id").to_owned());
+                }
+                match next["next_before"].as_str() {
+                    Some(cursor) => before = cursor.to_owned(),
+                    None => break,
+                }
+            }
+            assert_eq!(seen, [second.to_string(), configured.agent.to_string()]);
+
+            for refused in [
+                "?limit=0",
+                "?limit=101",
+                "?before=7",
+                "?after=profile:1",
+                "?limit",
+            ] {
+                let answer = get(address, &format!("/api/v1/agent-profiles{refused}"));
+                assert_eq!(
+                    (answer.status, answer.error().as_str()),
+                    (400, "invalid_request"),
+                    "{refused}"
+                );
+            }
+            let (host, address_host) = (host(address), address);
+            let anonymous = send(
+                address_host,
+                "GET /api/v1/agent-profiles",
+                &[("Host", &host)],
+                b"",
+            );
+            assert_eq!(anonymous.status, 401, "{}", anonymous.body);
+            running.stop();
+        }
+
         #[test]
         fn a_submission_is_admitted_once_and_answered_before_its_provider() {
             let (_root, directory) = data_directory("c2-admission");

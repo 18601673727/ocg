@@ -103,6 +103,16 @@ const PROFILE_NOT_FOUND: Refusal = Refusal::new(
     "llm_profile_not_found",
     "no such LLM Profile; nothing was submitted",
 );
+const AGENT_PROFILE_NOT_FOUND: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "agent_profile_not_found",
+    "no such Agent Profile; nothing was submitted",
+);
+const AGENT_TARGET_MISMATCH: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "llm_profile_not_targeted",
+    "the Agent Profile is not configured to run with that LLM Profile; nothing was submitted",
+);
 const EXECUTOR_NOT_FOUND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "executor_not_found",
@@ -135,11 +145,13 @@ const NOT_STOPPABLE: Refusal = Refusal::new(
 );
 
 /// A validated submission: an existing LLM Profile and Executor, by their
-/// persisted identities, an objective and, optionally, a Job name. Nothing
+/// persisted identities, an objective and, optionally, an Agent Profile
+/// that targets the LLM Profile and a Job name. Nothing
 /// else can be submitted: the Provider, its credential and the model come
 /// from the Profile, and no tool is offered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct JobRequest {
+    agent_profile: Option<ProfileId>,
     llm_profile: ProfileId,
     executor: ExecutorId,
     objective: String,
@@ -149,6 +161,8 @@ pub(super) struct JobRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireRequest {
+    #[serde(default)]
+    agent_profile: Option<String>,
     llm_profile: String,
     executor: String,
     objective: String,
@@ -177,6 +191,12 @@ impl JobRequest {
         let wire: WireRequest = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
         let llm_profile = identity(&wire.llm_profile, "profile:").ok_or(INVALID_BODY)?;
         let executor = identity(&wire.executor, "executor:").ok_or(INVALID_BODY)?;
+        let agent_profile = wire
+            .agent_profile
+            .as_deref()
+            .map(|agent| identity(agent, "profile:").ok_or(INVALID_BODY))
+            .transpose()?
+            .map(ProfileId::new);
         if !text(&wire.objective, MAX_OBJECTIVE_BYTES)
             || wire
                 .name
@@ -186,6 +206,7 @@ impl JobRequest {
             return Err(INVALID_BODY);
         }
         Ok(Self {
+            agent_profile,
             llm_profile: ProfileId::new(llm_profile),
             executor: ExecutorId::new(executor),
             objective: wire.objective,
@@ -211,6 +232,12 @@ impl JobRequest {
                 context.update(&(name.len() as u64).to_le_bytes());
                 context.update(name.as_bytes());
             }
+        }
+        // Appended only when named, so the fingerprint of a request without
+        // an Agent Profile is what it was before one could be named.
+        if let Some(agent) = self.agent_profile {
+            context.update(&[2]);
+            context.update(&agent.get().to_le_bytes());
         }
         RequestFingerprint::from_digest(sha256(context))
     }
@@ -784,7 +811,8 @@ async fn admit(
     }
 }
 
-/// Refuses a Profile that is not an existing LLM Profile, and an Executor
+/// Refuses a Profile that is not an existing LLM Profile, an Agent Profile
+/// that does not exist or does not target it, and an Executor
 /// that does not exist or cannot run it now. The creation checks both again
 /// in its own transaction.
 async fn check_configuration(
@@ -795,6 +823,16 @@ async fn check_configuration(
         Ok(Some(_)) => {}
         Ok(None) | Err(DatabaseError::WrongProfileKind(_)) => return Err(PROFILE_NOT_FOUND),
         Err(error) => return Err(error.into()),
+    }
+    if let Some(agent_profile) = request.agent_profile {
+        match database.agent_profile(agent_profile).await {
+            Ok(Some(agent)) if agent.links.contains(&request.llm_profile) => {}
+            Ok(Some(_)) => return Err(AGENT_TARGET_MISMATCH),
+            Ok(None) | Err(DatabaseError::WrongProfileKind(_)) => {
+                return Err(AGENT_PROFILE_NOT_FOUND);
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     if database.executor(request.executor).await?.is_none() {
         return Err(EXECUTOR_NOT_FOUND);
@@ -830,7 +868,7 @@ fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan
             projects: Vec::new(),
             dependencies: Vec::new(),
             configuration: Some(ExecutionConfiguration {
-                agent_profile: None,
+                agent_profile: request.agent_profile,
                 llm_profile: request.llm_profile,
             }),
             assigned_executor: None,
@@ -971,6 +1009,7 @@ mod tests {
             br#"{"llm_profile":"profile:4","executor":"executor:2","objective":"Say hi"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:3","objective":"Say hi"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi","name":"n"}"#,
+            br#"{"agent_profile":"profile:2","llm_profile":"profile:3","executor":"executor:2","objective":"Say hi"}"#,
         ] {
             let other = JobRequest::parse(other).expect("valid");
             assert_ne!(request.fingerprint(), other.fingerprint(), "{other:?}");
@@ -991,6 +1030,9 @@ mod tests {
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"   "}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"a\u0000b"}"#,
             br#"{"llm_profile":"3","executor":"executor:2","objective":"o"}"#,
+            br#"{"agent_profile":"2","llm_profile":"profile:3","executor":"executor:2","objective":"o"}"#,
+            br#"{"agent_profile":"profile:02","llm_profile":"profile:3","executor":"executor:2","objective":"o"}"#,
+            br#"{"agent_profile":"executor:2","llm_profile":"profile:3","executor":"executor:2","objective":"o"}"#,
             br#"{"llm_profile":"profile:03","executor":"executor:2","objective":"o"}"#,
             br#"{"llm_profile":"profile:3","executor":"job:2","objective":"o"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","tools":[]}"#,
