@@ -18,21 +18,28 @@
 //!
 //! Every request must:
 //!
-//! - use `GET`, or `POST` on a route that submits or stops;
+//! - use `GET`, or `POST` or `DELETE` on the routes that take them;
 //! - name the listener exactly in `Host`: `127.0.0.1:<port>` or
 //!   `localhost:<port>` with the bound port, so a page served from any
 //!   other name, rebound to this address, is refused;
 //! - when it carries `Origin`, name the same origin over `http`, and when
 //!   it carries `Sec-Fetch-Site`, be `same-origin` or `none`;
-//! - carry `Authorization: Bearer <token>` with the configured token;
-//! - carry no body, except a submission, whose body must be JSON, declared
-//!   `application/json` with its one `Content-Length`, at most
-//!   [`MAX_SUBMISSION_BYTES`].
+//! - to reach the API, be authenticated as one of two kinds of client: a
+//!   programmatic client carrying `Authorization: Bearer <token>` with
+//!   the configured token, or the operator's browser carrying its session
+//!   cookie, whose state-changing requests must also carry that session's
+//!   CSRF token in `X-OCG-CSRF`. A request carrying both kinds of
+//!   credential, or neither, is refused;
+//! - carry no body, except a submission or a sign-in, whose body must be
+//!   JSON, declared `application/json` with its one `Content-Length`, at
+//!   most [`MAX_SUBMISSION_BYTES`] or [`browser::MAX_LOGIN_BYTES`].
 //!
 //! The connection's loopback peer authorizes nothing. No response carries
-//! a CORS header, a cookie or the token, and no route serves a file. A
-//! request is answered with a small JSON body, an error with a fixed code
-//! and message that repeats nothing the request or the database said.
+//! a CORS header or the token; only a sign-in and its sign-out set a
+//! cookie, and only the routes under `/api/` are API. When the operator
+//! named an exported frontend in [`UI_VARIABLE`], any other `GET` is
+//! answered with that frontend's files from that directory alone, never
+//! from anywhere else on disk; see [`assets`].
 //!
 //! Routes, all versioned under `/api/v1`:
 //!
@@ -71,9 +78,20 @@
 //!   `not_stoppable` for a Job with no execution here, such as one of an
 //!   earlier process. A requested stop is not an outcome: the Job's record
 //!   says how it settled.
+//! - `POST /api/v1/session`: signs the operator's browser in under the
+//!   pairing code this run printed for its operator, and sets its session
+//!   cookie; `GET /api/v1/session` reports that session and the CSRF
+//!   token its requests carry; `DELETE /api/v1/session` revokes it and
+//!   clears the cookie. The browser's alone: a bearer token reaches none
+//!   of them. See [`browser`].
+//!
+//! A request is answered with a small JSON body, an error with a fixed
+//! code and message that repeats nothing the request or the database
+//! said.
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -93,6 +111,8 @@ use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::orchestration::execution_runtime::SchedulerHandle;
 use crate::persistence::{ExecutionMode, JobId, JobOutputRecord, JobRecord, OutputKind};
 
+mod assets;
+mod browser;
 mod events;
 mod submissions;
 
@@ -105,6 +125,10 @@ pub(crate) use submissions::resolution_seam;
 pub const PORT_VARIABLE: &str = "OCG_CONTROL_PORT";
 /// The bearer token every request must present. It is never logged.
 pub const TOKEN_VARIABLE: &str = "OCG_CONTROL_TOKEN";
+/// The directory of the exported frontend the listener serves to the
+/// operator's browser. Optional: without it no file is served and no
+/// browser signs in.
+pub const UI_VARIABLE: &str = "OCG_UI_DIR";
 
 /// The version of the JSON this listener answers.
 pub const API_VERSION: u32 = 1;
@@ -174,6 +198,8 @@ pub enum ConfigError {
         "{TOKEN_VARIABLE} must be a random token of {MIN_TOKEN_CHARS} to {MAX_TOKEN_CHARS} characters of A-Z, a-z, 0-9, '-', '.', '_', '~', '+', '/' or '='"
     )]
     InvalidToken,
+    #[error("{UI_VARIABLE} must name an existing directory of the exported frontend")]
+    InvalidUiDirectory,
 }
 
 /// What the operator configured for the Control Plane.
@@ -181,6 +207,8 @@ pub enum ConfigError {
 pub struct ControlPlaneConfig {
     port: u16,
     token: Token,
+    /// The directory of the exported frontend, when one is served.
+    ui_dir: Option<PathBuf>,
     /// The largest response body.
     response_bytes: usize,
     /// How long a submission waits for its admission.
@@ -220,7 +248,18 @@ impl ControlPlaneConfig {
                     .filter(|port| *port != 0)
                     .ok_or(ConfigError::InvalidPort)?;
                 let token = token.map_err(|_| ConfigError::InvalidToken)?;
-                Self::new(port, &token).map(Some)
+                let ui_dir = match source(UI_VARIABLE) {
+                    None => None,
+                    Some(Err(_)) => return Err(ConfigError::InvalidUiDirectory),
+                    Some(Ok(directory)) => {
+                        let directory = PathBuf::from(directory);
+                        if !directory.is_dir() {
+                            return Err(ConfigError::InvalidUiDirectory);
+                        }
+                        Some(directory)
+                    }
+                };
+                Self::new(port, &token).map(|config| Some(Self { ui_dir, ..config }))
             }
         }
     }
@@ -248,6 +287,7 @@ impl ControlPlaneConfig {
         Ok(Self {
             port,
             token: Token(token.into()),
+            ui_dir: None,
             response_bytes: RESPONSE_BYTES,
             admission_wait: ADMISSION_WAIT,
             stream_limits: events::StreamLimits::default(),
@@ -303,6 +343,11 @@ pub enum StartError {
         #[source]
         source: std::io::Error,
     },
+    #[error("the control plane cannot serve the frontend in {UI_VARIABLE}: {source}")]
+    Ui {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("the control plane could not start serving: {0}")]
     Serve(#[source] std::io::Error),
 }
@@ -341,6 +386,19 @@ impl ControlPlane {
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).map_err(bind)?;
         let address = listener.local_addr().map_err(bind)?;
+        let assets = match config.ui_dir.as_deref() {
+            Some(directory) => Some(
+                assets::UiAssets::open(directory).map_err(|source| StartError::Ui { source })?,
+            ),
+            None => None,
+        };
+        // The browser surface is exactly the one the frontend serves in:
+        // no UI directory, no session.
+        let browser = assets
+            .is_some()
+            .then(browser::State::start)
+            .transpose()
+            .map_err(|_| StartError::Serve(std::io::Error::other("no randomness for sign-in")))?;
         let shared = Arc::new(Shared {
             database,
             scheduler,
@@ -350,6 +408,8 @@ impl ControlPlane {
             response_bytes: config.response_bytes,
             admission_wait: config.admission_wait,
             stream_limits: config.stream_limits,
+            assets,
+            browser,
             streams: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             #[cfg(test)]
@@ -423,6 +483,16 @@ impl ControlPlane {
         self.address
     }
 
+    /// The pairing code its operator signs a browser in with, when the
+    /// browser surface is served. It is shown to the operator alone, and
+    /// is not the bearer token.
+    pub fn pairing_code(&self) -> Option<String> {
+        self.shared
+            .browser
+            .as_ref()
+            .map(|browser| browser.pairing_code().to_owned())
+    }
+
     /// How many Jobs it admitted whose execution has not returned, and how
     /// many keys it holds unresolved.
     #[cfg(test)]
@@ -479,6 +549,10 @@ struct Shared {
     response_bytes: usize,
     admission_wait: Duration,
     stream_limits: events::StreamLimits,
+    /// The exported frontend, when one is served.
+    assets: Option<assets::UiAssets>,
+    /// The browser's sign-in and its one session, with the frontend.
+    browser: Option<browser::State>,
     /// How many event streams are open.
     streams: AtomicUsize,
     /// Set once the listener stops.
@@ -529,19 +603,33 @@ impl Refusal {
     }
 }
 
-/// An answered request: its status and JSON body.
+/// An answered request: its status and JSON body, and a cookie when the
+/// answer signs a browser in or out.
 struct Reply {
     status: StatusCode,
     body: Value,
+    cookie: Option<String>,
 }
 
 impl Reply {
     fn new(status: StatusCode, body: Value) -> Self {
-        Self { status, body }
+        Self {
+            status,
+            body,
+            cookie: None,
+        }
     }
 
     fn ok(body: Value) -> Self {
         Self::new(StatusCode::OK, body)
+    }
+
+    fn with_cookie(status: StatusCode, body: Value, cookie: String) -> Self {
+        Self {
+            status,
+            body,
+            cookie: Some(cookie),
+        }
     }
 }
 
@@ -575,6 +663,11 @@ const METHOD_NOT_ALLOWED: Refusal = Refusal::new(
 const ONLY_POST: Refusal = Refusal {
     message: "only POST is accepted",
     allow: "POST",
+    ..METHOD_NOT_ALLOWED
+};
+const SESSION_METHODS: Refusal = Refusal {
+    message: "only GET, POST or DELETE is accepted",
+    allow: "GET, POST, DELETE",
     ..METHOD_NOT_ALLOWED
 };
 const URI_TOO_LONG: Refusal = Refusal::new(
@@ -669,17 +762,42 @@ async fn answer(
     payload: web::types::Payload,
     shared: web::types::State<Arc<Shared>>,
 ) -> HttpResponse {
-    match admit(&request, &shared).and_then(|()| route(&request)) {
-        Ok(Route::Events { job, after_seq }) => {
-            events::open(&shared, request.io().cloned(), job, after_seq)
-                .await
-                .unwrap_or_else(|refusal| refusal.response())
-        }
-        Ok(route) => match respond(route, &request, payload, &shared).await {
-            Ok(reply) => json_response(reply.status, &reply.body),
+    match admit(&request, &shared) {
+        Err(refusal) => refusal.response(),
+        Ok(Destination::Asset) => match shared
+            .assets
+            .as_ref()
+            .map(|assets| assets.serve(request.path()))
+            .unwrap_or(Err(NOT_FOUND))
+        {
+            Ok(asset) => assets::response(asset),
             Err(refusal) => refusal.response(),
         },
-        Err(refusal) => refusal.response(),
+        Ok(Destination::Api(caller)) => {
+            match route(&request).and_then(|route| authorize(&caller, route)) {
+                Ok(Route::Events { job, after_seq }) => {
+                    events::open(&shared, request.io().cloned(), job, after_seq)
+                        .await
+                        .unwrap_or_else(|refusal| refusal.response())
+                }
+                Ok(route) => match respond(route, &caller, &request, payload, &shared).await {
+                    Ok(reply) => {
+                        let mut response = json_response(reply.status, &reply.body);
+                        if let Some(cookie) = &reply.cookie {
+                            match HeaderValue::from_str(cookie) {
+                                Ok(value) => {
+                                    response.headers_mut().insert(header::SET_COOKIE, value);
+                                }
+                                Err(_) => return INTERNAL.response(),
+                            }
+                        }
+                        response
+                    }
+                    Err(refusal) => refusal.response(),
+                },
+                Err(refusal) => refusal.response(),
+            }
+        }
     }
 }
 
@@ -696,8 +814,30 @@ fn takes_post(path: &str) -> bool {
     }
 }
 
-/// Checks everything about a request but its route.
-fn admit(request: &HttpRequest, shared: &Shared) -> Result<(), Refusal> {
+/// Where an admitted request is answered from.
+enum Destination {
+    /// The exported frontend's files.
+    Asset,
+    /// An API route, for one caller.
+    Api(Caller),
+}
+
+/// Who an API request is.
+#[derive(Clone)]
+enum Caller {
+    /// A programmatic client carrying the bearer token.
+    Programmatic,
+    /// The operator's browser, within its session.
+    Operator(browser::Session),
+    /// No one yet: only the sign-in, which needs this run's pairing code
+    /// and nothing else.
+    Anonymous,
+}
+
+/// Checks everything about a request but its route: its shape, that it
+/// names this listener and its own origin, who it is, and what it may
+/// carry.
+fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destination, Refusal> {
     let headers = request.headers();
     let header_bytes = headers
         .iter()
@@ -709,10 +849,22 @@ fn admit(request: &HttpRequest, shared: &Shared) -> Result<(), Refusal> {
     if request.path().len() > MAX_PATH_BYTES || request.query_string().len() > MAX_QUERY_BYTES {
         return Err(URI_TOO_LONG);
     }
-    let takes_post = takes_post(request.path());
+    let path = request.path();
+    let login = path == "/api/v1/session";
+    let api = login || path.starts_with("/api/");
+    let takes_post = takes_post(path);
     let method = request.method();
-    if method != Method::GET && !(takes_post && method == Method::POST) {
-        return Err(if takes_post {
+    let allowed = if login {
+        *method == Method::GET || *method == Method::POST || *method == Method::DELETE
+    } else if api {
+        *method == Method::GET || (takes_post && *method == Method::POST)
+    } else {
+        *method == Method::GET
+    };
+    if !allowed {
+        return Err(if login {
+            SESSION_METHODS
+        } else if takes_post {
             ONLY_POST
         } else {
             METHOD_NOT_ALLOWED
@@ -724,11 +876,39 @@ fn admit(request: &HttpRequest, shared: &Shared) -> Result<(), Refusal> {
     if !same_origin(headers, &host) {
         return Err(FORBIDDEN_ORIGIN);
     }
-    if !authenticated(headers, &shared.token) {
-        return Err(UNAUTHENTICATED);
+    if !api {
+        // The frontend's files are the same shell for every reader on this
+        // machine: all application data and every command is API, and
+        // refused there without its credential.
+        return Ok(Destination::Asset);
     }
-    if method == Method::POST && request.path() == "/api/v1/jobs" {
-        return submission_body(headers);
+    let caller = if login && method == Method::POST {
+        // A sign-in carries its own credential, this run's pairing code;
+        // the bearer API has no use for it.
+        if headers.get_all(header::AUTHORIZATION).count() != 0 {
+            return Err(NOT_FOUND);
+        }
+        Caller::Anonymous
+    } else {
+        authenticate(headers, shared)?
+    };
+    if matches!(caller, Caller::Operator(_)) && method != Method::GET {
+        let Caller::Operator(session) = &caller else {
+            return Err(INTERNAL);
+        };
+        if !shared
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.csrf_matches(session, headers))
+        {
+            return Err(browser::FORBIDDEN_CSRF);
+        }
+    }
+    if method == Method::POST && path == "/api/v1/jobs" {
+        return submission_body(headers).map(|()| Destination::Api(caller));
+    }
+    if login && method == Method::POST {
+        return browser::login_body(headers).map(|()| Destination::Api(caller));
     }
     let length = headers.get_all(header::CONTENT_LENGTH).collect::<Vec<_>>();
     if headers.contains_key(header::TRANSFER_ENCODING)
@@ -739,7 +919,29 @@ fn admit(request: &HttpRequest, shared: &Shared) -> Result<(), Refusal> {
     {
         return Err(BODY_NOT_ACCEPTED);
     }
-    Ok(())
+    Ok(Destination::Api(caller))
+}
+
+/// The request's one credential, or refusal: exactly one of the bearer
+/// token and a live session cookie. A request with both, with a
+/// duplicated header, or with a cookie that names no live session, is
+/// refused rather than believed in part.
+fn authenticate(headers: &HeaderMap, shared: &Shared) -> Result<Caller, Refusal> {
+    let credentials = headers.get_all(header::AUTHORIZATION).count();
+    let presented = browser::presented(headers);
+    match (credentials, &presented) {
+        (0, browser::Presented::None) => Err(UNAUTHENTICATED),
+        (1, browser::Presented::None) if authenticated(headers, &shared.token) => {
+            Ok(Caller::Programmatic)
+        }
+        (0, browser::Presented::One(_)) => shared
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.session(&presented))
+            .map(Caller::Operator)
+            .ok_or(UNAUTHENTICATED),
+        _ => Err(UNAUTHENTICATED),
+    }
 }
 
 /// A submission's body is declared JSON, with exactly one length, and no
@@ -851,6 +1053,37 @@ enum Route {
     Submit,
     Admission,
     Stop(JobId),
+    SessionCreate,
+    SessionStatus,
+    SessionRevoke,
+}
+
+/// Whether `caller` may use `route`: the API routes a signed-in browser
+/// may use are named one by one, and everything unnamed is refused to it.
+/// The session routes are the browser's alone.
+fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal> {
+    let allowed = match (caller, &route) {
+        (Caller::Anonymous, Route::SessionCreate) => true,
+        (
+            Caller::Programmatic,
+            Route::SessionCreate | Route::SessionStatus | Route::SessionRevoke,
+        ) => false,
+        (Caller::Programmatic, _) => true,
+        (
+            Caller::Operator(_),
+            Route::Health
+            | Route::Job(_)
+            | Route::Outputs { .. }
+            | Route::Events { .. }
+            | Route::Admission
+            | Route::Submit
+            | Route::Stop(_)
+            | Route::SessionStatus
+            | Route::SessionRevoke,
+        ) => true,
+        (Caller::Operator(_) | Caller::Anonymous, _) => false,
+    };
+    if allowed { Ok(route) } else { Err(NOT_FOUND) }
 }
 
 fn route(request: &HttpRequest) -> Result<Route, Refusal> {
@@ -868,12 +1101,20 @@ fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 let job = job_id(job)?;
                 no_query(query).map(|()| Route::Stop(job))
             }
+            ["session"] => no_query(query).map(|()| Route::SessionCreate),
+            _ => Err(NOT_FOUND),
+        };
+    }
+    if request.method() == Method::DELETE {
+        return match segments.as_slice() {
+            ["session"] => no_query(query).map(|()| Route::SessionRevoke),
             _ => Err(NOT_FOUND),
         };
     }
     match segments.as_slice() {
         ["health"] => no_query(query).map(|()| Route::Health),
         ["admissions"] => no_query(query).map(|()| Route::Admission),
+        ["session"] => no_query(query).map(|()| Route::SessionStatus),
         ["jobs", job] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
@@ -947,6 +1188,7 @@ fn output_query(query: &str) -> Result<(Option<i64>, usize), Refusal> {
 
 async fn respond(
     route: Route,
+    caller: &Caller,
     request: &HttpRequest,
     payload: web::types::Payload,
     shared: &Arc<Shared>,
@@ -976,6 +1218,22 @@ async fn respond(
             submissions::lookup(shared, key).await
         }
         Route::Stop(job) => submissions::stop(shared, job).await,
+        Route::SessionCreate => {
+            let body = read_body(payload, browser::MAX_LOGIN_BYTES).await?;
+            let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
+            browser.login(&body)
+        }
+        Route::SessionStatus => match caller {
+            Caller::Operator(session) => Ok(Reply::ok(browser::described(session))),
+            _ => Err(NOT_FOUND),
+        },
+        Route::SessionRevoke => match caller {
+            Caller::Operator(session) => {
+                let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
+                Ok(browser.logout(session))
+            }
+            _ => Err(NOT_FOUND),
+        },
         // Answered as a stream, before any reply.
         Route::Events { .. } => Err(INTERNAL),
     }

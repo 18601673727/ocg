@@ -398,6 +398,13 @@ where
                 log::info!("control plane listening on http://{address}");
                 eprintln!("OCG control plane listening on http://{address}");
             }
+            // The sign-in code is for the operator alone, on this machine:
+            // it is not the bearer token and reveals none of it. Each run
+            // prints its own, and only that one signs a browser in.
+            if let Some(pairing) = listener.as_ref().and_then(ControlPlane::pairing_code) {
+                log::info!("local browser pairing code: {pairing}");
+                eprintln!("OCG local browser pairing code: {pairing}");
+            }
             eprintln!("OCG aggregation service running as {}", service.job());
             until_stopped(context).await;
             if let Some(listener) = listener
