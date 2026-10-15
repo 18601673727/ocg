@@ -29,7 +29,17 @@ function formatMicros(micros: number | null): string {
   return micros === null ? "—" : new Date(micros / 1000).toLocaleString();
 }
 
+function failureText(failure: { code: string; scope: "read" | "stream" }): string {
+  if (failure.code === "job_not_found") return "No such Job.";
+  if (failure.code === "unauthenticated") return "This session is no longer signed in.";
+  return failure.scope === "stream"
+    ? `The stream failed (${failure.code}).`
+    : `This Job could not be read (${failure.code}).`;
+}
+
 const TONE: Record<string, string> = {
+  loading: "bg-muted text-muted-foreground",
+  unavailable: "bg-muted text-muted-foreground",
   unsettled: "bg-muted text-muted-foreground",
   completed: "bg-primary/10 text-primary",
   failed: "bg-destructive/10 text-destructive",
@@ -43,18 +53,36 @@ const TONE: Record<string, string> = {
  * stream is the stored history continued live, and a reconnect replays
  * from the last output this view processed, never twice.
  */
-export function JobWatch({
+export function JobWatch(props: {
+  client: HttpCanonicalControlClient;
+  jobId: string;
+  // The inspector shows the Job's record around its answer; chat shows the
+  // answer first and keeps the record one click away.
+  presentation?: "inspector" | "chat";
+}) {
+  // Retry re-runs the whole load (record, stored history, stream) from scratch.
+  const [attempt, setAttempt] = useState(0);
+  return <JobWatchBody key={attempt} {...props} onRetry={() => setAttempt((current) => current + 1)} />;
+}
+
+function JobWatchBody({
   client,
   jobId,
+  presentation = "inspector",
+  onRetry,
 }: {
   client: HttpCanonicalControlClient;
   jobId: string;
+  presentation?: "inspector" | "chat";
+  onRetry: () => void;
 }) {
   const [job, setJob] = useState<ControlJob | null>(null);
   const [outputs, setOutputs] = useState<ControlOutput[]>([]);
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
-  const [failure, setFailure] = useState<{ code: string; message: string } | null>(null);
+  const [failure, setFailure] = useState<{ code: string; scope: "read" | "stream" } | null>(null);
+  // The objective is read from the Job's frozen input; the record names it only by identity.
+  const [input, setInput] = useState<{ objective: string | null } | { error: string } | null>(null);
   const [stop, setStop] = useState<string | null>(null);
   const [stopBusy, setStopBusy] = useState(false);
 
@@ -65,15 +93,18 @@ export function JobWatch({
     // page reads and everything the stream replays passes this cursor.
     let processed = 0;
 
-    const fail = (error: unknown) => {
-      if (error instanceof ControlTransportError) setFailure({ code: error.code, message: error.message });
-      else if (error instanceof ContractError) setFailure({ code: "contract", message: error.message });
-      else setFailure({ code: "unreachable", message: "OCG could not be reached." });
+    // `read` failures are of the Job's record or stored history; `stream` ones of the live stream.
+    const fail = (error: unknown, scope: "read" | "stream") => {
+      if (error instanceof ControlTransportError) setFailure({ code: error.code, scope });
+      else if (error instanceof ContractError) setFailure({ code: "contract", scope });
+      else setFailure({ code: "unreachable", scope });
       setStream("closed");
     };
 
     const listener = (event: JobStreamEvent) => {
       if (!alive) return;
+      // Anything the server sent proves the connection is back.
+      setStream((current) => (current === "reconnecting" ? "live" : current));
       if (event.type === "job") {
         setJob(event.job);
         if (event.job.settlement.state !== "unsettled") {
@@ -95,7 +126,7 @@ export function JobWatch({
         });
         setStream("settled");
       } else if (event.type === "stream_error") {
-        setFailure(event.error);
+        setFailure({ code: event.error.code, scope: "stream" });
         setStream("stream_error");
       }
     };
@@ -135,10 +166,26 @@ export function JobWatch({
         const record = await client.readJob(jobId);
         if (!alive) return;
         setJob(record);
+        // The record is the Job's own truth, whether or not the stream ever connects.
+        if (record.settlement.state !== "unsettled") {
+          setSettlement({
+            state: record.settlement.state,
+            settled_at_us: record.settlement.settled_at_us,
+            stop_confirmed_at_us: record.stop_confirmed_at_us,
+          });
+        }
       } catch (error) {
-        if (alive) fail(error);
+        if (alive) fail(error, "read");
         return;
       }
+      client.readJobInput(jobId).then(
+        (frozen) => {
+          if (alive) setInput({ objective: frozen.objective });
+        },
+        (error: unknown) => {
+          if (alive) setInput({ error: error instanceof ControlTransportError ? error.code : "unreachable" });
+        },
+      );
       // The stored history first, in pages and in order; the stream then
       // continues after the last output this view processed.
       try {
@@ -154,7 +201,7 @@ export function JobWatch({
           if (!page.has_more) break;
         }
       } catch (error) {
-        if (alive) fail(error);
+        if (alive) fail(error, "read");
         return;
       }
       try {
@@ -164,14 +211,20 @@ export function JobWatch({
           return;
         }
         setStream("live");
-        void subscription.closed.then((end) => {
-          if (!alive) return;
-          if (end === "settled") setStream("settled");
-          else if (end === "stream_error") setStream("stream_error");
-          else setStream("closed");
-        });
+        subscription.closed.then(
+          (end) => {
+            if (!alive) return;
+            if (end === "settled") setStream("settled");
+            else if (end === "stream_error") setStream("stream_error");
+            else setStream("closed");
+          },
+          // A stream that cannot go on, such as an ended session, is a failure to show, not a lost rejection.
+          (error: unknown) => {
+            if (alive) fail(error, "stream");
+          },
+        );
       } catch (error) {
-        if (alive) fail(error);
+        if (alive) fail(error, "stream");
       }
     })();
 
@@ -208,77 +261,45 @@ export function JobWatch({
     }
   }
 
-  const state = settlement?.state ?? "unsettled";
+  // Until the record is read there is no settlement to claim.
+  const state = settlement?.state ?? (job ? "unsettled" : null);
+  const badge = state ?? (failure ? "unavailable" : "loading");
 
-  return (
-    <section className="flex flex-col gap-4 rounded-lg border border-border bg-card p-5 text-card-foreground">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-col gap-1">
-          <h2 className="font-heading text-lg">{job?.name ?? jobId}</h2>
-          <p className="text-xs text-muted-foreground">
-            <code className="font-geist-mono">{jobId}</code>
-            {job ? ` · ${job.execution_mode}` : ""}
-            {job?.assigned_executor ? ` · ${job.assigned_executor}` : ""}
-          </p>
+  const recordFacts = (
+    <dl className="grid gap-x-6 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
+      <div className="flex justify-between gap-2">
+        <dt>Created</dt>
+        <dd>{formatMicros(job?.created_at_us ?? null)}</dd>
+      </div>
+      <div className="flex justify-between gap-2">
+        <dt>Started</dt>
+        <dd>{formatMicros(job?.started_at_us ?? null)}</dd>
+      </div>
+      <div className="flex justify-between gap-2">
+        <dt>Updated</dt>
+        <dd>{formatMicros(job?.updated_at_us ?? null)}</dd>
+      </div>
+      <div className="flex justify-between gap-2">
+        <dt>Settled</dt>
+        <dd>{formatMicros(settlement?.settled_at_us ?? null)}</dd>
+      </div>
+      {job ? (
+        <div className="flex justify-between gap-2">
+          <dt>Input</dt>
+          <dd>
+            <code className="font-geist-mono">{job.input}</code>
+          </dd>
         </div>
-        <div className="flex items-center gap-2">
-          <span className={`rounded-full px-3 py-1 text-xs font-semibold tracking-widest uppercase ${TONE[state]}`}>
-            {state}
-          </span>
-          <span className="rounded-full bg-muted px-3 py-1 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-            {stream}
-          </span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void requestStop()}
-            disabled={stopBusy || state !== "unsettled"}
-          >
-            {stopBusy ? "Requesting…" : "Request stop"}
-          </Button>
-        </div>
-      </header>
-      {stop ? <p className="text-sm text-muted-foreground">{stop}</p> : null}
-      {failure ? (
-        <p className="text-sm text-destructive">
-          The stream failed ({failure.code}).
-        </p>
       ) : null}
-      <dl className="grid gap-x-6 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
+      {settlement?.state === "unknown" ? (
         <div className="flex justify-between gap-2">
-          <dt>Created</dt>
-          <dd>{formatMicros(job?.created_at_us ?? null)}</dd>
+          <dt>Stop confirmed</dt>
+          <dd>{formatMicros(settlement.stop_confirmed_at_us)}</dd>
         </div>
-        <div className="flex justify-between gap-2">
-          <dt>Started</dt>
-          <dd>{formatMicros(job?.started_at_us ?? null)}</dd>
-        </div>
-        <div className="flex justify-between gap-2">
-          <dt>Updated</dt>
-          <dd>{formatMicros(job?.updated_at_us ?? null)}</dd>
-        </div>
-        <div className="flex justify-between gap-2">
-          <dt>Settled</dt>
-          <dd>{formatMicros(settlement?.settled_at_us ?? null)}</dd>
-        </div>
-        {job ? (
-          <div className="flex justify-between gap-2">
-            <dt>Input</dt>
-            <dd>
-              <code className="font-geist-mono">{job.input}</code>
-            </dd>
-          </div>
-        ) : null}
-        {settlement?.state === "unknown" ? (
-          <div className="flex justify-between gap-2">
-            <dt>Stop confirmed</dt>
-            <dd>{formatMicros(settlement.stop_confirmed_at_us)}</dd>
-          </div>
-        ) : null}
-      </dl>
-      <JobTranscript
-        turns={jobTranscript(jobId, outputs, settlement, stream === "live" || stream === "reconnecting")}
-      />
+      ) : null}
+    </dl>
+  );
+  const storedOutputs = job ? (
       <details className="flex flex-col gap-2">
         <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
           Stored outputs ({outputs.length})
@@ -314,6 +335,82 @@ export function JobWatch({
           ))}
         </ol>
       </details>
+  ) : null;
+  const answer = job ? (
+    <>
+      <JobTranscript
+        turns={jobTranscript(
+          jobId,
+          input !== null && "objective" in input ? input.objective : null,
+          outputs,
+          settlement,
+          stream === "live" || stream === "reconnecting",
+        )}
+        userLabel={presentation === "chat" ? "You" : "Objective"}
+      />
+      {input !== null && "error" in input ? (
+        <p className="text-xs text-muted-foreground">The objective could not be read ({input.error}).</p>
+      ) : null}
+    </>
+  ) : null;
+
+  return (
+    <section className="flex flex-col gap-4 rounded-lg border border-border bg-card p-5 text-card-foreground">
+      <header className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-col gap-1">
+          <h2 className="font-heading text-lg">{job?.name ?? jobId}</h2>
+          <p className="text-xs text-muted-foreground">
+            <code className="font-geist-mono">{jobId}</code>
+            {job ? ` · ${job.execution_mode}` : ""}
+            {job?.assigned_executor ? ` · ${job.assigned_executor}` : ""}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`rounded-full px-3 py-1 text-xs font-semibold tracking-widest uppercase ${TONE[badge] ?? TONE.unsettled}`}>
+            {badge}
+          </span>
+          <span className="rounded-full bg-muted px-3 py-1 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+            {stream}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void requestStop()}
+            disabled={stopBusy || state !== "unsettled"}
+          >
+            {stopBusy ? "Requesting…" : "Request stop"}
+          </Button>
+        </div>
+      </header>
+      {stop ? <p className="text-sm text-muted-foreground">{stop}</p> : null}
+      {failure ? (
+        <div role="alert" className="flex flex-wrap items-center gap-3 text-sm text-destructive">
+          <p>{failureText(failure)}</p>
+          <Button variant="outline" size="sm" onClick={onRetry}>
+            Retry
+          </Button>
+        </div>
+      ) : null}
+      {presentation === "chat" ? (
+        <>
+          {answer}
+          <details className="flex flex-col gap-3">
+            <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+              Job record
+            </summary>
+            <div className="mt-3 flex flex-col gap-4">
+              {recordFacts}
+              {storedOutputs}
+            </div>
+          </details>
+        </>
+      ) : (
+        <>
+          {recordFacts}
+          {answer}
+          {storedOutputs}
+        </>
+      )}
     </section>
   );
 }

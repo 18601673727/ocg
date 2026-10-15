@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
   ControlTransportError,
+  type ControlSubmission,
   type HttpCanonicalControlClient,
 } from "@/components/ocg/runtime/canonical-client";
 import { ContractError } from "@/components/ocg/contracts";
@@ -32,6 +33,13 @@ function outcomeOf(error: unknown): "refused" | "uncertain" {
   return "uncertain";
 }
 
+/** What Chat has already chosen: the form then asks only for the message. */
+export type SubmissionTarget = {
+  agentProfile: string;
+  llmProfile: string;
+  executor: string;
+};
+
 /**
  * Submits one Provider Job under one Idempotency-Key. The key survives
  * every retry and admission lookup of this intent: no timeout or pending
@@ -40,10 +48,15 @@ function outcomeOf(error: unknown): "refused" | "uncertain" {
 export function JobSubmissionForm({
   client,
   onJob,
+  target,
 }: {
   client: HttpCanonicalControlClient;
   onJob: (jobId: string) => void;
+  // Present in Chat: the Agent Profile, LLM target and Executor come from the
+  // selector. Absent in the Jobs view: they are typed by identity.
+  target?: SubmissionTarget | null;
 }) {
+  const chat = target !== undefined;
   const [llmProfile, setLlmProfile] = useState("");
   const [executor, setExecutor] = useState("");
   const [objective, setObjective] = useState("");
@@ -52,6 +65,9 @@ export function JobSubmissionForm({
   const [message, setMessage] = useState<string | null>(null);
   const [key, setKey] = useState<string | null>(null);
   const keyRef = useRef<string | null>(null);
+  // What the held key was submitted with. A retry replays exactly this, so a
+  // later selection or edit can never turn one key into two requests.
+  const requestRef = useRef<ControlSubmission | null>(null);
   const reconciliation = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mounted = useRef(true);
 
@@ -101,7 +117,7 @@ export function JobSubmissionForm({
       });
   }
 
-  async function submit() {
+  async function submit(replay = false) {
     clearReconciliation();
     const held = keyRef.current ?? makeKey();
     keyRef.current = held;
@@ -109,15 +125,18 @@ export function JobSubmissionForm({
     setPhase("submitting");
     setMessage(null);
     try {
-      const result = await client.submitJob(
-        {
-          llm_profile: llmProfile.trim(),
-          executor: executor.trim(),
-          objective,
-          ...(name.trim() ? { name: name.trim() } : {}),
-        },
-        held,
-      );
+      const request: ControlSubmission =
+        replay && requestRef.current
+          ? requestRef.current
+          : {
+              ...(target ? { agent_profile: target.agentProfile } : {}),
+              llm_profile: target ? target.llmProfile : llmProfile.trim(),
+              executor: target ? target.executor : executor.trim(),
+              objective,
+              ...(name.trim() ? { name: name.trim() } : {}),
+            };
+      requestRef.current = request;
+      const result = await client.submitJob(request, held);
       if (!mounted.current || keyRef.current !== held) return;
       if (result.status === "admitted" && result.job) {
         setPhase("admitted");
@@ -155,13 +174,14 @@ export function JobSubmissionForm({
 
   function retrySame() {
     // The same intent, the same key: the API answers one Job for it.
-    void submit();
+    void submit(true);
   }
 
   function fresh() {
     if (phase !== "admitted" && phase !== "refused") return;
     clearReconciliation();
     keyRef.current = null;
+    requestRef.current = null;
     setKey(null);
     setPhase("editing");
     setMessage(null);
@@ -172,37 +192,41 @@ export function JobSubmissionForm({
   return (
     <section className="flex flex-col gap-4 rounded-lg border border-border bg-card p-5 text-card-foreground">
       <header className="flex flex-col gap-1">
-        <h2 className="font-heading text-lg">Submit a Job</h2>
+        <h2 className="font-heading text-lg">{chat ? "Send a message" : "Submit a Job"}</h2>
         <p className="text-xs text-muted-foreground">
-          An existing LLM Profile and Executor, by their canonical identities,
-          and an objective. One Idempotency-Key names this submission through
-          every retry.
+          {chat
+            ? "The message becomes one Job of the selected Agent. One Idempotency-Key names it through every retry."
+            : "An existing LLM Profile and Executor, by their canonical identities, and an objective. One Idempotency-Key names this submission through every retry."}
         </p>
       </header>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-          LLM Profile
-          <Input
-            value={llmProfile}
-            onChange={(event) => setLlmProfile(event.target.value)}
-            placeholder="profile:<n>"
-            spellCheck={false}
-            disabled={settled}
-          />
-        </label>
-        <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-          Executor
-          <Input
-            value={executor}
-            onChange={(event) => setExecutor(event.target.value)}
-            placeholder="executor:<n>"
-            spellCheck={false}
-            disabled={settled}
-          />
-        </label>
-      </div>
+      {chat ? null : (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+              LLM Profile
+              <Input
+                value={llmProfile}
+                onChange={(event) => setLlmProfile(event.target.value)}
+                placeholder="profile:<n>"
+                spellCheck={false}
+                disabled={settled}
+              />
+            </label>
+            <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+              Executor
+              <Input
+                value={executor}
+                onChange={(event) => setExecutor(event.target.value)}
+                placeholder="executor:<n>"
+                spellCheck={false}
+                disabled={settled}
+              />
+            </label>
+          </div>
+        </>
+      )}
       <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-        Objective
+        {chat ? "Message" : "Objective"}
         <Textarea
           value={objective}
           onChange={(event) => setObjective(event.target.value)}
@@ -210,14 +234,16 @@ export function JobSubmissionForm({
           disabled={settled}
         />
       </label>
-      <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-        Name (optional)
-        <Input
-          value={name}
-          onChange={(event) => setName(event.target.value)}
-          disabled={settled}
-        />
-      </label>
+      {chat ? null : (
+        <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+          Name (optional)
+          <Input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            disabled={settled}
+          />
+        </label>
+      )}
       {key ? (
         <p className="text-xs text-muted-foreground">
           Idempotency-Key: <code className="font-geist-mono">{key}</code>
@@ -231,8 +257,11 @@ export function JobSubmissionForm({
       ) : null}
       <div className="flex flex-wrap gap-2">
         {phase === "editing" || phase === "refused" ? (
-          <Button onClick={() => void submit()} disabled={objective.trim().length === 0}>
-            {phase === "editing" ? "Submit Job" : "Submit again"}
+          <Button
+            onClick={() => void submit()}
+            disabled={objective.trim().length === 0 || (chat && !target)}
+          >
+            {phase === "editing" ? (chat ? "Send" : "Submit Job") : chat ? "Send again" : "Submit again"}
           </Button>
         ) : null}
         {phase === "uncertain" ? (
@@ -255,7 +284,7 @@ export function JobSubmissionForm({
         ) : null}
         {phase !== "editing" ? (
           <Button variant="ghost" disabled={settled} onClick={fresh}>
-            New submission
+            {chat ? "New message" : "New submission"}
           </Button>
         ) : null}
       </div>

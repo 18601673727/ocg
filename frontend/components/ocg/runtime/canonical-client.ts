@@ -1,9 +1,11 @@
 import {
   ContractError,
   decodeAdmission,
+  decodeAgentProfiles,
   decodeControlError,
   decodeHealth,
   decodeJob,
+  decodeJobInput,
   decodeJobEvent,
   decodeOutputsPage,
   decodeSession,
@@ -37,6 +39,8 @@ export type HttpCanonicalControlClientOptions = {
 };
 
 export type ControlSubmission = {
+  // An Agent Profile that targets `llm_profile`; its instructions are frozen with the Job.
+  agent_profile?: string;
   llm_profile: string;
   executor: string;
   objective: string;
@@ -267,6 +271,28 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeJob((await send("GET", `/api/v1/jobs/${job}`, { signal })).input);
     },
 
+    /** The Job's frozen input: its objective as text, never inferred from its identity. */
+    async readJobInput(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      return decodeJobInput((await send("GET", `/api/v1/jobs/${job}/input`, { signal })).input, job);
+    },
+
+    /** One page of Agent Profiles with their LLM targets and the Executors that can run each. */
+    async readAgentProfiles(
+      settings: { before?: string; limit?: number; signal?: AbortSignal } = {},
+    ) {
+      const query: string[] = [];
+      if (settings.before !== undefined) query.push(`before=${identity(settings.before, "before", "profile:")}`);
+      if (settings.limit !== undefined) {
+        if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
+          throw new ContractError("limit", "an integer from 1 to 100");
+        }
+        query.push(`limit=${settings.limit}`);
+      }
+      const suffix = query.length ? `?${query.join("&")}` : "";
+      return decodeAgentProfiles((await send("GET", `/api/v1/agent-profiles${suffix}`, { signal: settings.signal })).input);
+    },
+
     /** One stored page of the Job's outputs, in `seq` order. */
     async readOutputs(
       job: string,
@@ -292,6 +318,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
      * submitted under a second key; the same key is looked up or replayed.
      */
     async submitJob(submission: ControlSubmission, key: string, signal?: AbortSignal) {
+      if (submission.agent_profile !== undefined) identity(submission.agent_profile, "agent_profile", "profile:");
       identity(submission.llm_profile, "llm_profile", "profile:");
       identity(submission.executor, "executor", "executor:");
       submissionKey(key);

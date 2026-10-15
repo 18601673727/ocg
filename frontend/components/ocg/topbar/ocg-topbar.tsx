@@ -43,7 +43,7 @@ export function OcgTopbar({ activeView, job, collapsed, onOpenNavigation, health
         Menu
       </Button>
       <h1 className={cn("min-w-0 max-w-full truncate px-3 py-1.5 text-[13px] font-semibold tracking-tight", PILL)}>
-        {activeView === "jobs" && job ? job : VIEW_TITLE[activeView]}
+        {(activeView === "jobs" || activeView === "chat") && job ? job : VIEW_TITLE[activeView]}
       </h1>
       <div className="ml-auto flex shrink-0 items-center">
         <Pill

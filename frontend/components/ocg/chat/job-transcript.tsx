@@ -14,20 +14,24 @@ const STATUS_NOTE: Partial<Record<TranscriptTurn["status"], string>> = {
   unknown: "The Job's outcome is unknown. Check its record before acting on this output.",
 };
 
-function TurnRow({ turn }: { turn: TranscriptTurn }) {
+function TurnRow({ turn, userLabel }: { turn: TranscriptTurn; userLabel: string }) {
   const { isCopied, copyToClipboard } = useCopyToClipboard();
-  const note = STATUS_NOTE[turn.status];
+  const isUser = turn.role === "user";
+  const note = isUser ? undefined : STATUS_NOTE[turn.status];
   return (
     <div className="flex gap-2.5">
       <span
-        className="flex size-6 shrink-0 items-center justify-center rounded-md border border-border bg-primary text-[10px] font-semibold text-primary-foreground"
+        className={cn(
+          "flex size-6 shrink-0 items-center justify-center rounded-md border border-border text-[10px] font-semibold",
+          isUser ? "bg-muted text-muted-foreground" : "bg-primary text-primary-foreground",
+        )}
         aria-hidden="true"
       >
-        A
+        {isUser ? "U" : "A"}
       </span>
       <div className="min-w-0 flex-1">
         <div className="mb-1 flex items-center gap-2">
-          <span className="text-xs font-semibold">Answer</span>
+          <span className="text-xs font-semibold">{isUser ? userLabel : "Answer"}</span>
           {turn.createdAtUs === null ? null : (
             <span className="text-xs text-muted-foreground">
               {new Date(turn.createdAtUs / 1000).toLocaleTimeString()}
@@ -38,7 +42,7 @@ function TurnRow({ turn }: { turn: TranscriptTurn }) {
             onClick={() => copyToClipboard(turn.content)}
             disabled={turn.content.length === 0}
             className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
-            aria-label="Copy the answer"
+            aria-label={isUser ? "Copy the message" : "Copy the answer"}
           >
             <span role="status">{isCopied ? "Copied" : "Copy"}</span>
           </button>
@@ -46,6 +50,7 @@ function TurnRow({ turn }: { turn: TranscriptTurn }) {
         <div
           className={cn(
             "text-base leading-7 text-foreground/90",
+            isUser && "rounded-md border border-border bg-muted/30 px-3 py-2",
             turn.status === "failed" && STATUS_TEXT["error"],
             turn.status === "cancelled" && "text-muted-foreground italic",
           )}
@@ -66,12 +71,18 @@ function TurnRow({ turn }: { turn: TranscriptTurn }) {
   );
 }
 
-/** One Job's answer; see `jobTranscript` for what it is made of. */
-export function JobTranscript({ turns }: { turns: readonly TranscriptTurn[] }) {
+/** One Job as its objective and answer; see `jobTranscript` for what each is made of. */
+export function JobTranscript({
+  turns,
+  userLabel = "Objective",
+}: {
+  turns: readonly TranscriptTurn[];
+  userLabel?: string;
+}) {
   return (
     <div className="flex flex-col gap-4" aria-live="polite">
       {turns.map((turn) => (
-        <TurnRow key={turn.id} turn={turn} />
+        <TurnRow key={turn.id} turn={turn} userLabel={userLabel} />
       ))}
     </div>
   );

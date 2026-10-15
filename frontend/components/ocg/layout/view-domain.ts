@@ -6,7 +6,7 @@
  * navigation states what is missing instead of pretending.
  */
 
-export type WorkspaceView = "jobs" | "usage" | "logs" | "settings";
+export type WorkspaceView = "chat" | "jobs" | "usage" | "logs" | "settings";
 
 export type ViewAvailability =
   | { available: true }
@@ -16,9 +16,10 @@ export type ViewAvailability =
       missing: string;
     };
 
-export const WORKSPACE_VIEWS: readonly WorkspaceView[] = ["jobs", "usage", "logs", "settings"];
+export const WORKSPACE_VIEWS: readonly WorkspaceView[] = ["chat", "jobs", "usage", "logs", "settings"];
 
 export const VIEW_AVAILABILITY: Record<WorkspaceView, ViewAvailability> = {
+  chat: { available: true },
   jobs: { available: true },
   settings: { available: true },
   usage: {
@@ -32,6 +33,7 @@ export const VIEW_AVAILABILITY: Record<WorkspaceView, ViewAvailability> = {
 };
 
 export const VIEW_TITLE: Record<WorkspaceView, string> = {
+  chat: "Chat",
   jobs: "Jobs",
   usage: "Usage",
   logs: "Logs",
@@ -69,7 +71,7 @@ export function parseWorkspaceLocation(search: string): WorkspaceLocation {
 export function workspaceLocationHref(location: WorkspaceLocation): string {
   const params = new URLSearchParams();
   if (location.view !== "jobs") params.set("view", location.view);
-  if (location.view === "jobs" && location.job) params.set("job", location.job);
+  if ((location.view === "jobs" || location.view === "chat") && location.job) params.set("job", location.job);
   const query = params.toString();
   return query ? `/?${query}` : "/";
 }

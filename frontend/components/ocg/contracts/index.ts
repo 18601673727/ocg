@@ -236,3 +236,93 @@ export function decodeSession(input: unknown) {
     expires_at_us: integer(session.expires_at_us, "session.expires_at_us"),
   };
 }
+
+/**
+ * A Job's frozen input as `GET /api/v1/jobs/{job}/input` reports it: the
+ * objective as text (the Job record names its input only by identity), its
+ * Attachments by identity, and the Profiles and model it was frozen with.
+ */
+export function decodeJobInput(input: unknown, jobId: string) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
+  const value = record(envelope.input, "input");
+  const attachments = value.attachments;
+  if (!Array.isArray(attachments)) throw new ContractError("input.attachments", "an array");
+  let configuration: { agent_profile: string | null; llm_profile: string; model: string } | null = null;
+  if (value.configuration !== null) {
+    const frozen = record(value.configuration, "input.configuration");
+    configuration = {
+      agent_profile: frozen.agent_profile === null
+        ? null
+        : identity(frozen.agent_profile, "input.configuration.agent_profile", "profile:"),
+      llm_profile: identity(frozen.llm_profile, "input.configuration.llm_profile", "profile:"),
+      model: string(frozen.model, "input.configuration.model"),
+    };
+  }
+  return {
+    job: jobId,
+    id: identity(value.id, "input.id", "job_input:"),
+    objective: value.objective === null ? null : string(value.objective, "input.objective"),
+    submitted_at_us: timestamp(value.submitted_at_us, "input.submitted_at_us"),
+    attachments: attachments.map((attachment, index) =>
+      identity(attachment, `input.attachments[${index}]`, "attachment:")),
+    configuration,
+  };
+}
+
+const CAPABILITIES = ["chat", "tools", "vision", "reasoning"] as const;
+export type ControlCapability = (typeof CAPABILITIES)[number];
+
+function listOf<T>(value: unknown, path: string, item: (entry: unknown, path: string) => T): T[] {
+  if (!Array.isArray(value)) throw new ContractError(path, "an array");
+  return value.map((entry, index) => item(entry, `${path}[${index}]`));
+}
+
+/**
+ * One page of Agent Profiles from `GET /api/v1/agent-profiles`, each with the
+ * LLM Profiles it may run with and the Executors that can run each now.
+ */
+export function decodeAgentProfiles(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const nextBefore = envelope.next_before === null
+    ? null
+    : identity(envelope.next_before, "next_before", "profile:");
+  const hasMore = boolean(envelope.has_more, "has_more");
+  if (hasMore !== (nextBefore !== null)) {
+    throw new ContractError("next_before", "a cursor exactly when more Profiles remain");
+  }
+  return {
+    agent_profiles: listOf(envelope.agent_profiles, "agent_profiles", (entry, path) => {
+      const agent = record(entry, path);
+      return {
+        id: identity(agent.id, `${path}.id`, "profile:"),
+        name: string(agent.name, `${path}.name`),
+        llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`, (target, targetPath) => {
+          const llm = record(target, targetPath);
+          return {
+            id: identity(llm.id, `${targetPath}.id`, "profile:"),
+            name: string(llm.name, `${targetPath}.name`),
+            model: string(llm.model, `${targetPath}.model`),
+            declared_capabilities: listOf(llm.declared_capabilities, `${targetPath}.declared_capabilities`,
+              (capability, capabilityPath) => {
+                const named = string(capability, capabilityPath);
+                const known = CAPABILITIES.find((candidate) => candidate === named);
+                if (!known) throw new ContractError(capabilityPath, "a declared model capability");
+                return known;
+              }),
+            executors: listOf(llm.executors, `${targetPath}.executors`,
+              (executor, executorPath) => identity(executor, executorPath, "executor:")),
+          };
+        }),
+      };
+    }),
+    has_more: hasMore,
+    next_before: nextBefore,
+  };
+}
+
+export type ControlJobInput = ReturnType<typeof decodeJobInput>;
+export type ControlAgentProfiles = ReturnType<typeof decodeAgentProfiles>;
+export type ControlAgentProfile = ControlAgentProfiles["agent_profiles"][number];

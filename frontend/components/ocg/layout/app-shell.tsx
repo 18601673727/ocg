@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import type { HttpCanonicalControlClient } from "@/components/ocg/runtime/canonical-client";
 import { JobSubmissionForm } from "@/components/ocg/job/job-submission-form";
 import { JobWatch } from "@/components/ocg/job/job-watch";
+import { ChatSurface } from "@/components/ocg/chat/chat-surface";
 import { OcgSidebar } from "@/components/ocg/sidebar/ocg-sidebar";
 import { OcgTopbar } from "@/components/ocg/topbar/ocg-topbar";
 import { SettingsSurface } from "@/components/ocg/settings/settings-surface";
@@ -121,9 +122,10 @@ export function AppShell({
     setLocation(next);
   }
 
-  function openJob(job: string) {
+  // A Job opens in the surface that asked for it, so sending a Chat message stays in Chat.
+  function openJob(job: string, surface: "chat" | "jobs") {
     setOpened((current) => [job, ...current.filter((entry) => entry !== job)].slice(0, OPENED_JOBS_LIMIT));
-    go({ view: "jobs", job });
+    go({ view: surface, job });
   }
 
   function navigate(view: WorkspaceView) {
@@ -142,7 +144,7 @@ export function AppShell({
         onNavigate={navigate}
         openedJobs={opened}
         activeJob={location.job}
-        onOpenJob={openJob}
+        onOpenJob={(job) => openJob(job, view === "chat" ? "chat" : "jobs")}
         signingOut={signingOut}
         onSignOut={onSignOut}
       />
@@ -163,7 +165,15 @@ export function AppShell({
           </p>
         ) : null}
         <main className="ocg-subtle-scrollbar min-h-0 flex-1 overflow-y-auto">
-          {view === "jobs" ? <JobsView client={client} job={location.job} onJob={openJob} /> : null}
+          {/* Kept mounted while another view is open: a pending submission keeps its
+              Idempotency-Key and its lookup, and a watched Job keeps its stream. */}
+          <div hidden={view !== "chat"}>
+            {/* Only the visible view watches the Job: a Job has one event stream per client. */}
+            <ChatSurface client={client} job={view === "chat" ? location.job : null} onJob={(job) => openJob(job, "chat")} />
+          </div>
+          <div hidden={view !== "jobs"}>
+            <JobsView client={client} job={view === "jobs" ? location.job : null} onJob={(job) => openJob(job, "jobs")} />
+          </div>
           {view === "settings" ? (
             <SettingsSurface
               health={health}
