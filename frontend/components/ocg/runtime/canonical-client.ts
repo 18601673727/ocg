@@ -1,4 +1,15 @@
-import { ContractError, decodeControlError, decodeJobEvent, type ControlJobEvent } from "../contracts";
+import {
+  ContractError,
+  decodeAdmission,
+  decodeControlError,
+  decodeHealth,
+  decodeJob,
+  decodeJobEvent,
+  decodeOutputsPage,
+  decodeSession,
+  decodeStop,
+  type ControlJobEvent,
+} from "../contracts";
 import { SseParser } from "./sse";
 
 export type JobStreamEvent = ControlJobEvent | { type: "heartbeat"; };
@@ -16,8 +27,27 @@ export class ControlTransportError extends Error {
 export type HttpCanonicalControlClientOptions = {
   baseUrl: string;
   fetch: typeof fetch;
-  // Supplied by an already authorized caller; no acquisition or storage here.
-  bearerToken: () => string | Promise<string>;
+  // Programmatic mode: supplied by an already authorized caller; no
+  // acquisition or storage here.
+  bearerToken?: () => string | Promise<string>;
+  // Browser-session mode: the session cookie authenticates every request,
+  // and the session's CSRF token, from the session route, signs the
+  // state-changing ones. Never the bearer token.
+  csrfToken?: () => string | Promise<string>;
+};
+
+export type ControlSubmission = {
+  llm_profile: string;
+  executor: string;
+  objective: string;
+  name?: string;
+};
+
+export type ControlSubmissionResult = {
+  status: "admitted" | "pending";
+  job: string | null;
+  // Whether this request created the Job, rather than replay its key.
+  created: boolean;
 };
 
 function controlOrigin(raw: string): string {
@@ -37,6 +67,26 @@ function sequence(value: number): number {
   return value;
 }
 
+function jobIdentity(value: string): string {
+  if (!/^job:(0|[1-9][0-9]*)$/.test(value)) throw new ContractError("job", "a canonical Job identity");
+  return value;
+}
+
+function identity(value: string, path: string, prefix: string): string {
+  const number = value.slice(prefix.length);
+  if (!value.startsWith(prefix) || !/^(0|[1-9][0-9]*)$/.test(number)) {
+    throw new ContractError(path, `a canonical ${prefix.slice(0, -1)} identity`);
+  }
+  return value;
+}
+
+function submissionKey(value: string): string {
+  if (!/^[A-Za-z0-9._~:+/=-]{16,128}$/.test(value)) {
+    throw new ContractError("Idempotency-Key", "a well-formed idempotency key");
+  }
+  return value;
+}
+
 function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) { resolve(); return; }
@@ -50,27 +100,44 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+export type HttpCanonicalControlClient = ReturnType<typeof createHttpCanonicalControlClient>;
+
 // Retains the 0.4.5 canonical client's injected-fetch boundary and contracts
 // entrypoint. None of its legacy lifecycle, chat or fixture stores are needed.
 export function createHttpCanonicalControlClient(options: HttpCanonicalControlClientOptions) {
   const base = controlOrigin(options.baseUrl);
   const fetchImpl = options.fetch.bind(globalThis);
+  const programmatic = options.bearerToken !== undefined;
   // Delivery acknowledgements only; output history and Job state live on server.
   const cursors = new Map<string, number>();
   const active = new Map<string, AbortController>();
   let closed = false;
+
+  // The one credential this client sends: the bearer token of its caller,
+  // or nothing at all where the browser's own session cookie applies.
+  async function credentials(): Promise<Record<string, string>> {
+    if (!options.bearerToken) return {};
+    const token = await options.bearerToken();
+    if (!/^[A-Za-z0-9._~+/=-]{32,512}$/.test(token)) {
+      throw new ControlTransportError("credential_unavailable", 0, false);
+    }
+    return { Authorization: `Bearer ${token}` };
+  }
+
+  function retryable(status: number, code: string): boolean {
+    return status === 503 &&
+      ["too_many_streams", "database_busy", "database_unavailable", "shutting_down"].includes(code);
+  }
 
   async function connection(
     jobId: string,
     signal: AbortSignal,
     listener: (event: JobStreamEvent) => void | Promise<void>,
   ): Promise<Exclude<JobStreamEnd, "aborted"> | null> {
-    const token = await options.bearerToken();
-    if (!/^[A-Za-z0-9._~+/=-]{32,512}$/.test(token)) {
-      throw new ControlTransportError("credential_unavailable", 0, false);
-    }
-    signal.throwIfAborted();
-    const headers: Record<string, string> = { Accept: "text/event-stream", Authorization: `Bearer ${token}` };
+    const headers: Record<string, string> = {
+      Accept: "text/event-stream",
+      ...await credentials(),
+    };
     const cursor = cursors.get(jobId);
     if (cursor !== undefined) headers["Last-Event-ID"] = String(cursor);
     let response: Response;
@@ -78,7 +145,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       // The route requires the canonical literal job:<n>; it does not decode %3A.
       response = await fetchImpl(`${base}/api/v1/jobs/${jobId}/events`, {
         method: "GET", headers, signal,
-        mode: "same-origin", credentials: "omit", cache: "no-store", redirect: "error",
+        mode: "same-origin", credentials: programmatic ? "omit" : "same-origin",
+        cache: "no-store", redirect: "error",
       });
     } catch {
       throw new ControlTransportError("connection_lost", 0, true);
@@ -88,7 +156,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       try { code = decodeControlError(await response.json()).code; }
       catch { /* An unrecognized body still retains its HTTP status. */ }
       throw new ControlTransportError(code, response.status,
-        response.status === 503 && ["too_many_streams", "database_busy", "database_unavailable", "shutting_down"].includes(code));
+        retryable(response.status, code));
     }
     const mediaType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
     if (mediaType !== "text/event-stream" || !response.body) {
@@ -139,8 +207,148 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     }
   }
 
+  // One JSON request to one route of this API: no open proxy, no other
+  // upstream, and every answer checked against its contract.
+  async function send(
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    settings: {
+      body?: unknown;
+      // The request's own `Idempotency-Key`, where a route names one.
+      key?: string;
+      // Whether the request changes state and so carries the session's
+      // CSRF token in browser mode.
+      sign?: boolean;
+      signal?: AbortSignal;
+    },
+  ): Promise<{ status: number; input: unknown }> {
+    const headers: Record<string, string> = { ...await credentials() };
+    if (settings.body !== undefined) headers["Content-Type"] = "application/json";
+    if (settings.key !== undefined) headers["Idempotency-Key"] = settings.key;
+    if (settings.sign) {
+      const csrf = await options.csrfToken?.();
+      if (!csrf) throw new ControlTransportError("credential_unavailable", 0, false);
+      headers["X-OCG-CSRF"] = csrf;
+    }
+    let response: Response;
+    try {
+      response = await fetchImpl(`${base}${path}`, {
+        method, headers, signal: settings.signal,
+        ...(settings.body === undefined ? {} : { body: JSON.stringify(settings.body) }),
+        mode: "same-origin", credentials: programmatic ? "omit" : "same-origin",
+        cache: "no-store", redirect: "error",
+      });
+    } catch {
+      throw new ControlTransportError("connection_lost", 0, true);
+    }
+    if (!response.ok) {
+      let code = "http_error";
+      try { code = decodeControlError(await response.json()).code; }
+      catch { /* An unrecognized body still retains its HTTP status. */ }
+      throw new ControlTransportError(code, response.status, retryable(response.status, code));
+    }
+    let input: unknown;
+    try { input = await response.json(); }
+    catch { throw new ContractError("response", "a complete JSON answer"); }
+    return { status: response.status, input };
+  }
+
   return {
     lastOutputSequence(jobId: string): number | undefined { return cursors.get(jobId); },
+
+    /** What the host establishes about itself and its database, now. */
+    async readHealth(signal?: AbortSignal) {
+      return decodeHealth((await send("GET", "/api/v1/health", { signal })).input);
+    },
+
+    /** The Job's persisted lifecycle record. */
+    async readJob(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      return decodeJob((await send("GET", `/api/v1/jobs/${job}`, { signal })).input);
+    },
+
+    /** One stored page of the Job's outputs, in `seq` order. */
+    async readOutputs(
+      job: string,
+      settings: { afterSeq?: number; limit?: number; signal?: AbortSignal } = {},
+    ) {
+      jobIdentity(job);
+      const query: string[] = [];
+      if (settings.afterSeq !== undefined) query.push(`after_seq=${sequence(settings.afterSeq)}`);
+      if (settings.limit !== undefined) {
+        if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
+          throw new ContractError("limit", "an integer from 1 to 100");
+        }
+        query.push(`limit=${settings.limit}`);
+      }
+      const suffix = query.length ? `?${query.join("&")}` : "";
+      const answer = await send("GET", `/api/v1/jobs/${job}/outputs${suffix}`, { signal: settings.signal });
+      return decodeOutputsPage(answer.input, job);
+    },
+
+    /**
+     * Submits one Job under the request's `key`. The key names at most one
+     * Job: a request that timed out or answered `pending` is never
+     * submitted under a second key; the same key is looked up or replayed.
+     */
+    async submitJob(submission: ControlSubmission, key: string, signal?: AbortSignal) {
+      identity(submission.llm_profile, "llm_profile", "profile:");
+      identity(submission.executor, "executor", "executor:");
+      submissionKey(key);
+      const answer = await send("POST", "/api/v1/jobs", {
+        body: submission,
+        key,
+        sign: true,
+        signal,
+      });
+      const admission = decodeAdmission(answer.input);
+      if (admission.status !== "admitted" && admission.status !== "pending") {
+        throw new ContractError("admission.status", "admitted or pending from a submission");
+      }
+      return {
+        status: admission.status,
+        job: admission.job,
+        created: answer.status === 201,
+      } satisfies ControlSubmissionResult;
+    },
+
+    /** What `key` created, however its submission ended. */
+    async readAdmission(key: string, signal?: AbortSignal) {
+      submissionKey(key);
+      const answer = await send("GET", "/api/v1/admissions", { key, signal });
+      return decodeAdmission(answer.input);
+    },
+
+    /** Requests the stop of one Job this listener admitted. */
+    async stopJob(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      const answer = await send("POST", `/api/v1/jobs/${job}/stop`, { sign: true, signal });
+      return decodeStop(answer.input, job);
+    },
+
+    /** Signs the browser in under this run's pairing code. */
+    async createSession(pairingCode: string, signal?: AbortSignal) {
+      const answer = await send("POST", "/api/v1/session", {
+        body: { pairing_code: pairingCode },
+        signal,
+      });
+      const session = decodeSession(answer.input);
+      if (!session.authenticated) throw new ContractError("session", "a signed-in session");
+      return { csrfToken: session.csrf_token, expiresAtUs: session.expires_at_us };
+    },
+
+    /** The session this browser holds, if it is still authorized. */
+    async readSession(signal?: AbortSignal) {
+      const answer = await send("GET", "/api/v1/session", { signal });
+      const session = decodeSession(answer.input);
+      if (!session.authenticated) throw new ContractError("session", "a signed-in session");
+      return { csrfToken: session.csrf_token, expiresAtUs: session.expires_at_us };
+    },
+
+    /** Revokes this browser's session. */
+    async deleteSession(signal?: AbortSignal) {
+      await send("DELETE", "/api/v1/session", { sign: true, signal });
+    },
 
     subscribeJobEvents(
       jobId: string,
