@@ -1030,6 +1030,24 @@ fn resource_bounds_and_authorized_roots_are_enforced() {
 }
 
 #[test]
+fn a_data_directory_moved_under_the_workspace_is_never_indexed() {
+    let (root_guard, root) = temporary_directory(SUITE, "moved-data-root");
+    let (data_guard, directory) = data_directory(SUITE, "moved-data");
+    let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+    let original = directory.root().to_path_buf();
+    write_file(&original, "payload.rs", b"privatedataneedle");
+    std::fs::rename(&original, root.join("ordinary")).expect("move data under root");
+    let fts = WorkspaceFts::new(workspace, FtsLimits::default());
+    let coverage = fts.build().expect("build without data").coverage;
+    assert_eq!(coverage.files_indexed, 0);
+    let result = fts.search("privatedataneedle", 10).expect("search");
+    assert!(at(&result).is_empty());
+    assert!(!result.to_string().contains("payload.rs"));
+    std::fs::rename(root.join("ordinary"), original).expect("restore data");
+    drop((root_guard, data_guard));
+}
+
+#[test]
 fn cancellation_during_file_admission_discards_initial_and_replacement_builds() {
     for initial in [true, false] {
         let setup = setup(

@@ -22,6 +22,9 @@ fn measure(runs: usize, mut run: impl FnMut()) -> Value {
 #[test]
 #[ignore = "release-mode bounded search performance measurement"]
 fn production_search_measurements() {
+    if cfg!(debug_assertions) {
+        panic!("release measurements only");
+    }
     let setup = setup("production-performance", &[]);
     for file in 0..4000 {
         let target = [512, 2048, 4096, 9216][file % 4];
@@ -71,16 +74,41 @@ fn production_search_measurements() {
         ("missing", "neverpresenttoken"),
         ("selective_phrase", "\"alpha beta\""),
         ("broad_phrase_zero", "\"packet state error\""),
+        ("broad_phrase_matching", "\"packet state\""),
         ("scattered_phrase_zero", "\"state error\""),
-        ("and", "rarebeacon state"),
+        ("and", "rarebeacon packet"),
         ("and_complete", "rarebeacon alpha"),
     ] {
         let value = invoke(query, false);
+        if class.ends_with("zero") {
+            assert!(value["results"].as_array().expect("results").is_empty());
+        }
         println!(
             "FTS_MEASUREMENT {}",
             json!({"class":class,"tool":measure(21,||{std::hint::black_box(invoke(query,false));}),"complete":value["complete"],"limit":value["limit"],"records":value["results"].as_array().expect("results").len()})
         );
     }
+    let mixed = [
+        "rarebeacon",
+        "packet",
+        "neverfindbeaconxqz",
+        "rarebeacon packet",
+        "packet state",
+        "\"alpha beta\"",
+        "\"packet state\"",
+        "\"state error\"",
+        "HTTPServer",
+    ];
+    let started = Instant::now();
+    for _ in 0..21 {
+        for query in mixed {
+            std::hint::black_box(invoke(query, false));
+        }
+    }
+    println!(
+        "FTS_MEASUREMENT {}",
+        json!({"class":"mixed_tool_throughput", "queries":21*mixed.len(), "queries_per_second":(21*mixed.len()) as f64/started.elapsed().as_secs_f64()})
+    );
     println!(
         "FTS_MEASUREMENT {}",
         json!({"class":"full_refresh_tool","timing":measure(5,||{std::hint::black_box(invoke("rarebeacon",true));})})
