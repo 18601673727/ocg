@@ -686,23 +686,26 @@ pub(crate) fn code_tools_with(
     timeout: Duration,
 ) -> Result<ToolExecution, ToolRegistryError> {
     let registry = ToolRegistry::default();
+    let limits = coding_limits(timeout);
     workspace_read::register(&registry, workspace.clone())?;
     workspace_write::register(&registry, workspace.clone())?;
     register(&registry, workspace.clone(), environment, timeout)?;
-    workspace_discovery::register(&registry, workspace)?;
+    workspace_discovery::register(&registry, workspace.clone())?;
+    crate::orchestration::workspace_index_query::register(&registry, workspace, limits.max_tool_result_bytes)?;
     let names = [
         workspace_read::TOOL_NAME,
         workspace_write::TOOL_NAME,
         TOOL_NAME,
         workspace_discovery::LIST_TOOL_NAME,
         workspace_discovery::SEARCH_TOOL_NAME,
+        crate::orchestration::workspace_index_query::TOOL_NAME,
     ];
     for name in names {
         registry.authorize(name)?;
     }
     Ok(ToolExecution {
         offer: registry.offer(&names)?,
-        limits: coding_limits(timeout),
+        limits,
     })
 }
 

@@ -46,3 +46,9 @@ rustix = { version = "1", features = ["fs", "process"] }
 # (`getpwuid_r`), never from `HOME`, for Workspace authorization; the nix the
 # tree already builds, with only its safe account lookup.
 nix = { version = "0.31", default-features = false, features = ["user"] }
+# Embedded code intelligence for workspace_index_query: syntax-only structural
+# analysis (outline, syntax errors) for Rust, TypeScript/TSX, Python.
+tree-sitter = "=0.27.1"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-python = "=0.25.0"
