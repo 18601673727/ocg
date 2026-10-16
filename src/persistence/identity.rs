@@ -1,0 +1,144 @@
+use super::*;
+
+/// Microseconds since the Unix epoch, as recorded by the database worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(i64);
+
+impl Timestamp {
+    pub fn now() -> Self {
+        let micros = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(elapsed) => i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX),
+            Err(before) => i64::try_from(before.duration().as_micros()).map_or(i64::MIN, |micros| -micros),
+        };
+        Self(micros)
+    }
+
+    pub const fn from_unix_micros(micros: i64) -> Self {
+        Self(micros)
+    }
+
+    pub const fn as_unix_micros(self) -> i64 {
+        self.0
+    }
+}
+
+macro_rules! record_id_type {
+    ($name:ident, $table:literal) => {
+        /// A stable business identifier allocated by the database. A committed
+        /// identifier is never reused; one allocated by a transaction that
+        /// rolled back may be allocated again by a later transaction.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub(super) u64);
+
+        impl $name {
+            pub const fn new(value: u64) -> Self {
+                Self(value)
+            }
+
+            pub const fn get(self) -> u64 {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, concat!($table, ":{}"), self.0)
+            }
+        }
+    };
+}
+
+record_id_type!(JobId, "job");
+record_id_type!(JobInputId, "job_input");
+record_id_type!(JobOutputId, "job_output");
+record_id_type!(ExecutorId, "executor");
+record_id_type!(ProjectId, "project");
+record_id_type!(ProfileId, "profile");
+record_id_type!(AgentId, "agent");
+record_id_type!(LlmProviderId, "llm_provider");
+record_id_type!(MetricsId, "metrics");
+record_id_type!(AvailabilityStatId, "availability_stat");
+record_id_type!(AttachmentId, "attachment");
+
+/// The number of one Provider request within the Job that sent it, from 1
+/// in the order the Job sent them. A Job may send several requests, such as
+/// the rounds of a tool loop; every Metrics and AvailabilityStat record
+/// belongs to exactly one of them, and evidence is reduced per request,
+/// never across the requests of a Job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestNumber(u32);
+
+impl RequestNumber {
+    /// A Job's first request, and the only request of a Job recorded before
+    /// requests were numbered.
+    pub const FIRST: Self = Self(1);
+
+    /// `None` for 0, which numbers no request.
+    #[must_use]
+    pub const fn new(value: u32) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The request after this one; `None` when numbers ran out.
+    #[must_use]
+    pub fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
+impl fmt::Display for RequestNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "request {}", self.0)
+    }
+}
+
+/// One Provider request: the Job that sent it and its number in that Job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestRef {
+    pub job: JobId,
+    pub request: RequestNumber,
+}
+
+impl fmt::Display for RequestRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} of {}", self.request, self.job)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RecordRef {
+    Job(JobId),
+    JobInput(JobInputId),
+    JobOutput(JobOutputId),
+    Executor(ExecutorId),
+    Project(ProjectId),
+    Profile(ProfileId),
+    Agent(AgentId),
+    LlmProvider(LlmProviderId),
+    Metrics(MetricsId),
+    AvailabilityStat(AvailabilityStatId),
+    Attachment(AttachmentId),
+}
+
+impl fmt::Display for RecordRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Job(id) => id.fmt(f),
+            Self::JobInput(id) => id.fmt(f),
+            Self::JobOutput(id) => id.fmt(f),
+            Self::Executor(id) => id.fmt(f),
+            Self::Project(id) => id.fmt(f),
+            Self::Profile(id) => id.fmt(f),
+            Self::Agent(id) => id.fmt(f),
+            Self::LlmProvider(id) => id.fmt(f),
+            Self::Metrics(id) => id.fmt(f),
+            Self::AvailabilityStat(id) => id.fmt(f),
+            Self::Attachment(id) => id.fmt(f),
+        }
+    }
+}
