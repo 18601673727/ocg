@@ -124,7 +124,9 @@ use crate::persistence::{ExecutionMode, JobId, JobOutputRecord, JobRecord, Outpu
 mod assets;
 mod browser;
 mod catalog;
+mod config;
 mod events;
+mod listener;
 mod submissions;
 
 #[cfg(test)]
@@ -132,184 +134,17 @@ pub(crate) use events::events_seam;
 #[cfg(test)]
 pub(crate) use submissions::resolution_seam;
 
-/// The loopback TCP port the listener binds, from 1 to 65535.
-pub const PORT_VARIABLE: &str = "OCG_CONTROL_PORT";
-/// The bearer token every request must present. It is never logged.
-pub const TOKEN_VARIABLE: &str = "OCG_CONTROL_TOKEN";
-/// The directory of the exported frontend the listener serves to the
-/// operator's browser. Optional: without it no file is served and no
-/// browser signs in.
-pub const UI_VARIABLE: &str = "OCG_UI_DIR";
+pub use config::{
+    API_VERSION, ConfigError, ControlPlaneConfig, MAX_OUTPUT_PAGE, MAX_SUBMISSION_BYTES,
+    MIN_TOKEN_CHARS, PORT_VARIABLE, TOKEN_VARIABLE, UI_VARIABLE,
+};
+use config::{
+    DEFAULT_OUTPUT_PAGE, MAX_HEADER_BYTES, MAX_HEADERS, MAX_PATH_BYTES, MAX_QUERY_BYTES, Token,
+};
+pub use listener::{ControlPlane, StartError, StopError};
 
-/// The version of the JSON this listener answers.
-pub const API_VERSION: u32 = 1;
-
-/// The shortest token accepted, in characters.
-pub const MIN_TOKEN_CHARS: usize = 32;
-/// The longest token accepted, in characters.
-const MAX_TOKEN_CHARS: usize = 512;
-/// The fewest distinct characters a token may have.
-const MIN_TOKEN_DISTINCT: usize = 8;
-
-/// The largest submission body, in bytes.
-pub const MAX_SUBMISSION_BYTES: usize = 64 * 1024;
-
-/// The most outputs one page returns, and the default.
-pub const MAX_OUTPUT_PAGE: usize = 100;
-const DEFAULT_OUTPUT_PAGE: usize = 50;
-
-/// The longest path and query a request may have, in bytes.
-const MAX_PATH_BYTES: usize = 256;
-const MAX_QUERY_BYTES: usize = 128;
-/// The most headers, and header bytes, a request may have.
-const MAX_HEADERS: usize = 32;
-const MAX_HEADER_BYTES: usize = 8 * 1024;
-
-/// The largest response body, by default.
-const RESPONSE_BYTES: usize = 1024 * 1024;
-
-/// How long a stop waits for requests in flight before it closes them.
-const STOP_TIMEOUT: Seconds = Seconds(5);
-
-/// How long a submission waits for its admission before it answers
-/// `pending`. The admission runs on either way.
-const ADMISSION_WAIT: Duration = Duration::from_secs(3);
-
-/// The bearer token. Its value is never displayed.
-#[derive(Clone)]
-struct Token(Arc<str>);
-
-impl fmt::Debug for Token {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Token(<redacted>)")
-    }
-}
-
-impl Token {
-    /// Whether `presented` is the token, compared in constant time over
-    /// digests, so neither its content nor its length is timed.
-    fn matches(&self, presented: &[u8]) -> bool {
-        let expected = digest(&SHA256, self.0.as_bytes());
-        let presented = digest(&SHA256, presented);
-        verify_slices_are_equal(expected.as_ref(), presented.as_ref()).is_ok()
-    }
-}
-
-/// Why the Control Plane configuration is refused. It never repeats the
-/// token.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ConfigError {
-    #[error("{PORT_VARIABLE} is set but {TOKEN_VARIABLE} is not; the control plane needs both")]
-    TokenMissing,
-    #[error("{TOKEN_VARIABLE} is set but {PORT_VARIABLE} is not; the control plane needs both")]
-    PortMissing,
-    #[error("{PORT_VARIABLE} must be a TCP port from 1 to 65535")]
-    InvalidPort,
-    #[error(
-        "{TOKEN_VARIABLE} must be a random token of {MIN_TOKEN_CHARS} to {MAX_TOKEN_CHARS} characters of A-Z, a-z, 0-9, '-', '.', '_', '~', '+', '/' or '='"
-    )]
-    InvalidToken,
-    #[error("{UI_VARIABLE} must name an existing directory of the exported frontend")]
-    InvalidUiDirectory,
-}
-
-/// What the operator configured for the Control Plane.
-#[derive(Clone, Debug)]
-pub struct ControlPlaneConfig {
-    port: u16,
-    token: Token,
-    /// The directory of the exported frontend, when one is served.
-    ui_dir: Option<PathBuf>,
-    /// The largest response body.
-    response_bytes: usize,
-    /// How long a submission waits for its admission.
-    admission_wait: Duration,
-    /// The bounds of event streams.
-    stream_limits: events::StreamLimits,
-}
-
+#[cfg(test)]
 impl ControlPlaneConfig {
-    /// The configuration in OCG's environment: `None` when neither variable
-    /// is set, which leaves the Control Plane off.
-    ///
-    /// # Errors
-    ///
-    /// Returns why a configuration that was given is refused.
-    pub fn from_environment() -> Result<Option<Self>, ConfigError> {
-        Self::from_source(|name| std::env::var_os(name).map(|value| value.into_string()))
-    }
-
-    /// The configuration in the variables `source` gives; a value that is
-    /// not Unicode is `Some(Err(_))`.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::from_environment`].
-    pub fn from_source(
-        source: impl Fn(&str) -> Option<Result<String, std::ffi::OsString>>,
-    ) -> Result<Option<Self>, ConfigError> {
-        match (source(PORT_VARIABLE), source(TOKEN_VARIABLE)) {
-            (None, None) => Ok(None),
-            (Some(_), None) => Err(ConfigError::TokenMissing),
-            (None, Some(_)) => Err(ConfigError::PortMissing),
-            (Some(port), Some(token)) => {
-                let port = port
-                    .ok()
-                    .and_then(|port| port.parse::<u16>().ok())
-                    .filter(|port| *port != 0)
-                    .ok_or(ConfigError::InvalidPort)?;
-                let token = token.map_err(|_| ConfigError::InvalidToken)?;
-                let ui_dir = match source(UI_VARIABLE) {
-                    None => None,
-                    Some(Err(_)) => return Err(ConfigError::InvalidUiDirectory),
-                    Some(Ok(directory)) => {
-                        let directory = PathBuf::from(directory);
-                        if !directory.is_dir() {
-                            return Err(ConfigError::InvalidUiDirectory);
-                        }
-                        Some(directory)
-                    }
-                };
-                Self::new(port, &token).map(|config| Some(Self { ui_dir, ..config }))
-            }
-        }
-    }
-
-    /// A configuration of `port` and `token`, checked as the environment's
-    /// is, except that port 0, any free port, is allowed.
-    ///
-    /// # Errors
-    ///
-    /// [`ConfigError::InvalidToken`] for a token that is refused.
-    pub fn new(port: u16, token: &str) -> Result<Self, ConfigError> {
-        let length = token.chars().count();
-        let distinct = token
-            .chars()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        if !(MIN_TOKEN_CHARS..=MAX_TOKEN_CHARS).contains(&length)
-            || distinct < MIN_TOKEN_DISTINCT
-            || !token
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-._~+/=".contains(character))
-        {
-            return Err(ConfigError::InvalidToken);
-        }
-        Ok(Self {
-            port,
-            token: Token(token.into()),
-            ui_dir: None,
-            response_bytes: RESPONSE_BYTES,
-            admission_wait: ADMISSION_WAIT,
-            stream_limits: events::StreamLimits::default(),
-        })
-    }
-
-    /// The configured port; 0 for any free one.
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
     #[cfg(test)]
     pub(crate) fn with_response_bytes(mut self, bytes: usize) -> Self {
         self.response_bytes = bytes;
@@ -345,165 +180,8 @@ impl ControlPlaneConfig {
     }
 }
 
-/// Why the listener did not start.
-#[derive(Debug, thiserror::Error)]
-pub enum StartError {
-    #[error("the control plane cannot listen on 127.0.0.1:{port}: {source}")]
-    Bind {
-        port: u16,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("the control plane cannot serve the frontend in {UI_VARIABLE}: {source}")]
-    Ui {
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("the control plane could not start serving: {0}")]
-    Serve(#[source] std::io::Error),
-}
-
-/// Why the listener did not stop cleanly.
-#[derive(Debug, thiserror::Error)]
-pub enum StopError {
-    #[error("the control plane thread panicked")]
-    Panicked,
-}
-
-/// A running listener. Only [`ControlPlane::stop`] stops it.
-pub struct ControlPlane {
-    address: SocketAddr,
-    server: Server,
-    thread: std::thread::JoinHandle<()>,
-    shared: Arc<Shared>,
-}
-
+#[cfg(test)]
 impl ControlPlane {
-    /// Binds `127.0.0.1` at the configured port, then starts answering on
-    /// a thread of its own. Nothing is answered unless the bind succeeded.
-    /// Jobs are submitted to `scheduler`, which must be the host's own.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the listener cannot be bound.
-    pub fn start(
-        config: ControlPlaneConfig,
-        database: DatabaseHandle,
-        scheduler: SchedulerHandle,
-    ) -> Result<Self, StartError> {
-        let bind = |source| StartError::Bind {
-            port: config.port,
-            source,
-        };
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).map_err(bind)?;
-        let address = listener.local_addr().map_err(bind)?;
-        let assets = match config.ui_dir.as_deref() {
-            Some(directory) => Some(
-                assets::UiAssets::open(directory).map_err(|source| StartError::Ui { source })?,
-            ),
-            None => None,
-        };
-        // The browser surface is exactly the one the frontend serves in:
-        // no UI directory, no session.
-        let browser = assets
-            .is_some()
-            .then(browser::State::start)
-            .transpose()
-            .map_err(|_| StartError::Serve(std::io::Error::other("no randomness for sign-in")))?;
-        let shared = Arc::new(Shared {
-            database,
-            scheduler,
-            submissions: submissions::Registry::default(),
-            token: config.token,
-            port: address.port(),
-            response_bytes: config.response_bytes,
-            admission_wait: config.admission_wait,
-            stream_limits: config.stream_limits,
-            assets,
-            browser,
-            streams: AtomicUsize::new(0),
-            closing: AtomicBool::new(false),
-            #[cfg(test)]
-            fetched: AtomicUsize::new(0),
-        });
-        let kept = shared.clone();
-        let (started, starting) = flume::bounded(1);
-        let thread = std::thread::Builder::new()
-            .name("ocg-control-plane".to_owned())
-            .spawn(move || {
-                // A runtime of its own, without signals: the server's
-                // signal settings apply to this runtime only.
-                ntex::rt::System::new("ocg-control-plane", ntex::rt::DefaultRuntime).block_on(
-                    async move {
-                        let server = HttpServer::new(async move || {
-                            App::new()
-                                .state(shared.clone())
-                                .default_service(web::to(answer))
-                        })
-                        .workers(1)
-                        .maxconn(64)
-                        .backlog(64)
-                        .disable_signals()
-                        .shutdown_timeout(STOP_TIMEOUT)
-                        .config(
-                            SharedCfg::new("OCG-CONTROL").add(IoConfig::new()).add(
-                                HttpServiceConfig::new()
-                                    .set_max_headers(MAX_HEADERS)
-                                    .set_max_buf_size(16 * 1024),
-                            ),
-                        )
-                        .listen(listener);
-                        match server {
-                            Ok(server) => {
-                                let server = server.run();
-                                started.send(Ok(server.clone())).ok();
-                                // Resolves once the server has stopped.
-                                server.await.ok();
-                            }
-                            Err(error) => {
-                                started.send(Err(error)).ok();
-                            }
-                        }
-                    },
-                );
-            })
-            .map_err(StartError::Serve)?;
-        let server = match starting.recv() {
-            Ok(Ok(server)) => server,
-            Ok(Err(error)) => {
-                thread.join().ok();
-                return Err(StartError::Serve(error));
-            }
-            Err(_) => {
-                thread.join().ok();
-                return Err(StartError::Serve(std::io::Error::other(
-                    "the control plane thread stopped before serving",
-                )));
-            }
-        };
-        Ok(Self {
-            address,
-            server,
-            thread,
-            shared: kept,
-        })
-    }
-
-    /// The address it listens on.
-    pub fn address(&self) -> SocketAddr {
-        self.address
-    }
-
-    /// The pairing code its operator signs a browser in with, when the
-    /// browser surface is served. It is shown to the operator alone, and
-    /// is not the bearer token.
-    pub fn pairing_code(&self) -> Option<String> {
-        self.shared
-            .browser
-            .as_ref()
-            .map(|browser| browser.pairing_code().to_owned())
-    }
-
     /// How many Jobs it admitted whose execution has not returned, and how
     /// many keys it holds unresolved.
     #[cfg(test)]
@@ -530,23 +208,6 @@ impl ControlPlane {
     pub(crate) fn holders(&self) -> impl Fn() -> usize + Send + 'static {
         let shared = Arc::downgrade(&self.shared);
         move || shared.strong_count()
-    }
-
-    /// Stops accepting, lets requests in flight finish within a bounded
-    /// time, then closes them and the listening socket, and joins the
-    /// listener's thread. Event streams end at their next read, without a
-    /// settlement, for their clients to resume. Admissions still running
-    /// are dropped with it: none of them owns its Job, which the execution
-    /// runtime settles or refuses as it stops, and whose record a later
-    /// lookup reads.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StopError::Panicked`] when the listener's thread panicked.
-    pub async fn stop(self) -> Result<(), StopError> {
-        self.shared.closing.store(true, Ordering::SeqCst);
-        self.server.stop(true).await;
-        self.thread.join().map_err(|_| StopError::Panicked)
     }
 }
 
