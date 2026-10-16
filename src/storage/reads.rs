@@ -1,3 +1,5 @@
+use std::ops::Bound;
+
 use super::*;
 
 // ---- typed reads ---------------------------------------------------------------
@@ -107,6 +109,57 @@ pub(crate) fn read_jobs(
         records.push(job_record(&rx, row)?);
     }
     Ok(records)
+}
+
+/// Up to `limit` entries of [`PENDING_JOBS`] in key order, strictly after
+/// `after` when given, never more than [`MAX_PAGE`]. Every entry examined
+/// counts against the limit, so the cost of a call is bounded by it however
+/// many Jobs the table holds. An entry must reference a Job row that is
+/// still pending and carries that very key; anything else is corruption and
+/// fails the read rather than being skipped.
+pub(crate) fn read_pending_jobs(
+    database: &Database,
+    after: Option<PendingJobKey>,
+    limit: usize,
+) -> Result<PendingJobsPage, StorageError> {
+    let rx = read(database)?;
+    let genesis = genesis_id(&rx.open_table(META)?)?;
+    let index = rx.open_table(PENDING_JOBS)?;
+    let jobs = rx.open_table(JOBS)?;
+    let start = after.map_or(Bound::Unbounded, |key| {
+        Bound::Excluded((key.created_at.as_unix_micros(), key.job.get()))
+    });
+    let limit = limit.min(MAX_PAGE);
+    let mut entries = index.range((start, Bound::Unbounded))?;
+    let mut visited = Vec::new();
+    let mut exhausted = false;
+    while visited.len() < limit {
+        let Some(entry) = entries.next() else {
+            exhausted = true;
+            break;
+        };
+        let key = entry?.0.value();
+        let (created_at, job) = (Timestamp::from_unix_micros(key.0), JobId::new(key.1));
+        let row = jobs
+            .get(key.1)?
+            .map(|v| JobRow::decode(v.value()))
+            .transpose()?
+            .ok_or_else(|| {
+                StorageError::corrupted(format!("PENDING_JOBS names the missing Job {job}"))
+            })?;
+        if row.pending_key() != key || row.id == genesis || !row.awaits_start() {
+            return Err(StorageError::corrupted(format!(
+                "PENDING_JOBS names {job}, which is not a pending Job created at {created_at:?}"
+            )));
+        }
+        visited.push(PendingJobKey { created_at, job });
+    }
+    let last_visited = visited.last().copied();
+    Ok(PendingJobsPage {
+        visited,
+        last_visited,
+        exhausted,
+    })
 }
 
 /// A Job's ordinary children in ID order, strictly after `after` when given.

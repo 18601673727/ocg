@@ -378,6 +378,19 @@ impl DatabaseHandle {
             .await
     }
 
+    /// The Jobs that are submitted but neither started nor settled, oldest
+    /// first by creation time and then ID, strictly after `after` when given.
+    /// At most `limit`, and never more than 1,000, index entries are
+    /// examined per call, see [`persistence::PendingJobsPage`].
+    pub async fn pending_jobs(
+        &self,
+        after: Option<persistence::PendingJobKey>,
+        limit: usize,
+    ) -> Result<persistence::PendingJobsPage, DatabaseError> {
+        self.read(move |database| storage::read_pending_jobs(database, after, limit))
+            .await
+    }
+
     /// A Job's ordinary children in ID order, strictly after `after` when
     /// given; at most 1,000 per call. The Genesis Job is not its own child.
     pub async fn children(

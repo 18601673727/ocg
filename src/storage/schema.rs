@@ -41,6 +41,11 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// created a Job with a submission key. An earlier build that opens a file
 /// holding it leaves it alone and cannot contradict it: it never creates a
 /// Job with a key, and a committed Job identity is never reused.
+///
+/// It then gained [`PENDING_JOBS`], again without a new version. An earlier
+/// build neither knows nor maintains it and can start or finalize a Job
+/// behind its back, so its entries are never trusted: every opening discards
+/// the table and rebuilds it from the Job table.
 pub(crate) const FORMAT_VERSION: u32 = 13;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
@@ -62,6 +67,16 @@ pub(super) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta
 pub(super) const GENESIS_KEY: &str = "genesis";
 pub(super) const SEQUENCES: TableDefinition<&str, u64> = TableDefinition::new("sequence");
 pub(super) const JOBS: Records = TableDefinition::new("job");
+/// (created_at in Unix microseconds, Job) for every Job other than Genesis
+/// that has not started and has no terminal outcome. Derived from JOBS and
+/// never an authority of its own: JOBS decides, and [`Batch::insert_job`] and
+/// [`Batch::put_job`] keep the two in step in the transaction that writes the
+/// Job. A Job's creation time and identity never change, so a Job has one
+/// key for as long as it is a member. The Job identity makes equal times
+/// distinct, and a clock that moved backwards only changes where a later Job
+/// sorts, never the order of the keys themselves.
+pub(super) const PENDING_JOBS: TableDefinition<(i64, u64), ()> =
+    TableDefinition::new("pending_job");
 pub(super) const JOB_INPUTS: Records = TableDefinition::new("job_input");
 pub(super) const JOB_OUTPUTS: Records = TableDefinition::new("job_output");
 pub(super) const EXECUTORS: Records = TableDefinition::new("executor");

@@ -60,12 +60,12 @@ use crate::persistence::{
     LlmProviderRecord, LlmTarget, LlmTransport, Measurements, MetricsId, MetricsRecord,
     ModelCapability, NotInvokedReason, ObservationCursor, ObservationFilter, ObservationPage,
     ObservedModel, ObservedModelChoice, ObservedModelFilter, ObservedModelPage, OperationId,
-    OperationKind, OperationMarker, OutputKind, ProfileConfig, ProfileEditability, ProfileId,
-    ProfileKind, ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef, Recorded,
-    RequestFingerprint, RequestNumber, RequestRef, SubmissionKey, SubmissionRecord,
-    SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
-    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause, Violation,
-    WithheldReason, WrongProfileKind,
+    OperationKind, OperationMarker, OutputKind, PendingJobKey, PendingJobsPage, ProfileConfig,
+    ProfileEditability, ProfileId, ProfileKind, ProfileRecord, ProjectId, ProjectRecord,
+    ProviderSnapshot, RecordRef, Recorded, RequestFingerprint, RequestNumber, RequestRef,
+    SubmissionKey, SubmissionRecord, SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef,
+    ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation,
+    UncertainCause, Violation, WithheldReason, WrongProfileKind,
 };
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
@@ -122,10 +122,10 @@ pub(crate) use reads::{
     read_attachment_inputs, read_attachments, read_children, read_compatible_executors,
     read_executor, read_executors, read_input_jobs, read_job, read_job_compatible_executors,
     read_job_configuration, read_job_input, read_job_input_for_job, read_jobs, read_latest_output,
-    read_llm_provider, read_llm_providers, read_marker, read_markers, read_outputs, read_profile,
-    read_profile_editability, read_profile_jobs, read_profiles, read_project, read_project_jobs,
-    read_projects, read_provider_profiles, read_retries, read_submission, read_tool_evidence,
-    unneeded_content,
+    read_llm_provider, read_llm_providers, read_marker, read_markers, read_outputs,
+    read_pending_jobs, read_profile, read_profile_editability, read_profile_jobs, read_profiles,
+    read_project, read_project_jobs, read_projects, read_provider_profiles, read_retries,
+    read_submission, read_tool_evidence, unneeded_content,
 };
 use reads::{read, read_link, read_pairs};
 pub(crate) use rows::{

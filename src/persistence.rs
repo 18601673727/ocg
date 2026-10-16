@@ -60,9 +60,9 @@ pub use records::{
     LlmProviderRecord, LlmTarget, LlmTransport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES,
     MAX_ATTACHMENT_NAME_BYTES, Measurements, MetricsRecord, ModelCapability, NewAgent,
     NewAttachment, NewLlmProvider, NewMetrics, NewProfile, NewProfileConfig, NewProject,
-    NewSubmission, Profile, ProfileConfig, ProfileEditability, ProfileKind, ProfileRecord,
-    ProfileVariant, ProjectRecord, ProviderSnapshot, RequestFingerprint, SubmissionKey,
-    SubmissionRecord, SubmittedConfiguration, WrongProfileKind,
+    NewSubmission, PendingJobKey, PendingJobsPage, Profile, ProfileConfig, ProfileEditability,
+    ProfileKind, ProfileRecord, ProfileVariant, ProjectRecord, ProviderSnapshot,
+    RequestFingerprint, SubmissionKey, SubmissionRecord, SubmittedConfiguration, WrongProfileKind,
 };
 pub use tool_evidence::{
     AuthorizationBasis, EffectConclusion, MAX_HANDLER_VERSION_BYTES,

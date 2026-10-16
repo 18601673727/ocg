@@ -432,11 +432,34 @@ impl Batch {
     }
 
     pub(crate) fn insert_job(&mut self, row: &JobRow) -> Result<(), BatchError> {
-        self.insert_new(JOBS, row.id.get(), row.encode(), RecordRef::Job(row.id))
+        self.insert_new(JOBS, row.id.get(), row.encode(), RecordRef::Job(row.id))?;
+        self.index_pending(row)
     }
 
     pub(crate) fn put_job(&mut self, row: &JobRow) -> Result<(), BatchError> {
-        self.overwrite(JOBS, row.id.get(), row.encode())
+        if let Some(previous) = self.job(row.id)?
+            && previous.created_at != row.created_at
+        {
+            return self.corrupted(format!("{} changed its creation time", row.id));
+        }
+        self.overwrite(JOBS, row.id.get(), row.encode())?;
+        self.index_pending(row)
+    }
+
+    /// Brings the Job's [`PENDING_JOBS`] entry in line with the row just
+    /// written. The key is fixed by the Job's identity and creation time, so
+    /// removing it can only remove this Job's own entry.
+    fn index_pending(&mut self, row: &JobRow) -> Result<(), BatchError> {
+        let genesis = self.genesis()?;
+        self.step(|tx| {
+            let mut pending = tx.open_table(PENDING_JOBS)?;
+            if row.id != genesis && row.awaits_start() {
+                pending.insert(row.pending_key(), ())?;
+            } else {
+                pending.remove(row.pending_key())?;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn require_input(&mut self, id: JobInputId) -> Result<JobInputRow, BatchError> {

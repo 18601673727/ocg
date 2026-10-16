@@ -35,6 +35,30 @@ pub struct JobRecord {
     pub retry_of: Option<JobId>,
 }
 
+/// A position in the order of Jobs that have been submitted but have not
+/// started or reached an outcome: creation time, then Job ID, so Jobs created
+/// in the same microsecond keep a stable order. A creation time is the
+/// database worker's wall clock, so it can run backwards across Job IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PendingJobKey {
+    pub created_at: Timestamp,
+    pub job: JobId,
+}
+
+/// A bounded run of the pending Jobs in key order, read in one short
+/// transaction. `visited` holds every index entry the read examined and each
+/// references an existing Job that was pending in that transaction. Nothing
+/// is filtered here, and a page never examines more entries than its limit.
+/// `exhausted` is set only when the read went past the last entry; a page
+/// that used its whole limit says nothing about what follows it, and the
+/// next page starts strictly after `last_visited`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingJobsPage {
+    pub visited: Vec<PendingJobKey>,
+    pub last_visited: Option<PendingJobKey>,
+    pub exhausted: bool,
+}
+
 /// A stored JobInput.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobInputRecord {

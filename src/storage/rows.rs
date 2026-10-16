@@ -33,6 +33,18 @@ impl JobRow {
         self.confirmed_terminal() || self.unknown_at.is_some()
     }
 
+    /// Whether the Job has neither started nor reached any outcome, unknown
+    /// included. Whether it is a member of [`PENDING_JOBS`] also depends on
+    /// it not being the Genesis Job, which the row does not say.
+    pub(super) fn awaits_start(&self) -> bool {
+        self.started_at.is_none() && !self.any_terminal()
+    }
+
+    /// The Job's [`PENDING_JOBS`] key.
+    pub(super) fn pending_key(&self) -> (i64, u64) {
+        (self.created_at.as_unix_micros(), self.id.get())
+    }
+
     /// Whether the Job's own execution is over: it has a confirmed outcome,
     /// or an unknown outcome whose execution the trusted path confirmed
     /// stopped. An unknown outcome without that confirmation may still be

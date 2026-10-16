@@ -167,6 +167,9 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId), OpenError>
         // not say whether an earlier build wrote it or changed it since.
         let certified = created || certify_subtree_closure(&tx)?;
         record_closure(&tx, certified)?;
+        // Rebuilt even in a new file, which has no table yet, and whatever the
+        // table held: only this build maintains it.
+        rebuild_pending_jobs(&tx, genesis)?;
         let mut sequences = tx.open_table(SEQUENCES).map_err(StorageError::from)?;
         let epoch = sequences
             .get(OPEN_EPOCH)
@@ -180,6 +183,35 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId), OpenError>
     };
     tx.commit().map_err(StorageError::from)?;
     Ok(opened)
+}
+
+/// Replaces [`PENDING_JOBS`] with the Jobs that [`JobRow::awaits_start`]
+/// says wait, read from the Job table in the open transaction. It reads
+/// every Job once, in time linear in the Jobs, and writes only the entries
+/// of the Jobs that wait. A failure leaves the transaction to be abandoned
+/// with the table as it was.
+pub(super) fn rebuild_pending_jobs(
+    tx: &WriteTransaction,
+    genesis: JobId,
+) -> Result<(), StorageError> {
+    tx.delete_table(PENDING_JOBS)?;
+    let mut pending = tx.open_table(PENDING_JOBS)?;
+    let jobs = tx.open_table(JOBS)?;
+    for entry in jobs.iter()? {
+        let (id, bytes) = entry?;
+        let row = JobRow::decode(bytes.value())?;
+        if row.id.get() != id.value() {
+            return Err(StorageError::corrupted(format!(
+                "the Job record {} holds {}",
+                id.value(),
+                row.id
+            )));
+        }
+        if row.id != genesis && row.awaits_start() {
+            pending.insert(row.pending_key(), ())?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
