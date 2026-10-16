@@ -153,11 +153,11 @@ pub(super) fn admit_job(
         batch.require_project(*project)?;
     }
     let mut dependency_rows = Vec::with_capacity(job.dependencies.len());
-    for (index, (dependency, condition)) in job.dependencies.iter().enumerate() {
+    for (index, (dependency, _)) in job.dependencies.iter().enumerate() {
         if job.dependencies[..index].iter().any(|(earlier, _)| earlier == dependency) {
             return batch.reject(Violation::DuplicateDependency(*dependency));
         }
-        dependency_rows.push((batch.require_job(*dependency)?, *condition));
+        dependency_rows.push(batch.require_job(*dependency)?);
     }
     if let Some(configuration) = job.configuration {
         batch.require_configuration(configuration)?;
@@ -171,8 +171,8 @@ pub(super) fn admit_job(
 
     let id = JobId(batch.next_id(crate::storage::Sequence::Job)?);
     let mut proposed = vec![(job.parent, id)];
-    for (row, condition) in &dependency_rows {
-        if dependency_state(*condition, row) == DependencyState::Waiting {
+    for row in &dependency_rows {
+        if !batch.subtree_settled(row)? {
             proposed.push((id, row.id));
         }
     }
@@ -295,11 +295,12 @@ pub(crate) fn create_submitted_local_job(
 /// Creates a new Job that retries `retry.original` under the original's
 /// parent. The original Job, its input and its outputs are not touched.
 ///
-/// Only a settled original may be retried, and only while none of its
-/// direct retries is unsettled; both are checked in the transaction that
-/// creates the retry, so concurrent retries cannot both become active. The
-/// original's tool effects are checked in the same transaction, see
-/// [`require_repeatable_tool_effects`].
+/// Only an original whose subtree has settled may be retried, and only
+/// while none of its direct retries has an unsettled subtree; both are
+/// checked in the transaction that creates the retry, so concurrent retries
+/// cannot both become active. An original that stopped locally while a
+/// descendant still runs is not retried yet. The original's tool effects
+/// are checked in the same transaction, see [`require_repeatable_tool_effects`].
 ///
 /// The retry's configuration is frozen from its Profiles as they are now. It
 /// may share the original's input only when that equals what the input
@@ -310,11 +311,12 @@ pub(crate) fn retry_job(batch: &mut Batch, retry: JobRetry) -> OpResult<JobId> {
     if batch.genesis()? == original {
         return batch.reject(Violation::GenesisProtected(original));
     }
-    if !original_row.settled() {
+    if !batch.subtree_settled(&original_row)? {
         return batch.reject(Violation::RetryOfUnsettledJob(original));
     }
     for existing in batch.retries(original)? {
-        if !batch.require_job(existing)?.settled() {
+        let existing_row = batch.require_job(existing)?;
+        if !batch.subtree_settled(&existing_row)? {
             return batch.reject(Violation::ActiveRetry {
                 original,
                 retry: existing,
@@ -514,9 +516,10 @@ pub(super) fn publish_output(
     Ok(AppendedOutput { output: id, seq: record.seq })
 }
 
-/// A confirmed outcome requires every child Job to be settled: a child with
-/// an unknown outcome counts once its execution is confirmed stopped. A
-/// child's own outcome does not decide the parent's; a required success is
+/// A confirmed outcome requires the subtree of every child Job to be
+/// settled: a child with an unknown outcome counts once its execution is
+/// confirmed stopped and so is every descendant of it. A child's own
+/// outcome does not decide the parent's; a required success is
 /// an explicit Success dependency. Completion also requires every explicit
 /// dependency of the Job to be satisfied, while failure and cancellation do
 /// not. The Job is then sterilized, its final result published, and the
@@ -553,7 +556,8 @@ pub(crate) fn finalize_job(batch: &mut Batch, job: JobId, finalization: JobFinal
         JobFinalization::Cancelled(result) => (|row| &mut row.cancelled_at, result),
     };
     for child in batch.children(job)? {
-        if !batch.require_job(child)?.settled() {
+        let child_row = batch.require_job(child)?;
+        if !batch.subtree_settled(&child_row)? {
             return batch.reject(Violation::UnfinishedChild(job));
         }
     }
@@ -761,14 +765,15 @@ pub(crate) fn record_tool_outcome(
 
 /// Records a verified conclusion about an admitted call whose outcome is
 /// uncertain, once, keeping the admission and the uncertain outcome as
-/// they are. The Job must be settled, so nothing still executes for it.
+/// they are. The Job must be locally stopped, so nothing still executes for
+/// it; a descendant that still runs executes its own calls, not this Job's.
 /// The reconciler, its evidence and its explanation must each be given.
 pub(crate) fn reconcile_tool_effect(
     batch: &mut Batch,
     call: ToolCallRef,
     reconciliation: ToolReconciliation,
 ) -> OpResult<()> {
-    if !batch.require_job(call.job)?.settled() {
+    if !batch.require_job(call.job)?.locally_stopped() {
         return batch.reject(Violation::ToolEffectStillExecuting(call.job));
     }
     let Some(mut record) = batch.tool_evidence(call)? else {
@@ -813,7 +818,10 @@ pub(super) fn require_satisfied_dependencies(
     job: JobId,
 ) -> Result<(), BatchError> {
     for (prerequisite, condition) in batch.dependencies(job)? {
-        let state = dependency_state(condition, &batch.require_job(prerequisite)?);
+        let row = batch.require_job(prerequisite)?;
+        let subtree_settled =
+            matches!(condition, DependencyCondition::Settled) && batch.subtree_settled(&row)?;
+        let state = dependency_state_with(condition, &row, subtree_settled);
         if state != DependencyState::Satisfied {
             return batch.reject(Violation::UnsatisfiedDependency {
                 job,

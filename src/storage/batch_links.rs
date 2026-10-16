@@ -183,6 +183,18 @@ impl Batch {
         })
     }
 
+    /// Whether the Job and all its descendants have stopped, read inside
+    /// this transaction. A confirmed outcome answers without touching a
+    /// table; only a locally stopped unknown outcome follows its children.
+    /// A traversal that reaches its bound answers `false`, so every caller
+    /// refuses rather than proceeds on a guess.
+    pub(crate) fn subtree_settled(&mut self, job: &JobRow) -> Result<bool, BatchError> {
+        if let Some(settlement) = Settlement::of_row(job) {
+            return Ok(settlement == Settlement::Settled);
+        }
+        self.step(|tx| Ok(WaitingTables::open(tx)?.subtree_settlement(job)? == Settlement::Settled))
+    }
+
     /// The Jobs that directly retry `original`, in creation order.
     pub(crate) fn retries(&mut self, original: JobId) -> Result<Vec<JobId>, BatchError> {
         self.step(|tx| {

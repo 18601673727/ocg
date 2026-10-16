@@ -26,6 +26,12 @@
 //! The waiting graph is never cached. [`Batch::check_waiting`] builds a
 //! bounded petgraph view from records read inside the current write
 //! transaction, adds the proposed edges and rejects any cycle.
+//!
+//! A Job's own execution being over and its whole subtree being over are
+//! different facts. [`JobRow::locally_stopped`] reads the row and governs the
+//! Job's own holds. [`Batch::subtree_settled`] also follows the descendants
+//! of a locally stopped unknown outcome, and governs everything that waits
+//! on the Job or closes over it. Neither is stored.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -140,8 +146,10 @@ pub(crate) use token_aggregation::{
 };
 #[cfg(test)]
 pub(crate) use token_aggregation::{replace_token_minute, replace_token_request};
+#[cfg(test)]
 pub(crate) use waiting::dependency_state;
-use waiting::{WaitingVerdict, waiting_verdict};
+pub(crate) use waiting::dependency_state_with;
+use waiting::{Settlement, WaitingTables, WaitingVerdict, waiting_verdict};
 
 // ---- storage errors -------------------------------------------------------------
 

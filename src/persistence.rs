@@ -9,7 +9,7 @@ use crate::openai_compatible::{
 };
 use crate::storage::{
     AgentRow, AvailabilityStatRow, Batch, BatchError, ExecutorRow, JobInputRow, JobRow,
-    MarkerSubjects, MetricsRow, ProfileLinks, ProfileRow, dependency_state,
+    MarkerSubjects, MetricsRow, ProfileLinks, ProfileRow, dependency_state_with,
 };
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 

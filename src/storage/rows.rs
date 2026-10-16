@@ -33,11 +33,21 @@ impl JobRow {
         self.confirmed_terminal() || self.unknown_at.is_some()
     }
 
-    /// Whether the Job is settled: it has a confirmed outcome, or an unknown
-    /// outcome whose execution the trusted path confirmed stopped. An unknown
-    /// outcome without that confirmation may still be executing.
-    pub(crate) fn settled(&self) -> bool {
+    /// Whether the Job's own execution is over: it has a confirmed outcome,
+    /// or an unknown outcome whose execution the trusted path confirmed
+    /// stopped. An unknown outcome without that confirmation may still be
+    /// executing. This says nothing of the Job's children; whether they are
+    /// over too is its subtree settlement, read from the waiting tables.
+    pub(crate) fn locally_stopped(&self) -> bool {
         self.confirmed_terminal() || (self.unknown_at.is_some() && self.stop_confirmed_at.is_some())
+    }
+
+    /// The row-only reading that predates the subtree distinction, kept so
+    /// the tests that pin it still compile. Production code asks
+    /// [`Self::locally_stopped`] or the graph-aware settlement instead.
+    #[cfg(test)]
+    pub(crate) fn settled(&self) -> bool {
+        self.locally_stopped()
     }
 
     /// Whether this Job holds the Profiles it was submitted with: until a

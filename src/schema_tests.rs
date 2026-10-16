@@ -2570,9 +2570,11 @@ fn an_unknown_outcome_holds_its_profiles_until_its_stop_is_confirmed() {
         "no result is published"
     );
 
-    // The stopped Job is settled: a success dependency on it can never be
-    // met, so it is no wait, and the stopped Job waits for nothing. No cycle
-    // closes through it, and the dependent can fail but never complete.
+    // The stopped Job's own execution is over, so a success dependency on it
+    // can never be met and the dependent can fail but never complete. Its
+    // child still runs, though, so its subtree has not settled: the stopped
+    // Job still waits for that child and the dependency edge stays, and a
+    // cycle closed through them is refused.
     let dependent = create_job(
         &handle,
         NewJob {
@@ -2581,18 +2583,23 @@ fn an_unknown_outcome_holds_its_profiles_until_its_stop_is_confirmed() {
         },
     );
     let input = wait(handle.save_job_input(None, JobInputDraft::default())).expect("save input");
-    wait(handle.create_job_with_input(
-        NewJob {
-            dependencies: vec![(dependent, DependencyCondition::Success)],
-            ..new_job(
-                "closed a cycle while the stop was unconfirmed",
-                child,
-                Vec::new(),
-            )
-        },
-        input,
-    ))
-    .expect("no waiting edge runs through a stopped Job");
+    assert!(
+        matches!(
+            violation(wait(handle.create_job_with_input(
+                NewJob {
+                    dependencies: vec![(dependent, DependencyCondition::Success)],
+                    ..new_job(
+                        "closed a cycle through a stopped Job with an active child",
+                        child,
+                        Vec::new(),
+                    )
+                },
+                input,
+            ))),
+            Violation::WaitingCycle(_)
+        ),
+        "a waiting edge runs through a stopped Job while its subtree is active"
+    );
     assert_eq!(
         violation(wait(handle.finalize_job(
             dependent,
