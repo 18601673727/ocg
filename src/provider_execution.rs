@@ -39,17 +39,18 @@ mod types;
 mod usage;
 
 pub use cancellation::CancellationToken;
+pub(crate) use conversation::request_body;
 pub use conversation::{execute_chat, objective_conversation, objective_conversation_with_images};
 #[cfg(test)]
 use exchange::authorization;
 use exchange::incomplete_tool_calls;
 pub use exchange::{execute_chat_with_sink, execute_conversation};
-#[cfg(test)]
-pub(crate) use exchange::{read_response, request_body};
 pub(crate) use observe::{announce, rejected_failure};
 use observe::{announce_at, bounded_body, classify_client_error, trim_ascii, unannounced_fact};
 pub use observe::{error_observations, metrics, result_value, success_observation};
+#[cfg(test)]
 use stream::parse_stream;
+pub(crate) use stream::read_response;
 pub use types::{
     CredentialResolver, EnvironmentCredentialResolver, OutputSinkError, ProviderExecutionConfig,
     ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,

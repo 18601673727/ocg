@@ -173,43 +173,6 @@ async fn exchange(
     .await
 }
 
-/// Reads one response stream, then admits its tool calls only as far as
-/// `conversation` allowed them. The configured timeout applies only while
-/// waiting for the next provider chunk; parsing and persistence are outside
-/// that interval.
-pub(crate) async fn read_response(
-    payload: Payload,
-    status_code: u16,
-    started: Instant,
-    request_id: Option<String>,
-    config: &ProviderExecutionConfig,
-    sink: Option<&mut dyn ProviderOutputSink>,
-    conversation: &ChatConversation,
-) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-    let mut capture = UsageCapture::default();
-    let result = parse_stream(
-        payload,
-        status_code,
-        started,
-        request_id,
-        config,
-        sink,
-        &mut capture,
-    )
-    .await?;
-    if let Err(error) = conversation.admit_tool_calls(&result.tool_calls) {
-        return Err(incomplete_tool_calls(
-            error,
-            ResponseFacts {
-                status_code: result.status_code,
-                finish_reason: result.finish_reason,
-                raw_finish_reason: result.raw_finish_reason,
-            },
-        ));
-    }
-    Ok(result)
-}
-
 pub(super) fn incomplete_tool_calls(
     error: InvalidToolCall,
     facts: ResponseFacts,
@@ -243,41 +206,4 @@ pub(super) fn authorization(credential: &str) -> Result<HeaderValue, ProviderExe
     })?;
     value.set_sensitive(true);
     Ok(value)
-}
-
-/// The request body: the conversation as given, with the frozen model and
-/// parameters. Streaming with usage is always requested.
-pub(crate) fn request_body(
-    model: &str,
-    parameters: &LlmParameters,
-    conversation: &ChatConversation,
-) -> Result<Value, ProviderExecutionError> {
-    let mut body =
-        serde_json::to_value(conversation).map_err(|error| ProviderExecutionError::Build {
-            message: format!("could not encode the chat request: {error}"),
-        })?;
-    let Some(object) = body.as_object_mut() else {
-        return Err(ProviderExecutionError::Build {
-            message: "the chat request did not encode as a JSON object".to_owned(),
-        });
-    };
-    object.insert("model".to_owned(), json!(model));
-    object.insert("stream".to_owned(), json!(true));
-    object.insert("stream_options".to_owned(), json!({"include_usage": true}));
-    if let Some(value) = parameters.temperature {
-        object.insert("temperature".to_owned(), json!(value));
-    }
-    if let Some(value) = parameters.top_p {
-        object.insert("top_p".to_owned(), json!(value));
-    }
-    if let Some(value) = parameters.max_tokens {
-        object.insert("max_tokens".to_owned(), json!(value));
-    }
-    if let Some(value) = parameters.presence_penalty {
-        object.insert("presence_penalty".to_owned(), json!(value));
-    }
-    if let Some(value) = parameters.frequency_penalty {
-        object.insert("frequency_penalty".to_owned(), json!(value));
-    }
-    Ok(body)
 }

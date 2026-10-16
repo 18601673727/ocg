@@ -1,5 +1,42 @@
 use super::*;
 
+/// Reads one response stream, then admits its tool calls only as far as
+/// `conversation` allowed them. The configured timeout applies only while
+/// waiting for the next provider chunk; parsing and persistence are outside
+/// that interval.
+pub(crate) async fn read_response(
+    payload: Payload,
+    status_code: u16,
+    started: Instant,
+    request_id: Option<String>,
+    config: &ProviderExecutionConfig,
+    sink: Option<&mut dyn ProviderOutputSink>,
+    conversation: &ChatConversation,
+) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+    let mut capture = UsageCapture::default();
+    let result = parse_stream(
+        payload,
+        status_code,
+        started,
+        request_id,
+        config,
+        sink,
+        &mut capture,
+    )
+    .await?;
+    if let Err(error) = conversation.admit_tool_calls(&result.tool_calls) {
+        return Err(incomplete_tool_calls(
+            error,
+            ResponseFacts {
+                status_code: result.status_code,
+                finish_reason: result.finish_reason,
+                raw_finish_reason: result.raw_finish_reason,
+            },
+        ));
+    }
+    Ok(result)
+}
+
 pub(super) async fn parse_stream(
     payload: Payload,
     status_code: u16,
