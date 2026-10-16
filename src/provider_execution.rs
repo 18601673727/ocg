@@ -33,23 +33,31 @@ const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 mod cancellation;
 mod conversation;
 mod exchange;
+mod observe;
 mod stream;
 mod types;
+mod usage;
 
 pub use cancellation::CancellationToken;
 pub use conversation::{execute_chat, objective_conversation, objective_conversation_with_images};
-use exchange::incomplete_tool_calls;
 #[cfg(test)]
-use exchange::{authorization, unannounced_fact};
+use exchange::authorization;
+use exchange::incomplete_tool_calls;
 pub use exchange::{execute_chat_with_sink, execute_conversation};
 #[cfg(test)]
 pub(crate) use exchange::{read_response, request_body};
+pub(crate) use observe::{announce, rejected_failure};
+use observe::{announce_at, bounded_body, classify_client_error, trim_ascii, unannounced_fact};
+pub use observe::{error_observations, metrics, result_value, success_observation};
 use stream::parse_stream;
 pub use types::{
     CredentialResolver, EnvironmentCredentialResolver, OutputSinkError, ProviderExecutionConfig,
     ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
     ProviderOutputSink, ResponseFacts,
 };
+
+pub(crate) use usage::UsageCapture;
+use usage::reported_usage;
 
 #[cfg(test)]
 impl CancellationToken {
@@ -63,329 +71,6 @@ impl CancellationToken {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
-}
-
-/// Hands one fact to the sink with the current time.
-pub(crate) async fn announce(sink: Option<&mut (dyn ProviderOutputSink + '_)>, fact: ProviderFact) {
-    announce_at(sink, Timestamp::now(), fact).await;
-}
-
-/// Hands one fact to the sink with the time the producer learned it. The time
-/// is fixed by the caller before this awaits, so a slow sink cannot move it.
-async fn announce_at(
-    sink: Option<&mut (dyn ProviderOutputSink + '_)>,
-    observed_at: Timestamp,
-    fact: ProviderFact,
-) {
-    if let Some(sink) = sink {
-        sink.observe(ProviderObservation { observed_at, fact })
-            .await;
-    }
-}
-
-/// A valid, non-null usage object of one event, and what its position says
-/// about its finality.
-#[derive(Clone, Debug, PartialEq)]
-struct ReportedUsage {
-    usage: NormalizedUsage,
-    finality: UsageFinality,
-}
-
-fn counter(value: Option<&Value>) -> Option<u32> {
-    value
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-}
-
-/// The usage object of an event. `usage: null` and any other non-object is
-/// absence: it reports nothing and erases nothing.
-///
-/// Final is the documented `stream_options.include_usage` chunk: usage with
-/// an explicit empty `choices` array carries the whole request's usage. Usage
-/// beside choices (or with no `choices` at all) is a running total and stays
-/// cumulative. A finish reason, `[DONE]`, the end of the stream or the Job's
-/// completion never promotes anything to final.
-fn reported_usage(event: &Value) -> Option<ReportedUsage> {
-    let value = event.get("usage").filter(|value| value.is_object())?;
-    let usage_only = event
-        .get("choices")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty);
-    Some(ReportedUsage {
-        usage: NormalizedUsage {
-            input_tokens: counter(value.get("prompt_tokens")),
-            output_tokens: counter(value.get("completion_tokens")),
-            cache_read_tokens: counter(
-                value
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens")),
-            ),
-            cache_write_tokens: None,
-            reasoning_tokens: counter(
-                value
-                    .get("completion_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens")),
-            ),
-            raw: Some(value.clone()),
-        },
-        finality: if usage_only {
-            UsageFinality::Final
-        } else {
-            UsageFinality::Cumulative
-        },
-    })
-}
-
-/// Hands each usage object a stream reports to the sink as it is parsed. It
-/// keeps no history, no count and no merged total: the only state is the last
-/// cumulative object, to skip an identical repeat, and the clock. Memory is
-/// one bounded SSE object plus that one, whatever the stream reports, and each
-/// object is awaited before the next is read, so a slow sink slows the read.
-pub(crate) struct UsageCapture {
-    last_cumulative: Option<NormalizedUsage>,
-    /// When the producer observes an object. It is read when the object is
-    /// parsed, before the sink is awaited.
-    clock: fn() -> Timestamp,
-}
-
-impl Default for UsageCapture {
-    fn default() -> Self {
-        Self::with_clock(Timestamp::now)
-    }
-}
-
-impl UsageCapture {
-    pub(crate) fn with_clock(clock: fn() -> Timestamp) -> Self {
-        Self {
-            last_cumulative: None,
-            clock,
-        }
-    }
-
-    /// Hands one reported object over as it is, with its own normalization,
-    /// its finality and the time it was parsed. Distinct objects are never
-    /// merged or dropped, however many there are; per-field maxima belong to
-    /// the reducer. Only an identical consecutive cumulative repeat, which
-    /// carries nothing new, is skipped.
-    async fn record(
-        &mut self,
-        sink: Option<&mut (dyn ProviderOutputSink + '_)>,
-        reported: ReportedUsage,
-    ) {
-        let Some(sink) = sink else { return };
-        let observed_at = (self.clock)();
-        if reported.finality == UsageFinality::Cumulative {
-            if self.last_cumulative.as_ref() == Some(&reported.usage) {
-                return;
-            }
-            self.last_cumulative = Some(reported.usage.clone());
-        }
-        announce_at(
-            Some(sink),
-            observed_at,
-            ProviderFact::Usage {
-                usage: reported.usage,
-                finality: reported.finality,
-            },
-        )
-        .await;
-    }
-}
-
-async fn bounded_body(response: ClientResponse, limit: usize) -> Option<String> {
-    response
-        .body()
-        .limit(limit)
-        .await
-        .ok()
-        .and_then(|body| String::from_utf8(body.to_vec()).ok())
-}
-
-/// What OCG keeps of a non-200 response to `conversation`. A Provider or
-/// gateway may echo the request it refuses, and an image-bearing request
-/// carries whole images, so of a refusal of one only the HTTP status, and
-/// the retryability it implies, is kept: never its body, nor the message or
-/// code read from it, nor its request id header. Nothing is redacted; all
-/// of it is dropped. A text-only refusal is kept as the Provider gave it.
-pub(crate) fn rejected_failure(
-    conversation: &ChatConversation,
-    status_code: u16,
-    request_id: Option<String>,
-    response_body: Option<String>,
-) -> ProviderFailure {
-    if !conversation.carries_images() {
-        return provider_failure(status_code, request_id, response_body);
-    }
-    ProviderFailure {
-        message: format!("provider rejected image request (HTTP {status_code})"),
-        status_code: Some(status_code),
-        retryable: retryable_status(status_code),
-        ..ProviderFailure::default()
-    }
-}
-
-/// Whether a refusal with this status may succeed when sent again.
-fn retryable_status(status_code: u16) -> bool {
-    matches!(status_code, 408 | 409 | 425 | 429 | 500..=599)
-}
-
-fn provider_failure(
-    status_code: u16,
-    request_id: Option<String>,
-    response_body: Option<String>,
-) -> ProviderFailure {
-    let (message, provider_code) = response_body
-        .as_deref()
-        .and_then(parse_provider_error)
-        .unwrap_or_else(|| (format!("provider returned HTTP {status_code}"), None));
-    ProviderFailure {
-        message,
-        status_code: Some(status_code),
-        provider_code,
-        response_body,
-        request_id,
-        retry_after_ms: None,
-        retryable: retryable_status(status_code),
-    }
-}
-
-fn parse_provider_error(body: &str) -> Option<(String, Option<String>)> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let error = value.get("error")?;
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("provider request failed")
-        .to_owned();
-    let code = error.get("code").and_then(Value::as_str).map(str::to_owned);
-    Some((message, code))
-}
-
-/// A failure before any response head: it observed no response fact.
-fn classify_client_error(error: ClientError) -> ProviderExecutionError {
-    let message = error.to_string();
-    match error {
-        ClientError::Url(_) | ClientError::Connect(_) => {
-            ProviderExecutionError::NotDelivered { message }
-        }
-        ClientError::Request(_) => ProviderExecutionError::NotDelivered { message },
-        ClientError::Send(_)
-        | ClientError::Timeout
-        | ClientError::Response(_)
-        | ClientError::Http(_)
-        | ClientError::H2(_)
-        | ClientError::TunnelNotSupported
-        | ClientError::Error(_) => ProviderExecutionError::Unknown {
-            message,
-            facts: None,
-            finished: false,
-        },
-    }
-}
-
-fn trim_ascii(value: &[u8]) -> &[u8] {
-    let start = value
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(value.len());
-    let end = value
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    &value[start..end]
-}
-
-/// The timing of a finished request, and nothing else. Its usage is in the
-/// result and in the annotated Metrics records captured while it streamed.
-pub fn metrics(result: &ProviderExecutionResult) -> crate::persistence::Measurements {
-    crate::persistence::Measurements {
-        ttfb_ms: Some(result.ttfb.as_millis().min(u128::from(u64::MAX)) as u64),
-        request_finished_in_ms: Some(
-            result.finished_in.as_millis().min(u128::from(u64::MAX)) as u64
-        ),
-        ..crate::persistence::Measurements::default()
-    }
-}
-
-/// The availability observations an error proves, in the order they were
-/// observed; at most two. Only what the provider or transport actually
-/// reported becomes a failure: a refusal before delivery proves nothing, and
-/// a local stop keeps just the response facts it already had. A failure keeps
-/// the response facts observed before it. When the response had finished
-/// before an independent transport failure, its facts and the failure are
-/// two observations, so the failure is not recorded as part of the finish.
-/// Nothing is inferred from an unknown outcome.
-pub fn error_observations(
-    error: &ProviderExecutionError,
-) -> Vec<crate::persistence::AvailabilityObservation> {
-    use crate::persistence::AvailabilityObservation;
-    let observed =
-        |facts: &ResponseFacts, failure: Option<ProviderFailure>| AvailabilityObservation {
-            status_code: Some(facts.status_code),
-            finish_reason: facts.finish_reason,
-            raw_finish_reason: facts.raw_finish_reason.clone(),
-            failure,
-        };
-    let failure = || ProviderFailure {
-        message: error.to_string(),
-        ..ProviderFailure::default()
-    };
-    // A failure without any response fact beside it.
-    let failure_only = || AvailabilityObservation {
-        status_code: None,
-        finish_reason: None,
-        raw_finish_reason: None,
-        failure: Some(failure()),
-    };
-    match error {
-        // A local interruption before any response head observed nothing
-        // about the Provider.
-        ProviderExecutionError::Build { .. }
-        | ProviderExecutionError::NotDelivered { .. }
-        | ProviderExecutionError::Interrupted { .. } => Vec::new(),
-        ProviderExecutionError::Stopped { facts, .. } => vec![observed(facts, None)],
-        ProviderExecutionError::Rejected { failure } => vec![AvailabilityObservation {
-            status_code: failure.status_code,
-            finish_reason: None,
-            raw_finish_reason: None,
-            failure: Some(failure.clone()),
-        }],
-        ProviderExecutionError::Unknown { facts: None, .. } => vec![failure_only()],
-        ProviderExecutionError::Unknown {
-            facts: Some(facts),
-            finished: true,
-            ..
-        } => vec![observed(facts, None), failure_only()],
-        ProviderExecutionError::Unknown {
-            facts: Some(facts),
-            finished: false,
-            ..
-        }
-        | ProviderExecutionError::Incomplete { facts, .. } => {
-            vec![observed(facts, Some(failure()))]
-        }
-        ProviderExecutionError::OutputPersistence { stream, .. } => error_observations(stream),
-    }
-}
-
-pub fn success_observation(
-    result: &ProviderExecutionResult,
-) -> crate::persistence::AvailabilityObservation {
-    crate::persistence::AvailabilityObservation {
-        status_code: Some(result.status_code),
-        finish_reason: result.finish_reason,
-        raw_finish_reason: result.raw_finish_reason.clone(),
-        failure: None,
-    }
-}
-
-pub fn result_value(result: &ProviderExecutionResult) -> Value {
-    let mut value = serde_json::Map::new();
-    value.insert("text".to_owned(), Value::String(result.text.clone()));
-    if let Some(reason) = result.raw_finish_reason.as_deref() {
-        value.insert("finish_reason".to_owned(), Value::String(reason.to_owned()));
-    }
-    Value::Object(value)
 }
 
 /// A scripted response body, for tests that drive the real parser.

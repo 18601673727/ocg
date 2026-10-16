@@ -33,24 +33,6 @@ pub async fn execute_conversation(
     result
 }
 
-/// What an error before any response head proves about delivery. Only a
-/// failure that positively happened before the request could leave is
-/// NotDelivered; anything that may have reached a Provider is Delivered,
-/// whatever the Job's outcome becomes.
-pub(super) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
-    match error {
-        ProviderExecutionError::Build { .. } | ProviderExecutionError::NotDelivered { .. } => {
-            ProviderFact::NotDelivered
-        }
-        ProviderExecutionError::Unknown { .. }
-        | ProviderExecutionError::Rejected { .. }
-        | ProviderExecutionError::Incomplete { .. }
-        | ProviderExecutionError::Interrupted { .. }
-        | ProviderExecutionError::Stopped { .. } => ProviderFact::Delivered,
-        ProviderExecutionError::OutputPersistence { stream, .. } => unannounced_fact(stream),
-    }
-}
-
 fn borrow_output_sink<'a>(
     sink: &'a mut Option<&mut dyn ProviderOutputSink>,
 ) -> Option<&'a mut dyn ProviderOutputSink> {
