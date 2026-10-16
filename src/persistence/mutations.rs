@@ -176,7 +176,7 @@ pub(super) fn admit_job(
             proposed.push((id, row.id));
         }
     }
-    batch.check_waiting(&proposed)?;
+    batch.check_waiting(id, &proposed)?;
 
     batch.insert_job(&JobRow {
         id,

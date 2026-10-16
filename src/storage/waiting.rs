@@ -60,26 +60,118 @@ pub(super) enum Settlement {
 }
 
 impl Settlement {
-    /// What the row alone decides. A confirmed outcome needed every child
-    /// subtree settled when it was written and the Job accepts no children
-    /// afterwards, so it settles the subtree without a traversal. A Job
-    /// whose own execution may still run has not settled. Only a locally
-    /// stopped Job with an unknown outcome depends on its descendants.
-    pub(super) fn of_row(job: &JobRow) -> Option<Self> {
-        if job.confirmed_terminal() {
-            Some(Self::Settled)
-        } else if !job.locally_stopped() {
+    /// What the row alone decides. A Job whose own execution may still run
+    /// has not settled. A confirmed outcome settles the subtree without a
+    /// traversal only where the file is `certified`: finalization requires
+    /// every child subtree to have settled and the Job accepts no children
+    /// afterwards, but an earlier build required only that each child had
+    /// locally stopped, see [`certify_subtree_closure`]. Anything else
+    /// depends on the descendants.
+    pub(super) fn of_row(job: &JobRow, certified: bool) -> Option<Self> {
+        if !job.locally_stopped() {
             Some(Self::Unsettled)
+        } else if job.confirmed_terminal() && certified {
+            Some(Self::Settled)
         } else {
             None
         }
     }
 }
 
+/// The meta entry that records the most recent [`certify_subtree_closure`]
+/// as passed. A missing entry means the confirmed outcomes of the file are
+/// not trusted to have settled subtrees.
+pub(super) const SUBTREE_CLOSURE_KEY: &str = "subtree_closure";
+const CERTIFIED: &[u8] = b"certified";
+
+/// Whether the file's confirmed outcomes were certified when it was opened.
+pub(super) fn closure_certified(tx: &WriteTransaction) -> Result<bool, StorageError> {
+    Ok(tx
+        .open_table(META)?
+        .get(SUBTREE_CLOSURE_KEY)?
+        .is_some_and(|v| v.value() == CERTIFIED))
+}
+
+/// Records the result of [`certify_subtree_closure`] in the open transaction.
+pub(super) fn record_closure(tx: &WriteTransaction, certified: bool) -> Result<(), StorageError> {
+    let mut meta = tx.open_table(META)?;
+    if certified {
+        meta.insert(SUBTREE_CLOSURE_KEY, CERTIFIED)?;
+    } else {
+        meta.remove(SUBTREE_CLOSURE_KEY)?;
+    }
+    Ok(())
+}
+
+/// Whether no Job that may still run lies below a confirmed outcome, which
+/// is what lets [`Settlement::of_row`] settle a confirmed outcome from its
+/// row. A file written by this build keeps that true, but a file written by
+/// an earlier build can hold a confirmed outcome over a locally stopped
+/// unknown outcome over a Job that still runs, since that build finalized a
+/// Job once each child had merely stopped locally. A matching format version
+/// does not say which build wrote the file, so every opening reads the whole
+/// Job table once, in time linear in the Jobs.
+///
+/// Only a locally stopped unknown outcome lets a descendant escape its
+/// confirmed ancestor's finalization, so each Job that may still run follows
+/// its ancestors through such outcomes, and the first confirmed ancestor
+/// fails the check. An ancestor that was followed once is not followed
+/// again. A Job whose parent record is missing is corruption.
+pub(super) fn certify_subtree_closure(tx: &WriteTransaction) -> Result<bool, StorageError> {
+    let jobs = tx.open_table(JOBS)?;
+    let child_of = tx.open_table(CHILD_OF)?;
+    let mut followed = HashSet::new();
+    for entry in jobs.iter()? {
+        let (id, row) = entry?;
+        if JobRow::decode(row.value())?.locally_stopped() {
+            continue;
+        }
+        let mut at = id.value();
+        let mut path = HashSet::new();
+        loop {
+            let parent = child_of
+                .get(at)?
+                .ok_or_else(|| StorageError::corrupted(format!("{at} has no parent record")))?
+                .value();
+            // The Genesis Job is its own parent.
+            if parent == at || followed.contains(&parent) {
+                break;
+            }
+            let Some(parent_row) = jobs.get(parent)? else {
+                return Err(StorageError::corrupted(format!(
+                    "{at} names the missing parent {parent}"
+                )));
+            };
+            let parent_row = JobRow::decode(parent_row.value())?;
+            if parent_row.confirmed_terminal() {
+                return Ok(false);
+            }
+            // A Job that may still run is checked for its own ancestors.
+            if !parent_row.locally_stopped() {
+                break;
+            }
+            if !path.insert(parent) {
+                return Err(StorageError::corrupted(format!(
+                    "{parent} is its own ancestor"
+                )));
+            }
+            at = parent;
+        }
+        followed.extend(path);
+    }
+    Ok(true)
+}
+
 pub(super) struct WaitingTables<J, D, C> {
     jobs: J,
     depends_on: D,
     children: C,
+    /// Whether confirmed outcomes settle their subtrees, see
+    /// [`certify_subtree_closure`].
+    certified: bool,
+    /// The Job an admission is about to create. It has no record yet and is
+    /// the only Job allowed to be missing.
+    candidate: Option<u64>,
     settlements: RefCell<HashMap<u64, Settlement>>,
 }
 
@@ -90,11 +182,17 @@ impl<'tx>
         Table<'tx, (u64, u64), ()>,
     >
 {
-    pub(super) fn open(tx: &'tx WriteTransaction) -> Result<Self, StorageError> {
+    pub(super) fn open(
+        tx: &'tx WriteTransaction,
+        certified: bool,
+        candidate: Option<JobId>,
+    ) -> Result<Self, StorageError> {
         Ok(Self {
             jobs: tx.open_table(JOBS)?,
             depends_on: tx.open_table(DEPENDS_ON)?,
             children: tx.open_table(CHILDREN)?,
+            certified,
+            candidate: candidate.map(JobId::get),
             settlements: RefCell::default(),
         })
     }
@@ -113,16 +211,15 @@ where
             .transpose()
     }
 
-    /// Whether the Job and every descendant have stopped. A confirmed
-    /// outcome and a Job that may still run are decided by their rows. A
-    /// locally stopped unknown outcome claims nothing about its children, so
-    /// each descendant is followed until one is found that may still run;
-    /// a confirmed descendant ends its branch. The Genesis self-parent
-    /// marker is not in the children index, and the Job itself starts out
-    /// visited, so nothing is followed twice. A missing child record is
-    /// corruption.
+    /// Whether the Job and every descendant have stopped. A Job that may
+    /// still run is decided by its row, and so is a confirmed outcome in a
+    /// certified file. Otherwise each descendant is followed until one is
+    /// found that may still run; in a certified file a confirmed descendant
+    /// ends its branch. The Genesis self-parent marker is not in the
+    /// children index, and the Job itself starts out visited, so nothing is
+    /// followed twice. A missing child record is corruption.
     pub(super) fn subtree_settlement(&self, job: &JobRow) -> Result<Settlement, StorageError> {
-        if let Some(settlement) = Settlement::of_row(job) {
+        if let Some(settlement) = Settlement::of_row(job, self.certified) {
             return Ok(settlement);
         }
         if let Some(settlement) = self.settlements.borrow().get(&job.id.get()) {
@@ -161,7 +258,7 @@ where
                             "{parent} lists the missing child {child}"
                         )));
                     };
-                    match Settlement::of_row(&row) {
+                    match Settlement::of_row(&row, self.certified) {
                         Some(Settlement::Settled) => {}
                         Some(_) => return Ok(Settlement::Unsettled),
                         None => next.push(child),
@@ -173,11 +270,20 @@ where
         Ok(Settlement::Settled)
     }
 
-    /// Adds `id` to `targets` when its subtree has not settled. Returns
-    /// `false` when that could not be decided within the bounds.
-    fn push_unsettled(&self, targets: &mut Vec<u64>, id: u64) -> Result<bool, StorageError> {
+    /// Adds `id`, which `by` names, to `targets` when its subtree has not
+    /// settled. Returns `false` when that could not be decided within the
+    /// bounds. A persisted relationship never names a missing Job, not even
+    /// the candidate of an admission, which no relationship names yet.
+    fn push_unsettled(
+        &self,
+        targets: &mut Vec<u64>,
+        id: u64,
+        by: u64,
+    ) -> Result<bool, StorageError> {
         let Some(row) = self.job(id)? else {
-            return Ok(true);
+            return Err(StorageError::corrupted(format!(
+                "{by} names the missing Job {id}"
+            )));
         };
         match self.subtree_settlement(&row)? {
             Settlement::Settled => {}
@@ -193,19 +299,31 @@ where
     /// dependency that can no longer be satisfied still orders the two Jobs
     /// until the prerequisite's descendants have stopped.
     ///
-    /// A confirmed outcome waits for nothing. A Job that stopped with an
-    /// unknown outcome never runs again, so its dependencies are obsolete,
-    /// but it still waits for every child whose subtree is active: that
-    /// edge is what keeps a descendant from being made to wait on it. The
-    /// Genesis root marker is not in the children index, so the Genesis Job
-    /// never waits for itself.
+    /// A confirmed outcome of a certified file waits for nothing. A Job that
+    /// stopped never runs again, so its dependencies are obsolete, but it
+    /// still waits for every child whose subtree is active. Only an unknown
+    /// outcome, or a confirmed outcome of an uncertified file, can have one,
+    /// and that edge is what keeps a descendant from being made to wait on
+    /// it. The Genesis root marker is not in the children index, so the
+    /// Genesis Job never waits for itself.
     ///
-    /// `None` when a subtree traversal reached its bound.
+    /// A Job that a relationship names must be stored, and so must `id`,
+    /// unless it is the admission's candidate. `None` when a subtree
+    /// traversal reached its bound.
     pub(super) fn waits_for(&self, id: u64) -> Result<Option<Vec<u64>>, StorageError> {
         let Some(job) = self.job(id)? else {
-            return Ok(Some(Vec::new()));
+            // The candidate has no record and no persisted relationships; its
+            // proposed edges are added by the caller. Any other Job reached
+            // here was named by a relationship or a required reference.
+            return if self.candidate == Some(id) {
+                Ok(Some(Vec::new()))
+            } else {
+                Err(StorageError::corrupted(format!(
+                    "the waiting graph reaches the missing Job {id}"
+                )))
+            };
         };
-        if job.confirmed_terminal() {
+        if job.confirmed_terminal() && self.certified {
             return Ok(Some(Vec::new()));
         }
         let mut targets = Vec::new();
@@ -214,13 +332,13 @@ where
                 let (key, condition) = entry?;
                 DependencyCondition::from_code(condition.value())
                     .ok_or_else(|| StorageError::corrupted("invalid dependency condition"))?;
-                if !self.push_unsettled(&mut targets, key.value().1)? {
+                if !self.push_unsettled(&mut targets, key.value().1, id)? {
                     return Ok(None);
                 }
             }
         }
         for entry in self.children.range((id, 0)..=(id, u64::MAX))? {
-            if !self.push_unsettled(&mut targets, entry?.0.value().1)? {
+            if !self.push_unsettled(&mut targets, entry?.0.value().1, id)? {
                 return Ok(None);
             }
         }
@@ -228,11 +346,16 @@ where
     }
 }
 
+/// The verdict on the waiting graph with the `proposed` edges added. Every
+/// Job the graph reaches must be stored, except `candidate`, the Job the
+/// admission is about to create.
 pub(super) fn waiting_verdict(
     tx: &WriteTransaction,
+    certified: bool,
+    candidate: JobId,
     proposed: &[(JobId, JobId)],
 ) -> Result<WaitingVerdict, StorageError> {
-    let tables = WaitingTables::open(tx)?;
+    let tables = WaitingTables::open(tx, certified, Some(candidate))?;
     let mut graph: DiGraph<u64, ()> = DiGraph::new();
     let mut nodes: HashMap<u64, NodeIndex> = HashMap::new();
     let mut node = |graph: &mut DiGraph<u64, ()>, id: u64| -> Option<NodeIndex> {

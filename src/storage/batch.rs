@@ -57,6 +57,8 @@ pub(crate) struct Batch {
     pub(super) tx: WriteTransaction,
     pub(super) failed: Option<Failure>,
     pub(super) now: Timestamp,
+    /// [`closure_certified`], once read.
+    pub(super) certified: Option<bool>,
 }
 
 /// How a batch's commit becomes durable.
@@ -111,6 +113,7 @@ pub(crate) fn run_batch_with<T>(
         tx,
         failed: None,
         now: Timestamp::now(),
+        certified: None,
     };
     let body_result = body(&mut batch);
     // A failure the body swallowed still prevents the commit.
@@ -165,6 +168,7 @@ pub(crate) fn run_batch_declinable<T>(
         tx,
         failed: None,
         now: Timestamp::now(),
+        certified: None,
     };
     let body_result = body(&mut batch);
     let (value, subjects) = match (body_result, batch.failed.take()) {

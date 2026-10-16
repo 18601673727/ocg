@@ -184,15 +184,31 @@ impl Batch {
     }
 
     /// Whether the Job and all its descendants have stopped, read inside
-    /// this transaction. A confirmed outcome answers without touching a
-    /// table; only a locally stopped unknown outcome follows its children.
-    /// A traversal that reaches its bound answers `false`, so every caller
-    /// refuses rather than proceeds on a guess.
+    /// this transaction. A Job that may still run answers without touching
+    /// a table, and so does a confirmed outcome in a file whose open
+    /// certified that none has a running descendant; otherwise the
+    /// descendants are followed. A traversal that reaches its bound answers
+    /// `false`, so every caller refuses rather than proceeds on a guess.
     pub(crate) fn subtree_settled(&mut self, job: &JobRow) -> Result<bool, BatchError> {
-        if let Some(settlement) = Settlement::of_row(job) {
+        let certified = self.closure_certified()?;
+        if let Some(settlement) = Settlement::of_row(job, certified) {
             return Ok(settlement == Settlement::Settled);
         }
-        self.step(|tx| Ok(WaitingTables::open(tx)?.subtree_settlement(job)? == Settlement::Settled))
+        self.step(|tx| {
+            let tables = WaitingTables::open(tx, certified, None)?;
+            Ok(tables.subtree_settlement(job)? == Settlement::Settled)
+        })
+    }
+
+    /// Whether the file's open certified its confirmed outcomes, read once
+    /// per batch.
+    fn closure_certified(&mut self) -> Result<bool, BatchError> {
+        if let Some(certified) = self.certified {
+            return Ok(certified);
+        }
+        let certified = self.step(closure_certified)?;
+        self.certified = Some(certified);
+        Ok(certified)
     }
 
     /// The Jobs that directly retry `original`, in creation order.
@@ -569,11 +585,18 @@ impl Batch {
     /// targets inside this transaction, adds the proposed edges and rejects
     /// any cycle. Every new cycle passes through a proposed edge and therefore
     /// through its target. Reaching a bound rejects instead of skipping the check.
-    pub(crate) fn check_waiting(&mut self, proposed: &[(JobId, JobId)]) -> Result<(), BatchError> {
+    /// `candidate` is the Job the admission is about to create, the only one
+    /// the graph may reach without a stored record.
+    pub(crate) fn check_waiting(
+        &mut self,
+        candidate: JobId,
+        proposed: &[(JobId, JobId)],
+    ) -> Result<(), BatchError> {
         if proposed.is_empty() {
             return Ok(());
         }
-        let verdict = self.step(|tx| waiting_verdict(tx, proposed))?;
+        let certified = self.closure_certified()?;
+        let verdict = self.step(|tx| waiting_verdict(tx, certified, candidate, proposed))?;
         match verdict {
             WaitingVerdict::Acyclic => Ok(()),
             WaitingVerdict::Cycle(jobs) => self.reject(Violation::WaitingCycle(jobs)),

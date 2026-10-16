@@ -162,6 +162,11 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId), OpenError>
         } else {
             verify_genesis(&tx)?
         };
+        // A new file holds no Job below a confirmed outcome. An existing one
+        // is read again at every opening, because the version it carries does
+        // not say whether an earlier build wrote it or changed it since.
+        let certified = created || certify_subtree_closure(&tx)?;
+        record_closure(&tx, certified)?;
         let mut sequences = tx.open_table(SEQUENCES).map_err(StorageError::from)?;
         let epoch = sequences
             .get(OPEN_EPOCH)

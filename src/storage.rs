@@ -32,6 +32,11 @@
 //! Job's own holds. [`Batch::subtree_settled`] also follows the descendants
 //! of a locally stopped unknown outcome, and governs everything that waits
 //! on the Job or closes over it. Neither is stored.
+//!
+//! A confirmed outcome answers `subtree_settled` from its row only in a file
+//! whose opening certified that no Job that may still run lies below one; an
+//! earlier build could write such a file. Otherwise its descendants are
+//! followed within the same bounds, and a file is never refused for it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -149,7 +154,10 @@ pub(crate) use token_aggregation::{replace_token_minute, replace_token_request};
 #[cfg(test)]
 pub(crate) use waiting::dependency_state;
 pub(crate) use waiting::dependency_state_with;
-use waiting::{Settlement, WaitingTables, WaitingVerdict, waiting_verdict};
+use waiting::{
+    Settlement, WaitingTables, WaitingVerdict, certify_subtree_closure, closure_certified,
+    record_closure, waiting_verdict,
+};
 
 // ---- storage errors -------------------------------------------------------------
 
