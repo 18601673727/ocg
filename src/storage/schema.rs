@@ -32,8 +32,11 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// each tool call a Provider request asked for; an older build would settle
 /// Jobs past their unresolved tool effects. Version 13 adds Attachments and
 /// the ordered Attachments of each JobInput; an older build would decode
-/// such an input without them. Files of any other version are refused on
-/// open, before anything is written to them.
+/// such an input without them. Version 14 requires PENDING_JOBS, the ordered
+/// derived index of pending Jobs; a version 13 build neither knew nor
+/// maintained it, so a version 13 file is refused rather than initialized in
+/// place. Files of any other version are refused on open, before anything is
+/// written to them.
 ///
 /// Format 13 later gained [`SUBMISSIONS`], the index of Control Plane
 /// submissions, without a new version: it is created empty when a format 13
@@ -45,8 +48,9 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// It then gained [`PENDING_JOBS`], again without a new version. An earlier
 /// build neither knows nor maintains it and can start or finalize a Job
 /// behind its back, so its entries are never trusted: every opening discards
-/// the table and rebuilds it from the Job table.
-pub(crate) const FORMAT_VERSION: u32 = 13;
+/// the table and rebuilds it from the Job table. Format 14 requires this
+/// table; a version 13 file is refused before that rebuild could run for it.
+pub(crate) const FORMAT_VERSION: u32 = 14;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PAGE: usize = 1_000;

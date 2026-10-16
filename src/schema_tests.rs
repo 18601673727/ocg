@@ -23458,8 +23458,8 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 13);
-            let worker = DatabaseWorker::start(&directory).expect("a new format 13 database");
+            assert_eq!(crate::storage::FORMAT_VERSION, 14);
+            let worker = DatabaseWorker::start(&directory).expect("a new format 14 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");
             let second = attach(&handle, jpeg(), "image/jpeg", "photo.jpg");
@@ -24619,7 +24619,7 @@ mod requests_and_tool_loop {
             let bytes = std::fs::read(&file).expect("read");
             match DatabaseWorker::start(&directory) {
                 Err(DatabaseError::UnsupportedFormat { found, supported }) => {
-                    assert_eq!((found, supported), (12, 13));
+                    assert_eq!((found, supported), (12, 14));
                 }
                 Err(other) => panic!("expected a format refusal, got {other}"),
                 Ok(_) => panic!("a format 12 database must be refused"),
