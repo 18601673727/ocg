@@ -479,13 +479,27 @@ impl Command {
                 // Only this command can decline: `Ok(None)` is its explicit
                 // statement that nothing was committed, not a reply value.
                 let declined = matches!(outcome.result, Ok(None));
-                settle(operation, commit, reply, outcome, declined)
+                settle(
+                    operation,
+                    commit,
+                    Kind::ConsumeAvailability,
+                    reply,
+                    outcome,
+                    declined,
+                )
             }
             Self::CommitTokenAggregation { plan, reply } => {
                 let outcome = storage::commit_token_aggregation(database, operation, commit, *plan);
                 // The same explicit decline as the availability commit.
                 let declined = matches!(outcome.result, Ok(None));
-                settle(operation, commit, reply, outcome, declined)
+                settle(
+                    operation,
+                    commit,
+                    Kind::ConsumeTokenUsage,
+                    reply,
+                    outcome,
+                    declined,
+                )
             }
         }
     }

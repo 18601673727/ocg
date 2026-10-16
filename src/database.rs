@@ -92,6 +92,7 @@ const TRANSACTION_ALLOWANCE_BYTES: u64 = 1024 * 1024;
 mod commands;
 mod errors;
 mod handle;
+mod scheduler_wake;
 mod shared;
 mod worker;
 #[cfg(test)]
@@ -102,6 +103,8 @@ pub use errors::{
     CommandOutcome, CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError,
     DatabaseStatus, MaintenanceError, OperationStatus, TokenConsumeError, UnknownCause,
 };
+pub use scheduler_wake::SchedulerWakeSubscription;
+use scheduler_wake::{SchedulerWake, affects_scheduling};
 pub(crate) use shared::AggregationClaim;
 #[cfg(test)]
 pub(crate) use shared::GroupProbe;

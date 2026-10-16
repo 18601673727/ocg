@@ -16,6 +16,7 @@ pub(super) struct Executed {
     operation: OperationId,
     /// Its changes are in a staged commit that is not durable yet.
     staged: bool,
+    scheduling_dirty: bool,
     answer: Answer,
     /// The storage failure that must release this opening of the database.
     failure: Option<StorageFailure>,
@@ -30,7 +31,7 @@ pub(super) fn run<T: Send + 'static>(
     body: impl FnOnce(&mut storage::Batch) -> Result<(T, MarkerSubjects), BatchError>,
 ) -> Executed {
     let outcome = storage::run_batch_with(database, operation, kind, commit, body);
-    settle(operation, commit, reply, outcome, false)
+    settle(operation, commit, kind, reply, outcome, false)
 }
 
 /// Answers a command from its batch outcome and says how it must be waited on.
@@ -42,6 +43,7 @@ pub(super) fn run<T: Send + 'static>(
 pub(super) fn settle<T: Send + 'static>(
     operation: OperationId,
     commit: Commit,
+    kind: OperationKind,
     reply: Reply<T>,
     outcome: storage::BatchOutcome<T>,
     declined: bool,
@@ -56,6 +58,7 @@ pub(super) fn settle<T: Send + 'static>(
     });
     let outcome_unknown = matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
     let staged = commit == Commit::Staged && result.is_ok() && !declined;
+    let scheduling_dirty = result.is_ok() && !declined && affects_scheduling(kind);
     let answer: Answer = Box::new(move |lost| {
         let result = match (result, lost) {
             (Ok(_), Some(error)) if declined => Err(DatabaseError::RolledBack(error.clone())),
@@ -75,6 +78,7 @@ pub(super) fn settle<T: Send + 'static>(
     Executed {
         operation,
         staged,
+        scheduling_dirty,
         answer,
         failure: outcome.storage_failure.map(|error| StorageFailure {
             error,
@@ -87,6 +91,7 @@ pub(super) fn settle<T: Send + 'static>(
 /// a time on a dedicated write thread, in admission order, each in its own
 /// write transaction. Reads run on [`READ_WORKERS`] dedicated read threads.
 pub struct DatabaseWorker {
+    scheduler_wake: Option<SchedulerWakeSubscription>,
     pub(super) handle: DatabaseHandle,
     pub(super) thread: JoinHandle<Result<(), DatabaseError>>,
     pub(super) readers: Vec<JoinHandle<()>>,
@@ -148,6 +153,7 @@ impl DatabaseWorker {
         let (sender, receiver) = flume::bounded(COMMAND_QUEUE_CAPACITY);
         let (control_sender, control) = flume::bounded(CONTROL_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = flume::bounded(1);
+        let (scheduler_wake, scheduler_subscription) = SchedulerWake::new();
         let thread = std::thread::Builder::new()
             .name("ocg-database".to_string())
             .spawn(move || {
@@ -205,6 +211,7 @@ impl DatabaseWorker {
                     }
                 };
                 let shared = Arc::new(Shared {
+                    scheduler_wake,
                     active_policy: policy,
                     log_directory,
                     log_files: Arc::new(crate::logger::LogFiles::default()),
@@ -247,6 +254,9 @@ impl DatabaseWorker {
                     shutdown_requested: false,
                 };
                 worker.check_all_paths();
+                if !worker.shared.abandoned_at_open.is_empty() {
+                    worker.publish_scheduling_change();
+                }
                 if ready_sender.send(Ok(shared)).is_ok() {
                     worker.serve();
                 }
@@ -267,6 +277,7 @@ impl DatabaseWorker {
         };
         let (read_sender, read_receiver) = flume::bounded(READ_QUEUE_CAPACITY);
         let mut worker = Self {
+            scheduler_wake: Some(scheduler_subscription),
             handle: DatabaseHandle {
                 sender,
                 read_sender,
@@ -299,6 +310,10 @@ impl DatabaseWorker {
 
     pub fn handle(&self) -> DatabaseHandle {
         self.handle.clone()
+    }
+
+    pub fn take_scheduler_wake(&mut self) -> Option<SchedulerWakeSubscription> {
+        self.scheduler_wake.take()
     }
 
     /// Closes admission, lets the worker finish every command accepted before
@@ -891,11 +906,17 @@ impl WriteWorker {
         // The database guard is gone and the staging barrier still held, so
         // releasing the database waits for no reader and no reader can see a
         // lost change before it is released.
+        let scheduling_dirty = failure.is_none()
+            && lost.is_none()
+            && executed.iter().any(|(ran, _)| ran.scheduling_dirty);
         let lock = failure.map(|failure| {
             self.storage_failure = Some(failure.error.clone());
             self.activate(vec![ProtectionReason::StorageUnavailable(failure.error)])
         });
         drop(staging);
+        if scheduling_dirty {
+            self.publish_scheduling_change();
+        }
         for (ran, _) in executed {
             (ran.answer)(lost.as_ref());
         }
@@ -909,6 +930,18 @@ impl WriteWorker {
                         lock: lock.clone(),
                     });
             }
+        }
+    }
+
+    fn publish_scheduling_change(&self) {
+        // Shutdown drains accepted writes too. A known durable commit may
+        // still dirty the generation then, but protected storage must recover
+        // before a notification can advertise its state as readable again.
+        if self.storage_failure.is_none()
+            && !self.shared.released.load(Ordering::SeqCst)
+            && self.shared.protection.status().lock.is_none()
+        {
+            self.shared.scheduler_wake.notify_dirty();
         }
     }
 
@@ -1146,6 +1179,8 @@ impl WriteWorker {
             self.shared
                 .protection
                 .update(|status| status.recovering = false);
+        } else {
+            self.publish_scheduling_change();
         }
         result
     }
