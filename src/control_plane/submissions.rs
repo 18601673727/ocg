@@ -133,6 +133,11 @@ const RUNTIME_BUSY: Refusal = Refusal::new(
     "runtime_busy",
     "OCG has too much work queued; nothing was admitted; retry later",
 );
+const PENDING_LIMIT_REACHED: Refusal = Refusal::new(
+    StatusCode::SERVICE_UNAVAILABLE,
+    "pending_limit_reached",
+    "OCG holds as many pending Jobs as it admits at once; nothing was admitted; retry after pending work drains",
+);
 const STORAGE_REFUSED: Refusal = Refusal::new(
     StatusCode::SERVICE_UNAVAILABLE,
     "storage_refused",
@@ -890,7 +895,7 @@ fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
         | ExecutionRuntimeError::ExecutorStopped => SHUTTING_DOWN,
         ExecutionRuntimeError::ExecutorNotFound(_) => EXECUTOR_NOT_FOUND,
         ExecutionRuntimeError::Database(error) => match error {
-            DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => RUNTIME_BUSY,
+            DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => PENDING_LIMIT_REACHED,
             DatabaseError::Rejected(_) => CONFIGURATION_REFUSED,
             DatabaseError::ShuttingDown => SHUTTING_DOWN,
             DatabaseError::QueueFull | DatabaseError::ReadQueueFull => DATABASE_BUSY,
