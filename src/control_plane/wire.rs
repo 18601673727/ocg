@@ -45,8 +45,8 @@ impl Refusal {
 /// An answered request: its status and JSON body, and a cookie when the
 /// answer signs a browser in or out.
 pub(super) struct Reply {
-    status: StatusCode,
-    body: Value,
+    pub(super) status: StatusCode,
+    pub(super) body: Value,
     cookie: Option<String>,
 }
 
@@ -221,6 +221,11 @@ pub(super) async fn answer(
                         .await
                         .unwrap_or_else(|refusal| refusal.response())
                 }
+                Ok(Route::AttachmentContent(attachment)) => {
+                    attachments::content(&shared.database, attachment)
+                        .await
+                        .unwrap_or_else(|refusal| refusal.response())
+                }
                 Ok(route) => match respond(route, &caller, &request, payload, &shared).await {
                     Ok(reply) => {
                         let mut response = json_response(reply.status, &reply.body);
@@ -243,8 +248,8 @@ pub(super) async fn answer(
 }
 
 /// A submission's body is declared JSON, with exactly one length, and no
-/// larger than a submission may be, before any of it is read.
-pub(super) fn submission_body(headers: &HeaderMap) -> Result<(), Refusal> {
+/// larger than `limit`, before any of it is read.
+pub(super) fn submission_body(headers: &HeaderMap, limit: usize) -> Result<(), Refusal> {
     let mut lengths = headers.get_all(header::CONTENT_LENGTH);
     let length = match (lengths.next(), lengths.next()) {
         (Some(length), None) if !headers.contains_key(header::TRANSFER_ENCODING) => length,
@@ -255,7 +260,7 @@ pub(super) fn submission_body(headers: &HeaderMap) -> Result<(), Refusal> {
         .ok()
         .and_then(decimal::<usize>)
         .ok_or(LENGTH_REQUIRED)?;
-    if length > MAX_SUBMISSION_BYTES {
+    if length > limit {
         return Err(BODY_TOO_LARGE);
     }
     let json = single(headers, &header::CONTENT_TYPE)

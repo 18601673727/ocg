@@ -85,6 +85,69 @@ pub(super) async fn job_input(database: &DatabaseHandle, job: JobId) -> Result<R
     })))
 }
 
+/// Reconstructs the bounded conversation ending at `job` from persisted Job
+/// records, their `previous` links, their frozen inputs and their stored
+/// outputs, ordered from oldest turn to `job`.
+pub(super) async fn job_conversation(
+    database: &DatabaseHandle,
+    job: JobId,
+) -> Result<Reply, Refusal> {
+    let genesis = database.genesis();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut turns = Vec::new();
+    let mut cursor = Some(job);
+    while let Some(current) = cursor {
+        if turns.len() >= super::submissions::MAX_CONVERSATION_TURNS || !visited.insert(current) {
+            return Err(INCONSISTENT_RECORD);
+        }
+        let record = database.job(current).await?.ok_or(if current == job {
+            JOB_NOT_FOUND
+        } else {
+            INCONSISTENT_RECORD
+        })?;
+        let configuration = database.job_configuration(current).await?;
+        if current != job
+            && (current == genesis || record.parent != genesis || configuration.is_none())
+        {
+            return Err(INCONSISTENT_RECORD);
+        }
+        let input = database
+            .job_input_for_job(current)
+            .await?
+            .ok_or(INCONSISTENT_RECORD)?;
+        let configuration_json = configuration.map(|submitted| {
+            json!({
+                "agent_profile": submitted.agent_profile.map(|profile| profile.to_string()),
+                "llm_profile": submitted.llm_profile.to_string(),
+                "model": submitted.frozen.llm.config.model,
+            })
+        });
+        let outputs = database.job_outputs(current, None, 1_000).await?;
+        turns.push(json!({
+            "job": super::job_json(&record)?,
+            "input": {
+                "id": input.id.to_string(),
+                "objective": input.objective,
+                "submitted_at_us": micros(input.submitted_at),
+                "attachments": input
+                    .attachments
+                    .iter()
+                    .map(|attachment| attachment.to_string())
+                    .collect::<Vec<_>>(),
+                "configuration": configuration_json,
+            },
+            "outputs": outputs.iter().map(super::output_json).collect::<Vec<_>>(),
+        }));
+        cursor = record.previous;
+    }
+    turns.reverse();
+    Ok(Reply::ok(json!({
+        "api_version": API_VERSION,
+        "job": job.to_string(),
+        "turns": turns,
+    })))
+}
+
 fn capability(capability: ModelCapability) -> &'static str {
     match capability {
         ModelCapability::Chat => "chat",

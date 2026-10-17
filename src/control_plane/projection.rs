@@ -59,6 +59,7 @@ pub(super) fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
         "name": record.name,
         "execution_mode": execution_mode,
         "input": record.input.to_string(),
+        "previous": record.previous.map(|previous| previous.to_string()),
         "assigned_executor": record.assigned_executor.map(|executor| executor.to_string()),
         "created_at_us": record.created_at.as_unix_micros(),
         "updated_at_us": record.updated_at.as_unix_micros(),

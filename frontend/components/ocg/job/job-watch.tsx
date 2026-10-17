@@ -59,6 +59,10 @@ export function JobWatch(props: {
   // The inspector shows the Job's record around its answer; chat shows the
   // answer first and keeps the record one click away.
   presentation?: "inspector" | "chat";
+  onStateChange?: (
+    state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown",
+    job: ControlJob | null,
+  ) => void;
 }) {
   // Retry re-runs the whole load (record, stored history, stream) from scratch.
   const [attempt, setAttempt] = useState(0);
@@ -69,11 +73,16 @@ function JobWatchBody({
   client,
   jobId,
   presentation = "inspector",
+  onStateChange,
   onRetry,
 }: {
   client: HttpCanonicalControlClient;
   jobId: string;
   presentation?: "inspector" | "chat";
+  onStateChange?: (
+    state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown",
+    job: ControlJob | null,
+  ) => void;
   onRetry: () => void;
 }) {
   const [job, setJob] = useState<ControlJob | null>(null);
@@ -81,10 +90,15 @@ function JobWatchBody({
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
   const [failure, setFailure] = useState<{ code: string; scope: "read" | "stream" } | null>(null);
-  // The objective is read from the Job's frozen input; the record names it only by identity.
-  const [input, setInput] = useState<{ objective: string | null } | { error: string } | null>(null);
+  // The objective and attachments are read from the Job's frozen input; the record names it only by identity.
+  const [input, setInput] = useState<{ objective: string | null; attachments: string[] } | { error: string } | null>(null);
   const [stop, setStop] = useState<string | null>(null);
   const [stopBusy, setStopBusy] = useState(false);
+
+  useEffect(() => {
+    if (!job && !settlement) return;
+    onStateChange?.(settlement?.state ?? "unsettled", job);
+  }, [job, settlement, onStateChange]);
 
   useEffect(() => {
     let alive = true;
@@ -180,7 +194,7 @@ function JobWatchBody({
       }
       client.readJobInput(jobId).then(
         (frozen) => {
-          if (alive) setInput({ objective: frozen.objective });
+          if (alive) setInput({ objective: frozen.objective, attachments: frozen.attachments });
         },
         (error: unknown) => {
           if (alive) setInput({ error: error instanceof ControlTransportError ? error.code : "unreachable" });
@@ -291,6 +305,14 @@ function JobWatchBody({
           </dd>
         </div>
       ) : null}
+      {job?.previous ? (
+        <div className="flex justify-between gap-2">
+          <dt>Previous Job</dt>
+          <dd>
+            <code className="font-geist-mono">{job.previous}</code>
+          </dd>
+        </div>
+      ) : null}
       {settlement?.state === "unknown" ? (
         <div className="flex justify-between gap-2">
           <dt>Stop confirmed</dt>
@@ -345,8 +367,10 @@ function JobWatchBody({
           outputs,
           settlement,
           stream === "live" || stream === "reconnecting",
+          input !== null && "attachments" in input ? input.attachments : undefined,
         )}
         userLabel={presentation === "chat" ? "You" : "Objective"}
+        attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
       />
       {input !== null && "error" in input ? (
         <p className="text-xs text-muted-foreground">The objective could not be read ({input.error}).</p>

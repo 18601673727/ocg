@@ -45,13 +45,17 @@ use super::{
     API_VERSION, DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, JOB_NOT_FOUND, Refusal, Reply,
     SHUTTING_DOWN, Shared, decimal,
 };
+use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
+use crate::openai_compatible::image::MAX_REQUEST_IMAGES;
 use crate::orchestration::execution_runtime::{
-    AdmissionError, ExecutionRuntimeError, JobStop, ProviderExecutionPlan,
+    AdmissionError, AttachmentImageError, ExecutionRuntimeError, JobStop, ProviderExecutionPlan,
+    attachment_images,
 };
 use crate::persistence::{
-    ExecutionConfiguration, ExecutionMode, ExecutorId, JobId, JobInputDraft, JobRecord, NewJob,
-    NewSubmission, ProfileId, RequestFingerprint, SubmissionKey, SubmissionRecord, Violation,
+    AttachmentId, AttachmentOrigin, ExecutionConfiguration, ExecutionMode, ExecutorId, JobId,
+    JobInputDraft, JobRecord, ModelCapability, NewJob, NewSubmission, ProfileId,
+    RequestFingerprint, SubmissionKey, SubmissionRecord, Violation,
 };
 
 /// The request header that names a submission.
@@ -148,12 +152,65 @@ const NOT_STOPPABLE: Refusal = Refusal::new(
     "not_stoppable",
     "the Job has no execution that this process can stop",
 );
+const PREVIOUS_JOB_NOT_FOUND: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "previous_job_not_found",
+    "no such previous Job; nothing was submitted",
+);
+const INVALID_PREVIOUS_JOB: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_previous_job",
+    "the previous Job cannot be used as conversation context; nothing was submitted",
+);
+const PREVIOUS_JOB_NOT_COMPLETED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "previous_job_not_completed",
+    "the previous Job has not completed; nothing was submitted",
+);
+const CONVERSATION_TOO_LONG: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "conversation_too_long",
+    "the conversation exceeds the maximum number of turns; nothing was submitted",
+);
+const VISION_NOT_SUPPORTED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "vision_not_supported",
+    "the selected LLM Profile does not declare the vision capability, but the conversation carries images; nothing was submitted",
+);
+const TOO_MANY_IMAGES: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "too_many_images",
+    "a conversation may carry at most 8 images; nothing was submitted",
+);
+const IMAGES_TOO_LARGE: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "images_too_large",
+    "the conversation's images exceed 16 MiB together, or one exceeds 4 MiB; nothing was submitted",
+);
+const ATTACHMENT_NOT_AN_IMAGE: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "attachment_not_an_image",
+    "an Attachment is not a PNG or JPEG image that can be sent; nothing was submitted",
+);
+const ATTACHMENT_NOT_FOUND: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "attachment_not_found",
+    "no such uploaded image Attachment; nothing was submitted",
+);
+const ATTACHMENT_UNAVAILABLE: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "attachment_unavailable",
+    "an Attachment's content is no longer available; nothing was submitted",
+);
+
+/// The most turns a Job-linked conversation may traverse.
+pub(crate) const MAX_CONVERSATION_TURNS: usize = 64;
 
 /// A validated submission: an existing LLM Profile and Executor, by their
 /// persisted identities, an objective and, optionally, an Agent Profile
-/// that targets the LLM Profile and a Job name. Nothing
-/// else can be submitted: the Provider, its credential and the model come
-/// from the Profile, and no tool is offered.
+/// that targets the LLM Profile, a Job name, and a completed predecessor Job.
+/// Nothing else can be submitted: the Provider, its credential and the model
+/// come from the Profile, and no tool is offered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct JobRequest {
     agent_profile: Option<ProfileId>,
@@ -161,6 +218,9 @@ pub(super) struct JobRequest {
     executor: ExecutorId,
     objective: String,
     name: Option<String>,
+    previous: Option<JobId>,
+    /// Image Attachments sent with the objective, in order.
+    attachments: Vec<AttachmentId>,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +233,10 @@ struct WireRequest {
     objective: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    previous: Option<String>,
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// Text that may be stored: no control character but tab, carriage return
@@ -202,6 +266,25 @@ impl JobRequest {
             .map(|agent| identity(agent, "profile:").ok_or(INVALID_BODY))
             .transpose()?
             .map(ProfileId::new);
+        let previous = wire
+            .previous
+            .as_deref()
+            .map(|prev| identity(prev, "job:").ok_or(INVALID_BODY))
+            .transpose()?
+            .map(JobId::new);
+        if wire.attachments.len() > MAX_REQUEST_IMAGES {
+            return Err(TOO_MANY_IMAGES);
+        }
+        let mut attachments = Vec::with_capacity(wire.attachments.len());
+        for attachment in &wire.attachments {
+            let attachment = AttachmentId::new(
+                identity(attachment, "attachment:").ok_or(INVALID_BODY)?,
+            );
+            if attachments.contains(&attachment) {
+                return Err(INVALID_BODY);
+            }
+            attachments.push(attachment);
+        }
         if !text(&wire.objective, MAX_OBJECTIVE_BYTES)
             || wire
                 .name
@@ -216,11 +299,13 @@ impl JobRequest {
             executor: ExecutorId::new(executor),
             objective: wire.objective,
             name: wire.name,
+            previous,
+            attachments,
         })
     }
 
     /// The digest of the request as parsed, whatever its JSON spelling.
-    fn fingerprint(&self) -> RequestFingerprint {
+    pub(super) fn fingerprint(&self) -> RequestFingerprint {
         let mut context = Context::new(&SHA256);
         context.update(REQUEST_DOMAIN);
         context.update(&self.llm_profile.get().to_le_bytes());
@@ -243,6 +328,17 @@ impl JobRequest {
         if let Some(agent) = self.agent_profile {
             context.update(&[2]);
             context.update(&agent.get().to_le_bytes());
+        }
+        if let Some(previous) = self.previous {
+            context.update(&[3]);
+            context.update(&previous.get().to_le_bytes());
+        }
+        if !self.attachments.is_empty() {
+            context.update(&[4]);
+            context.update(&(self.attachments.len() as u64).to_le_bytes());
+            for attachment in &self.attachments {
+                context.update(&attachment.get().to_le_bytes());
+            }
         }
         RequestFingerprint::from_digest(sha256(context))
     }
@@ -272,7 +368,7 @@ pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<SubmissionKey, Refu
     Ok(digest_key(key))
 }
 
-fn digest_key(key: &[u8]) -> SubmissionKey {
+pub(super) fn digest_key(key: &[u8]) -> SubmissionKey {
     let mut context = Context::new(&SHA256);
     context.update(KEY_DOMAIN);
     context.update(key);
@@ -820,15 +916,15 @@ async fn admit(
 /// that does not exist or does not target it, and an Executor
 /// that does not exist or cannot run it now. The creation checks both again
 /// in its own transaction.
-async fn check_configuration(
+pub(super) async fn check_configuration(
     database: &DatabaseHandle,
     request: &JobRequest,
 ) -> Result<(), Refusal> {
-    match database.llm_profile(request.llm_profile).await {
-        Ok(Some(_)) => {}
+    let llm = match database.llm_profile(request.llm_profile).await {
+        Ok(Some(llm)) => llm,
         Ok(None) | Err(DatabaseError::WrongProfileKind(_)) => return Err(PROFILE_NOT_FOUND),
         Err(error) => return Err(error.into()),
-    }
+    };
     if let Some(agent_profile) = request.agent_profile {
         match database.agent_profile(agent_profile).await {
             Ok(Some(agent)) if agent.links.contains(&request.llm_profile) => {}
@@ -849,16 +945,87 @@ async fn check_configuration(
     {
         return Err(EXECUTOR_INCOMPATIBLE);
     }
-    Ok(())
+    // Every image the conversation's one Provider request will carry: the
+    // earlier turns' first, then this one's.
+    let mut images: Vec<AttachmentId> = Vec::new();
+    if let Some(previous) = request.previous {
+        let genesis = database.genesis();
+        let mut visited = std::collections::BTreeSet::new();
+        let mut cursor = Some(previous);
+        let mut prior_turns = 0usize;
+        while let Some(current) = cursor {
+            prior_turns += 1;
+            if prior_turns >= MAX_CONVERSATION_TURNS {
+                return Err(CONVERSATION_TOO_LONG);
+            }
+            if !visited.insert(current) {
+                return Err(INVALID_PREVIOUS_JOB);
+            }
+            let Some(record) = database.job(current).await? else {
+                return Err(if current == previous {
+                    PREVIOUS_JOB_NOT_FOUND
+                } else {
+                    INVALID_PREVIOUS_JOB
+                });
+            };
+            if current == genesis
+                || record.parent != genesis
+                || database.job_configuration(current).await?.is_none()
+            {
+                return Err(INVALID_PREVIOUS_JOB);
+            }
+            if record.completed_at.is_none() {
+                return Err(PREVIOUS_JOB_NOT_COMPLETED);
+            }
+            if let Some(input) = database.job_input(record.input).await? {
+                images.extend(input.attachments);
+            }
+            cursor = record.previous;
+        }
+    }
+    images.extend(request.attachments.iter().copied());
+    if images.is_empty() {
+        return Ok(());
+    }
+    if !llm
+        .config
+        .declared_capabilities
+        .contains(&ModelCapability::Vision)
+    {
+        return Err(VISION_NOT_SUPPORTED);
+    }
+    for &attachment in &request.attachments {
+        match database.attachment(attachment).await? {
+            Some(record) if record.origin == AttachmentOrigin::UserProvided => {}
+            _ => return Err(ATTACHMENT_NOT_FOUND),
+        }
+    }
+    match attachment_images(database, &images).await {
+        Ok(_) => Ok(()),
+        Err(AttachmentImageError::TooMany) => Err(TOO_MANY_IMAGES),
+        Err(AttachmentImageError::TooLarge) => Err(IMAGES_TOO_LARGE),
+        Err(AttachmentImageError::NotAnImage { .. }) => Err(ATTACHMENT_NOT_AN_IMAGE),
+        Err(AttachmentImageError::Attachment(error)) => Err(match error {
+            AttachmentError::Database(error) => error.into(),
+            AttachmentError::NotFound(_) => ATTACHMENT_NOT_FOUND,
+            AttachmentError::CleanedUp { .. } | AttachmentError::Content { .. } => {
+                ATTACHMENT_UNAVAILABLE
+            }
+            AttachmentError::NotStored(_) => INTERNAL,
+        }),
+    }
 }
 
 /// The no-tool Provider plan of a checked request, a child of the Genesis
 /// Job, with the credential resolved as the Profile's Provider names it.
-fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan {
-    ProviderExecutionPlan::environment_credentials(
+/// Its images are referenced by Attachment identity; their bytes stay in the
+/// attachment store.
+pub(super) fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan {
+    let mut plan = ProviderExecutionPlan::environment_credentials(
         request.executor,
         JobInputDraft {
             objective: Some(request.objective),
+            attachments: request.attachments,
             ..JobInputDraft::default()
         },
         NewJob {
@@ -877,10 +1044,12 @@ fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan
                 llm_profile: request.llm_profile,
             }),
             assigned_executor: None,
-            previous: None,
+            previous: request.previous,
             replaces: None,
         },
-    )
+    );
+    plan.credential_resolver = database.credential_resolver();
+    plan
 }
 
 /// Why a plan known not to have created its Job was refused, without what
@@ -1016,6 +1185,7 @@ mod tests {
             br#"{"llm_profile":"profile:3","executor":"executor:3","objective":"Say hi"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi","name":"n"}"#,
             br#"{"agent_profile":"profile:2","llm_profile":"profile:3","executor":"executor:2","objective":"Say hi"}"#,
+            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi","previous":"job:2"}"#,
         ] {
             let other = JobRequest::parse(other).expect("valid");
             assert_ne!(request.fingerprint(), other.fingerprint(), "{other:?}");
@@ -1041,6 +1211,8 @@ mod tests {
             br#"{"agent_profile":"executor:2","llm_profile":"profile:3","executor":"executor:2","objective":"o"}"#,
             br#"{"llm_profile":"profile:03","executor":"executor:2","objective":"o"}"#,
             br#"{"llm_profile":"profile:3","executor":"job:2","objective":"o"}"#,
+            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","previous":"2"}"#,
+            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","previous":"job:02"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","tools":[]}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","endpoint":"https://x"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","objective":"p"}"#,
@@ -1056,5 +1228,204 @@ mod tests {
                 String::from_utf8_lossy(&refused[..refused.len().min(120)])
             );
         }
+    }
+
+    #[test]
+    fn multi_turn_chat_jobs_reconstruct_context_and_conversation_projection() {
+        use std::collections::BTreeSet;
+        use std::num::NonZeroU32;
+
+        use crate::control_plane::{catalog, profiles};
+        use crate::database::DatabaseWorker;
+        use crate::orchestration::execution_runtime::{
+            ExecutionRuntime,
+            provider_seam::{self, Response},
+        };
+        use crate::persistence::{ExecutorType, LlmTransport, NewExecutor};
+        use crate::provider_execution::scripted::Step;
+        use crate::test_support::{data_directory, wait};
+
+        let (_root, directory) = data_directory("submissions", "multi-turn-chat");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let scheduler = runtime.scheduler();
+
+        let executor = wait(handle.create_executor(NewExecutor {
+            name: "local-llm".to_owned(),
+            executor_type: ExecutorType::Llm,
+            concurrency_limit: NonZeroU32::MIN,
+            llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+        }))
+        .expect("register executor");
+
+        let created_llm = wait(profiles::save_profile(
+            &handle,
+            None,
+            serde_json::to_vec(&json!({
+                "kind": "llm",
+                "name": "Chat GPT",
+                "endpoint": "https://multi-turn.invalid/v1",
+                "credential_ref": "MULTI_TURN_KEY",
+                "credential": "sk-test-secret",
+                "model": "gpt-4o-mini",
+                "declared_capabilities": ["chat"],
+            }))
+            .expect("json")
+            .as_slice(),
+        ))
+        .expect("create llm profile");
+        let llm_id: ProfileId = created_llm.body["profile_id"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("profile:"))
+            .and_then(|s| s.parse().ok())
+            .map(ProfileId::new)
+            .expect("llm profile id");
+
+        let created_agent = wait(profiles::save_profile(
+            &handle,
+            None,
+            serde_json::to_vec(&json!({
+                "kind": "agent",
+                "name": "Helpful Assistant",
+                "instructions": "Be concise and remember context.",
+                "llm_targets": [llm_id.to_string()],
+            }))
+            .expect("json")
+            .as_slice(),
+        ))
+        .expect("create agent profile");
+        let agent_id: ProfileId = created_agent.body["profile_id"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("profile:"))
+            .and_then(|s| s.parse().ok())
+            .map(ProfileId::new)
+            .expect("agent profile id");
+
+        let seen_conversations = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen_conversations.clone();
+        let mut replies = vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 1: Remembered cobalt.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 2: Your word is cobalt.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 3: tlaboc.\"}}]}\n\n",
+        ]
+        .into_iter();
+        provider_seam::install("https://multi-turn.invalid/v1", move |conversation| {
+            recorded
+                .lock()
+                .expect("lock")
+                .push(serde_json::to_value(conversation).expect("json"));
+            let chunk = replies.next().expect("reply chunk");
+            Response {
+                gate: None,
+                steps: vec![
+                    Step::Chunk(chunk),
+                    Step::Chunk(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    ),
+                    Step::Chunk(
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+                    ),
+                    Step::Chunk("data: [DONE]\n\n"),
+                ],
+            }
+        });
+
+        let run_turn = |key: &str, objective: &str, previous: Option<JobId>| -> JobId {
+            let body = json!({
+                "agent_profile": agent_id.to_string(),
+                "llm_profile": llm_id.to_string(),
+                "executor": executor.to_string(),
+                "objective": objective,
+                "previous": previous.map(|id| id.to_string()),
+            });
+            let request = JobRequest::parse(&serde_json::to_vec(&body).expect("json"))
+                .expect("parse request");
+            wait(check_configuration(&handle, &request)).expect("valid configuration");
+            let fingerprint = request.fingerprint();
+            let sub_key = digest_key(key.as_bytes());
+            let plan = plan(&handle, request);
+            let admitted = wait(scheduler.admit_submitted_provider(
+                plan,
+                NewSubmission {
+                    key: sub_key,
+                    fingerprint,
+                },
+            ))
+            .expect("admit provider job");
+            let job = admitted.job();
+            wait(admitted.settled()).expect("job settled");
+            job
+        };
+
+        let job1 = run_turn("turn-1-00000000000001", "My secret word is cobalt.", None);
+        let job2 = run_turn(
+            "turn-2-00000000000002",
+            "What is my secret word?",
+            Some(job1),
+        );
+        let job3 = run_turn("turn-3-00000000000003", "Spell it backwards.", Some(job2));
+
+        let sent = seen_conversations.lock().expect("lock").clone();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0]["messages"].as_array().expect("msgs").len(), 2);
+        assert_eq!(sent[1]["messages"].as_array().expect("msgs").len(), 4);
+        assert_eq!(sent[1]["messages"][1]["content"], "My secret word is cobalt.");
+        assert_eq!(
+            sent[1]["messages"][2]["content"],
+            "Reply 1: Remembered cobalt."
+        );
+        assert_eq!(sent[1]["messages"][3]["content"], "What is my secret word?");
+        assert_eq!(sent[2]["messages"].as_array().expect("msgs").len(), 6);
+        assert_eq!(
+            sent[2]["messages"][4]["content"],
+            "Reply 2: Your word is cobalt."
+        );
+        assert_eq!(sent[2]["messages"][5]["content"], "Spell it backwards.");
+
+        let conversation = wait(catalog::job_conversation(&handle, job3)).expect("conversation");
+        let turns = conversation.body["turns"].as_array().expect("turns");
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0]["job"]["id"], job1.to_string());
+        assert_eq!(turns[0]["job"]["previous"], Value::Null);
+        assert_eq!(turns[1]["job"]["id"], job2.to_string());
+        assert_eq!(turns[1]["job"]["previous"], job1.to_string());
+        assert_eq!(turns[2]["job"]["id"], job3.to_string());
+        assert_eq!(turns[2]["job"]["previous"], job2.to_string());
+
+        // Linking to Genesis or a non-existent Job is refused.
+        let genesis_req = JobRequest::parse(
+            serde_json::to_vec(&json!({
+                "llm_profile": llm_id.to_string(),
+                "executor": executor.to_string(),
+                "objective": "Bad link",
+                "previous": handle.genesis().to_string(),
+            }))
+            .expect("json")
+            .as_slice(),
+        )
+        .expect("parse");
+        assert_eq!(
+            wait(check_configuration(&handle, &genesis_req)).err(),
+            Some(INVALID_PREVIOUS_JOB)
+        );
+        let missing_req = JobRequest::parse(
+            serde_json::to_vec(&json!({
+                "llm_profile": llm_id.to_string(),
+                "executor": executor.to_string(),
+                "objective": "Missing link",
+                "previous": "job:999999",
+            }))
+            .expect("json")
+            .as_slice(),
+        )
+        .expect("parse");
+        assert_eq!(
+            wait(check_configuration(&handle, &missing_req)).err(),
+            Some(PREVIOUS_JOB_NOT_FOUND)
+        );
+
+        runtime.shutdown().expect("shutdown runtime");
+        worker.shutdown().expect("shutdown worker");
     }
 }

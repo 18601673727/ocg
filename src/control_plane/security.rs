@@ -1,15 +1,33 @@
 use super::*;
 
 /// Whether `path` names a route that is submitted to with `POST`: Job
-/// submission and a Job's stop.
+/// submission, a Job's stop, Profile creation/update, or an image upload.
 fn takes_post(path: &str) -> bool {
     match path.strip_prefix("/api/v1/") {
-        Some("jobs") => true,
-        Some(rest) => rest
-            .strip_prefix("jobs/")
-            .and_then(|rest| rest.strip_suffix("/stop"))
-            .is_some_and(|job| !job.contains('/')),
+        Some("jobs" | "profiles" | "attachments") => true,
+        Some(rest) => {
+            rest.strip_prefix("jobs/")
+                .and_then(|rest| rest.strip_suffix("/stop"))
+                .is_some_and(|job| !job.contains('/'))
+                || rest
+                    .strip_prefix("profiles/")
+                    .is_some_and(|profile| !profile.is_empty() && !profile.contains('/'))
+        }
         None => false,
+    }
+}
+
+/// The largest JSON body `path` accepts with `POST`, or `None` when it
+/// accepts none.
+fn json_post_limit(path: &str) -> Option<usize> {
+    match path.strip_prefix("/api/v1/") {
+        Some("attachments") => Some(MAX_ATTACHMENT_UPLOAD_BYTES),
+        Some("jobs" | "profiles") => Some(MAX_SUBMISSION_BYTES),
+        Some(rest) => rest
+            .strip_prefix("profiles/")
+            .is_some_and(|profile| !profile.is_empty() && !profile.contains('/'))
+            .then_some(MAX_SUBMISSION_BYTES),
+        None => None,
     }
 }
 
@@ -103,8 +121,10 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
             return Err(browser::FORBIDDEN_CSRF);
         }
     }
-    if method == Method::POST && path == "/api/v1/jobs" {
-        return submission_body(headers).map(|()| Destination::Api(caller));
+    if method == Method::POST
+        && let Some(limit) = json_post_limit(path)
+    {
+        return submission_body(headers, limit).map(|()| Destination::Api(caller));
     }
     if login && method == Method::POST {
         return browser::login_body(headers).map(|()| Destination::Api(caller));

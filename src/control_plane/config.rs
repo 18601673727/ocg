@@ -22,6 +22,12 @@ const MIN_TOKEN_DISTINCT: usize = 8;
 /// The largest submission body, in bytes.
 pub const MAX_SUBMISSION_BYTES: usize = 64 * 1024;
 
+/// The largest image upload body, in bytes: one image of at most
+/// [`crate::openai_compatible::image::MAX_IMAGE_BYTES`] as base64 within a
+/// small JSON object.
+pub const MAX_ATTACHMENT_UPLOAD_BYTES: usize =
+    crate::openai_compatible::image::MAX_IMAGE_BYTES.div_ceil(3) * 4 + 4 * 1024;
+
 /// The most outputs one page returns, and the default.
 pub const MAX_OUTPUT_PAGE: usize = 100;
 pub(super) const DEFAULT_OUTPUT_PAGE: usize = 50;

@@ -5,10 +5,14 @@ pub(super) enum Route {
     Health,
     Job(JobId),
     JobInput(JobId),
+    JobConversation(JobId),
     AgentProfiles {
         before: Option<ProfileId>,
         limit: usize,
     },
+    Profiles,
+    ProfileCreate,
+    ProfileUpdate(ProfileId),
     Outputs {
         job: JobId,
         after_seq: Option<i64>,
@@ -21,6 +25,9 @@ pub(super) enum Route {
     Submit,
     Admission,
     Stop(JobId),
+    AttachmentUpload,
+    Attachment(AttachmentId),
+    AttachmentContent(AttachmentId),
     SessionCreate,
     SessionStatus,
     SessionRevoke,
@@ -42,12 +49,19 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             Route::Health
             | Route::Job(_)
             | Route::JobInput(_)
+            | Route::JobConversation(_)
             | Route::AgentProfiles { .. }
+            | Route::Profiles
+            | Route::ProfileCreate
+            | Route::ProfileUpdate(_)
             | Route::Outputs { .. }
             | Route::Events { .. }
             | Route::Admission
             | Route::Submit
             | Route::Stop(_)
+            | Route::AttachmentUpload
+            | Route::Attachment(_)
+            | Route::AttachmentContent(_)
             | Route::SessionStatus
             | Route::SessionRevoke,
         ) => true,
@@ -71,6 +85,12 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 let job = job_id(job)?;
                 no_query(query).map(|()| Route::Stop(job))
             }
+            ["profiles"] => no_query(query).map(|()| Route::ProfileCreate),
+            ["profiles", profile] => {
+                let profile = profiles::profile_id(profile)?;
+                no_query(query).map(|()| Route::ProfileUpdate(profile))
+            }
+            ["attachments"] => no_query(query).map(|()| Route::AttachmentUpload),
             ["session"] => no_query(query).map(|()| Route::SessionCreate),
             _ => Err(NOT_FOUND),
         };
@@ -85,6 +105,15 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["health"] => no_query(query).map(|()| Route::Health),
         ["admissions"] => no_query(query).map(|()| Route::Admission),
         ["session"] => no_query(query).map(|()| Route::SessionStatus),
+        ["profiles"] => no_query(query).map(|()| Route::Profiles),
+        ["attachments", attachment] => {
+            let attachment = attachments::attachment_id(attachment)?;
+            no_query(query).map(|()| Route::Attachment(attachment))
+        }
+        ["attachments", attachment, "content"] => {
+            let attachment = attachments::attachment_id(attachment)?;
+            no_query(query).map(|()| Route::AttachmentContent(attachment))
+        }
         ["jobs", job] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
@@ -92,6 +121,10 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["jobs", job, "input"] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::JobInput(job))
+        }
+        ["jobs", job, "conversation"] => {
+            let job = job_id(job)?;
+            no_query(query).map(|()| Route::JobConversation(job))
         }
         ["agent-profiles"] => catalog::agent_profile_query(query)
             .map(|(before, limit)| Route::AgentProfiles { before, limit }),
@@ -179,8 +212,18 @@ pub(super) async fn respond(
             ))
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,
+        Route::JobConversation(job) => catalog::job_conversation(database, job).await,
         Route::AgentProfiles { before, limit } => {
             catalog::agent_profiles(database, before, limit).await
+        }
+        Route::Profiles => profiles::list_profiles(database).await,
+        Route::ProfileCreate => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            profiles::save_profile(database, None, &body).await
+        }
+        Route::ProfileUpdate(profile) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            profiles::save_profile(database, Some(profile), &body).await
         }
         Route::Outputs {
             job,
@@ -198,6 +241,11 @@ pub(super) async fn respond(
             submissions::lookup(shared, key).await
         }
         Route::Stop(job) => submissions::stop(shared, job).await,
+        Route::AttachmentUpload => {
+            let body = read_body(payload, MAX_ATTACHMENT_UPLOAD_BYTES).await?;
+            attachments::upload(database, &body).await
+        }
+        Route::Attachment(attachment) => attachments::metadata(database, attachment).await,
         Route::SessionCreate => {
             let body = read_body(payload, browser::MAX_LOGIN_BYTES).await?;
             let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
@@ -216,5 +264,7 @@ pub(super) async fn respond(
         },
         // Answered as a stream, before any reply.
         Route::Events { .. } => Err(INTERNAL),
+        // Answered as the image itself, before any reply.
+        Route::AttachmentContent(_) => Err(INTERNAL),
     }
 }

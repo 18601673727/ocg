@@ -14,7 +14,15 @@ const STATUS_NOTE: Partial<Record<TranscriptTurn["status"], string>> = {
   unknown: "The Job's outcome is unknown. Check its record before acting on this output.",
 };
 
-function TurnRow({ turn, userLabel }: { turn: TranscriptTurn; userLabel: string }) {
+function TurnRow({
+  turn,
+  userLabel,
+  attachmentContentUrl,
+}: {
+  turn: TranscriptTurn;
+  userLabel: string;
+  attachmentContentUrl?: (id: string) => string;
+}) {
   const { isCopied, copyToClipboard } = useCopyToClipboard();
   const isUser = turn.role === "user";
   const note = isUser ? undefined : STATUS_NOTE[turn.status];
@@ -55,6 +63,35 @@ function TurnRow({ turn, userLabel }: { turn: TranscriptTurn; userLabel: string 
             turn.status === "cancelled" && "text-muted-foreground italic",
           )}
         >
+          {turn.attachments && turn.attachments.length > 0 ? (
+            <div className="mb-3 flex flex-wrap gap-2">
+              {turn.attachments.map((id) => {
+                const url = attachmentContentUrl
+                  ? attachmentContentUrl(id)
+                  : `/api/v1/attachments/${encodeURIComponent(id)}/content`;
+                return (
+                  <a
+                    key={id}
+                    href={url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="group relative block overflow-hidden rounded-md border border-border bg-background transition-shadow hover:shadow-md"
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={url}
+                      alt={id}
+                      className="max-h-48 max-w-xs rounded object-contain"
+                      loading="lazy"
+                    />
+                    <span className="absolute bottom-1 right-1 rounded bg-background/80 px-1 py-0.5 font-mono text-[10px] text-muted-foreground">
+                      {id}
+                    </span>
+                  </a>
+                );
+              })}
+            </div>
+          ) : null}
           <BoundedMessage streaming={turn.status === "streaming"}>
             {/* The Provider's text is shown as text: it is never interpreted as markup. */}
             <p className="whitespace-pre-wrap break-words">{turn.content}</p>
@@ -75,14 +112,21 @@ function TurnRow({ turn, userLabel }: { turn: TranscriptTurn; userLabel: string 
 export function JobTranscript({
   turns,
   userLabel = "Objective",
+  attachmentContentUrl,
 }: {
   turns: readonly TranscriptTurn[];
   userLabel?: string;
+  attachmentContentUrl?: (id: string) => string;
 }) {
   return (
     <div className="flex flex-col gap-4" aria-live="polite">
       {turns.map((turn) => (
-        <TurnRow key={turn.id} turn={turn} userLabel={userLabel} />
+        <TurnRow
+          key={turn.id}
+          turn={turn}
+          userLabel={userLabel}
+          attachmentContentUrl={attachmentContentUrl}
+        />
       ))}
     </div>
   );

@@ -37,9 +37,13 @@ function usable(target: ControlAgentProfile["llm_targets"][number]): boolean {
 export function AgentSelector({
   client,
   onChange,
+  preferredAgentProfile,
+  preferredLlmProfile,
 }: {
   client: HttpCanonicalControlClient;
   onChange: (target: SubmissionTarget | null) => void;
+  preferredAgentProfile?: string | null;
+  preferredLlmProfile?: string | null;
 }) {
   const id = useId();
   const [attempt, setAttempt] = useState(0);
@@ -78,23 +82,33 @@ export function AgentSelector({
     () => (loaded?.status === "ready" ? loaded.agents.filter((agent) => agent.llm_targets.some(usable)) : []),
     [loaded],
   );
-  const agent = agents.find((candidate) => candidate.id === agentChoice) ?? agents[0];
+  const effectiveAgentChoice = agentChoice || preferredAgentProfile || "";
+  const effectiveTargetChoice = targetChoice || preferredLlmProfile || "";
+  const agent = agents.find((candidate) => candidate.id === effectiveAgentChoice) ?? agents[0];
   const targets = agent ? agent.llm_targets.filter(usable) : [];
-  const llm = targets.find((candidate) => candidate.id === targetChoice) ?? targets[0];
+  const llm = targets.find((candidate) => candidate.id === effectiveTargetChoice) ?? targets[0];
   const executor = llm?.executors.find((candidate) => candidate === executorChoice) ?? llm?.executors[0];
   const choice =
-    agent && llm && executor ? { agentProfile: agent.id, llmProfile: llm.id, executor } : null;
+    agent && llm && executor
+      ? {
+          agentProfile: agent.id,
+          llmProfile: llm.id,
+          executor,
+          declaredCapabilities: llm.declared_capabilities,
+        }
+      : null;
   const agentProfile = choice?.agentProfile;
   const llmProfile = choice?.llmProfile;
   const executorId = choice?.executor;
+  const declaredCapabilities = choice?.declaredCapabilities;
 
   useEffect(() => {
     onChange(
       agentProfile && llmProfile && executorId
-        ? { agentProfile, llmProfile, executor: executorId }
+        ? { agentProfile, llmProfile, executor: executorId, declaredCapabilities }
         : null,
     );
-  }, [agentProfile, llmProfile, executorId, onChange]);
+  }, [agentProfile, llmProfile, executorId, declaredCapabilities, onChange]);
 
   const unusable = loaded?.status === "ready" ? loaded.agents.length - agents.length : 0;
 

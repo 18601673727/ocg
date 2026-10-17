@@ -9,6 +9,7 @@ export type TranscriptTurn = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  attachments?: readonly string[];
   status: "completed" | "streaming" | "pending" | "failed" | "cancelled" | "unknown";
   /** The Result output's own text where the Job did not complete. */
   detail: string | null;
@@ -30,6 +31,7 @@ export function jobTranscript(
   outputs: readonly ControlOutput[],
   settlement: TranscriptSettlement | null,
   streaming: boolean,
+  attachments?: readonly string[],
 ): TranscriptTurn[] {
   const progress = outputs
     .filter((output) => output.kind === "progress")
@@ -42,10 +44,20 @@ export function jobTranscript(
     role: "assistant" as const,
     createdAtUs: outputs.at(-1)?.created_at_us ?? null,
   };
-  const user: TranscriptTurn[] =
-    objective === null
-      ? []
-      : [{ id: `${jobId}:objective`, role: "user", content: objective, status: "completed", detail: null, createdAtUs: null }];
+  const hasUserTurn = objective !== null || (attachments && attachments.length > 0);
+  const user: TranscriptTurn[] = !hasUserTurn
+    ? []
+    : [
+        {
+          id: `${jobId}:objective`,
+          role: "user",
+          content: objective ?? "",
+          attachments: attachments && attachments.length > 0 ? attachments : undefined,
+          status: "completed",
+          detail: null,
+          createdAtUs: null,
+        },
+      ];
   if (state === "completed") {
     // The Result carries the Provider's complete text; it supersedes the
     // streamed pieces it was assembled from.

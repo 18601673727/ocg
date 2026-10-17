@@ -1122,6 +1122,9 @@ async fn run_started_provider_job(
             result,
         })
     };
+    let Some(job_record) = database.job(job).await? else {
+        return refused("started Job record disappeared".to_owned()).await;
+    };
     let Some(configuration) = database.job_configuration(job).await? else {
         return refused("provider execution requires frozen LLM configuration".to_owned()).await;
     };
@@ -1138,11 +1141,103 @@ async fn run_started_provider_job(
             return refused(format!("the input's attachments cannot be sent: {error}")).await;
         }
     };
-    let mut conversation = provider_execution::objective_conversation_with_images(
-        &configuration.frozen,
-        input_record.objective.as_deref(),
-        &images,
-    );
+    let mut conversation = if let Some(first_previous) = job_record.previous {
+        const MAX_CONVERSATION_TURNS: usize = 64;
+        let genesis = database.genesis();
+        let mut visited = std::collections::BTreeSet::new();
+        visited.insert(job);
+        let mut prior_turns = Vec::new();
+        let mut cursor = Some(first_previous);
+        while let Some(current) = cursor {
+            if prior_turns.len() + 1 >= MAX_CONVERSATION_TURNS {
+                return refused("conversation exceeds the maximum number of turns".to_owned())
+                    .await;
+            }
+            if !visited.insert(current) {
+                return refused("conversation contains a cycle of previous Jobs".to_owned()).await;
+            }
+            let Some(ancestor) = database.job(current).await? else {
+                return refused(format!("previous Job {current} does not exist")).await;
+            };
+            if current == genesis
+                || ancestor.parent != genesis
+                || database.job_configuration(current).await?.is_none()
+            {
+                return refused(format!(
+                    "previous Job {current} cannot be used as conversation context"
+                ))
+                .await;
+            }
+            if ancestor.completed_at.is_none() {
+                return refused(format!("previous Job {current} has not completed")).await;
+            }
+            let Some(ancestor_input) = database.job_input_for_job(current).await? else {
+                return refused(format!("previous Job {current} input disappeared")).await;
+            };
+            let ancestor_images =
+                match attachment_images(&database, &ancestor_input.attachments).await {
+                    Ok(imgs) => imgs,
+                    Err(AttachmentImageError::Attachment(AttachmentError::Database(error))) => {
+                        return Err(error.into());
+                    }
+                    Err(error) => {
+                        return refused(format!(
+                            "previous Job {current} attachments cannot be sent: {error}"
+                        ))
+                        .await;
+                    }
+                };
+            let assistant_text = match database.latest_output(current).await? {
+                Some(output) if output.summary.is_some() => output.summary.unwrap_or_default(),
+                _ => {
+                    let outputs = database.job_outputs(current, None, 1_000).await?;
+                    outputs
+                        .into_iter()
+                        .filter(|output| output.kind == crate::persistence::OutputKind::Progress)
+                        .filter_map(|output| output.summary)
+                        .collect::<String>()
+                }
+            };
+            prior_turns.push((ancestor_input.objective, ancestor_images, assistant_text));
+            cursor = ancestor.previous;
+        }
+        prior_turns.reverse();
+        let mut built =
+            provider_execution::objective_conversation(&configuration.frozen, None);
+        built.messages.pop();
+        for (turn_objective, turn_images, assistant_text) in prior_turns {
+            if let Some(user_msg) = provider_execution::objective_conversation_with_images(
+                &configuration.frozen,
+                turn_objective.as_deref(),
+                &turn_images,
+            )
+            .messages
+            .pop()
+            {
+                built.messages.push(user_msg);
+            }
+            built
+                .messages
+                .push(ChatMessage::assistant(Some(assistant_text), Vec::new()));
+        }
+        if let Some(user_msg) = provider_execution::objective_conversation_with_images(
+            &configuration.frozen,
+            input_record.objective.as_deref(),
+            &images,
+        )
+        .messages
+        .pop()
+        {
+            built.messages.push(user_msg);
+        }
+        built
+    } else {
+        provider_execution::objective_conversation_with_images(
+            &configuration.frozen,
+            input_record.objective.as_deref(),
+            &images,
+        )
+    };
     conversation.tools = offered.unwrap_or_default();
     let frozen = &configuration.frozen;
     let resolver = plan.credential_resolver.as_ref();

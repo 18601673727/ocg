@@ -2,14 +2,19 @@ import {
   ContractError,
   decodeAdmission,
   decodeAgentProfiles,
+  decodeAttachment,
   decodeControlError,
   decodeHealth,
   decodeJob,
+  decodeJobConversation,
   decodeJobInput,
   decodeJobEvent,
   decodeOutputsPage,
+  decodeProfiles,
   decodeSession,
   decodeStop,
+  type ControlAttachment,
+  type ControlCapability,
   type ControlJobEvent,
 } from "../contracts";
 import { SseParser } from "./sse";
@@ -19,7 +24,12 @@ export type JobStreamEnd = "settled" | "stream_error" | "aborted";
 export type JobStreamSubscription = { closed: Promise<JobStreamEnd>; close(): void; };
 
 export class ControlTransportError extends Error {
-  constructor(readonly code: string, readonly status: number, readonly retryable: boolean) {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+    readonly retryable: boolean,
+    readonly detail: string = "",
+  ) {
     // Do not echo fetch errors, request URLs, credentials or untrusted bodies.
     super(`OCG event transport: ${code} (${status})`);
     this.name = "ControlTransportError";
@@ -45,7 +55,37 @@ export type ControlSubmission = {
   executor: string;
   objective: string;
   name?: string;
+  // A completed predecessor Job whose conversation history precedes this turn.
+  previous?: string;
+  // Image Attachments to send with the objective.
+  attachments?: string[];
 };
+
+export type ControlProfileWriteRequest =
+  | {
+      kind: "llm";
+      name: string;
+      model: string;
+      protocol?: "openai_chat_completions";
+      endpoint?: string | null;
+      credential_ref?: string | null;
+      credential?: string | null;
+      clear_credential?: boolean;
+      declared_capabilities: ControlCapability[];
+      parameters?: {
+        temperature?: number | null;
+        top_p?: number | null;
+        max_tokens?: number | null;
+        presence_penalty?: number | null;
+        frequency_penalty?: number | null;
+      };
+    }
+  | {
+      kind: "agent";
+      name: string;
+      instructions?: string | null;
+      llm_targets: string[];
+    };
 
 export type ControlSubmissionResult = {
   status: "admitted" | "pending";
@@ -247,9 +287,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     }
     if (!response.ok) {
       let code = "http_error";
-      try { code = decodeControlError(await response.json()).code; }
-      catch { /* An unrecognized body still retains its HTTP status. */ }
-      throw new ControlTransportError(code, response.status, retryable(response.status, code));
+      let detail = "";
+      try {
+        const decoded = decodeControlError(await response.json());
+        code = decoded.code;
+        detail = decoded.message;
+      } catch { /* An unrecognized body still retains its HTTP status. */ }
+      throw new ControlTransportError(code, response.status, retryable(response.status, code), detail);
     }
     let input: unknown;
     try { input = await response.json(); }
@@ -277,6 +321,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeJobInput((await send("GET", `/api/v1/jobs/${job}/input`, { signal })).input, job);
     },
 
+    /** The bounded conversation ending at `job`, reconstructed from persisted Job `previous` links. */
+    async readJobConversation(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      return decodeJobConversation((await send("GET", `/api/v1/jobs/${job}/conversation`, { signal })).input, job);
+    },
+
     /** One page of Agent Profiles with their LLM targets and the Executors that can run each. */
     async readAgentProfiles(
       settings: { before?: string; limit?: number; signal?: AbortSignal } = {},
@@ -291,6 +341,32 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       }
       const suffix = query.length ? `?${query.join("&")}` : "";
       return decodeAgentProfiles((await send("GET", `/api/v1/agent-profiles${suffix}`, { signal: settings.signal })).input);
+    },
+
+    /** Full Profile catalog (LLM Profiles, Agent Profiles) and computed Provider projection. */
+    async readProfiles(signal?: AbortSignal) {
+      return decodeProfiles((await send("GET", "/api/v1/profiles", { signal })).input);
+    },
+
+    /** Creates an LLM Profile or Agent Profile. */
+    async createProfile(profile: ControlProfileWriteRequest, signal?: AbortSignal) {
+      const answer = await send("POST", "/api/v1/profiles", {
+        body: profile,
+        sign: true,
+        signal,
+      });
+      return decodeProfiles(answer.input);
+    },
+
+    /** Updates an existing LLM Profile or Agent Profile. */
+    async updateProfile(profileId: string, profile: ControlProfileWriteRequest, signal?: AbortSignal) {
+      identity(profileId, "profile", "profile:");
+      const answer = await send("POST", `/api/v1/profiles/${profileId}`, {
+        body: profile,
+        sign: true,
+        signal,
+      });
+      return decodeProfiles(answer.input);
     },
 
     /** One stored page of the Job's outputs, in `seq` order. */
@@ -321,6 +397,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (submission.agent_profile !== undefined) identity(submission.agent_profile, "agent_profile", "profile:");
       identity(submission.llm_profile, "llm_profile", "profile:");
       identity(submission.executor, "executor", "executor:");
+      if (submission.previous !== undefined) jobIdentity(submission.previous);
+      if (submission.attachments !== undefined) {
+        for (const [index, att] of submission.attachments.entries()) {
+          identity(att, `attachments[${index}]`, "attachment:");
+        }
+      }
       submissionKey(key);
       const answer = await send("POST", "/api/v1/jobs", {
         body: submission,
@@ -337,6 +419,32 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         job: admission.job,
         created: answer.status === 201,
       } satisfies ControlSubmissionResult;
+    },
+
+    /** Uploads a PNG or JPEG image to the Attachment store. */
+    async uploadAttachment(
+      payload: { mime: "image/png" | "image/jpeg"; data_base64: string; display_name?: string },
+      signal?: AbortSignal,
+    ): Promise<ControlAttachment> {
+      const answer = await send("POST", "/api/v1/attachments", {
+        body: payload,
+        sign: true,
+        signal,
+      });
+      return decodeAttachment(answer.input);
+    },
+
+    /** Reads metadata of an image Attachment. */
+    async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<ControlAttachment> {
+      identity(attachmentId, "attachment", "attachment:");
+      const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, { signal });
+      return decodeAttachment(answer.input);
+    },
+
+    /** URL to fetch the raw image content of an Attachment. */
+    attachmentContentUrl(attachmentId: string): string {
+      identity(attachmentId, "attachment", "attachment:");
+      return `${base}/api/v1/attachments/${attachmentId}/content`;
     },
 
     /** What `key` created, however its submission ended. */

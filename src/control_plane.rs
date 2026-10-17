@@ -119,14 +119,18 @@ use serde_json::{Value, json};
 
 use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::orchestration::execution_runtime::SchedulerHandle;
-use crate::persistence::{ExecutionMode, JobId, JobOutputRecord, JobRecord, OutputKind, ProfileId};
+use crate::persistence::{
+    AttachmentId, ExecutionMode, JobId, JobOutputRecord, JobRecord, OutputKind, ProfileId,
+};
 
 mod assets;
+mod attachments;
 mod browser;
 mod catalog;
 mod config;
 mod events;
 mod listener;
+mod profiles;
 mod projection;
 mod routing;
 mod security;
@@ -139,8 +143,8 @@ pub(crate) use events::events_seam;
 pub(crate) use submissions::resolution_seam;
 
 pub use config::{
-    API_VERSION, ConfigError, ControlPlaneConfig, MAX_OUTPUT_PAGE, MAX_SUBMISSION_BYTES,
-    MIN_TOKEN_CHARS, PORT_VARIABLE, TOKEN_VARIABLE, UI_VARIABLE,
+    API_VERSION, ConfigError, ControlPlaneConfig, MAX_ATTACHMENT_UPLOAD_BYTES, MAX_OUTPUT_PAGE,
+    MAX_SUBMISSION_BYTES, MIN_TOKEN_CHARS, PORT_VARIABLE, TOKEN_VARIABLE, UI_VARIABLE,
 };
 use config::{
     DEFAULT_OUTPUT_PAGE, MAX_HEADER_BYTES, MAX_HEADERS, MAX_PATH_BYTES, MAX_QUERY_BYTES, Token,

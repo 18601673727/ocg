@@ -75,6 +75,9 @@ function jobRecord(input: unknown) {
     name: job.name === null ? null : string(job.name, "job.name"),
     execution_mode: mode,
     input: string(job.input, "job.input"),
+    previous: job.previous === undefined || job.previous === null
+      ? null
+      : identity(job.previous, "job.previous", "job:"),
     assigned_executor: job.assigned_executor === null
       ? null
       : identity(job.assigned_executor, "job.assigned_executor", "executor:"),
@@ -237,6 +240,32 @@ export function decodeSession(input: unknown) {
   };
 }
 
+function jobInputRecord(input: unknown, path: string, jobId: string) {
+  const value = record(input, path);
+  const attachments = value.attachments;
+  if (!Array.isArray(attachments)) throw new ContractError(`${path}.attachments`, "an array");
+  let configuration: { agent_profile: string | null; llm_profile: string; model: string } | null = null;
+  if (value.configuration !== null) {
+    const frozen = record(value.configuration, `${path}.configuration`);
+    configuration = {
+      agent_profile: frozen.agent_profile === null
+        ? null
+        : identity(frozen.agent_profile, `${path}.configuration.agent_profile`, "profile:"),
+      llm_profile: identity(frozen.llm_profile, `${path}.configuration.llm_profile`, "profile:"),
+      model: string(frozen.model, `${path}.configuration.model`),
+    };
+  }
+  return {
+    job: jobId,
+    id: identity(value.id, `${path}.id`, "job_input:"),
+    objective: value.objective === null ? null : string(value.objective, `${path}.objective`),
+    submitted_at_us: timestamp(value.submitted_at_us, `${path}.submitted_at_us`),
+    attachments: attachments.map((attachment, index) =>
+      identity(attachment, `${path}.attachments[${index}]`, "attachment:")),
+    configuration,
+  };
+}
+
 /**
  * A Job's frozen input as `GET /api/v1/jobs/{job}/input` reports it: the
  * objective as text (the Job record names its input only by identity), its
@@ -246,30 +275,35 @@ export function decodeJobInput(input: unknown, jobId: string) {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
   if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
-  const value = record(envelope.input, "input");
-  const attachments = value.attachments;
-  if (!Array.isArray(attachments)) throw new ContractError("input.attachments", "an array");
-  let configuration: { agent_profile: string | null; llm_profile: string; model: string } | null = null;
-  if (value.configuration !== null) {
-    const frozen = record(value.configuration, "input.configuration");
-    configuration = {
-      agent_profile: frozen.agent_profile === null
-        ? null
-        : identity(frozen.agent_profile, "input.configuration.agent_profile", "profile:"),
-      llm_profile: identity(frozen.llm_profile, "input.configuration.llm_profile", "profile:"),
-      model: string(frozen.model, "input.configuration.model"),
-    };
+  return jobInputRecord(envelope.input, "input", jobId);
+}
+
+/**
+ * Reconstructs the bounded conversation ending at `jobId` from
+ * `GET /api/v1/jobs/{job}/conversation`, ordered from oldest turn to `jobId`.
+ */
+export function decodeJobConversation(input: unknown, jobId: string) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
+  const turns = listOf(envelope.turns, "turns", (entry, path) => {
+    const turn = record(entry, path);
+    const job = jobRecord(turn.job);
+    const frozenInput = jobInputRecord(turn.input, `${path}.input`, job.id);
+    const outputs = listOf(turn.outputs, `${path}.outputs`, (output) => outputRecord(output));
+    return { job, input: frozenInput, outputs };
+  });
+  if (turns.length === 0 || turns[turns.length - 1].job.id !== jobId) {
+    throw new ContractError("turns", "a non-empty conversation ending at the requested Job");
   }
   return {
     job: jobId,
-    id: identity(value.id, "input.id", "job_input:"),
-    objective: value.objective === null ? null : string(value.objective, "input.objective"),
-    submitted_at_us: timestamp(value.submitted_at_us, "input.submitted_at_us"),
-    attachments: attachments.map((attachment, index) =>
-      identity(attachment, `input.attachments[${index}]`, "attachment:")),
-    configuration,
+    turns,
   };
 }
+
+export type ControlConversation = ReturnType<typeof decodeJobConversation>;
+export type ControlConversationTurn = ControlConversation["turns"][number];
 
 const CAPABILITIES = ["chat", "tools", "vision", "reasoning"] as const;
 export type ControlCapability = (typeof CAPABILITIES)[number];
@@ -326,3 +360,132 @@ export function decodeAgentProfiles(input: unknown) {
 export type ControlJobInput = ReturnType<typeof decodeJobInput>;
 export type ControlAgentProfiles = ReturnType<typeof decodeAgentProfiles>;
 export type ControlAgentProfile = ControlAgentProfiles["agent_profiles"][number];
+
+function optionalString(value: unknown, path: string): string | null {
+  return value === null ? null : string(value, path);
+}
+
+function optionalFiniteNumber(value: unknown, path: string): number | null {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ContractError(path, "a finite number or null");
+  }
+  return value;
+}
+
+/**
+ * Full Profile management snapshot from `GET /api/v1/profiles`,
+ * `POST /api/v1/profiles`, and `POST /api/v1/profiles/{profile}`, including
+ * LLM Profiles, Agent Profiles, and the computed Provider projection.
+ */
+export function decodeProfiles(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const profileId = envelope.profile_id === undefined || envelope.profile_id === null
+    ? null
+    : identity(envelope.profile_id, "profile_id", "profile:");
+  return {
+    profile_id: profileId,
+    llm_profiles: listOf(envelope.llm_profiles, "llm_profiles", (entry, path) => {
+      const llm = record(entry, path);
+      const protocol = string(llm.protocol, `${path}.protocol`);
+      if (protocol !== "openai_chat_completions") {
+        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
+      }
+      const params = record(llm.parameters, `${path}.parameters`);
+      return {
+        id: identity(llm.id, `${path}.id`, "profile:"),
+        name: string(llm.name, `${path}.name`),
+        model: string(llm.model, `${path}.model`),
+        protocol,
+        endpoint: optionalString(llm.endpoint, `${path}.endpoint`),
+        credential_ref: optionalString(llm.credential_ref, `${path}.credential_ref`),
+        has_credential: boolean(llm.has_credential, `${path}.has_credential`),
+        declared_capabilities: listOf(llm.declared_capabilities, `${path}.declared_capabilities`,
+          (capability, capabilityPath) => {
+            const named = string(capability, capabilityPath);
+            const known = CAPABILITIES.find((candidate) => candidate === named);
+            if (!known) throw new ContractError(capabilityPath, "a declared model capability");
+            return known;
+          }),
+        parameters: {
+          temperature: optionalFiniteNumber(params.temperature, `${path}.parameters.temperature`),
+          top_p: optionalFiniteNumber(params.top_p, `${path}.parameters.top_p`),
+          max_tokens: timestamp(params.max_tokens, `${path}.parameters.max_tokens`),
+          presence_penalty: optionalFiniteNumber(params.presence_penalty, `${path}.parameters.presence_penalty`),
+          frequency_penalty: optionalFiniteNumber(params.frequency_penalty, `${path}.parameters.frequency_penalty`),
+        },
+        executors: listOf(llm.executors, `${path}.executors`,
+          (executor, executorPath) => identity(executor, executorPath, "executor:")),
+        editable: boolean(llm.editable, `${path}.editable`),
+        blocking_jobs: listOf(llm.blocking_jobs, `${path}.blocking_jobs`,
+          (job, jobPath) => identity(job, jobPath, "job:")),
+        more_blocking_jobs: boolean(llm.more_blocking_jobs, `${path}.more_blocking_jobs`),
+        created_at_us: integer(llm.created_at_us, `${path}.created_at_us`),
+        updated_at_us: integer(llm.updated_at_us, `${path}.updated_at_us`),
+      };
+    }),
+    agent_profiles: listOf(envelope.agent_profiles, "agent_profiles", (entry, path) => {
+      const agent = record(entry, path);
+      return {
+        id: identity(agent.id, `${path}.id`, "profile:"),
+        name: string(agent.name, `${path}.name`),
+        instructions: optionalString(agent.instructions, `${path}.instructions`),
+        llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`,
+          (target, targetPath) => identity(target, targetPath, "profile:")),
+        editable: boolean(agent.editable, `${path}.editable`),
+        blocking_jobs: listOf(agent.blocking_jobs, `${path}.blocking_jobs`,
+          (job, jobPath) => identity(job, jobPath, "job:")),
+        more_blocking_jobs: boolean(agent.more_blocking_jobs, `${path}.more_blocking_jobs`),
+        created_at_us: integer(agent.created_at_us, `${path}.created_at_us`),
+        updated_at_us: integer(agent.updated_at_us, `${path}.updated_at_us`),
+      };
+    }),
+    providers: listOf(envelope.providers, "providers", (entry, path) => {
+      const provider = record(entry, path);
+      const protocol = string(provider.protocol, `${path}.protocol`);
+      if (protocol !== "openai_chat_completions") {
+        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
+      }
+      return {
+        protocol,
+        endpoint: optionalString(provider.endpoint, `${path}.endpoint`),
+        credential_ref: optionalString(provider.credential_ref, `${path}.credential_ref`),
+        has_credential: boolean(provider.has_credential, `${path}.has_credential`),
+        profile_ids: listOf(provider.profile_ids, `${path}.profile_ids`,
+          (id, idPath) => identity(id, idPath, "profile:")),
+        models: listOf(provider.models, `${path}.models`,
+          (model, modelPath) => string(model, modelPath)),
+      };
+    }),
+  };
+}
+
+export type ControlProfilesSnapshot = ReturnType<typeof decodeProfiles>;
+export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
+export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];
+export type ControlProviderProjection = ControlProfilesSnapshot["providers"][number];
+
+/**
+ * An image Attachment as `POST /api/v1/attachments` and
+ * `GET /api/v1/attachments/{attachment}` report it.
+ */
+export function decodeAttachment(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const attachment = record(envelope.attachment, "attachment");
+  return {
+    id: identity(attachment.id, "attachment.id", "attachment:"),
+    mime: string(attachment.mime, "attachment.mime"),
+    byte_length: integer(attachment.byte_length, "attachment.byte_length"),
+    sha256: string(attachment.sha256, "attachment.sha256"),
+    display_name:
+      attachment.display_name === null ? null : string(attachment.display_name, "attachment.display_name"),
+    created_at_us: timestamp(attachment.created_at_us, "attachment.created_at_us"),
+    available: typeof attachment.available === "boolean" ? attachment.available : true,
+    data_url: typeof attachment.data_url === "string" ? attachment.data_url : undefined,
+  };
+}
+
+export type ControlAttachment = ReturnType<typeof decodeAttachment>;
+
