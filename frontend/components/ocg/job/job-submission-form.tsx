@@ -10,7 +10,7 @@ import {
   type ControlSubmission,
   type HttpCanonicalControlClient,
 } from "@/components/ocg/runtime/canonical-client";
-import { ContractError } from "@/components/ocg/contracts";
+import { ContractError, type ControlCapability } from "@/components/ocg/contracts";
 
 type Phase = "editing" | "submitting" | "pending" | "uncertain" | "admitted" | "refused";
 
@@ -38,6 +38,7 @@ export type SubmissionTarget = {
   agentProfile: string;
   llmProfile: string;
   executor: string;
+  declaredCapabilities?: ControlCapability[];
 };
 
 /**
@@ -49,12 +50,18 @@ export function JobSubmissionForm({
   client,
   onJob,
   target,
+  previousJob,
+  disabledReason,
 }: {
   client: HttpCanonicalControlClient;
   onJob: (jobId: string) => void;
   // Present in Chat: the Agent Profile, LLM target and Executor come from the
   // selector. Absent in the Jobs view: they are typed by identity.
   target?: SubmissionTarget | null;
+  // When continuing a multi-turn conversation in Chat, names the completed predecessor Job.
+  previousJob?: string | null;
+  // Explains why the next turn cannot be sent yet (e.g. while the current Job is running).
+  disabledReason?: string | null;
 }) {
   const chat = target !== undefined;
   const [agentProfile, setAgentProfile] = useState("");
@@ -105,6 +112,17 @@ export function JobSubmissionForm({
     reconciliation.current = null;
   }
 
+  function resetAfterChatAdmitted() {
+    clearReconciliation();
+    keyRef.current = null;
+    requestRef.current = null;
+    setKey(null);
+    setPhase("editing");
+    setMessage(null);
+    setObjective("");
+    setName("");
+  }
+
   function reconcile(held: string) {
     client
       .readAdmission(held)
@@ -112,8 +130,12 @@ export function JobSubmissionForm({
         if (!mounted.current || keyRef.current !== held) return;
         if (admission.status === "admitted" && admission.job) {
           clearReconciliation();
-          setPhase("admitted");
-          setMessage(`${admission.job} is admitted and running.`);
+          if (chat) {
+            resetAfterChatAdmitted();
+          } else {
+            setPhase("admitted");
+            setMessage(`${admission.job} is admitted and running.`);
+          }
           onJob(admission.job);
         } else if (admission.status === "uncertain") {
           clearReconciliation();
@@ -154,17 +176,22 @@ export function JobSubmissionForm({
               executor: target ? target.executor : executor.trim(),
               objective,
               ...(name.trim() ? { name: name.trim() } : {}),
+              ...(previousJob ? { previous: previousJob } : {}),
             };
       requestRef.current = request;
       const result = await client.submitJob(request, held);
       if (!mounted.current || keyRef.current !== held) return;
       if (result.status === "admitted" && result.job) {
-        setPhase("admitted");
-        setMessage(
-          result.created
-            ? `${result.job} was created and admitted by this request.`
-            : `${result.job} was already admitted under this key.`,
-        );
+        if (chat) {
+          resetAfterChatAdmitted();
+        } else {
+          setPhase("admitted");
+          setMessage(
+            result.created
+              ? `${result.job} was created and admitted by this request.`
+              : `${result.job} was already admitted under this key.`,
+          );
+        }
         onJob(result.job);
       } else {
         setPhase("pending");
@@ -214,10 +241,14 @@ export function JobSubmissionForm({
   return (
     <section className="flex flex-col gap-4 rounded-lg border border-border bg-card p-5 text-card-foreground">
       <header className="flex flex-col gap-1">
-        <h2 className="font-heading text-lg">{chat ? "Send a message" : "Submit a Job"}</h2>
+        <h2 className="font-heading text-lg">
+          {chat ? (previousJob ? "Send follow-up message" : "Send a message") : "Submit a Job"}
+        </h2>
         <p className="text-xs text-muted-foreground">
           {chat
-            ? "The message becomes one Job of the selected Agent. One Idempotency-Key names it through every retry."
+            ? previousJob
+              ? `This message will be submitted as a new Job linked to ${previousJob}, carrying the conversation's prior exchanges as context.`
+              : "The message becomes one Job of the selected Agent. One Idempotency-Key names it through every retry."
             : "An existing LLM Profile and Executor, by their canonical identities, and an objective. One Idempotency-Key names this submission through every retry."}
         </p>
       </header>
@@ -311,6 +342,11 @@ export function JobSubmissionForm({
           />
         </label>
       )}
+      {disabledReason ? (
+        <p role="status" className="text-xs text-muted-foreground">
+          {disabledReason}
+        </p>
+      ) : null}
       {key ? (
         <p className="text-xs text-muted-foreground">
           Idempotency-Key: <code className="font-geist-mono">{key}</code>
@@ -326,7 +362,7 @@ export function JobSubmissionForm({
         {phase === "editing" || phase === "refused" ? (
           <Button
             onClick={() => void submit()}
-            disabled={objective.trim().length === 0 || (chat && !target)}
+            disabled={objective.trim().length === 0 || (chat && !target) || Boolean(disabledReason)}
           >
             {phase === "editing" ? (chat ? "Send" : "Submit Job") : chat ? "Send again" : "Submit again"}
           </Button>

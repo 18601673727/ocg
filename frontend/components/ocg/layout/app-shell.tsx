@@ -169,7 +169,13 @@ export function AppShell({
               Idempotency-Key and its lookup, and a watched Job keeps its stream. */}
           <div hidden={view !== "chat"}>
             {/* Only the visible view watches the Job: a Job has one event stream per client. */}
-            <ChatSurface client={client} job={view === "chat" ? location.job : null} onJob={(job) => openJob(job, "chat")} />
+            <ChatSurface
+              client={client}
+              job={view === "chat" ? location.job : null}
+              onJob={(job) => openJob(job, "chat")}
+              onNewConversation={() => go({ view: "chat", job: null })}
+              onInspectJob={(targetJob) => openJob(targetJob, "jobs")}
+            />
           </div>
           <div hidden={view !== "jobs"}>
             <JobsView client={client} job={view === "jobs" ? location.job : null} onJob={(job) => openJob(job, "jobs")} />

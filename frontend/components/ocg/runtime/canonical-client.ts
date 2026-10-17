@@ -5,6 +5,7 @@ import {
   decodeControlError,
   decodeHealth,
   decodeJob,
+  decodeJobConversation,
   decodeJobInput,
   decodeJobEvent,
   decodeOutputsPage,
@@ -52,6 +53,8 @@ export type ControlSubmission = {
   executor: string;
   objective: string;
   name?: string;
+  // A completed predecessor Job whose conversation history precedes this turn.
+  previous?: string;
 };
 
 export type ControlProfileWriteRequest =
@@ -314,6 +317,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeJobInput((await send("GET", `/api/v1/jobs/${job}/input`, { signal })).input, job);
     },
 
+    /** The bounded conversation ending at `job`, reconstructed from persisted Job `previous` links. */
+    async readJobConversation(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      return decodeJobConversation((await send("GET", `/api/v1/jobs/${job}/conversation`, { signal })).input, job);
+    },
+
     /** One page of Agent Profiles with their LLM targets and the Executors that can run each. */
     async readAgentProfiles(
       settings: { before?: string; limit?: number; signal?: AbortSignal } = {},
@@ -384,6 +393,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (submission.agent_profile !== undefined) identity(submission.agent_profile, "agent_profile", "profile:");
       identity(submission.llm_profile, "llm_profile", "profile:");
       identity(submission.executor, "executor", "executor:");
+      if (submission.previous !== undefined) jobIdentity(submission.previous);
       submissionKey(key);
       const answer = await send("POST", "/api/v1/jobs", {
         body: submission,

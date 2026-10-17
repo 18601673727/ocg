@@ -59,6 +59,10 @@ export function JobWatch(props: {
   // The inspector shows the Job's record around its answer; chat shows the
   // answer first and keeps the record one click away.
   presentation?: "inspector" | "chat";
+  onStateChange?: (
+    state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown",
+    job: ControlJob | null,
+  ) => void;
 }) {
   // Retry re-runs the whole load (record, stored history, stream) from scratch.
   const [attempt, setAttempt] = useState(0);
@@ -69,11 +73,16 @@ function JobWatchBody({
   client,
   jobId,
   presentation = "inspector",
+  onStateChange,
   onRetry,
 }: {
   client: HttpCanonicalControlClient;
   jobId: string;
   presentation?: "inspector" | "chat";
+  onStateChange?: (
+    state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown",
+    job: ControlJob | null,
+  ) => void;
   onRetry: () => void;
 }) {
   const [job, setJob] = useState<ControlJob | null>(null);
@@ -85,6 +94,11 @@ function JobWatchBody({
   const [input, setInput] = useState<{ objective: string | null } | { error: string } | null>(null);
   const [stop, setStop] = useState<string | null>(null);
   const [stopBusy, setStopBusy] = useState(false);
+
+  useEffect(() => {
+    if (!job && !settlement) return;
+    onStateChange?.(settlement?.state ?? "unsettled", job);
+  }, [job, settlement, onStateChange]);
 
   useEffect(() => {
     let alive = true;
@@ -288,6 +302,14 @@ function JobWatchBody({
           <dt>Input</dt>
           <dd>
             <code className="font-geist-mono">{job.input}</code>
+          </dd>
+        </div>
+      ) : null}
+      {job?.previous ? (
+        <div className="flex justify-between gap-2">
+          <dt>Previous Job</dt>
+          <dd>
+            <code className="font-geist-mono">{job.previous}</code>
           </dd>
         </div>
       ) : null}

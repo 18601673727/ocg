@@ -75,6 +75,9 @@ function jobRecord(input: unknown) {
     name: job.name === null ? null : string(job.name, "job.name"),
     execution_mode: mode,
     input: string(job.input, "job.input"),
+    previous: job.previous === undefined || job.previous === null
+      ? null
+      : identity(job.previous, "job.previous", "job:"),
     assigned_executor: job.assigned_executor === null
       ? null
       : identity(job.assigned_executor, "job.assigned_executor", "executor:"),
@@ -237,6 +240,32 @@ export function decodeSession(input: unknown) {
   };
 }
 
+function jobInputRecord(input: unknown, path: string, jobId: string) {
+  const value = record(input, path);
+  const attachments = value.attachments;
+  if (!Array.isArray(attachments)) throw new ContractError(`${path}.attachments`, "an array");
+  let configuration: { agent_profile: string | null; llm_profile: string; model: string } | null = null;
+  if (value.configuration !== null) {
+    const frozen = record(value.configuration, `${path}.configuration`);
+    configuration = {
+      agent_profile: frozen.agent_profile === null
+        ? null
+        : identity(frozen.agent_profile, `${path}.configuration.agent_profile`, "profile:"),
+      llm_profile: identity(frozen.llm_profile, `${path}.configuration.llm_profile`, "profile:"),
+      model: string(frozen.model, `${path}.configuration.model`),
+    };
+  }
+  return {
+    job: jobId,
+    id: identity(value.id, `${path}.id`, "job_input:"),
+    objective: value.objective === null ? null : string(value.objective, `${path}.objective`),
+    submitted_at_us: timestamp(value.submitted_at_us, `${path}.submitted_at_us`),
+    attachments: attachments.map((attachment, index) =>
+      identity(attachment, `${path}.attachments[${index}]`, "attachment:")),
+    configuration,
+  };
+}
+
 /**
  * A Job's frozen input as `GET /api/v1/jobs/{job}/input` reports it: the
  * objective as text (the Job record names its input only by identity), its
@@ -246,30 +275,35 @@ export function decodeJobInput(input: unknown, jobId: string) {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
   if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
-  const value = record(envelope.input, "input");
-  const attachments = value.attachments;
-  if (!Array.isArray(attachments)) throw new ContractError("input.attachments", "an array");
-  let configuration: { agent_profile: string | null; llm_profile: string; model: string } | null = null;
-  if (value.configuration !== null) {
-    const frozen = record(value.configuration, "input.configuration");
-    configuration = {
-      agent_profile: frozen.agent_profile === null
-        ? null
-        : identity(frozen.agent_profile, "input.configuration.agent_profile", "profile:"),
-      llm_profile: identity(frozen.llm_profile, "input.configuration.llm_profile", "profile:"),
-      model: string(frozen.model, "input.configuration.model"),
-    };
+  return jobInputRecord(envelope.input, "input", jobId);
+}
+
+/**
+ * Reconstructs the bounded conversation ending at `jobId` from
+ * `GET /api/v1/jobs/{job}/conversation`, ordered from oldest turn to `jobId`.
+ */
+export function decodeJobConversation(input: unknown, jobId: string) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
+  const turns = listOf(envelope.turns, "turns", (entry, path) => {
+    const turn = record(entry, path);
+    const job = jobRecord(turn.job);
+    const frozenInput = jobInputRecord(turn.input, `${path}.input`, job.id);
+    const outputs = listOf(turn.outputs, `${path}.outputs`, (output) => outputRecord(output));
+    return { job, input: frozenInput, outputs };
+  });
+  if (turns.length === 0 || turns[turns.length - 1].job.id !== jobId) {
+    throw new ContractError("turns", "a non-empty conversation ending at the requested Job");
   }
   return {
     job: jobId,
-    id: identity(value.id, "input.id", "job_input:"),
-    objective: value.objective === null ? null : string(value.objective, "input.objective"),
-    submitted_at_us: timestamp(value.submitted_at_us, "input.submitted_at_us"),
-    attachments: attachments.map((attachment, index) =>
-      identity(attachment, `input.attachments[${index}]`, "attachment:")),
-    configuration,
+    turns,
   };
 }
+
+export type ControlConversation = ReturnType<typeof decodeJobConversation>;
+export type ControlConversationTurn = ControlConversation["turns"][number];
 
 const CAPABILITIES = ["chat", "tools", "vision", "reasoning"] as const;
 export type ControlCapability = (typeof CAPABILITIES)[number];

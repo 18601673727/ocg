@@ -5,6 +5,7 @@ pub(super) enum Route {
     Health,
     Job(JobId),
     JobInput(JobId),
+    JobConversation(JobId),
     AgentProfiles {
         before: Option<ProfileId>,
         limit: usize,
@@ -45,6 +46,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             Route::Health
             | Route::Job(_)
             | Route::JobInput(_)
+            | Route::JobConversation(_)
             | Route::AgentProfiles { .. }
             | Route::Profiles
             | Route::ProfileCreate
@@ -104,6 +106,10 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["jobs", job, "input"] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::JobInput(job))
+        }
+        ["jobs", job, "conversation"] => {
+            let job = job_id(job)?;
+            no_query(query).map(|()| Route::JobConversation(job))
         }
         ["agent-profiles"] => catalog::agent_profile_query(query)
             .map(|(before, limit)| Route::AgentProfiles { before, limit }),
@@ -191,6 +197,7 @@ pub(super) async fn respond(
             ))
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,
+        Route::JobConversation(job) => catalog::job_conversation(database, job).await,
         Route::AgentProfiles { before, limit } => {
             catalog::agent_profiles(database, before, limit).await
         }
