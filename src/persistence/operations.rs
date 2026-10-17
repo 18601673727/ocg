@@ -71,6 +71,7 @@ pub enum OperationKind {
     CreateAttachment,
     /// The cleanup of an available Attachment: its kind and time, together.
     CleanupAttachment,
+    ClaimExecution,
     CreateExecutionPool,
     SetExecutionPoolEnabled,
     SetExecutionPoolProfile,

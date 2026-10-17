@@ -1,0 +1,214 @@
+use super::*;
+use crate::persistence::*;
+use crate::test_support::{WAIT, data_directory, poll_once, wait};
+use std::collections::BTreeSet;
+use std::num::NonZeroU32;
+
+fn provision(database: &DatabaseHandle) -> (ExecutionPoolId, ProfileId) {
+    let provider = wait(database.create_llm_provider(NewLlmProvider {
+        name: "p".into(),
+        transport: LlmTransport::OpenAiChatCompletions,
+        endpoint: None,
+        credential_ref: None,
+    }))
+    .unwrap();
+    let llm = wait(database.create_profile(NewProfile {
+        name: "llm".into(),
+        config: NewProfileConfig::Llm {
+            provider,
+            config: LlmConfig {
+                model: "m".into(),
+                parameters: Default::default(),
+                declared_capabilities: Default::default(),
+            },
+        },
+    }))
+    .unwrap();
+    let profile = wait(database.create_profile(NewProfile {
+        name: "pool".into(),
+        config: NewProfileConfig::ExecutionPool(ExecutionPoolConfig {
+            concurrency_limit: NonZeroU32::new(16).unwrap(),
+            capabilities: CapabilitySet {
+                operations: BTreeSet::from([ExecutionOperation::LlmRequest]),
+                llm_protocols: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+            },
+        }),
+    }))
+    .unwrap();
+    let pool = wait(database.create_execution_pool(NewExecutionPool {
+        name: "ordinary".into(),
+        profile,
+        enabled: true,
+    }))
+    .unwrap();
+    (pool, llm)
+}
+
+fn pending(database: &DatabaseHandle, llm: ProfileId) -> JobId {
+    let input = wait(database.save_job_input(None, JobInputDraft::default())).unwrap();
+    wait(database.create_job_with_input(
+        NewJob {
+            name: None,
+            execution_mode: ExecutionMode::Once,
+            eligible_at: None,
+            scheduled_at: None,
+            next_due_at: None,
+            next_iteration_no: None,
+            iteration_no: None,
+            parent: database.genesis(),
+            projects: Vec::new(),
+            dependencies: Vec::new(),
+            configuration: Some(ExecutionConfiguration {
+                agent_profile: None,
+                llm_profile: llm,
+            }),
+            assigned_executor: None,
+            previous: None,
+            replaces: None,
+        },
+        input,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn consuming_claim_emits_neither_generation_unknown_release_and_recovery_are_durable() {
+    let (_root, directory) = data_directory("ocg-stage-b-worker", "wake");
+    let mut worker = DatabaseWorker::start(&directory).unwrap();
+    let wake = worker.take_scheduler_wake().unwrap();
+    let database = worker.handle();
+    let (pool, llm) = provision(&database);
+    let job = pending(&database, llm);
+    let before = (wake.dirty_generation(), wake.capacity_generation());
+    wait(database.claim_execution(ClaimRequest {
+        job,
+        allowed_pools: BTreeSet::from([pool]),
+    }))
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        (wake.dirty_generation(), wake.capacity_generation()),
+        before
+    );
+    wait(database.finalize_job(job, JobFinalization::Unknown)).unwrap();
+    assert_eq!(wait(database.occupancy()).unwrap(), vec![(pool, job)]);
+    let unknown_generation = wake.capacity_generation();
+    wait(database.confirm_job_stopped(job)).unwrap();
+    assert!(wake.capacity_generation() > unknown_generation);
+    assert!(wait(database.occupancy()).unwrap().is_empty());
+    let released = (wake.dirty_generation(), wake.capacity_generation());
+    wait(database.recover_storage()).unwrap();
+    assert!(wake.dirty_generation() > released.0 && wake.capacity_generation() > released.1);
+    worker.shutdown().unwrap();
+}
+
+#[test]
+fn duplicate_racing_claims_yield_one_known_committed_grant() {
+    let (_root, directory) = data_directory("ocg-stage-b-worker", "race");
+    let worker = DatabaseWorker::start(&directory).unwrap();
+    let database = worker.handle();
+    let (pool, llm) = provision(&database);
+    let job = pending(&database, llm);
+    let (entered, release) = database.group_probe().hold_next_group();
+    let mut first = std::pin::pin!(database.claim_execution(ClaimRequest {
+        job,
+        allowed_pools: BTreeSet::from([pool])
+    }));
+    assert!(poll_once(first.as_mut()).is_none());
+    entered.recv_timeout(WAIT).unwrap();
+    let mut second = std::pin::pin!(database.claim_execution(ClaimRequest {
+        job,
+        allowed_pools: BTreeSet::from([pool])
+    }));
+    assert!(poll_once(second.as_mut()).is_none());
+    release.send(()).unwrap();
+    assert!(wait(first).unwrap().is_ok());
+    assert_eq!(wait(second).unwrap(), Err(ClaimRefusal::NotPending));
+    assert_eq!(wait(database.occupancy()).unwrap(), vec![(pool, job)]);
+    worker.shutdown().unwrap();
+}
+
+#[test]
+fn uncertain_claim_flush_never_grants_and_marker_resolution_releases_committed_claim() {
+    let (_root, directory) = data_directory("ocg-stage-b-worker", "uncertain");
+    let mut worker = DatabaseWorker::start(&directory).unwrap();
+    let wake = worker.take_scheduler_wake().unwrap();
+    let database = worker.handle();
+    let (pool, llm) = provision(&database);
+    let job = pending(&database, llm);
+    let before = (wake.dirty_generation(), wake.capacity_generation());
+    let probe = database.group_probe();
+    let (entered, release) = probe.hold_next_group();
+    let mut claim = std::pin::pin!(database.claim_execution(ClaimRequest {
+        job,
+        allowed_pools: BTreeSet::from([pool])
+    }));
+    assert!(poll_once(claim.as_mut()).is_none());
+    entered.recv_timeout(WAIT).unwrap();
+    let mut extra = std::pin::pin!(database.create_project(NewProject {
+        name: "flush group".into(),
+        description: None
+    }));
+    assert!(poll_once(extra.as_mut()).is_none());
+    probe.fail_next_flush.store(true, Ordering::SeqCst);
+    release.send(()).unwrap();
+    let operation = match wait(claim) {
+        Err(DatabaseError::OutcomeUnknown { operation, .. }) => operation,
+        result => panic!("claim must be unknown, got {result:?}"),
+    };
+    assert!(matches!(
+        wait(extra),
+        Err(DatabaseError::OutcomeUnknown { .. })
+    ));
+    assert_eq!(
+        (wake.dirty_generation(), wake.capacity_generation()),
+        before
+    );
+    wait(database.recover_storage()).unwrap();
+    assert!(wake.dirty_generation() > before.0 && wake.capacity_generation() > before.1);
+    let marker = wait(database.reconcile_operation(operation)).unwrap();
+    wait(database.reconcile_unexecuted_claim(job, operation)).unwrap();
+    assert!(wait(database.occupancy()).unwrap().is_empty());
+    let row = wait(database.job(job)).unwrap().unwrap();
+    match marker {
+        OperationStatus::Committed(_) => {
+            assert!(row.unknown_at.is_some() && row.stop_confirmed_at.is_some())
+        }
+        OperationStatus::NotCommitted => assert!(row.started_at.is_none()),
+        status => panic!("recovery must resolve operation, got {status:?}"),
+    }
+    worker.shutdown().unwrap();
+}
+
+#[test]
+fn process_reopen_settles_unspawned_claim_without_rerunning() {
+    let (_root, directory) = data_directory("ocg-stage-b-worker", "restart");
+    let worker = DatabaseWorker::start(&directory).unwrap();
+    let database = worker.handle();
+    let (pool, llm) = provision(&database);
+    let job = pending(&database, llm);
+    wait(database.claim_execution(ClaimRequest {
+        job,
+        allowed_pools: BTreeSet::from([pool]),
+    }))
+    .unwrap()
+    .unwrap();
+    let binding = wait(database.frozen_pool_binding(job)).unwrap();
+    worker.shutdown().unwrap();
+    let worker = DatabaseWorker::start(&directory).unwrap();
+    let database = worker.handle();
+    assert!(database.abandoned_at_open().contains(&job));
+    assert_eq!(wait(database.frozen_pool_binding(job)).unwrap(), binding);
+    assert!(wait(database.occupancy()).unwrap().is_empty());
+    let row = wait(database.job(job)).unwrap().unwrap();
+    assert!(row.unknown_at.is_some() && row.stop_confirmed_at.is_some());
+    assert_eq!(
+        wait(database.claim_execution(ClaimRequest {
+            job,
+            allowed_pools: BTreeSet::from([pool])
+        }))
+        .unwrap(),
+        Err(ClaimRefusal::NotPending)
+    );
+    worker.shutdown().unwrap();
+}

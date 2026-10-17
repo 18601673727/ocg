@@ -69,6 +69,16 @@ pub(super) struct Envelope {
 }
 
 pub(super) enum Command {
+    ClaimExecution {
+        request: ClaimRequest,
+        reply: Reply<Result<ClaimGrant, ClaimRefusal>>,
+    },
+    #[allow(dead_code, reason = "M2 keeps Scheduler dispatch dormant")]
+    ReconcileUnexecutedClaim {
+        job: JobId,
+        claim: OperationId,
+        reply: Reply<()>,
+    },
     CreateExecutionPool {
         pool: NewExecutionPool,
         reply: Reply<ExecutionPoolId>,
@@ -233,6 +243,64 @@ impl Command {
     ) -> Executed {
         use OperationKind as Kind;
         match self {
+            Self::ClaimExecution { request, reply } => {
+                let job = request.job;
+                let mut refusal = ClaimRefusal::RecipeInvalid;
+                let outcome = storage::run_batch_declinable(
+                    database,
+                    operation,
+                    Kind::ClaimExecution,
+                    commit,
+                    |batch| match batch.claim_execution(request, operation.epoch())? {
+                        Ok(grant) => Ok(Some((
+                            grant,
+                            MarkerSubjects::addressed(persistence::RecordRef::Job(job)),
+                        ))),
+                        Err(reason) => {
+                            refusal = reason;
+                            Ok(None)
+                        }
+                    },
+                );
+                let declined = matches!(outcome.result, Ok(None));
+                let outcome = storage::BatchOutcome {
+                    result: outcome.result.map(|grant| match grant {
+                        Some(grant) => Ok(grant),
+                        None => Err(refusal),
+                    }),
+                    storage_failure: outcome.storage_failure,
+                };
+                settle(
+                    operation,
+                    commit,
+                    Kind::ClaimExecution,
+                    reply,
+                    outcome,
+                    declined,
+                )
+            }
+            Self::ReconcileUnexecutedClaim { job, claim, reply } => {
+                let outcome = storage::run_batch_declinable(
+                    database,
+                    operation,
+                    Kind::ReconcileAbandonedJob,
+                    commit,
+                    |batch| batch.reconcile_unexecuted_claim(job, claim),
+                );
+                let declined = matches!(outcome.result, Ok(None));
+                let outcome = storage::BatchOutcome {
+                    result: outcome.result.map(|_| ()),
+                    storage_failure: outcome.storage_failure,
+                };
+                settle(
+                    operation,
+                    commit,
+                    Kind::ReconcileAbandonedJob,
+                    reply,
+                    outcome,
+                    declined,
+                )
+            }
             Self::CreateExecutionPool { pool, reply } => run(
                 database,
                 operation,
@@ -547,6 +615,10 @@ impl Command {
     /// rather than wraps, so an absurd payload fails the space check.
     pub(super) fn expected_write_bytes(&self) -> u64 {
         let payload = match self {
+            Self::ClaimExecution { request, .. } => {
+                byte_count(request.allowed_pools.len()).saturating_mul(8)
+            }
+            Self::ReconcileUnexecutedClaim { .. } => 0,
             Self::CreateExecutionPool { pool, .. } => byte_count(pool.name.len()),
             Self::SetExecutionPoolEnabled { .. } | Self::SetExecutionPoolProfile { .. } => 0,
             Self::BeginCoreLogCleanup { started, .. } => {
@@ -639,6 +711,8 @@ impl Command {
     /// waiting and knows nothing was applied.
     pub(super) fn refuse(self, error: impl Fn() -> DatabaseError) {
         match self {
+            Self::ClaimExecution { reply, .. } => refuse(reply, error),
+            Self::ReconcileUnexecutedClaim { reply, .. } => refuse(reply, error),
             Self::CreateExecutionPool { reply, .. } => refuse(reply, error),
             Self::SetExecutionPoolEnabled { reply, .. }
             | Self::SetExecutionPoolProfile { reply, .. } => refuse(reply, error),

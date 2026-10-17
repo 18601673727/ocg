@@ -17,6 +17,7 @@ pub(super) struct Executed {
     /// Its changes are in a staged commit that is not durable yet.
     staged: bool,
     scheduling_dirty: bool,
+    capacity_released: bool,
     answer: Answer,
     /// The storage failure that must release this opening of the database.
     failure: Option<StorageFailure>,
@@ -59,6 +60,7 @@ pub(super) fn settle<T: Send + 'static>(
     let outcome_unknown = matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
     let staged = commit == Commit::Staged && result.is_ok() && !declined;
     let scheduling_dirty = result.is_ok() && !declined && affects_scheduling(kind);
+    let capacity_released = result.is_ok() && !declined && releases_capacity(kind);
     let answer: Answer = Box::new(move |lost| {
         let result = match (result, lost) {
             (Ok(_), Some(error)) if declined => Err(DatabaseError::RolledBack(error.clone())),
@@ -79,6 +81,7 @@ pub(super) fn settle<T: Send + 'static>(
         operation,
         staged,
         scheduling_dirty,
+        capacity_released,
         answer,
         failure: outcome.storage_failure.map(|error| StorageFailure {
             error,
@@ -255,7 +258,7 @@ impl DatabaseWorker {
                 };
                 worker.check_all_paths();
                 if !worker.shared.abandoned_at_open.is_empty() {
-                    worker.publish_scheduling_change();
+                    worker.publish_scheduling_change(true, true);
                 }
                 if ready_sender.send(Ok(shared)).is_ok() {
                     worker.serve();
@@ -909,13 +912,16 @@ impl WriteWorker {
         let scheduling_dirty = failure.is_none()
             && lost.is_none()
             && executed.iter().any(|(ran, _)| ran.scheduling_dirty);
+        let capacity_released = failure.is_none()
+            && lost.is_none()
+            && executed.iter().any(|(ran, _)| ran.capacity_released);
         let lock = failure.map(|failure| {
             self.storage_failure = Some(failure.error.clone());
             self.activate(vec![ProtectionReason::StorageUnavailable(failure.error)])
         });
         drop(staging);
-        if scheduling_dirty {
-            self.publish_scheduling_change();
+        if scheduling_dirty || capacity_released {
+            self.publish_scheduling_change(scheduling_dirty, capacity_released);
         }
         for (ran, _) in executed {
             (ran.answer)(lost.as_ref());
@@ -933,7 +939,7 @@ impl WriteWorker {
         }
     }
 
-    fn publish_scheduling_change(&self) {
+    fn publish_scheduling_change(&self, dirty: bool, capacity: bool) {
         // Shutdown drains accepted writes too. A known durable commit may
         // still dirty the generation then, but protected storage must recover
         // before a notification can advertise its state as readable again.
@@ -941,7 +947,7 @@ impl WriteWorker {
             && !self.shared.released.load(Ordering::SeqCst)
             && self.shared.protection.status().lock.is_none()
         {
-            self.shared.scheduler_wake.notify_dirty();
+            self.shared.scheduler_wake.publish(dirty, capacity);
         }
     }
 
@@ -1149,7 +1155,10 @@ impl WriteWorker {
     /// stays unless every step succeeds.
     pub(super) fn recover(&mut self) -> Result<RecoveryReport, RecoveryError> {
         match self.shared.admission() {
-            Admission::Open => return Ok(RecoveryReport::default()),
+            Admission::Open => {
+                self.publish_scheduling_change(true, true);
+                return Ok(RecoveryReport::default());
+            }
             Admission::Protected(_) => {}
             Admission::ShuttingDown => return Err(RecoveryError::ShuttingDown),
             Admission::WorkerStopped => return Err(RecoveryError::WorkerStopped),
@@ -1180,7 +1189,7 @@ impl WriteWorker {
                 .protection
                 .update(|status| status.recovering = false);
         } else {
-            self.publish_scheduling_change();
+            self.publish_scheduling_change(true, true);
         }
         result
     }

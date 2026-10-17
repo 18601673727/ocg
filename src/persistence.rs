@@ -19,6 +19,7 @@ mod identity;
 mod mutations;
 mod operations;
 mod records;
+mod scheduling;
 mod tool_evidence;
 
 pub(crate) use availability::RequestEvidence;
@@ -67,6 +68,7 @@ pub use records::{
     ProjectRecord, ProviderSnapshot, RequestFingerprint, SubmissionKey, SubmissionRecord,
     SubmittedConfiguration, WrongProfileKind,
 };
+pub use scheduling::*;
 pub use tool_evidence::{
     AuthorizationBasis, EffectConclusion, MAX_HANDLER_VERSION_BYTES,
     MAX_STORED_TOOL_ARGUMENTS_BYTES, MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES,

@@ -455,6 +455,7 @@ impl Batch {
             return self.corrupted(format!("{} changed its creation time", row.id));
         }
         self.overwrite(JOBS, row.id.get(), row.encode())?;
+        self.index_occupancy(row)?;
         self.index_pending(row)
     }
 
@@ -816,7 +817,11 @@ impl Batch {
             Ok(())
         })?;
         self.overwrite(PROFILES, profile, row.encode())?;
-        self.write_profile_links(row, links)
+        self.write_profile_links(row, links)?;
+        if row.config.kind() == ProfileKind::ExecutionPool {
+            self.refresh_pool_compatibility()?;
+        }
+        Ok(())
     }
 
     pub(super) fn write_profile_links(

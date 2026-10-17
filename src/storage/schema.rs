@@ -204,3 +204,10 @@ pub(super) const TOOL_CALL_IDS: TableDefinition<(u64, &str), (u32, u32)> =
 /// rebuildable: it is the only record of which key created which Job.
 pub(super) const SUBMISSIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("control_submission");
+
+// Binding is authoritative; these projections are always rebuilt on opening.
+pub(super) const FROZEN_POOL_BINDINGS: Records = TableDefinition::new("frozen_pool_binding");
+pub(super) const ASSIGNED_POOL: Link = TableDefinition::new("assigned_pool");
+pub(super) const OCCUPANCY: PairSet = TableDefinition::new("occupancy");
+pub(super) const COMPATIBLE_POOLS: TableDefinition<(u8, u8), &[u8]> =
+    TableDefinition::new("compatible_pool_projection");

@@ -391,6 +391,67 @@ impl DatabaseHandle {
             .await
     }
 
+    pub async fn pending_capture_page(
+        &self,
+        after: Option<persistence::PendingJobKey>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Result<PendingCapturePage, PendingReadFault>, DatabaseError> {
+        self.read(move |database| storage::read_pending_capture_page(database, after, limit))
+            .await
+    }
+
+    pub async fn pending_keys(
+        &self,
+        after: Option<persistence::PendingJobKey>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Result<PendingCapturePage, PendingReadFault>, DatabaseError> {
+        self.read(move |database| storage::read_pending_keys(database, after, limit))
+            .await
+    }
+
+    pub async fn pending_snapshot(
+        &self,
+        budget: std::num::NonZeroUsize,
+    ) -> Result<Result<PendingSnapshot, PendingReadFault>, DatabaseError> {
+        self.read(move |database| storage::read_pending_snapshot(database, budget))
+            .await
+    }
+
+    pub async fn evaluate_pending(&self, request: EvalRequest) -> Result<EvalPage, DatabaseError> {
+        self.read(move |database| storage::evaluate_pending(database, request))
+            .await
+    }
+
+    pub async fn claim_execution(
+        &self,
+        request: ClaimRequest,
+    ) -> Result<Result<ClaimGrant, ClaimRefusal>, DatabaseError> {
+        self.submit(|reply| Command::ClaimExecution { request, reply })
+            .await
+    }
+
+    #[allow(dead_code, reason = "M2 keeps Scheduler dispatch dormant")]
+    pub(crate) async fn reconcile_unexecuted_claim(
+        &self,
+        job: JobId,
+        claim: OperationId,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::ReconcileUnexecutedClaim { job, claim, reply })
+            .await
+    }
+
+    pub async fn frozen_pool_binding(
+        &self,
+        job: JobId,
+    ) -> Result<Option<FrozenPoolBinding>, DatabaseError> {
+        self.read(move |database| storage::read_pool_binding(database, job))
+            .await
+    }
+
+    pub async fn occupancy(&self) -> Result<Vec<(ExecutionPoolId, JobId)>, DatabaseError> {
+        self.read(storage::read_occupancy).await
+    }
+
     /// A Job's ordinary children in ID order, strictly after `after` when
     /// given; at most 1,000 per call. The Genesis Job is not its own child.
     pub async fn children(

@@ -170,6 +170,8 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId), OpenError>
         // Rebuilt even in a new file, which has no table yet, and whatever the
         // table held: only this build maintains it.
         rebuild_pending_jobs(&tx, genesis)?;
+        execution_claim::rebuild_execution_indexes(&tx)?;
+        pools::rebuild_compatibility(&tx)?;
         let mut sequences = tx.open_table(SEQUENCES).map_err(StorageError::from)?;
         let epoch = sequences
             .get(OPEN_EPOCH)
@@ -221,6 +223,7 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
         JOB_OUTPUTS,
         EXECUTORS,
         EXECUTION_POOLS,
+        FROZEN_POOL_BINDINGS,
         PROJECTS,
         PROFILES,
         AGENTS,
@@ -270,6 +273,9 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     for table in [METRICS_BY_SCOPE, AVAILABILITY_BY_SCOPE] {
         tx.open_table(table)?;
     }
+    tx.open_table(ASSIGNED_POOL)?;
+    tx.open_table(OCCUPANCY)?;
+    tx.open_table(COMPATIBLE_POOLS)?;
     tx.open_table(AVAILABILITY_SAMPLES)?;
     tx.open_table(AVAILABILITY_MINUTES)?;
     tx.open_table(AGGREGATION_PROGRESS)?;

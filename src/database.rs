@@ -32,6 +32,10 @@ use crate::persistence::{
     ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation,
     WrongProfileKind,
 };
+use crate::persistence::{
+    ClaimGrant, ClaimRefusal, ClaimRequest, EvalPage, EvalRequest, FrozenPoolBinding,
+    PendingCapturePage, PendingReadFault, PendingSnapshot,
+};
 use crate::storage::{
     self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile,
 };
@@ -95,6 +99,8 @@ mod errors;
 mod handle;
 mod scheduler_wake;
 mod shared;
+#[cfg(test)]
+mod stage_b_tests;
 mod worker;
 #[cfg(test)]
 use commands::{ByteCounter, counted_json_bytes, json_bytes};
@@ -105,7 +111,7 @@ pub use errors::{
     DatabaseStatus, MaintenanceError, OperationStatus, TokenConsumeError, UnknownCause,
 };
 pub use scheduler_wake::SchedulerWakeSubscription;
-use scheduler_wake::{SchedulerWake, affects_scheduling};
+use scheduler_wake::{SchedulerWake, affects_scheduling, releases_capacity};
 pub(crate) use shared::AggregationClaim;
 #[cfg(test)]
 pub(crate) use shared::GroupProbe;

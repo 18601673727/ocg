@@ -74,16 +74,29 @@ mod availability_aggregation;
 mod batch;
 mod batch_links;
 mod codec;
+mod evaluation;
+mod execution_claim;
 #[cfg(test)]
 mod integrity;
 mod observations;
 mod open;
+mod pending;
 mod pools;
+use crate::persistence::{
+    Block, CapacityScope, ClaimGrant, ClaimRefusal, ClaimRequest, EvalContinuation, EvalPage,
+    EvalRequest, FrozenPoolBinding, GLOBAL_EXECUTION_LIMIT, PendingCapturePage, PendingFence,
+    PendingIndexFault, PendingReadFault, PendingSnapshot, Readiness, Why,
+};
+pub(crate) use evaluation::evaluate_pending;
+pub(crate) use execution_claim::{read_occupancy, read_pool_binding};
+pub(crate) use pending::{read_pending_capture_page, read_pending_keys, read_pending_snapshot};
 mod reads;
 pub(crate) use pools::{read_execution_pool, read_execution_pools};
 mod rows;
 mod schema;
 mod sequences;
+#[cfg(test)]
+mod stage_b_tests;
 mod token_aggregation;
 mod waiting;
 pub(crate) use availability_aggregation::{

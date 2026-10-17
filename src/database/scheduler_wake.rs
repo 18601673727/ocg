@@ -2,35 +2,48 @@ use super::*;
 
 pub(super) struct SchedulerWake {
     dirty_gen: Arc<AtomicU64>,
+    capacity_gen: Arc<AtomicU64>,
     permit_tx: flume::Sender<()>,
 }
 
 pub struct SchedulerWakeSubscription {
     dirty_gen: Arc<AtomicU64>,
+    capacity_gen: Arc<AtomicU64>,
     permit_rx: flume::Receiver<()>,
 }
 
 impl SchedulerWake {
     pub(super) fn new() -> (Self, SchedulerWakeSubscription) {
         let dirty_gen = Arc::new(AtomicU64::new(0));
+        let capacity_gen = Arc::new(AtomicU64::new(0));
         let (permit_tx, permit_rx) = flume::bounded(1);
         (
             Self {
                 dirty_gen: dirty_gen.clone(),
+                capacity_gen: capacity_gen.clone(),
                 permit_tx,
             },
             SchedulerWakeSubscription {
                 dirty_gen,
+                capacity_gen,
                 permit_rx,
             },
         )
     }
 
-    pub(super) fn notify_dirty(&self) {
+    pub(super) fn publish(&self, dirty: bool, capacity: bool) {
         // The generation must advance even when a permit already exists or
         // the consumer has gone. SeqCst gives generation snapshots one order
         // across a scan; database visibility still comes from its read locks.
-        self.dirty_gen.fetch_add(1, Ordering::SeqCst);
+        if dirty {
+            self.dirty_gen.fetch_add(1, Ordering::SeqCst);
+        }
+        if capacity {
+            self.capacity_gen.fetch_add(1, Ordering::SeqCst);
+        }
+        if !dirty && !capacity {
+            return;
+        }
         match self.permit_tx.try_send(()) {
             Ok(()) | Err(flume::TrySendError::Full(())) => {}
             Err(flume::TrySendError::Disconnected(())) => {}
@@ -39,6 +52,9 @@ impl SchedulerWake {
 }
 
 impl SchedulerWakeSubscription {
+    pub fn capacity_generation(&self) -> u64 {
+        self.capacity_gen.load(Ordering::SeqCst)
+    }
     pub fn dirty_generation(&self) -> u64 {
         self.dirty_gen.load(Ordering::SeqCst)
     }
@@ -81,7 +97,8 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         // Tool effects gate confirmed finalization and repeatable retries.
         | OperationKind::RecordToolOutcome
         | OperationKind::ReconcileToolEffect => true,
-        OperationKind::SaveJobInput
+        OperationKind::ClaimExecution
+        | OperationKind::SaveJobInput
         | OperationKind::AssociateJobProject
         | OperationKind::CreateProject
         | OperationKind::AppendJobOutput
@@ -91,6 +108,42 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::ConsumeTokenUsage
         // Decisions only add evidence while the owning Job executes locally;
         // outcome/finalization/stop changes announce subsequent eligibility.
+        | OperationKind::RecordToolDecision
+        | OperationKind::CreateAttachment
+        | OperationKind::CleanupAttachment => false,
+    }
+}
+
+pub(super) fn releases_capacity(kind: OperationKind) -> bool {
+    match kind {
+        OperationKind::FinalizeJob
+        | OperationKind::ConfirmJobStopped
+        | OperationKind::ReconcileAbandonedJob
+        | OperationKind::CreateExecutionPool
+        | OperationKind::SetExecutionPoolEnabled
+        | OperationKind::SetExecutionPoolProfile
+        | OperationKind::UpdateProfile => true,
+        OperationKind::ClaimExecution
+        | OperationKind::SaveJobInput
+        | OperationKind::CreateJobWithInput
+        | OperationKind::RetryJob
+        | OperationKind::AssignJobExecutor
+        | OperationKind::StartJob
+        | OperationKind::StartLocalJob
+        | OperationKind::BeginCoreLogCleanup
+        | OperationKind::CreateExecutor
+        | OperationKind::CreateLlmProvider
+        | OperationKind::CreateProfile
+        | OperationKind::CreateAgent
+        | OperationKind::RecordToolOutcome
+        | OperationKind::ReconcileToolEffect
+        | OperationKind::AssociateJobProject
+        | OperationKind::CreateProject
+        | OperationKind::AppendJobOutput
+        | OperationKind::RecordMetrics
+        | OperationKind::RecordAvailabilityStat
+        | OperationKind::ConsumeAvailability
+        | OperationKind::ConsumeTokenUsage
         | OperationKind::RecordToolDecision
         | OperationKind::CreateAttachment
         | OperationKind::CleanupAttachment => false,

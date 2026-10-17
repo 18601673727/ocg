@@ -25,6 +25,7 @@ pub(super) const TAG_TOOL_EVIDENCE: u8 = 20;
 pub(super) const TAG_ATTACHMENT: u8 = 21;
 pub(super) const TAG_SUBMISSION: u8 = 22;
 pub(super) const TAG_EXECUTION_POOL: u8 = 23;
+pub(super) const TAG_POOL_BINDING: u8 = 24;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 
@@ -450,6 +451,7 @@ codes!(OperationKind {
     OperationKind::CleanupAttachment = 31,
     OperationKind::CreateExecutionPool = 32, OperationKind::SetExecutionPoolEnabled = 33,
     OperationKind::SetExecutionPoolProfile = 34,
+    OperationKind::ClaimExecution = 35,
 });
 codes!(ToolCallRefusal {
     ToolCallRefusal::Malformed = 1, ToolCallRefusal::ConflictingIdentity = 2, ToolCallRefusal::AmbiguousIdentity = 3,
