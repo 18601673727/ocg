@@ -1,0 +1,546 @@
+import {
+  ContractError,
+  decodeAdmission,
+  decodeAgentProfiles,
+  decodeAttachment,
+  decodeControlError,
+  decodeHealth,
+  decodeJob,
+  decodeJobConversation,
+  decodeJobInput,
+  decodeJobEvent,
+  decodeOutputsPage,
+  decodeProfiles,
+  decodeSession,
+  decodeStop,
+  type ControlAttachment,
+  type ControlCapability,
+  type ControlJobEvent,
+} from "../contracts";
+import { SseParser } from "./sse";
+
+export type JobStreamEvent = ControlJobEvent | { type: "heartbeat"; };
+export type JobStreamEnd = "settled" | "stream_error" | "aborted";
+export type JobStreamSubscription = { closed: Promise<JobStreamEnd>; close(): void; };
+
+export class ControlTransportError extends Error {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+    readonly retryable: boolean,
+    readonly detail: string = "",
+  ) {
+    // Do not echo fetch errors, request URLs, credentials or untrusted bodies.
+    super(`OCG event transport: ${code} (${status})`);
+    this.name = "ControlTransportError";
+  }
+}
+
+export type HttpCanonicalControlClientOptions = {
+  baseUrl: string;
+  fetch: typeof fetch;
+  // Programmatic mode: supplied by an already authorized caller; no
+  // acquisition or storage here.
+  bearerToken?: () => string | Promise<string>;
+  // Browser-session mode: the session cookie authenticates every request,
+  // and the session's CSRF token, from the session route, signs the
+  // state-changing ones. Never the bearer token.
+  csrfToken?: () => string | Promise<string>;
+};
+
+export type ControlSubmission = {
+  // An Agent Profile that targets `llm_profile`; its instructions are frozen with the Job.
+  agent_profile?: string;
+  llm_profile: string;
+  executor: string;
+  objective: string;
+  name?: string;
+  // A completed predecessor Job whose conversation history precedes this turn.
+  previous?: string;
+  // Image Attachments to send with the objective.
+  attachments?: string[];
+};
+
+export type ControlProfileWriteRequest =
+  | {
+      kind: "llm";
+      name: string;
+      model: string;
+      protocol?: "openai_chat_completions";
+      endpoint?: string | null;
+      credential_ref?: string | null;
+      credential?: string | null;
+      clear_credential?: boolean;
+      declared_capabilities: ControlCapability[];
+      parameters?: {
+        temperature?: number | null;
+        top_p?: number | null;
+        max_tokens?: number | null;
+        presence_penalty?: number | null;
+        frequency_penalty?: number | null;
+      };
+    }
+  | {
+      kind: "agent";
+      name: string;
+      instructions?: string | null;
+      llm_targets: string[];
+    };
+
+export type ControlSubmissionResult = {
+  status: "admitted" | "pending";
+  job: string | null;
+  // Whether this request created the Job, rather than replay its key.
+  created: boolean;
+};
+
+function controlOrigin(raw: string): string {
+  const url = new URL(raw);
+  if (url.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(url.hostname) ||
+    !url.port || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+    throw new ControlTransportError("invalid_control_origin", 0, false);
+  }
+  if (typeof window !== "undefined" && window.location.origin !== url.origin) {
+    throw new ControlTransportError("same_origin_required", 0, false);
+  }
+  return url.origin;
+}
+
+function sequence(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new ContractError("after_seq", "a non-negative safe integer");
+  return value;
+}
+
+function jobIdentity(value: string): string {
+  if (!/^job:(0|[1-9][0-9]*)$/.test(value)) throw new ContractError("job", "a canonical Job identity");
+  return value;
+}
+
+function identity(value: string, path: string, prefix: string): string {
+  const number = value.slice(prefix.length);
+  if (!value.startsWith(prefix) || !/^(0|[1-9][0-9]*)$/.test(number)) {
+    throw new ContractError(path, `a canonical ${prefix.slice(0, -1)} identity`);
+  }
+  return value;
+}
+
+function submissionKey(value: string): string {
+  if (!/^[A-Za-z0-9._~:+/=-]{16,128}$/.test(value)) {
+    throw new ContractError("Idempotency-Key", "a well-formed idempotency key");
+  }
+  return value;
+}
+
+function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) { resolve(); return; }
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    signal.addEventListener("abort", finish, { once: true });
+  });
+}
+
+export type HttpCanonicalControlClient = ReturnType<typeof createHttpCanonicalControlClient>;
+
+// Retains the 0.4.5 canonical client's injected-fetch boundary and contracts
+// entrypoint. None of its legacy lifecycle, chat or fixture stores are needed.
+export function createHttpCanonicalControlClient(options: HttpCanonicalControlClientOptions) {
+  const base = controlOrigin(options.baseUrl);
+  const fetchImpl = options.fetch.bind(globalThis);
+  const programmatic = options.bearerToken !== undefined;
+  // Delivery acknowledgements only; output history and Job state live on server.
+  const cursors = new Map<string, number>();
+  const active = new Map<string, AbortController>();
+  let closed = false;
+
+  // The one credential this client sends: the bearer token of its caller,
+  // or nothing at all where the browser's own session cookie applies.
+  async function credentials(): Promise<Record<string, string>> {
+    if (!options.bearerToken) return {};
+    const token = await options.bearerToken();
+    if (!/^[A-Za-z0-9._~+/=-]{32,512}$/.test(token)) {
+      throw new ControlTransportError("credential_unavailable", 0, false);
+    }
+    return { Authorization: `Bearer ${token}` };
+  }
+
+  function retryable(status: number, code: string): boolean {
+    return status === 503 &&
+      ["too_many_streams", "database_busy", "database_unavailable", "shutting_down"].includes(code);
+  }
+
+  async function connection(
+    jobId: string,
+    signal: AbortSignal,
+    listener: (event: JobStreamEvent) => void | Promise<void>,
+  ): Promise<Exclude<JobStreamEnd, "aborted"> | null> {
+    const headers: Record<string, string> = {
+      Accept: "text/event-stream",
+      ...await credentials(),
+    };
+    const cursor = cursors.get(jobId);
+    if (cursor !== undefined) headers["Last-Event-ID"] = String(cursor);
+    let response: Response;
+    try {
+      // The route requires the canonical literal job:<n>; it does not decode %3A.
+      response = await fetchImpl(`${base}/api/v1/jobs/${jobId}/events`, {
+        method: "GET", headers, signal,
+        mode: "same-origin", credentials: programmatic ? "omit" : "same-origin",
+        cache: "no-store", redirect: "error",
+      });
+    } catch {
+      throw new ControlTransportError("connection_lost", 0, true);
+    }
+    if (!response.ok) {
+      let code = "http_error";
+      try { code = decodeControlError(await response.json()).code; }
+      catch { /* An unrecognized body still retains its HTTP status. */ }
+      throw new ControlTransportError(code, response.status,
+        retryable(response.status, code));
+    }
+    const mediaType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
+    if (mediaType !== "text/event-stream" || !response.body) {
+      await response.body?.cancel();
+      throw new ControlTransportError("invalid_event_stream", response.status, false);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const parser = new SseParser();
+    try {
+      for (; ;) {
+        let chunk: ReadableStreamReadResult<Uint8Array>;
+        try { chunk = await reader.read(); }
+        catch { throw new ControlTransportError("connection_lost", 0, true); }
+        signal.throwIfAborted();
+        // Discard an incomplete frame or UTF-8 tail at EOF. Neither was
+        // acknowledged; the stored cursor will replay the entire output.
+        if (chunk.done) return null;
+        for (const frame of parser.push(decoder.decode(chunk.value, { stream: true }))) {
+          signal.throwIfAborted();
+          if ("comment" in frame) {
+            if (frame.comment === "heartbeat") await listener({ type: "heartbeat" });
+            continue;
+          }
+          let input: unknown;
+          try { input = JSON.parse(frame.data); }
+          catch { throw new ContractError("data", "a complete JSON event"); }
+          const event = decodeJobEvent(frame.event, input, jobId, frame.id);
+          if (event.type === "output") {
+            const acknowledged = event.output.seq;
+            const previous = cursors.get(jobId) ?? 0;
+            if (acknowledged <= previous) continue;
+            if (acknowledged !== previous + 1) throw new ContractError("output.seq", "the next stored sequence without a gap");
+            await listener(event);
+            // A rejected listener never acknowledges an unprocessed output.
+            cursors.set(jobId, acknowledged);
+          } else {
+            await listener(event);
+          }
+          if (event.type === "settlement") return "settled";
+          if (event.type === "stream_error") return "stream_error";
+        }
+      }
+    } finally {
+      try { await reader.cancel(); }
+      catch { /* The read failure is reported above; cleanup cannot replace it. */ }
+      reader.releaseLock();
+    }
+  }
+
+  // One JSON request to one route of this API: no open proxy, no other
+  // upstream, and every answer checked against its contract.
+  async function send(
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    settings: {
+      body?: unknown;
+      // The request's own `Idempotency-Key`, where a route names one.
+      key?: string;
+      // Whether the request changes state and so carries the session's
+      // CSRF token in browser mode.
+      sign?: boolean;
+      signal?: AbortSignal;
+    },
+  ): Promise<{ status: number; input: unknown }> {
+    const headers: Record<string, string> = { ...await credentials() };
+    if (settings.body !== undefined) headers["Content-Type"] = "application/json";
+    if (settings.key !== undefined) headers["Idempotency-Key"] = settings.key;
+    if (settings.sign) {
+      const csrf = await options.csrfToken?.();
+      if (!csrf) throw new ControlTransportError("credential_unavailable", 0, false);
+      headers["X-OCG-CSRF"] = csrf;
+    }
+    let response: Response;
+    try {
+      response = await fetchImpl(`${base}${path}`, {
+        method, headers, signal: settings.signal,
+        ...(settings.body === undefined ? {} : { body: JSON.stringify(settings.body) }),
+        mode: "same-origin", credentials: programmatic ? "omit" : "same-origin",
+        cache: "no-store", redirect: "error",
+      });
+    } catch {
+      throw new ControlTransportError("connection_lost", 0, true);
+    }
+    if (!response.ok) {
+      let code = "http_error";
+      let detail = "";
+      try {
+        const decoded = decodeControlError(await response.json());
+        code = decoded.code;
+        detail = decoded.message;
+      } catch { /* An unrecognized body still retains its HTTP status. */ }
+      throw new ControlTransportError(code, response.status, retryable(response.status, code), detail);
+    }
+    let input: unknown;
+    try { input = await response.json(); }
+    catch { throw new ContractError("response", "a complete JSON answer"); }
+    return { status: response.status, input };
+  }
+
+  return {
+    lastOutputSequence(jobId: string): number | undefined { return cursors.get(jobId); },
+
+    /** What the host establishes about itself and its database, now. */
+    async readHealth(signal?: AbortSignal) {
+      return decodeHealth((await send("GET", "/api/v1/health", { signal })).input);
+    },
+
+    /** The Job's persisted lifecycle record. */
+    async readJob(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      return decodeJob((await send("GET", `/api/v1/jobs/${job}`, { signal })).input);
+    },
+
+    /** The Job's frozen input: its objective as text, never inferred from its identity. */
+    async readJobInput(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      return decodeJobInput((await send("GET", `/api/v1/jobs/${job}/input`, { signal })).input, job);
+    },
+
+    /** The bounded conversation ending at `job`, reconstructed from persisted Job `previous` links. */
+    async readJobConversation(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      return decodeJobConversation((await send("GET", `/api/v1/jobs/${job}/conversation`, { signal })).input, job);
+    },
+
+    /** One page of Agent Profiles with their LLM targets and the Executors that can run each. */
+    async readAgentProfiles(
+      settings: { before?: string; limit?: number; signal?: AbortSignal } = {},
+    ) {
+      const query: string[] = [];
+      if (settings.before !== undefined) query.push(`before=${identity(settings.before, "before", "profile:")}`);
+      if (settings.limit !== undefined) {
+        if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
+          throw new ContractError("limit", "an integer from 1 to 100");
+        }
+        query.push(`limit=${settings.limit}`);
+      }
+      const suffix = query.length ? `?${query.join("&")}` : "";
+      return decodeAgentProfiles((await send("GET", `/api/v1/agent-profiles${suffix}`, { signal: settings.signal })).input);
+    },
+
+    /** Full Profile catalog (LLM Profiles, Agent Profiles) and computed Provider projection. */
+    async readProfiles(signal?: AbortSignal) {
+      return decodeProfiles((await send("GET", "/api/v1/profiles", { signal })).input);
+    },
+
+    /** Creates an LLM Profile or Agent Profile. */
+    async createProfile(profile: ControlProfileWriteRequest, signal?: AbortSignal) {
+      const answer = await send("POST", "/api/v1/profiles", {
+        body: profile,
+        sign: true,
+        signal,
+      });
+      return decodeProfiles(answer.input);
+    },
+
+    /** Updates an existing LLM Profile or Agent Profile. */
+    async updateProfile(profileId: string, profile: ControlProfileWriteRequest, signal?: AbortSignal) {
+      identity(profileId, "profile", "profile:");
+      const answer = await send("POST", `/api/v1/profiles/${profileId}`, {
+        body: profile,
+        sign: true,
+        signal,
+      });
+      return decodeProfiles(answer.input);
+    },
+
+    /** One stored page of the Job's outputs, in `seq` order. */
+    async readOutputs(
+      job: string,
+      settings: { afterSeq?: number; limit?: number; signal?: AbortSignal } = {},
+    ) {
+      jobIdentity(job);
+      const query: string[] = [];
+      if (settings.afterSeq !== undefined) query.push(`after_seq=${sequence(settings.afterSeq)}`);
+      if (settings.limit !== undefined) {
+        if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
+          throw new ContractError("limit", "an integer from 1 to 100");
+        }
+        query.push(`limit=${settings.limit}`);
+      }
+      const suffix = query.length ? `?${query.join("&")}` : "";
+      const answer = await send("GET", `/api/v1/jobs/${job}/outputs${suffix}`, { signal: settings.signal });
+      return decodeOutputsPage(answer.input, job);
+    },
+
+    /**
+     * Submits one Job under the request's `key`. The key names at most one
+     * Job: a request that timed out or answered `pending` is never
+     * submitted under a second key; the same key is looked up or replayed.
+     */
+    async submitJob(submission: ControlSubmission, key: string, signal?: AbortSignal) {
+      if (submission.agent_profile !== undefined) identity(submission.agent_profile, "agent_profile", "profile:");
+      identity(submission.llm_profile, "llm_profile", "profile:");
+      identity(submission.executor, "executor", "executor:");
+      if (submission.previous !== undefined) jobIdentity(submission.previous);
+      if (submission.attachments !== undefined) {
+        for (const [index, att] of submission.attachments.entries()) {
+          identity(att, `attachments[${index}]`, "attachment:");
+        }
+      }
+      submissionKey(key);
+      const answer = await send("POST", "/api/v1/jobs", {
+        body: submission,
+        key,
+        sign: true,
+        signal,
+      });
+      const admission = decodeAdmission(answer.input);
+      if (admission.status !== "admitted" && admission.status !== "pending") {
+        throw new ContractError("admission.status", "admitted or pending from a submission");
+      }
+      return {
+        status: admission.status,
+        job: admission.job,
+        created: answer.status === 201,
+      } satisfies ControlSubmissionResult;
+    },
+
+    /** Uploads a PNG or JPEG image to the Attachment store. */
+    async uploadAttachment(
+      payload: { mime: "image/png" | "image/jpeg"; data_base64: string; display_name?: string },
+      signal?: AbortSignal,
+    ): Promise<ControlAttachment> {
+      const answer = await send("POST", "/api/v1/attachments", {
+        body: payload,
+        sign: true,
+        signal,
+      });
+      return decodeAttachment(answer.input);
+    },
+
+    /** Reads metadata of an image Attachment. */
+    async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<ControlAttachment> {
+      identity(attachmentId, "attachment", "attachment:");
+      const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, { signal });
+      return decodeAttachment(answer.input);
+    },
+
+    /** URL to fetch the raw image content of an Attachment. */
+    attachmentContentUrl(attachmentId: string): string {
+      identity(attachmentId, "attachment", "attachment:");
+      return `${base}/api/v1/attachments/${attachmentId}/content`;
+    },
+
+    /** What `key` created, however its submission ended. */
+    async readAdmission(key: string, signal?: AbortSignal) {
+      submissionKey(key);
+      const answer = await send("GET", "/api/v1/admissions", { key, signal });
+      return decodeAdmission(answer.input);
+    },
+
+    /** Requests the stop of one Job this listener admitted. */
+    async stopJob(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      const answer = await send("POST", `/api/v1/jobs/${job}/stop`, { sign: true, signal });
+      return decodeStop(answer.input, job);
+    },
+
+    /** Signs the browser in under this run's pairing code. */
+    async createSession(pairingCode: string, signal?: AbortSignal) {
+      const answer = await send("POST", "/api/v1/session", {
+        body: { pairing_code: pairingCode },
+        signal,
+      });
+      const session = decodeSession(answer.input);
+      if (!session.authenticated) throw new ContractError("session", "a signed-in session");
+      return { csrfToken: session.csrf_token, expiresAtUs: session.expires_at_us };
+    },
+
+    /** The session this browser holds, if it is still authorized. */
+    async readSession(signal?: AbortSignal) {
+      const answer = await send("GET", "/api/v1/session", { signal });
+      const session = decodeSession(answer.input);
+      if (!session.authenticated) throw new ContractError("session", "a signed-in session");
+      return { csrfToken: session.csrf_token, expiresAtUs: session.expires_at_us };
+    },
+
+    /** Revokes this browser's session. */
+    async deleteSession(signal?: AbortSignal) {
+      await send("DELETE", "/api/v1/session", { sign: true, signal });
+    },
+
+    subscribeJobEvents(
+      jobId: string,
+      listener: (event: JobStreamEvent) => void | Promise<void>,
+      settings: {
+        signal?: AbortSignal;
+        // Only seed from output the canonical consumer has already processed.
+        afterSeq?: number;
+        onReconnect?: (error: ControlTransportError) => void | Promise<void>;
+      } = {},
+    ): JobStreamSubscription {
+      if (closed) throw new ControlTransportError("client_closed", 0, false);
+      if (!/^job:(0|[1-9][0-9]*)$/.test(jobId)) throw new ContractError("job", "a canonical Job identity");
+      if (active.has(jobId)) throw new ControlTransportError("job_stream_already_open", 0, false);
+      if (settings.afterSeq !== undefined) {
+        const supplied = sequence(settings.afterSeq);
+        const previous = cursors.get(jobId);
+        if (previous !== undefined && supplied !== previous) throw new ContractError("after_seq", "the acknowledged Job cursor");
+        cursors.set(jobId, supplied);
+      }
+      const controller = new AbortController();
+      const signal = controller.signal;
+      const stop = () => controller.abort();
+      settings.signal?.addEventListener("abort", stop, { once: true });
+      if (settings.signal?.aborted) stop();
+      active.set(jobId, controller);
+      const completed = (async (): Promise<JobStreamEnd> => {
+        let delay = 250;
+        try {
+          while (!signal.aborted) {
+            let failure = new ControlTransportError("premature_end", 0, true);
+            try {
+              const end = await connection(jobId, signal, listener);
+              if (end) return end;
+            } catch (error) {
+              if (signal.aborted) return "aborted";
+              if (!(error instanceof ControlTransportError) || !error.retryable) throw error;
+              failure = error;
+            }
+            if (signal.aborted) return "aborted";
+            await settings.onReconnect?.(failure);
+            await pause(delay, signal);
+            delay = Math.min(delay * 2, 10_000);
+          }
+          return "aborted";
+        } finally {
+          controller.abort();
+          settings.signal?.removeEventListener("abort", stop);
+          active.delete(jobId);
+        }
+      })();
+      return { closed: completed, close: stop };
+    },
+
+    close(): void {
+      closed = true;
+      for (const controller of active.values()) controller.abort();
+    },
+  };
+}
