@@ -40,6 +40,78 @@ use crate::provider_execution::CancellationToken;
 const RETRY_START: Duration = Duration::from_millis(5);
 const RETRY_CAP: Duration = Duration::from_millis(500);
 
+/// Amendment 1 §C: sustained Scheduler active-time share, burst credit and
+/// prompt overdraft. A sweep starts only when the bucket holds the trigger's
+/// threshold; the bucket refills at `RHO` while the Scheduler issues nothing.
+const RHO: f64 = 0.5;
+const C_MAX: Duration = Duration::from_secs(1);
+const C_PROMPT: Duration = Duration::from_secs(1);
+/// Anti-spin floor for the earliest-due timer.
+const DUE_FLOOR: Duration = Duration::from_millis(5);
+
+fn micros(duration: Duration) -> i64 {
+    duration.as_micros().min(i64::MAX as u128) as i64
+}
+
+fn credit_threshold(trigger: SweepTrigger) -> i64 {
+    match trigger {
+        SweepTrigger::Startup | SweepTrigger::Recovery => i64::MIN,
+        SweepTrigger::Capacity | SweepTrigger::Due => -micros(C_PROMPT),
+        SweepTrigger::Dirty | SweepTrigger::Reconcile => 0,
+    }
+}
+
+/// What requested the next head sweep. Stronger means a lower gate threshold:
+/// `Startup` and `Recovery` always run, `Capacity` and `Due` may overdraw one
+/// prompt, `Dirty` and `Reconcile` need a non-negative bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SweepTrigger {
+    Startup,
+    Recovery,
+    Capacity,
+    Due,
+    Dirty,
+    Reconcile,
+}
+
+/// Amendment 1 §C.3: refill-then-debit on every counted request, capped above,
+/// never reset by wakes. Only time passage refills; wakes only lower the
+/// threshold by strengthening the trigger.
+#[derive(Debug)]
+struct CreditBucket {
+    balance_micros: i64,
+    refilled_at: std::time::Instant,
+}
+
+impl CreditBucket {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            balance_micros: micros(C_MAX),
+            refilled_at: now,
+        }
+    }
+
+    fn refill(&mut self, now: std::time::Instant) {
+        if now <= self.refilled_at {
+            return;
+        }
+        let gain = (now.duration_since(self.refilled_at).as_micros() as f64 * RHO) as i64;
+        self.balance_micros = (self.balance_micros + gain).min(micros(C_MAX));
+        self.refilled_at = now;
+    }
+
+    fn debit(&mut self, active: Duration) {
+        let now = std::time::Instant::now();
+        self.refill(now);
+        self.balance_micros -= micros(active);
+    }
+
+    fn balance(&mut self) -> i64 {
+        self.refill(std::time::Instant::now());
+        self.balance_micros
+    }
+}
+
 /// The fixed parameters of the sweep, each named by the approved contract so a
 /// later tuning change has one place to land.
 #[derive(Clone, Copy, Debug)]
@@ -81,6 +153,7 @@ pub(crate) struct UncertainClaim {
 
 /// The dormant Scheduler. It owns no durable state: every sweep works from the
 /// database's committed facts, and a sweep that is abandoned loses nothing.
+/// The credit bucket bounds sustained active time; wakes never reset it.
 pub(crate) struct Scheduler {
     database: DatabaseHandle,
     wake: SchedulerWakeSubscription,
@@ -88,6 +161,7 @@ pub(crate) struct Scheduler {
     shutdown: CancellationToken,
     limits: SchedulerLimits,
     seq: u64,
+    credit: CreditBucket,
     /// The one claim whose persistence outcome is unknown. M2 records it and
     /// stops claiming; nothing settles it, so it outlives every sweep.
     uncertain: Option<UncertainClaim>,
@@ -107,8 +181,15 @@ impl Scheduler {
             shutdown,
             limits,
             seq: 0,
+            credit: CreditBucket::new(std::time::Instant::now()),
             uncertain: None,
         }
+    }
+
+    /// Current credit after refill, for tests. Wakes never touch it.
+    #[cfg(test)]
+    pub(crate) fn credit_balance(&mut self) -> i64 {
+        self.credit.balance()
     }
 
     /// Whether an unresolved claim stops this Scheduler from claiming. While
@@ -219,22 +300,25 @@ impl Scheduler {
             captured.ledger.alarm(CaptureAlarm::AllocationExhausted);
             return Ok(captured.stream(fence));
         };
-        let began = std::time::Instant::now();
         let read = self
             .retry(|| self.database.pending_snapshot(budget))
             .await;
-        captured.ledger.service += began.elapsed();
         match read {
             None => Err(CaptureFailure::Shutdown),
             Some(Err(error)) => Err(classify(&error)),
-            Some(Ok(Ok(snapshot))) if snapshot.complete => Ok(captured.material(snapshot.keys)),
+            Some(Ok(Ok(snapshot))) if snapshot.complete => {
+                captured.ledger.service += snapshot.service_time;
+                Ok(captured.material(snapshot.keys))
+            }
             Some(Ok(Ok(snapshot))) => {
+                captured.ledger.service += snapshot.service_time;
                 captured.ledger.alarm(CaptureAlarm::OverCapacity {
                     len: snapshot.fence.len,
                 });
                 Ok(captured.stream(snapshot.fence))
             }
-            Some(Ok(Err(PendingReadFault::Allocation { fence, .. }))) => {
+            Some(Ok(Err(PendingReadFault::Allocation { fence, service_time }))) => {
+                captured.ledger.service += service_time;
                 captured.ledger.alarm(CaptureAlarm::AllocationExhausted);
                 Ok(captured.stream(fence))
             }
@@ -252,22 +336,33 @@ impl Scheduler {
         }
     }
 
-    /// One capture page, retried while the read queue refuses it.
+    /// One capture page, retried while the read queue refuses it. Only the
+    /// read worker's service time counts; queue wait and backoff never do.
     async fn capture_page(
         &self,
         after: Option<PendingJobKey>,
         ledger: &mut Ledger,
     ) -> CaptureStep<PendingCapturePage> {
-        let began = std::time::Instant::now();
         let read = self
             .retry(|| self.database.pending_capture_page(after, self.limits.capture_page))
             .await;
-        ledger.service += began.elapsed();
         match read {
             None => CaptureStep::Failed(CaptureFailure::Shutdown),
             Some(Err(error)) => CaptureStep::Failed(classify(&error)),
-            Some(Ok(Ok(page))) => CaptureStep::Page(page),
-            Some(Ok(Err(fault))) => CaptureStep::Fault(fault),
+            Some(Ok(Ok(page))) => {
+                ledger.service += page.service_time;
+                CaptureStep::Page(page)
+            }
+            Some(Ok(Err(fault))) => {
+                match &fault {
+                    PendingReadFault::IndexEntry { service_time, .. }
+                    | PendingReadFault::Allocation { service_time, .. } => {
+                        ledger.service += *service_time;
+                    }
+                    PendingReadFault::InvalidFence => {}
+                }
+                CaptureStep::Fault(fault)
+            }
         }
     }
 
@@ -371,6 +466,7 @@ impl Scheduler {
             }
         };
         let ledger = captured.ledger;
+        self.credit.debit(ledger.service);
         let Some(cohort) = captured.cohort else {
             return SweepOutcome::Completed(SweepCompleted {
                 seq,
@@ -379,6 +475,7 @@ impl Scheduler {
                 grants: Vec::new(),
                 earliest_due: None,
                 ledger,
+                cap_deferred: false,
                 restart_wanted: self.wake.dirty_generation() != d0,
             });
         };
@@ -398,9 +495,10 @@ impl Scheduler {
     /// Walks one captured cohort to exhaustion. Every `i < pc` has a
     /// definitive disposition; `pc` moves only through acknowledgement.
     /// `NoCapacity(Global)`, `BudgetExhausted`, read-queue backpressure and
-    /// pauses never acknowledge.
+    /// pauses never acknowledge. Every counted read debits its worker service
+    /// time and every claim its round trip; pauses and backoff never debit.
     async fn run_sweep(
-        &self,
+        &mut self,
         seq: u64,
         d0: u64,
         c0: u64,
@@ -448,7 +546,11 @@ impl Scheduler {
                     );
                 }
                 for _ in 0..want {
-                    match source.next_key(self, &mut ledger).await {
+                    let before = ledger.service;
+                    let fetched = source.next_key(&*self, &mut ledger).await;
+                    self.credit
+                        .debit(ledger.service.checked_sub(before).unwrap_or_default());
+                    match fetched {
                         Err(CaptureFailure::Shutdown) => {
                             return abandon(
                                 SweepAbandonedReason::Shutdown,
@@ -573,6 +675,7 @@ impl Scheduler {
                     }
                     Some(Ok(page)) => {
                         ledger.service += page.service_time;
+                        self.credit.debit(page.service_time);
                         cont = page.continuation;
                         if page.verdicts.is_empty() {
                             return abandon(
@@ -676,7 +779,9 @@ impl Scheduler {
                             allowed_pools: allowed,
                         })
                         .await;
-                    ledger.service += began.elapsed();
+                    let round_trip = began.elapsed();
+                    ledger.service += round_trip;
+                    self.credit.debit(round_trip);
                     match reply {
                         Ok(Ok(grant)) => {
                             hint = Some(grant.global_free_after);
@@ -771,6 +876,7 @@ impl Scheduler {
             grants,
             earliest_due,
             ledger,
+            cap_deferred,
             restart_wanted,
         })
     }
@@ -828,6 +934,330 @@ impl Scheduler {
                     }
                 }
             }
+        }
+    }
+
+    /// How long until the earliest not-yet-eligible Job may run, on the
+    /// monotonic clock, never below the anti-spin floor. `None` arms no timer:
+    /// under global saturation capacity, not time, is the binding constraint,
+    /// and `capacity_gen` resumes the sweep.
+    fn due_sleep_duration(earliest_due: Option<Timestamp>) -> Option<Duration> {
+        let eligible = earliest_due?;
+        let delta_micros = eligible
+            .as_unix_micros()
+            .saturating_sub(Timestamp::now().as_unix_micros())
+            .max(0);
+        let delta = Duration::from_micros(u64::try_from(delta_micros).unwrap_or(u64::MAX));
+        Some(delta.max(DUE_FLOOR))
+    }
+
+    /// Amendment 1 §C.3 gate: a head sweep starts only when the bucket holds
+    /// its trigger's threshold. `Startup` and `Recovery` always run. Waiting
+    /// issues nothing, so credit only refills; a stronger trigger lowers the
+    /// threshold and returns immediately when covered. Shutdown stops.
+    async fn gate(&mut self, mut trigger: SweepTrigger) -> Option<SweepTrigger> {
+        loop {
+            if self.shutdown.is_cancelled() {
+                return None;
+            }
+            let now = std::time::Instant::now();
+            self.credit.refill(now);
+            if self.credit.balance_micros >= credit_threshold(trigger) {
+                return Some(trigger);
+            }
+            let deficit = credit_threshold(trigger) - self.credit.balance_micros;
+            let wait = Duration::from_micros(((deficit as f64 / RHO) as u64).max(1));
+            enum GateWake {
+                Shutdown,
+                Permit,
+                Protection,
+                CreditReady,
+            }
+            let woken = ntex::util::select(
+                self.shutdown.cancelled(),
+                ntex::util::select(
+                    self.wake.recv_async(),
+                    ntex::util::select(
+                        self.protection.changed(),
+                        ntex::time::sleep(wait),
+                    ),
+                ),
+            )
+            .await;
+            let wake = match woken {
+                ntex::util::Either::Left(()) => GateWake::Shutdown,
+                ntex::util::Either::Right(ntex::util::Either::Left(_)) => GateWake::Permit,
+                ntex::util::Either::Right(ntex::util::Either::Right(
+                    ntex::util::Either::Left(_),
+                )) => GateWake::Protection,
+                ntex::util::Either::Right(ntex::util::Either::Right(
+                    ntex::util::Either::Right(()),
+                )) => GateWake::CreditReady,
+            };
+            match wake {
+                GateWake::Shutdown => return None,
+                GateWake::CreditReady => {}
+                GateWake::Permit | GateWake::Protection => {
+                    if self.protection.status().lock.is_some() {
+                        return None;
+                    }
+                    // A publication while gate-waiting can only strengthen the
+                    // trigger: a dirty-only wake must never weaken a pending
+                    // capacity or due overdraft. Recovery stays unconditional.
+                    match trigger {
+                        SweepTrigger::Startup | SweepTrigger::Recovery => {}
+                        SweepTrigger::Capacity | SweepTrigger::Due => {}
+                        SweepTrigger::Dirty | SweepTrigger::Reconcile => {
+                            trigger = SweepTrigger::Capacity;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The dormant loop shell. Never constructed in production: HTTP and the
+    /// CLI keep the legacy runtime, and no grant started here ever spawns a
+    /// `JobTask`. Sweeps record grants and drop them; occupancy stays held
+    /// until an explicit test finalizes.
+    ///
+    /// Wake handling: the permit is a doorbell only. Every decision compares
+    /// `dirty_gen`/`capacity_gen` against the last sweep's `d0`/`c0`, so a
+    /// coalesced or lost permit cannot suppress progress and cannot spin: a
+    /// permit with no generation change starts no sweep. `R` backstops
+    /// classification bugs. Pauses keep `pc`, the batch and the evaluation
+    /// continuation; only verdicts are dropped.
+    pub(crate) async fn run(&mut self) {
+        let mut first = true;
+        let mut last_d0 = 0u64;
+        let mut last_c0 = 0u64;
+        let mut last_cap_deferred = false;
+        let mut earliest_due: Option<Timestamp> = None;
+        let mut last_completed_at: Option<std::time::Instant> = None;
+        let mut need_recovery = false;
+        let mut was_protected = self.protection.status().lock.is_some();
+
+        loop {
+            if self.shutdown.is_cancelled() {
+                return;
+            }
+            if self.claims_halted() {
+                self.shutdown.cancelled().await;
+                return;
+            }
+            let protected = self.protection.status().lock.is_some();
+            if protected {
+                was_protected = true;
+                self.protection.changed().await;
+                continue;
+            }
+            if need_recovery {
+                enum RecoveryWake {
+                    Shutdown,
+                    Permit,
+                    Protection,
+                }
+                let woken = ntex::util::select(
+                    self.shutdown.cancelled(),
+                    ntex::util::select(self.wake.recv_async(), self.protection.changed()),
+                )
+                .await;
+                let wake = match woken {
+                    ntex::util::Either::Left(()) => RecoveryWake::Shutdown,
+                    ntex::util::Either::Right(ntex::util::Either::Left(_)) => {
+                        RecoveryWake::Permit
+                    }
+                    ntex::util::Either::Right(ntex::util::Either::Right(_)) => {
+                        RecoveryWake::Protection
+                    }
+                };
+                match wake {
+                    RecoveryWake::Shutdown => return,
+                    RecoveryWake::Permit | RecoveryWake::Protection => {
+                        if self.protection.status().lock.is_some() {
+                            continue;
+                        }
+                        need_recovery = false;
+                        was_protected = false;
+                        if self.gate(SweepTrigger::Recovery).await.is_none() {
+                            return;
+                        }
+                        match self.sweep_once().await {
+                            SweepOutcome::Completed(completed) => {
+                                last_d0 = completed.d0;
+                                last_c0 = completed.c0;
+                                last_cap_deferred = completed.cap_deferred;
+                                earliest_due = completed.earliest_due;
+                                last_completed_at = Some(std::time::Instant::now());
+                                first = false;
+                            }
+                            SweepOutcome::Abandoned(abandoned) => {
+                                first = false;
+                                match abandoned.reason {
+                                    SweepAbandonedReason::Shutdown => return,
+                                    SweepAbandonedReason::UncertainClaim { .. } => {
+                                        continue;
+                                    }
+                                    _ => {
+                                        need_recovery = true;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            if first {
+                first = false;
+                if self.gate(SweepTrigger::Startup).await.is_none() {
+                    return;
+                }
+                match self.sweep_once().await {
+                    SweepOutcome::Completed(completed) => {
+                        last_d0 = completed.d0;
+                        last_c0 = completed.c0;
+                        last_cap_deferred = completed.cap_deferred;
+                        earliest_due = completed.earliest_due;
+                        last_completed_at = Some(std::time::Instant::now());
+                    }
+                    SweepOutcome::Abandoned(abandoned) => {
+                        match abandoned.reason {
+                            SweepAbandonedReason::Shutdown => return,
+                            SweepAbandonedReason::UncertainClaim { .. } => continue,
+                            _ => need_recovery = true,
+                        }
+                    }
+                }
+                was_protected = self.protection.status().lock.is_some();
+                continue;
+            }
+
+            let due_wait = Self::due_sleep_duration(earliest_due);
+            let r_wait = match last_completed_at {
+                None => None,
+                Some(at) => {
+                    let elapsed = std::time::Instant::now().saturating_duration_since(at);
+                    if elapsed >= self.limits.reconcile {
+                        Some(Duration::ZERO)
+                    } else {
+                        Some(self.limits.reconcile - elapsed)
+                    }
+                }
+            };
+            let due_sleep = async {
+                match due_wait {
+                    Some(wait) => ntex::time::sleep(wait).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let r_sleep = async {
+                match r_wait {
+                    Some(wait) => ntex::time::sleep(wait).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            enum IdleWake {
+                Shutdown,
+                Permit,
+                Due,
+                Reconcile,
+                Protection,
+            }
+            let woken = ntex::util::select(
+                self.shutdown.cancelled(),
+                ntex::util::select(
+                    self.wake.recv_async(),
+                    ntex::util::select(
+                        due_sleep,
+                        ntex::util::select(r_sleep, self.protection.changed()),
+                    ),
+                ),
+            )
+            .await;
+            let wake = match woken {
+                ntex::util::Either::Left(()) => IdleWake::Shutdown,
+                ntex::util::Either::Right(ntex::util::Either::Left(_)) => IdleWake::Permit,
+                ntex::util::Either::Right(ntex::util::Either::Right(
+                    ntex::util::Either::Left(()),
+                )) => IdleWake::Due,
+                ntex::util::Either::Right(ntex::util::Either::Right(
+                    ntex::util::Either::Right(ntex::util::Either::Left(())),
+                )) => IdleWake::Reconcile,
+                ntex::util::Either::Right(ntex::util::Either::Right(
+                    ntex::util::Either::Right(ntex::util::Either::Right(_)),
+                )) => IdleWake::Protection,
+            };
+            match wake {
+                IdleWake::Shutdown => return,
+                IdleWake::Protection => {
+                    was_protected = self.protection.status().lock.is_some();
+                    continue;
+                }
+                IdleWake::Permit => {
+                    if self.protection.status().lock.is_some() {
+                        continue;
+                    }
+                    let dirty = self.wake.dirty_generation();
+                    let cap = self.wake.capacity_generation();
+                    let was_lift = was_protected && !self.protection.status().lock.is_some();
+                    was_protected = self.protection.status().lock.is_some();
+                    if was_lift {
+                        if self.gate(SweepTrigger::Recovery).await.is_none() {
+                            return;
+                        }
+                    } else if dirty != last_d0
+                        && last_cap_deferred
+                        && cap != last_c0
+                    {
+                        if self.gate(SweepTrigger::Capacity).await.is_none() {
+                            return;
+                        }
+                    } else if dirty != last_d0 {
+                        if self.gate(SweepTrigger::Dirty).await.is_none() {
+                            return;
+                        }
+                    } else if last_cap_deferred && cap != last_c0 {
+                        if self.gate(SweepTrigger::Capacity).await.is_none() {
+                            return;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                IdleWake::Due => {
+                    earliest_due = None;
+                    if self.protection.status().lock.is_some() {
+                        continue;
+                    }
+                    if self.gate(SweepTrigger::Due).await.is_none() {
+                        return;
+                    }
+                }
+                IdleWake::Reconcile => {
+                    if self.protection.status().lock.is_some() {
+                        continue;
+                    }
+                    if self.gate(SweepTrigger::Reconcile).await.is_none() {
+                        return;
+                    }
+                }
+            }
+            match self.sweep_once().await {
+                SweepOutcome::Completed(completed) => {
+                    last_d0 = completed.d0;
+                    last_c0 = completed.c0;
+                    last_cap_deferred = completed.cap_deferred;
+                    earliest_due = completed.earliest_due;
+                    last_completed_at = Some(std::time::Instant::now());
+                }
+                SweepOutcome::Abandoned(abandoned) => match abandoned.reason {
+                    SweepAbandonedReason::Shutdown => return,
+                    SweepAbandonedReason::UncertainClaim { .. } => continue,
+                    _ => need_recovery = true,
+                },
+            }
+            was_protected = self.protection.status().lock.is_some();
         }
     }
 }
@@ -995,7 +1425,6 @@ impl PendingCursor {
             if self.exhausted {
                 return Ok(None);
             }
-            let began = std::time::Instant::now();
             let read = scheduler
                 .retry(|| {
                     scheduler
@@ -1003,23 +1432,25 @@ impl PendingCursor {
                         .pending_keys(self.after, scheduler.limits.capture_page)
                 })
                 .await;
-            ledger.service += began.elapsed();
             match read {
                 None => return Err(CaptureFailure::Shutdown),
                 Some(Err(error)) => return Err(classify(&error)),
                 Some(Ok(Ok(page))) => {
+                    ledger.service += page.service_time;
                     self.after = page.page.last_visited;
                     self.page = page.page.visited;
                     self.next = 0;
                     self.exhausted = page.page.exhausted;
                 }
-                Some(Ok(Err(PendingReadFault::IndexEntry { key, kind, .. }))) => {
+                Some(Ok(Err(PendingReadFault::IndexEntry { key, kind, service_time, .. }))) => {
+                    ledger.service += service_time;
                     ledger.alarm(CaptureAlarm::IndexEntry { key, fault: kind });
                     return Err(CaptureFailure::IntegrityHalt(format!(
                         "the keys-only page reported {kind:?} at {key:?}"
                     )));
                 }
-                Some(Ok(Err(PendingReadFault::Allocation { .. }))) => {
+                Some(Ok(Err(PendingReadFault::Allocation { service_time, .. }))) => {
+                    ledger.service += service_time;
                     ledger.alarm(CaptureAlarm::AllocationExhausted);
                     return Err(CaptureFailure::IntegrityHalt(
                         "a streaming page could not be allocated".to_owned(),
@@ -1123,6 +1554,9 @@ pub(crate) struct SweepCompleted {
     pub(crate) grants: Vec<ClaimGrant>,
     pub(crate) earliest_due: Option<Timestamp>,
     pub(crate) ledger: Ledger,
+    /// A Pool bar, an empty allowed set or a global pause deferred capacity.
+    /// The loop restarts only when a release moved `capacity_gen` as well.
+    pub(crate) cap_deferred: bool,
     /// `dirty_gen != d0`, or deferred capacity saw a release. The caller
     /// decides whether another sweep follows; this sweep never starts one.
     pub(crate) restart_wanted: bool,
@@ -1988,6 +2422,239 @@ mod tests {
             SweepOutcome::Completed(_) => panic!("a halted scheduler starts no sweep"),
         }
         wait(database.recover_storage()).unwrap();
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn credit_starts_full_caps_refill_and_applies_trigger_thresholds() {
+        assert_eq!(credit_threshold(SweepTrigger::Startup), i64::MIN);
+        assert_eq!(credit_threshold(SweepTrigger::Recovery), i64::MIN);
+        assert_eq!(
+            credit_threshold(SweepTrigger::Capacity),
+            -micros(C_PROMPT)
+        );
+        assert_eq!(credit_threshold(SweepTrigger::Due), -micros(C_PROMPT));
+        assert_eq!(credit_threshold(SweepTrigger::Dirty), 0);
+        assert_eq!(credit_threshold(SweepTrigger::Reconcile), 0);
+        let now = std::time::Instant::now();
+        let mut bucket = CreditBucket::new(now);
+        assert_eq!(bucket.balance_micros, micros(C_MAX));
+        bucket.debit(Duration::from_millis(100));
+        let after_debit = bucket.balance_micros;
+        assert!(after_debit < micros(C_MAX));
+        // Wakes never touch the bucket: only time refills, capped above.
+        bucket.refill(now + Duration::from_secs(60));
+        assert_eq!(bucket.balance_micros, micros(C_MAX));
+        let _ = after_debit;
+    }
+
+    #[test]
+    fn due_timer_arms_nothing_without_a_due_date_and_floors_the_past() {
+        assert_eq!(Scheduler::due_sleep_duration(None), None);
+        let past = Timestamp::from_unix_micros(
+            Timestamp::now().as_unix_micros() - 1_000_000,
+        );
+        assert_eq!(
+            Scheduler::due_sleep_duration(Some(past)),
+            Some(DUE_FLOOR)
+        );
+        let future = Timestamp::from_unix_micros(
+            Timestamp::now().as_unix_micros() + 600_000,
+        );
+        let wait = Scheduler::due_sleep_duration(Some(future)).unwrap();
+        assert!(wait >= DUE_FLOOR && wait <= Duration::from_millis(650));
+    }
+
+    #[test]
+    fn a_sweep_debits_active_time_from_credit() {
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "credit-debit");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, llm) = provision(&database);
+        let _first = pending_ready(&database, llm);
+        let _second = pending_ready(&database, llm);
+        let mut scheduler = scheduler(&mut worker, limits(16, 100));
+        let before = scheduler.credit_balance();
+        assert_eq!(before, micros(C_MAX));
+        match wait(scheduler.sweep_once()) {
+            SweepOutcome::Completed(completed) => {
+                assert_eq!(completed.grants.len(), 2);
+                assert!(completed.ledger.service > Duration::ZERO);
+            }
+            SweepOutcome::Abandoned(abandoned) => {
+                panic!("a healthy sweep completes, got {:?}", abandoned.reason)
+            }
+        }
+        let after = scheduler.credit_balance();
+        assert!(
+            after < before,
+            "active time must leave the bucket lower than it started"
+        );
+        worker.shutdown().unwrap();
+    }
+
+    fn run_in_background(
+        worker: &mut DatabaseWorker,
+        limits: SchedulerLimits,
+        shutdown: CancellationToken,
+    ) -> std::thread::JoinHandle<u64> {
+        let scheduler = Scheduler::new(
+            worker.handle(),
+            worker.take_scheduler_wake().unwrap(),
+            shutdown,
+            limits,
+        );
+        std::thread::spawn(move || {
+            let mut scheduler = scheduler;
+            ntex::rt::System::new(
+                "scheduler-loop-test",
+                ntex::rt::DefaultRuntime,
+            )
+            .block_on(async move {
+                scheduler.run().await;
+                scheduler.seq
+            })
+        })
+    }
+
+    fn wait_for_occupancy(database: &DatabaseHandle, want: usize) {
+        let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+        loop {
+            let occupancy = wait(database.occupancy()).unwrap();
+            if occupancy.len() == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "occupancy {occupancy:?} never reached {want}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn the_loop_claims_a_job_admitted_after_startup_without_losing_its_wake() {
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "loop-dirty");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, llm) = provision(&database);
+        let shutdown = CancellationToken::default();
+        let join = run_in_background(&mut worker, limits(16, 100), shutdown.clone());
+        let job = pending_ready(&database, llm);
+        wait_for_occupancy(&database, 1);
+        shutdown.cancel();
+        let seq = join.join().unwrap();
+        assert!(seq >= 2, "startup plus the dirty wake, got {seq}");
+        let occupancy = wait(database.occupancy()).unwrap();
+        assert_eq!(occupancy.len(), 1);
+        assert_eq!(occupancy[0].1, job);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn the_loop_claims_after_the_due_timer_without_violating_the_budget() {
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "loop-due");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, llm) = provision(&database);
+        let at = Timestamp::from_unix_micros(Timestamp::now().as_unix_micros() + 300_000);
+        let input = wait(database.save_job_input(None, JobInputDraft::default())).unwrap();
+        let job = wait(database.create_job_with_input(
+            NewJob {
+                name: None,
+                execution_mode: ExecutionMode::Once,
+                eligible_at: Some(at),
+                scheduled_at: None,
+                next_due_at: None,
+                next_iteration_no: None,
+                iteration_no: None,
+                parent: database.genesis(),
+                projects: Vec::new(),
+                dependencies: Vec::new(),
+                configuration: Some(ExecutionConfiguration {
+                    agent_profile: None,
+                    llm_profile: llm,
+                }),
+                assigned_executor: None,
+                previous: None,
+                replaces: None,
+            },
+            input,
+        ))
+        .unwrap();
+        let shutdown = CancellationToken::default();
+        let join = run_in_background(&mut worker, limits(16, 100), shutdown.clone());
+        wait_for_occupancy(&database, 1);
+        shutdown.cancel();
+        let seq = join.join().unwrap();
+        assert!(seq >= 2, "startup plus the due fire, got {seq}");
+        let occupancy = wait(database.occupancy()).unwrap();
+        assert_eq!(occupancy, vec![(occupancy[0].0, job)]);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn an_idle_loop_with_no_work_starts_no_extra_sweep() {
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "loop-idle");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let shutdown = CancellationToken::default();
+        let join = run_in_background(&mut worker, limits(16, 100), shutdown.clone());
+        std::thread::sleep(Duration::from_millis(300));
+        shutdown.cancel();
+        let seq = join.join().unwrap();
+        assert_eq!(seq, 1, "one startup sweep and nothing else, got {seq}");
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn reconciliation_fires_on_its_cadence_and_stays_bounded() {
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "loop-reconcile");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let tiny = SchedulerLimits {
+            reconcile: Duration::from_millis(150),
+            ..limits(16, 100)
+        };
+        let shutdown = CancellationToken::default();
+        let join = run_in_background(&mut worker, tiny, shutdown.clone());
+        std::thread::sleep(Duration::from_millis(500));
+        shutdown.cancel();
+        let seq = join.join().unwrap();
+        assert!(
+            (2..=5).contains(&seq),
+            "startup plus bounded reconciles, got {seq}"
+        );
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn the_loop_does_not_lose_a_capacity_release_between_refusal_and_parking() {
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "loop-capacity");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (pool, llm) = provision(&database);
+        let mut filled = Vec::new();
+        for _ in 0..16 {
+            let job = pending_ready(&database, llm);
+            wait(database.claim_execution(ClaimRequest {
+                job,
+                allowed_pools: TestSet::from([pool]),
+            }))
+            .unwrap()
+            .unwrap();
+            filled.push(job);
+        }
+        let waiting = pending_ready(&database, llm);
+        let shutdown = CancellationToken::default();
+        let join = run_in_background(&mut worker, limits(16, 100), shutdown.clone());
+        // Give the startup sweep time to refuse global capacity and park.
+        std::thread::sleep(Duration::from_millis(300));
+        wait(database.finalize_job(filled[0], crate::persistence::JobFinalization::Completed(done_result("free"))))
+            .unwrap();
+        wait_for_occupancy(&database, 16);
+        shutdown.cancel();
+        join.join().unwrap();
+        let occupancy = wait(database.occupancy()).unwrap();
+        assert!(occupancy.iter().any(|(_, job)| *job == waiting));
         worker.shutdown().unwrap();
     }
 }
