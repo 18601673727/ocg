@@ -890,6 +890,7 @@ fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
         | ExecutionRuntimeError::ExecutorStopped => SHUTTING_DOWN,
         ExecutionRuntimeError::ExecutorNotFound(_) => EXECUTOR_NOT_FOUND,
         ExecutionRuntimeError::Database(error) => match error {
+            DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => RUNTIME_BUSY,
             DatabaseError::Rejected(_) => CONFIGURATION_REFUSED,
             DatabaseError::ShuttingDown => SHUTTING_DOWN,
             DatabaseError::QueueFull | DatabaseError::ReadQueueFull => DATABASE_BUSY,

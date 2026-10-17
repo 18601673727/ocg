@@ -222,4 +222,11 @@ pub enum Violation {
     /// the refused creation was for the request that created it.
     #[error("the submission key already created {job}")]
     SubmissionKeyUsed { job: JobId, same_request: bool },
+    /// Committing would leave [`PENDING_JOBS`](crate::storage::PENDING_JOBS)
+    /// above [`MAX_PENDING_JOBS`].
+    #[error("pending Job capacity ({max_pending_jobs} Jobs) is full; the Job was not admitted")]
+    PendingJobsLimit { max_pending_jobs: u64 },
 }
+
+/// The most pending Jobs the database may hold at once.
+pub const MAX_PENDING_JOBS: u64 = 1_048_576;

@@ -52,7 +52,7 @@ pub(crate) use mutations::{
 pub use mutations::{is_handler_version, sanitize_display_name};
 #[cfg(test)]
 pub(crate) use mutations::{record_preexisting_metrics, start_preexisting_local_job};
-pub use operations::{OperationId, OperationKind, OperationMarker, Violation};
+pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, OperationMarker, Violation};
 pub use records::{
     AgentConfig, AgentProfile, AgentRecord, AttachmentCleanup, AttachmentOrigin, AttachmentRecord,
     CleanupKind, ContentDigest, ExecutorRecord, FrozenExecutionConfig, FrozenLlmConfig,

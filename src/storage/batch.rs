@@ -1,3 +1,5 @@
+use redb::ReadableTableMetadata;
+
 use super::*;
 
 // ---- batches -------------------------------------------------------------------
@@ -59,6 +61,8 @@ pub(crate) struct Batch {
     pub(super) now: Timestamp,
     /// [`closure_certified`], once read.
     pub(super) certified: Option<bool>,
+    /// Net change to [`PENDING_JOBS`] membership made by this batch so far.
+    pub(super) pending_delta: i64,
 }
 
 /// How a batch's commit becomes durable.
@@ -114,6 +118,7 @@ pub(crate) fn run_batch_with<T>(
         failed: None,
         now: Timestamp::now(),
         certified: None,
+        pending_delta: 0,
     };
     let body_result = body(&mut batch);
     // A failure the body swallowed still prevents the commit.
@@ -123,6 +128,9 @@ pub(crate) fn run_batch_with<T>(
         }
         (Ok(value), None) => value,
     };
+    if let Err(BatchError(failure)) = batch.check_pending_limit() {
+        return finish_abort(batch.tx, failure);
+    }
     let (value, subjects) = value;
     let marker = OperationMarker {
         operation,
@@ -169,6 +177,7 @@ pub(crate) fn run_batch_declinable<T>(
         failed: None,
         now: Timestamp::now(),
         certified: None,
+        pending_delta: 0,
     };
     let body_result = body(&mut batch);
     let (value, subjects) = match (body_result, batch.failed.take()) {
@@ -192,6 +201,9 @@ pub(crate) fn run_batch_declinable<T>(
         }
         (Ok(Some(value)), None) => value,
     };
+    if let Err(BatchError(failure)) = batch.check_pending_limit() {
+        return finish_abort(batch.tx, failure);
+    }
     let marker = OperationMarker {
         operation,
         kind,
@@ -451,15 +463,33 @@ impl Batch {
     /// removing it can only remove this Job's own entry.
     fn index_pending(&mut self, row: &JobRow) -> Result<(), BatchError> {
         let genesis = self.genesis()?;
-        self.step(|tx| {
+        let delta = self.step(|tx| {
             let mut pending = tx.open_table(PENDING_JOBS)?;
             if row.id != genesis && row.awaits_start() {
-                pending.insert(row.pending_key(), ())?;
+                Ok(i64::from(pending.insert(row.pending_key(), ())?.is_none()))
             } else {
-                pending.remove(row.pending_key())?;
+                Ok(-i64::from(pending.remove(row.pending_key())?.is_some()))
             }
-            Ok(())
-        })
+        })?;
+        self.pending_delta = self.pending_delta.saturating_add(delta);
+        Ok(())
+    }
+
+    /// Refuses the batch when its net [`PENDING_JOBS`] membership change is
+    /// positive and would leave [`PENDING_JOBS`] above [`MAX_PENDING_JOBS`].
+    /// Checked after the body so a Job created and started in one transaction
+    /// is not refused for the entry it removed before committing.
+    fn check_pending_limit(&mut self) -> Result<(), BatchError> {
+        if self.pending_delta <= 0 {
+            return Ok(());
+        }
+        let count = self.step(|tx| Ok(tx.open_table(PENDING_JOBS)?.len()?))?;
+        if count > MAX_PENDING_JOBS {
+            return self.reject(Violation::PendingJobsLimit {
+                max_pending_jobs: MAX_PENDING_JOBS,
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn require_input(&mut self, id: JobInputId) -> Result<JobInputRow, BatchError> {

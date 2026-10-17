@@ -53,6 +53,7 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 pub(crate) const FORMAT_VERSION: u32 = 14;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
+pub(crate) const MAX_PENDING_JOBS: u64 = crate::persistence::MAX_PENDING_JOBS;
 pub(crate) const MAX_PAGE: usize = 1_000;
 /// The most index entries one observation query reads, matching or not.
 pub(crate) const MAX_OBSERVATION_SCAN: usize = 5_000;

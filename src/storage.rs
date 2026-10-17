@@ -141,7 +141,7 @@ use rows::{
 use schema::*;
 pub(crate) use schema::{
     CACHE_BYTES, DATABASE_FILE_NAME, FORMAT_NAME, FORMAT_VERSION, MAX_OBSERVATION_SCAN,
-    MAX_OBSERVED_MODEL_SCAN, MAX_PAGE, MAX_WAITING_JOBS, MAX_WAITING_LAYERS,
+    MAX_OBSERVED_MODEL_SCAN, MAX_PAGE, MAX_PENDING_JOBS, MAX_WAITING_JOBS, MAX_WAITING_LAYERS,
 };
 pub(crate) use sequences::Sequence;
 use sequences::{OPEN_EPOCH, Scope, filter_matches};
