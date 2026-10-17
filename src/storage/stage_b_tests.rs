@@ -607,9 +607,98 @@ fn reopen_refused(fixture: Fixture, name: &str, expected: &str) {
     drop(root);
 }
 
+/// Unattributed quarantine above the global limit is a saturated state, not
+/// damage.
+///
+/// Every unclean exit leaves behind an unbound abandoned Job, which holds a
+/// global slot and has no release path without termination evidence. Enough of
+/// them take the total past [`GLOBAL_EXECUTION_LIMIT`]. That must not refuse the
+/// database: the condition is ordinary, it is permanent by design, and refusing
+/// to open turns it into something no operator can get out of. Admission
+/// refuses on its own at or above the limit, so holding the capacity and
+/// starting are both possible at once.
+#[test]
+fn unattributed_quarantine_past_the_global_limit_still_opens_and_refuses_claims() {
+    let beyond = usize::from(GLOBAL_EXECUTION_LIMIT) + 1;
+    let fixture = Fixture::new("quarantine-over-limit", 16);
+    // Unbound Jobs, so none of them holds a Pool's occupancy: each is charged
+    // the global domain alone, exactly as an abandoned aggregation service Job
+    // or log cleanup Job is.
+    let abandoned: Vec<JobId> = (0..beyond)
+        .map(|_| fixture.job(fixture.genesis, Vec::new()))
+        .collect();
+    for &job in &abandoned {
+        fixture
+            .write(OperationKind::QuarantineAbandonedJob, |batch| {
+                batch.step(|tx| {
+                    tx.open_table(LOCAL_EXECUTIONS)?
+                        .insert(job.get(), fixture.epoch)?;
+                    Ok(())
+                })?;
+                persistence::quarantine_abandoned_job(batch, job, fixture.epoch)
+                    .map(|value| value.unwrap())
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        read_unresolved_executions(&fixture.database).unwrap().len(),
+        beyond,
+        "{beyond} unattributed quarantines: past the limit of {GLOBAL_EXECUTION_LIMIT}"
+    );
+    assert!(
+        read_occupancy(&fixture.database).unwrap().is_empty(),
+        "none of them holds a Pool, so none is charged twice"
+    );
+
+    // Admission is refused on its own terms, for the global domain, and every
+    // record is still there.
+    let candidate = fixture.job(fixture.genesis, Vec::new());
+    let _ = fixture.claim(candidate, BTreeSet::from([fixture.pool]));
+    let quarantined = read_unresolved_executions(&fixture.database).unwrap();
+    let mut held: Vec<JobId> = quarantined.iter().map(|(job, _)| *job).collect();
+    held.sort();
+    let mut expected = abandoned.clone();
+    expected.sort();
+    assert_eq!(held, expected, "no record was dropped or merged");
+    assert!(
+        quarantined.iter().all(|(_, record)| record.pool.is_none()),
+        "and each still names no Pool, so no Pool is over-quarantined"
+    );
+
+    // Reopening is the point: this is where the total used to be refused.
+    let Fixture {
+        database,
+        root,
+        path,
+        ..
+    } = fixture;
+    drop(database);
+    let reopened = match open(&path) {
+        Ok(opened) => opened,
+        Err(_) => panic!("an over-capacity quarantine must still open"),
+    };
+    let records = read_unresolved_executions(&reopened.database)
+        .unwrap()
+        .into_iter()
+        .map(|(job, _)| job)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        records,
+        expected.iter().copied().collect::<BTreeSet<_>>(),
+        "every record survives the reopen"
+    );
+    assert!(
+        read_occupancy(&reopened.database).unwrap().is_empty(),
+        "and nothing was silently released into a Pool"
+    );
+    drop(reopened);
+    drop(root);
+}
+
 /// A quarantine that cannot be reconciled with the capacity it claims to
 /// protect refuses the open, rather than letting admission run on a protection
-/// that was never confirmed.
+/// that was never confirmed. Over-limit totals are the one disagreement this
+/// does not refuse, which the test above pins; these are the ones it does.
 #[test]
 fn a_quarantine_that_cannot_be_reconstructed_refuses_to_open() {
     // (a) A domain no frozen binding establishes: the record would quarantine

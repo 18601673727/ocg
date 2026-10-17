@@ -150,9 +150,13 @@ pub(crate) fn read_unresolved_executions(
 /// what keeps claim retention and quarantine from charging one occupation
 /// twice.
 ///
-/// Bounded: past `GLOBAL_EXECUTION_LIMIT` the global domain is full whatever
-/// the exact count is, so a scan that stops there answers every question the
-/// capacity check asks.
+/// Bounded on purpose: the count stops one past [`GLOBAL_EXECUTION_LIMIT`],
+/// because that is the largest value any caller can act on. Every question asked
+/// of this count is whether the global domain is at or above the limit, and a
+/// returned `GLOBAL_EXECUTION_LIMIT + 1` answers yes to that whatever the true
+/// total is. The bound is what makes this a fixed-cost read of a table that
+/// unclean exits grow without limit; it is not a claim that the total stays
+/// within the limit, and it is not checked as one.
 pub(super) fn unattributed_quarantine(tx: &WriteTransaction) -> Result<u64, StorageError> {
     let table = tx.open_table(UNRESOLVED_EXECUTIONS)?;
     let mut count = 0;
@@ -171,6 +175,13 @@ pub(super) fn unattributed_quarantine(tx: &WriteTransaction) -> Result<u64, Stor
 
 /// The global execution domain's occupancy: every [`OCCUPANCY`] entry, plus
 /// the quarantined work that holds a global slot without one.
+///
+/// May exceed [`GLOBAL_EXECUTION_LIMIT`], and does once enough unclean exits
+/// have accumulated. This is the admission rule's input and nothing else: a
+/// caller refuses a claim when the result is at or above the limit, which
+/// covers every value above it. No caller treats a larger total as damage, and
+/// none should, because nothing in OCG releases such a charge without evidence
+/// that the work behind it stopped.
 pub(super) fn global_occupancy(tx: &WriteTransaction) -> Result<u64, StorageError> {
     let occupied = tx.open_table(OCCUPANCY)?.len()?;
     Ok(occupied + unattributed_quarantine(tx)?)
@@ -196,6 +207,10 @@ pub(super) fn global_occupancy(tx: &WriteTransaction) -> Result<u64, StorageErro
 /// finds is one no writer of this build could have produced; it is stated
 /// rather than assumed, because this runs on every open and the cost of
 /// catching it here, before admission, is the whole point.
+///
+/// What this checks is agreement between records, never how much capacity is
+/// held. A total above the limit is a legitimate saturated state and is
+/// deliberately not refused here; see the note before the return.
 pub(super) fn verify_quarantine(tx: &WriteTransaction) -> Result<(), StorageError> {
     let quarantine = tx.open_table(UNRESOLVED_EXECUTIONS)?;
     let bindings = tx.open_table(FROZEN_POOL_BINDINGS)?;
@@ -263,14 +278,14 @@ pub(super) fn verify_quarantine(tx: &WriteTransaction) -> Result<(), StorageErro
             )));
         }
     }
-    drop(quarantine);
-    drop(bindings);
-    drop(occupancy);
-    drop(jobs);
-    if global_occupancy(tx)? > u64::from(GLOBAL_EXECUTION_LIMIT) {
-        return Err(StorageError::corrupted(
-            "quarantined and occupied execution capacity exceeds the global limit",
-        ));
-    }
+    // Deliberately no bound on the total here. Global occupancy above
+    // [`GLOBAL_EXECUTION_LIMIT`] is a legitimate saturated state, not damage:
+    // it is what a bounded number of ordinary unclean exits accumulates, since
+    // an unbound abandoned Job is charged the global domain and nothing
+    // releases that charge without termination evidence. Refusing to open on it
+    // made the condition permanent and unrecoverable, and bought nothing:
+    // admission refuses every claim at or above the limit on its own, in the
+    // transaction that would have admitted it. Over-capacity quarantine is
+    // therefore held, not released, and the database still starts.
     Ok(())
 }

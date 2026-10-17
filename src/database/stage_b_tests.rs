@@ -286,3 +286,126 @@ fn process_reopen_quarantines_unspawned_claim_without_rerunning() {
     );
     worker.shutdown().unwrap();
 }
+
+/// One unbound local Job, started the way the shipped runtime starts work: a
+/// local execution claim and no frozen Pool binding, so nothing of it is
+/// attributable to a Pool.
+fn unbound_local_job(database: &DatabaseHandle, llm: ProfileId) -> JobId {
+    let input = wait(database.save_job_input(None, JobInputDraft::default())).unwrap();
+    wait(database.create_local_job_with_input(
+        NewJob {
+            name: None,
+            execution_mode: ExecutionMode::Once,
+            eligible_at: None,
+            scheduled_at: None,
+            next_due_at: None,
+            next_iteration_no: None,
+            iteration_no: None,
+            parent: database.genesis(),
+            projects: Vec::new(),
+            dependencies: Vec::new(),
+            configuration: Some(ExecutionConfiguration {
+                agent_profile: None,
+                llm_profile: llm,
+            }),
+            assigned_executor: None,
+            previous: None,
+            replaces: None,
+        },
+        input,
+    ))
+    .unwrap()
+}
+
+/// Repeated unclean exits, the way the aggregation service makes them: every
+/// start leaves one unbound Job behind when the process is killed, so each cycle
+/// adds one more unattributed quarantine until the global domain is past its
+/// limit and can never be drained.
+///
+/// The database must keep starting. It did not: startup refused to open on the
+/// nineteenth cycle, which turned a condition that is permanent by design into
+/// one no operator could get out of. This is that arithmetic, driven through the
+/// real worker start and quarantine path rather than by hand.
+#[test]
+fn repeated_unclean_exits_saturate_the_global_domain_without_refusing_to_start() {
+    let (_root, directory) = data_directory("ocg-stage-b-worker", "unclean-exits");
+    // One more than the limit, so the last cycle is the one that used to fail.
+    let cycles = usize::from(GLOBAL_EXECUTION_LIMIT) + 1;
+    let mut abandoned = Vec::new();
+
+    for cycle in 1..=cycles {
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, llm) = provision(&database);
+        let job = unbound_local_job(&database, llm);
+        assert!(
+            wait(database.job(job))
+                .unwrap()
+                .unwrap()
+                .started_at
+                .is_some(),
+            "cycle {cycle}: started and left unsettled"
+        );
+        abandoned.push(job);
+        // The opening ends without settling anything, which is all the
+        // accounting below turns on: the local claim survives into the next
+        // opening. A shutdown reproduces that inside one process; the signal
+        // that actually causes it is the subject of the process tests.
+        worker.shutdown().unwrap();
+        let worker = DatabaseWorker::start(&directory)
+            .unwrap_or_else(|error| panic!("cycle {cycle} of {cycles}: startup failed: {error:?}"));
+        worker.shutdown().unwrap();
+    }
+
+    // Past the limit, everything is quarantined, unattributed, and held.
+    let worker = DatabaseWorker::start(&directory).unwrap();
+    let database = worker.handle();
+    let held = wait(database.unresolved_executions()).unwrap();
+    assert_eq!(
+        held.len(),
+        cycles,
+        "one record per unclean exit, none merged"
+    );
+    assert!(
+        held.iter().all(|(_, record)| record.pool.is_none()),
+        "none is attributable to a Pool, so none is charged twice"
+    );
+    assert!(
+        wait(database.occupancy()).unwrap().is_empty(),
+        "and none released anything into a Pool"
+    );
+    for &job in &abandoned {
+        let record = wait(database.job(job)).unwrap().unwrap();
+        assert!(
+            record.unknown_at.is_some() && record.stop_confirmed_at.is_none(),
+            "{job}: unknown, and never confirmed stopped"
+        );
+    }
+
+    // Saturated means saturated: the global domain admits nothing new.
+    let (pool, llm) = provision(&database);
+    let waiting = pending(&database, llm);
+    assert_eq!(
+        wait(database.claim_execution(ClaimRequest {
+            job: waiting,
+            allowed_pools: BTreeSet::from([pool])
+        }))
+        .unwrap(),
+        Err(ClaimRefusal::NoCapacity(CapacityScope::Global)),
+        "the global domain is held past its limit"
+    );
+    worker.shutdown().unwrap();
+
+    // Restarts after saturation neither duplicate the accounting nor drain it.
+    for round in 1..=2 {
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        assert_eq!(
+            wait(database.unresolved_executions()).unwrap().len(),
+            cycles,
+            "round {round}: no record added, none lost"
+        );
+        assert!(wait(database.occupancy()).unwrap().is_empty());
+        worker.shutdown().unwrap();
+    }
+}
