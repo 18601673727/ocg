@@ -18336,7 +18336,7 @@ mod requests_and_tool_loop {
                     workspace_command::TOOL_NAME,
                     crate::orchestration::workspace_discovery::LIST_TOOL_NAME,
                     crate::orchestration::workspace_discovery::SEARCH_TOOL_NAME,
-                    crate::orchestration::workspace_index_query::TOOL_NAME,
+                    crate::orchestration::workspace_code::TOOL_NAME,
                     crate::orchestration::workspace_fts::TOOL_NAME,
                 ]
             );

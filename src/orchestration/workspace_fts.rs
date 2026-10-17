@@ -394,7 +394,7 @@ pub struct WorkspaceFts {
 /// Why a walk or scan stopped without finishing: the call was cancelled, so
 /// nothing it produced is used or claimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stopped;
+pub(super) struct Stopped;
 
 impl From<Stopped> for SearchRefusal {
     fn from(_stopped: Stopped) -> Self {
@@ -606,7 +606,7 @@ fn add_clause(
 /// link: a file of so many bytes, a directory, or nothing that may be
 /// indexed.
 enum Entry {
-    File { bytes: u64 },
+    File { stamp: FileStamp },
     Directory,
     Skip(Skipped),
 }
@@ -622,8 +622,16 @@ fn entry(directory: &std::fs::File, name: &str) -> Entry {
         return unreadable();
     };
     match FileType::from_raw_mode(stat.st_mode) {
+        FileType::RegularFile if stat.st_nlink > 1 => Entry::Skip(Skipped {
+            hard_linked: 1,
+            ..Skipped::default()
+        }),
         FileType::RegularFile => Entry::File {
-            bytes: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
+            stamp: FileStamp {
+                bytes: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
+                seconds: stat.st_mtime as i64,
+                nanos: stat.st_mtime_nsec as u32,
+            },
         },
         FileType::Directory => Entry::Directory,
         FileType::Symlink => Entry::Skip(Skipped {
@@ -669,6 +677,134 @@ fn names(directory: &std::fs::File, limit: usize) -> (Vec<String>, usize, Option
     }
     names.sort_unstable();
     (names, refused, omission)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FileStamp {
+    pub bytes: u64,
+    pub seconds: i64,
+    pub nanos: u32,
+}
+
+pub(super) trait WalkVisitor {
+    fn checkpoint(&mut self) -> Result<(), Stopped>;
+    fn examined(&mut self);
+    fn skipped(&mut self, skipped: Skipped);
+    fn omitted(&mut self, limit: BuildLimit);
+    fn file(
+        &mut self,
+        directory: &std::fs::File,
+        name: &str,
+        path: &str,
+        stamp: FileStamp,
+    ) -> Result<(), Stopped>;
+}
+
+pub(super) fn walk_directory(
+    workspace: &Workspace,
+    directory: &std::fs::File,
+    path: &str,
+    depth: usize,
+    device: u64,
+    limits: &FtsLimits,
+    visitor: &mut impl WalkVisitor,
+) -> Result<(), Stopped> {
+    let (names, refused, omission) = names(directory, limits.directory_entries);
+    visitor.skipped(Skipped {
+        protected: refused,
+        ..Skipped::default()
+    });
+    if let Some(omission) = omission {
+        visitor.omitted(omission);
+        if omission == BuildLimit::Unreadable {
+            visitor.skipped(Skipped {
+                unreadable: 1,
+                ..Skipped::default()
+            });
+        }
+    }
+    for name in &names {
+        visitor.checkpoint()?;
+        visitor.examined();
+        let path = if path == "." {
+            name.clone()
+        } else {
+            format!("{path}/{name}")
+        };
+        match entry(directory, name) {
+            Entry::Skip(skipped) => {
+                visitor.skipped(skipped);
+            }
+            Entry::File { stamp } => visitor.file(directory, name, &path, stamp)?,
+            Entry::Directory => {
+                if SKIPPED_DIRECTORY_NAMES.contains(&name.as_str()) {
+                    visitor.skipped(Skipped {
+                        other: 1,
+                        ..Skipped::default()
+                    });
+                    continue;
+                }
+                if depth == limits.depth {
+                    visitor.omitted(BuildLimit::Depth);
+                    continue;
+                }
+                let entered = workspace
+                    .subdirectory(directory, name)
+                    .ok()
+                    .filter(|child| {
+                        child
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.dev() == device)
+                    });
+                match entered {
+                    Some(child) => walk_directory(
+                        workspace,
+                        &child,
+                        &path,
+                        depth + 1,
+                        device,
+                        limits,
+                        visitor,
+                    )?,
+                    None => visitor.skipped(Skipped {
+                        unreadable: 1,
+                        ..Skipped::default()
+                    }),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl WalkVisitor for Build<'_> {
+    fn checkpoint(&mut self) -> Result<(), Stopped> {
+        self.ended()
+    }
+    fn examined(&mut self) {
+        self.coverage.entries_examined += 1;
+    }
+    fn skipped(&mut self, skipped: Skipped) {
+        self.coverage.skipped.protected += skipped.protected;
+        self.coverage.skipped.symlink += skipped.symlink;
+        self.coverage.skipped.binary += skipped.binary;
+        self.coverage.skipped.too_large += skipped.too_large;
+        self.coverage.skipped.hard_linked += skipped.hard_linked;
+        self.coverage.skipped.unreadable += skipped.unreadable;
+        self.coverage.skipped.other += skipped.other;
+    }
+    fn omitted(&mut self, limit: BuildLimit) {
+        self.omission = Some(limit);
+    }
+    fn file(
+        &mut self,
+        directory: &std::fs::File,
+        name: &str,
+        path: &str,
+        stamp: FileStamp,
+    ) -> Result<(), Stopped> {
+        Build::file(self, directory, name, path, stamp.bytes)
+    }
 }
 
 /// One build in progress: its budgets, its coverage so far, and the
@@ -724,58 +860,15 @@ impl Build<'_> {
         path: &str,
         depth: usize,
     ) -> Result<(), Stopped> {
-        let (names, refused, omission) = names(directory, self.limits.directory_entries);
-        self.coverage.skipped.protected += refused;
-        if let Some(omission) = omission {
-            self.omission = Some(omission);
-            if omission == BuildLimit::Unreadable {
-                self.coverage.skipped.unreadable += 1;
-            }
-        }
-        for name in &names {
-            self.ended()?;
-            self.coverage.entries_examined += 1;
-            let path = if path == "." {
-                name.clone()
-            } else {
-                format!("{path}/{name}")
-            };
-            match entry(directory, name) {
-                Entry::Skip(skipped) => {
-                    self.coverage.skipped.protected += skipped.protected;
-                    self.coverage.skipped.symlink += skipped.symlink;
-                    self.coverage.skipped.binary += skipped.binary;
-                    self.coverage.skipped.too_large += skipped.too_large;
-                    self.coverage.skipped.hard_linked += skipped.hard_linked;
-                    self.coverage.skipped.unreadable += skipped.unreadable;
-                    self.coverage.skipped.other += skipped.other;
-                }
-                Entry::File { bytes } => self.file(directory, name, &path, bytes)?,
-                Entry::Directory => {
-                    if SKIPPED_DIRECTORY_NAMES.contains(&name.as_str()) {
-                        self.coverage.skipped.other += 1;
-                        continue;
-                    }
-                    if depth == self.limits.depth {
-                        self.omission = Some(BuildLimit::Depth);
-                        continue;
-                    }
-                    let entered = workspace
-                        .subdirectory(directory, name)
-                        .ok()
-                        .filter(|child| {
-                            child
-                                .metadata()
-                                .is_ok_and(|metadata| metadata.dev() == self.device)
-                        });
-                    match entered {
-                        Some(child) => self.directory(workspace, &child, &path, depth + 1)?,
-                        None => self.coverage.skipped.unreadable += 1,
-                    }
-                }
-            }
-        }
-        Ok(())
+        walk_directory(
+            workspace,
+            directory,
+            path,
+            depth,
+            self.device,
+            self.limits,
+            self,
+        )
     }
 
     /// Indexes the file `name` of `directory` at `path`, of `bytes` bytes as

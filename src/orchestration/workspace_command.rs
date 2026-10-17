@@ -652,7 +652,7 @@ pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
 
 /// The tools of an execution that may read, write and build `workspace`:
 /// `workspace_read_file`, `workspace_write_file`, `workspace_run_command`,
-/// `workspace_list_directory`, `workspace_search`, `workspace_index_query` and
+/// `workspace_list_directory`, `workspace_search`, `workspace_code` and
 /// lazy `workspace_fts_search`, registered in a registry of their own and authorized
 /// there, with [`coding_limits`]. Commands get the environment
 /// OCG was started with, filtered, and run for at most [`COMMAND_TIMEOUT`].
@@ -677,10 +677,11 @@ pub(crate) fn code_tools_with(
     workspace_write::register(&registry, workspace.clone())?;
     register(&registry, workspace.clone(), environment, timeout)?;
     workspace_discovery::register(&registry, workspace.clone())?;
-    crate::orchestration::workspace_index_query::register(
+    crate::orchestration::workspace_code::register(
         &registry,
         workspace.clone(),
         limits.max_tool_result_bytes,
+        timeout,
     )?;
     let mut names = vec![
         workspace_read::TOOL_NAME,
@@ -688,7 +689,7 @@ pub(crate) fn code_tools_with(
         TOOL_NAME,
         workspace_discovery::LIST_TOOL_NAME,
         workspace_discovery::SEARCH_TOOL_NAME,
-        crate::orchestration::workspace_index_query::TOOL_NAME,
+        crate::orchestration::workspace_code::TOOL_NAME,
     ];
     super::workspace_fts::register(&registry, workspace.clone())?;
     names.push(super::workspace_fts::TOOL_NAME);
@@ -923,7 +924,7 @@ mod tests {
                 TOOL_NAME,
                 workspace_discovery::LIST_TOOL_NAME,
                 workspace_discovery::SEARCH_TOOL_NAME,
-                crate::orchestration::workspace_index_query::TOOL_NAME,
+                crate::orchestration::workspace_code::TOOL_NAME,
                 super::super::workspace_fts::TOOL_NAME,
             ]
         );
@@ -974,9 +975,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_index_query_and_search_tools_coexist_with_default_fts() {
+    fn workspace_code_and_search_tools_coexist_with_default_fts() {
         use crate::openai_compatible::CompletedToolCall;
-        use crate::orchestration::{workspace_fts, workspace_index_query};
+        use crate::orchestration::{workspace_code, workspace_fts};
 
         const CHILD: &str = "OCG_TEST_FTS_REGISTRATION_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -985,7 +986,7 @@ mod tests {
                 command
                     .args([
                         "--exact",
-                        "orchestration::workspace_command::tests::workspace_index_query_and_search_tools_coexist_with_default_fts",
+                        "orchestration::workspace_command::tests::workspace_code_and_search_tools_coexist_with_default_fts",
                         "--nocapture",
                     ])
                     .env(CHILD, "1");
@@ -1020,11 +1021,7 @@ mod tests {
                 .iter()
                 .any(|name| name == workspace_discovery::SEARCH_TOOL_NAME)
         );
-        assert!(
-            names
-                .iter()
-                .any(|name| name == workspace_index_query::TOOL_NAME)
-        );
+        assert!(names.iter().any(|name| name == workspace_code::TOOL_NAME));
         assert!(names.iter().any(|name| name == workspace_fts::TOOL_NAME));
         assert_eq!(names.len(), 7);
         for (name, arguments, version) in [
@@ -1034,14 +1031,14 @@ mod tests {
                 "workspace_search-1",
             ),
             (
-                workspace_index_query::TOOL_NAME,
-                json!({"path": "source.rs", "operation": "outline"}),
-                "workspace_index_query-1",
+                workspace_code::TOOL_NAME,
+                json!({"queries": [{"path": "source.rs", "op": "outline"}]}),
+                "workspace_code-1",
             ),
             (
-                workspace_index_query::TOOL_NAME,
-                json!({"path": "source.rs", "operation": "syntax_errors"}),
-                "workspace_index_query-1",
+                workspace_code::TOOL_NAME,
+                json!({"queries": [{"path": "source.rs", "op": "errors"}]}),
+                "workspace_code-1",
             ),
             (
                 workspace_fts::TOOL_NAME,
@@ -1061,11 +1058,13 @@ mod tests {
             assert_eq!(dispatch.effect, ToolEffect::ReadOnly);
             let result = on_ntex(async move { dispatch.handler.call(dispatch.arguments).await })
                 .expect("tool result");
-            if name == workspace_index_query::TOOL_NAME {
-                if result["operation"] == "outline" {
-                    assert_eq!(result["symbols"][0]["name"], "needle");
+            if name == workspace_code::TOOL_NAME {
+                if arguments["queries"][0]["op"] == "outline" {
+                    assert_eq!(result["counts"][0]["found"], 1);
+                    assert!(result["text"].as_str().expect("text").contains("needle"));
                 } else {
-                    assert!(result["errors"].as_array().expect("errors").is_empty());
+                    assert_eq!(result["counts"][0]["found"], 0);
+                    assert_eq!(result["counts"][0]["files"], 1);
                 }
             } else if name == workspace_discovery::SEARCH_TOOL_NAME {
                 assert_eq!(result["files"][0]["path"], "source.rs");

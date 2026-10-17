@@ -7,13 +7,13 @@ pub mod governor;
 pub(crate) mod scheduler;
 pub(crate) mod tools;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+pub mod workspace_code;
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 pub mod workspace_command;
 #[cfg(unix)]
 pub mod workspace_discovery;
 #[cfg(unix)]
 pub mod workspace_fts;
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-pub mod workspace_index_query;
 #[cfg(unix)]
 pub mod workspace_read;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
