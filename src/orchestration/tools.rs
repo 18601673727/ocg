@@ -86,11 +86,6 @@ pub(crate) trait ToolHandler: Send + Sync {
     fn stop(&self) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
         Box::pin(async { Ok(()) })
     }
-
-    /// Stops any process retained for the remainder of the Job before finalization.
-    fn stop_before_finalize(&self) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
-        self.stop()
-    }
 }
 
 /// What a failing handler knows of its effect.
@@ -338,24 +333,6 @@ pub(crate) struct Dispatch {
 }
 
 impl ToolOffer {
-    pub(crate) async fn stop_before_finalize(&self) -> Result<(), ToolFailure> {
-        let handlers = {
-            let registry = self.registry.lock();
-            self.tools
-                .iter()
-                .filter_map(|(name, generation)| {
-                    current(&registry, name, *generation)
-                        .ok()
-                        .map(|tool| tool.handler.clone())
-                })
-                .collect::<Vec<_>>()
-        };
-        for handler in handlers {
-            handler.stop_before_finalize().await?;
-        }
-        Ok(())
-    }
-
     /// The definitions to send, read from the registry now. Every selected
     /// tool must still be the registration selected, and still authorized.
     ///

@@ -691,13 +691,7 @@ pub(crate) fn code_tools_with(
         crate::orchestration::workspace_index_query::TOOL_NAME,
     ];
     super::workspace_fts::register(&registry, workspace.clone())?;
-    super::workspace_lsp::register(
-        &registry,
-        workspace,
-        super::workspace_lsp::Servers::from_environment(),
-    )?;
     names.push(super::workspace_fts::TOOL_NAME);
-    names.push(super::workspace_lsp::TOOL_NAME);
     for name in &names {
         registry.authorize(name)?;
     }
@@ -931,7 +925,6 @@ mod tests {
                 workspace_discovery::SEARCH_TOOL_NAME,
                 crate::orchestration::workspace_index_query::TOOL_NAME,
                 super::super::workspace_fts::TOOL_NAME,
-                super::super::workspace_lsp::TOOL_NAME,
             ]
         );
         assert_eq!(
@@ -1033,7 +1026,7 @@ mod tests {
                 .any(|name| name == workspace_index_query::TOOL_NAME)
         );
         assert!(names.iter().any(|name| name == workspace_fts::TOOL_NAME));
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 7);
         for (name, arguments, version) in [
             (
                 workspace_discovery::SEARCH_TOOL_NAME,

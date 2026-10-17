@@ -191,10 +191,6 @@ impl Process {
         })
     }
 
-    pub(crate) fn request_stop(&self) {
-        self.stopped.store(true, Ordering::Release);
-    }
-
     pub(crate) fn take_output(
         &mut self,
     ) -> (
@@ -202,20 +198,6 @@ impl Process {
         Option<std::process::ChildStderr>,
     ) {
         (self.child.stdout.take(), self.child.stderr.take())
-    }
-
-    pub(crate) fn take_io(
-        &mut self,
-    ) -> (
-        Option<std::process::ChildStdin>,
-        Option<std::process::ChildStdout>,
-        Option<std::process::ChildStderr>,
-    ) {
-        (
-            self.child.stdin.take(),
-            self.child.stdout.take(),
-            self.child.stderr.take(),
-        )
     }
 
     pub(crate) fn finish(
@@ -271,28 +253,6 @@ where
         .recv_async()
         .await
         .map_err(|_| "the blocking task ended without a result")
-}
-
-/// Runs already-accounted-for blocking cleanup without acquiring another
-/// permit. The process being cleaned up owns its permit until this finishes.
-pub(crate) async fn run_unpermitted<T, F>(work: F) -> Result<T, &'static str>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let (send, receive) = flume::bounded(1);
-    thread::Builder::new()
-        .name("ocg-blocking-cleanup".to_owned())
-        .spawn(move || {
-            if send.send(work()).is_err() {
-                log::debug!("blocking cleanup result was dropped");
-            }
-        })
-        .map_err(|_| "the blocking cleanup could not be started")?;
-    receive
-        .recv_async()
-        .await
-        .map_err(|_| "the blocking cleanup ended without a result")
 }
 
 fn signal(group: Pid, signal: Signal) {

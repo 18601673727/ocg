@@ -1487,7 +1487,6 @@ pub(crate) async fn run_provider_job(
     if let Some(Err(error)) = tools.map(|tools| tools.limits.validate()) {
         // Nothing was sent, so nothing of a Provider is recorded.
         let stopped = Stopped::from(ToolLoopStop::InvalidLimits(error));
-        stop_tools_before_finalize(tools).await?;
         return stop_tool_loop(run, sink, None, stopped).await;
     }
     let mut budget = ToolBudget::default();
@@ -1495,7 +1494,6 @@ pub(crate) async fn run_provider_job(
         let result = match exchange(&conversation, &mut sink).await {
             Ok(result) if result.requests_tools() => result,
             execution => {
-                stop_tools_before_finalize(tools).await?;
                 return finish_provider_job(
                     run.database,
                     run.executor,
@@ -1542,7 +1540,6 @@ pub(crate) async fn run_provider_job(
         let (answers, next) = match (answered, next) {
             (Ok(answers), Some(next)) => (answers, next),
             (Err(stopped), _) => {
-                stop_tools_before_finalize(tools).await?;
                 return stop_tool_loop(run, sink, Some(&result), stopped).await;
             }
             (Ok(_), None) => unreachable!("calls are answered only when a request may follow"),
@@ -1563,20 +1560,6 @@ pub(crate) async fn run_provider_job(
         }
         sink.request = next;
     }
-}
-
-async fn stop_tools_before_finalize(
-    tools: Option<&ToolExecution>,
-) -> Result<(), ExecutionRuntimeError> {
-    if let Some(tools) = tools
-        && let Err(error) = tools.offer.stop_before_finalize().await
-    {
-        return Err(ExecutionRuntimeError::Provider(format!(
-            "tool process cleanup failed before Job finalization: {}",
-            error.message
-        )));
-    }
-    Ok(())
 }
 
 /// What one Job's calls have used of their limits.

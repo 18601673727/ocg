@@ -114,10 +114,7 @@ pub struct ToolAdmission {
 
 impl ToolAdmission {
     pub fn spawns(&self) -> bool {
-        matches!(
-            self.handler_version.as_str(),
-            "workspace_run_command-1" | "workspace_lsp_query-2"
-        )
+        matches!(self.handler_version.as_str(), "workspace_run_command-1")
     }
 }
 
