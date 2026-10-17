@@ -57,7 +57,10 @@ impl SchedulerWakeSubscription {
 
 pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
     match kind {
-        OperationKind::CreateJobWithInput
+        OperationKind::CreateExecutionPool
+        | OperationKind::SetExecutionPoolEnabled
+        | OperationKind::SetExecutionPoolProfile
+        | OperationKind::CreateJobWithInput
         | OperationKind::RetryJob
         | OperationKind::AssignJobExecutor
         // Starts consume capacity; they do not announce a released slot.

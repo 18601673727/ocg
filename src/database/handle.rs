@@ -1498,3 +1498,48 @@ impl DatabaseHandle {
         .await
     }
 }
+
+impl DatabaseHandle {
+    pub async fn create_execution_pool(
+        &self,
+        pool: NewExecutionPool,
+    ) -> Result<ExecutionPoolId, DatabaseError> {
+        self.submit(|reply| Command::CreateExecutionPool { pool, reply })
+            .await
+    }
+
+    pub async fn set_execution_pool_enabled(
+        &self,
+        id: ExecutionPoolId,
+        enabled: bool,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::SetExecutionPoolEnabled { id, enabled, reply })
+            .await
+    }
+
+    pub async fn set_execution_pool_profile(
+        &self,
+        id: ExecutionPoolId,
+        profile: ProfileId,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::SetExecutionPoolProfile { id, profile, reply })
+            .await
+    }
+
+    pub async fn execution_pool(
+        &self,
+        id: ExecutionPoolId,
+    ) -> Result<Option<ExecutionPool>, DatabaseError> {
+        self.read(move |database| storage::read_execution_pool(database, id))
+            .await
+    }
+
+    pub async fn execution_pools(
+        &self,
+        before: Option<ExecutionPoolId>,
+        limit: usize,
+    ) -> Result<Vec<ExecutionPool>, DatabaseError> {
+        self.read(move |database| storage::read_execution_pools(database, before, limit))
+            .await
+    }
+}

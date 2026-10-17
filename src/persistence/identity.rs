@@ -52,6 +52,7 @@ record_id_type!(JobId, "job");
 record_id_type!(JobInputId, "job_input");
 record_id_type!(JobOutputId, "job_output");
 record_id_type!(ExecutorId, "executor");
+record_id_type!(ExecutionPoolId, "execution_pool");
 record_id_type!(ProjectId, "project");
 record_id_type!(ProfileId, "profile");
 record_id_type!(AgentId, "agent");
@@ -116,6 +117,7 @@ pub enum RecordRef {
     JobInput(JobInputId),
     JobOutput(JobOutputId),
     Executor(ExecutorId),
+    ExecutionPool(ExecutionPoolId),
     Project(ProjectId),
     Profile(ProfileId),
     Agent(AgentId),
@@ -132,6 +134,7 @@ impl fmt::Display for RecordRef {
             Self::JobInput(id) => id.fmt(f),
             Self::JobOutput(id) => id.fmt(f),
             Self::Executor(id) => id.fmt(f),
+            Self::ExecutionPool(id) => id.fmt(f),
             Self::Project(id) => id.fmt(f),
             Self::Profile(id) => id.fmt(f),
             Self::Agent(id) => id.fmt(f),

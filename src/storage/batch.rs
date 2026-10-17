@@ -825,6 +825,7 @@ impl Batch {
         links: &ProfileLinks,
     ) -> Result<(), BatchError> {
         match (links, row.config.kind()) {
+            (ProfileLinks::ExecutionPool, ProfileKind::ExecutionPool) => Ok(()),
             (ProfileLinks::Llm { provider }, ProfileKind::Llm) => {
                 self.link_profile_provider(row.id, *provider)
             }

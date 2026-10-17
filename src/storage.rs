@@ -53,19 +53,20 @@ use crate::openai_compatible::{
 use crate::persistence::{
     AgentConfig, AgentId, AgentRecord, AttachmentCleanup, AttachmentId, AttachmentOrigin,
     AttachmentRecord, AuthorizationBasis, AvailabilityObservation, AvailabilityStatId,
-    AvailabilityStatRecord, CleanupKind, ContentDigest, DependencyCondition, DependencyState,
-    EffectConclusion, ExecutionConfiguration, ExecutionMode, ExecutorId, ExecutorRecord,
-    ExecutorType, FrozenExecutionConfig, FrozenLlmConfig, JobId, JobInputId, JobInputRecord,
-    JobOutputId, JobOutputRecord, JobRecord, LlmConfig, LlmParameters, LlmProviderId,
-    LlmProviderRecord, LlmTarget, LlmTransport, Measurements, MetricsId, MetricsRecord,
-    ModelCapability, NotInvokedReason, ObservationCursor, ObservationFilter, ObservationPage,
-    ObservedModel, ObservedModelChoice, ObservedModelFilter, ObservedModelPage, OperationId,
-    OperationKind, OperationMarker, OutputKind, PendingJobKey, PendingJobsPage, ProfileConfig,
-    ProfileEditability, ProfileId, ProfileKind, ProfileRecord, ProjectId, ProjectRecord,
-    ProviderSnapshot, RecordRef, Recorded, RequestFingerprint, RequestNumber, RequestRef,
-    SubmissionKey, SubmissionRecord, SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef,
-    ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation,
-    UncertainCause, Violation, WithheldReason, WrongProfileKind,
+    AvailabilityStatRecord, CapabilitySet, CleanupKind, ContentDigest, DependencyCondition,
+    DependencyState, EffectConclusion, ExecutionConfiguration, ExecutionMode, ExecutionOperation,
+    ExecutionPool, ExecutionPoolConfig, ExecutionPoolId, ExecutorId, ExecutorRecord, ExecutorType,
+    FrozenExecutionConfig, FrozenLlmConfig, JobId, JobInputId, JobInputRecord, JobOutputId,
+    JobOutputRecord, JobRecord, LlmConfig, LlmParameters, LlmProviderId, LlmProviderRecord,
+    LlmTarget, LlmTransport, Measurements, MetricsId, MetricsRecord, ModelCapability,
+    NotInvokedReason, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
+    ObservedModelChoice, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind,
+    OperationMarker, OutputKind, PendingJobKey, PendingJobsPage, ProfileConfig, ProfileEditability,
+    ProfileId, ProfileKind, ProfileRecord, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef,
+    Recorded, RequestFingerprint, RequestNumber, RequestRef, SubmissionKey, SubmissionRecord,
+    SubmittedConfiguration, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
+    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause, Violation,
+    WithheldReason, WrongProfileKind,
 };
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
@@ -77,7 +78,9 @@ mod codec;
 mod integrity;
 mod observations;
 mod open;
+mod pools;
 mod reads;
+pub(crate) use pools::{read_execution_pool, read_execution_pools};
 mod rows;
 mod schema;
 mod sequences;

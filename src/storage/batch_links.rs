@@ -613,6 +613,7 @@ pub(super) fn profile_jobs_index(kind: ProfileKind) -> PairSet {
     match kind {
         ProfileKind::Agent => AGENT_PROFILE_JOBS,
         ProfileKind::Llm => LLM_PROFILE_JOBS,
+        ProfileKind::ExecutionPool => POOL_PROFILE_JOBS,
     }
 }
 

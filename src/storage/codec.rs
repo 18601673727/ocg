@@ -24,6 +24,7 @@ pub(super) const TAG_TOKEN_MINUTE: u8 = 19;
 pub(super) const TAG_TOOL_EVIDENCE: u8 = 20;
 pub(super) const TAG_ATTACHMENT: u8 = 21;
 pub(super) const TAG_SUBMISSION: u8 = 22;
+pub(super) const TAG_EXECUTION_POOL: u8 = 23;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 
@@ -104,12 +105,17 @@ impl Enc {
             RecordRef::Metrics(id) => (11, id.get()),
             RecordRef::AvailabilityStat(id) => (12, id.get()),
             RecordRef::Attachment(id) => (13, id.get()),
+            RecordRef::ExecutionPool(id) => (14, id.get()),
         };
         self.u8(tag);
         self.u64(id);
     }
     pub(super) fn profile_config(&mut self, config: &ProfileConfig) {
         match config {
+            ProfileConfig::ExecutionPool(pool) => {
+                self.u8(3);
+                self.pool_config(pool);
+            }
             ProfileConfig::Agent(agent) => {
                 self.u8(1);
                 self.agent_config(agent);
@@ -307,6 +313,7 @@ impl<'a> Dec<'a> {
             11 => RecordRef::Metrics(MetricsId::new(id)),
             12 => RecordRef::AvailabilityStat(AvailabilityStatId::new(id)),
             13 => RecordRef::Attachment(AttachmentId::new(id)),
+            14 => RecordRef::ExecutionPool(ExecutionPoolId::new(id)),
             _ => return Err(StorageError::corrupted("invalid record reference")),
         })
     }
@@ -314,6 +321,7 @@ impl<'a> Dec<'a> {
         Ok(match self.u8()? {
             1 => ProfileConfig::Agent(self.agent_config()?),
             2 => ProfileConfig::Llm(self.llm_config()?),
+            3 => ProfileConfig::ExecutionPool(self.pool_config()?),
             _ => {
                 return Err(StorageError::corrupted(
                     "invalid Profile configuration kind",
@@ -440,6 +448,8 @@ codes!(OperationKind {
     OperationKind::RecordToolDecision = 27, OperationKind::RecordToolOutcome = 28,
     OperationKind::ReconcileToolEffect = 29, OperationKind::CreateAttachment = 30,
     OperationKind::CleanupAttachment = 31,
+    OperationKind::CreateExecutionPool = 32, OperationKind::SetExecutionPoolEnabled = 33,
+    OperationKind::SetExecutionPoolProfile = 34,
 });
 codes!(ToolCallRefusal {
     ToolCallRefusal::Malformed = 1, ToolCallRefusal::ConflictingIdentity = 2, ToolCallRefusal::AmbiguousIdentity = 3,
@@ -453,3 +463,44 @@ codes!(UncertainCause { UncertainCause::TimedOut = 1, UncertainCause::Cancelled 
 codes!(EffectConclusion { EffectConclusion::Applied = 1, EffectConclusion::NotApplied = 2 });
 codes!(AttachmentOrigin { AttachmentOrigin::UserProvided = 1, AttachmentOrigin::ModelProduced = 2 });
 codes!(CleanupKind { CleanupKind::Manual = 1, CleanupKind::Automatic = 2 });
+
+impl Enc {
+    pub(super) fn pool_config(&mut self, config: &ExecutionPoolConfig) {
+        self.u32(config.concurrency_limit.get());
+        self.u32(config.capabilities.operations.len() as u32);
+        for operation in &config.capabilities.operations {
+            self.u8(match operation {
+                ExecutionOperation::LlmRequest => 1,
+            });
+        }
+        self.transports(&config.capabilities.llm_protocols);
+    }
+}
+
+impl Dec<'_> {
+    pub(super) fn pool_config(&mut self) -> DecodeResult<ExecutionPoolConfig> {
+        let concurrency_limit = std::num::NonZeroU32::new(self.u32()?)
+            .ok_or_else(|| StorageError::corrupted("zero Pool concurrency"))?;
+        let count = self.u32()?;
+        if count > 1 {
+            return Err(StorageError::corrupted("invalid Pool operation set"));
+        }
+        let mut operations = BTreeSet::new();
+        for _ in 0..count {
+            let operation = match self.u8()? {
+                1 => ExecutionOperation::LlmRequest,
+                _ => return Err(StorageError::corrupted("unknown Pool operation")),
+            };
+            if !operations.insert(operation) {
+                return Err(StorageError::corrupted("duplicate Pool operation"));
+            }
+        }
+        Ok(ExecutionPoolConfig {
+            concurrency_limit,
+            capabilities: CapabilitySet {
+                operations,
+                llm_protocols: self.transports()?,
+            },
+        })
+    }
+}

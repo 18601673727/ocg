@@ -1027,8 +1027,15 @@ pub(super) fn validate_llm_config(batch: &mut Batch, config: &LlmConfig) -> Resu
 }
 
 /// Validates a Profile's payload and the references that define it.
-pub(super) fn profile_parts(batch: &mut Batch, config: NewProfileConfig) -> Result<(ProfileConfig, ProfileLinks), BatchError> {
+pub(super) fn profile_parts(
+    batch: &mut Batch,
+    config: NewProfileConfig,
+) -> Result<(ProfileConfig, ProfileLinks), BatchError> {
     Ok(match config {
+        NewProfileConfig::ExecutionPool(config) => (
+            ProfileConfig::ExecutionPool(config),
+            ProfileLinks::ExecutionPool,
+        ),
         NewProfileConfig::Agent { config, llm_targets } => {
             for (index, target) in llm_targets.iter().enumerate() {
                 if llm_targets[..index].contains(target) {
@@ -1193,4 +1200,49 @@ pub(crate) fn record_availability_stat(batch: &mut Batch, stat: NewAvailabilityS
         stat.job,
     )?;
     Ok((id, MarkerSubjects::created(RecordRef::Job(stat.job), RecordRef::AvailabilityStat(id))))
+}
+
+pub(crate) fn create_execution_pool(
+    batch: &mut Batch,
+    new: NewExecutionPool,
+) -> OpResult<ExecutionPoolId> {
+    batch.require_profile_kind(new.profile, ProfileKind::ExecutionPool)?;
+    let id = ExecutionPoolId(batch.next_id(crate::storage::Sequence::ExecutionPool)?);
+    let now = batch.now();
+    batch.insert_execution_pool(&ExecutionPool {
+        id,
+        name: new.name,
+        profile: new.profile,
+        enabled: new.enabled,
+        created_at: now,
+        updated_at: now,
+    })?;
+    Ok((
+        id,
+        MarkerSubjects::created(RecordRef::ExecutionPool(id), RecordRef::ExecutionPool(id)),
+    ))
+}
+
+pub(crate) fn set_execution_pool_enabled(
+    batch: &mut Batch,
+    id: ExecutionPoolId,
+    enabled: bool,
+) -> OpResult<()> {
+    let mut pool = batch.require_execution_pool(id)?;
+    pool.enabled = enabled;
+    pool.updated_at = batch.now();
+    batch.put_execution_pool(&pool)?;
+    Ok(((), MarkerSubjects::addressed(RecordRef::ExecutionPool(id))))
+}
+
+pub(crate) fn set_execution_pool_profile(
+    batch: &mut Batch,
+    id: ExecutionPoolId,
+    profile: ProfileId,
+) -> OpResult<()> {
+    let mut pool = batch.require_execution_pool(id)?;
+    pool.profile = profile;
+    pool.updated_at = batch.now();
+    batch.put_execution_pool(&pool)?;
+    Ok(((), MarkerSubjects::addressed(RecordRef::ExecutionPool(id))))
 }

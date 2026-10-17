@@ -71,6 +71,9 @@ pub enum OperationKind {
     CreateAttachment,
     /// The cleanup of an available Attachment: its kind and time, together.
     CleanupAttachment,
+    CreateExecutionPool,
+    SetExecutionPoolEnabled,
+    SetExecutionPoolProfile,
 }
 
 /// Written in the same transaction as every accepted mutation, so its

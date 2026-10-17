@@ -393,6 +393,7 @@ pub struct AgentConfig {
 pub enum ProfileKind {
     Agent,
     Llm,
+    ExecutionPool,
 }
 
 impl fmt::Display for ProfileKind {
@@ -400,6 +401,7 @@ impl fmt::Display for ProfileKind {
         f.write_str(match self {
             Self::Agent => "Agent",
             Self::Llm => "LLM",
+            Self::ExecutionPool => "ExecutionPool",
         })
     }
 }
@@ -409,6 +411,7 @@ impl fmt::Display for ProfileKind {
 pub enum ProfileConfig {
     Agent(AgentConfig),
     Llm(LlmConfig),
+    ExecutionPool(ExecutionPoolConfig),
 }
 
 impl ProfileConfig {
@@ -416,6 +419,7 @@ impl ProfileConfig {
         match self {
             Self::Agent(_) => ProfileKind::Agent,
             Self::Llm(_) => ProfileKind::Llm,
+            Self::ExecutionPool(_) => ProfileKind::ExecutionPool,
         }
     }
 }
@@ -428,6 +432,7 @@ pub enum NewProfileConfig {
     /// They form a set: no default or fallback order is implied.
     Agent { config: AgentConfig, llm_targets: Vec<ProfileId> },
     Llm { provider: LlmProviderId, config: LlmConfig },
+    ExecutionPool(ExecutionPoolConfig),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -487,7 +492,7 @@ impl ProfileVariant for AgentConfig {
     fn split(record: ProfileRecord) -> Option<(Self, Vec<ProfileId>)> {
         match record.config {
             ProfileConfig::Agent(config) => Some((config, record.llm_targets)),
-            ProfileConfig::Llm(_) => None,
+            ProfileConfig::Llm(_) | ProfileConfig::ExecutionPool(_) => None,
         }
     }
 }
@@ -666,4 +671,59 @@ pub struct MetricsRecord {
     /// stored the record began, not when its commit completed. Wall-clock
     /// time is not monotonic. It is never used in place of `observed_at`.
     pub recorded_at: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExecutionOperation {
+    LlmRequest,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CapabilitySet {
+    pub operations: BTreeSet<ExecutionOperation>,
+    pub llm_protocols: BTreeSet<LlmTransport>,
+}
+
+impl CapabilitySet {
+    pub fn supports(&self, operation: ExecutionOperation, protocol: Option<LlmTransport>) -> bool {
+        self.operations.contains(&operation)
+            && protocol.is_none_or(|protocol| self.llm_protocols.contains(&protocol))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionPoolConfig {
+    pub concurrency_limit: NonZeroU32,
+    pub capabilities: CapabilitySet,
+}
+
+impl ProfileVariant for ExecutionPoolConfig {
+    const KIND: ProfileKind = ProfileKind::ExecutionPool;
+    type Links = ();
+
+    fn split(record: ProfileRecord) -> Option<(Self, ())> {
+        match record.config {
+            ProfileConfig::ExecutionPool(config) => Some((config, ())),
+            _ => None,
+        }
+    }
+}
+
+pub type ExecutionPoolProfile = Profile<ExecutionPoolConfig>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewExecutionPool {
+    pub name: String,
+    pub profile: ProfileId,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionPool {
+    pub id: ExecutionPoolId,
+    pub name: String,
+    pub profile: ProfileId,
+    pub enabled: bool,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }

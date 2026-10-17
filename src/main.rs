@@ -4,6 +4,7 @@ use ocg::control_plane::ControlPlaneConfig;
 use ocg::data_directory::DataDirectory;
 
 mod llm_target;
+mod pool_cli;
 #[cfg(unix)]
 mod workspace_job;
 
@@ -33,6 +34,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
     if let Some(command) = command.as_deref() {
+        if command == "pool" {
+            let directory = DataDirectory::from_environment()?;
+            return pool_cli::run(&directory, arguments.collect());
+        }
         #[cfg(unix)]
         if let Some(mode) = workspace_job::Mode::of(command) {
             let image = if mode.takes_image() {

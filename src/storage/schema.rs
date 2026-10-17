@@ -50,7 +50,7 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// behind its back, so its entries are never trusted: every opening discards
 /// the table and rebuilds it from the Job table. Format 14 requires this
 /// table; a version 13 file is refused before that rebuild could run for it.
-pub(crate) const FORMAT_VERSION: u32 = 14;
+pub(crate) const FORMAT_VERSION: u32 = 15;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PENDING_JOBS: u64 = crate::persistence::MAX_PENDING_JOBS;
@@ -85,6 +85,7 @@ pub(super) const PENDING_JOBS: TableDefinition<(i64, u64), ()> =
 pub(super) const JOB_INPUTS: Records = TableDefinition::new("job_input");
 pub(super) const JOB_OUTPUTS: Records = TableDefinition::new("job_output");
 pub(super) const EXECUTORS: Records = TableDefinition::new("executor");
+pub(super) const EXECUTION_POOLS: Records = TableDefinition::new("execution_pool");
 pub(super) const PROJECTS: Records = TableDefinition::new("project");
 pub(super) const PROFILES: Records = TableDefinition::new("profile");
 pub(super) const AGENTS: Records = TableDefinition::new("agent");
@@ -137,6 +138,7 @@ pub(super) const AGENT_PROFILE_JOBS: PairSet = TableDefinition::new("applies_pro
 /// without an Agent Profile has only this one.
 pub(super) const RUNS_LLM_PROFILE: Link = TableDefinition::new("runs_llm_profile");
 pub(super) const LLM_PROFILE_JOBS: PairSet = TableDefinition::new("runs_llm_profile_in");
+pub(super) const POOL_PROFILE_JOBS: PairSet = TableDefinition::new("pool_profile_jobs");
 /// (transport code, Executor): an index of the transports in each Executor
 /// record, written with the record at registration.
 pub(super) const TRANSPORT_EXECUTORS: TableDefinition<(u8, u64), ()> =

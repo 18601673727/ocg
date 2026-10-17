@@ -69,6 +69,20 @@ pub(super) struct Envelope {
 }
 
 pub(super) enum Command {
+    CreateExecutionPool {
+        pool: NewExecutionPool,
+        reply: Reply<ExecutionPoolId>,
+    },
+    SetExecutionPoolEnabled {
+        id: ExecutionPoolId,
+        enabled: bool,
+        reply: Reply<()>,
+    },
+    SetExecutionPoolProfile {
+        id: ExecutionPoolId,
+        profile: ProfileId,
+        reply: Reply<()>,
+    },
     BeginCoreLogCleanup {
         owner: JobId,
         executor: ExecutorId,
@@ -219,6 +233,30 @@ impl Command {
     ) -> Executed {
         use OperationKind as Kind;
         match self {
+            Self::CreateExecutionPool { pool, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateExecutionPool,
+                reply,
+                |batch| persistence::create_execution_pool(batch, pool),
+            ),
+            Self::SetExecutionPoolEnabled { id, enabled, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::SetExecutionPoolEnabled,
+                reply,
+                |batch| persistence::set_execution_pool_enabled(batch, id, enabled),
+            ),
+            Self::SetExecutionPoolProfile { id, profile, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::SetExecutionPoolProfile,
+                reply,
+                |batch| persistence::set_execution_pool_profile(batch, id, profile),
+            ),
             Self::BeginCoreLogCleanup {
                 owner,
                 executor,
@@ -509,6 +547,8 @@ impl Command {
     /// rather than wraps, so an absurd payload fails the space check.
     pub(super) fn expected_write_bytes(&self) -> u64 {
         let payload = match self {
+            Self::CreateExecutionPool { pool, .. } => byte_count(pool.name.len()),
+            Self::SetExecutionPoolEnabled { .. } | Self::SetExecutionPoolProfile { .. } => 0,
             Self::BeginCoreLogCleanup { started, .. } => {
                 output_bytes(&started.summary, &started.code, &started.value).saturating_add(256)
             }
@@ -548,6 +588,7 @@ impl Command {
                 byte_count(profile.name.len()).saturating_add(match &profile.config {
                     NewProfileConfig::Agent { config, .. } => text_bytes(&config.instructions),
                     NewProfileConfig::Llm { config, .. } => byte_count(config.model.len()),
+                    NewProfileConfig::ExecutionPool(_) => 32,
                 })
             }
             Self::CreateAgent { agent, .. } => byte_count(agent.name.len()),
@@ -598,6 +639,9 @@ impl Command {
     /// waiting and knows nothing was applied.
     pub(super) fn refuse(self, error: impl Fn() -> DatabaseError) {
         match self {
+            Self::CreateExecutionPool { reply, .. } => refuse(reply, error),
+            Self::SetExecutionPoolEnabled { reply, .. }
+            | Self::SetExecutionPoolProfile { reply, .. } => refuse(reply, error),
             Self::BeginCoreLogCleanup { reply, .. } => refuse(reply, error),
             Self::SaveJobInput { reply, .. } => refuse(reply, error),
             Self::CreateJobWithInput { reply, .. }

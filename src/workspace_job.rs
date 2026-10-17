@@ -371,7 +371,8 @@ async fn submit(
         credential_ref: config.credential_ref,
         capabilities: config.mode.capabilities(),
     };
-    let (executor, llm_profile) = targets(database, &target).await?;
+    let (executor, llm_profile, pool) = targets(database, &target).await?;
+    eprintln!("OCG execution Pool: {pool}");
     let mut attachments = Vec::new();
     if let Some(image) = image {
         attachments.push(database.create_user_attachment(image).await?);

@@ -408,6 +408,7 @@ impl ProfileRow {
 /// The references that define a Profile, written with it and replaced only
 /// together with its payload.
 pub(crate) enum ProfileLinks {
+    ExecutionPool,
     Agent { llm_targets: Vec<ProfileId> },
     Llm { provider: LlmProviderId },
 }

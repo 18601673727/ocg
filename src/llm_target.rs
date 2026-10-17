@@ -12,8 +12,10 @@ use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseError, DatabaseHandle};
 use ocg::host::{self, HostError};
 use ocg::persistence::{
-    AgentConfig, ExecutorId, ExecutorType, LlmConfig, LlmParameters, LlmTransport, ModelCapability,
-    NewExecutor, NewLlmProvider, NewProfile, NewProfileConfig, ProfileConfig, ProfileId,
+    AgentConfig, CapabilitySet, ExecutionOperation, ExecutionPoolConfig, ExecutionPoolId,
+    ExecutorId, ExecutorType, LlmConfig, LlmParameters, LlmTransport, ModelCapability,
+    NewExecutionPool, NewExecutor, NewLlmProvider, NewProfile, NewProfileConfig, ProfileConfig,
+    ProfileId,
 };
 
 /// The command that registers the Control Plane's LLM target.
@@ -93,8 +95,9 @@ impl Target {
 pub async fn targets(
     database: &DatabaseHandle,
     target: &Target,
-) -> Result<(ExecutorId, ProfileId), DatabaseError> {
+) -> Result<(ExecutorId, ProfileId, ExecutionPoolId), DatabaseError> {
     let transport = LlmTransport::OpenAiChatCompletions;
+    let pool = provision_pool(database, &target.name, transport, None).await?;
     let existing = database
         .executors(None, 1_000)
         .await?
@@ -148,7 +151,7 @@ pub async fn targets(
         if let Some(record) = database.profile(profile).await?
             && record.config == ProfileConfig::Llm(llm.clone())
         {
-            return Ok((executor, profile));
+            return Ok((executor, profile, pool));
         }
     }
     let profile = database
@@ -160,7 +163,7 @@ pub async fn targets(
             },
         })
         .await?;
-    Ok((executor, profile))
+    Ok((executor, profile, pool))
 }
 
 /// The Agent Profile that targets `llm_profile` with no instructions of its
@@ -202,19 +205,20 @@ pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Er
     host::run_hosted(data_directory, false, move |context| async move {
         let database = context.database();
         let outcome = match targets(database, &target).await {
-            Ok((executor, llm_profile)) => agent_profile(database, llm_profile)
+            Ok((executor, llm_profile, pool)) => agent_profile(database, llm_profile)
                 .await
-                .map(|agent_profile| (executor, llm_profile, agent_profile)),
+                .map(|agent_profile| (executor, llm_profile, agent_profile, pool)),
             Err(error) => Err(error),
         };
         *slot.borrow_mut() = Some(outcome);
     })?;
-    let (executor, llm_profile, agent_profile) =
+    let (executor, llm_profile, agent_profile, pool) =
         registered.borrow_mut().take().ok_or(Error::NotRun)??;
     println!(
         "{}",
         serde_json::json!({
             "executor": executor.to_string(),
+            "pool": pool.to_string(),
             "llm_profile": llm_profile.to_string(),
             "agent_profile": agent_profile.to_string(),
         })
@@ -226,4 +230,55 @@ pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Er
 /// `control-plane` Executor.
 pub fn control_plane_target() -> Result<Target, Error> {
     Target::from_environment(CONTROL_PLANE, BTreeSet::from([ModelCapability::Chat]))
+}
+
+pub async fn provision_pool(
+    database: &DatabaseHandle,
+    name: &str,
+    protocol: LlmTransport,
+    concurrency: Option<NonZeroU32>,
+) -> Result<ExecutionPoolId, DatabaseError> {
+    let mut before = None;
+    loop {
+        let page = database.execution_pools(before, 1_000).await?;
+        for pool in &page {
+            if pool.enabled
+                && let Some(profile) = database.profile(pool.profile).await?
+                && let ProfileConfig::ExecutionPool(config) = profile.config
+                && config
+                    .capabilities
+                    .supports(ExecutionOperation::LlmRequest, Some(protocol))
+                && concurrency.is_none_or(|limit| config.concurrency_limit == limit)
+            {
+                return Ok(pool.id);
+            }
+        }
+        if page.len() < 1_000 {
+            break;
+        }
+        before = page.last().map(|pool| pool.id);
+    }
+    let profile = database
+        .create_profile(NewProfile {
+            name: name.to_owned(),
+            config: NewProfileConfig::ExecutionPool(pool_config(protocol, concurrency)),
+        })
+        .await?;
+    database
+        .create_execution_pool(NewExecutionPool {
+            name: name.to_owned(),
+            profile,
+            enabled: true,
+        })
+        .await
+}
+
+pub fn pool_config(protocol: LlmTransport, concurrency: Option<NonZeroU32>) -> ExecutionPoolConfig {
+    ExecutionPoolConfig {
+        concurrency_limit: concurrency.unwrap_or(NonZeroU32::new(16).expect("nonzero default")),
+        capabilities: CapabilitySet {
+            operations: BTreeSet::from([ExecutionOperation::LlmRequest]),
+            llm_protocols: BTreeSet::from([protocol]),
+        },
+    }
 }
