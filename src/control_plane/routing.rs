@@ -25,6 +25,9 @@ pub(super) enum Route {
     Submit,
     Admission,
     Stop(JobId),
+    AttachmentUpload,
+    Attachment(AttachmentId),
+    AttachmentContent(AttachmentId),
     SessionCreate,
     SessionStatus,
     SessionRevoke,
@@ -56,6 +59,9 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Admission
             | Route::Submit
             | Route::Stop(_)
+            | Route::AttachmentUpload
+            | Route::Attachment(_)
+            | Route::AttachmentContent(_)
             | Route::SessionStatus
             | Route::SessionRevoke,
         ) => true,
@@ -84,6 +90,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 let profile = profiles::profile_id(profile)?;
                 no_query(query).map(|()| Route::ProfileUpdate(profile))
             }
+            ["attachments"] => no_query(query).map(|()| Route::AttachmentUpload),
             ["session"] => no_query(query).map(|()| Route::SessionCreate),
             _ => Err(NOT_FOUND),
         };
@@ -99,6 +106,14 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["admissions"] => no_query(query).map(|()| Route::Admission),
         ["session"] => no_query(query).map(|()| Route::SessionStatus),
         ["profiles"] => no_query(query).map(|()| Route::Profiles),
+        ["attachments", attachment] => {
+            let attachment = attachments::attachment_id(attachment)?;
+            no_query(query).map(|()| Route::Attachment(attachment))
+        }
+        ["attachments", attachment, "content"] => {
+            let attachment = attachments::attachment_id(attachment)?;
+            no_query(query).map(|()| Route::AttachmentContent(attachment))
+        }
         ["jobs", job] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
@@ -226,6 +241,11 @@ pub(super) async fn respond(
             submissions::lookup(shared, key).await
         }
         Route::Stop(job) => submissions::stop(shared, job).await,
+        Route::AttachmentUpload => {
+            let body = read_body(payload, MAX_ATTACHMENT_UPLOAD_BYTES).await?;
+            attachments::upload(database, &body).await
+        }
+        Route::Attachment(attachment) => attachments::metadata(database, attachment).await,
         Route::SessionCreate => {
             let body = read_body(payload, browser::MAX_LOGIN_BYTES).await?;
             let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
@@ -244,5 +264,7 @@ pub(super) async fn respond(
         },
         // Answered as a stream, before any reply.
         Route::Events { .. } => Err(INTERNAL),
+        // Answered as the image itself, before any reply.
+        Route::AttachmentContent(_) => Err(INTERNAL),
     }
 }

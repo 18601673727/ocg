@@ -45,13 +45,17 @@ use super::{
     API_VERSION, DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, JOB_NOT_FOUND, Refusal, Reply,
     SHUTTING_DOWN, Shared, decimal,
 };
+use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
+use crate::openai_compatible::image::MAX_REQUEST_IMAGES;
 use crate::orchestration::execution_runtime::{
-    AdmissionError, ExecutionRuntimeError, JobStop, ProviderExecutionPlan,
+    AdmissionError, AttachmentImageError, ExecutionRuntimeError, JobStop, ProviderExecutionPlan,
+    attachment_images,
 };
 use crate::persistence::{
-    ExecutionConfiguration, ExecutionMode, ExecutorId, JobId, JobInputDraft, JobRecord, NewJob,
-    NewSubmission, ProfileId, RequestFingerprint, SubmissionKey, SubmissionRecord, Violation,
+    AttachmentId, AttachmentOrigin, ExecutionConfiguration, ExecutionMode, ExecutorId, JobId,
+    JobInputDraft, JobRecord, ModelCapability, NewJob, NewSubmission, ProfileId,
+    RequestFingerprint, SubmissionKey, SubmissionRecord, Violation,
 };
 
 /// The request header that names a submission.
@@ -168,6 +172,36 @@ const CONVERSATION_TOO_LONG: Refusal = Refusal::new(
     "conversation_too_long",
     "the conversation exceeds the maximum number of turns; nothing was submitted",
 );
+const VISION_NOT_SUPPORTED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "vision_not_supported",
+    "the selected LLM Profile does not declare the vision capability, but the conversation carries images; nothing was submitted",
+);
+const TOO_MANY_IMAGES: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "too_many_images",
+    "a conversation may carry at most 8 images; nothing was submitted",
+);
+const IMAGES_TOO_LARGE: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "images_too_large",
+    "the conversation's images exceed 16 MiB together, or one exceeds 4 MiB; nothing was submitted",
+);
+const ATTACHMENT_NOT_AN_IMAGE: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "attachment_not_an_image",
+    "an Attachment is not a PNG or JPEG image that can be sent; nothing was submitted",
+);
+const ATTACHMENT_NOT_FOUND: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "attachment_not_found",
+    "no such uploaded image Attachment; nothing was submitted",
+);
+const ATTACHMENT_UNAVAILABLE: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "attachment_unavailable",
+    "an Attachment's content is no longer available; nothing was submitted",
+);
 
 /// The most turns a Job-linked conversation may traverse.
 pub(crate) const MAX_CONVERSATION_TURNS: usize = 64;
@@ -185,6 +219,8 @@ pub(super) struct JobRequest {
     objective: String,
     name: Option<String>,
     previous: Option<JobId>,
+    /// Image Attachments sent with the objective, in order.
+    attachments: Vec<AttachmentId>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +235,8 @@ struct WireRequest {
     name: Option<String>,
     #[serde(default)]
     previous: Option<String>,
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 /// Text that may be stored: no control character but tab, carriage return
@@ -234,6 +272,19 @@ impl JobRequest {
             .map(|prev| identity(prev, "job:").ok_or(INVALID_BODY))
             .transpose()?
             .map(JobId::new);
+        if wire.attachments.len() > MAX_REQUEST_IMAGES {
+            return Err(TOO_MANY_IMAGES);
+        }
+        let mut attachments = Vec::with_capacity(wire.attachments.len());
+        for attachment in &wire.attachments {
+            let attachment = AttachmentId::new(
+                identity(attachment, "attachment:").ok_or(INVALID_BODY)?,
+            );
+            if attachments.contains(&attachment) {
+                return Err(INVALID_BODY);
+            }
+            attachments.push(attachment);
+        }
         if !text(&wire.objective, MAX_OBJECTIVE_BYTES)
             || wire
                 .name
@@ -249,11 +300,12 @@ impl JobRequest {
             objective: wire.objective,
             name: wire.name,
             previous,
+            attachments,
         })
     }
 
     /// The digest of the request as parsed, whatever its JSON spelling.
-    fn fingerprint(&self) -> RequestFingerprint {
+    pub(super) fn fingerprint(&self) -> RequestFingerprint {
         let mut context = Context::new(&SHA256);
         context.update(REQUEST_DOMAIN);
         context.update(&self.llm_profile.get().to_le_bytes());
@@ -280,6 +332,13 @@ impl JobRequest {
         if let Some(previous) = self.previous {
             context.update(&[3]);
             context.update(&previous.get().to_le_bytes());
+        }
+        if !self.attachments.is_empty() {
+            context.update(&[4]);
+            context.update(&(self.attachments.len() as u64).to_le_bytes());
+            for attachment in &self.attachments {
+                context.update(&attachment.get().to_le_bytes());
+            }
         }
         RequestFingerprint::from_digest(sha256(context))
     }
@@ -309,7 +368,7 @@ pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<SubmissionKey, Refu
     Ok(digest_key(key))
 }
 
-fn digest_key(key: &[u8]) -> SubmissionKey {
+pub(super) fn digest_key(key: &[u8]) -> SubmissionKey {
     let mut context = Context::new(&SHA256);
     context.update(KEY_DOMAIN);
     context.update(key);
@@ -857,15 +916,15 @@ async fn admit(
 /// that does not exist or does not target it, and an Executor
 /// that does not exist or cannot run it now. The creation checks both again
 /// in its own transaction.
-async fn check_configuration(
+pub(super) async fn check_configuration(
     database: &DatabaseHandle,
     request: &JobRequest,
 ) -> Result<(), Refusal> {
-    match database.llm_profile(request.llm_profile).await {
-        Ok(Some(_)) => {}
+    let llm = match database.llm_profile(request.llm_profile).await {
+        Ok(Some(llm)) => llm,
         Ok(None) | Err(DatabaseError::WrongProfileKind(_)) => return Err(PROFILE_NOT_FOUND),
         Err(error) => return Err(error.into()),
-    }
+    };
     if let Some(agent_profile) = request.agent_profile {
         match database.agent_profile(agent_profile).await {
             Ok(Some(agent)) if agent.links.contains(&request.llm_profile) => {}
@@ -886,6 +945,9 @@ async fn check_configuration(
     {
         return Err(EXECUTOR_INCOMPATIBLE);
     }
+    // Every image the conversation's one Provider request will carry: the
+    // earlier turns' first, then this one's.
+    let mut images: Vec<AttachmentId> = Vec::new();
     if let Some(previous) = request.previous {
         let genesis = database.genesis();
         let mut visited = std::collections::BTreeSet::new();
@@ -915,19 +977,55 @@ async fn check_configuration(
             if record.completed_at.is_none() {
                 return Err(PREVIOUS_JOB_NOT_COMPLETED);
             }
+            if let Some(input) = database.job_input(record.input).await? {
+                images.extend(input.attachments);
+            }
             cursor = record.previous;
         }
     }
-    Ok(())
+    images.extend(request.attachments.iter().copied());
+    if images.is_empty() {
+        return Ok(());
+    }
+    if !llm
+        .config
+        .declared_capabilities
+        .contains(&ModelCapability::Vision)
+    {
+        return Err(VISION_NOT_SUPPORTED);
+    }
+    for &attachment in &request.attachments {
+        match database.attachment(attachment).await? {
+            Some(record) if record.origin == AttachmentOrigin::UserProvided => {}
+            _ => return Err(ATTACHMENT_NOT_FOUND),
+        }
+    }
+    match attachment_images(database, &images).await {
+        Ok(_) => Ok(()),
+        Err(AttachmentImageError::TooMany) => Err(TOO_MANY_IMAGES),
+        Err(AttachmentImageError::TooLarge) => Err(IMAGES_TOO_LARGE),
+        Err(AttachmentImageError::NotAnImage { .. }) => Err(ATTACHMENT_NOT_AN_IMAGE),
+        Err(AttachmentImageError::Attachment(error)) => Err(match error {
+            AttachmentError::Database(error) => error.into(),
+            AttachmentError::NotFound(_) => ATTACHMENT_NOT_FOUND,
+            AttachmentError::CleanedUp { .. } | AttachmentError::Content { .. } => {
+                ATTACHMENT_UNAVAILABLE
+            }
+            AttachmentError::NotStored(_) => INTERNAL,
+        }),
+    }
 }
 
 /// The no-tool Provider plan of a checked request, a child of the Genesis
 /// Job, with the credential resolved as the Profile's Provider names it.
-fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan {
+/// Its images are referenced by Attachment identity; their bytes stay in the
+/// attachment store.
+pub(super) fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan {
     let mut plan = ProviderExecutionPlan::environment_credentials(
         request.executor,
         JobInputDraft {
             objective: Some(request.objective),
+            attachments: request.attachments,
             ..JobInputDraft::default()
         },
         NewJob {

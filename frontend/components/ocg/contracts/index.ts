@@ -466,3 +466,26 @@ export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
 export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];
 export type ControlProviderProjection = ControlProfilesSnapshot["providers"][number];
 
+/**
+ * An image Attachment as `POST /api/v1/attachments` and
+ * `GET /api/v1/attachments/{attachment}` report it.
+ */
+export function decodeAttachment(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const attachment = record(envelope.attachment, "attachment");
+  return {
+    id: identity(attachment.id, "attachment.id", "attachment:"),
+    mime: string(attachment.mime, "attachment.mime"),
+    byte_length: integer(attachment.byte_length, "attachment.byte_length"),
+    sha256: string(attachment.sha256, "attachment.sha256"),
+    display_name:
+      attachment.display_name === null ? null : string(attachment.display_name, "attachment.display_name"),
+    created_at_us: timestamp(attachment.created_at_us, "attachment.created_at_us"),
+    available: typeof attachment.available === "boolean" ? attachment.available : true,
+    data_url: typeof attachment.data_url === "string" ? attachment.data_url : undefined,
+  };
+}
+
+export type ControlAttachment = ReturnType<typeof decodeAttachment>;
+

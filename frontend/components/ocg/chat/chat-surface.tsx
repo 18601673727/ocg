@@ -63,16 +63,34 @@ export function ChatSurface({
   );
 
   useEffect(() => {
-    if (!job) {
-      setTurns([]);
-      setConversationError(null);
-      setHeadState(null);
-      return;
-    }
+    if (!job) return;
     const controller = new AbortController();
-    void loadConversation(job, controller.signal);
-    return () => controller.abort();
-  }, [job, loadConversation]);
+    let aborted = false;
+    (async () => {
+      try {
+        const response = await client.readJobConversation(job, controller.signal);
+        if (!aborted) {
+          setTurns(response.turns);
+          setConversationError(null);
+        }
+      } catch (err) {
+        if (!aborted) {
+          setConversationError(err instanceof Error ? err.message : "Could not read conversation turns.");
+        }
+      }
+    })();
+    return () => {
+      aborted = true;
+      controller.abort();
+    };
+  }, [client, job]);
+
+  const handleNewConversation = useCallback(() => {
+    setTurns([]);
+    setConversationError(null);
+    setHeadState(null);
+    onNewConversation?.();
+  }, [onNewConversation]);
 
   const handleHeadStateChange = useCallback(
     (state: SettlementState) => {
@@ -92,11 +110,11 @@ export function ChatSurface({
     [...priorTurns].reverse().find((turn) => turn.job.settlement.state === "completed")?.job.id ?? null;
 
   const preferredAgentProfile =
-    headTurn?.input?.configuration && headTurn.input.configuration.mode === "configured"
+    headTurn?.input?.configuration
       ? headTurn.input.configuration.agent_profile
       : null;
   const preferredLlmProfile =
-    headTurn?.input?.configuration && headTurn.input.configuration.mode === "configured"
+    headTurn?.input?.configuration
       ? headTurn.input.configuration.llm_profile
       : null;
 
@@ -141,7 +159,7 @@ export function ChatSurface({
             </Button>
           ) : null}
           {job && onNewConversation ? (
-            <Button type="button" size="sm" variant="ghost" onClick={onNewConversation}>
+            <Button type="button" size="sm" variant="ghost" onClick={handleNewConversation}>
               New conversation
             </Button>
           ) : null}
@@ -155,14 +173,14 @@ export function ChatSurface({
       ) : null}
 
       {priorTurns.map((turn, index) => {
-        const objective =
-          turn.input && turn.input.objective.available ? turn.input.objective.text : null;
+        const objective = turn.input ? turn.input.objective : null;
         const transcript = jobTranscript(
           turn.job.id,
           objective,
           turn.outputs,
           turn.job.settlement,
           false,
+          turn.input ? turn.input.attachments : undefined,
         );
         return (
           <section
@@ -203,7 +221,11 @@ export function ChatSurface({
                 ) : null}
               </div>
             </div>
-            <JobTranscript turns={transcript} userLabel="You" />
+            <JobTranscript
+              turns={transcript}
+              userLabel="You"
+              attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
+            />
           </section>
         );
       })}
@@ -252,7 +274,7 @@ export function ChatSurface({
               </Button>
             ) : null}
             {onNewConversation ? (
-              <Button type="button" size="sm" variant="outline" onClick={onNewConversation}>
+              <Button type="button" size="sm" variant="outline" onClick={handleNewConversation}>
                 Start new conversation
               </Button>
             ) : null}

@@ -90,8 +90,8 @@ function JobWatchBody({
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
   const [failure, setFailure] = useState<{ code: string; scope: "read" | "stream" } | null>(null);
-  // The objective is read from the Job's frozen input; the record names it only by identity.
-  const [input, setInput] = useState<{ objective: string | null } | { error: string } | null>(null);
+  // The objective and attachments are read from the Job's frozen input; the record names it only by identity.
+  const [input, setInput] = useState<{ objective: string | null; attachments: string[] } | { error: string } | null>(null);
   const [stop, setStop] = useState<string | null>(null);
   const [stopBusy, setStopBusy] = useState(false);
 
@@ -194,7 +194,7 @@ function JobWatchBody({
       }
       client.readJobInput(jobId).then(
         (frozen) => {
-          if (alive) setInput({ objective: frozen.objective });
+          if (alive) setInput({ objective: frozen.objective, attachments: frozen.attachments });
         },
         (error: unknown) => {
           if (alive) setInput({ error: error instanceof ControlTransportError ? error.code : "unreachable" });
@@ -367,8 +367,10 @@ function JobWatchBody({
           outputs,
           settlement,
           stream === "live" || stream === "reconnecting",
+          input !== null && "attachments" in input ? input.attachments : undefined,
         )}
         userLabel={presentation === "chat" ? "You" : "Objective"}
+        attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
       />
       {input !== null && "error" in input ? (
         <p className="text-xs text-muted-foreground">The objective could not be read ({input.error}).</p>

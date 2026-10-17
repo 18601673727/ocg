@@ -197,9 +197,26 @@ export function SettingsSurface({
   useEffect(() => {
     if (!client) return;
     const controller = new AbortController();
-    void refreshProfiles(controller.signal);
-    return () => controller.abort();
-  }, [client, refreshProfiles]);
+    let aborted = false;
+    (async () => {
+      try {
+        const loaded = await client.readProfiles(controller.signal);
+        if (!aborted) {
+          setSnapshot(loaded);
+          setLoadingProfiles(false);
+        }
+      } catch (error) {
+        if (!aborted) {
+          setLoadError(describeError(error));
+          setLoadingProfiles(false);
+        }
+      }
+    })();
+    return () => {
+      aborted = true;
+      controller.abort();
+    };
+  }, [client]);
 
   function resetLlmForm() {
     setEditingLlmId(null);

@@ -2,6 +2,7 @@ import {
   ContractError,
   decodeAdmission,
   decodeAgentProfiles,
+  decodeAttachment,
   decodeControlError,
   decodeHealth,
   decodeJob,
@@ -12,6 +13,7 @@ import {
   decodeProfiles,
   decodeSession,
   decodeStop,
+  type ControlAttachment,
   type ControlCapability,
   type ControlJobEvent,
 } from "../contracts";
@@ -55,6 +57,8 @@ export type ControlSubmission = {
   name?: string;
   // A completed predecessor Job whose conversation history precedes this turn.
   previous?: string;
+  // Image Attachments to send with the objective.
+  attachments?: string[];
 };
 
 export type ControlProfileWriteRequest =
@@ -394,6 +398,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       identity(submission.llm_profile, "llm_profile", "profile:");
       identity(submission.executor, "executor", "executor:");
       if (submission.previous !== undefined) jobIdentity(submission.previous);
+      if (submission.attachments !== undefined) {
+        for (const [index, att] of submission.attachments.entries()) {
+          identity(att, `attachments[${index}]`, "attachment:");
+        }
+      }
       submissionKey(key);
       const answer = await send("POST", "/api/v1/jobs", {
         body: submission,
@@ -410,6 +419,32 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         job: admission.job,
         created: answer.status === 201,
       } satisfies ControlSubmissionResult;
+    },
+
+    /** Uploads a PNG or JPEG image to the Attachment store. */
+    async uploadAttachment(
+      payload: { mime: "image/png" | "image/jpeg"; data_base64: string; display_name?: string },
+      signal?: AbortSignal,
+    ): Promise<ControlAttachment> {
+      const answer = await send("POST", "/api/v1/attachments", {
+        body: payload,
+        sign: true,
+        signal,
+      });
+      return decodeAttachment(answer.input);
+    },
+
+    /** Reads metadata of an image Attachment. */
+    async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<ControlAttachment> {
+      identity(attachmentId, "attachment", "attachment:");
+      const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, { signal });
+      return decodeAttachment(answer.input);
+    },
+
+    /** URL to fetch the raw image content of an Attachment. */
+    attachmentContentUrl(attachmentId: string): string {
+      identity(attachmentId, "attachment", "attachment:");
+      return `${base}/api/v1/attachments/${attachmentId}/content`;
     },
 
     /** What `key` created, however its submission ended. */
