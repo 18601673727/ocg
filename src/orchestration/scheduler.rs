@@ -215,11 +215,10 @@ impl Scheduler {
         self.uncertain.as_ref()
     }
 
-    /// One capture, under the approved error policy: a retryable read refusal
-    /// is retried on the same cursor, an entry-level index fault degrades to
-    /// the keys-only snapshot, engine or metadata damage halts the sweep, and
-    /// a keys-only read that cannot be held in memory falls back to streaming
-    /// page by page.
+    /// Captures pending Jobs in Job ID order through the first page's
+    /// sequence high water. Retryable read refusals keep the same cursor;
+    /// entry faults, over-capacity cohorts and refused allocations stream
+    /// bounded keys under the original fence. Metadata damage halts capture.
     pub(crate) async fn capture(&self) -> Result<Captured, CaptureFailure> {
         let mut captured = Captured::default();
         let cohort = self.capture_cohort(&mut captured.ledger).await?;
@@ -239,7 +238,7 @@ impl Scheduler {
                 fence, key, kind, ..
             }) => {
                 ledger.alarm(CaptureAlarm::IndexEntry { key, fault: kind });
-                return self.snapshot_into(fence, ledger).await;
+                return Ok(Cohort::Stream(fence));
             }
             CaptureStep::Fault(PendingReadFault::Allocation { fence, .. }) => {
                 ledger.alarm(CaptureAlarm::AllocationExhausted);
@@ -268,17 +267,10 @@ impl Scheduler {
         let mut page = first;
         loop {
             for key in &page.page.visited {
-                // The fence names the last key of the captured snapshot. A key
-                // past it was admitted after the snapshot and belongs to the
-                // next sweep.
-                if fence.end.is_none_or(|end| *key > end) {
-                    return Ok(Cohort::Material(keys));
-                }
-                // A Job allocated after the fence was read. Only its keys can
-                // be ordered, so the sweep restarts from the keys-only
-                // snapshot rather than trusting the page's Jobs.
+                // IDs allocated after this read transaction belong to the
+                // next sweep; all remaining keys are later still.
                 if key.job > fence.high_water {
-                    return self.snapshot_into(fence, ledger).await;
+                    return Ok(Cohort::Material(keys));
                 }
                 keys.push(*key);
             }
@@ -290,7 +282,7 @@ impl Scheduler {
                 CaptureStep::Fault(PendingReadFault::IndexEntry { key, kind, .. }) => {
                     ledger.alarm(CaptureAlarm::IndexEntry { key, fault: kind });
                     drop(keys);
-                    return self.snapshot_into(fence, ledger).await;
+                    return Ok(Cohort::Stream(fence));
                 }
                 CaptureStep::Fault(PendingReadFault::Allocation { .. }) => {
                     ledger.alarm(CaptureAlarm::AllocationExhausted);
@@ -304,59 +296,6 @@ impl Scheduler {
                 }
                 CaptureStep::Failed(failure) => return Err(failure),
             }
-        }
-    }
-
-    /// The keys-only fallback behind [`Scheduler::capture_cohort`]: one read
-    /// transaction over at most `P_MAX` keys, reading no Job at all, so a
-    /// damaged entry surfaces as a per-candidate verdict instead of stalling
-    /// the capture. Service time lands in the caller's ledger, as above.
-    async fn snapshot_into(
-        &self,
-        fence: PendingFence,
-        ledger: &mut Ledger,
-    ) -> Result<Cohort, CaptureFailure> {
-        let Some(budget) = usize::try_from(self.limits.pending_max)
-            .ok()
-            .and_then(NonZeroUsize::new)
-        else {
-            ledger.alarm(CaptureAlarm::AllocationExhausted);
-            return Ok(Cohort::Stream(fence));
-        };
-        let read = self.retry(|| self.database.pending_snapshot(budget)).await;
-        match read {
-            None => Err(CaptureFailure::Shutdown),
-            Some(Err(error)) => Err(classify(&error)),
-            Some(Ok(Ok(snapshot))) if snapshot.complete => {
-                ledger.service += snapshot.service_time;
-                Ok(Cohort::Material(snapshot.keys))
-            }
-            Some(Ok(Ok(snapshot))) => {
-                ledger.service += snapshot.service_time;
-                ledger.alarm(CaptureAlarm::OverCapacity {
-                    len: snapshot.fence.len,
-                });
-                Ok(Cohort::Stream(snapshot.fence))
-            }
-            Some(Ok(Err(PendingReadFault::Allocation {
-                fence,
-                service_time,
-            }))) => {
-                ledger.service += service_time;
-                ledger.alarm(CaptureAlarm::AllocationExhausted);
-                Ok(Cohort::Stream(fence))
-            }
-            // A keys-only read verifies no entry, so this cannot name a
-            // damaged one; if it is ever reported, the read contradicted its
-            // own contract and nothing may be swept on it.
-            Some(Ok(Err(PendingReadFault::IndexEntry { key, kind, .. }))) => {
-                Err(CaptureFailure::IntegrityHalt(format!(
-                    "the keys-only snapshot reported {kind:?} at {key:?}"
-                )))
-            }
-            Some(Ok(Err(PendingReadFault::InvalidFence))) => Err(CaptureFailure::IntegrityHalt(
-                "the Pending index fence is missing or undecodable".to_owned(),
-            )),
         }
     }
 
@@ -1596,14 +1535,12 @@ impl PendingCursor {
                     });
                     return Ok(None);
                 }
-                // Past the captured snapshot: the rest is next sweep's work.
-                if self.fence.end.is_none_or(|end| key > end) {
-                    return Ok(None);
-                }
-                // A Job allocated after the fence was read. Its key is inside
-                // the range but its work belongs to the next sweep.
+                // Job ID order makes H a terminal fence, even if a later
+                // admission's wall-clock creation time moved backwards.
                 if key.job > self.fence.high_water {
-                    continue;
+                    self.next = self.page.len();
+                    self.exhausted = true;
+                    return Ok(None);
                 }
                 return Ok(Some(key));
             }
@@ -1660,8 +1597,8 @@ impl PendingCursor {
 /// these is a silent skip: each is logged and reported with the capture.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureAlarm {
-    /// An index entry names a Job that cannot be evaluated. The sweep fell
-    /// back to keys-only reads and the entry surfaces as a verdict.
+    /// A corrupt index entry was found; capture switches to bounded keys
+    /// under the original fence without taking another snapshot.
     IndexEntry {
         key: PendingJobKey,
         fault: PendingIndexFault,
@@ -2036,38 +1973,44 @@ mod tests {
     }
 
     #[test]
-    fn a_damaged_index_entry_degrades_to_the_keys_only_snapshot() {
-        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "damaged");
-        let mut worker = DatabaseWorker::start(&directory).unwrap();
-        let database = worker.handle();
-        let jobs: Vec<_> = (0..3).map(|_| pending(&database)).collect();
-        let expected = wait(index_order(&database));
-        let dangling = jobs[0];
-        wait(
-            database
-                .with_database(move |database| crate::storage::remove_job_row(database, dangling)),
-        )
-        .expect("remove the Job row");
-        let scheduler = scheduler(&mut worker, limits(16, 1));
-        let captured = wait(scheduler.capture()).expect("capture");
-        assert!(
-            matches!(
+    fn a_damaged_index_entry_streams_under_the_original_fence() {
+        for damaged_index in [0, 1] {
+            let (_root, directory) = data_directory("ocg-stage-b-scheduler", "damaged");
+            let mut worker = DatabaseWorker::start(&directory).unwrap();
+            let database = worker.handle();
+            let jobs: Vec<_> = (0..3).map(|_| pending(&database)).collect();
+            let expected = wait(index_order(&database));
+            let dangling = jobs[damaged_index];
+            wait(
+                database.with_database(move |database| {
+                    crate::storage::remove_job_row(database, dangling)
+                }),
+            )
+            .expect("remove the Job row");
+            let scheduler = scheduler(&mut worker, limits(16, 1));
+            let captured = wait(scheduler.capture()).expect("a damaged entry streams");
+            assert!(matches!(
                 captured.ledger.alarms.as_slice(),
-                [CaptureAlarm::IndexEntry {
-                    fault: PendingIndexFault::MissingJob,
-                    ..
-                }]
-            ),
-            "{:?}",
-            captured.ledger.alarms
-        );
-        // Keys-only: the damaged key is still delivered, so the evaluation of
-        // that candidate reports it instead of the whole capture stalling.
-        match captured.cohort.expect("a cohort") {
-            Cohort::Material(keys) => assert_eq!(keys, expected),
-            other => panic!("a keys-only snapshot materializes, got {other:?}"),
+                [CaptureAlarm::IndexEntry { key, fault: PendingIndexFault::MissingJob }]
+                    if key.job == dangling
+            ));
+            let Cohort::Stream(fence) = captured.cohort.expect("a cohort") else {
+                panic!("entry corruption streams without a replacement snapshot");
+            };
+            assert_eq!(fence.high_water, jobs[2]);
+            assert_eq!(fence.len, 3);
+            let later = pending(&database);
+            assert!(later > fence.high_water);
+            let mut cursor = Cohort::Stream(fence).cursor(&limits(16, 1));
+            let mut ledger = Ledger::default();
+            let mut drained = Vec::new();
+            while let Some(key) = wait(cursor.next_key(&scheduler, &mut ledger)).unwrap() {
+                drained.push(key);
+            }
+            assert_eq!(drained, expected);
+            assert!(ledger.alarms.is_empty());
+            worker.shutdown().unwrap();
         }
-        worker.shutdown().unwrap();
     }
 
     #[test]
@@ -2105,7 +2048,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stream_that_exceeds_its_visit_bound_stops_and_alarms() {
+    fn a_stream_stops_at_the_first_job_above_high_water() {
         let (_root, directory) = data_directory("ocg-stage-b-scheduler", "bound");
         let mut worker = DatabaseWorker::start(&directory).unwrap();
         let database = worker.handle();
@@ -2114,17 +2057,12 @@ mod tests {
         }
         let expected = wait(index_order(&database));
         let scheduler = scheduler(&mut worker, limits(1, 1));
-        // The shape of the backdated flood: a fence that claims two keys while
-        // the keys inside its range were allocated after it, so every key but
-        // the first is skipped as an intruder and the stream never reaches the
-        // fence end. The bound is the claimed length plus the cap plus one page.
         let fence = PendingFence {
             len: 2,
             high_water: expected[0].job,
             end: Some(expected[5]),
         };
-        let limits = limits(1, 1);
-        let mut cursor = Cohort::Stream(fence).cursor(&limits);
+        let mut cursor = Cohort::Stream(fence).cursor(&limits(1, 1));
         let mut captured = Captured::default();
         let mut drained = Vec::new();
         while let Some(key) =
@@ -2132,14 +2070,22 @@ mod tests {
         {
             drained.push(key);
         }
-        assert_eq!(
-            captured.ledger.alarms,
-            vec![CaptureAlarm::StreamBoundExceeded {
-                visits: 5,
-                bound: 2 + 1 + 1,
-            }]
-        );
+        assert!(captured.ledger.alarms.is_empty());
         assert_eq!(drained, expected[..1].to_vec());
+        let CohortSource::Stream(stream) = &cursor else {
+            panic!("a streaming cursor");
+        };
+        assert_eq!(stream.visits, 2);
+        assert_eq!(stream.after, Some(expected[1].job));
+        assert!(
+            wait(cursor.next_key(&scheduler, &mut captured.ledger))
+                .unwrap()
+                .is_none()
+        );
+        let CohortSource::Stream(stream) = &cursor else {
+            panic!("a streaming cursor");
+        };
+        assert_eq!(stream.visits, 2);
         worker.shutdown().unwrap();
     }
 
