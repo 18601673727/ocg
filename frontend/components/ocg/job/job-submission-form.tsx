@@ -57,6 +57,7 @@ export function JobSubmissionForm({
   target?: SubmissionTarget | null;
 }) {
   const chat = target !== undefined;
+  const [agentProfile, setAgentProfile] = useState("");
   const [llmProfile, setLlmProfile] = useState("");
   const [executor, setExecutor] = useState("");
   const [objective, setObjective] = useState("");
@@ -64,6 +65,8 @@ export function JobSubmissionForm({
   const [phase, setPhase] = useState<Phase>("editing");
   const [message, setMessage] = useState<string | null>(null);
   const [key, setKey] = useState<string | null>(null);
+  const [availableLlms, setAvailableLlms] = useState<{ id: string; name: string; model: string; executors: string[] }[]>([]);
+  const [availableAgents, setAvailableAgents] = useState<{ id: string; name: string; llm_targets: string[] }[]>([]);
   const keyRef = useRef<string | null>(null);
   // What the held key was submitted with. A retry replays exactly this, so a
   // later selection or edit can never turn one key into two requests.
@@ -78,6 +81,22 @@ export function JobSubmissionForm({
       if (reconciliation.current) clearTimeout(reconciliation.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (chat) return;
+    const controller = new AbortController();
+    client
+      .readProfiles(controller.signal)
+      .then((snapshot) => {
+        if (controller.signal.aborted) return;
+        setAvailableLlms(snapshot.llm_profiles);
+        setAvailableAgents(snapshot.agent_profiles);
+      })
+      .catch(() => {
+        // Manual identity entry remains available even if catalog read fails.
+      });
+    return () => controller.abort();
+  }, [chat, client]);
 
   const settled = phase === "submitting" || phase === "pending" || phase === "uncertain";
 
@@ -125,11 +144,12 @@ export function JobSubmissionForm({
     setPhase("submitting");
     setMessage(null);
     try {
+      const chosenAgent = target ? target.agentProfile : agentProfile.trim();
       const request: ControlSubmission =
         replay && requestRef.current
           ? requestRef.current
           : {
-              ...(target ? { agent_profile: target.agentProfile } : {}),
+              ...(chosenAgent ? { agent_profile: chosenAgent } : {}),
               llm_profile: target ? target.llmProfile : llmProfile.trim(),
               executor: target ? target.executor : executor.trim(),
               objective,
@@ -157,7 +177,9 @@ export function JobSubmissionForm({
       setPhase(outcome);
       const code =
         error instanceof ControlTransportError
-          ? error.code
+          ? error.detail
+            ? `${error.code}: ${error.detail}`
+            : error.code
           : error instanceof ContractError
             ? "contract"
             : "unreachable";
@@ -201,16 +223,61 @@ export function JobSubmissionForm({
       </header>
       {chat ? null : (
         <>
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-3 sm:grid-cols-3">
             <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-              LLM Profile
+              Agent Profile (optional)
               <Input
-                value={llmProfile}
-                onChange={(event) => setLlmProfile(event.target.value)}
+                list="ocg-agent-profile-options"
+                value={agentProfile}
+                onChange={(event) => {
+                  const val = event.target.value;
+                  setAgentProfile(val);
+                  const matchedAgent = availableAgents.find((a) => a.id === val);
+                  if (matchedAgent && matchedAgent.llm_targets.length > 0 && !llmProfile) {
+                    const firstLlmId = matchedAgent.llm_targets[0];
+                    setLlmProfile(firstLlmId);
+                    const matchedLlm = availableLlms.find((l) => l.id === firstLlmId);
+                    if (matchedLlm && matchedLlm.executors.length > 0 && !executor) {
+                      setExecutor(matchedLlm.executors[0]);
+                    }
+                  }
+                }}
                 placeholder="profile:<n>"
                 spellCheck={false}
                 disabled={settled}
               />
+              <datalist id="ocg-agent-profile-options">
+                {availableAgents.map((agent) => (
+                  <option key={agent.id} value={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </datalist>
+            </label>
+            <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+              LLM Profile
+              <Input
+                list="ocg-llm-profile-options"
+                value={llmProfile}
+                onChange={(event) => {
+                  const val = event.target.value;
+                  setLlmProfile(val);
+                  const matchedLlm = availableLlms.find((l) => l.id === val);
+                  if (matchedLlm && matchedLlm.executors.length > 0 && !executor) {
+                    setExecutor(matchedLlm.executors[0]);
+                  }
+                }}
+                placeholder="profile:<n>"
+                spellCheck={false}
+                disabled={settled}
+              />
+              <datalist id="ocg-llm-profile-options">
+                {availableLlms.map((llm) => (
+                  <option key={llm.id} value={llm.id}>
+                    {llm.name} ({llm.model})
+                  </option>
+                ))}
+              </datalist>
             </label>
             <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
               Executor

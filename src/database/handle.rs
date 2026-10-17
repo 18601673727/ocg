@@ -1612,4 +1612,95 @@ impl DatabaseHandle {
         self.read(move |database| storage::read_execution_pools(database, before, limit))
             .await
     }
+
+    pub fn set_credential(&self, reference: &str, secret: &str) -> Result<(), String> {
+        let reference = reference.trim();
+        let secret = secret.trim();
+        if reference.is_empty() || reference.len() > 128 || reference.chars().any(char::is_control)
+        {
+            return Err("credential reference must be 1..=128 non-control bytes".to_string());
+        }
+        if secret.is_empty() || secret.len() > 4096 {
+            return Err("credential secret must be 1..=4096 bytes".to_string());
+        }
+        if ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}")).is_err() {
+            return Err("credential secret is not a valid HTTP Bearer token".to_string());
+        }
+        let mut guard = self
+            .shared
+            .credentials
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut updated = guard.clone();
+        updated.insert(reference.to_string(), secret.to_string());
+        let serialized = serde_json::to_vec(&updated)
+            .map_err(|error| format!("failed to serialize credentials: {error}"))?;
+        let temp_path = self.shared.credentials_path.with_extension("json.tmp");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        crate::data_directory::private_file(&mut options);
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|error| format!("failed to open credential staging file: {error}"))?;
+        file.write_all(&serialized)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("failed to write credential staging file: {error}"))?;
+        drop(file);
+        std::fs::rename(&temp_path, &self.shared.credentials_path)
+            .map_err(|error| format!("failed to commit credential store: {error}"))?;
+        let _ = crate::data_directory::restrict_file(&self.shared.credentials_path);
+        *guard = updated;
+        Ok(())
+    }
+
+    pub fn has_credential(&self, reference: &str) -> bool {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return false;
+        }
+        let in_store = self
+            .shared
+            .credentials
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(reference)
+            .is_some_and(|secret| !secret.is_empty());
+        in_store || std::env::var_os(reference).is_some_and(|value| !value.is_empty())
+    }
+
+    pub fn credential_resolver(
+        &self,
+    ) -> Arc<dyn crate::provider_execution::CredentialResolver> {
+        Arc::new(LocalCredentialResolver {
+            shared: self.shared.clone(),
+        })
+    }
 }
+
+struct LocalCredentialResolver {
+    shared: Arc<Shared>,
+}
+
+impl crate::provider_execution::CredentialResolver for LocalCredentialResolver {
+    fn resolve(
+        &self,
+        credential_ref: Option<&str>,
+    ) -> Result<Option<String>, crate::provider_execution::ProviderExecutionError> {
+        let Some(name) = credential_ref else {
+            return Ok(None);
+        };
+        if let Some(secret) = self
+            .shared
+            .credentials
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .filter(|secret| !secret.is_empty())
+            .cloned()
+        {
+            return Ok(Some(secret));
+        }
+        crate::provider_execution::EnvironmentCredentialResolver.resolve(Some(name))
+    }
+}
+

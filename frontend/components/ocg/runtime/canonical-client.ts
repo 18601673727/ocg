@@ -8,8 +8,10 @@ import {
   decodeJobInput,
   decodeJobEvent,
   decodeOutputsPage,
+  decodeProfiles,
   decodeSession,
   decodeStop,
+  type ControlCapability,
   type ControlJobEvent,
 } from "../contracts";
 import { SseParser } from "./sse";
@@ -19,7 +21,12 @@ export type JobStreamEnd = "settled" | "stream_error" | "aborted";
 export type JobStreamSubscription = { closed: Promise<JobStreamEnd>; close(): void; };
 
 export class ControlTransportError extends Error {
-  constructor(readonly code: string, readonly status: number, readonly retryable: boolean) {
+  constructor(
+    readonly code: string,
+    readonly status: number,
+    readonly retryable: boolean,
+    readonly detail: string = "",
+  ) {
     // Do not echo fetch errors, request URLs, credentials or untrusted bodies.
     super(`OCG event transport: ${code} (${status})`);
     this.name = "ControlTransportError";
@@ -46,6 +53,32 @@ export type ControlSubmission = {
   objective: string;
   name?: string;
 };
+
+export type ControlProfileWriteRequest =
+  | {
+      kind: "llm";
+      name: string;
+      model: string;
+      protocol?: "openai_chat_completions";
+      endpoint?: string | null;
+      credential_ref?: string | null;
+      credential?: string | null;
+      clear_credential?: boolean;
+      declared_capabilities: ControlCapability[];
+      parameters?: {
+        temperature?: number | null;
+        top_p?: number | null;
+        max_tokens?: number | null;
+        presence_penalty?: number | null;
+        frequency_penalty?: number | null;
+      };
+    }
+  | {
+      kind: "agent";
+      name: string;
+      instructions?: string | null;
+      llm_targets: string[];
+    };
 
 export type ControlSubmissionResult = {
   status: "admitted" | "pending";
@@ -247,9 +280,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     }
     if (!response.ok) {
       let code = "http_error";
-      try { code = decodeControlError(await response.json()).code; }
-      catch { /* An unrecognized body still retains its HTTP status. */ }
-      throw new ControlTransportError(code, response.status, retryable(response.status, code));
+      let detail = "";
+      try {
+        const decoded = decodeControlError(await response.json());
+        code = decoded.code;
+        detail = decoded.message;
+      } catch { /* An unrecognized body still retains its HTTP status. */ }
+      throw new ControlTransportError(code, response.status, retryable(response.status, code), detail);
     }
     let input: unknown;
     try { input = await response.json(); }
@@ -291,6 +328,32 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       }
       const suffix = query.length ? `?${query.join("&")}` : "";
       return decodeAgentProfiles((await send("GET", `/api/v1/agent-profiles${suffix}`, { signal: settings.signal })).input);
+    },
+
+    /** Full Profile catalog (LLM Profiles, Agent Profiles) and computed Provider projection. */
+    async readProfiles(signal?: AbortSignal) {
+      return decodeProfiles((await send("GET", "/api/v1/profiles", { signal })).input);
+    },
+
+    /** Creates an LLM Profile or Agent Profile. */
+    async createProfile(profile: ControlProfileWriteRequest, signal?: AbortSignal) {
+      const answer = await send("POST", "/api/v1/profiles", {
+        body: profile,
+        sign: true,
+        signal,
+      });
+      return decodeProfiles(answer.input);
+    },
+
+    /** Updates an existing LLM Profile or Agent Profile. */
+    async updateProfile(profileId: string, profile: ControlProfileWriteRequest, signal?: AbortSignal) {
+      identity(profileId, "profile", "profile:");
+      const answer = await send("POST", `/api/v1/profiles/${profileId}`, {
+        body: profile,
+        sign: true,
+        signal,
+      });
+      return decodeProfiles(answer.input);
     },
 
     /** One stored page of the Job's outputs, in `seq` order. */

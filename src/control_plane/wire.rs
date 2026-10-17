@@ -45,8 +45,8 @@ impl Refusal {
 /// An answered request: its status and JSON body, and a cookie when the
 /// answer signs a browser in or out.
 pub(super) struct Reply {
-    status: StatusCode,
-    body: Value,
+    pub(super) status: StatusCode,
+    pub(super) body: Value,
     cookie: Option<String>,
 }
 

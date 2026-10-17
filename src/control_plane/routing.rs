@@ -9,6 +9,9 @@ pub(super) enum Route {
         before: Option<ProfileId>,
         limit: usize,
     },
+    Profiles,
+    ProfileCreate,
+    ProfileUpdate(ProfileId),
     Outputs {
         job: JobId,
         after_seq: Option<i64>,
@@ -43,6 +46,9 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Job(_)
             | Route::JobInput(_)
             | Route::AgentProfiles { .. }
+            | Route::Profiles
+            | Route::ProfileCreate
+            | Route::ProfileUpdate(_)
             | Route::Outputs { .. }
             | Route::Events { .. }
             | Route::Admission
@@ -71,6 +77,11 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 let job = job_id(job)?;
                 no_query(query).map(|()| Route::Stop(job))
             }
+            ["profiles"] => no_query(query).map(|()| Route::ProfileCreate),
+            ["profiles", profile] => {
+                let profile = profiles::profile_id(profile)?;
+                no_query(query).map(|()| Route::ProfileUpdate(profile))
+            }
             ["session"] => no_query(query).map(|()| Route::SessionCreate),
             _ => Err(NOT_FOUND),
         };
@@ -85,6 +96,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["health"] => no_query(query).map(|()| Route::Health),
         ["admissions"] => no_query(query).map(|()| Route::Admission),
         ["session"] => no_query(query).map(|()| Route::SessionStatus),
+        ["profiles"] => no_query(query).map(|()| Route::Profiles),
         ["jobs", job] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
@@ -181,6 +193,15 @@ pub(super) async fn respond(
         Route::JobInput(job) => catalog::job_input(database, job).await,
         Route::AgentProfiles { before, limit } => {
             catalog::agent_profiles(database, before, limit).await
+        }
+        Route::Profiles => profiles::list_profiles(database).await,
+        Route::ProfileCreate => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            profiles::save_profile(database, None, &body).await
+        }
+        Route::ProfileUpdate(profile) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            profiles::save_profile(database, Some(profile), &body).await
         }
         Route::Outputs {
             job,

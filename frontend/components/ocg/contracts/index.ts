@@ -326,3 +326,109 @@ export function decodeAgentProfiles(input: unknown) {
 export type ControlJobInput = ReturnType<typeof decodeJobInput>;
 export type ControlAgentProfiles = ReturnType<typeof decodeAgentProfiles>;
 export type ControlAgentProfile = ControlAgentProfiles["agent_profiles"][number];
+
+function optionalString(value: unknown, path: string): string | null {
+  return value === null ? null : string(value, path);
+}
+
+function optionalFiniteNumber(value: unknown, path: string): number | null {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ContractError(path, "a finite number or null");
+  }
+  return value;
+}
+
+/**
+ * Full Profile management snapshot from `GET /api/v1/profiles`,
+ * `POST /api/v1/profiles`, and `POST /api/v1/profiles/{profile}`, including
+ * LLM Profiles, Agent Profiles, and the computed Provider projection.
+ */
+export function decodeProfiles(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const profileId = envelope.profile_id === undefined || envelope.profile_id === null
+    ? null
+    : identity(envelope.profile_id, "profile_id", "profile:");
+  return {
+    profile_id: profileId,
+    llm_profiles: listOf(envelope.llm_profiles, "llm_profiles", (entry, path) => {
+      const llm = record(entry, path);
+      const protocol = string(llm.protocol, `${path}.protocol`);
+      if (protocol !== "openai_chat_completions") {
+        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
+      }
+      const params = record(llm.parameters, `${path}.parameters`);
+      return {
+        id: identity(llm.id, `${path}.id`, "profile:"),
+        name: string(llm.name, `${path}.name`),
+        model: string(llm.model, `${path}.model`),
+        protocol,
+        endpoint: optionalString(llm.endpoint, `${path}.endpoint`),
+        credential_ref: optionalString(llm.credential_ref, `${path}.credential_ref`),
+        has_credential: boolean(llm.has_credential, `${path}.has_credential`),
+        declared_capabilities: listOf(llm.declared_capabilities, `${path}.declared_capabilities`,
+          (capability, capabilityPath) => {
+            const named = string(capability, capabilityPath);
+            const known = CAPABILITIES.find((candidate) => candidate === named);
+            if (!known) throw new ContractError(capabilityPath, "a declared model capability");
+            return known;
+          }),
+        parameters: {
+          temperature: optionalFiniteNumber(params.temperature, `${path}.parameters.temperature`),
+          top_p: optionalFiniteNumber(params.top_p, `${path}.parameters.top_p`),
+          max_tokens: timestamp(params.max_tokens, `${path}.parameters.max_tokens`),
+          presence_penalty: optionalFiniteNumber(params.presence_penalty, `${path}.parameters.presence_penalty`),
+          frequency_penalty: optionalFiniteNumber(params.frequency_penalty, `${path}.parameters.frequency_penalty`),
+        },
+        executors: listOf(llm.executors, `${path}.executors`,
+          (executor, executorPath) => identity(executor, executorPath, "executor:")),
+        editable: boolean(llm.editable, `${path}.editable`),
+        blocking_jobs: listOf(llm.blocking_jobs, `${path}.blocking_jobs`,
+          (job, jobPath) => identity(job, jobPath, "job:")),
+        more_blocking_jobs: boolean(llm.more_blocking_jobs, `${path}.more_blocking_jobs`),
+        created_at_us: integer(llm.created_at_us, `${path}.created_at_us`),
+        updated_at_us: integer(llm.updated_at_us, `${path}.updated_at_us`),
+      };
+    }),
+    agent_profiles: listOf(envelope.agent_profiles, "agent_profiles", (entry, path) => {
+      const agent = record(entry, path);
+      return {
+        id: identity(agent.id, `${path}.id`, "profile:"),
+        name: string(agent.name, `${path}.name`),
+        instructions: optionalString(agent.instructions, `${path}.instructions`),
+        llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`,
+          (target, targetPath) => identity(target, targetPath, "profile:")),
+        editable: boolean(agent.editable, `${path}.editable`),
+        blocking_jobs: listOf(agent.blocking_jobs, `${path}.blocking_jobs`,
+          (job, jobPath) => identity(job, jobPath, "job:")),
+        more_blocking_jobs: boolean(agent.more_blocking_jobs, `${path}.more_blocking_jobs`),
+        created_at_us: integer(agent.created_at_us, `${path}.created_at_us`),
+        updated_at_us: integer(agent.updated_at_us, `${path}.updated_at_us`),
+      };
+    }),
+    providers: listOf(envelope.providers, "providers", (entry, path) => {
+      const provider = record(entry, path);
+      const protocol = string(provider.protocol, `${path}.protocol`);
+      if (protocol !== "openai_chat_completions") {
+        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
+      }
+      return {
+        protocol,
+        endpoint: optionalString(provider.endpoint, `${path}.endpoint`),
+        credential_ref: optionalString(provider.credential_ref, `${path}.credential_ref`),
+        has_credential: boolean(provider.has_credential, `${path}.has_credential`),
+        profile_ids: listOf(provider.profile_ids, `${path}.profile_ids`,
+          (id, idPath) => identity(id, idPath, "profile:")),
+        models: listOf(provider.models, `${path}.models`,
+          (model, modelPath) => string(model, modelPath)),
+      };
+    }),
+  };
+}
+
+export type ControlProfilesSnapshot = ReturnType<typeof decodeProfiles>;
+export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
+export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];
+export type ControlProviderProjection = ControlProfilesSnapshot["providers"][number];
+

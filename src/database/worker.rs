@@ -214,6 +214,8 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
+                let credentials_path = directory.join("credentials.json");
+                let credentials = load_credentials_file(&credentials_path);
                 let shared = Arc::new(Shared {
                     scheduler_wake,
                     active_policy: policy,
@@ -236,6 +238,8 @@ impl DatabaseWorker {
                     space_check: SharedRequest::new(),
                     recovery: SharedRequest::new(),
                     aggregation_host: AtomicBool::new(false),
+                    credentials_path,
+                    credentials: RwLock::new(credentials),
                     #[cfg(test)]
                     probe: GroupProbe::default(),
                 });
@@ -398,6 +402,17 @@ pub(super) fn open_error(error: OpenError, directory: &std::path::Path) -> Datab
             supported: storage::FORMAT_VERSION,
         },
     }
+}
+
+fn load_credentials_file(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    if !path.exists() {
+        return std::collections::BTreeMap::new();
+    }
+    let _ = crate::data_directory::restrict_file(path);
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
 }
 
 /// Quarantines every Job that an earlier opening started as its own local

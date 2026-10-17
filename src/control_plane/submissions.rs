@@ -855,7 +855,7 @@ async fn check_configuration(
 /// The no-tool Provider plan of a checked request, a child of the Genesis
 /// Job, with the credential resolved as the Profile's Provider names it.
 fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan {
-    ProviderExecutionPlan::environment_credentials(
+    let mut plan = ProviderExecutionPlan::environment_credentials(
         request.executor,
         JobInputDraft {
             objective: Some(request.objective),
@@ -880,7 +880,9 @@ fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan
             previous: None,
             replaces: None,
         },
-    )
+    );
+    plan.credential_resolver = database.credential_resolver();
+    plan
 }
 
 /// Why a plan known not to have created its Job was refused, without what

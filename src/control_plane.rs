@@ -127,6 +127,7 @@ mod catalog;
 mod config;
 mod events;
 mod listener;
+mod profiles;
 mod projection;
 mod routing;
 mod security;

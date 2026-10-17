@@ -88,6 +88,8 @@ pub(super) struct Shared {
     /// Set while a host owns the background aggregation loop of this opening,
     /// so one process run never has two.
     pub(super) aggregation_host: AtomicBool,
+    pub(super) credentials_path: PathBuf,
+    pub(super) credentials: RwLock<std::collections::BTreeMap<String, String>>,
     #[cfg(test)]
     pub(super) probe: GroupProbe,
 }

@@ -176,6 +176,7 @@ export function AppShell({
           </div>
           {view === "settings" ? (
             <SettingsSurface
+              client={client}
               health={health}
               sessionExpiresAtUs={sessionExpiresAtUs}
               signingOut={signingOut}

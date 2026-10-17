@@ -1,14 +1,28 @@
 use super::*;
 
 /// Whether `path` names a route that is submitted to with `POST`: Job
-/// submission and a Job's stop.
+/// submission, a Job's stop, or Profile creation/update.
 fn takes_post(path: &str) -> bool {
     match path.strip_prefix("/api/v1/") {
-        Some("jobs") => true,
+        Some("jobs" | "profiles") => true,
+        Some(rest) => {
+            rest.strip_prefix("jobs/")
+                .and_then(|rest| rest.strip_suffix("/stop"))
+                .is_some_and(|job| !job.contains('/'))
+                || rest
+                    .strip_prefix("profiles/")
+                    .is_some_and(|profile| !profile.is_empty() && !profile.contains('/'))
+        }
+        None => false,
+    }
+}
+
+fn accepts_json_post(path: &str) -> bool {
+    match path.strip_prefix("/api/v1/") {
+        Some("jobs" | "profiles") => true,
         Some(rest) => rest
-            .strip_prefix("jobs/")
-            .and_then(|rest| rest.strip_suffix("/stop"))
-            .is_some_and(|job| !job.contains('/')),
+            .strip_prefix("profiles/")
+            .is_some_and(|profile| !profile.is_empty() && !profile.contains('/')),
         None => false,
     }
 }
@@ -103,7 +117,7 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
             return Err(browser::FORBIDDEN_CSRF);
         }
     }
-    if method == Method::POST && path == "/api/v1/jobs" {
+    if method == Method::POST && accepts_json_post(path) {
         return submission_body(headers).map(|()| Destination::Api(caller));
     }
     if login && method == Method::POST {
