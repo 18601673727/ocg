@@ -732,12 +732,14 @@ fn settle_fixture_job(handle: &DatabaseHandle, targets: &Targets) -> JobId {
 }
 
 /// Lets the real service consume the raw records, within a bound.
-fn aggregate(handle: &DatabaseHandle, job: JobId) -> Vec<String> {
+async fn aggregate(handle: &DatabaseHandle, job: JobId) -> Vec<String> {
     let mut notes = Vec::new();
-    let service = match wait(AggregationService::start(
+    let service = match AggregationService::start(
         handle.clone(),
         AggregationServiceConfig::default(),
-    )) {
+    )
+    .await
+    {
         Ok(service) => service,
         Err(error) => {
             notes.push(format!("the aggregation service did not start: {error}"));
@@ -762,15 +764,22 @@ fn aggregate(handle: &DatabaseHandle, job: JobId) -> Vec<String> {
             notes.push("the aggregation service did not cover the raw records in time".to_owned());
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        ntex::time::sleep(Duration::from_millis(100)).await;
     }
-    if let Err(error) = wait(service.shutdown()).into_result() {
+    if let Err(error) = service.shutdown().await.into_result() {
         notes.push(format!("aggregation service shutdown: {error}"));
     }
     notes
 }
 
 fn run_writer(mode: Mode, directory: &Path) {
+    let directory = directory.to_path_buf();
+    ntex::rt::System::new("acceptance-writer", ntex::rt::DefaultRuntime).block_on(async move {
+        run_writer_async(mode, &directory).await;
+    });
+}
+
+async fn run_writer_async(mode: Mode, directory: &Path) {
     let (worker, handle) = open_database(directory);
     let genesis = handle.genesis().get();
     let live = (mode == Mode::Live).then(|| {
@@ -803,10 +812,12 @@ fn run_writer(mode: Mode, directory: &Path) {
                 tools: None,
             };
             // The one and only Provider request. Nothing below resends it.
-            let outcome = wait_for(
-                execution.scheduler().schedule_provider(plan),
+            let outcome = ntex::time::timeout(
                 config.timeout + Duration::from_secs(60),
-            );
+                execution.scheduler().schedule_provider(plan),
+            )
+            .await
+            .expect("the execution settled within its bound");
             match outcome {
                 Ok(receipt) => (Some(receipt.job), None, None),
                 Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
@@ -835,11 +846,11 @@ fn run_writer(mode: Mode, directory: &Path) {
         }
     };
     let job = job.expect("a Job was created for the request");
-    let mut shutdown = aggregate(&handle, job);
+    let mut shutdown = aggregate(&handle, job).await;
     let observed = observe_job(&handle, job);
 
     // Component owners are closed cleanly, database last.
-    if let Err(error) = execution.shutdown() {
+    if let Err(error) = execution.shutdown().await {
         shutdown.push(format!("execution runtime: {error}"));
     }
     if let Err(error) = worker.shutdown() {

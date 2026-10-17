@@ -71,3 +71,39 @@ pub(crate) fn temporary_directory(suite: &str, name: &str) -> (TestRoot, PathBuf
     let resolved = root.canonicalize().expect("resolve a temporary directory");
     (TestRoot(root), resolved)
 }
+
+pub(crate) fn on_system<Make, Work, Output>(make: Make) -> Output
+where
+    Make: FnOnce() -> Work + Send + 'static,
+    Work: Future<Output = Output> + 'static,
+    Output: Send + 'static,
+{
+    static SYSTEM: std::sync::OnceLock<ntex::rt::System> = std::sync::OnceLock::new();
+    let system = SYSTEM.get_or_init(|| {
+        let (ready, started) = flume::bounded(1);
+        std::thread::spawn(move || {
+            let runner = ntex::rt::System::new("test-components", ntex::rt::DefaultRuntime);
+            runner
+                .run(move || {
+                    ready.send(ntex::rt::System::current()).expect("test host");
+                    Ok(())
+                })
+                .expect("test System");
+        });
+        started.recv().expect("test System started")
+    });
+    let (done, finished) = flume::bounded(1);
+    system
+        .arbiter()
+        .handle()
+        .spawn(async move {
+            ntex::rt::spawn(async move {
+                let output = make().await;
+                if done.send(output).is_err() {
+                    panic!("test stopped waiting for its System task");
+                }
+            });
+        })
+        .detach();
+    wait(finished.recv_async()).expect("System task completed")
+}

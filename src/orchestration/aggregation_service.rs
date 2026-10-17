@@ -22,11 +22,11 @@
 //! timer at once, waits for a batch already in flight to reach its actual
 //! boundary, joins the loop's thread, and only then ends the service Job.
 
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::database::{
@@ -237,7 +237,6 @@ impl std::fmt::Display for JobEnd {
 pub enum StartCause {
     /// The Job could not be started.
     Database(DatabaseError),
-    Thread(std::io::Error),
     /// The loop failed or stopped before it was ready, in its first check.
     Loop(ServiceFailure),
 }
@@ -246,7 +245,6 @@ impl std::fmt::Display for StartCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Database(error) => write!(f, "the Job could not be started: {error}"),
-            Self::Thread(error) => write!(f, "the loop could not be spawned: {error}"),
             Self::Loop(failure) => write!(f, "{failure}"),
         }
     }
@@ -320,9 +318,9 @@ pub struct AggregationService {
     database: DatabaseHandle,
     job: JobId,
     control: flume::Sender<Control>,
-    thread: Option<JoinHandle<Result<(), ServiceFailure>>>,
+    finished: Option<flume::Receiver<Result<(), ServiceFailure>>>,
     shared: Arc<Shared>,
-    _claim: AggregationClaim,
+    _claim: Arc<AggregationClaim>,
 }
 
 impl AggregationService {
@@ -333,6 +331,11 @@ impl AggregationService {
         database: DatabaseHandle,
         config: AggregationServiceConfig,
     ) -> Result<Self, ServiceStartError> {
+        #[cfg(test)]
+        if ntex::rt::System::try_current().is_none() {
+            return crate::test_support::on_system(move || Box::pin(Self::start(database, config)));
+        }
+
         let claim = database
             .claim_aggregation_host()
             .ok_or(ServiceStartError::AlreadyRunning)?;
@@ -374,59 +377,56 @@ impl AggregationService {
             return Err(failed_start(job, StartCause::Database(error), end));
         }
 
+        let claim = Arc::new(claim);
         let shared = Arc::new(Shared::default());
         let (control, control_receiver) = flume::unbounded();
         let (ready_sender, ready) = flume::bounded(1);
-        let thread = {
-            let (database, shared) = (database.clone(), shared.clone());
-            std::thread::Builder::new()
-                .name("ocg-aggregation".to_owned())
-                .spawn(move || {
-                    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        ntex::rt::System::new("ocg-aggregation", ntex::rt::DefaultRuntime).block_on(
-                            serve(
-                                database,
-                                control_receiver,
-                                shared.clone(),
-                                config,
-                                ready_sender,
-                            ),
-                        )
-                    }));
-                    // A panic is kept with its message, so the state reports
-                    // it before anyone joins the thread.
-                    let result = served.unwrap_or_else(|payload| {
-                        shared.record_failure(format!(
-                            "{}: {}",
-                            ServiceFailure::Panicked,
-                            panic_message(payload.as_ref())
-                        ));
-                        Err(ServiceFailure::Panicked)
-                    });
-                    shared.exited.store(true, Ordering::SeqCst);
-                    result
+        let (done, finished) = flume::bounded(1);
+        {
+            let (database, shared, claim) = (database.clone(), shared.clone(), claim.clone());
+            ntex::rt::spawn(async move {
+                let _claim = claim;
+                let mut serving = std::pin::pin!(serve(
+                    database,
+                    control_receiver,
+                    shared.clone(),
+                    config,
+                    ready_sender,
+                ));
+                let result = std::future::poll_fn(|context| {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        serving.as_mut().poll(context)
+                    })) {
+                        Ok(result) => result,
+                        Err(payload) => {
+                            shared.record_failure(format!(
+                                "{}: {}",
+                                ServiceFailure::Panicked,
+                                panic_message(payload.as_ref())
+                            ));
+                            std::task::Poll::Ready(Err(ServiceFailure::Panicked))
+                        }
+                    }
                 })
-        };
-        let thread = match thread {
-            Ok(thread) => thread,
-            Err(error) => {
-                let end =
-                    end_failed(&database, job, "the aggregation loop could not be spawned").await;
-                return Err(failed_start(job, StartCause::Thread(error), end));
-            }
-        };
+                .await;
+                shared.exited.store(true, Ordering::SeqCst);
+                if done.send(result).is_err() {
+                    log::debug!("aggregation host dropped before its loop ended");
+                }
+            });
+        }
         let mut service = Self {
             database,
             job,
             control,
-            thread: Some(thread),
+            finished: Some(finished),
             shared,
             _claim: claim,
         };
         if ready.recv_async().await.is_err() {
             // The loop ended before it was ready. Its own result says why, and
             // it is joined before the Job is ended and before the claim goes.
-            let failure = match service.stop_loop() {
+            let failure = match service.stop_loop().await {
                 Some(Err(failure)) => failure,
                 Some(Ok(())) | None => ServiceFailure::Exited,
             };
@@ -493,11 +493,16 @@ impl AggregationService {
 
     /// Asks the loop to stop, wakes it, and joins it. A batch in flight
     /// finishes first: it is awaited, never abandoned.
-    fn stop_loop(&mut self) -> Option<Result<(), ServiceFailure>> {
+    async fn stop_loop(&mut self) -> Option<Result<(), ServiceFailure>> {
         self.shared.stop.store(true, Ordering::SeqCst);
         self.control.send(Control::Stop).ok();
-        let thread = self.thread.take()?;
-        Some(thread.join().unwrap_or(Err(ServiceFailure::Panicked)))
+        let finished = self.finished.take()?;
+        Some(
+            finished
+                .recv_async()
+                .await
+                .unwrap_or(Err(ServiceFailure::Panicked)),
+        )
     }
 
     /// Stops the loop, and only after it has really stopped ends the service
@@ -505,7 +510,7 @@ impl AggregationService {
     /// the end is refused the Job stays started; if its outcome is unknown,
     /// that is reported as unconfirmed.
     pub async fn shutdown(mut self) -> ServiceOutcome {
-        let loop_result = self.stop_loop().unwrap_or(Ok(()));
+        let loop_result = self.stop_loop().await.unwrap_or(Ok(()));
         let (failure, finalization) = match loop_result {
             Ok(()) => (
                 None,
@@ -529,7 +534,10 @@ impl Drop for AggregationService {
     /// A service dropped without a shutdown still stops and joins its loop, so
     /// no loop outlives its host. Its Job is left as it was: started.
     fn drop(&mut self) {
-        self.stop_loop();
+        self.shared.stop.store(true, Ordering::SeqCst);
+        if self.control.send(Control::Stop).is_err() {
+            log::debug!("aggregation loop already stopped");
+        }
     }
 }
 

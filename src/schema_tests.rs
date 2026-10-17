@@ -2000,7 +2000,7 @@ fn the_execution_runtime_runs_a_configured_child_only_on_a_compatible_executor()
         (Some(compatible), configuration(agent, targeted))
     );
     assert!(record.completed_at.is_some());
-    runtime.shutdown().expect("shutdown runtime");
+    wait(runtime.shutdown()).expect("shutdown runtime");
     worker.shutdown().expect("shutdown");
 }
 
@@ -10333,16 +10333,22 @@ mod control_plane {
     ) -> (crate::host::HostReport, Option<T>) {
         let returned = Arc::new(Mutex::new(None));
         let slot = returned.clone();
-        let report =
-            run_controlled_reporting(directory, false, control, move |context: HostContext| {
-                let address = context.control_plane();
-                async move {
-                    let value = std::thread::spawn(move || client(address))
-                        .join()
-                        .expect("the client did not panic");
-                    *slot.lock().expect("lock") = Some(value);
-                }
-            });
+        let report = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    run_controlled_reporting(directory, false, control, move |context: HostContext| {
+                        let address = context.control_plane();
+                        async move {
+                            let (returned, response) = flume::bounded(1);
+                            std::thread::spawn(move || returned.send(client(address)));
+                            let value = response.recv_async().await.expect("the client did not panic");
+                            *slot.lock().expect("lock") = Some(value);
+                        }
+                    })
+                })
+                .join()
+                .expect("the host did not panic")
+        });
         // The process-wide logger may already be another host's in this
         // test binary; that is reported, and nothing else may fail.
         let returned = returned.lock().expect("lock").take();
@@ -11533,7 +11539,7 @@ mod lifecycle_closure {
         let job_record = record(&handle, receipt.job);
         assert!(job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_some());
         assert!(blocking(&handle, setup.llm).is_empty());
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         worker.shutdown().expect("shutdown");
 
         let worker = DatabaseWorker::start(&directory).expect("restart");
@@ -11580,7 +11586,7 @@ mod lifecycle_closure {
         }));
 
         let started = Instant::now();
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "shutdown waited for the request's timeout"
@@ -11803,7 +11809,7 @@ mod lifecycle_closure {
             Ok(receipt) => receipt,
             Err(error) => panic!("the request must settle, got {error}"),
         };
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         for job in [plain.job, provider.job] {
             let operations = operations_on(&handle, job);
             assert_eq!(operations.first(), Some(&OperationKind::CreateJobWithInput));
@@ -11987,7 +11993,7 @@ mod lifecycle_closure {
             ))) => {}
             other => panic!("a waiting plan must not start, got {other:?}"),
         }
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         assert_eq!(job_count(&handle), jobs_before);
         worker.shutdown().expect("shutdown");
 
@@ -14763,7 +14769,7 @@ mod requests_and_tool_loop {
                 ToolLimitsError::NoProviderRequest
             ))
         ));
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         assert_eq!(markers(), before, "no input, Job or evidence was written");
 
         // Called on a Job already started: it fails without a request.
@@ -15003,7 +15009,7 @@ mod requests_and_tool_loop {
         ));
         assert_eq!(wait(handle.jobs(None, 1_000)).expect("jobs").len(), jobs);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         assert!(matches!(
             registry.register(
                 "add",
@@ -19329,7 +19335,7 @@ mod requests_and_tool_loop {
                 1,
                 "one Job, created once"
             );
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }
@@ -19387,7 +19393,7 @@ mod requests_and_tool_loop {
                 wait(handle.jobs(None, 1_000)).expect("read").len(),
                 before + 2
             );
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }
@@ -19471,7 +19477,7 @@ mod requests_and_tool_loop {
             assert_eq!(requests.load(Ordering::SeqCst), 0, "nothing was sent");
 
             // Once shutdown has begun, nothing is admitted.
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             assert!(matches!(
                 refused(wait(scheduler.admit_provider(plan(
                     &handle,
@@ -19519,7 +19525,7 @@ mod requests_and_tool_loop {
                 Err(DatabaseError::OutcomeUnknown { .. })
             ));
             assert_eq!(requests.load(Ordering::SeqCst), 0, "nothing was sent");
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
 
             // Whatever the commit did, there is at most that one Job, and a
             // later start settles it if it exists; nothing created another.
@@ -19591,7 +19597,7 @@ mod requests_and_tool_loop {
                 summary(&handle, second_id).as_deref(),
                 Some("second answer")
             );
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }
@@ -19648,7 +19654,7 @@ mod requests_and_tool_loop {
             let probe = upstream.child();
             assert_eq!(upstream.registered_children(), 1);
             drop(probe);
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
         }
 
@@ -19695,7 +19701,7 @@ mod requests_and_tool_loop {
                 );
             }
             assert_eq!(requests.load(Ordering::SeqCst), 1, "nothing else was sent");
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
         }
 
@@ -19719,7 +19725,7 @@ mod requests_and_tool_loop {
             wait(job.settled()).expect("settled");
             let before = job_record(&handle, id);
             stop.request();
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             let after = job_record(&handle, id);
             assert!(after.completed_at.is_some());
             assert_eq!(before, after, "a completed Job is not cancelled afterwards");
@@ -19774,7 +19780,7 @@ mod requests_and_tool_loop {
                 Violation::UnresolvedToolEffect(record.call),
                 "the effect stays unresolved"
             );
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
         }
 
@@ -19794,7 +19800,7 @@ mod requests_and_tool_loop {
 
             let stop = job.stop_handle();
             let stopping = std::thread::spawn(move || stop.request());
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             stopping.join().expect("joined");
             assert!(matches!(
                 queued(),
@@ -19838,7 +19844,7 @@ mod requests_and_tool_loop {
             open.send(()).expect("let the Provider answer");
             until(|| job_record(&handle, id).completed_at.is_some());
             assert_eq!(summary(&handle, id).as_deref(), Some("finished alone"));
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
         }
 
@@ -20255,7 +20261,7 @@ mod requests_and_tool_loop {
             /// Stops in the host's order: listener, runtime, database.
             fn stop(self) {
                 wait(self.control.stop()).expect("stop the listener");
-                self.runtime.shutdown().expect("shutdown runtime");
+                wait(self.runtime.shutdown()).expect("shutdown runtime");
                 self.worker.shutdown().expect("shutdown");
             }
         }
@@ -20760,20 +20766,27 @@ mod requests_and_tool_loop {
         ) -> T {
             let returned = Arc::new(std::sync::Mutex::new(None));
             let slot = returned.clone();
-            let report = run_controlled_reporting(
-                directory,
-                false,
-                Some(config(admission_wait)),
-                move |context: HostContext| {
-                    let address = context.control_plane().expect("listening");
-                    async move {
-                        let value = std::thread::spawn(move || client(address))
-                            .join()
-                            .expect("the client did not panic");
-                        *slot.lock().expect("lock") = Some(value);
-                    }
-                },
-            );
+            let report = std::thread::scope(|scope| {
+                scope
+                    .spawn(move || {
+                        run_controlled_reporting(
+                            directory,
+                            false,
+                            Some(config(admission_wait)),
+                            move |context: HostContext| {
+                                let address = context.control_plane().expect("listening");
+                                async move {
+                                    let (returned, response) = flume::bounded(1);
+                                    std::thread::spawn(move || returned.send(client(address)));
+                                    let value = response.recv_async().await.expect("the client did not panic");
+                                    *slot.lock().expect("lock") = Some(value);
+                                }
+                            },
+                        )
+                    })
+                    .join()
+                    .expect("the host did not panic")
+            });
             assert!(
                 report
                     .failures
@@ -21156,7 +21169,7 @@ mod requests_and_tool_loop {
                 control,
             } = running;
             wait(control.stop()).expect("stop the listener");
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             if let Some(answer) = stopping.join().expect("joined") {
                 assert!(matches!(answer.as_str(), "requested" | "already_settled"));
             }
@@ -21882,7 +21895,7 @@ mod requests_and_tool_loop {
 
             fn stop(self) {
                 wait(self.control.stop()).expect("stop the listener");
-                self.runtime.shutdown().expect("shutdown runtime");
+                wait(self.runtime.shutdown()).expect("shutdown runtime");
                 self.worker.shutdown().expect("shutdown");
             }
         }
@@ -22936,7 +22949,7 @@ mod requests_and_tool_loop {
             // Job was left as it was.
             let left = record(&handle, job);
             assert!(left.started_at.is_some() && left.unknown_at.is_none());
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
             drop(silent);
         }
@@ -25036,7 +25049,7 @@ mod requests_and_tool_loop {
                 job_record(&handle, receipt.job).unknown_at.is_some(),
                 "it timed out"
             );
-            runtime.shutdown().expect("shutdown runtime");
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }

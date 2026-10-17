@@ -219,21 +219,11 @@ where
             return report;
         }
     };
-    let execution = match ExecutionRuntime::start(database.handle()) {
-        Ok(execution) => execution,
-        Err(error) => {
-            // The database still has to be closed, and its failure is kept
-            // beside the startup failure.
-            report.fail(Phase::Startup, error);
-            report.attempt(Phase::Database, database.shutdown());
-            return report;
-        }
-    };
     let served = ntex::rt::System::build()
         .name("ocg")
         .signals(signals)
         .build(ntex::rt::DefaultRuntime)
-        .block_on(serve(database.handle(), execution, control, until_stopped));
+        .block_on(serve(database.handle(), control, until_stopped));
     report.attempted.extend(served.attempted);
     report.failures.extend(served.failures);
     report.attempt(Phase::Database, database.shutdown());
@@ -280,7 +270,6 @@ fn protection_notice(
 /// database after it.
 async fn serve<F>(
     handle: DatabaseHandle,
-    execution: ExecutionRuntime,
     control: Option<ControlPlaneConfig>,
     until_stopped: impl FnOnce(HostContext) -> F,
 ) -> HostReport
@@ -288,6 +277,13 @@ where
     F: Future<Output = ()>,
 {
     let mut report = HostReport::default();
+    let execution = match ExecutionRuntime::start(handle.clone()) {
+        Ok(execution) => execution,
+        Err(error) => {
+            report.fail(Phase::Startup, error);
+            return report;
+        }
+    };
     // Started first: a lock also blocks the file log, so it is reported on
     // standard error for as long as the process runs.
     ntex::rt::spawn(report_protection(handle.watch_disk_protection()));
@@ -300,7 +296,7 @@ where
         Ok(logger) => logger,
         Err(error) => {
             report.attempt::<(), _>(Phase::Logger, Err(error));
-            report.attempt(Phase::ExecutionRuntime, execution.shutdown());
+            report.attempt(Phase::ExecutionRuntime, execution.shutdown().await);
             return report;
         }
     };
@@ -415,7 +411,7 @@ where
         }
     }
 
-    report.attempt(Phase::ExecutionRuntime, execution.shutdown());
+    report.attempt(Phase::ExecutionRuntime, execution.shutdown().await);
     // The cleanup worker is joined while the database and the logger it
     // uses are still open; a run in flight stops at its next file.
     if let Some(cleanup) = cleanup

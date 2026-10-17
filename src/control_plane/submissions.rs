@@ -1425,7 +1425,7 @@ mod tests {
             Some(PREVIOUS_JOB_NOT_FOUND)
         );
 
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         worker.shutdown().expect("shutdown worker");
     }
 }

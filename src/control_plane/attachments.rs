@@ -432,7 +432,7 @@ mod tests {
                 .contains("I see a 1x1 PNG image")
         }));
 
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         worker.shutdown().expect("shutdown worker");
     }
 }

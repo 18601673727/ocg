@@ -59,9 +59,6 @@ impl SchedulerWakeSubscription {
         self.dirty_gen.load(Ordering::SeqCst)
     }
 
-    // A permit is only a hint to read authoritative state. The consumer must
-    // scan initially and periodically even without a permit, and compare
-    // generations across a scan before sleeping. Equality is modulo 2^64.
     pub async fn recv_async(&self) -> Result<(), flume::RecvError> {
         self.permit_rx.recv_async().await
     }
