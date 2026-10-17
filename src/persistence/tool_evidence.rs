@@ -112,6 +112,12 @@ pub struct ToolAdmission {
     pub authorization: AuthorizationBasis,
 }
 
+impl ToolAdmission {
+    pub fn spawns(&self) -> bool {
+        crate::persistence::handler_spawns(&self.handler_version)
+    }
+}
+
 /// A call the Provider requested, as OCG identified it, with OCG's decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewToolEvidence {

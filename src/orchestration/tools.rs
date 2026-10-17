@@ -69,11 +69,28 @@ pub(crate) trait ToolHandler: Send + Sync {
     /// handler is registered.
     fn effect(&self) -> ToolEffect;
 
+    /// Whether this handler may start an operating-system process.
+    fn spawns(&self) -> bool {
+        false
+    }
+
     /// Runs one call with arguments its registered schema accepted, exactly
     /// as the Provider sent them. It should finish promptly and yield while
     /// it waits, so that its time limit and cancellation can stop it; a
     /// handler stopped either way leaves its outcome uncertain.
     fn call(&self, arguments: Value) -> ToolFuture<'_>;
+
+    /// Stops work started by this handler and waits until its supervisor has
+    /// confirmed that no process group remains. Handlers without processes
+    /// have nothing to stop.
+    fn stop(&self) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Stops any process retained for the remainder of the Job before finalization.
+    fn stop_before_finalize(&self) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
+        self.stop()
+    }
 }
 
 /// What a failing handler knows of its effect.
@@ -315,11 +332,30 @@ pub(crate) struct Dispatch {
     pub(crate) arguments: Value,
     pub(crate) version: String,
     pub(crate) effect: ToolEffect,
+    pub(crate) spawns: bool,
     /// The parameter schema the arguments were checked against, serialized.
     pub(crate) schema: String,
 }
 
 impl ToolOffer {
+    pub(crate) async fn stop_before_finalize(&self) -> Result<(), ToolFailure> {
+        let handlers = {
+            let registry = self.registry.lock();
+            self.tools
+                .iter()
+                .filter_map(|(name, generation)| {
+                    current(&registry, name, *generation)
+                        .ok()
+                        .map(|tool| tool.handler.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for handler in handlers {
+            handler.stop_before_finalize().await?;
+        }
+        Ok(())
+    }
+
     /// The definitions to send, read from the registry now. Every selected
     /// tool must still be the registration selected, and still authorized.
     ///
@@ -360,7 +396,7 @@ impl ToolOffer {
                 call.name
             )));
         };
-        let (validator, handler, version, effect, schema) = {
+        let (validator, handler, version, effect, spawns, schema) = {
             let registry = self.registry.lock();
             let tool = current(&registry, name, *generation)
                 .map_err(|error| refused(format!("tool call {index} cannot run: {error}")))?;
@@ -369,6 +405,7 @@ impl ToolOffer {
                 tool.handler.clone(),
                 tool.version.clone(),
                 tool.effect,
+                tool.handler.spawns(),
                 tool.schema.clone(),
             )
         };
@@ -378,6 +415,7 @@ impl ToolOffer {
             arguments,
             version,
             effect,
+            spawns,
             schema,
         })
     }

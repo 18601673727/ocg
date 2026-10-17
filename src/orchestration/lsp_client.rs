@@ -30,18 +30,20 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use flume::{self, Sender};
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 use serde_json::{Value, json};
 
+#[cfg(test)]
+use rustix::process::Pid;
+
+use crate::orchestration::blocking::{self, Kind, StopSignal};
 use crate::orchestration::workspace_lsp::file_uri;
 
 /// The largest message this client accepts or sends. A server that announces
@@ -60,9 +62,6 @@ const SHUTDOWN_ID: i64 = -1;
 
 /// How long [`Client::drop`] waits for a `shutdown` answer, and then for the
 /// process to leave. Bounded, because a drop cannot wait indefinitely.
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
-const EXIT_GRACE: Duration = Duration::from_millis(500);
-const POLL: Duration = Duration::from_millis(10);
 
 /// Why a server's stream could not be read, or could not be believed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -115,79 +114,65 @@ pub(crate) struct Launch {
 
 /// The child process of a session, which its `Drop` stops and reaps.
 struct Process {
-    child: Mutex<Option<Child>>,
-    group: Pid,
+    process: Mutex<Option<blocking::Process>>,
+    stop: StopSignal,
+    cleanup: Mutex<Option<Result<(), String>>>,
+    cleaned: Condvar,
 }
 
 impl Process {
     /// Reaps the process when it exits within `limit`, and says whether it
     /// was. Polled rather than waited on, so a server that never leaves
     /// cannot hold this up for longer than `limit`.
-    fn reaps_within(&self, limit: Duration) -> bool {
-        let deadline = Instant::now() + limit;
-        loop {
-            let reaped = {
-                let mut guard = self.lock();
-                match guard.as_ref() {
-                    None => true,
-                    Some(child) => match rustix::process::waitid(
-                        WaitId::Pid(Pid::from_child(child)),
-                        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-                    ) {
-                        Ok(Some(_)) => {
-                            if let Err(error) =
-                                rustix::process::kill_process_group(self.group, Signal::KILL)
-                                && error != rustix::io::Errno::SRCH
-                            {
-                                log::error!("LSP descendant cleanup failed: {error}");
-                            }
-                            if let Some(mut child) = guard.take()
-                                && let Err(error) = child.wait()
-                            {
-                                log::error!("LSP reap failed: {error}");
-                            }
-                            true
-                        }
-                        Ok(None) => false,
-                        Err(rustix::io::Errno::INTR) => false,
-                        Err(error) => {
-                            log::error!("LSP wait failed: {error}");
-                            false
-                        }
-                    },
-                }
-            };
-            if reaped {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(POLL);
+    fn stop_blocking(&self) -> Result<(), LspError> {
+        let process = self
+            .process
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(process) = process {
+            self.request_signal();
+            let result = process
+                .finish(|| true)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let mut cleanup = self.cleanup.lock().unwrap_or_else(PoisonError::into_inner);
+            *cleanup = Some(result.clone());
+            self.cleaned.notify_all();
+            return result.map_err(LspError::NotStarted);
         }
+
+        let mut cleanup = self.cleanup.lock().unwrap_or_else(PoisonError::into_inner);
+        while cleanup.is_none() {
+            cleanup = self
+                .cleaned
+                .wait(cleanup)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        cleanup
+            .clone()
+            .expect("cleanup completion was observed")
+            .map_err(LspError::NotStarted)
     }
 
-    /// Kills the whole group and reaps its leader. Whatever is left of the
-    /// group is killed before the leader is reaped, so a server that spawned
-    /// Cargo, Node or a plugin cannot outlive its session. Doing it twice is
-    /// not an error: the leader is reaped once.
-    fn kill_and_reap(&self) {
-        let mut guard = self.lock();
-        let Some(mut child) = guard.take() else {
-            return;
-        };
-        if let Err(error) = rustix::process::kill_process_group(self.group, Signal::KILL)
-            && error != rustix::io::Errno::SRCH
+    fn request_signal(&self) {
+        self.stop.request();
+        if let Some(process) = self
+            .process
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
         {
-            log::error!("LSP group cleanup failed: {error}");
-        }
-        if let Err(error) = child.wait() {
-            log::error!("LSP reap failed: {error}");
+            process.request_stop();
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Option<Child>> {
-        self.child.lock().unwrap_or_else(PoisonError::into_inner)
+    fn request_stop(&self) {
+        self.request_signal();
+        #[cfg(test)]
+        if let Err(error) = self.stop_blocking() {
+            log::error!("LSP cancellation cleanup failed: {error}");
+        }
     }
 }
 
@@ -555,7 +540,6 @@ pub(crate) struct Client {
     pending: Arc<Mutex<HashMap<i64, Sender<Outcome>>>>,
     notifications: Mutex<flume::Receiver<Value>>,
     failure: Arc<Mutex<Option<ProtocolError>>>,
-    shutdown_acked: Arc<AtomicBool>,
 }
 
 /// Builds a session over whatever streams it is given.
@@ -576,7 +560,9 @@ fn assemble(
         .spawn(move || drain(stderr))
         .map_err(|error| {
             if let Some(process) = &process {
-                process.kill_and_reap();
+                if let Err(error) = process.stop_blocking() {
+                    log::error!("LSP startup cleanup failed: {error}");
+                }
             }
             LspError::NotStarted(error.to_string())
         })?;
@@ -602,7 +588,9 @@ fn assemble(
                     record(&failure, problem);
                 }
                 if let Some(process) = process {
-                    process.kill_and_reap();
+                    if let Err(error) = process.stop_blocking() {
+                        log::error!("LSP process cleanup failed: {error}");
+                    }
                 }
                 // The stream is over: no answer can arrive from here on, so
                 // everything waiting is failed rather than left waiting.
@@ -625,7 +613,9 @@ fn assemble(
         })
         .map_err(|error| {
             if let Some(process) = &process {
-                process.kill_and_reap();
+                if let Err(error) = process.stop_blocking() {
+                    log::error!("LSP startup cleanup failed: {error}");
+                }
             }
             LspError::NotStarted(error.to_string())
         })?;
@@ -637,16 +627,26 @@ fn assemble(
         pending,
         notifications: Mutex::new(receiver),
         failure,
-        shutdown_acked,
     }))
 }
 
 impl Client {
-    pub(crate) fn terminate(&self) {
+    pub(crate) fn request_stop(&self) {
         record(&self.failure, ProtocolError::Closed);
         if let Some(process) = &self.process {
-            process.kill_and_reap();
+            process.request_stop();
         }
+    }
+
+    pub(crate) async fn terminate(&self) -> Result<(), LspError> {
+        record(&self.failure, ProtocolError::Closed);
+        if let Some(process) = &self.process {
+            let process = process.clone();
+            blocking::run_unpermitted(move || process.stop_blocking())
+                .await
+                .map_err(|error| LspError::NotStarted(error.to_owned()))??;
+        }
+        Ok(())
     }
 
     pub(crate) fn clear_notifications(&self) {
@@ -664,7 +664,37 @@ impl Client {
     ///
     /// Returns [`LspError::NotStarted`] when the process cannot be started or
     /// its pipes cannot be taken.
+    #[cfg(test)]
     pub(crate) fn start(launch: &Launch) -> Result<Arc<Self>, LspError> {
+        Self::start_blocking(launch)
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn start(launch: &Launch) -> Result<Arc<Self>, LspError> {
+        let launch = Launch {
+            program: launch.program.clone(),
+            arguments: launch.arguments.clone(),
+            root: launch.root.clone(),
+            variables: launch.variables.clone(),
+        };
+        blocking::run_unpermitted(move || Self::start_blocking(&launch))
+            .await
+            .map_err(|error| LspError::NotStarted(error.to_owned()))?
+    }
+
+    pub(crate) async fn start_for_execution(launch: &Launch) -> Result<Arc<Self>, LspError> {
+        #[cfg(test)]
+        {
+            return Self::start(launch);
+        }
+
+        #[cfg(not(test))]
+        {
+            Self::start(launch).await
+        }
+    }
+
+    fn start_blocking(launch: &Launch) -> Result<Arc<Self>, LspError> {
         let mut command = Command::new(&launch.program);
         command
             .args(&launch.arguments)
@@ -673,33 +703,32 @@ impl Client {
             .envs(launch.variables.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let mut child = command
-            .spawn()
+            .stderr(Stdio::piped());
+        let stop = StopSignal::new();
+        let mut process = blocking::Process::spawn(command, Kind::Command, stop.clone())
             .map_err(|error| LspError::NotStarted(error.to_string()))?;
-        let group = Pid::from_child(&child);
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            rustix::process::kill_process_group(group, Signal::KILL).ok();
-            child.wait().ok();
+        let (stdin, stdout, stderr) = process.take_io();
+        let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
+            process.request_stop();
+            if let Err(error) = process.finish(|| true) {
+                log::error!("LSP stream setup cleanup failed: {error}");
+            }
             return Err(LspError::NotStarted(
                 "the server's standard streams were not piped".to_owned(),
             ));
         };
         if let Err(error) = rustix::fs::fcntl_setfl(&stdin, rustix::fs::OFlags::NONBLOCK) {
-            if let Err(problem) = rustix::process::kill_process_group(group, Signal::KILL) {
+            process.request_stop();
+            if let Err(problem) = process.finish(|| true) {
                 log::error!("LSP startup cleanup failed: {problem}");
-            }
-            if let Err(problem) = child.wait() {
-                log::error!("LSP startup reap failed: {problem}");
             }
             return Err(LspError::NotStarted(error.to_string()));
         }
         let process = Arc::new(Process {
-            child: Mutex::new(Some(child)),
-            group,
+            process: Mutex::new(Some(process)),
+            stop,
+            cleanup: Mutex::new(None),
+            cleaned: Condvar::new(),
         });
         assemble(
             Box::new(stdin),
@@ -768,7 +797,7 @@ impl Client {
             },
         });
         self.request("initialize", parameters, limit).await?;
-        self.notify("initialized", json!({}))?;
+        self.notify("initialized", json!({})).await?;
         Ok(())
     }
 
@@ -801,7 +830,11 @@ impl Client {
             completed: false,
         };
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": parameters});
-        if let Err(problem) = self.writer.send(&message) {
+        let writer = self.writer.clone();
+        let written = blocking::run_unpermitted(move || writer.send(&message))
+            .await
+            .map_err(|error| LspError::NotStarted(error.to_owned()))?;
+        if let Err(problem) = written {
             self.forget(id);
             return Err(problem.into());
         }
@@ -836,9 +869,13 @@ impl Client {
     /// # Errors
     ///
     /// Returns why the message could not be written.
-    pub(crate) fn notify(&self, method: &str, parameters: Value) -> Result<(), LspError> {
+    pub(crate) async fn notify(&self, method: &str, parameters: Value) -> Result<(), LspError> {
         let message = json!({"jsonrpc": "2.0", "method": method, "params": parameters});
-        self.writer.send(&message).map_err(LspError::from)
+        let writer = self.writer.clone();
+        blocking::run_unpermitted(move || writer.send(&message))
+            .await
+            .map_err(|error| LspError::NotStarted(error.to_owned()))?
+            .map_err(LspError::from)
     }
 
     /// Waits for the next notification of `method`, or for `limit` to pass.
@@ -871,13 +908,14 @@ impl Client {
     /// # Errors
     ///
     /// Returns why the server did not confirm `shutdown`.
-    #[cfg(test)]
     pub(crate) async fn shutdown(&self, limit: Duration) -> Result<(), LspError> {
         let result = self.request("shutdown", Value::Null, limit).await;
-        self.notify("exit", Value::Null).ok();
+        self.notify("exit", Value::Null).await.ok();
         if let Some(process) = &self.process {
-            process.reaps_within(limit);
-            process.kill_and_reap();
+            let process = process.clone();
+            blocking::run_unpermitted(move || process.stop_blocking())
+                .await
+                .map_err(|error| LspError::NotStarted(error.to_owned()))??;
         }
         result.map(|_| ())
     }
@@ -906,39 +944,39 @@ struct PendingRequest<'a> {
 impl Drop for PendingRequest<'_> {
     fn drop(&mut self) {
         self.client.forget(self.id);
-        if !self.completed
-            && let Err(error) = self
-                .client
-                .notify("$/cancelRequest", json!({"id": self.id}))
-        {
-            log::debug!("LSP cancellation could not be sent: {error}");
+        if !self.completed {
+            let writer = self.client.writer.clone();
+            let message =
+                json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": self.id}});
+            if let Err(error) = thread::Builder::new()
+                .name("ocg-lsp-cancel".to_owned())
+                .spawn(move || {
+                    if let Err(error) = writer.send(&message) {
+                        log::debug!("LSP cancellation could not be sent: {error}");
+                    }
+                })
+            {
+                log::debug!("LSP cancellation worker could not start: {error}");
+            }
         }
     }
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
-        // A best-effort `shutdown`, then `exit` for a server that answers it
-        // in time; either way the group is killed and the leader reaped, so
-        // nothing a server started outlives this drop.
-        let sent = self
-            .writer
-            .send(&json!({"jsonrpc": "2.0", "id": SHUTDOWN_ID, "method": "shutdown", "params": Value::Null}))
-            .is_ok();
-        if sent {
-            let deadline = Instant::now() + SHUTDOWN_GRACE;
-            while !self.shutdown_acked.load(Ordering::Relaxed) && Instant::now() < deadline {
-                thread::sleep(POLL);
-            }
-            if self.shutdown_acked.load(Ordering::Relaxed) {
-                self.writer
-                    .send(&json!({"jsonrpc": "2.0", "method": "exit"}))
-                    .ok();
-            }
-        }
         if let Some(process) = &self.process {
-            process.reaps_within(EXIT_GRACE);
-            process.kill_and_reap();
+            let process = process.clone();
+            process.request_stop();
+            if let Err(error) = thread::Builder::new()
+                .name("ocg-lsp-drop-cleanup".to_owned())
+                .spawn(move || {
+                    if let Err(error) = process.stop_blocking() {
+                        log::error!("LSP drop cleanup failed: {error}");
+                    }
+                })
+            {
+                log::error!("LSP drop cleanup worker could not start: {error}");
+            }
         }
     }
 }

@@ -368,6 +368,23 @@ impl ToolHandler for QueryLsp {
         ToolEffect::NonIdempotent
     }
 
+    fn spawns(&self) -> bool {
+        true
+    }
+
+    fn stop(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolFailure>> + '_>> {
+        let sessions = self.sessions.clone();
+        Box::pin(async move { sessions.stop().await })
+    }
+
+    fn stop_before_finalize(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolFailure>> + '_>> {
+        self.stop()
+    }
+
     /// Asks the one question, yielding while the server works, so the
     /// execution's own time limit and cancellation can stop the call.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
@@ -469,14 +486,14 @@ impl Session {
             .launch
             .as_ref()
             .ok_or(CallError::Refused(Refusal::NoServer(self.name)))?;
-        let client = Client::start(launch)?;
-        client.initialize(self.limits.initialize).await?;
+        let client = Client::start_for_execution(launch).await?;
         let previous = self
             .client
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .replace(client.clone());
         drop(previous);
+        client.initialize(self.limits.initialize).await?;
         // A new server knows nothing, so nothing may be withheld from it on
         // the grounds that some other server was told about it.
         self.opened
@@ -486,7 +503,13 @@ impl Session {
         Ok(client)
     }
 
-    fn open(&self, client: &Client, uri: &str, path: &str, text: &str) -> Result<i64, CallError> {
+    async fn open(
+        &self,
+        client: &Client,
+        uri: &str,
+        path: &str,
+        text: &str,
+    ) -> Result<i64, CallError> {
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, text.as_bytes())
             .as_ref()
             .to_vec();
@@ -499,20 +522,24 @@ impl Session {
             client.clear_notifications();
             client.notify("textDocument/didChange", json!({
                 "textDocument": {"uri": uri, "version": next}, "contentChanges": [{"text": text}]
-            }))?;
+            })).await?;
             // These bytes were read from the authorized on-disk file. A save
             // notification also triggers rust-analyzer's semantic cargo check.
-            client.notify("textDocument/didSave", json!({"textDocument":{"uri":uri}}))?;
+            client
+                .notify("textDocument/didSave", json!({"textDocument":{"uri":uri}}))
+                .await?;
             opened.insert(uri.to_owned(), (digest, next));
             return Ok(next);
         }
         if opened.len() >= MAX_OPEN_DOCUMENTS
             && let Some(oldest) = opened.keys().next().cloned()
         {
-            client.notify(
-                "textDocument/didClose",
-                json!({"textDocument": {"uri": oldest}}),
-            )?;
+            client
+                .notify(
+                    "textDocument/didClose",
+                    json!({"textDocument": {"uri": oldest}}),
+                )
+                .await?;
             opened.remove(&oldest);
         }
         client.clear_notifications();
@@ -521,12 +548,24 @@ impl Session {
             json!({"textDocument": {
                 "uri": uri, "languageId": self.language.identifier(path), "version": 1, "text": text
             }}),
-        )?;
+        ).await?;
         opened.insert(uri.to_owned(), (digest, 1));
         Ok(1)
     }
 
-    fn stop(&self) {
+    fn request_stop(&self) {
+        self.disabled.store(true, Ordering::Release);
+        if let Some(client) = self
+            .client
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            client.request_stop();
+        }
+    }
+
+    async fn stop(&self) -> Result<(), ToolFailure> {
         self.disabled.store(true, Ordering::Release);
         let client = self
             .client
@@ -534,8 +573,12 @@ impl Session {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(client) = client {
-            client.terminate();
+            client.shutdown(Duration::from_millis(500)).await.ok();
+            if let Err(error) = client.terminate().await {
+                return Err(ToolFailure::uncertain(error.to_string()));
+            }
         }
+        Ok(())
     }
 }
 
@@ -571,6 +614,11 @@ impl Sessions {
         }
     }
 
+    async fn stop(&self) -> Result<(), ToolFailure> {
+        self.rust.stop().await?;
+        self.typescript.stop().await
+    }
+
     /// Stops every running server through the protocol's own `shutdown` and
     /// `exit`, and reaps them. The tool loop has no end-of-execution hook to
     /// call this from, so in an execution this is not what stops a server:
@@ -599,7 +647,7 @@ struct SessionUse<'a> {
 impl Drop for SessionUse<'_> {
     fn drop(&mut self) {
         if !self.complete {
-            self.session.stop();
+            self.session.request_stop();
         }
         self.session.busy.store(false, Ordering::Release);
     }
@@ -673,7 +721,7 @@ async fn query_once(
     };
     let uri = file_uri(&absolute);
     let client = session.client().await?;
-    let version = session.open(&client, &uri, request.path, &text)?;
+    let version = session.open(&client, &uri, request.path, &text).await?;
     let mut value = json!({
         "server": session.name,
         "language": language.name(),

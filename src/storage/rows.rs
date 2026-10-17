@@ -595,6 +595,9 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
             e.u8(2);
             e.str(&admission.handler_version);
             e.u8(admission.effect.code());
+            e.bool(crate::persistence::handler_spawns(
+                &admission.handler_version,
+            ));
             e.str(&admission.parameters);
             e.str(admission.arguments.as_str());
             e.u8(admission.authorization.code());
@@ -652,13 +655,24 @@ pub(super) fn decode_tool_evidence(
     let decided_at = d.ts()?;
     let decision = match d.u8()? {
         1 => ToolDecision::Refused(d.code(ToolCallRefusal::from_code)?),
-        2 => ToolDecision::Admitted(ToolAdmission {
-            handler_version: d.str()?,
-            effect: d.code(ToolEffect::from_code)?,
-            parameters: d.str()?,
-            arguments: ToolPayload::new(d.str()?),
-            authorization: d.code(AuthorizationBasis::from_code)?,
-        }),
+        2 => {
+            let handler_version = d.str()?;
+            let effect = d.code(ToolEffect::from_code)?;
+            let spawns = d.bool()?;
+            let admission = ToolAdmission {
+                handler_version,
+                effect,
+                parameters: d.str()?,
+                arguments: ToolPayload::new(d.str()?),
+                authorization: d.code(AuthorizationBasis::from_code)?,
+            };
+            if spawns != admission.spawns() {
+                return Err(StorageError::corrupted(
+                    "tool spawn metadata disagrees with its handler version",
+                ));
+            }
+            ToolDecision::Admitted(admission)
+        }
         _ => return Err(StorageError::corrupted("invalid tool decision")),
     };
     let outcome = d.opt(|d| {

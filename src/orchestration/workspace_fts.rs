@@ -57,6 +57,7 @@ use rustix::fs::{AtFlags, Dir, FileType};
 use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 
+use crate::orchestration::blocking::{Kind, Permit};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
@@ -1693,6 +1694,7 @@ impl ToolHandler for FtsSearch {
             let worker = thread::Builder::new()
                 .name("ocg-workspace-fts".to_owned())
                 .spawn(move || {
+                    let _permit = Permit::acquire(Kind::Cpu);
                     if report
                         .send(run_call(&worker_fts, &call, &worker_stop))
                         .is_err()
@@ -1734,10 +1736,21 @@ impl Drop for StopOnDrop {
         if let Some(probe) = &self.fts.probe {
             probe("worker_stopped", 0);
         }
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            log::error!("workspace search worker panicked");
+        if let Some(worker) = self.worker.take() {
+            #[cfg(test)]
+            {
+                if worker.join().is_err() {
+                    log::error!("workspace search worker panicked");
+                }
+            }
+            #[cfg(not(test))]
+            let _ = thread::Builder::new()
+                .name("ocg-workspace-fts-join".to_owned())
+                .spawn(move || {
+                    if worker.join().is_err() {
+                        log::error!("workspace search worker panicked");
+                    }
+                });
         }
     }
 }

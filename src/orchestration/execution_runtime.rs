@@ -1202,8 +1202,7 @@ async fn run_started_provider_job(
             cursor = ancestor.previous;
         }
         prior_turns.reverse();
-        let mut built =
-            provider_execution::objective_conversation(&configuration.frozen, None);
+        let mut built = provider_execution::objective_conversation(&configuration.frozen, None);
         built.messages.pop();
         for (turn_objective, turn_images, assistant_text) in prior_turns {
             if let Some(user_msg) = provider_execution::objective_conversation_with_images(
@@ -1488,6 +1487,7 @@ pub(crate) async fn run_provider_job(
     if let Some(Err(error)) = tools.map(|tools| tools.limits.validate()) {
         // Nothing was sent, so nothing of a Provider is recorded.
         let stopped = Stopped::from(ToolLoopStop::InvalidLimits(error));
+        stop_tools_before_finalize(tools).await?;
         return stop_tool_loop(run, sink, None, stopped).await;
     }
     let mut budget = ToolBudget::default();
@@ -1495,6 +1495,7 @@ pub(crate) async fn run_provider_job(
         let result = match exchange(&conversation, &mut sink).await {
             Ok(result) if result.requests_tools() => result,
             execution => {
+                stop_tools_before_finalize(tools).await?;
                 return finish_provider_job(
                     run.database,
                     run.executor,
@@ -1540,7 +1541,10 @@ pub(crate) async fn run_provider_job(
         };
         let (answers, next) = match (answered, next) {
             (Ok(answers), Some(next)) => (answers, next),
-            (Err(stopped), _) => return stop_tool_loop(run, sink, Some(&result), stopped).await,
+            (Err(stopped), _) => {
+                stop_tools_before_finalize(tools).await?;
+                return stop_tool_loop(run, sink, Some(&result), stopped).await;
+            }
             (Ok(_), None) => unreachable!("calls are answered only when a request may follow"),
         };
         let text = Some(result.text.clone()).filter(|text| !text.is_empty());
@@ -1559,6 +1563,20 @@ pub(crate) async fn run_provider_job(
         }
         sink.request = next;
     }
+}
+
+async fn stop_tools_before_finalize(
+    tools: Option<&ToolExecution>,
+) -> Result<(), ExecutionRuntimeError> {
+    if let Some(tools) = tools
+        && let Err(error) = tools.offer.stop_before_finalize().await
+    {
+        return Err(ExecutionRuntimeError::Provider(format!(
+            "tool process cleanup failed before Job finalization: {}",
+            error.message
+        )));
+    }
+    Ok(())
 }
 
 /// What one Job's calls have used of their limits.
@@ -1778,7 +1796,9 @@ async fn answer_calls(
             return Err(cancelled_before_invocation(site, reference).await);
         }
         let handler = dispatch.handler;
+        let spawns = dispatch.spawns;
         let arguments = dispatch.arguments;
+        let stopping_handler = handler.clone();
         let invocation = CatchPanic(Box::pin(async move { handler.call(arguments).await }));
         let ran = select(
             cancellation.cancelled(),
@@ -1787,6 +1807,25 @@ async fn answer_calls(
         .await;
         #[cfg(test)]
         dispatch_seam::reach(dispatch_seam::Point::Ran, reference);
+        let stopped = match &ran {
+            Either::Left(()) | Either::Right(Err(())) if spawns => stopping_handler.stop().await,
+            _ => Ok(()),
+        };
+        if let Err(failure) = stopped {
+            return Err(conclude(
+                site,
+                reference,
+                ToolOutcome::Uncertain {
+                    cause: UncertainCause::HandlerReported,
+                    message: Some(failure.message),
+                },
+                ToolLoopStop::HandlerUncertain {
+                    index,
+                    message: "the handler could not confirm its process cleanup".to_owned(),
+                },
+            )
+            .await);
+        }
         let (outcome, stop) = match ran {
             Either::Left(()) => (
                 ToolOutcome::Uncertain {

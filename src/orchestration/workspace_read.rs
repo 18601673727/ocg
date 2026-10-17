@@ -54,6 +54,7 @@ use rustix::io::Errno;
 use serde_json::{Value, json};
 
 use crate::data_directory::DataDirectory;
+use crate::orchestration::blocking::{self, Kind};
 use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
@@ -792,9 +793,7 @@ impl ToolHandler for ReadFile {
         ToolEffect::ReadOnly
     }
 
-    /// Reads the file synchronously: it is local and bounded, so the call
-    /// does not yield while it reads, and its time limit cannot interrupt a
-    /// read that blocks.
+    /// Reads on a dedicated blocking worker while holding a file permit.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let refused = |refusal: Refusal| ToolFailure::not_applied(refusal.to_string());
@@ -803,14 +802,23 @@ impl ToolHandler for ReadFile {
             };
             match requested_range(&arguments).map_err(refused)? {
                 None => {
-                    let content = self.workspace.read(path).map_err(refused)?;
+                    let owned_path = path.to_owned();
+                    let workspace = self.workspace.clone();
+                    let content = blocking::run(Kind::File, move || workspace.read(&owned_path))
+                        .await
+                        .map_err(ToolFailure::uncertain)?
+                        .map_err(refused)?;
                     Ok(json!({"path": path, "content": content}))
                 }
                 Some((start_line, line_count)) => {
-                    let range = self
-                        .workspace
-                        .read_range(path, start_line, line_count)
-                        .map_err(refused)?;
+                    let owned_path = path.to_owned();
+                    let workspace = self.workspace.clone();
+                    let range = blocking::run(Kind::File, move || {
+                        workspace.read_range(&owned_path, start_line, line_count)
+                    })
+                    .await
+                    .map_err(ToolFailure::uncertain)?
+                    .map_err(refused)?;
                     Ok(range.to_json(path))
                 }
             }

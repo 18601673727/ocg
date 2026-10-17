@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tree_sitter::{Language, ParseOptions, Parser, Point};
 
+use crate::orchestration::blocking::{self, Kind};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
@@ -84,29 +85,29 @@ impl ToolHandler for WorkspaceIndexQuery {
                 None => return Err(ToolFailure::not_applied("unsupported file type")),
             };
 
-            let language_obj = match language {
-                LanguageKind::Rust => self.rust.clone(),
-                LanguageKind::TypeScript => self.typescript.clone(),
-                LanguageKind::Tsx => self.tsx.clone(),
-                LanguageKind::Python => self.python.clone(),
-            };
-
-            // Read and validate the file
-            let bytes = self
-                .workspace
-                .read_binary(path, MAX_PARSE_FILE_BYTES)
-                .map_err(|refusal| ToolFailure::not_applied(refusal.to_string()))?;
-
-            let source = String::from_utf8(bytes)
-                .map_err(|_| ToolFailure::not_applied("the file is not UTF-8 text"))?;
-
-            // Capture owned data for the blocking task
+            // Capture owned data for the worker that performs both file I/O
+            // and syntax analysis under one CPU permit.
+            let workspace = self.workspace.clone();
             let path_owned = path.to_string();
             let operation_owned = operation.to_string();
             let max_result_bytes = self.max_result_bytes;
+            let rust = self.rust.clone();
+            let typescript = self.typescript.clone();
+            let tsx = self.tsx.clone();
+            let python = self.python.clone();
 
-            // Run parsing and extraction in a blocking task
-            let result = ntex::rt::spawn_blocking(move || {
+            let result = blocking::run(Kind::Cpu, move || {
+                let bytes = workspace
+                    .read_binary(&path_owned, MAX_PARSE_FILE_BYTES)
+                    .map_err(|refusal| ToolFailure::not_applied(refusal.to_string()))?;
+                let source = String::from_utf8(bytes)
+                    .map_err(|_| ToolFailure::not_applied("the file is not UTF-8 text"))?;
+                let language_obj = match language {
+                    LanguageKind::Rust => rust,
+                    LanguageKind::TypeScript => typescript,
+                    LanguageKind::Tsx => tsx,
+                    LanguageKind::Python => python,
+                };
                 parse_and_extract(
                     &path_owned,
                     &source,
@@ -117,7 +118,7 @@ impl ToolHandler for WorkspaceIndexQuery {
                 )
             })
             .await
-            .map_err(|_| ToolFailure::uncertain("the blocking task panicked or was cancelled"))??;
+            .map_err(ToolFailure::uncertain)??;
 
             Ok(result)
         })
@@ -811,7 +812,8 @@ fn truncate_result(
     if let Some(array) = result.get_mut(array_key).and_then(Value::as_array_mut) {
         array.truncate(best);
     }
-    result["truncated"] = Value::Bool(best < original_len || result["truncated"] == Value::Bool(true));
+    result["truncated"] =
+        Value::Bool(best < original_len || result["truncated"] == Value::Bool(true));
 
     Ok(result)
 }

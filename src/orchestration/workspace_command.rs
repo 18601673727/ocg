@@ -61,17 +61,21 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use rustix::io::Errno;
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 use serde_json::{Value, json};
 
+#[cfg(test)]
+use rustix::io::Errno;
+#[cfg(test)]
+use rustix::process::Pid;
+
+use crate::orchestration::blocking::{self, Kind, Process, StopSignal};
 use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
@@ -92,7 +96,7 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a stopped command is given to be reaped before the call returns
 /// without it, and how much longer than its command the tool loop gives a
 /// call, so the command's own limit stops it first.
-const STOP_GRACE: Duration = Duration::from_secs(5);
+const STOP_GRACE: Duration = blocking::STOP_GRACE;
 
 /// The most output, of stdout and stderr together, a result carries.
 pub const OUTPUT_BYTES: usize = 12 * 1024;
@@ -279,42 +283,17 @@ struct Invocation {
     variables: Vec<(OsString, OsString)>,
 }
 
-/// What the call and the supervisor of its command share.
-#[derive(Default)]
-struct Control {
-    /// The command's process group, once it is started.
-    group: Option<Pid>,
-    /// Set once the command's process is reaped; its group is never
-    /// signalled after.
-    reaped: bool,
-    /// Set once the call stops the command. Nothing starts after it.
-    stopped: bool,
+static ACTIVE: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, StopSignal>>> = OnceLock::new();
+
+fn active() -> &'static Mutex<std::collections::BTreeMap<PathBuf, StopSignal>> {
+    ACTIVE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
 }
 
-type SharedControl = Arc<Mutex<Control>>;
-
-fn lock(control: &SharedControl) -> MutexGuard<'_, Control> {
-    control.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Kills the command's process group, unless its process was reaped, and
-/// keeps a command not yet started from starting. It never waits for the
-/// process: the supervisor reaps it.
-fn stop(control: &SharedControl) {
-    let mut control = lock(control);
-    control.stopped = true;
-    if let (Some(group), false) = (control.group, control.reaped) {
-        rustix::process::kill_process_group(group, Signal::KILL).ok();
-    }
-}
-
-/// Stops the command when the call ends without its report, as when the
-/// call's limit or cancellation drops it.
-struct StopOnDrop(SharedControl);
+struct StopOnDrop(StopSignal);
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        stop(&self.0);
+        self.0.request();
     }
 }
 
@@ -425,7 +404,7 @@ fn result(preset: Preset, ended: &Ended) -> Value {
 
 /// Starts the command and supervises it to its end, on the calling thread,
 /// which is never the executor's.
-fn supervise(invocation: Invocation, control: &SharedControl) -> Result<Ended, Failure> {
+fn supervise(invocation: Invocation, stop: StopSignal) -> Result<Ended, Failure> {
     let mut command = Command::new(&invocation.program);
     command
         .args(invocation.arguments)
@@ -439,48 +418,24 @@ fn supervise(invocation: Invocation, control: &SharedControl) -> Result<Ended, F
         )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    if lock(control).stopped {
-        return Err(Refusal::NotStarted.into());
-    }
-    // Started outside the lock, so a stop never waits for a slow start; a
-    // stop that came meanwhile kills the group as soon as it is known, while
-    // its leader is unreaped.
-    let mut child = command.spawn().map_err(|_| Refusal::NotStarted)?;
-    {
-        let mut state = lock(control);
-        let group = Pid::from_child(&child);
-        state.group = Some(group);
-        if state.stopped {
-            rustix::process::kill_process_group(group, Signal::KILL).ok();
-        }
-    }
-    let readers = match (child.stdout.take(), child.stderr.take()) {
+        .stderr(Stdio::piped());
+    let mut process =
+        Process::spawn(command, Kind::Command, stop.clone()).map_err(|_| Refusal::NotStarted)?;
+    let (stdout_pipe, stderr_pipe) = process.take_output();
+    let readers = match (stdout_pipe, stderr_pipe) {
         (Some(stdout), Some(stderr)) => {
             reader(stdout).and_then(|stdout| reader(stderr).map(|stderr| (stdout, stderr)))
         }
         _ => None,
     };
     let Some((stdout, stderr)) = readers else {
-        stop(control);
-        reap(&mut child, control);
+        stop.request();
+        let _ = process.finish(|| true);
         return Err(Uncertainty::OutputNotCaptured.into());
     };
-    let exited = await_exit(&child);
-    // The process has exited but is not reaped, so its group is still its
-    // own: whatever is left in it is killed before it is reaped.
-    let status = {
-        let mut state = lock(control);
-        if let Some(group) = state.group {
-            rustix::process::kill_process_group(group, Signal::KILL).ok();
-        }
-        let status = child.wait();
-        state.reaped = true;
-        status
-    };
-    let (Ok(()), Ok(status)) = (exited, status) else {
-        return Err(Uncertainty::NotObserved.into());
+    let status = match process.finish(|| stop.requested()) {
+        Ok(status) => status,
+        Err(_) => return Err(Uncertainty::NotObserved.into()),
     };
     match (stdout.join(), stderr.join()) {
         (Ok(stdout), Ok(stderr)) => Ok(Ended {
@@ -513,32 +468,6 @@ fn reader(mut pipe: impl Read + Send + 'static) -> Option<JoinHandle<Capture>> {
             capture
         })
         .ok()
-}
-
-/// Waits until the process has exited, leaving it unreaped. When that cannot
-/// be waited for, the process is killed, so reaping it never waits long.
-fn await_exit(child: &Child) -> Result<(), Errno> {
-    let pid = Pid::from_child(child);
-    loop {
-        match rustix::process::waitid(
-            WaitId::Pid(pid),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-        ) {
-            Ok(_) => return Ok(()),
-            Err(Errno::INTR) => {}
-            Err(errno) => {
-                rustix::process::kill_process_group(pid, Signal::KILL).ok();
-                return Err(errno);
-            }
-        }
-    }
-}
-
-/// Reaps a process whose group was killed.
-fn reap(child: &mut Child, control: &SharedControl) {
-    let mut state = lock(control);
-    child.wait().ok();
-    state.reaped = true;
 }
 
 /// The handler of `workspace_run_command`, bound to one authorized Workspace
@@ -578,6 +507,37 @@ impl ToolHandler for RunCommand {
         ToolEffect::NonIdempotent
     }
 
+    fn spawns(&self) -> bool {
+        true
+    }
+
+    fn stop(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolFailure>> + '_>> {
+        let root = self.workspace.root().to_path_buf();
+        Box::pin(async move {
+            if let Some(signal) = active()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&root)
+                .cloned()
+            {
+                signal.request();
+            }
+            loop {
+                let running = active()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .contains_key(&root);
+                if !running {
+                    break;
+                }
+                ntex::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        })
+    }
+
     /// Starts the command on a supervising thread and awaits its report
     /// within the command's limit. Dropping the call, as its time limit or
     /// cancellation does, stops the command.
@@ -585,30 +545,48 @@ impl ToolHandler for RunCommand {
         Box::pin(async move {
             let preset = parse(&arguments).map_err(Failure::from)?;
             let invocation = self.prepare(preset).map_err(Failure::from)?;
-            let control = SharedControl::default();
-            let stopping = StopOnDrop(control.clone());
+            let stop = StopSignal::new();
+            let _stop_on_drop = StopOnDrop(stop.clone());
             let (report, reported) = flume::bounded(1);
-            let supervised = control.clone();
+            let supervised = stop.clone();
             let mutation = workspace_read::WorkspaceMutation::begin();
+            let root = self.workspace.root().to_path_buf();
+            let supervisor_root = root.clone();
+            active()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(root.clone(), stop.clone());
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
                     let _mutation = mutation;
-                    report.send(supervise(invocation, &supervised)).ok();
+                    let result = supervise(invocation, supervised);
+                    active()
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&supervisor_root);
+                    if report.send(result).is_err() {
+                        log::debug!("command report receiver was dropped after cleanup");
+                    }
                 })
-                .map_err(|_| Failure::from(Refusal::NotStarted))?;
+                .map_err(|_| {
+                    active()
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&root);
+                    Failure::from(Refusal::NotStarted)
+                })?;
             let ended = match ntex::time::timeout(self.timeout, reported.recv_async()).await {
                 Ok(Ok(ended)) => ended?,
                 Ok(Err(_)) => return Err(Failure::from(Uncertainty::NotObserved).into()),
                 Err(()) => {
-                    stop(&control);
-                    ntex::time::timeout(STOP_GRACE, reported.recv_async())
-                        .await
-                        .ok();
+                    stop.request();
+                    if reported.recv_async().await.is_err() {
+                        return Err(Failure::from(Uncertainty::NotObserved).into());
+                    }
                     return Err(Failure::from(Uncertainty::TimedOut(self.timeout)).into());
                 }
             };
-            drop(stopping);
             Ok(result(preset, &ended))
         })
     }

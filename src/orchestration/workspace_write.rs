@@ -59,6 +59,7 @@ use rustix::fs::{AtFlags, FileType, Gid, Mode, OFlags, RenameFlags, Stat};
 use rustix::io::Errno;
 use serde_json::{Value, json};
 
+use crate::orchestration::blocking::{self, Kind};
 use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
@@ -160,15 +161,6 @@ impl From<Failure> for ToolFailure {
 enum Operation<'a> {
     Create,
     Update { expected: &'a str },
-}
-
-impl Operation<'_> {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Create => "create",
-            Self::Update { .. } => "update",
-        }
-    }
 }
 
 /// A call's arguments, checked. The schema already enforces their shape;
@@ -496,21 +488,34 @@ impl ToolHandler for WriteFile {
         ToolEffect::NonIdempotent
     }
 
-    /// Writes synchronously, as the read tool reads: the file is small and
-    /// local, so the call does not yield, and its time limit cannot interrupt
-    /// a write that blocks.
+    /// Writes on a dedicated blocking worker while holding a file permit.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let (path, content, operation) = parse(&arguments)
                 .map_err(|refusal| ToolFailure::not_applied(refusal.to_string()))?;
-            let _mutation = workspace_read::WorkspaceMutation::begin();
-            match operation {
-                Operation::Create => create(&self.workspace, path, content),
-                Operation::Update { expected } => update(&self.workspace, path, expected, content),
-            }
+            let path = path.to_owned();
+            let content = content.to_owned();
+            let (operation_name, expected) = match operation {
+                Operation::Create => ("create", None),
+                Operation::Update { expected } => ("update", Some(expected.to_owned())),
+            };
+            let workspace = self.workspace.clone();
+            let path_for_worker = path.clone();
+            let content_for_write = content.clone();
+            blocking::run(Kind::File, move || {
+                let _mutation = workspace_read::WorkspaceMutation::begin();
+                match expected.as_deref() {
+                    None => create(&workspace, &path_for_worker, &content_for_write),
+                    Some(expected) => {
+                        update(&workspace, &path_for_worker, expected, &content_for_write)
+                    }
+                }
+            })
+            .await
+            .map_err(ToolFailure::uncertain)?
             .map_err(ToolFailure::from)?;
             Ok(json!({
-                "operation": operation.name(),
+                "operation": operation_name,
                 "path": path,
                 "bytes_written": content.len(),
             }))

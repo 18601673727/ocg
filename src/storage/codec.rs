@@ -2,7 +2,7 @@ use super::*;
 
 // ---- explicit versioned encoding ----------------------------------------------
 
-pub(super) const RECORD_VERSION: u8 = 1;
+pub(super) const RECORD_VERSION: u8 = 2;
 pub(super) const TAG_JOB: u8 = 1;
 pub(super) const TAG_INPUT: u8 = 2;
 pub(super) const TAG_OUTPUT: u8 = 3;

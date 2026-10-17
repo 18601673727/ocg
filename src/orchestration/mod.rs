@@ -1,6 +1,7 @@
 //! Orchestration primitives shared by the scheduler and executors.
 
 pub mod aggregation_service;
+pub mod blocking;
 pub mod execution_runtime;
 pub mod governor;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
