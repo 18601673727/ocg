@@ -5,6 +5,7 @@ pub mod execution_runtime;
 pub mod governor;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 pub(crate) mod lsp_client;
+pub(crate) mod scheduler;
 pub(crate) mod tools;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 pub mod workspace_command;
