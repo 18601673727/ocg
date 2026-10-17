@@ -210,15 +210,28 @@ impl Scheduler {
     /// page by page.
     pub(crate) async fn capture(&self) -> Result<Captured, CaptureFailure> {
         let mut captured = Captured::default();
-        let first = match self.capture_page(None, &mut captured.ledger).await {
+        let cohort = self.capture_cohort(&mut captured.ledger).await?;
+        captured.cohort = Some(cohort);
+        Ok(captured)
+    }
+
+    /// The cohort behind [`Scheduler::capture`], writing its service time and
+    /// alarms into the caller's ledger. The ledger outlives a failure (SCH-6):
+    /// an abandoned capture still charges the work it performed, and the
+    /// sweep debits it exactly once. Only queue wait and backoff are excluded,
+    /// because they never reach the ledger.
+    async fn capture_cohort(&self, ledger: &mut Ledger) -> Result<Cohort, CaptureFailure> {
+        let first = match self.capture_page(None, ledger).await {
             CaptureStep::Page(page) => page,
-            CaptureStep::Fault(PendingReadFault::IndexEntry { fence, key, kind, .. }) => {
-                captured.ledger.alarm(CaptureAlarm::IndexEntry { key, fault: kind });
-                return self.snapshot(fence, captured).await;
+            CaptureStep::Fault(PendingReadFault::IndexEntry {
+                fence, key, kind, ..
+            }) => {
+                ledger.alarm(CaptureAlarm::IndexEntry { key, fault: kind });
+                return self.snapshot_into(fence, ledger).await;
             }
             CaptureStep::Fault(PendingReadFault::Allocation { fence, .. }) => {
-                captured.ledger.alarm(CaptureAlarm::AllocationExhausted);
-                return Ok(captured.stream(fence));
+                ledger.alarm(CaptureAlarm::AllocationExhausted);
+                return Ok(Cohort::Stream(fence));
             }
             CaptureStep::Fault(PendingReadFault::InvalidFence) => {
                 return Err(CaptureFailure::IntegrityHalt(
@@ -229,16 +242,16 @@ impl Scheduler {
         };
         let fence = first.fence;
         if fence.len == 0 {
-            return Ok(captured.material(Vec::new()));
+            return Ok(Cohort::Material(Vec::new()));
         }
         if fence.len > self.limits.pending_max {
-            captured.ledger.alarm(CaptureAlarm::OverCapacity { len: fence.len });
-            return Ok(captured.stream(fence));
+            ledger.alarm(CaptureAlarm::OverCapacity { len: fence.len });
+            return Ok(Cohort::Stream(fence));
         }
         let mut keys = Vec::new();
         if keys.try_reserve_exact(fence.len as usize).is_err() {
-            captured.ledger.alarm(CaptureAlarm::AllocationExhausted);
-            return Ok(captured.stream(fence));
+            ledger.alarm(CaptureAlarm::AllocationExhausted);
+            return Ok(Cohort::Stream(fence));
         }
         let mut page = first;
         loop {
@@ -247,33 +260,30 @@ impl Scheduler {
                 // past it was admitted after the snapshot and belongs to the
                 // next sweep.
                 if fence.end.is_none_or(|end| *key > end) {
-                    return Ok(captured.material(keys));
+                    return Ok(Cohort::Material(keys));
                 }
                 // A Job allocated after the fence was read. Only its keys can
                 // be ordered, so the sweep restarts from the keys-only
                 // snapshot rather than trusting the page's Jobs.
                 if key.job > fence.high_water {
-                    return self.snapshot(fence, captured).await;
+                    return self.snapshot_into(fence, ledger).await;
                 }
                 keys.push(*key);
             }
             if page.page.exhausted {
-                return Ok(captured.material(keys));
+                return Ok(Cohort::Material(keys));
             }
-            match self
-                .capture_page(page.page.last_visited, &mut captured.ledger)
-                .await
-            {
+            match self.capture_page(page.page.last_visited, ledger).await {
                 CaptureStep::Page(next) => page = next,
                 CaptureStep::Fault(PendingReadFault::IndexEntry { key, kind, .. }) => {
-                    captured.ledger.alarm(CaptureAlarm::IndexEntry { key, fault: kind });
+                    ledger.alarm(CaptureAlarm::IndexEntry { key, fault: kind });
                     drop(keys);
-                    return self.snapshot(fence, captured).await;
+                    return self.snapshot_into(fence, ledger).await;
                 }
                 CaptureStep::Fault(PendingReadFault::Allocation { .. }) => {
-                    captured.ledger.alarm(CaptureAlarm::AllocationExhausted);
+                    ledger.alarm(CaptureAlarm::AllocationExhausted);
                     drop(keys);
-                    return Ok(captured.stream(fence));
+                    return Ok(Cohort::Stream(fence));
                 }
                 CaptureStep::Fault(PendingReadFault::InvalidFence) => {
                     return Err(CaptureFailure::IntegrityHalt(
@@ -285,51 +295,53 @@ impl Scheduler {
         }
     }
 
-    /// The keys-only fallback: one read transaction over at most `P_MAX` keys,
-    /// reading no Job at all, so a damaged entry surfaces as a per-candidate
-    /// verdict instead of stalling the capture.
-    async fn snapshot(
+    /// The keys-only fallback behind [`Scheduler::capture_cohort`]: one read
+    /// transaction over at most `P_MAX` keys, reading no Job at all, so a
+    /// damaged entry surfaces as a per-candidate verdict instead of stalling
+    /// the capture. Service time lands in the caller's ledger, as above.
+    async fn snapshot_into(
         &self,
         fence: PendingFence,
-        mut captured: Captured,
-    ) -> Result<Captured, CaptureFailure> {
+        ledger: &mut Ledger,
+    ) -> Result<Cohort, CaptureFailure> {
         let Some(budget) = usize::try_from(self.limits.pending_max)
             .ok()
             .and_then(NonZeroUsize::new)
         else {
-            captured.ledger.alarm(CaptureAlarm::AllocationExhausted);
-            return Ok(captured.stream(fence));
+            ledger.alarm(CaptureAlarm::AllocationExhausted);
+            return Ok(Cohort::Stream(fence));
         };
-        let read = self
-            .retry(|| self.database.pending_snapshot(budget))
-            .await;
+        let read = self.retry(|| self.database.pending_snapshot(budget)).await;
         match read {
             None => Err(CaptureFailure::Shutdown),
             Some(Err(error)) => Err(classify(&error)),
             Some(Ok(Ok(snapshot))) if snapshot.complete => {
-                captured.ledger.service += snapshot.service_time;
-                Ok(captured.material(snapshot.keys))
+                ledger.service += snapshot.service_time;
+                Ok(Cohort::Material(snapshot.keys))
             }
             Some(Ok(Ok(snapshot))) => {
-                captured.ledger.service += snapshot.service_time;
-                captured.ledger.alarm(CaptureAlarm::OverCapacity {
+                ledger.service += snapshot.service_time;
+                ledger.alarm(CaptureAlarm::OverCapacity {
                     len: snapshot.fence.len,
                 });
-                Ok(captured.stream(snapshot.fence))
+                Ok(Cohort::Stream(snapshot.fence))
             }
-            Some(Ok(Err(PendingReadFault::Allocation { fence, service_time }))) => {
-                captured.ledger.service += service_time;
-                captured.ledger.alarm(CaptureAlarm::AllocationExhausted);
-                Ok(captured.stream(fence))
+            Some(Ok(Err(PendingReadFault::Allocation {
+                fence,
+                service_time,
+            }))) => {
+                ledger.service += service_time;
+                ledger.alarm(CaptureAlarm::AllocationExhausted);
+                Ok(Cohort::Stream(fence))
             }
             // A keys-only read verifies no entry, so this cannot name a
             // damaged one; if it is ever reported, the read contradicted its
             // own contract and nothing may be swept on it.
-            Some(Ok(Err(PendingReadFault::IndexEntry { key, kind, .. }))) => Err(
-                CaptureFailure::IntegrityHalt(format!(
+            Some(Ok(Err(PendingReadFault::IndexEntry { key, kind, .. }))) => {
+                Err(CaptureFailure::IntegrityHalt(format!(
                     "the keys-only snapshot reported {kind:?} at {key:?}"
-                )),
-            ),
+                )))
+            }
             Some(Ok(Err(PendingReadFault::InvalidFence))) => Err(CaptureFailure::IntegrityHalt(
                 "the Pending index fence is missing or undecodable".to_owned(),
             )),
@@ -344,7 +356,10 @@ impl Scheduler {
         ledger: &mut Ledger,
     ) -> CaptureStep<PendingCapturePage> {
         let read = self
-            .retry(|| self.database.pending_capture_page(after, self.limits.capture_page))
+            .retry(|| {
+                self.database
+                    .pending_capture_page(after, self.limits.capture_page)
+            })
             .await;
         match read {
             None => CaptureStep::Failed(CaptureFailure::Shutdown),
@@ -438,36 +453,32 @@ impl Scheduler {
         let c0 = self.wake.capacity_generation();
         self.seq += 1;
         let seq = self.seq;
-        let captured = match self.capture().await {
-            Ok(captured) => captured,
-            Err(CaptureFailure::Shutdown) => {
+        // SCH-6: the ledger is owned here, not by the capture, so service
+        // performed before an abandoned capture is still charged below.
+        let mut ledger = Ledger::default();
+        let cohort = match self.capture_cohort(&mut ledger).await {
+            Ok(cohort) => cohort,
+            Err(failure) => {
+                self.credit.debit(ledger.service);
+                let reason = match failure {
+                    CaptureFailure::Shutdown => SweepAbandonedReason::Shutdown,
+                    CaptureFailure::IntegrityHalt(detail) => {
+                        SweepAbandonedReason::IntegrityHalt(detail)
+                    }
+                    CaptureFailure::StorageBoundary(detail) => {
+                        SweepAbandonedReason::StorageBoundary(detail)
+                    }
+                };
                 return SweepOutcome::Abandoned(SweepAbandoned {
-                    reason: SweepAbandonedReason::Shutdown,
-                    ledger: Ledger::default(),
-                    grants_so_far: Vec::new(),
-                    earliest_due_so_far: None,
-                });
-            }
-            Err(CaptureFailure::IntegrityHalt(detail)) => {
-                return SweepOutcome::Abandoned(SweepAbandoned {
-                    reason: SweepAbandonedReason::IntegrityHalt(detail),
-                    ledger: Ledger::default(),
-                    grants_so_far: Vec::new(),
-                    earliest_due_so_far: None,
-                });
-            }
-            Err(CaptureFailure::StorageBoundary(detail)) => {
-                return SweepOutcome::Abandoned(SweepAbandoned {
-                    reason: SweepAbandonedReason::StorageBoundary(detail),
-                    ledger: Ledger::default(),
+                    reason,
+                    ledger,
                     grants_so_far: Vec::new(),
                     earliest_due_so_far: None,
                 });
             }
         };
-        let ledger = captured.ledger;
         self.credit.debit(ledger.service);
-        let Some(cohort) = captured.cohort else {
+        if cohort.len() == 0 {
             return SweepOutcome::Completed(SweepCompleted {
                 seq,
                 d0,
@@ -478,7 +489,7 @@ impl Scheduler {
                 cap_deferred: false,
                 restart_wanted: self.wake.dirty_generation() != d0,
             });
-        };
+        }
         let source = cohort.cursor(&self.limits);
         let outcome = self.run_sweep(seq, d0, c0, source, ledger).await;
         if let SweepOutcome::Abandoned(abandoned) = &outcome
@@ -513,7 +524,11 @@ impl Scheduler {
         let mut bars: BTreeMap<ExecutionPoolId, PendingJobKey> = BTreeMap::new();
         let mut earliest_due: Option<Timestamp> = None;
         let mut cap_deferred = false;
-        let mut hint: Option<u8> = None;
+        // The pre-claim `capacity_gen` of the latest successful claim, keyed
+        // by its `global_free_after` hint. The pause below must use the stored
+        // generation (SCH-1): a release that shared the claim's write group
+        // already advanced the counter before the claim was answered.
+        let mut hint: Option<(u8, u64)> = None;
         let mut grants: Vec<ClaimGrant> = Vec::new();
 
         let abandon = |reason: SweepAbandonedReason,
@@ -584,19 +599,12 @@ impl Scheduler {
                 }
             }
 
-            if verdicts.is_none()
-                || verdict_pos >= verdicts.as_ref().map(Vec::len).unwrap_or(0)
-            {
+            if verdicts.is_none() || verdict_pos >= verdicts.as_ref().map(Vec::len).unwrap_or(0) {
                 if batch_pos >= batch.len() {
                     continue;
                 }
                 if self.shutdown.is_cancelled() {
-                    return abandon(
-                        SweepAbandonedReason::Shutdown,
-                        ledger,
-                        grants,
-                        earliest_due,
-                    );
+                    return abandon(SweepAbandonedReason::Shutdown, ledger, grants, earliest_due);
                 }
                 if self.protection.status().lock.is_some() {
                     return abandon(
@@ -606,12 +614,15 @@ impl Scheduler {
                         earliest_due,
                     );
                 }
-                if hint == Some(0) {
+                if let Some((0, c_hint)) = hint {
                     cap_deferred = true;
                     verdicts = None;
                     verdict_pos = 0;
-                    let c_seen = self.wake.capacity_generation();
-                    match self.pause_global(c_seen).await {
+                    // SCH-1: pause against the generation loaded before the
+                    // claim that produced this hint. Loading a fresh
+                    // generation here would park past a release that shared
+                    // the claim's write group.
+                    match self.pause_global(c_hint).await {
                         Ok(()) => {
                             hint = None;
                             continue;
@@ -621,8 +632,7 @@ impl Scheduler {
                         }
                     }
                 }
-                let candidates: Vec<JobId> =
-                    batch[batch_pos..].iter().map(|key| key.job).collect();
+                let candidates: Vec<JobId> = batch[batch_pos..].iter().map(|key| key.job).collect();
                 let request = EvalRequest {
                     candidates,
                     budget: self.limits.evaluation_budget,
@@ -718,11 +728,19 @@ impl Scheduler {
                 }
                 Readiness::Blocked(_) | Readiness::Indeterminate(_) => {
                     match &page[verdict_pos].1 {
-                        Readiness::Indeterminate(why) if matches!(why, crate::persistence::Why::MissingJob | crate::persistence::Why::Corrupt) => {
+                        Readiness::Indeterminate(why)
+                            if matches!(
+                                why,
+                                crate::persistence::Why::MissingJob
+                                    | crate::persistence::Why::Corrupt
+                            ) =>
+                        {
                             ledger.alarm(CaptureAlarm::IndexEntry {
                                 key,
                                 fault: match why {
-                                    crate::persistence::Why::MissingJob => PendingIndexFault::MissingJob,
+                                    crate::persistence::Why::MissingJob => {
+                                        PendingIndexFault::MissingJob
+                                    }
                                     _ => PendingIndexFault::JobDecode,
                                 },
                             });
@@ -784,7 +802,7 @@ impl Scheduler {
                     self.credit.debit(round_trip);
                     match reply {
                         Ok(Ok(grant)) => {
-                            hint = Some(grant.global_free_after);
+                            hint = Some((grant.global_free_after, c_claim));
                             grants.push(grant);
                             batch_pos += 1;
                             verdict_pos += 1;
@@ -824,8 +842,7 @@ impl Scheduler {
                         }
                         Err(error) => match error.command_outcome() {
                             Some(CommandOutcome::Unknown) => {
-                                let DatabaseError::OutcomeUnknown { operation, .. } = error
-                                else {
+                                let DatabaseError::OutcomeUnknown { operation, .. } = error else {
                                     return abandon(
                                         SweepAbandonedReason::StorageBoundary(
                                             "a claim outcome was unknown without its operation"
@@ -843,9 +860,7 @@ impl Scheduler {
                                     earliest_due,
                                 );
                             }
-                            Some(
-                                CommandOutcome::NotAccepted | CommandOutcome::NotCommitted,
-                            ) => {
+                            Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted) => {
                                 return abandon(
                                     SweepAbandonedReason::StorageBoundary(error.to_string()),
                                     ledger,
@@ -881,6 +896,40 @@ impl Scheduler {
         })
     }
 
+    /// Follows a finished sweep with further head sweeps while its finish
+    /// comparison wants a restart (SCH-2). Each restart re-reads the
+    /// generations and gates like an idle wake, so coalesced commits share
+    /// one restart sweep and a quiet domain settles after one pass. The
+    /// caller's own claims never set this off: they advance neither counter.
+    /// Returns the settled outcome, or `None` when the loop itself must stop.
+    async fn drain_restarts(&mut self, mut completed: SweepCompleted) -> Option<SweepOutcome> {
+        loop {
+            if !completed.restart_wanted {
+                return Some(SweepOutcome::Completed(completed));
+            }
+            let dirty_now = self.wake.dirty_generation();
+            let cap_now = self.wake.capacity_generation();
+            let trigger =
+                if dirty_now != completed.d0 && completed.cap_deferred && cap_now != completed.c0 {
+                    SweepTrigger::Capacity
+                } else if dirty_now != completed.d0 {
+                    SweepTrigger::Dirty
+                } else if completed.cap_deferred && cap_now != completed.c0 {
+                    SweepTrigger::Capacity
+                } else {
+                    return Some(SweepOutcome::Completed(completed));
+                };
+            self.gate(trigger, completed.cap_deferred, completed.c0)
+                .await?;
+            match self.sweep_once().await {
+                SweepOutcome::Completed(next) => completed = next,
+                SweepOutcome::Abandoned(abandoned) => {
+                    return Some(SweepOutcome::Abandoned(abandoned));
+                }
+            }
+        }
+    }
+
     /// Waits for a global slot without consuming the cohort cursor. Verdicts
     /// are stale and dropped by the caller; the cohort and `pc` are kept.
     /// A dirty-only wake never resumes: only `capacity_gen` releases room.
@@ -897,10 +946,7 @@ impl Scheduler {
             }
             match ntex::util::select(
                 self.shutdown.cancelled(),
-                ntex::util::select(
-                    self.wake.recv_async(),
-                    self.protection.changed(),
-                ),
+                ntex::util::select(self.wake.recv_async(), self.protection.changed()),
             )
             .await
             {
@@ -955,7 +1001,16 @@ impl Scheduler {
     /// its trigger's threshold. `Startup` and `Recovery` always run. Waiting
     /// issues nothing, so credit only refills; a stronger trigger lowers the
     /// threshold and returns immediately when covered. Shutdown stops.
-    async fn gate(&mut self, mut trigger: SweepTrigger) -> Option<SweepTrigger> {
+    /// `cap_deferred`/`c0` name the last settled sweep, so a wake upgrades a
+    /// Dirty/Reconcile wait to Capacity only on a genuine capacity release
+    /// (SCH-3). A closed wake or protection channel means the worker is gone
+    /// and stops the loop (SCH-5).
+    async fn gate(
+        &mut self,
+        mut trigger: SweepTrigger,
+        cap_deferred: bool,
+        c0: u64,
+    ) -> Option<SweepTrigger> {
         loop {
             if self.shutdown.is_cancelled() {
                 return None;
@@ -969,27 +1024,26 @@ impl Scheduler {
             let wait = Duration::from_micros(((deficit as f64 / RHO) as u64).max(1));
             enum GateWake {
                 Shutdown,
-                Permit,
-                Protection,
+                Permit(Result<(), flume::RecvError>),
+                Protection(Option<crate::disk_protection::DiskProtectionStatus>),
                 CreditReady,
             }
             let woken = ntex::util::select(
                 self.shutdown.cancelled(),
                 ntex::util::select(
                     self.wake.recv_async(),
-                    ntex::util::select(
-                        self.protection.changed(),
-                        ntex::time::sleep(wait),
-                    ),
+                    ntex::util::select(self.protection.changed(), ntex::time::sleep(wait)),
                 ),
             )
             .await;
             let wake = match woken {
                 ntex::util::Either::Left(()) => GateWake::Shutdown,
-                ntex::util::Either::Right(ntex::util::Either::Left(_)) => GateWake::Permit,
-                ntex::util::Either::Right(ntex::util::Either::Right(
-                    ntex::util::Either::Left(_),
-                )) => GateWake::Protection,
+                ntex::util::Either::Right(ntex::util::Either::Left(permit)) => {
+                    GateWake::Permit(permit)
+                }
+                ntex::util::Either::Right(ntex::util::Either::Right(ntex::util::Either::Left(
+                    protection,
+                ))) => GateWake::Protection(protection),
                 ntex::util::Either::Right(ntex::util::Either::Right(
                     ntex::util::Either::Right(()),
                 )) => GateWake::CreditReady,
@@ -997,19 +1051,33 @@ impl Scheduler {
             match wake {
                 GateWake::Shutdown => return None,
                 GateWake::CreditReady => {}
-                GateWake::Permit | GateWake::Protection => {
+                GateWake::Permit(permit) => {
+                    // SCH-5: a closed wake means the worker is gone; stop
+                    // instead of waiting out the credit deficit.
+                    if permit.is_err() {
+                        return None;
+                    }
                     if self.protection.status().lock.is_some() {
                         return None;
                     }
-                    // A publication while gate-waiting can only strengthen the
-                    // trigger: a dirty-only wake must never weaken a pending
-                    // capacity or due overdraft. Recovery stays unconditional.
-                    match trigger {
-                        SweepTrigger::Startup | SweepTrigger::Recovery => {}
-                        SweepTrigger::Capacity | SweepTrigger::Due => {}
-                        SweepTrigger::Dirty | SweepTrigger::Reconcile => {
-                            trigger = SweepTrigger::Capacity;
-                        }
+                    // SCH-3: a publication while gate-waiting strengthens the
+                    // trigger only when it qualifies as Capacity: a release
+                    // moved `capacity_gen` on a capacity-deferred sweep. A
+                    // dirty-only wake never lowers a Dirty/Reconcile
+                    // threshold. Recovery stays unconditional.
+                    if matches!(trigger, SweepTrigger::Dirty | SweepTrigger::Reconcile)
+                        && cap_deferred
+                        && self.wake.capacity_generation() != c0
+                    {
+                        trigger = SweepTrigger::Capacity;
+                    }
+                }
+                GateWake::Protection(protection) => {
+                    // SCH-5: a closed watcher means the worker is gone; stop.
+                    // SCH-3: a protection event never upgrades the trigger.
+                    protection.as_ref()?;
+                    if self.protection.status().lock.is_some() {
+                        return None;
                     }
                 }
             }
@@ -1048,14 +1116,22 @@ impl Scheduler {
             let protected = self.protection.status().lock.is_some();
             if protected {
                 was_protected = true;
-                self.protection.changed().await;
+                // SCH-4: protection waiting stays responsive to shutdown, and
+                // SCH-5: a closed watcher means the worker is gone, so the
+                // loop stops instead of parking past it. Neither path starts
+                // a claim.
+                match ntex::util::select(self.shutdown.cancelled(), self.protection.changed()).await
+                {
+                    ntex::util::Either::Left(()) | ntex::util::Either::Right(None) => return,
+                    ntex::util::Either::Right(Some(_)) => {}
+                }
                 continue;
             }
             if need_recovery {
                 enum RecoveryWake {
                     Shutdown,
-                    Permit,
-                    Protection,
+                    Permit(Result<(), flume::RecvError>),
+                    Protection(Option<crate::disk_protection::DiskProtectionStatus>),
                 }
                 let woken = ntex::util::select(
                     self.shutdown.cancelled(),
@@ -1064,32 +1140,58 @@ impl Scheduler {
                 .await;
                 let wake = match woken {
                     ntex::util::Either::Left(()) => RecoveryWake::Shutdown,
-                    ntex::util::Either::Right(ntex::util::Either::Left(_)) => {
-                        RecoveryWake::Permit
+                    ntex::util::Either::Right(ntex::util::Either::Left(permit)) => {
+                        RecoveryWake::Permit(permit)
                     }
-                    ntex::util::Either::Right(ntex::util::Either::Right(_)) => {
-                        RecoveryWake::Protection
+                    ntex::util::Either::Right(ntex::util::Either::Right(protection)) => {
+                        RecoveryWake::Protection(protection)
                     }
                 };
                 match wake {
                     RecoveryWake::Shutdown => return,
-                    RecoveryWake::Permit | RecoveryWake::Protection => {
+                    // SCH-5: a closed wake or protection channel means the
+                    // worker is gone; stop instead of retrying against it.
+                    RecoveryWake::Permit(Err(_)) | RecoveryWake::Protection(None) => {
+                        return;
+                    }
+                    RecoveryWake::Permit(Ok(())) | RecoveryWake::Protection(Some(_)) => {
                         if self.protection.status().lock.is_some() {
                             continue;
                         }
                         need_recovery = false;
                         was_protected = false;
-                        if self.gate(SweepTrigger::Recovery).await.is_none() {
+                        if self
+                            .gate(SweepTrigger::Recovery, last_cap_deferred, last_c0)
+                            .await
+                            .is_none()
+                        {
                             return;
                         }
                         match self.sweep_once().await {
-                            SweepOutcome::Completed(completed) => {
-                                last_d0 = completed.d0;
-                                last_c0 = completed.c0;
-                                last_cap_deferred = completed.cap_deferred;
-                                earliest_due = completed.earliest_due;
-                                last_completed_at = Some(std::time::Instant::now());
-                                first = false;
+                            SweepOutcome::Completed(settled) => {
+                                match self.drain_restarts(settled).await {
+                                    Some(SweepOutcome::Completed(completed)) => {
+                                        last_d0 = completed.d0;
+                                        last_c0 = completed.c0;
+                                        last_cap_deferred = completed.cap_deferred;
+                                        earliest_due = completed.earliest_due;
+                                        last_completed_at = Some(std::time::Instant::now());
+                                        first = false;
+                                    }
+                                    Some(SweepOutcome::Abandoned(abandoned)) => {
+                                        first = false;
+                                        match abandoned.reason {
+                                            SweepAbandonedReason::Shutdown => return,
+                                            SweepAbandonedReason::UncertainClaim { .. } => {
+                                                continue;
+                                            }
+                                            _ => {
+                                                need_recovery = true;
+                                            }
+                                        }
+                                    }
+                                    None => return,
+                                }
                             }
                             SweepOutcome::Abandoned(abandoned) => {
                                 first = false;
@@ -1110,10 +1212,24 @@ impl Scheduler {
             }
             if first {
                 first = false;
-                if self.gate(SweepTrigger::Startup).await.is_none() {
+                if self
+                    .gate(SweepTrigger::Startup, last_cap_deferred, last_c0)
+                    .await
+                    .is_none()
+                {
                     return;
                 }
-                match self.sweep_once().await {
+                // SCH-2: consume the finished sweep's restart comparison
+                // before idling, so a commit that landed during the sweep is
+                // reconsidered from this wake rather than waiting for R.
+                let outcome = match self.sweep_once().await {
+                    SweepOutcome::Completed(first) => match self.drain_restarts(first).await {
+                        Some(outcome) => outcome,
+                        None => return,
+                    },
+                    SweepOutcome::Abandoned(abandoned) => SweepOutcome::Abandoned(abandoned),
+                };
+                match outcome {
                     SweepOutcome::Completed(completed) => {
                         last_d0 = completed.d0;
                         last_c0 = completed.c0;
@@ -1121,13 +1237,11 @@ impl Scheduler {
                         earliest_due = completed.earliest_due;
                         last_completed_at = Some(std::time::Instant::now());
                     }
-                    SweepOutcome::Abandoned(abandoned) => {
-                        match abandoned.reason {
-                            SweepAbandonedReason::Shutdown => return,
-                            SweepAbandonedReason::UncertainClaim { .. } => continue,
-                            _ => need_recovery = true,
-                        }
-                    }
+                    SweepOutcome::Abandoned(abandoned) => match abandoned.reason {
+                        SweepAbandonedReason::Shutdown => return,
+                        SweepAbandonedReason::UncertainClaim { .. } => continue,
+                        _ => need_recovery = true,
+                    },
                 }
                 was_protected = self.protection.status().lock.is_some();
                 continue;
@@ -1159,10 +1273,10 @@ impl Scheduler {
             };
             enum IdleWake {
                 Shutdown,
-                Permit,
+                Permit(Result<(), flume::RecvError>),
                 Due,
                 Reconcile,
-                Protection,
+                Protection(Option<crate::disk_protection::DiskProtectionStatus>),
             }
             let woken = ntex::util::select(
                 self.shutdown.cancelled(),
@@ -1177,24 +1291,34 @@ impl Scheduler {
             .await;
             let wake = match woken {
                 ntex::util::Either::Left(()) => IdleWake::Shutdown,
-                ntex::util::Either::Right(ntex::util::Either::Left(_)) => IdleWake::Permit,
-                ntex::util::Either::Right(ntex::util::Either::Right(
-                    ntex::util::Either::Left(()),
-                )) => IdleWake::Due,
+                ntex::util::Either::Right(ntex::util::Either::Left(permit)) => {
+                    IdleWake::Permit(permit)
+                }
+                ntex::util::Either::Right(ntex::util::Either::Right(ntex::util::Either::Left(
+                    (),
+                ))) => IdleWake::Due,
                 ntex::util::Either::Right(ntex::util::Either::Right(
                     ntex::util::Either::Right(ntex::util::Either::Left(())),
                 )) => IdleWake::Reconcile,
                 ntex::util::Either::Right(ntex::util::Either::Right(
-                    ntex::util::Either::Right(ntex::util::Either::Right(_)),
-                )) => IdleWake::Protection,
+                    ntex::util::Either::Right(ntex::util::Either::Right(protection)),
+                )) => IdleWake::Protection(protection),
             };
             match wake {
                 IdleWake::Shutdown => return,
-                IdleWake::Protection => {
+                IdleWake::Protection(protection) => {
+                    // SCH-5: a closed watcher means the worker is gone; stop.
+                    if protection.is_none() {
+                        return;
+                    }
                     was_protected = self.protection.status().lock.is_some();
                     continue;
                 }
-                IdleWake::Permit => {
+                IdleWake::Permit(permit) => {
+                    // SCH-5: a closed wake means the worker is gone; stop.
+                    if permit.is_err() {
+                        return;
+                    }
                     if self.protection.status().lock.is_some() {
                         continue;
                     }
@@ -1203,22 +1327,35 @@ impl Scheduler {
                     let was_lift = was_protected && !self.protection.status().lock.is_some();
                     was_protected = self.protection.status().lock.is_some();
                     if was_lift {
-                        if self.gate(SweepTrigger::Recovery).await.is_none() {
+                        if self
+                            .gate(SweepTrigger::Recovery, last_cap_deferred, last_c0)
+                            .await
+                            .is_none()
+                        {
                             return;
                         }
-                    } else if dirty != last_d0
-                        && last_cap_deferred
-                        && cap != last_c0
-                    {
-                        if self.gate(SweepTrigger::Capacity).await.is_none() {
+                    } else if dirty != last_d0 && last_cap_deferred && cap != last_c0 {
+                        if self
+                            .gate(SweepTrigger::Capacity, last_cap_deferred, last_c0)
+                            .await
+                            .is_none()
+                        {
                             return;
                         }
                     } else if dirty != last_d0 {
-                        if self.gate(SweepTrigger::Dirty).await.is_none() {
+                        if self
+                            .gate(SweepTrigger::Dirty, last_cap_deferred, last_c0)
+                            .await
+                            .is_none()
+                        {
                             return;
                         }
                     } else if last_cap_deferred && cap != last_c0 {
-                        if self.gate(SweepTrigger::Capacity).await.is_none() {
+                        if self
+                            .gate(SweepTrigger::Capacity, last_cap_deferred, last_c0)
+                            .await
+                            .is_none()
+                        {
                             return;
                         }
                     } else {
@@ -1230,7 +1367,11 @@ impl Scheduler {
                     if self.protection.status().lock.is_some() {
                         continue;
                     }
-                    if self.gate(SweepTrigger::Due).await.is_none() {
+                    if self
+                        .gate(SweepTrigger::Due, last_cap_deferred, last_c0)
+                        .await
+                        .is_none()
+                    {
                         return;
                     }
                 }
@@ -1238,12 +1379,25 @@ impl Scheduler {
                     if self.protection.status().lock.is_some() {
                         continue;
                     }
-                    if self.gate(SweepTrigger::Reconcile).await.is_none() {
+                    if self
+                        .gate(SweepTrigger::Reconcile, last_cap_deferred, last_c0)
+                        .await
+                        .is_none()
+                    {
                         return;
                     }
                 }
             }
-            match self.sweep_once().await {
+            // SCH-2: consume the finished sweep's restart comparison before
+            // idling, as at startup above.
+            let outcome = match self.sweep_once().await {
+                SweepOutcome::Completed(first) => match self.drain_restarts(first).await {
+                    Some(outcome) => outcome,
+                    None => return,
+                },
+                SweepOutcome::Abandoned(abandoned) => SweepOutcome::Abandoned(abandoned),
+            };
+            match outcome {
                 SweepOutcome::Completed(completed) => {
                     last_d0 = completed.d0;
                     last_c0 = completed.c0;
@@ -1442,7 +1596,12 @@ impl PendingCursor {
                     self.next = 0;
                     self.exhausted = page.page.exhausted;
                 }
-                Some(Ok(Err(PendingReadFault::IndexEntry { key, kind, service_time, .. }))) => {
+                Some(Ok(Err(PendingReadFault::IndexEntry {
+                    key,
+                    kind,
+                    service_time,
+                    ..
+                }))) => {
                     ledger.service += service_time;
                     ledger.alarm(CaptureAlarm::IndexEntry { key, fault: kind });
                     return Err(CaptureFailure::IntegrityHalt(format!(
@@ -1594,9 +1753,9 @@ mod tests {
     use super::*;
     use crate::database::DatabaseWorker;
     use crate::persistence::{
-        CapabilitySet, ExecutionConfiguration, ExecutionMode, ExecutionOperation, ExecutionPoolConfig,
-        FinalResult, JobId, JobInputDraft, LlmConfig, LlmTransport, NewExecutionPool,
-        NewJob, NewLlmProvider, NewProfile, NewProfileConfig, PendingJobsPage,
+        CapabilitySet, ExecutionConfiguration, ExecutionMode, ExecutionOperation,
+        ExecutionPoolConfig, FinalResult, JobId, JobInputDraft, LlmConfig, LlmTransport,
+        NewExecutionPool, NewJob, NewLlmProvider, NewProfile, NewProfileConfig, PendingJobsPage,
     };
     use crate::storage::StorageError;
     use crate::test_support::{data_directory, wait};
@@ -1634,17 +1793,9 @@ mod tests {
         }
     }
 
-    fn scheduler(
-        worker: &mut DatabaseWorker,
-        limits: SchedulerLimits,
-    ) -> Scheduler {
+    fn scheduler(worker: &mut DatabaseWorker, limits: SchedulerLimits) -> Scheduler {
         let wake = worker.take_scheduler_wake().unwrap();
-        Scheduler::new(
-            worker.handle(),
-            wake,
-            CancellationToken::default(),
-            limits,
-        )
+        Scheduler::new(worker.handle(), wake, CancellationToken::default(), limits)
     }
 
     fn provision(database: &DatabaseHandle) -> (ExecutionPoolId, crate::persistence::ProfileId) {
@@ -1707,10 +1858,7 @@ mod tests {
         .unwrap()
     }
 
-    fn pending_ready(
-        database: &DatabaseHandle,
-        llm: crate::persistence::ProfileId,
-    ) -> JobId {
+    fn pending_ready(database: &DatabaseHandle, llm: crate::persistence::ProfileId) -> JobId {
         let input = wait(database.save_job_input(None, JobInputDraft::default())).unwrap();
         wait(database.create_job_with_input(
             NewJob {
@@ -1780,7 +1928,11 @@ mod tests {
             Cohort::Material(keys) => assert_eq!(keys, expected),
             other => panic!("a small index materializes, got {other:?}"),
         }
-        assert!(captured.ledger.alarms.is_empty(), "{:?}", captured.ledger.alarms);
+        assert!(
+            captured.ledger.alarms.is_empty(),
+            "{:?}",
+            captured.ledger.alarms
+        );
         worker.shutdown().unwrap();
     }
 
@@ -1812,7 +1964,11 @@ mod tests {
             drained.push(key);
         }
         assert_eq!(drained, expected);
-        assert!(captured.ledger.alarms.is_empty(), "{:?}", captured.ledger.alarms);
+        assert!(
+            captured.ledger.alarms.is_empty(),
+            "{:?}",
+            captured.ledger.alarms
+        );
         worker.shutdown().unwrap();
     }
 
@@ -1856,9 +2012,10 @@ mod tests {
         let jobs: Vec<_> = (0..3).map(|_| pending(&database)).collect();
         let expected = wait(index_order(&database));
         let dangling = jobs[0];
-        wait(database.with_database(move |database| {
-            crate::storage::remove_job_row(database, dangling)
-        }))
+        wait(
+            database
+                .with_database(move |database| crate::storage::remove_job_row(database, dangling)),
+        )
         .expect("remove the Job row");
         let scheduler = scheduler(&mut worker, limits(16, 1));
         let captured = wait(scheduler.capture()).expect("capture");
@@ -2143,15 +2300,17 @@ mod tests {
         let (_pool, llm) = provision(&database);
         let _job = pending_ready(&database, llm);
         let path = directory.database_path().to_path_buf();
-        assert!(database.activate_filesystem_protection(
-            ProtectionReason::InsufficientSpace(SpaceShortage {
-                area: ProtectedArea::Database,
-                path,
-                available_bytes: 0,
-                expected_write_bytes: 0,
-                threshold_bytes: 1,
-            })
-        ));
+        assert!(
+            database.activate_filesystem_protection(ProtectionReason::InsufficientSpace(
+                SpaceShortage {
+                    area: ProtectedArea::Database,
+                    path,
+                    available_bytes: 0,
+                    expected_write_bytes: 0,
+                    threshold_bytes: 1,
+                }
+            ))
+        );
         let mut scheduler = scheduler(&mut worker, limits(16, 100));
         match wait(scheduler.sweep_once()) {
             SweepOutcome::Abandoned(abandoned) => {
@@ -2224,7 +2383,10 @@ mod tests {
                 assert!(row.started_at.is_none());
             }
             SweepOutcome::Abandoned(abandoned) => {
-                panic!("a sweep with a blocked child completes, got {:?}", abandoned.reason)
+                panic!(
+                    "a sweep with a blocked child completes, got {:?}",
+                    abandoned.reason
+                )
             }
         }
         worker.shutdown().unwrap();
@@ -2238,9 +2400,10 @@ mod tests {
         let (_pool, llm) = provision(&database);
         let dangling = pending_ready(&database, llm);
         let healthy = pending_ready(&database, llm);
-        wait(database.with_database(move |database| {
-            crate::storage::remove_job_row(database, dangling)
-        }))
+        wait(
+            database
+                .with_database(move |database| crate::storage::remove_job_row(database, dangling)),
+        )
         .expect("remove the Job row");
         let mut scheduler = scheduler(&mut worker, limits(16, 100));
         match wait(scheduler.sweep_once()) {
@@ -2260,7 +2423,10 @@ mod tests {
                 );
             }
             SweepOutcome::Abandoned(abandoned) => {
-                panic!("a sweep with a damaged key completes, got {:?}", abandoned.reason)
+                panic!(
+                    "a sweep with a damaged key completes, got {:?}",
+                    abandoned.reason
+                )
             }
         }
         worker.shutdown().unwrap();
@@ -2275,10 +2441,16 @@ mod tests {
         let (_pool, llm) = provision(&database);
         let first = pending_ready(&database, llm);
         let second = pending_ready(&database, llm);
-        wait(database.finalize_job(first, crate::persistence::JobFinalization::Completed(done_result("one"))))
-            .unwrap();
-        wait(database.finalize_job(second, crate::persistence::JobFinalization::Completed(done_result("two"))))
-            .unwrap();
+        wait(database.finalize_job(
+            first,
+            crate::persistence::JobFinalization::Completed(done_result("one")),
+        ))
+        .unwrap();
+        wait(database.finalize_job(
+            second,
+            crate::persistence::JobFinalization::Completed(done_result("two")),
+        ))
+        .unwrap();
         let input = wait(database.save_job_input(None, JobInputDraft::default())).unwrap();
         let child = wait(database.create_job_with_input(
             NewJob {
@@ -2317,7 +2489,10 @@ mod tests {
                 assert_eq!(completed.grants[0].job, child);
             }
             SweepOutcome::Abandoned(abandoned) => {
-                panic!("an exhausted candidate is retried, got {:?}", abandoned.reason)
+                panic!(
+                    "an exhausted candidate is retried, got {:?}",
+                    abandoned.reason
+                )
             }
         }
         worker.shutdown().unwrap();
@@ -2429,10 +2604,7 @@ mod tests {
     fn credit_starts_full_caps_refill_and_applies_trigger_thresholds() {
         assert_eq!(credit_threshold(SweepTrigger::Startup), i64::MIN);
         assert_eq!(credit_threshold(SweepTrigger::Recovery), i64::MIN);
-        assert_eq!(
-            credit_threshold(SweepTrigger::Capacity),
-            -micros(C_PROMPT)
-        );
+        assert_eq!(credit_threshold(SweepTrigger::Capacity), -micros(C_PROMPT));
         assert_eq!(credit_threshold(SweepTrigger::Due), -micros(C_PROMPT));
         assert_eq!(credit_threshold(SweepTrigger::Dirty), 0);
         assert_eq!(credit_threshold(SweepTrigger::Reconcile), 0);
@@ -2451,16 +2623,9 @@ mod tests {
     #[test]
     fn due_timer_arms_nothing_without_a_due_date_and_floors_the_past() {
         assert_eq!(Scheduler::due_sleep_duration(None), None);
-        let past = Timestamp::from_unix_micros(
-            Timestamp::now().as_unix_micros() - 1_000_000,
-        );
-        assert_eq!(
-            Scheduler::due_sleep_duration(Some(past)),
-            Some(DUE_FLOOR)
-        );
-        let future = Timestamp::from_unix_micros(
-            Timestamp::now().as_unix_micros() + 600_000,
-        );
+        let past = Timestamp::from_unix_micros(Timestamp::now().as_unix_micros() - 1_000_000);
+        assert_eq!(Scheduler::due_sleep_duration(Some(past)), Some(DUE_FLOOR));
+        let future = Timestamp::from_unix_micros(Timestamp::now().as_unix_micros() + 600_000);
         let wait = Scheduler::due_sleep_duration(Some(future)).unwrap();
         assert!(wait >= DUE_FLOOR && wait <= Duration::from_millis(650));
     }
@@ -2506,14 +2671,12 @@ mod tests {
         );
         std::thread::spawn(move || {
             let mut scheduler = scheduler;
-            ntex::rt::System::new(
-                "scheduler-loop-test",
-                ntex::rt::DefaultRuntime,
+            ntex::rt::System::new("scheduler-loop-test", ntex::rt::DefaultRuntime).block_on(
+                async move {
+                    scheduler.run().await;
+                    scheduler.seq
+                },
             )
-            .block_on(async move {
-                scheduler.run().await;
-                scheduler.seq
-            })
         })
     }
 
@@ -2648,13 +2811,426 @@ mod tests {
         let join = run_in_background(&mut worker, limits(16, 100), shutdown.clone());
         // Give the startup sweep time to refuse global capacity and park.
         std::thread::sleep(Duration::from_millis(300));
-        wait(database.finalize_job(filled[0], crate::persistence::JobFinalization::Completed(done_result("free"))))
-            .unwrap();
+        wait(database.finalize_job(
+            filled[0],
+            crate::persistence::JobFinalization::Completed(done_result("free")),
+        ))
+        .unwrap();
         wait_for_occupancy(&database, 16);
         shutdown.cancel();
         join.join().unwrap();
         let occupancy = wait(database.occupancy()).unwrap();
         assert!(occupancy.iter().any(|(_, job)| *job == waiting));
+        worker.shutdown().unwrap();
+    }
+
+    /// Drives a future on this thread for at most `limit`, returning `None`
+    /// on expiry. Mirrors the review probes: a stalled sweep must time out
+    /// rather than hang the test.
+    fn drive_for<F: Future>(
+        mut future: std::pin::Pin<&mut F>,
+        limit: Duration,
+    ) -> Option<F::Output> {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            if let Some(value) = crate::test_support::poll_once(future.as_mut()) {
+                return Some(value);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::park_timeout(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_release_sharing_the_last_claims_write_group_wakes_the_hint_pause() {
+        use crate::test_support::{WAIT, poll_once};
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch1-hint");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (pool, llm) = provision(&database);
+        // SCH-1: 15 occupants and two Ready candidates behind one-per-page
+        // boundaries, so the 16th claim leaves `hint == Some(0)` at a page
+        // edge. The unrelated release below shares that claim's write group.
+        let mut filled = Vec::new();
+        for _ in 0..15 {
+            let job = pending_ready(&database, llm);
+            wait(database.claim_execution(ClaimRequest {
+                job,
+                allowed_pools: TestSet::from([pool]),
+            }))
+            .unwrap()
+            .unwrap();
+            filled.push(job);
+        }
+        let first = pending_ready(&database, llm);
+        let second = pending_ready(&database, llm);
+        let one_per_page = SchedulerLimits {
+            candidates: NonZeroUsize::new(1).unwrap(),
+            ..limits(16, 100)
+        };
+        let mut scheduler = scheduler(&mut worker, one_per_page);
+        let (entered, release_group) = database.group_probe().hold_next_group();
+        let freed = filled[0];
+        let helper_db = database.clone();
+        let helper = std::thread::spawn(move || {
+            entered.recv_timeout(WAIT).unwrap();
+            let mut fin = std::pin::pin!(helper_db.finalize_job(
+                freed,
+                crate::persistence::JobFinalization::Completed(done_result("free")),
+            ));
+            assert!(poll_once(fin.as_mut()).is_none());
+            release_group.send(()).unwrap();
+            let _ = crate::test_support::wait(fin);
+        });
+        let mut sweep = std::pin::pin!(scheduler.sweep_once());
+        let outcome = drive_for(sweep.as_mut(), Duration::from_secs(10));
+        helper.join().unwrap();
+        match outcome.expect("the hint pause must see the shared-group release") {
+            SweepOutcome::Completed(completed) => {
+                assert_eq!(completed.grants.len(), 2);
+                assert_eq!(completed.grants[0].job, first);
+                assert_eq!(completed.grants[1].job, second);
+            }
+            SweepOutcome::Abandoned(abandoned) => {
+                panic!("a hint-paused sweep resumes, got {:?}", abandoned.reason)
+            }
+        }
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn the_loop_restarts_from_a_pause_without_waiting_for_reconciliation() {
+        use crate::test_support::{WAIT, poll_once};
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch2-restart");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (pool, llm) = provision(&database);
+        let mut filled = Vec::new();
+        for _ in 0..16 {
+            let job = pending_ready(&database, llm);
+            wait(database.claim_execution(ClaimRequest {
+                job,
+                allowed_pools: TestSet::from([pool]),
+            }))
+            .unwrap()
+            .unwrap();
+            filled.push(job);
+        }
+        // SCH-2: the startup sweep parks on the saturated domain; a Job
+        // admitted during the pause must be reconsidered from that pause's
+        // finish comparison, not from the R=6 s backstop.
+        let waiting = pending_ready(&database, llm);
+        let tiny_r = SchedulerLimits {
+            reconcile: Duration::from_secs(6),
+            ..limits(16, 100)
+        };
+        let shutdown = CancellationToken::default();
+        let join = run_in_background(&mut worker, tiny_r, shutdown.clone());
+        std::thread::sleep(Duration::from_millis(600));
+        let admitted = pending_ready(&database, llm);
+        std::thread::sleep(Duration::from_millis(400));
+        // Two releases in ONE write group: one publication, so the restart
+        // must carry both claims without another wake.
+        let (entered, release_group) = database.group_probe().hold_next_group();
+        let (first_freed, second_freed) = (filled[0], filled[1]);
+        let db0 = database.clone();
+        let releaser = std::thread::spawn(move || {
+            crate::test_support::wait(db0.finalize_job(
+                first_freed,
+                crate::persistence::JobFinalization::Completed(done_result("a")),
+            ))
+            .unwrap();
+        });
+        entered.recv_timeout(WAIT).unwrap();
+        let mut fin1 = std::pin::pin!(database.finalize_job(
+            second_freed,
+            crate::persistence::JobFinalization::Completed(done_result("b")),
+        ));
+        assert!(poll_once(fin1.as_mut()).is_none());
+        release_group.send(()).unwrap();
+        crate::test_support::wait(fin1).unwrap();
+        releaser.join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let occupancy = wait(database.occupancy()).unwrap();
+            if occupancy.iter().any(|(_, job)| *job == admitted) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the paused sweep never restarted; the admitted job waited for R"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shutdown.cancel();
+        join.join().unwrap();
+        let occupancy = wait(database.occupancy()).unwrap();
+        assert!(occupancy.iter().any(|(_, job)| *job == waiting));
+        assert!(occupancy.iter().any(|(_, job)| *job == admitted));
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_dirty_only_wake_does_not_escalate_the_credit_gate() {
+        // SCH-3: a bucket 0.5 s in debt, gated at Dirty, woken only by an
+        // admission that releases no capacity. The gate must serve the full
+        // 1 s Dirty wait at the Dirty threshold, not a Capacity overdraft.
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch3-dirty");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, _llm) = provision(&database);
+        let mut scheduler = scheduler(&mut worker, limits(16, 100));
+        while scheduler.wake.try_recv().is_ok() {}
+        let c0 = scheduler.wake.capacity_generation();
+        scheduler.credit.balance_micros = -500_000;
+        scheduler.credit.refilled_at = std::time::Instant::now();
+        let helper_db = database.clone();
+        let helper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            pending(&helper_db);
+        });
+        let started = std::time::Instant::now();
+        let trigger = ntex::rt::System::new("sch3-dirty-gate", ntex::rt::DefaultRuntime)
+            .block_on(async move { scheduler.gate(SweepTrigger::Dirty, false, c0).await });
+        let elapsed = started.elapsed();
+        helper.join().unwrap();
+        assert_eq!(trigger, Some(SweepTrigger::Dirty));
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "a dirty-only wake bypassed the Dirty threshold after {elapsed:?}"
+        );
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_genuine_capacity_release_still_strengthens_the_credit_gate() {
+        // SCH-3 control: the same indebted Dirty wait, but the wake releases
+        // a slot on a capacity-deferred sweep. The gate must upgrade to
+        // Capacity and return promptly.
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch3-capacity");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (pool, llm) = provision(&database);
+        let occupant = pending_ready(&database, llm);
+        wait(database.claim_execution(ClaimRequest {
+            job: occupant,
+            allowed_pools: TestSet::from([pool]),
+        }))
+        .unwrap()
+        .unwrap();
+        let mut scheduler = scheduler(&mut worker, limits(16, 100));
+        while scheduler.wake.try_recv().is_ok() {}
+        let c0 = scheduler.wake.capacity_generation();
+        scheduler.credit.balance_micros = -500_000;
+        scheduler.credit.refilled_at = std::time::Instant::now();
+        let helper_db = database.clone();
+        let helper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            crate::test_support::wait(helper_db.finalize_job(
+                occupant,
+                crate::persistence::JobFinalization::Completed(done_result("free")),
+            ))
+            .unwrap();
+        });
+        let started = std::time::Instant::now();
+        let trigger = ntex::rt::System::new("sch3-capacity-gate", ntex::rt::DefaultRuntime)
+            .block_on(async move { scheduler.gate(SweepTrigger::Dirty, true, c0).await });
+        let elapsed = started.elapsed();
+        helper.join().unwrap();
+        assert_eq!(trigger, Some(SweepTrigger::Capacity));
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "a genuine capacity release did not strengthen the gate: {elapsed:?}"
+        );
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn the_loop_stays_responsive_to_shutdown_while_protected() {
+        // SCH-4: protection waiting must observe shutdown promptly without
+        // starting any claim.
+        use crate::disk_protection::{ProtectedArea, ProtectionReason, SpaceShortage};
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch4-protected");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, llm) = provision(&database);
+        let _job = pending_ready(&database, llm);
+        let path = directory.database_path().to_path_buf();
+        assert!(
+            database.activate_filesystem_protection(ProtectionReason::InsufficientSpace(
+                SpaceShortage {
+                    area: ProtectedArea::Database,
+                    path,
+                    available_bytes: 0,
+                    expected_write_bytes: 0,
+                    threshold_bytes: 1,
+                }
+            ))
+        );
+        let shutdown = CancellationToken::default();
+        let join = run_in_background(&mut worker, limits(16, 100), shutdown.clone());
+        std::thread::sleep(Duration::from_millis(300));
+        shutdown.cancel();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !join.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop ignored shutdown while protection was held"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let seq = join.join().unwrap();
+        assert_eq!(seq, 0, "a protected loop starts no sweep, got {seq}");
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn the_loop_stops_when_the_database_worker_stops() {
+        // SCH-5: a closed protection watcher (and a dead read pool) is a
+        // terminal condition: the loop stops instead of spinning on it.
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch5-worker-stop");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let shutdown = CancellationToken::default();
+        let join = run_in_background(&mut worker, limits(16, 100), shutdown.clone());
+        std::thread::sleep(Duration::from_millis(300));
+        worker.shutdown().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !join.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop kept waking after the worker stopped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let seq = join.join().unwrap();
+        assert_eq!(seq, 1, "one startup sweep and nothing else, got {seq}");
+    }
+
+    #[test]
+    fn an_abandoned_sweep_charges_the_service_it_performed() {
+        // SCH-6: the claim round trip (200 ms of held-group wait) plus the
+        // capture service must leave the credit bucket lower, and the
+        // abandoned sweep must carry the service it spent.
+        use crate::test_support::{WAIT, poll_once};
+        use std::sync::atomic::Ordering;
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch6-charge");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, llm) = provision(&database);
+        let _job = pending_ready(&database, llm);
+        let probe = database.group_probe();
+        let (entered, release) = probe.hold_next_group();
+        let extra_database = database.clone();
+        let extra = std::thread::spawn(move || {
+            entered.recv_timeout(WAIT).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            let mut extra = std::pin::pin!(extra_database.create_project(
+                crate::persistence::NewProject {
+                    name: "flush group".into(),
+                    description: None,
+                }
+            ));
+            assert!(poll_once(extra.as_mut()).is_none());
+            extra_database
+                .group_probe()
+                .fail_next_flush
+                .store(true, Ordering::SeqCst);
+            release.send(()).unwrap();
+            let _ = crate::test_support::wait(extra);
+        });
+        let mut scheduler = scheduler(&mut worker, limits(16, 100));
+        let before = scheduler.credit_balance();
+        match wait(scheduler.sweep_once()) {
+            SweepOutcome::Abandoned(abandoned) => {
+                assert!(
+                    matches!(
+                        abandoned.reason,
+                        SweepAbandonedReason::UncertainClaim { .. }
+                    ),
+                    "{:?}",
+                    abandoned.reason
+                );
+                assert!(
+                    abandoned.ledger.service >= Duration::from_millis(200),
+                    "the abandon dropped the service it performed: {:?}",
+                    abandoned.ledger.service
+                );
+            }
+            SweepOutcome::Completed(_) => panic!("an unknown claim never grants"),
+        }
+        extra.join().unwrap();
+        let after = scheduler.credit_balance();
+        assert!(
+            after < before,
+            "performed service must leave the bucket lower: {before} -> {after}"
+        );
+        wait(database.recover_storage()).unwrap();
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_sweep_abandoned_before_any_work_charges_nothing() {
+        // SCH-6 control: shutdown or protection before the first read performs
+        // no service, so the ledger stays empty and the bucket is untouched.
+        use crate::disk_protection::{ProtectedArea, ProtectionReason, SpaceShortage};
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch6-no-charge");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, llm) = provision(&database);
+        let _job = pending_ready(&database, llm);
+        let wake = worker.take_scheduler_wake().unwrap();
+        let shutdown = CancellationToken::default();
+        let mut scheduler =
+            Scheduler::new(database.clone(), wake, shutdown.clone(), limits(16, 100));
+        let before = scheduler.credit_balance();
+        shutdown.cancel();
+        match wait(scheduler.sweep_once()) {
+            SweepOutcome::Abandoned(abandoned) => {
+                assert_eq!(abandoned.reason, SweepAbandonedReason::Shutdown);
+                assert_eq!(abandoned.ledger.service, Duration::ZERO);
+            }
+            SweepOutcome::Completed(_) => panic!("a stopped sweep claims nothing"),
+        }
+        assert_eq!(scheduler.credit_balance(), before);
+
+        // Protection before the first read likewise performs no service.
+        let (_protected_root, protected_dir) =
+            data_directory("ocg-stage-b-scheduler", "sch6-no-charge-protected");
+        let mut protected_worker = DatabaseWorker::start(&protected_dir).unwrap();
+        let protected_db = protected_worker.handle();
+        let (_pool, llm) = provision(&protected_db);
+        let _job = pending_ready(&protected_db, llm);
+        let path = protected_dir.database_path().to_path_buf();
+        assert!(
+            protected_db.activate_filesystem_protection(ProtectionReason::InsufficientSpace(
+                SpaceShortage {
+                    area: ProtectedArea::Database,
+                    path,
+                    available_bytes: 0,
+                    expected_write_bytes: 0,
+                    threshold_bytes: 1,
+                }
+            ))
+        );
+        let wake = protected_worker.take_scheduler_wake().unwrap();
+        let mut protected_scheduler = Scheduler::new(
+            protected_db,
+            wake,
+            CancellationToken::default(),
+            limits(16, 100),
+        );
+        let protected_before = protected_scheduler.credit_balance();
+        match wait(protected_scheduler.sweep_once()) {
+            SweepOutcome::Abandoned(abandoned) => {
+                assert_eq!(abandoned.reason, SweepAbandonedReason::ProtectionActive);
+                assert_eq!(abandoned.ledger.service, Duration::ZERO);
+            }
+            SweepOutcome::Completed(_) => panic!("a protected sweep sends no claim"),
+        }
+        assert_eq!(protected_scheduler.credit_balance(), protected_before);
+        protected_worker.shutdown().unwrap();
         worker.shutdown().unwrap();
     }
 }
