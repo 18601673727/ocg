@@ -36,12 +36,11 @@ pub struct JobRecord {
 }
 
 /// A position in the order of Jobs that have been submitted but have not
-/// started or reached an outcome: creation time, then Job ID, so Jobs created
-/// in the same microsecond keep a stable order. A creation time is the
-/// database worker's wall clock, so it can run backwards across Job IDs.
+/// started or reached an outcome: Job ID alone. IDs are allocated in the
+/// single write transaction, so this order follows commits independently
+/// of the worker's wall clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PendingJobKey {
-    pub created_at: Timestamp,
     pub job: JobId,
 }
 
@@ -55,7 +54,7 @@ pub struct PendingJobKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingJobsPage {
     pub visited: Vec<PendingJobKey>,
-    pub last_visited: Option<PendingJobKey>,
+    pub last_visited: Option<JobId>,
     pub exhausted: bool,
 }
 

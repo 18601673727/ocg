@@ -882,22 +882,59 @@ fn fenced_pages_are_bounded_exclusive_and_snapshot_complete_at_exact_budget() {
 }
 
 #[test]
-fn typed_first_page_index_fault_keeps_fence_and_keys_fallback_works() {
+fn job_id_pending_index_preserves_order_and_reports_corruption() {
     let fixture = Fixture::new("fault", 16);
-    let job = fixture.job(fixture.genesis, Vec::new());
-    fixture.job(fixture.genesis, Vec::new());
+    let admit_at = |micros| {
+        fixture
+            .write(OperationKind::CreateJobWithInput, |batch| {
+                batch.now = Timestamp::from_unix_micros(micros);
+                let (input, _) =
+                    persistence::save_job_input(batch, None, JobInputDraft::default())?;
+                persistence::create_job_with_input(
+                    batch,
+                    NewJob {
+                        name: None,
+                        execution_mode: ExecutionMode::Once,
+                        eligible_at: None,
+                        scheduled_at: None,
+                        next_due_at: None,
+                        next_iteration_no: None,
+                        iteration_no: None,
+                        parent: fixture.genesis,
+                        projects: Vec::new(),
+                        dependencies: Vec::new(),
+                        configuration: None,
+                        assigned_executor: None,
+                        previous: None,
+                        replaces: None,
+                    },
+                    input,
+                )
+            })
+            .unwrap()
+    };
+    let job = admit_at(2_000_000);
+    let second = admit_at(1_000_000);
+    assert!(job < second);
+    let page = read_pending_jobs(&fixture.database, None, 100).unwrap();
+    assert_eq!(
+        page.visited,
+        vec![PendingJobKey { job }, PendingJobKey { job: second }]
+    );
+    assert_eq!(page.last_visited, Some(second));
+    let page = read_pending_jobs(&fixture.database, Some(job), 100).unwrap();
+    assert_eq!(page.visited, vec![PendingJobKey { job: second }]);
     let transaction = fixture.database.begin_write().unwrap();
-    let key = JobRow::decode(
-        transaction
-            .open_table(JOBS)
+    let index = transaction.open_table(PENDING_JOBS).unwrap();
+    assert_eq!(
+        index
+            .iter()
             .unwrap()
-            .get(job.get())
-            .unwrap()
-            .unwrap()
-            .value(),
-    )
-    .unwrap()
-    .pending_key();
+            .map(|entry| entry.unwrap().0.value())
+            .collect::<Vec<_>>(),
+        vec![job.get(), second.get()]
+    );
+    drop(index);
     transaction
         .open_table(JOBS)
         .unwrap()
@@ -910,16 +947,23 @@ fn typed_first_page_index_fault_keeps_fence_and_keys_fallback_works() {
     assert!(matches!(
         fault,
         PendingReadFault::IndexEntry {
-            fence: PendingFence { len: 2, .. },
+            fence: PendingFence { len: 2, high_water, .. },
+            key: PendingJobKey { job: damaged },
             kind: PendingIndexFault::MissingJob,
             ..
-        }
+        } if high_water == second && damaged == job
     ));
+    assert_eq!(
+        read_pending_jobs(&fixture.database, None, 100)
+            .unwrap_err()
+            .kind,
+        StorageErrorKind::Corrupted
+    );
     let keys = read_pending_keys(&fixture.database, None, NonZeroUsize::MIN)
         .unwrap()
         .unwrap();
-    assert_eq!(keys.page.visited[0].job, job);
-    assert_eq!(keys.page.visited[0].created_at.as_unix_micros(), key.0);
+    assert_eq!(keys.page.visited, vec![PendingJobKey { job }]);
+    assert_eq!(keys.page.last_visited, Some(job));
     assert!(
         !read_pending_snapshot(&fixture.database, NonZeroUsize::MIN)
             .unwrap()
@@ -942,6 +986,29 @@ fn typed_first_page_index_fault_keeps_fence_and_keys_fallback_works() {
             .unwrap_err()
             .kind,
         StorageErrorKind::Corrupted
+    );
+    let transaction = fixture.database.begin_write().unwrap();
+    transaction
+        .open_table(SEQUENCES)
+        .unwrap()
+        .insert(Sequence::Job.key(), second.get())
+        .unwrap();
+    transaction.delete_table(PENDING_JOBS).unwrap();
+    let legacy: TableDefinition<(i64, u64), ()> = TableDefinition::new("pending_job");
+    let mut index = transaction.open_table(legacy).unwrap();
+    index.insert((2_000_000, job.get()), ()).unwrap();
+    index.insert((1_000_000, second.get()), ()).unwrap();
+    drop(index);
+    transaction.commit().unwrap();
+    drop(fixture.database);
+    let reopened = open(&fixture.path)
+        .ok()
+        .expect("rebuild the old tuple index");
+    assert_eq!(
+        read_pending_jobs(&reopened.database, None, 100)
+            .unwrap()
+            .visited,
+        vec![PendingJobKey { job: second }]
     );
 }
 

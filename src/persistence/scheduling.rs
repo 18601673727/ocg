@@ -98,7 +98,7 @@ pub struct PendingSnapshot {
     pub fence: PendingFence,
     pub keys: Vec<PendingJobKey>,
     pub complete: bool,
-    pub resume_after: Option<PendingJobKey>,
+    pub resume_after: Option<JobId>,
     pub service_time: Duration,
 }
 

@@ -72,16 +72,13 @@ pub(super) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta
 pub(super) const GENESIS_KEY: &str = "genesis";
 pub(super) const SEQUENCES: TableDefinition<&str, u64> = TableDefinition::new("sequence");
 pub(super) const JOBS: Records = TableDefinition::new("job");
-/// (created_at in Unix microseconds, Job) for every Job other than Genesis
+/// Job ID for every Job other than Genesis
 /// that has not started and has no terminal outcome. Derived from JOBS and
 /// never an authority of its own: JOBS decides, and [`Batch::insert_job`] and
 /// [`Batch::put_job`] keep the two in step in the transaction that writes the
-/// Job. A Job's creation time and identity never change, so a Job has one
-/// key for as long as it is a member. The Job identity makes equal times
-/// distinct, and a clock that moved backwards only changes where a later Job
-/// sorts, never the order of the keys themselves.
-pub(super) const PENDING_JOBS: TableDefinition<(i64, u64), ()> =
-    TableDefinition::new("pending_job");
+/// Job. IDs are allocated by SEQUENCES in the single write transaction, so
+/// their order is commit order even when the wall clock moves backwards.
+pub(super) const PENDING_JOBS: TableDefinition<u64, ()> = TableDefinition::new("pending_job");
 pub(super) const JOB_INPUTS: Records = TableDefinition::new("job_input");
 pub(super) const JOB_OUTPUTS: Records = TableDefinition::new("job_output");
 pub(super) const EXECUTORS: Records = TableDefinition::new("executor");

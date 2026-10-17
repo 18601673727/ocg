@@ -4,10 +4,9 @@ use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::time::Instant;
 
-fn key(tuple: (i64, u64)) -> PendingJobKey {
+fn key(id: u64) -> PendingJobKey {
     PendingJobKey {
-        created_at: Timestamp::from_unix_micros(tuple.0),
-        job: JobId::new(tuple.1),
+        job: JobId::new(id),
     }
 }
 
@@ -36,7 +35,7 @@ fn fence(transaction: &ReadTransaction) -> Result<PendingFence, StorageError> {
 
 pub(crate) fn read_pending_capture_page(
     database: &Database,
-    after: Option<PendingJobKey>,
+    after: Option<JobId>,
     limit: NonZeroUsize,
 ) -> Result<Result<PendingCapturePage, PendingReadFault>, StorageError> {
     pending_page(database, after, limit, true)
@@ -44,7 +43,7 @@ pub(crate) fn read_pending_capture_page(
 
 pub(crate) fn read_pending_keys(
     database: &Database,
-    after: Option<PendingJobKey>,
+    after: Option<JobId>,
     limit: NonZeroUsize,
 ) -> Result<Result<PendingCapturePage, PendingReadFault>, StorageError> {
     pending_page(database, after, limit, false)
@@ -52,7 +51,7 @@ pub(crate) fn read_pending_keys(
 
 fn pending_page(
     database: &Database,
-    after: Option<PendingJobKey>,
+    after: Option<JobId>,
     limit: NonZeroUsize,
     verify: bool,
 ) -> Result<Result<PendingCapturePage, PendingReadFault>, StorageError> {
@@ -70,9 +69,7 @@ fn pending_page(
             service_time: began.elapsed(),
         }));
     }
-    let start = after.map_or(Bound::Unbounded, |key| {
-        Bound::Excluded((key.created_at.as_unix_micros(), key.job.get()))
-    });
+    let start = after.map_or(Bound::Unbounded, |job| Bound::Excluded(job.get()));
     let mut entries = index.range((start, Bound::Unbounded))?;
     let mut exhausted = false;
     while visited.len() < limit {
@@ -80,8 +77,7 @@ fn pending_page(
             exhausted = true;
             break;
         };
-        let tuple = entry?.0.value();
-        let key = key(tuple);
+        let key = key(entry?.0.value());
         if verify {
             let defect = match jobs.get(key.job.get())? {
                 None => Some(PendingIndexFault::MissingJob),
@@ -90,7 +86,6 @@ fn pending_page(
                     Ok(row) if row.id != key.job => Some(PendingIndexFault::WrongJobIdentity),
                     Ok(row) if row.id == genesis => Some(PendingIndexFault::Genesis),
                     Ok(row) if !row.awaits_start() => Some(PendingIndexFault::NotPending),
-                    Ok(row) if row.pending_key() != tuple => Some(PendingIndexFault::KeyMismatch),
                     Ok(_) => None,
                 },
             };
@@ -105,7 +100,7 @@ fn pending_page(
         }
         visited.push(key);
     }
-    let last_visited = visited.last().copied().or(after);
+    let last_visited = visited.last().map(|key| key.job).or(after);
     Ok(Ok(PendingCapturePage {
         fence,
         page: PendingJobsPage {
@@ -138,7 +133,7 @@ pub(crate) fn read_pending_snapshot(
         keys.push(key(entry?.0.value()));
     }
     let complete = fence.len <= limit as u64;
-    let resume_after = keys.last().copied();
+    let resume_after = keys.last().map(|key| key.job);
     Ok(Ok(PendingSnapshot {
         fence,
         keys,

@@ -364,7 +364,7 @@ impl Scheduler {
     /// read worker's service time counts; queue wait and backoff never do.
     async fn capture_page(
         &self,
-        after: Option<PendingJobKey>,
+        after: Option<JobId>,
         ledger: &mut Ledger,
     ) -> CaptureStep<PendingCapturePage> {
         let read = self
@@ -1570,7 +1570,7 @@ impl CohortSource {
 #[derive(Debug)]
 pub(crate) struct PendingCursor {
     fence: PendingFence,
-    after: Option<PendingJobKey>,
+    after: Option<JobId>,
     page: Vec<PendingJobKey>,
     next: usize,
     exhausted: bool,

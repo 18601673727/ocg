@@ -460,7 +460,7 @@ impl Batch {
     }
 
     /// Brings the Job's [`PENDING_JOBS`] entry in line with the row just
-    /// written. The key is fixed by the Job's identity and creation time, so
+    /// written. The key is fixed by the Job's identity, so
     /// removing it can only remove this Job's own entry.
     fn index_pending(&mut self, row: &JobRow) -> Result<(), BatchError> {
         let genesis = self.genesis()?;

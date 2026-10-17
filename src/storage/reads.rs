@@ -119,16 +119,14 @@ pub(crate) fn read_jobs(
 /// fails the read rather than being skipped.
 pub(crate) fn read_pending_jobs(
     database: &Database,
-    after: Option<PendingJobKey>,
+    after: Option<JobId>,
     limit: usize,
 ) -> Result<PendingJobsPage, StorageError> {
     let rx = read(database)?;
     let genesis = genesis_id(&rx.open_table(META)?)?;
     let index = rx.open_table(PENDING_JOBS)?;
     let jobs = rx.open_table(JOBS)?;
-    let start = after.map_or(Bound::Unbounded, |key| {
-        Bound::Excluded((key.created_at.as_unix_micros(), key.job.get()))
-    });
+    let start = after.map_or(Bound::Unbounded, |job| Bound::Excluded(job.get()));
     let limit = limit.min(MAX_PAGE);
     let mut entries = index.range((start, Bound::Unbounded))?;
     let mut visited = Vec::new();
@@ -139,22 +137,22 @@ pub(crate) fn read_pending_jobs(
             break;
         };
         let key = entry?.0.value();
-        let (created_at, job) = (Timestamp::from_unix_micros(key.0), JobId::new(key.1));
+        let job = JobId::new(key);
         let row = jobs
-            .get(key.1)?
+            .get(key)?
             .map(|v| JobRow::decode(v.value()))
             .transpose()?
             .ok_or_else(|| {
                 StorageError::corrupted(format!("PENDING_JOBS names the missing Job {job}"))
             })?;
-        if row.pending_key() != key || row.id == genesis || !row.awaits_start() {
+        if row.id != job || row.id == genesis || !row.awaits_start() {
             return Err(StorageError::corrupted(format!(
-                "PENDING_JOBS names {job}, which is not a pending Job created at {created_at:?}"
+                "PENDING_JOBS key {job} does not name the same non-Genesis pending Job"
             )));
         }
-        visited.push(PendingJobKey { created_at, job });
+        visited.push(PendingJobKey { job });
     }
-    let last_visited = visited.last().copied();
+    let last_visited = visited.last().map(|key| key.job);
     Ok(PendingJobsPage {
         visited,
         last_visited,

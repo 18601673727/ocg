@@ -379,12 +379,12 @@ impl DatabaseHandle {
     }
 
     /// The Jobs that are submitted but neither started nor settled, oldest
-    /// first by creation time and then ID, strictly after `after` when given.
+    /// first by Job ID, strictly after `after` when given.
     /// At most `limit`, and never more than 1,000, index entries are
     /// examined per call, see [`persistence::PendingJobsPage`].
     pub async fn pending_jobs(
         &self,
-        after: Option<persistence::PendingJobKey>,
+        after: Option<JobId>,
         limit: usize,
     ) -> Result<persistence::PendingJobsPage, DatabaseError> {
         self.read(move |database| storage::read_pending_jobs(database, after, limit))
@@ -393,7 +393,7 @@ impl DatabaseHandle {
 
     pub async fn pending_capture_page(
         &self,
-        after: Option<persistence::PendingJobKey>,
+        after: Option<JobId>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Result<PendingCapturePage, PendingReadFault>, DatabaseError> {
         self.read(move |database| storage::read_pending_capture_page(database, after, limit))
@@ -402,7 +402,7 @@ impl DatabaseHandle {
 
     pub async fn pending_keys(
         &self,
-        after: Option<persistence::PendingJobKey>,
+        after: Option<JobId>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Result<PendingCapturePage, PendingReadFault>, DatabaseError> {
         self.read(move |database| storage::read_pending_keys(database, after, limit))

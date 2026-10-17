@@ -41,8 +41,8 @@ impl JobRow {
     }
 
     /// The Job's [`PENDING_JOBS`] key.
-    pub(super) fn pending_key(&self) -> (i64, u64) {
-        (self.created_at.as_unix_micros(), self.id.get())
+    pub(super) fn pending_key(&self) -> u64 {
+        self.id.get()
     }
 
     /// Whether the Job's own execution is over: it has a confirmed outcome,
