@@ -390,7 +390,12 @@ impl ToolHandler for QueryLsp {
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let arguments = Request::of(&arguments)?;
-            query(&self.workspace, &self.sessions, &self.servers, &arguments).await
+            let result = query(&self.workspace, &self.sessions, &self.servers, &arguments).await;
+            let stopped = self.sessions.stop_after_call().await;
+            match stopped {
+                Ok(()) => result,
+                Err(failure) => Err(failure),
+            }
         })
     }
 }
@@ -617,6 +622,13 @@ impl Sessions {
     async fn stop(&self) -> Result<(), ToolFailure> {
         self.rust.stop().await?;
         self.typescript.stop().await
+    }
+
+    async fn stop_after_call(&self) -> Result<(), ToolFailure> {
+        self.stop().await?;
+        self.rust.disabled.store(false, Ordering::Release);
+        self.typescript.disabled.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Stops every running server through the protocol's own `shutdown` and

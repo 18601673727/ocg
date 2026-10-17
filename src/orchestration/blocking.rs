@@ -16,10 +16,7 @@ const COMMANDS: usize = 1;
 const CPU: usize = 2;
 const FILES: usize = 4;
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(5);
-#[cfg(not(test))]
 const STARTUP_GRACE: Duration = Duration::from_millis(50);
-#[cfg(test)]
-const STARTUP_GRACE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy)]
@@ -174,9 +171,6 @@ impl Process {
         command.process_group(0);
         let sentinel = Sentinel::new()?;
         sentinel.configure_child(&mut command)?;
-        let (exec_read, exec_write) = pipe()?;
-        fcntl_setfd(&exec_read, fcntl_getfd(&exec_read)? | FdFlags::CLOEXEC)?;
-        fcntl_setfd(&exec_write, fcntl_getfd(&exec_write)? | FdFlags::CLOEXEC)?;
         let permit = Permit::acquire(kind);
         let child = match command.spawn() {
             Ok(child) => child,
@@ -185,13 +179,6 @@ impl Process {
                 return Err(error);
             }
         };
-        drop(exec_write);
-        let mut exec_read = std::fs::File::from(exec_read);
-        let mut exec_marker = [0u8; 1];
-        use std::io::Read;
-        exec_read.read(&mut exec_marker)?;
-        #[cfg(test)]
-        thread::sleep(Duration::from_millis(100));
         let group = Pid::from_child(&child);
         drop(sentinel.write);
         Ok(Self {
@@ -270,27 +257,20 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    #[cfg(test)]
-    {
-        let _permit = Permit::acquire(kind);
-        return Ok(work());
-    }
-
-    #[cfg(not(test))]
-    {
-        let (send, receive) = flume::bounded(1);
-        thread::Builder::new()
-            .name("ocg-blocking-work".to_owned())
-            .spawn(move || {
-                let _permit = Permit::acquire(kind);
-                let _ = send.send(work());
-            })
-            .map_err(|_| "the blocking task could not be started")?;
-        receive
-            .recv_async()
-            .await
-            .map_err(|_| "the blocking task ended without a result")
-    }
+    let (send, receive) = flume::bounded(1);
+    thread::Builder::new()
+        .name("ocg-blocking-work".to_owned())
+        .spawn(move || {
+            let _permit = Permit::acquire(kind);
+            if send.send(work()).is_err() {
+                log::debug!("blocking work result was dropped");
+            }
+        })
+        .map_err(|_| "the blocking task could not be started")?;
+    receive
+        .recv_async()
+        .await
+        .map_err(|_| "the blocking task ended without a result")
 }
 
 /// Runs already-accounted-for blocking cleanup without acquiring another
@@ -300,27 +280,19 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    #[cfg(test)]
-    {
-        return Ok(work());
-    }
-
-    #[cfg(not(test))]
-    {
-        let (send, receive) = flume::bounded(1);
-        thread::Builder::new()
-            .name("ocg-blocking-cleanup".to_owned())
-            .spawn(move || {
-                if send.send(work()).is_err() {
-                    log::debug!("blocking cleanup result was dropped");
-                }
-            })
-            .map_err(|_| "the blocking cleanup could not be started")?;
-        receive
-            .recv_async()
-            .await
-            .map_err(|_| "the blocking cleanup ended without a result")
-    }
+    let (send, receive) = flume::bounded(1);
+    thread::Builder::new()
+        .name("ocg-blocking-cleanup".to_owned())
+        .spawn(move || {
+            if send.send(work()).is_err() {
+                log::debug!("blocking cleanup result was dropped");
+            }
+        })
+        .map_err(|_| "the blocking cleanup could not be started")?;
+    receive
+        .recv_async()
+        .await
+        .map_err(|_| "the blocking cleanup ended without a result")
 }
 
 fn signal(group: Pid, signal: Signal) {

@@ -64,6 +64,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -283,9 +284,11 @@ struct Invocation {
     variables: Vec<(OsString, OsString)>,
 }
 
-static ACTIVE: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, StopSignal>>> = OnceLock::new();
+static ACTIVE: OnceLock<Mutex<std::collections::BTreeMap<u64, (PathBuf, StopSignal)>>> =
+    OnceLock::new();
+static NEXT_ACTIVE: AtomicU64 = AtomicU64::new(1);
 
-fn active() -> &'static Mutex<std::collections::BTreeMap<PathBuf, StopSignal>> {
+fn active() -> &'static Mutex<std::collections::BTreeMap<u64, (PathBuf, StopSignal)>> {
     ACTIVE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
 }
 
@@ -516,19 +519,22 @@ impl ToolHandler for RunCommand {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolFailure>> + '_>> {
         let root = self.workspace.root().to_path_buf();
         Box::pin(async move {
-            if let Some(signal) = active()
+            let signals = active()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .get(&root)
-                .cloned()
-            {
+                .values()
+                .filter(|(active_root, _)| active_root == &root)
+                .map(|(_, signal)| signal.clone())
+                .collect::<Vec<_>>();
+            for signal in signals {
                 signal.request();
             }
             loop {
                 let running = active()
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .contains_key(&root);
+                    .values()
+                    .any(|(active_root, _)| active_root == &root);
                 if !running {
                     break;
                 }
@@ -551,11 +557,11 @@ impl ToolHandler for RunCommand {
             let supervised = stop.clone();
             let mutation = workspace_read::WorkspaceMutation::begin();
             let root = self.workspace.root().to_path_buf();
-            let supervisor_root = root.clone();
+            let active_id = NEXT_ACTIVE.fetch_add(1, Ordering::Relaxed);
             active()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(root.clone(), stop.clone());
+                .insert(active_id, (root.clone(), stop.clone()));
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
@@ -564,7 +570,7 @@ impl ToolHandler for RunCommand {
                     active()
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&supervisor_root);
+                        .remove(&active_id);
                     if report.send(result).is_err() {
                         log::debug!("command report receiver was dropped after cleanup");
                     }
@@ -573,7 +579,7 @@ impl ToolHandler for RunCommand {
                     active()
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&root);
+                        .remove(&active_id);
                     Failure::from(Refusal::NotStarted)
                 })?;
             let ended = match ntex::time::timeout(self.timeout, reported.recv_async()).await {

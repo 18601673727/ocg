@@ -52,12 +52,6 @@ pub(crate) use mutations::{
     start_local_job, update_profile,
 };
 pub use mutations::{is_handler_version, sanitize_display_name};
-
-/// The process-spawn capability is fixed by the handler version and stored in
-/// format 16 without widening the in-memory admission record.
-pub fn handler_spawns(version: &str) -> bool {
-    matches!(version, "workspace_run_command-1" | "workspace_lsp_query-2")
-}
 #[cfg(test)]
 pub(crate) use mutations::{record_preexisting_metrics, start_preexisting_local_job};
 pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, OperationMarker, Violation};

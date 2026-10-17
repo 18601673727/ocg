@@ -1808,7 +1808,9 @@ async fn answer_calls(
         #[cfg(test)]
         dispatch_seam::reach(dispatch_seam::Point::Ran, reference);
         let stopped = match &ran {
-            Either::Left(()) | Either::Right(Err(())) if spawns => stopping_handler.stop().await,
+            Either::Left(()) | Either::Right(Err(())) | Either::Right(Ok(Err(_))) if spawns => {
+                stopping_handler.stop().await
+            }
             _ => Ok(()),
         };
         if let Err(failure) = stopped {

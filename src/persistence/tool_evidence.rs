@@ -114,7 +114,10 @@ pub struct ToolAdmission {
 
 impl ToolAdmission {
     pub fn spawns(&self) -> bool {
-        crate::persistence::handler_spawns(&self.handler_version)
+        matches!(
+            self.handler_version.as_str(),
+            "workspace_run_command-1" | "workspace_lsp_query-2"
+        )
     }
 }
 

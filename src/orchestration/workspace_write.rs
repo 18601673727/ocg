@@ -502,7 +502,11 @@ impl ToolHandler for WriteFile {
             let workspace = self.workspace.clone();
             let path_for_worker = path.clone();
             let content_for_write = content.clone();
+            #[cfg(test)]
+            let seam = write_seam::take();
             blocking::run(Kind::File, move || {
+                #[cfg(test)]
+                write_seam::install_boxed(seam);
                 let _mutation = workspace_read::WorkspaceMutation::begin();
                 match expected.as_deref() {
                     None => create(&workspace, &path_for_worker, &content_for_write),
@@ -577,7 +581,7 @@ pub(crate) mod write_seam {
         Published,
     }
 
-    type Seam = Box<dyn FnMut(Point) -> bool>;
+    type Seam = Box<dyn FnMut(Point) -> bool + Send>;
 
     thread_local! {
         static SEAM: RefCell<Option<Seam>> = const { RefCell::new(None) };
@@ -585,8 +589,16 @@ pub(crate) mod write_seam {
 
     /// Runs `seam` at every point of this thread's writes; a step fails when
     /// it returns `false`.
-    pub(crate) fn install(seam: impl FnMut(Point) -> bool + 'static) {
+    pub(crate) fn install(seam: impl FnMut(Point) -> bool + Send + 'static) {
         SEAM.with(|installed| *installed.borrow_mut() = Some(Box::new(seam)));
+    }
+
+    pub(super) fn take() -> Option<Seam> {
+        SEAM.with(|installed| installed.borrow_mut().take())
+    }
+
+    pub(super) fn install_boxed(seam: Option<Seam>) {
+        SEAM.with(|installed| *installed.borrow_mut() = seam);
     }
 
     pub(crate) fn clear() {

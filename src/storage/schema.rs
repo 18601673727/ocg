@@ -50,10 +50,7 @@ pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
 /// behind its back, so its entries are never trusted: every opening discards
 /// the table and rebuilds it from the Job table. Format 14 requires this
 /// table; a version 13 file is refused before that rebuild could run for it.
-#[cfg(test)]
 pub(crate) const FORMAT_VERSION: u32 = 15;
-#[cfg(not(test))]
-pub(crate) const FORMAT_VERSION: u32 = 16;
 pub(crate) const MAX_WAITING_LAYERS: usize = 64;
 pub(crate) const MAX_WAITING_JOBS: usize = 10_000;
 pub(crate) const MAX_PENDING_JOBS: u64 = crate::persistence::MAX_PENDING_JOBS;
