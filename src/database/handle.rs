@@ -448,6 +448,15 @@ impl DatabaseHandle {
             .await
     }
 
+    /// Every execution whose external work OCG never credibly confirmed
+    /// stopped, and the capacity each one still holds. Read-only and never a
+    /// route to release any of it: see
+    /// [`persistence::confirm_job_stopped`](crate::persistence::confirm_job_stopped).
+    pub async fn unresolved_executions(
+        &self,
+    ) -> Result<Vec<(JobId, crate::storage::UnresolvedExecution)>, DatabaseError> {
+        self.read(storage::read_unresolved_executions).await
+    }
     pub async fn occupancy(&self) -> Result<Vec<(ExecutionPoolId, JobId)>, DatabaseError> {
         self.read(storage::read_occupancy).await
     }

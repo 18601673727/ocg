@@ -46,7 +46,7 @@ pub(crate) use mutations::{
     begin_core_log_cleanup, check_new_attachment, cleanup_attachment, confirm_job_stopped,
     create_agent, create_attachment, create_execution_pool, create_executor, create_job_with_input,
     create_llm_provider, create_local_job_with_input, create_profile, create_project,
-    create_submitted_local_job, finalize_job, reconcile_abandoned_job, reconcile_tool_effect,
+    create_submitted_local_job, finalize_job, quarantine_abandoned_job, reconcile_tool_effect,
     record_availability_stat, record_metrics, record_tool_decision, record_tool_outcome, retry_job,
     save_job_input, set_execution_pool_enabled, set_execution_pool_profile, start_job,
     start_local_job, update_profile,

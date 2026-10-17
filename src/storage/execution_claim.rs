@@ -1,3 +1,4 @@
+use super::quarantine::global_occupancy;
 use super::*;
 use redb::ReadableTableMetadata;
 
@@ -8,7 +9,7 @@ fn encode_binding(binding: FrozenPoolBinding) -> Vec<u8> {
     encoder.0
 }
 
-fn decode_binding(bytes: &[u8]) -> Result<FrozenPoolBinding, StorageError> {
+pub(super) fn decode_frozen_binding(bytes: &[u8]) -> Result<FrozenPoolBinding, StorageError> {
     let mut decoder = Dec::new(bytes, codec::TAG_POOL_BINDING)?;
     let binding = FrozenPoolBinding {
         pool: ExecutionPoolId::new(decoder.u64()?),
@@ -25,7 +26,7 @@ pub(crate) fn read_pool_binding(
     read(database)?
         .open_table(FROZEN_POOL_BINDINGS)?
         .get(job.get())?
-        .map(|value| decode_binding(value.value()))
+        .map(|value| decode_frozen_binding(value.value()))
         .transpose()
 }
 
@@ -77,7 +78,7 @@ impl Batch {
         {
             return Ok(Err(ClaimRefusal::NotYetEligible { eligible_at }));
         }
-        let occupied = self.step(|transaction| Ok(transaction.open_table(OCCUPANCY)?.len()?))?;
+        let occupied = self.step(global_occupancy)?;
         if occupied >= u64::from(GLOBAL_EXECUTION_LIMIT) {
             return Ok(Err(ClaimRefusal::NoCapacity(CapacityScope::Global)));
         }
@@ -192,13 +193,31 @@ impl Batch {
         }))
     }
 
+    /// The Job's frozen Pool binding, authoritative once written and never
+    /// changed, so it is the same domain the quarantine will name.
+    pub(crate) fn pool_binding(
+        &mut self,
+        job: JobId,
+    ) -> Result<Option<FrozenPoolBinding>, BatchError> {
+        let bytes = self.step(|tx| {
+            Ok(tx
+                .open_table(FROZEN_POOL_BINDINGS)?
+                .get(job.get())?
+                .map(|value| value.value().to_vec()))
+        })?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        Ok(Some(self.decoded(decode_frozen_binding(&bytes))?))
+    }
+
     pub(super) fn index_occupancy(&mut self, row: &JobRow) -> Result<(), BatchError> {
         self.step(|transaction| {
             let bindings = transaction.open_table(FROZEN_POOL_BINDINGS)?;
             let Some(bytes) = bindings.get(row.id.get())? else {
                 return Ok(());
             };
-            let binding = decode_binding(bytes.value())?;
+            let binding = decode_frozen_binding(bytes.value())?;
             let mut occupancy = transaction.open_table(OCCUPANCY)?;
             let key = (binding.pool.get(), row.id.get());
             if row.started_at.is_some() && !row.locally_stopped() {
@@ -231,7 +250,7 @@ impl Batch {
                 "does not name this Job's execution grant",
             ));
         }
-        crate::persistence::reconcile_abandoned_job(self, job, operation.epoch())
+        crate::persistence::quarantine_abandoned_job(self, job, operation.epoch())
     }
 }
 
@@ -250,7 +269,7 @@ pub(super) fn rebuild_execution_indexes(
     let profile_rows = transaction.open_table(PROFILES)?;
     for entry in bindings.iter()? {
         let (job, bytes) = entry?;
-        let binding = decode_binding(bytes.value())?;
+        let binding = decode_frozen_binding(bytes.value())?;
         let row = jobs
             .get(job.value())?
             .ok_or_else(|| StorageError::corrupted("Pool binding names missing Job"))?;
@@ -286,5 +305,19 @@ pub(super) fn rebuild_execution_indexes(
             "execution occupancy exceeds global limit",
         ));
     }
+    // The occupancy rows above are rebuilt from the frozen bindings, so the
+    // quarantine that claims to protect them has to be checked against what
+    // was actually rebuilt. This runs at every open, before any admission, so
+    // a capacity state that cannot be reconstructed safely refuses to open
+    // rather than admitting on a claim it could not confirm. It opens those
+    // tables itself, so this opening's handles are released first.
+    drop(assigned);
+    drop(occupancy);
+    drop(profiles);
+    drop(bindings);
+    drop(jobs);
+    drop(pools);
+    drop(profile_rows);
+    quarantine::verify_quarantine(transaction)?;
     Ok(())
 }

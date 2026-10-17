@@ -387,7 +387,7 @@ pub(crate) fn start_job(batch: &mut Batch, job: JobId) -> OpResult<()> {
 /// opening of `epoch`. Besides the start, it claims the execution for that
 /// opening until the Job settles, so a later opening can tell that work this
 /// opening left unsettled can no longer be running; see
-/// [`reconcile_abandoned_job`]. The Genesis Job is never executed.
+/// [`quarantine_abandoned_job`]. The Genesis Job is never executed.
 pub(crate) fn start_local_job(batch: &mut Batch, job: JobId, epoch: u64) -> OpResult<()> {
     if batch.genesis()? == job {
         return batch.reject(Violation::GenesisProtected(job));
@@ -414,34 +414,68 @@ pub(crate) fn start_preexisting_local_job(
     Ok(((), MarkerSubjects::addressed(RecordRef::Job(job))))
 }
 
-/// Settles a Job that the opening of `epoch` started as its own local
-/// execution and left unsettled. Runs only when the database is opened, so
-/// that opening is closed: nothing it ran can still execute or settle the
-/// Job. An unsettled Job's outcome becomes unknown, never a claimed result,
-/// and its stop is confirmed, which releases the Profiles it holds and
-/// settles it. An unknown outcome only has its stop confirmed. Children are
-/// not touched: a parent still needs each of them to be settled. Neither is
-/// the Job's tool evidence: a call admitted without an outcome stays
+/// Records that the Job's external execution is unresolved, because the
+/// opening that ran it is gone without having established that it stopped.
+/// Runs only when the database is opened, so this opening is closed.
+///
+/// The opening's death establishes local stop and nothing more. Nothing in this
+/// process can drive the Job any more, so the Job takes an unknown outcome, and
+/// its children are untouched: a parent still needs each of them settled.
+/// Neither is its tool evidence: a call admitted without an outcome stays
 /// unresolved, never taken as not applied.
 ///
-/// Declines when the Job no longer has that claim, so running it again
-/// changes nothing.
-pub(crate) fn reconcile_abandoned_job(
+/// What it does *not* establish is that the earlier supervisor's OS
+/// descendants stopped. So the Job's stop is not confirmed, and it keeps every
+/// claim and occupancy it held: its unknown outcome and its unconfirmed stop
+/// stay distinguishable, and the capacity its unresolved work may still occupy
+/// is quarantined instead of released back into admission. See
+/// [`crate::storage::quarantine`].
+///
+/// The quarantine is durable and is written once, so repeated restarts cannot
+/// weaken a protection an earlier one set. This run declines when the Job
+/// already carries a quarantine, or no longer has the abandoned claim, so
+/// running it again changes nothing.
+///
+/// The Genesis Job is never executed and is never quarantined.
+pub(crate) fn quarantine_abandoned_job(
     batch: &mut Batch,
     job: JobId,
     epoch: u64,
 ) -> Result<Option<((), MarkerSubjects)>, BatchError> {
+    if batch.unresolved_execution(job)?.is_some() {
+        return Ok(None);
+    }
     if batch.local_execution(job)? != Some(epoch) {
         return Ok(None);
     }
     let now = batch.now();
     let mut row = batch.require_job(job)?;
-    if batch.genesis()? != job && row.holds_profiles() {
-        row.unknown_at.get_or_insert(now);
-        row.stop_confirmed_at = Some(now);
-        row.updated_at = now;
-        batch.put_job(&row)?;
+    if batch.genesis()? == job || !row.holds_profiles() {
+        // Nothing is unresolved: the Job holds nothing that could be running.
+        batch.release_local_execution(job)?;
+        return Ok(Some(((), MarkerSubjects::addressed(RecordRef::Job(job)))));
     }
+    // The binding is authoritative and immutable, and is read in the same
+    // transaction as the quarantine, so the quarantined domain cannot diverge
+    // from the occupancy it protects. A Job with no binding was started
+    // outside Pool admission and its domain cannot be established: the
+    // quarantine then charges only the global domain, rather than guessing a
+    // Pool and quarantining capacity whose safety can be established.
+    let domain = batch.pool_binding(job)?.map(|binding| binding.pool);
+    row.unknown_at.get_or_insert(now);
+    row.updated_at = now;
+    // Written before the claim is released and without a confirmed stop, so
+    // `put_job` leaves the Job's occupancy in place: the retained occupancy is
+    // what keeps the Pool's slot, and the global domain, out of admission.
+    batch.put_job(&row)?;
+    batch.quarantine_execution(
+        job,
+        crate::storage::UnresolvedExecution {
+            epoch,
+            unresolved_at: now,
+            pool: domain,
+        },
+    )?;
     batch.release_local_execution(job)?;
     Ok(Some(((), MarkerSubjects::addressed(RecordRef::Job(job)))))
 }
@@ -1109,6 +1143,14 @@ pub(crate) fn create_agent(batch: &mut Batch, agent: NewAgent) -> OpResult<Agent
 /// restart is not such an observation. The unknown outcome stays as it is.
 /// The stop is local: it says nothing of an effect a tool call had outside
 /// OCG, and leaves the Job's tool evidence as it is.
+///
+/// A quarantined execution is refused. Its trusted path belonged to an
+/// opening that is gone, so nothing alive can observe the termination of the
+/// external work it left behind, and this call could only be an assertion
+/// rather than the observation that release requires. The quarantine is
+/// therefore left in place, and its capacity with it. No administrative path
+/// exists to assert the stop instead: there is no trustworthy evidence to
+/// record, so the conservative unresolved state is retained.
 pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId) -> OpResult<()> {
     let now = batch.now();
     let mut row = batch.require_job(job)?;
@@ -1118,9 +1160,13 @@ pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId) -> OpResult<()>
     if row.stop_confirmed_at.is_some() {
         return batch.reject(Violation::StopAlreadyConfirmed(job));
     }
+    if batch.unresolved_execution(job)?.is_some() {
+        return batch.reject(Violation::StopUnresolved(job));
+    }
     row.stop_confirmed_at = Some(now);
     row.updated_at = now;
     batch.put_job(&row)?;
+    batch.release_quarantine(job)?;
     batch.release_local_execution(job)?;
     Ok(((), MarkerSubjects::addressed(RecordRef::Job(job))))
 }

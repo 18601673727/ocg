@@ -160,8 +160,24 @@ pub(super) const AVAILABILITY_BY_SCOPE: ScopeIndex =
 /// Job -> the epoch of the opening whose own runtime started it. Written
 /// with the start and removed when the Job settles: with a confirmed outcome,
 /// or with a confirmed stop after an unknown one. An entry of an earlier
-/// opening is work that no running process can still execute or settle.
+/// opening is work that no running process in this opening can still execute
+/// or settle, but its external work is not thereby known to have stopped; see
+/// [`UNRESOLVED_EXECUTIONS`].
 pub(super) const LOCAL_EXECUTIONS: Link = TableDefinition::new("local_execution");
+/// Job -> why the external execution it started is unresolved, and the
+/// capacity its unresolved work may still occupy. Written by the opening that
+/// found the Job abandoned, and removed only by a stop confirmation backed by
+/// evidence of termination. It is authority, not a projection: nothing rebuilds
+/// it, and losing an entry would silently reallocate capacity whose prior
+/// occupant was never credibly shown to have stopped.
+///
+/// It exists because the death of an OCG supervisor is not the termination of
+/// its descendants. [`LOCAL_EXECUTIONS`] naming a dead epoch proves only that
+/// no opening can still *drive* the Job; it says nothing about processes that
+/// epoch left running. An entry here keeps that distinction durable, so an
+/// unknown outcome and an unconfirmed physical stop stay distinguishable across
+/// any number of restarts.
+pub(super) const UNRESOLVED_EXECUTIONS: Records = TableDefinition::new("unresolved_execution");
 /// (epoch, seq) -> operation marker.
 pub(super) const OPERATIONS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("operation");
 /// (job, request) -> its request sample as materialized. Rebuildable from

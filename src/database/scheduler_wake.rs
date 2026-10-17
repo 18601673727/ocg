@@ -86,7 +86,7 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::BeginCoreLogCleanup
         | OperationKind::FinalizeJob
         | OperationKind::ConfirmJobStopped
-        | OperationKind::ReconcileAbandonedJob
+        | OperationKind::QuarantineAbandonedJob
         | OperationKind::CreateExecutor
         // Configurations are frozen for submitted Jobs. These low-frequency
         // writes conservatively dirty the configuration available to admission.
@@ -118,12 +118,15 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
     match kind {
         OperationKind::FinalizeJob
         | OperationKind::ConfirmJobStopped
-        | OperationKind::ReconcileAbandonedJob
         | OperationKind::CreateExecutionPool
         | OperationKind::SetExecutionPoolEnabled
         | OperationKind::SetExecutionPoolProfile
         | OperationKind::UpdateProfile => true,
-        OperationKind::ClaimExecution
+        // Quarantining retains the abandoned Job's occupancy rather than
+        // freeing it, so no slot is released and a capacity scan on the other
+        // side would only be told to re-read what it already knows.
+        OperationKind::QuarantineAbandonedJob
+        | OperationKind::ClaimExecution
         | OperationKind::SaveJobInput
         | OperationKind::CreateJobWithInput
         | OperationKind::RetryJob

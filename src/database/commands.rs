@@ -283,7 +283,7 @@ impl Command {
                 let outcome = storage::run_batch_declinable(
                     database,
                     operation,
-                    Kind::ReconcileAbandonedJob,
+                    Kind::QuarantineAbandonedJob,
                     commit,
                     |batch| batch.reconcile_unexecuted_claim(job, claim),
                 );
@@ -295,7 +295,7 @@ impl Command {
                 settle(
                     operation,
                     commit,
-                    Kind::ReconcileAbandonedJob,
+                    Kind::QuarantineAbandonedJob,
                     reply,
                     outcome,
                     declined,

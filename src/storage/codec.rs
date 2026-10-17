@@ -26,6 +26,7 @@ pub(super) const TAG_ATTACHMENT: u8 = 21;
 pub(super) const TAG_SUBMISSION: u8 = 22;
 pub(super) const TAG_EXECUTION_POOL: u8 = 23;
 pub(super) const TAG_POOL_BINDING: u8 = 24;
+pub(super) const TAG_QUARANTINE: u8 = 25;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 
@@ -445,7 +446,7 @@ codes!(OperationKind {
     OperationKind::CreateProfile = 16, OperationKind::CreateAgent = 17, OperationKind::UpdateProfile = 19,
     OperationKind::ConfirmJobStopped = 20, OperationKind::RecordMetrics = 21, OperationKind::RecordAvailabilityStat = 22,
     OperationKind::ConsumeAvailability = 23, OperationKind::ConsumeTokenUsage = 24,
-    OperationKind::StartLocalJob = 25, OperationKind::ReconcileAbandonedJob = 26,
+    OperationKind::StartLocalJob = 25, OperationKind::QuarantineAbandonedJob = 26,
     OperationKind::RecordToolDecision = 27, OperationKind::RecordToolOutcome = 28,
     OperationKind::ReconcileToolEffect = 29, OperationKind::CreateAttachment = 30,
     OperationKind::CleanupAttachment = 31,

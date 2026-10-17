@@ -181,13 +181,14 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
-                let (abandoned_at_open, next_operation) = match settle_abandoned(&database, epoch) {
-                    Ok(settled) => settled,
-                    Err(error) => {
-                        ready_sender.send(Err(DatabaseError::Open(error))).ok();
-                        return Ok(());
-                    }
-                };
+                let (abandoned_at_open, next_operation) =
+                    match quarantine_abandoned(&database, epoch) {
+                        Ok(quarantined) => quarantined,
+                        Err(error) => {
+                            ready_sender.send(Err(DatabaseError::Open(error))).ok();
+                            return Ok(());
+                        }
+                    };
                 // Opened only once the database file is known to be of this
                 // format and locked by this process, so no other OCG process
                 // publishes into the directory while it is cleaned up.
@@ -399,22 +400,29 @@ pub(super) fn open_error(error: OpenError, directory: &std::path::Path) -> Datab
     }
 }
 
-/// Settles every Job that an earlier opening started as its own local
+/// Quarantines every Job that an earlier opening started as its own local
 /// execution and left unsettled, before this opening admits any command; see
-/// [`persistence::reconcile_abandoned_job`]. Only one opening of the file can
+/// [`persistence::quarantine_abandoned_job`]. Only one opening of the file can
 /// exist at a time, so when a worker starts, every earlier opening is closed
-/// and nothing it ran can still settle its Jobs. A reopen during recovery
-/// keeps its process's executions running and never comes here.
+/// and nothing in this process can still drive its Jobs. That is not the same
+/// as its external work having stopped, so the Jobs are quarantined rather
+/// than settled: their outcomes become unknown, their claims and occupancy are
+/// retained, and no stop is confirmed. A reopen during recovery keeps its
+/// process's executions running and never comes here.
 ///
-/// Each Job is settled in its own durable transaction, so a failure part-way
-/// leaves the rest claimed for the next start, and a settled Job is not
-/// touched again. Returns the settled Jobs and the next operation sequence
-/// number of this opening.
-pub(super) fn settle_abandoned(
+/// Each Job is quarantined in its own durable transaction, so a failure
+/// part-way leaves the rest claimed for the next start, and a quarantined Job
+/// is not touched again. A failure to reconstruct the quarantine refuses the
+/// open rather than admitting without it: there must be no window in which
+/// capacity is handed out before the protections over it are known.
+///
+/// Returns the quarantined Jobs and the next operation sequence number of this
+/// opening.
+pub(super) fn quarantine_abandoned(
     database: &Database,
     epoch: u64,
 ) -> Result<(Vec<JobId>, u64), StorageError> {
-    let mut settled = Vec::new();
+    let mut quarantined = Vec::new();
     let mut seq = 1;
     for (job, claimed) in storage::abandoned_local_executions(database, epoch)? {
         let operation = OperationId::new(epoch, seq);
@@ -422,16 +430,16 @@ pub(super) fn settle_abandoned(
         let outcome = storage::run_batch_declinable(
             database,
             operation,
-            OperationKind::ReconcileAbandonedJob,
+            OperationKind::QuarantineAbandonedJob,
             Commit::Durable,
-            |batch| persistence::reconcile_abandoned_job(batch, job, claimed),
+            |batch| persistence::quarantine_abandoned_job(batch, job, claimed),
         );
         match outcome.result {
-            Ok(Some(())) => settled.push(job),
+            Ok(Some(())) => quarantined.push(job),
             Ok(None) => {}
             Err(BatchFailure::Rejected(violation)) => {
                 return Err(StorageError::corrupted(format!(
-                    "{job}, abandoned by opening {claimed}, could not be settled: {violation}"
+                    "{job}, abandoned by opening {claimed}, could not be quarantined: {violation}"
                 )));
             }
             Err(BatchFailure::NotCommitted(error) | BatchFailure::OutcomeUnknown(error)) => {
@@ -439,7 +447,7 @@ pub(super) fn settle_abandoned(
             }
         }
     }
-    Ok((settled, seq))
+    Ok((quarantined, seq))
 }
 
 pub(super) fn join(thread: JoinHandle<Result<(), DatabaseError>>) -> Result<(), DatabaseError> {

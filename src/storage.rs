@@ -82,6 +82,7 @@ mod observations;
 mod open;
 mod pending;
 mod pools;
+mod quarantine;
 use crate::persistence::{
     Block, CapacityScope, ClaimGrant, ClaimRefusal, ClaimRequest, EvalContinuation, EvalPage,
     EvalRequest, FrozenPoolBinding, GLOBAL_EXECUTION_LIMIT, PendingCapturePage, PendingFence,
@@ -92,6 +93,7 @@ pub(crate) use execution_claim::{read_occupancy, read_pool_binding};
 pub(crate) use pending::{read_pending_capture_page, read_pending_keys, read_pending_snapshot};
 mod reads;
 pub(crate) use pools::{read_execution_pool, read_execution_pools};
+pub(crate) use quarantine::{UnresolvedExecution, read_unresolved_executions};
 mod rows;
 mod schema;
 mod sequences;

@@ -58,9 +58,11 @@ pub enum OperationKind {
     /// A start by this process's own runtime, which claims the Job's
     /// execution for the current opening of the database.
     StartLocalJob,
-    /// The settlement, when the database is opened, of a Job that an
-    /// earlier opening started locally and never settled.
-    ReconcileAbandonedJob,
+    /// The quarantine, when the database is opened, of a Job that an earlier
+    /// opening started locally, never settled, and left with external work
+    /// whose termination nothing established. The Job takes an unknown outcome
+    /// and keeps its claims; no stop is confirmed and no capacity released.
+    QuarantineAbandonedJob,
     /// OCG's refusal or admission of a tool call a Provider requested.
     RecordToolDecision,
     /// What is known of an admitted tool call's execution.
@@ -168,6 +170,10 @@ pub enum Violation {
     StopNeedsUnknownOutcome(JobId),
     #[error("the execution of {0} was already confirmed stopped")]
     StopAlreadyConfirmed(JobId),
+    #[error(
+        "the external work of {0} was left unresolved by an OCG restart and holds quarantined capacity; nothing alive can confirm that it stopped"
+    )]
+    StopUnresolved(JobId),
     #[error("{0} was submitted without an LLM configuration")]
     NotAnLlmExecution(JobId),
     /// Every Token annotation of one Provider request states the same

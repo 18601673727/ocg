@@ -275,6 +275,7 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     }
     tx.open_table(ASSIGNED_POOL)?;
     tx.open_table(OCCUPANCY)?;
+    tx.open_table(UNRESOLVED_EXECUTIONS)?;
     tx.open_table(COMPATIBLE_POOLS)?;
     tx.open_table(AVAILABILITY_SAMPLES)?;
     tx.open_table(AVAILABILITY_MINUTES)?;
