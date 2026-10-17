@@ -74,6 +74,18 @@ enum SweepTrigger {
     Reconcile,
 }
 
+/// What the credit gate decided (SCH-15). Only `Stop` ends the loop: storage
+/// protection is a recoverable pause the loop waits out and then recovers from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateOutcome {
+    /// The bucket holds the threshold of this, possibly strengthened, trigger.
+    Go(SweepTrigger),
+    /// Storage protection is active: abandon the start and issue nothing.
+    Protected,
+    /// Shutdown, or the worker's wake or protection channel closed.
+    Stop,
+}
+
 /// Amendment 1 §C.3: refill-then-debit on every counted request, capped above,
 /// never reset by wakes. Only time passage refills; wakes only lower the
 /// threshold by strengthening the trigger.
@@ -902,6 +914,9 @@ impl Scheduler {
     /// one restart sweep and a quiet domain settles after one pass. The
     /// caller's own claims never set this off: they advance neither counter.
     /// Returns the settled outcome, or `None` when the loop itself must stop.
+    /// Protection that holds or arrives at a restart's gate (SCH-15) ends the
+    /// drain as an abandoned sweep, which the caller already turns into a
+    /// wait for the lift and a Recovery sweep.
     async fn drain_restarts(&mut self, mut completed: SweepCompleted) -> Option<SweepOutcome> {
         loop {
             if !completed.restart_wanted {
@@ -919,8 +934,21 @@ impl Scheduler {
                 } else {
                     return Some(SweepOutcome::Completed(completed));
                 };
-            self.gate(trigger, completed.cap_deferred, completed.c0)
-                .await?;
+            match self
+                .gate(trigger, completed.cap_deferred, completed.c0)
+                .await
+            {
+                GateOutcome::Go(_) => {}
+                GateOutcome::Protected => {
+                    return Some(SweepOutcome::Abandoned(SweepAbandoned {
+                        reason: SweepAbandonedReason::ProtectionActive,
+                        ledger: completed.ledger,
+                        grants_so_far: completed.grants,
+                        earliest_due_so_far: completed.earliest_due,
+                    }));
+                }
+                GateOutcome::Stop => return None,
+            }
             match self.sweep_once().await {
                 SweepOutcome::Completed(next) => completed = next,
                 SweepOutcome::Abandoned(abandoned) => {
@@ -1004,21 +1032,26 @@ impl Scheduler {
     /// `cap_deferred`/`c0` name the last settled sweep, so a wake upgrades a
     /// Dirty/Reconcile wait to Capacity only on a genuine capacity release
     /// (SCH-3). A closed wake or protection channel means the worker is gone
-    /// and stops the loop (SCH-5).
+    /// and stops the loop (SCH-5). Storage protection, held on entry or
+    /// arriving during the wait, abandons the start as `Protected` (SCH-15):
+    /// the caller waits for the lift and runs a Recovery sweep.
     async fn gate(
         &mut self,
         mut trigger: SweepTrigger,
         cap_deferred: bool,
         c0: u64,
-    ) -> Option<SweepTrigger> {
+    ) -> GateOutcome {
         loop {
             if self.shutdown.is_cancelled() {
-                return None;
+                return GateOutcome::Stop;
+            }
+            if self.protection.status().lock.is_some() {
+                return GateOutcome::Protected;
             }
             let now = std::time::Instant::now();
             self.credit.refill(now);
             if self.credit.balance_micros >= credit_threshold(trigger) {
-                return Some(trigger);
+                return GateOutcome::Go(trigger);
             }
             let deficit = credit_threshold(trigger) - self.credit.balance_micros;
             let wait = Duration::from_micros(((deficit as f64 / RHO) as u64).max(1));
@@ -1049,16 +1082,13 @@ impl Scheduler {
                 )) => GateWake::CreditReady,
             };
             match wake {
-                GateWake::Shutdown => return None,
+                GateWake::Shutdown => return GateOutcome::Stop,
                 GateWake::CreditReady => {}
                 GateWake::Permit(permit) => {
                     // SCH-5: a closed wake means the worker is gone; stop
                     // instead of waiting out the credit deficit.
                     if permit.is_err() {
-                        return None;
-                    }
-                    if self.protection.status().lock.is_some() {
-                        return None;
+                        return GateOutcome::Stop;
                     }
                     // SCH-3: a publication while gate-waiting strengthens the
                     // trigger only when it qualifies as Capacity: a release
@@ -1075,9 +1105,10 @@ impl Scheduler {
                 GateWake::Protection(protection) => {
                     // SCH-5: a closed watcher means the worker is gone; stop.
                     // SCH-3: a protection event never upgrades the trigger.
-                    protection.as_ref()?;
-                    if self.protection.status().lock.is_some() {
-                        return None;
+                    // SCH-15: an active lock is reported as `Protected` by the
+                    // check at the top of the loop, not as a stop.
+                    if protection.is_none() {
+                        return GateOutcome::Stop;
                     }
                 }
             }
@@ -1160,12 +1191,16 @@ impl Scheduler {
                         }
                         need_recovery = false;
                         was_protected = false;
-                        if self
+                        match self
                             .gate(SweepTrigger::Recovery, last_cap_deferred, last_c0)
                             .await
-                            .is_none()
                         {
-                            return;
+                            GateOutcome::Go(_) => {}
+                            GateOutcome::Protected => {
+                                need_recovery = true;
+                                continue;
+                            }
+                            GateOutcome::Stop => return,
                         }
                         match self.sweep_once().await {
                             SweepOutcome::Completed(settled) => {
@@ -1212,12 +1247,16 @@ impl Scheduler {
             }
             if first {
                 first = false;
-                if self
+                match self
                     .gate(SweepTrigger::Startup, last_cap_deferred, last_c0)
                     .await
-                    .is_none()
                 {
-                    return;
+                    GateOutcome::Go(_) => {}
+                    GateOutcome::Protected => {
+                        need_recovery = true;
+                        continue;
+                    }
+                    GateOutcome::Stop => return,
                 }
                 // SCH-2: consume the finished sweep's restart comparison
                 // before idling, so a commit that landed during the sweep is
@@ -1326,40 +1365,24 @@ impl Scheduler {
                     let cap = self.wake.capacity_generation();
                     let was_lift = was_protected && !self.protection.status().lock.is_some();
                     was_protected = self.protection.status().lock.is_some();
-                    if was_lift {
-                        if self
-                            .gate(SweepTrigger::Recovery, last_cap_deferred, last_c0)
-                            .await
-                            .is_none()
-                        {
-                            return;
-                        }
+                    let trigger = if was_lift {
+                        SweepTrigger::Recovery
                     } else if dirty != last_d0 && last_cap_deferred && cap != last_c0 {
-                        if self
-                            .gate(SweepTrigger::Capacity, last_cap_deferred, last_c0)
-                            .await
-                            .is_none()
-                        {
-                            return;
-                        }
+                        SweepTrigger::Capacity
                     } else if dirty != last_d0 {
-                        if self
-                            .gate(SweepTrigger::Dirty, last_cap_deferred, last_c0)
-                            .await
-                            .is_none()
-                        {
-                            return;
-                        }
+                        SweepTrigger::Dirty
                     } else if last_cap_deferred && cap != last_c0 {
-                        if self
-                            .gate(SweepTrigger::Capacity, last_cap_deferred, last_c0)
-                            .await
-                            .is_none()
-                        {
-                            return;
-                        }
+                        SweepTrigger::Capacity
                     } else {
                         continue;
+                    };
+                    match self.gate(trigger, last_cap_deferred, last_c0).await {
+                        GateOutcome::Go(_) => {}
+                        GateOutcome::Protected => {
+                            need_recovery = true;
+                            continue;
+                        }
+                        GateOutcome::Stop => return,
                     }
                 }
                 IdleWake::Due => {
@@ -1367,24 +1390,32 @@ impl Scheduler {
                     if self.protection.status().lock.is_some() {
                         continue;
                     }
-                    if self
+                    match self
                         .gate(SweepTrigger::Due, last_cap_deferred, last_c0)
                         .await
-                        .is_none()
                     {
-                        return;
+                        GateOutcome::Go(_) => {}
+                        GateOutcome::Protected => {
+                            need_recovery = true;
+                            continue;
+                        }
+                        GateOutcome::Stop => return,
                     }
                 }
                 IdleWake::Reconcile => {
                     if self.protection.status().lock.is_some() {
                         continue;
                     }
-                    if self
+                    match self
                         .gate(SweepTrigger::Reconcile, last_cap_deferred, last_c0)
                         .await
-                        .is_none()
                     {
-                        return;
+                        GateOutcome::Go(_) => {}
+                        GateOutcome::Protected => {
+                            need_recovery = true;
+                            continue;
+                        }
+                        GateOutcome::Stop => return,
                     }
                 }
             }
@@ -2996,7 +3027,7 @@ mod tests {
             .block_on(async move { scheduler.gate(SweepTrigger::Dirty, false, c0).await });
         let elapsed = started.elapsed();
         helper.join().unwrap();
-        assert_eq!(trigger, Some(SweepTrigger::Dirty));
+        assert_eq!(trigger, GateOutcome::Go(SweepTrigger::Dirty));
         assert!(
             elapsed >= Duration::from_millis(700),
             "a dirty-only wake bypassed the Dirty threshold after {elapsed:?}"
@@ -3039,7 +3070,7 @@ mod tests {
             .block_on(async move { scheduler.gate(SweepTrigger::Dirty, true, c0).await });
         let elapsed = started.elapsed();
         helper.join().unwrap();
-        assert_eq!(trigger, Some(SweepTrigger::Capacity));
+        assert_eq!(trigger, GateOutcome::Go(SweepTrigger::Capacity));
         assert!(
             elapsed < Duration::from_millis(900),
             "a genuine capacity release did not strengthen the gate: {elapsed:?}"
@@ -3231,6 +3262,87 @@ mod tests {
         }
         assert_eq!(protected_scheduler.credit_balance(), protected_before);
         protected_worker.shutdown().unwrap();
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn protection_during_a_credit_gate_wait_pauses_the_loop_until_recovery() {
+        // SCH-15: disk protection that arrives while the loop waits out a
+        // credit deficit is a pause, not an end. The loop must stay alive,
+        // claim nothing while protected, and run its unconditional Recovery
+        // sweep after the lift instead of waiting out the old deficit.
+        use crate::disk_protection::{ProtectedArea, ProtectionReason, SpaceShortage};
+        let (_root, directory) = data_directory("ocg-stage-b-scheduler", "sch15-gate-protection");
+        let mut worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let (_pool, llm) = provision(&database);
+        let shutdown = CancellationToken::default();
+        let mut scheduler = Scheduler::new(
+            database.clone(),
+            worker.take_scheduler_wake().unwrap(),
+            shutdown.clone(),
+            limits(16, 100),
+        );
+        // A 2 s debt gates a Dirty start for about 3.7 s at RHO 0.5, far
+        // longer than the whole schedule below.
+        scheduler.credit.balance_micros = -2_000_000;
+        scheduler.credit.refilled_at = std::time::Instant::now();
+        let join = std::thread::spawn(move || {
+            ntex::rt::System::new("sch15-loop", ntex::rt::DefaultRuntime).block_on(async move {
+                scheduler.run().await;
+                scheduler.seq
+            })
+        });
+        // Let the startup sweep finish, then admit a Ready Job: its dirty
+        // wake puts the loop into the Dirty credit wait.
+        std::thread::sleep(Duration::from_millis(300));
+        let job = pending_ready(&database, llm);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            wait(database.occupancy()).unwrap().is_empty(),
+            "the credit gate must still be holding the claim back"
+        );
+        let path = directory.database_path().to_path_buf();
+        assert!(
+            database.activate_filesystem_protection(ProtectionReason::InsufficientSpace(
+                SpaceShortage {
+                    area: ProtectedArea::Database,
+                    path,
+                    available_bytes: 0,
+                    expected_write_bytes: 0,
+                    threshold_bytes: 1,
+                }
+            ))
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !join.is_finished(),
+            "protection during a credit-gate wait ended the loop for good"
+        );
+        assert!(
+            wait(database.occupancy()).unwrap().is_empty(),
+            "nothing is claimed while protected"
+        );
+        wait(database.recover_storage()).unwrap();
+        // Recovery is unconditional: the claim must not wait for the 3 s that
+        // remain of the Dirty deficit.
+        let lifted = std::time::Instant::now();
+        let deadline = lifted + Duration::from_millis(1_500);
+        loop {
+            let occupancy = wait(database.occupancy()).unwrap();
+            if let Some((_, claimed)) = occupancy.first() {
+                assert_eq!(*claimed, job);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the loop never claimed the Ready Job after protection lifted"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        shutdown.cancel();
+        let seq = join.join().unwrap();
+        assert!(seq >= 2, "startup plus the recovery sweep, got {seq}");
         worker.shutdown().unwrap();
     }
 }
