@@ -507,12 +507,12 @@ fn rebuild_matches_maintained_indexes_and_does_not_use_local_claim_epoch() {
 }
 
 #[test]
-fn unexecuted_committed_claim_reconciliation_checks_marker_and_stops_without_spawn() {
+fn unexecuted_committed_claim_reconciliation_checks_marker_and_quarantines_without_spawn() {
     let fixture = Fixture::new("unexecuted", 16);
     let job = fixture.job(fixture.genesis, Vec::new());
     let (_, operation) = fixture.claim(job, BTreeSet::from([fixture.pool]));
     assert!(matches!(
-        fixture.write(OperationKind::ReconcileAbandonedJob, |batch| {
+        fixture.write(OperationKind::QuarantineAbandonedJob, |batch| {
             batch
                 .reconcile_unexecuted_claim(fixture.genesis, operation)
                 .map(|value| value.unwrap())
@@ -520,16 +520,234 @@ fn unexecuted_committed_claim_reconciliation_checks_marker_and_stops_without_spa
         Err(BatchFailure::Rejected(_))
     ));
     fixture
-        .write(OperationKind::ReconcileAbandonedJob, |batch| {
+        .write(OperationKind::QuarantineAbandonedJob, |batch| {
             batch
                 .reconcile_unexecuted_claim(job, operation)
                 .map(|value| value.unwrap())
         })
         .unwrap();
-    assert!(read_occupancy(&fixture.database).unwrap().is_empty());
+    // The commit is what it says: the Job started in an opening that is gone,
+    // its outcome is unknown, and its stop is not confirmed because nothing
+    // established that the external work it began has ended.
+    assert_eq!(
+        read_occupancy(&fixture.database).unwrap(),
+        vec![(fixture.pool, job)],
+        "the slot stays occupied and its capacity is quarantined"
+    );
+    let quarantined = read_unresolved_executions(&fixture.database).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].0, job);
+    assert_eq!(quarantined[0].1.pool, Some(fixture.pool));
     let row = read_job(&fixture.database, job).unwrap().unwrap();
-    assert!(row.unknown_at.is_some() && row.stop_confirmed_at.is_some());
+    assert!(row.unknown_at.is_some() && row.stop_confirmed_at.is_none());
     assert!(read_pool_binding(&fixture.database, job).unwrap().is_some());
+    // The quarantine is what a later opening reads, and it is the only thing
+    // that refuses the release: no stop can be confirmed for it.
+    assert!(matches!(
+        fixture.write(OperationKind::ConfirmJobStopped, |batch| {
+            persistence::confirm_job_stopped(batch, job)
+        }),
+        Err(BatchFailure::Rejected(Violation::StopUnresolved(released)))
+            if released == job
+    ));
+    // Reconciling the same claim again changes nothing: the quarantine is
+    // written once, so a repeated restart cannot weaken it.
+    assert_eq!(
+        run_batch_declinable(
+            &fixture.database,
+            fixture.operation(),
+            OperationKind::QuarantineAbandonedJob,
+            Commit::Durable,
+            |batch| batch.reconcile_unexecuted_claim(job, operation),
+        )
+        .result
+        .unwrap(),
+        None
+    );
+}
+
+/// Writes a quarantine record straight into the table, so a durable state that
+/// no correct writer could produce can be reconstructed from.
+fn forge_quarantine(fixture: &Fixture, job: JobId, record: UnresolvedExecution) {
+    fixture
+        .write(OperationKind::QuarantineAbandonedJob, |batch| {
+            batch.step(|tx| {
+                tx.open_table(UNRESOLVED_EXECUTIONS)?
+                    .insert(job.get(), record.encode().as_slice())?;
+                Ok(())
+            })?;
+            Ok(((), MarkerSubjects::addressed(RecordRef::Job(job))))
+        })
+        .unwrap();
+}
+
+fn quarantine_record(epoch: u64, pool: Option<ExecutionPoolId>) -> UnresolvedExecution {
+    UnresolvedExecution {
+        epoch,
+        unresolved_at: Timestamp::now(),
+        pool,
+    }
+}
+
+/// Closes `fixture` and reopens the same file, which is where a quarantine
+/// that cannot be reconciled with the capacity it claims must be refused.
+fn reopen_refused(fixture: Fixture, name: &str, expected: &str) {
+    let Fixture {
+        database,
+        root,
+        path,
+        ..
+    } = fixture;
+    drop(database);
+    let detail = match open(&path).err().expect("the open must fail closed") {
+        OpenError::Storage(StorageError { detail, .. }) => detail,
+        _ => panic!("{name}: a storage failure, not a format verdict"),
+    };
+    assert!(detail.contains(expected), "{name}: {detail}");
+    drop(root);
+}
+
+/// A quarantine that cannot be reconciled with the capacity it claims to
+/// protect refuses the open, rather than letting admission run on a protection
+/// that was never confirmed.
+#[test]
+fn a_quarantine_that_cannot_be_reconstructed_refuses_to_open() {
+    // (a) A domain no frozen binding establishes: the record would quarantine
+    // a Pool the Job never held, while the occupancy it should be protecting
+    // is charged to a different one.
+    let mismatch = Fixture::new("quarantine-mismatch", 16);
+    let claimed = mismatch.job(mismatch.genesis, Vec::new());
+    let _ = mismatch.claim(claimed, BTreeSet::from([mismatch.pool]));
+    let elsewhere = ExecutionPoolId::new(mismatch.pool.get() + 1_000);
+    forge_quarantine(&mismatch, claimed, quarantine_record(1, Some(elsewhere)));
+    reopen_refused(mismatch, "quarantine-mismatch", "bound to");
+
+    // (b) An entry beside a confirmed stop: capacity that has already been
+    // handed back must not also be claimed as still held.
+    let confirmed = Fixture::new("quarantine-confirmed", 16);
+    let job = confirmed.job(confirmed.genesis, Vec::new());
+    let _ = confirmed.claim(job, BTreeSet::from([confirmed.pool]));
+    confirmed
+        .write(OperationKind::FinalizeJob, |batch| {
+            let now = batch.now();
+            let mut row = batch.require_job(job)?;
+            row.unknown_at = Some(now);
+            row.stop_confirmed_at = Some(now);
+            row.updated_at = now;
+            batch.put_job(&row)?;
+            Ok(((), MarkerSubjects::addressed(RecordRef::Job(job))))
+        })
+        .unwrap();
+    forge_quarantine(&confirmed, job, quarantine_record(1, Some(confirmed.pool)));
+    reopen_refused(confirmed, "quarantine-confirmed", "confirmed stopped");
+
+    // (c) A Job that does not exist.
+    let ghost = Fixture::new("quarantine-missing", 16);
+    let missing = JobId::new(9_999);
+    forge_quarantine(&ghost, missing, quarantine_record(1, None));
+    reopen_refused(ghost, "quarantine-missing", "missing Job");
+
+    // (d) A Job that already holds a Pool's occupancy but is quarantined with
+    // no domain: the same occupied resource counted twice, which would hide a
+    // slot behind a claim that names none.
+    let twice = Fixture::new("quarantine-twice", 16);
+    let claimed = twice.job(twice.genesis, Vec::new());
+    let _ = twice.claim(claimed, BTreeSet::from([twice.pool]));
+    forge_quarantine(&twice, claimed, quarantine_record(1, None));
+    reopen_refused(twice, "quarantine-twice", "no quarantined domain");
+
+    // A quarantine that reconstructs cleanly still opens, so the refusals
+    // above are about the disagreement and not about the table existing.
+    let sound = Fixture::new("quarantine-sound", 16);
+    let claimed = sound.job(sound.genesis, Vec::new());
+    let _ = sound.claim(claimed, BTreeSet::from([sound.pool]));
+    forge_quarantine(&sound, claimed, quarantine_record(1, Some(sound.pool)));
+    let Fixture {
+        database,
+        root,
+        path,
+        ..
+    } = sound;
+    drop(database);
+    assert!(open(&path).is_ok(), "an agreeing quarantine opens");
+    drop(root);
+}
+
+/// A quarantined execution is released by no assertion, only by evidence, and
+/// a confirmed release is idempotent and touches nothing else.
+#[test]
+fn a_confirmed_stop_releases_once_and_a_quarantined_one_is_never_released() {
+    let fixture = Fixture::new("release", 16);
+    let live = fixture.job(fixture.genesis, Vec::new());
+    let quarantined = fixture.job(fixture.genesis, Vec::new());
+    let _ = fixture.claim(live, BTreeSet::from([fixture.pool]));
+    let _ = fixture.claim(quarantined, BTreeSet::from([fixture.pool]));
+    // Both Jobs are finalized unknown by the trusted path that ran them, so
+    // neither is abandoned: one may confirm its stop, and one may not.
+    for job in [live, quarantined] {
+        fixture
+            .write(OperationKind::FinalizeJob, |batch| {
+                persistence::finalize_job(batch, job, JobFinalization::Unknown)
+            })
+            .unwrap();
+    }
+    // The second is then made abandoned, as a restart would find it.
+    fixture
+        .write(OperationKind::QuarantineAbandonedJob, |batch| {
+            batch.step(|tx| {
+                tx.open_table(LOCAL_EXECUTIONS)?
+                    .insert(quarantined.get(), fixture.epoch)?;
+                Ok(())
+            })?;
+            persistence::quarantine_abandoned_job(batch, quarantined, fixture.epoch)
+                .map(|value| value.unwrap())
+        })
+        .unwrap();
+
+    assert_eq!(
+        read_occupancy(&fixture.database).unwrap(),
+        vec![(fixture.pool, live), (fixture.pool, quarantined)]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "an unknown outcome holds its occupancy until its stop is confirmed"
+    );
+
+    // The quarantined one is refused, however many times it is asked.
+    for _ in 0..2 {
+        assert!(matches!(
+            fixture.write(OperationKind::ConfirmJobStopped, |batch| {
+                persistence::confirm_job_stopped(batch, quarantined)
+            }),
+            Err(BatchFailure::Rejected(Violation::StopUnresolved(job)))
+                if job == quarantined
+        ));
+    }
+    assert!(
+        read_unresolved_executions(&fixture.database)
+            .unwrap()
+            .iter()
+            .any(|(job, _)| *job == quarantined)
+    );
+
+    // The live one confirms once and releases exactly its own occupancy.
+    fixture
+        .write(OperationKind::ConfirmJobStopped, |batch| {
+            persistence::confirm_job_stopped(batch, live)
+        })
+        .unwrap();
+    let once = read_occupancy(&fixture.database).unwrap();
+    assert_eq!(once, vec![(fixture.pool, quarantined)]);
+    // Confirming again is refused as already confirmed rather than freeing
+    // anything a second time.
+    assert!(matches!(
+        fixture.write(OperationKind::ConfirmJobStopped, |batch| {
+            persistence::confirm_job_stopped(batch, live)
+        }),
+        Err(BatchFailure::Rejected(Violation::StopAlreadyConfirmed(job))) if job == live
+    ));
+    assert_eq!(read_occupancy(&fixture.database).unwrap(), once);
 }
 
 #[test]

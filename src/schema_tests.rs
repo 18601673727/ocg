@@ -11040,7 +11040,7 @@ mod lifecycle_closure {
         wait(handle.operation_markers(None, 1_000))
             .expect("read markers")
             .into_iter()
-            .filter(|marker| marker.kind == OperationKind::ReconcileAbandonedJob)
+            .filter(|marker| marker.kind == OperationKind::QuarantineAbandonedJob)
             .collect()
     }
 
@@ -11223,7 +11223,7 @@ mod lifecycle_closure {
     }
 
     #[test]
-    fn work_abandoned_by_a_closed_opening_is_settled_unknown_and_stopped_exactly_once() {
+    fn work_abandoned_by_a_closed_opening_is_quarantined_unknown_and_unstopped_exactly_once() {
         let (_root, directory) = data_directory("abandoned");
         let worker = DatabaseWorker::start(&directory).expect("start database");
         let handle = worker.handle();
@@ -11268,7 +11268,10 @@ mod lifecycle_closure {
         abandoned.sort();
         assert_eq!(abandoned, [child, unconfirmed]);
         let child_record = record(&handle, child);
-        assert!(child_record.unknown_at.is_some() && child_record.stop_confirmed_at.is_some());
+        // The opening that started it is closed, which makes its outcome
+        // unknown. Its stop is a separate question, and nothing answered it:
+        // the supervisor's death is not its descendants' termination.
+        assert!(child_record.unknown_at.is_some() && child_record.stop_confirmed_at.is_none());
         assert_eq!(
             (
                 child_record.completed_at,
@@ -11289,7 +11292,7 @@ mod lifecycle_closure {
             unconfirmed_record.unknown_at, unknown_at,
             "the recorded outcome is kept"
         );
-        assert!(unconfirmed_record.stop_confirmed_at.is_some());
+        assert!(unconfirmed_record.stop_confirmed_at.is_none());
         assert_eq!(record(&handle, finished), finished_before);
         let external_record = record(&handle, external);
         assert!(
@@ -11298,11 +11301,21 @@ mod lifecycle_closure {
                 && external_record.stop_confirmed_at.is_none()
         );
         for profile in [agent, targeted] {
-            assert_eq!(blocking(&handle, profile), [external]);
+            let mut blocked = blocking(&handle, profile);
+            blocked.sort();
+            // The quarantined Jobs keep holding the Profiles they were
+            // submitted with: their claims outlive the opening that took them.
+            assert_eq!(blocked, [child, unconfirmed, external]);
         }
-        // The abandoned child is settled, so it no longer holds its parent open.
-        wait(handle.finalize_job(parent, JobFinalization::Completed(result("done"))))
-            .expect("the parent closes once its child is settled");
+        // The abandoned child's external work is not known to have stopped, so
+        // its subtree is not settled and the parent stays open. Settling it
+        // would be exactly the unproven release this contract forbids.
+        assert_eq!(
+            violation(wait(
+                handle.finalize_job(parent, JobFinalization::Completed(result("done")))
+            )),
+            Violation::UnfinishedChild(parent),
+        );
         let markers = reconciliations(&handle);
         assert_eq!(markers.len(), 2);
         assert!(
@@ -11311,15 +11324,30 @@ mod lifecycle_closure {
                 .all(|marker| marker.operation.epoch() == handle.epoch())
         );
         let child_after = record(&handle, child);
+        let quarantined = wait(handle.unresolved_executions()).expect("read quarantine");
+        let mut quarantined_jobs: Vec<JobId> = quarantined.iter().map(|(job, _)| *job).collect();
+        quarantined_jobs.sort();
+        assert_eq!(quarantined_jobs, [child, unconfirmed]);
+        assert!(
+            quarantined.iter().all(|(_, record)| record.pool.is_none()),
+            "neither Job was Pool-claimed, so only the global domain is charged"
+        );
         worker.shutdown().expect("shutdown");
 
         let worker = DatabaseWorker::start(&directory).expect("restart again");
         let handle = worker.handle();
         assert!(
             handle.abandoned_at_open().is_empty(),
-            "settled work is not settled twice"
+            "quarantined work is not quarantined twice"
         );
         assert_eq!(record(&handle, child), child_after);
+        assert_eq!(
+            wait(handle.unresolved_executions())
+                .expect("read quarantine")
+                .len(),
+            2,
+            "the protection survives a further restart unchanged"
+        );
         assert_eq!(reconciliations(&handle).len(), 2);
         worker.shutdown().expect("shutdown");
         assert_relationships_consistent(&directory);
@@ -11361,7 +11389,7 @@ mod lifecycle_closure {
     }
 
     #[test]
-    fn an_abandoned_aggregation_service_job_is_settled_by_the_next_start() {
+    fn an_abandoned_aggregation_service_job_is_quarantined_by_the_next_start() {
         let (_root, directory) = data_directory("abandoned-service");
         let worker = DatabaseWorker::start(&directory).expect("start database");
         let handle = worker.handle();
@@ -11384,7 +11412,10 @@ mod lifecycle_closure {
         let handle = worker.handle();
         assert_eq!(handle.abandoned_at_open(), [job]);
         let job_record = record(&handle, job);
-        assert!(job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_some());
+        // Unknown, because the opening that started it is gone. Not confirmed
+        // stopped, because that opening's death says nothing about the external
+        // work it may have left running.
+        assert!(job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_none());
         assert!(job_record.completed_at.is_none() && job_record.failed_at.is_none());
 
         // A service that ends normally leaves nothing to settle.
@@ -11707,7 +11738,7 @@ mod lifecycle_closure {
             "the claim committed with the Job"
         );
         let job_record = record(&handle, job);
-        assert!(job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_some());
+        assert!(job_record.unknown_at.is_some() && job_record.stop_confirmed_at.is_none());
         assert_eq!(
             (
                 job_record.completed_at,
@@ -11717,17 +11748,30 @@ mod lifecycle_closure {
             (None, None, None)
         );
         for profile in [agent, targeted] {
-            assert!(
-                blocking(&handle, profile).is_empty(),
-                "the Profiles are released"
+            assert_eq!(
+                blocking(&handle, profile),
+                [job],
+                "the Profiles are still held by work whose stop is unconfirmed"
             );
         }
-        wait(handle.finalize_job(parent, JobFinalization::Completed(result("done"))))
-            .expect("the parent settles once its settled child no longer holds it");
+        assert_eq!(
+            violation(wait(
+                handle.finalize_job(parent, JobFinalization::Completed(result("done")))
+            )),
+            Violation::UnfinishedChild(parent),
+            "the parent stays open while its child's execution may still run"
+        );
         worker.shutdown().expect("shutdown");
 
         let worker = DatabaseWorker::start(&directory).expect("restart again");
         assert!(worker.handle().abandoned_at_open().is_empty());
+        assert_eq!(
+            wait(worker.handle().unresolved_executions())
+                .expect("read quarantine")
+                .len(),
+            1,
+            "the quarantine is not rebuilt on a further restart, nor lost"
+        );
         worker.shutdown().expect("shutdown");
         assert_relationships_consistent(&directory);
     }
@@ -15639,8 +15683,11 @@ mod requests_and_tool_loop {
             let handle = worker.handle();
             assert_eq!(handle.abandoned_at_open(), [run.job]);
             let job = job_record(&handle, run.job);
-            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
-            assert!(blocking(&handle, llm).is_empty());
+            // The opening is gone, so the outcome is unknown. Whether the work
+            // it admitted has stopped was never established, so the stop stays
+            // unconfirmed and the Profiles it still holds are not released.
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_none());
+            assert_eq!(blocking(&handle, llm), [run.job]);
             let records = evidence(&handle, run.job);
             if unknown {
                 assert!(
@@ -15716,12 +15763,13 @@ mod requests_and_tool_loop {
             assert_eq!(handle.abandoned_at_open(), [run.job], "{case}");
             let job = job_record(&handle, run.job);
             assert!(
-                job.unknown_at.is_some() && job.stop_confirmed_at.is_some(),
-                "{case}"
+                job.unknown_at.is_some() && job.stop_confirmed_at.is_none(),
+                "{case}: unknown, and not confirmed stopped"
             );
-            assert!(
-                blocking(&handle, llm).is_empty(),
-                "{case}: the Profile is released"
+            assert_eq!(
+                blocking(&handle, llm),
+                [run.job],
+                "{case}: the Profile is still held by work of unknown stop"
             );
             let records = evidence(&handle, run.job);
             let [record] = records.as_slice() else {
@@ -15737,8 +15785,9 @@ mod requests_and_tool_loop {
             for acknowledge in [false, true] {
                 assert_eq!(
                     violation(wait(handle.retry_job(retry_of(run.job, llm, acknowledge)))),
-                    Violation::UnresolvedToolEffect(tool_call(run.job, 1, 0)),
-                    "{case}: no retry repeats an unresolved effect"
+                    Violation::RetryOfUnsettledJob(run.job),
+                    "{case}: the original is unsettled, so no acknowledgement \
+                     reaches the unresolved effect behind it"
                 );
             }
             assert_eq!(
@@ -15848,7 +15897,7 @@ mod requests_and_tool_loop {
             let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("restart");
             let handle = worker.handle();
             let job = job_record(&handle, run.job);
-            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+            assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_none());
             let records = evidence(&handle, run.job);
             let [record] = records.as_slice() else {
                 panic!("one admission");
@@ -17001,7 +17050,7 @@ mod requests_and_tool_loop {
                     DatabaseWorker::start_with_config(&directory, lenient()).expect("restart");
                 let handle = worker.handle();
                 let job = job_record(&handle, run.job);
-                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_none());
                 let records = evidence(&handle, run.job);
                 assert!(
                     records.len() == 1
@@ -17010,8 +17059,12 @@ mod requests_and_tool_loop {
                     "an unrecorded NotInvoked is not claimed: {records:?}"
                 );
                 assert_eq!(
+                    records[0].call, call,
+                    "the same admitted call is still the unresolved one"
+                );
+                assert_eq!(
                     violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                    Violation::UnresolvedToolEffect(call)
+                    Violation::RetryOfUnsettledJob(run.job)
                 );
                 worker.shutdown().expect("shutdown");
             } else {
@@ -17893,11 +17946,16 @@ mod requests_and_tool_loop {
             assert_eq!(handle.abandoned_at_open(), [run.job]);
             let job = job_record(&handle, run.job);
             assert!(job.unknown_at.is_some() && job.completed_at.is_none());
+            assert!(job.stop_confirmed_at.is_none());
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert!(record.outcome.is_none() && record.is_unresolved());
             assert_eq!(
                 violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                Violation::UnresolvedToolEffect(record.call)
+                // The original's execution is not confirmed stopped, so it is
+                // not settled and cannot be retried at all. That refusal now
+                // precedes the unresolved-effect one, and is the stronger of
+                // the two: acknowledging the effect would not lift it.
+                Violation::RetryOfUnsettledJob(run.job)
             );
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
@@ -17985,8 +18043,8 @@ mod requests_and_tool_loop {
                 let worker = DatabaseWorker::start(&directory).expect("restart");
                 let handle = worker.handle();
                 let job = job_record(&handle, run.job);
-                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
-                assert!(blocking(&handle, llm).is_empty());
+                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_none());
+                assert_eq!(blocking(&handle, llm), [run.job]);
                 let [record] = evidence(&handle, run.job).try_into().expect("one call");
                 assert!(
                     record.admission().is_some()
@@ -17995,7 +18053,10 @@ mod requests_and_tool_loop {
                 );
                 assert_eq!(
                     violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                    Violation::UnresolvedToolEffect(record.call)
+                    // Unsettled, because its stop was never confirmed, so the
+                    // retry is refused before the unresolved effect is even
+                    // considered, and repeated restarts do not change that.
+                    Violation::RetryOfUnsettledJob(run.job)
                 );
                 worker.shutdown().expect("shutdown");
                 assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
@@ -18593,11 +18654,12 @@ mod requests_and_tool_loop {
             assert_eq!(handle.abandoned_at_open(), [run.job]);
             let job = job_record(&handle, run.job);
             assert!(job.unknown_at.is_some() && job.completed_at.is_none());
+            assert!(job.stop_confirmed_at.is_none());
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert!(record.outcome.is_none() && record.is_unresolved());
             assert_eq!(
                 violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                Violation::UnresolvedToolEffect(record.call)
+                Violation::RetryOfUnsettledJob(run.job)
             );
             assert_eq!(project.runs(), 1, "nothing ran again");
             worker.shutdown().expect("shutdown");
@@ -18639,8 +18701,8 @@ mod requests_and_tool_loop {
                 let worker = DatabaseWorker::start(&directory).expect("restart");
                 let handle = worker.handle();
                 let job = job_record(&handle, run.job);
-                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
-                assert!(blocking(&handle, llm).is_empty());
+                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_none());
+                assert_eq!(blocking(&handle, llm), [run.job]);
                 let [record] = evidence(&handle, run.job).try_into().expect("one call");
                 assert!(
                     record.admission().is_some()
@@ -18649,7 +18711,7 @@ mod requests_and_tool_loop {
                 );
                 assert_eq!(
                     violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                    Violation::UnresolvedToolEffect(record.call)
+                    Violation::RetryOfUnsettledJob(run.job)
                 );
                 worker.shutdown().expect("shutdown");
                 assert_eq!(project.runs(), 1, "no restart runs it again");

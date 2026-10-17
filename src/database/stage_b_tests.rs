@@ -44,6 +44,28 @@ fn provision(database: &DatabaseHandle) -> (ExecutionPoolId, ProfileId) {
     (pool, llm)
 }
 
+/// A second, independent Pool with a single slot, so a test can tell a domain
+/// that is quarantined from one that is merely full.
+fn narrow_pool(database: &DatabaseHandle, name: &str) -> ExecutionPoolId {
+    let profile = wait(database.create_profile(NewProfile {
+        name: name.into(),
+        config: NewProfileConfig::ExecutionPool(ExecutionPoolConfig {
+            concurrency_limit: NonZeroU32::new(1).unwrap(),
+            capabilities: CapabilitySet {
+                operations: BTreeSet::from([ExecutionOperation::LlmRequest]),
+                llm_protocols: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+            },
+        }),
+    }))
+    .unwrap();
+    wait(database.create_execution_pool(NewExecutionPool {
+        name: name.into(),
+        profile,
+        enabled: true,
+    }))
+    .unwrap()
+}
+
 fn pending(database: &DatabaseHandle, llm: ProfileId) -> JobId {
     let input = wait(database.save_job_input(None, JobInputDraft::default())).unwrap();
     wait(database.create_job_with_input(
@@ -129,7 +151,7 @@ fn duplicate_racing_claims_yield_one_known_committed_grant() {
 }
 
 #[test]
-fn uncertain_claim_flush_never_grants_and_marker_resolution_releases_committed_claim() {
+fn uncertain_claim_flush_never_grants_and_marker_resolution_quarantines_committed_claim() {
     let (_root, directory) = data_directory("ocg-stage-b-worker", "uncertain");
     let mut worker = DatabaseWorker::start(&directory).unwrap();
     let wake = worker.take_scheduler_wake().unwrap();
@@ -168,47 +190,99 @@ fn uncertain_claim_flush_never_grants_and_marker_resolution_releases_committed_c
     assert!(wake.dirty_generation() > before.0 && wake.capacity_generation() > before.1);
     let marker = wait(database.reconcile_operation(operation)).unwrap();
     wait(database.reconcile_unexecuted_claim(job, operation)).unwrap();
-    assert!(wait(database.occupancy()).unwrap().is_empty());
     let row = wait(database.job(job)).unwrap().unwrap();
     match marker {
         OperationStatus::Committed(_) => {
-            assert!(row.unknown_at.is_some() && row.stop_confirmed_at.is_some())
+            // The claim committed, so the Job started in an opening that is
+            // gone. Its outcome is unknown and its stop is *not* confirmed:
+            // nothing established that the external work it began has ended.
+            assert!(row.unknown_at.is_some() && row.stop_confirmed_at.is_none());
+            // So the slot it holds stays occupied and is quarantined.
+            assert_eq!(
+                wait(database.occupancy()).unwrap(),
+                vec![(pool, job)],
+                "a committed claim's capacity is quarantined, not released"
+            );
+            let quarantined = wait(database.unresolved_executions()).unwrap();
+            assert_eq!(quarantined.len(), 1);
+            assert_eq!(quarantined[0].0, job);
+            assert_eq!(quarantined[0].1.pool, Some(pool));
         }
-        OperationStatus::NotCommitted => assert!(row.started_at.is_none()),
+        OperationStatus::NotCommitted => {
+            assert!(row.started_at.is_none());
+            assert!(wait(database.occupancy()).unwrap().is_empty());
+            assert!(wait(database.unresolved_executions()).unwrap().is_empty());
+        }
         status => panic!("recovery must resolve operation, got {status:?}"),
     }
     worker.shutdown().unwrap();
 }
 
 #[test]
-fn process_reopen_settles_unspawned_claim_without_rerunning() {
+fn process_reopen_quarantines_unspawned_claim_without_rerunning() {
     let (_root, directory) = data_directory("ocg-stage-b-worker", "restart");
     let worker = DatabaseWorker::start(&directory).unwrap();
     let database = worker.handle();
     let (pool, llm) = provision(&database);
+    let narrow = narrow_pool(&database, "narrow");
     let job = pending(&database, llm);
     wait(database.claim_execution(ClaimRequest {
         job,
-        allowed_pools: BTreeSet::from([pool]),
+        allowed_pools: BTreeSet::from([narrow]),
     }))
     .unwrap()
     .unwrap();
-    let binding = wait(database.frozen_pool_binding(job)).unwrap();
+    let binding = wait(database.frozen_pool_binding(job))
+        .unwrap()
+        .expect("bound");
+    assert_eq!(binding.pool, narrow);
     worker.shutdown().unwrap();
     let worker = DatabaseWorker::start(&directory).unwrap();
     let database = worker.handle();
     assert!(database.abandoned_at_open().contains(&job));
-    assert_eq!(wait(database.frozen_pool_binding(job)).unwrap(), binding);
-    assert!(wait(database.occupancy()).unwrap().is_empty());
+    assert_eq!(
+        wait(database.frozen_pool_binding(job)).unwrap(),
+        Some(binding)
+    );
+    // The earlier opening is gone, but nothing showed that the work it began
+    // stopped, so the slot stays occupied and its capacity is quarantined.
+    assert_eq!(wait(database.occupancy()).unwrap(), vec![(narrow, job)]);
+    let quarantined = wait(database.unresolved_executions()).unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].0, job);
+    assert_eq!(quarantined[0].1.pool, Some(narrow));
     let row = wait(database.job(job)).unwrap().unwrap();
-    assert!(row.unknown_at.is_some() && row.stop_confirmed_at.is_some());
+    assert!(row.unknown_at.is_some() && row.stop_confirmed_at.is_none());
     assert_eq!(
         wait(database.claim_execution(ClaimRequest {
             job,
-            allowed_pools: BTreeSet::from([pool])
+            allowed_pools: BTreeSet::from([narrow])
         }))
         .unwrap(),
         Err(ClaimRefusal::NotPending)
+    );
+    // The quarantined Pool has no free slot, so a new Job cannot enter it,
+    // while a Pool whose safety was established is unaffected and admits.
+    let blocked = pending(&database, llm);
+    assert_eq!(
+        wait(database.claim_execution(ClaimRequest {
+            job: blocked,
+            allowed_pools: BTreeSet::from([narrow])
+        }))
+        .unwrap(),
+        Err(ClaimRefusal::NoCapacity(CapacityScope::Pools(
+            BTreeSet::from([narrow])
+        )))
+    );
+    let admitted = pending(&database, llm);
+    assert!(
+        wait(database.claim_execution(ClaimRequest {
+            job: admitted,
+            allowed_pools: BTreeSet::from([pool])
+        }))
+        .unwrap()
+        .is_ok(),
+        "an independent Pool still admits"
     );
     worker.shutdown().unwrap();
 }

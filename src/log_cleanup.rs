@@ -1141,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cleanup_job_left_running_is_settled_by_the_next_start() {
+    fn a_cleanup_job_left_running_is_quarantined_by_the_next_start() {
         let (_root, directory) = data_directory("abandoned");
         let worker =
             DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
@@ -1168,7 +1168,9 @@ mod tests {
         let job = wait(database.job(records.job))
             .expect("read job")
             .expect("job exists");
-        assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+        // The opening that ran it is gone, which settles its outcome as unknown
+        // but says nothing about whether its external work stopped.
+        assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_none());
         assert!(job.completed_at.is_none() && job.failed_at.is_none());
         worker.shutdown().expect("shutdown database");
     }
