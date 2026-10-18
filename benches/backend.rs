@@ -12,9 +12,9 @@ use ocg::persistence::{
     CapabilitySet, ConfigBody, ConnectionConfig, DependencyCondition, ExecutionConfiguration,
     ExecutionOperation, ExecutionPoolConfig, ExecutorId, FinalResult, IntermediateOutputKind,
     JobFinalization, JobId, JobInputDraft, LlmTransport, ModelConfig, NewConfig, NewExecutionPool,
-    NewExecutor, NewJob, NewJobOutput,
+    NewExecutor, NewJob, NewJobOutput, OutcomeCause, OutcomeKind,
 };
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
 use serde_json::{json, Value};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -554,10 +554,39 @@ fn claim_and_finalize(
     Ok((claim_batch_samples, finalize_samples, elapsed))
 }
 
+fn peak_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut usage = std::mem::zeroed::<libc::rusage>();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
+            return Some(usage.ru_maxrss as u64);
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    unsafe {
+        #[repr(C)]
+        struct Rusage {
+            ru_utime: [u64; 2],
+            ru_stime: [u64; 2],
+            ru_maxrss: i64,
+            _pad: [i64; 13],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        let mut usage = std::mem::zeroed::<Rusage>();
+        if getrusage(0, &mut usage) == 0 {
+            return Some((usage.ru_maxrss as u64) * 1024);
+        }
+    }
+    None
+}
+
 fn stop_unclean_and_reopen(
     directory: &DataDirectory,
     worker: DatabaseWorker,
-) -> Result<(Duration, u64)> {
+    check: impl FnOnce(&DatabaseHandle) -> Result<()>,
+) -> Result<(Duration, u64, Option<u64>)> {
     worker.shutdown()?;
     let db_path = directory.database_path().join("ocg.redb");
     {
@@ -574,8 +603,57 @@ fn stop_unclean_and_reopen(
     let began = Instant::now();
     let reopened = DatabaseWorker::start(directory)?;
     let duration = began.elapsed();
+    let peak_memory = peak_memory_bytes();
+
+    let pending_page = block_on(reopened.handle().pending_jobs(None, 1))?;
+    if !pending_page.visited.is_empty() {
+        return Err(format!(
+            "expected no pending jobs after reopen, found at least {}",
+            pending_page.visited.len()
+        )
+        .into());
+    }
+    let claimed = block_on(reopened.handle().claim_batch())?;
+    if !claimed.is_empty() {
+        return Err(format!(
+            "expected no claimable jobs after reopen, found {}",
+            claimed.len()
+        )
+        .into());
+    }
+    check(&reopened.handle())?;
+
     reopened.shutdown()?;
-    Ok((duration, file_size))
+
+    {
+        let db = Database::open(&db_path)?;
+        let tx = db.begin_read()?;
+        let pending_table: TableDefinition<u64, ()> = TableDefinition::new("pending");
+        let ready_table: TableDefinition<(u16, u64), ()> = TableDefinition::new("ready");
+        let delayed_table: TableDefinition<(i64, u64), ()> = TableDefinition::new("delayed");
+        let waiters_table: TableDefinition<(u64, u64), u8> =
+            TableDefinition::new("dependency_waiter");
+        let unsettled_table: TableDefinition<u64, (u32, u32)> =
+            TableDefinition::new("unsettled");
+        let pending_count = tx.open_table(pending_table)?.len()?;
+        let ready_count = tx.open_table(ready_table)?.len()?;
+        let delayed_count = tx.open_table(delayed_table)?.len()?;
+        let waiters_count = tx.open_table(waiters_table)?.len()?;
+        let unsettled_count = tx.open_table(unsettled_table)?.len()?;
+        if pending_count != 0
+            || ready_count != 0
+            || delayed_count != 0
+            || waiters_count != 0
+            || unsettled_count != 0
+        {
+            return Err(format!(
+                "jobs still pending after reopen: pending={pending_count}, ready={ready_count}, delayed={delayed_count}, waiters={waiters_count}, unsettled={unsettled_count}"
+            )
+            .into());
+        }
+    }
+
+    Ok((duration, file_size, peak_memory))
 }
 
 fn scheduler(options: &Options) -> Result<()> {
@@ -694,12 +772,15 @@ fn scheduler(options: &Options) -> Result<()> {
             Some(elapsed_dep_claim),
         );
 
-        // 4: Stop without clean shutdown and reopen it
-        let (reopen_duration, file_size) = stop_unclean_and_reopen(&directory, worker)?;
+        // 4: Stop without clean shutdown and reopen it (after all jobs completed)
+        let (reopen_duration, file_size, peak_memory) =
+            stop_unclean_and_reopen(&directory, worker, |_| Ok(()))?;
         let reopen_params = json!({
             "jobs": count,
             "dependencies": true,
+            "work_queued": false,
             "database_file_bytes": file_size,
+            "peak_memory_bytes": peak_memory,
         });
         report(
             "scheduler.unclean_open",
@@ -713,15 +794,93 @@ fn scheduler(options: &Options) -> Result<()> {
                 "type": "fixture",
                 "name": "scheduler.reopen",
                 "jobs": count,
+                "work_queued": false,
                 "database_file_bytes": file_size,
                 "duration_ms": reopen_duration.as_secs_f64() * 1000.0,
+                "peak_memory_bytes": peak_memory,
+            })
+        );
+        drop(root);
+
+        // 5: Work still queued: admit N Jobs (half dependent), claim none,
+        // stop without clean shutdown, time reopen, report peak memory,
+        // and check after reopen that no Job is still pending.
+        let root = TemporaryRoot::new()?;
+        let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
+        let worker = DatabaseWorker::start(&directory)?;
+        let handle = worker.handle();
+        let target = setup_scheduler_pools(&handle)?;
+
+        let (queued_job_ids, _admit_samples, _elapsed) =
+            admit_jobs(&handle, target, count, true)?;
+
+        let (queued_reopen_duration, queued_file_size, queued_peak_memory) =
+            stop_unclean_and_reopen(&directory, worker, |handle| {
+                if let Some(first_id) = queued_job_ids.first() {
+                    let record = block_on(handle.job(*first_id))?
+                        .ok_or("first job not found after reopen")?;
+                    let outcome = record
+                        .outcome
+                        .ok_or("first job missing outcome after reopen")?;
+                    if outcome.kind != OutcomeKind::Cancelled
+                        || outcome.cause != Some(OutcomeCause::Abandoned)
+                    {
+                        return Err(format!(
+                            "first job expected Cancelled(Abandoned), got {:?}",
+                            outcome
+                        )
+                        .into());
+                    }
+                }
+                if let Some(last_id) = queued_job_ids.last() {
+                    let record = block_on(handle.job(*last_id))?
+                        .ok_or("last job not found after reopen")?;
+                    let outcome = record
+                        .outcome
+                        .ok_or("last job missing outcome after reopen")?;
+                    if outcome.kind != OutcomeKind::Cancelled
+                        || outcome.cause != Some(OutcomeCause::Abandoned)
+                    {
+                        return Err(format!(
+                            "last job expected Cancelled(Abandoned), got {:?}",
+                            outcome
+                        )
+                        .into());
+                    }
+                }
+                Ok(())
+            })?;
+
+        let queued_reopen_params = json!({
+            "jobs": count,
+            "dependencies": true,
+            "work_queued": true,
+            "database_file_bytes": queued_file_size,
+            "peak_memory_bytes": queued_peak_memory,
+        });
+        report(
+            "scheduler.unclean_open_queued",
+            &queued_reopen_params,
+            vec![queued_reopen_duration],
+            Some(queued_reopen_duration),
+        );
+        println!(
+            "{}",
+            json!({
+                "type": "fixture",
+                "name": "scheduler.reopen_queued",
+                "jobs": count,
+                "work_queued": true,
+                "database_file_bytes": queued_file_size,
+                "duration_ms": queued_reopen_duration.as_secs_f64() * 1000.0,
+                "peak_memory_bytes": queued_peak_memory,
             })
         );
         drop(root);
 
         let total_run_time = run_started.elapsed();
         prev_time = Some(total_run_time);
-        prev_size = Some(file_size);
+        prev_size = Some(file_size.max(queued_file_size));
     }
     Ok(())
 }
