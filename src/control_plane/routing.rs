@@ -25,6 +25,11 @@ pub(super) enum Route {
         after_seq: Option<i64>,
         limit: usize,
     },
+    Tools {
+        job: JobId,
+        after: Option<(RequestNumber, u32)>,
+        limit: usize,
+    },
     Events {
         job: JobId,
         after_seq: Option<i64>,
@@ -61,6 +66,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Job(_)
             | Route::JobInput(_)
             | Route::JobConversation(_)
+            | Route::Tools { .. }
             | Route::AgentProfiles { .. }
             | Route::Profiles
             | Route::ProfileCreate
@@ -153,6 +159,11 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 after_seq,
                 limit,
             })
+        }
+        ["jobs", job, "tools"] => {
+            let job = job_id(job)?;
+            let (after, limit) = projection::tools_query(query)?;
+            Ok(Route::Tools { job, after, limit })
         }
         ["jobs", job, "events"] => {
             let job = job_id(job)?;
@@ -251,6 +262,9 @@ pub(super) async fn respond(
             after_seq,
             limit,
         } => outputs(shared, job, after_seq, limit).await.map(Reply::ok),
+        Route::Tools { job, after, limit } => {
+            projection::tools(shared, job, after, limit).await.map(Reply::ok)
+        }
         Route::Submit => {
             let key = submissions::idempotency_key(request.headers())?;
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ocg/primitives";
-import type { ControlConversationTurn } from "@/components/ocg/contracts";
+import type { ControlConversationTurn, ControlToolCall } from "@/components/ocg/contracts";
 import type { HttpCanonicalControlClient } from "@/components/ocg/runtime/canonical-client";
 import { JobSubmissionForm, type SubmissionTarget } from "@/components/ocg/job/job-submission-form";
 import { JobWatch } from "@/components/ocg/job/job-watch";
@@ -44,6 +44,7 @@ export function ChatSurface({
 }) {
   const [target, setTarget] = useState<SubmissionTarget | null>(null);
   const [turns, setTurns] = useState<ControlConversationTurn[]>([]);
+  const [toolsByJob, setToolsByJob] = useState<Record<string, ControlToolCall[]>>({});
   const [conversationError, setConversationError] = useState<string | null>(null);
   const [headState, setHeadState] = useState<SettlementState | null>(null);
 
@@ -85,8 +86,25 @@ export function ChatSurface({
     };
   }, [client, job]);
 
+  useEffect(() => {
+    if (turns.length === 0) return;
+    const controller = new AbortController();
+    turns.forEach((turn) => {
+      client
+        .readAllJobTools(turn.job.id, controller.signal)
+        .then((tools) => {
+          setToolsByJob((prev) => ({ ...prev, [turn.job.id]: tools }));
+        })
+        .catch(() => {});
+    });
+    return () => {
+      controller.abort();
+    };
+  }, [client, turns]);
+
   const handleNewConversation = useCallback(() => {
     setTurns([]);
+    setToolsByJob({});
     setConversationError(null);
     setHeadState(null);
     onNewConversation?.();
@@ -174,6 +192,7 @@ export function ChatSurface({
 
       {priorTurns.map((turn, index) => {
         const objective = turn.input ? turn.input.objective : null;
+        const turnTools = toolsByJob[turn.job.id];
         const transcript = jobTranscript(
           turn.job.id,
           objective,
@@ -181,6 +200,7 @@ export function ChatSurface({
           turn.job.settlement,
           false,
           turn.input ? turn.input.attachments : undefined,
+          turnTools,
         );
         return (
           <section
@@ -223,6 +243,7 @@ export function ChatSurface({
             </div>
             <JobTranscript
               turns={transcript}
+              tools={turnTools}
               userLabel="You"
               attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
             />

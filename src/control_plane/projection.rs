@@ -1,3 +1,6 @@
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
 use super::*;
 
 /// What the host can establish: it runs, as the listener answers only
@@ -131,4 +134,309 @@ pub(super) async fn outputs(
         next = Some(record.seq);
     }
     Ok(envelope(page, next, more))
+}
+
+pub(super) const MAX_EXPOSED_TOOL_STRING_BYTES: usize = 2 * 1024;
+
+pub(super) fn cut_tool_string(text: &str) -> (&str, bool) {
+    if text.len() <= MAX_EXPOSED_TOOL_STRING_BYTES {
+        (text, false)
+    } else {
+        let mut boundary = MAX_EXPOSED_TOOL_STRING_BYTES;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        (&text[..boundary], true)
+    }
+}
+
+pub(super) fn parse_tool_cursor(text: &str) -> Result<(RequestNumber, u32), Refusal> {
+    if let Some((req_str, idx_str)) = text.split_once(':') {
+        let req = decimal::<u32>(req_str)
+            .and_then(RequestNumber::new)
+            .ok_or(INVALID_REQUEST)?;
+        let idx = decimal::<u32>(idx_str).ok_or(INVALID_REQUEST)?;
+        return Ok((req, idx));
+    }
+    if let Ok(bytes) = URL_SAFE_NO_PAD.decode(text) {
+        if let Ok((req, idx)) = serde_json::from_slice::<(u32, u32)>(&bytes) {
+            if let Some(req) = RequestNumber::new(req) {
+                return Ok((req, idx));
+            }
+        }
+    }
+    Err(INVALID_REQUEST)
+}
+
+pub(super) fn tools_query(query: &str) -> Result<(Option<(RequestNumber, u32)>, usize), Refusal> {
+    let (mut after, mut limit) = (None, None);
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
+            match key {
+                "after" if after.is_none() => {
+                    after = Some(parse_tool_cursor(value)?);
+                }
+                "limit" if limit.is_none() => {
+                    limit = Some(
+                        decimal::<usize>(value)
+                            .filter(|limit| (1..=100).contains(limit))
+                            .ok_or(INVALID_REQUEST)?,
+                    );
+                }
+                _ => return Err(INVALID_REQUEST),
+            }
+        }
+    }
+    Ok((after, limit.unwrap_or(50)))
+}
+
+pub(super) fn tool_json(record: &ToolEvidenceRecord) -> Value {
+    let decision = match &record.decision.fact {
+        ToolDecision::Admitted(_) => "admitted",
+        ToolDecision::Refused(refusal) => refusal.as_str(),
+    };
+    let (arguments, arguments_cut) = match record.admission() {
+        Some(admission) => {
+            let (cut, truncated) = cut_tool_string(admission.arguments.as_str());
+            (Some(cut), truncated)
+        }
+        None => (None, false),
+    };
+    let raw_result = match &record.outcome {
+        Some(outcome) => match &outcome.fact {
+            ToolOutcome::Completed { result } => Some(result.as_str()),
+            ToolOutcome::CompletedWithheld { reason } => match reason {
+                WithheldReason::TooLarge => Some("result withheld: too large"),
+                WithheldReason::Unserializable => Some("result withheld: unserializable"),
+            },
+            ToolOutcome::NotApplied { message } => Some(message.as_str()),
+            ToolOutcome::NotInvoked { reason } => match reason {
+                NotInvokedReason::Refused(r) => Some(r.as_str()),
+                NotInvokedReason::Cancelled => Some("cancelled before invocation"),
+            },
+            ToolOutcome::Uncertain { message, cause } => {
+                message.as_deref().or(match cause {
+                    UncertainCause::TimedOut => Some("timed out"),
+                    UncertainCause::Cancelled => Some("cancelled"),
+                    UncertainCause::HandlerReported => Some("handler reported failure"),
+                })
+            }
+        },
+        None => None,
+    };
+    let (result, result_cut) = match raw_result {
+        Some(text) => {
+            let (cut, truncated) = cut_tool_string(text);
+            (Some(cut), truncated)
+        }
+        None => (None, false),
+    };
+    let outcome_kind = record.outcome.as_ref().map(|o| match o.fact.kind() {
+        ToolOutcomeKind::Completed => "completed",
+        ToolOutcomeKind::CompletedWithheld => "completed_withheld",
+        ToolOutcomeKind::NotApplied => "not_applied",
+        ToolOutcomeKind::NotInvoked => "not_invoked",
+        ToolOutcomeKind::Uncertain => "uncertain",
+    });
+
+    json!({
+        "tool_call_id": record.tool_call_id,
+        "request": record.call.request.get(),
+        "index": record.call.index,
+        "name": record.name,
+        "decision": decision,
+        "outcome_kind": outcome_kind,
+        "outcome": outcome_kind,
+        "arguments": arguments,
+        "arguments_cut": arguments_cut,
+        "arguments_truncated": arguments_cut,
+        "result": result,
+        "result_cut": result_cut,
+        "result_truncated": result_cut,
+    })
+}
+
+pub(super) async fn tools(
+    shared: &Shared,
+    job: JobId,
+    after: Option<(RequestNumber, u32)>,
+    limit: usize,
+) -> Result<Value, Refusal> {
+    let database = &shared.database;
+    if database.job(job).await?.is_none() {
+        return Err(JOB_NOT_FOUND);
+    }
+    let records = database.tool_evidence(job, after, limit + 1).await?;
+    let after_cursor = after.map(|(req, idx)| format!("{}:{}", req.get(), idx));
+    let envelope = |page: Vec<Value>, next: Option<(RequestNumber, u32)>, more: bool| {
+        json!({
+            "api_version": API_VERSION,
+            "job": job.to_string(),
+            "after": after_cursor,
+            "tools": page,
+            "next_after": next.map(|(req, idx)| format!("{}:{}", req.get(), idx)),
+            "has_more": more,
+        })
+    };
+    let mut size = envelope(Vec::new(), None, true).to_string().len();
+    let mut page = Vec::new();
+    let mut next = None;
+    let mut more = records.len() > limit;
+    for record in records.iter().take(limit) {
+        let tool = tool_json(record);
+        let cost = tool.to_string().len() + 1;
+        if size + cost > shared.response_bytes {
+            if page.is_empty() {
+                return Err(OUTPUT_TOO_LARGE);
+            }
+            more = true;
+            break;
+        }
+        size += cost;
+        next = Some((record.call.request, record.call.index));
+        page.push(tool);
+    }
+    if !more {
+        next = None;
+    }
+    Ok(envelope(page, next, more))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_query_parsing() {
+        let (after, limit) = tools_query("").expect("empty query");
+        assert_eq!(after, None);
+        assert_eq!(limit, 50);
+
+        let (after, limit) = tools_query("limit=10").expect("limit only");
+        assert_eq!(after, None);
+        assert_eq!(limit, 10);
+
+        let (after, limit) = tools_query("after=1:0&limit=100").expect("after and limit");
+        assert_eq!(after, Some((RequestNumber::new(1).unwrap(), 0)));
+        assert_eq!(limit, 100);
+
+        let (after, limit) = tools_query("after=2:15").expect("after only");
+        assert_eq!(after, Some((RequestNumber::new(2).unwrap(), 15)));
+        assert_eq!(limit, 50);
+
+        for invalid in [
+            "limit=0",
+            "limit=101",
+            "limit=05",
+            "after=0:0",
+            "after=1",
+            "after=1:0:0",
+            "after=:0",
+            "after=1:",
+            "unknown=1",
+            "limit=10&limit=20",
+        ] {
+            assert!(tools_query(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn string_cutting_at_2kib() {
+        let short = "hello world";
+        let (cut, truncated) = cut_tool_string(short);
+        assert_eq!(cut, short);
+        assert!(!truncated);
+
+        let exact = "a".repeat(2048);
+        let (cut, truncated) = cut_tool_string(&exact);
+        assert_eq!(cut.len(), 2048);
+        assert!(!truncated);
+
+        let long = "a".repeat(3000);
+        let (cut, truncated) = cut_tool_string(&long);
+        assert_eq!(cut.len(), 2048);
+        assert!(truncated);
+
+        // UTF-8 boundary safety
+        let mut multibyte = "a".repeat(2047);
+        multibyte.push('€'); // 3 bytes: 2047 + 3 = 2050 bytes total
+        let (cut, truncated) = cut_tool_string(&multibyte);
+        assert_eq!(cut.len(), 2047);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn tool_json_formats_admitted_cut_and_refused() {
+        use crate::persistence::{
+            AuthorizationBasis, Recorded, Timestamp, ToolAdmission, ToolCallRef, ToolEffect,
+            ToolPayload,
+        };
+
+        let call = ToolCallRef {
+            job: JobId::new(1),
+            request: RequestNumber::new(1).unwrap(),
+            index: 0,
+        };
+        let admitted_record = ToolEvidenceRecord {
+            call,
+            tool_call_id: "call_abc".into(),
+            name: "workspace_read_file".into(),
+            spawns: false,
+            decision: Recorded {
+                fact: ToolDecision::Admitted(ToolAdmission {
+                    handler_version: "workspace_read_file-1".into(),
+                    effect: ToolEffect::ReadOnly,
+                    parameters: "{}".into(),
+                    arguments: ToolPayload::new(format!("{{\"path\": \"{}\"}}", "a".repeat(3000))),
+                    authorization: AuthorizationBasis::RegistryGrant,
+                }),
+                at: Timestamp::now(),
+            },
+            outcome: Some(Recorded {
+                fact: ToolOutcome::Completed {
+                    result: ToolPayload::new("result output".repeat(300)),
+                },
+                at: Timestamp::now(),
+            }),
+            reconciliation: None,
+        };
+
+        let json = tool_json(&admitted_record);
+        assert_eq!(json["name"], "workspace_read_file");
+        assert_eq!(json["decision"], "admitted");
+        assert_eq!(json["outcome_kind"], "completed");
+        assert_eq!(json["arguments_cut"], true);
+        assert_eq!(json["arguments_truncated"], true);
+        assert_eq!(json["result_cut"], true);
+        assert_eq!(json["result_truncated"], true);
+        assert_eq!(json["arguments"].as_str().unwrap().len(), 2048);
+        assert_eq!(json["result"].as_str().unwrap().len(), 2048);
+
+        let refused_record = ToolEvidenceRecord {
+            call: ToolCallRef {
+                job: JobId::new(1),
+                request: RequestNumber::new(1).unwrap(),
+                index: 1,
+            },
+            tool_call_id: "call_refused".into(),
+            name: "workspace_run_command".into(),
+            spawns: false,
+            decision: Recorded {
+                fact: ToolDecision::Refused(crate::openai_compatible::ToolCallRefusal::Unauthorized),
+                at: Timestamp::now(),
+            },
+            outcome: None,
+            reconciliation: None,
+        };
+
+        let json_refused = tool_json(&refused_record);
+        assert_eq!(json_refused["name"], "workspace_run_command");
+        assert_eq!(json_refused["decision"], "unauthorized");
+        assert_eq!(json_refused["outcome_kind"], Value::Null);
+        assert_eq!(json_refused["arguments"], Value::Null);
+        assert_eq!(json_refused["arguments_cut"], false);
+        assert_eq!(json_refused["result"], Value::Null);
+        assert_eq!(json_refused["result_cut"], false);
+    }
 }

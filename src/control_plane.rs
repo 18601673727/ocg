@@ -119,7 +119,11 @@ use serde_json::{Value, json};
 
 use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::orchestration::execution_runtime::SchedulerHandle;
-use crate::persistence::{AttachmentId, JobId, JobOutputRecord, JobRecord, OutputKind, ProfileId};
+use crate::persistence::{
+    AttachmentId, JobId, JobOutputRecord, JobRecord, NotInvokedReason, OutputKind, ProfileId,
+    RequestNumber, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind, UncertainCause,
+    WithheldReason,
+};
 
 mod assets;
 mod attachments;

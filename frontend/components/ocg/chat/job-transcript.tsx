@@ -3,6 +3,7 @@
 import { cn } from "@/lib/utils";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { STATUS_TEXT } from "@/components/ocg/primitives";
+import type { ControlToolCall, ControlToolOutcomeKind } from "@/components/ocg/contracts";
 import { BoundedMessage } from "./bounded-message";
 import type { TranscriptTurn } from "./job-transcript-model";
 
@@ -103,31 +104,147 @@ function TurnRow({
           ) : null}
           {note ? <span className="mt-1 block text-xs text-muted-foreground">{note}</span> : null}
         </div>
+        {!isUser && turn.tools && turn.tools.length > 0 ? (
+          <TurnToolCalls tools={turn.tools} />
+        ) : null}
       </div>
     </div>
+  );
+}
+
+function argumentSummary(raw: string | null): string {
+  if (!raw) return "";
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === "object" && parsed !== null) {
+      if (typeof parsed.path === "string") return parsed.path;
+      if (typeof parsed.preset === "string") return parsed.preset;
+      if (typeof parsed.command === "string") return parsed.command;
+      if (typeof parsed.query === "string") return parsed.query;
+      if (typeof parsed.pattern === "string") return parsed.pattern;
+      for (const val of Object.values(parsed)) {
+        if (typeof val === "string") return val.length > 60 ? `${val.slice(0, 57)}…` : val;
+      }
+    }
+  } catch {
+    const line = raw.trim().split("\n")[0] ?? "";
+    return line.length > 60 ? `${line.slice(0, 57)}…` : line;
+  }
+  return "";
+}
+
+function outcomeLabel(kind: ControlToolOutcomeKind | null | undefined): string {
+  if (!kind || kind === "uncertain") return "uncertain";
+  return kind;
+}
+
+function TurnToolCalls({ tools }: { tools: readonly ControlToolCall[] }) {
+  return (
+    <details className="mt-2.5 rounded-md border border-border bg-muted/20 text-xs">
+      <summary className="cursor-pointer select-none px-3 py-2 font-medium text-muted-foreground hover:text-foreground">
+        Tool calls ({tools.length})
+      </summary>
+      <div className="flex flex-col gap-2 p-3 pt-0">
+        {tools.map((tool) => {
+          const summary = argumentSummary(tool.arguments);
+          const outcome = outcomeLabel(tool.outcome_kind);
+          const isCompleted = outcome === "completed";
+          const isUncertain = outcome === "uncertain";
+          return (
+            <details
+              key={`${tool.request}:${tool.index}`}
+              className="group rounded border border-border bg-card p-2 text-card-foreground"
+            >
+              <summary className="flex cursor-pointer select-none flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex min-w-0 items-center gap-2 font-mono">
+                  <span className="font-semibold text-foreground">{tool.name}</span>
+                  {summary ? (
+                    <span className="truncate text-[11px] text-muted-foreground">
+                      {summary}
+                    </span>
+                  ) : null}
+                </div>
+                <span
+                  className={cn(
+                    "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
+                    isCompleted &&
+                      "border border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+                    isUncertain &&
+                      "border border-amber-500/20 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+                    !isCompleted &&
+                      !isUncertain &&
+                      "border border-border bg-muted text-muted-foreground",
+                  )}
+                >
+                  {outcome}
+                </span>
+              </summary>
+              <div className="mt-2 space-y-2 border-t border-border pt-2 font-mono text-xs">
+                {tool.decision !== "admitted" ? (
+                  <div className="font-sans text-xs text-destructive">
+                    Decision: {tool.decision}
+                  </div>
+                ) : null}
+                <div>
+                  <div className="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
+                    <span>Arguments</span>
+                    {tool.arguments_cut ? (
+                      <span className="text-[10px] font-semibold text-amber-500">
+                        (cut to 2 KiB)
+                      </span>
+                    ) : null}
+                  </div>
+                  <pre className="ocg-subtle-scrollbar max-h-48 overflow-x-auto whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
+                    {tool.arguments ?? "—"}
+                  </pre>
+                </div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
+                    <span>Result</span>
+                    {tool.result_cut ? (
+                      <span className="text-[10px] font-semibold text-amber-500">
+                        (cut to 2 KiB)
+                      </span>
+                    ) : null}
+                  </div>
+                  <pre className="ocg-subtle-scrollbar max-h-48 overflow-x-auto whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
+                    {tool.result ?? "—"}
+                  </pre>
+                </div>
+              </div>
+            </details>
+          );
+        })}
+      </div>
+    </details>
   );
 }
 
 /** One Job as its objective and answer; see `jobTranscript` for what each is made of. */
 export function JobTranscript({
   turns,
+  tools,
   userLabel = "Objective",
   attachmentContentUrl,
 }: {
   turns: readonly TranscriptTurn[];
+  tools?: readonly ControlToolCall[];
   userLabel?: string;
   attachmentContentUrl?: (id: string) => string;
 }) {
   return (
     <div className="flex flex-col gap-4" aria-live="polite">
-      {turns.map((turn) => (
-        <TurnRow
-          key={turn.id}
-          turn={turn}
-          userLabel={userLabel}
-          attachmentContentUrl={attachmentContentUrl}
-        />
-      ))}
+      {turns.map((turn) => {
+        const turnTools = turn.tools ?? (turn.role === "assistant" ? tools : undefined);
+        return (
+          <TurnRow
+            key={turn.id}
+            turn={{ ...turn, tools: turnTools }}
+            userLabel={userLabel}
+            attachmentContentUrl={attachmentContentUrl}
+          />
+        );
+      })}
     </div>
   );
 }

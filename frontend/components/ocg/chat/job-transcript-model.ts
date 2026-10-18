@@ -1,4 +1,4 @@
-import type { ControlOutput } from "@/components/ocg/contracts";
+import type { ControlOutput, ControlToolCall } from "@/components/ocg/contracts";
 
 /** How a Job settled, as the Control Plane reports it. */
 export type TranscriptSettlement = {
@@ -14,6 +14,7 @@ export type TranscriptTurn = {
   /** The Result output's own text where the Job did not complete. */
   detail: string | null;
   createdAtUs: number | null;
+  tools?: readonly ControlToolCall[];
 };
 
 /**
@@ -32,6 +33,7 @@ export function jobTranscript(
   settlement: TranscriptSettlement | null,
   streaming: boolean,
   attachments?: readonly string[],
+  tools?: readonly ControlToolCall[],
 ): TranscriptTurn[] {
   const progress = outputs
     .filter((output) => output.kind === "progress")
@@ -43,6 +45,7 @@ export function jobTranscript(
     id: `${jobId}:answer`,
     role: "assistant" as const,
     createdAtUs: outputs.at(-1)?.created_at_us ?? null,
+    tools,
   };
   const hasUserTurn = objective !== null || (attachments && attachments.length > 0);
   const user: TranscriptTurn[] = !hasUserTurn

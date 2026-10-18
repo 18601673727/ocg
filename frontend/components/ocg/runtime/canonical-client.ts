@@ -13,6 +13,7 @@ import {
   decodeJobConversation,
   decodeJobInput,
   decodeJobEvent,
+  decodeJobTools,
   decodeOutputsPage,
   decodeProfiles,
   decodeSession,
@@ -20,6 +21,8 @@ import {
   type ControlAttachment,
   type ControlCapability,
   type ControlJobEvent,
+  type ControlJobToolsPage,
+  type ControlToolCall,
 } from "../contracts";
 import { SseParser } from "./sse";
 
@@ -332,6 +335,26 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     return { status: response.status, input };
   }
 
+  const readJobToolsInternal = async (
+    job: string,
+    settings: { after?: string; limit?: number; signal?: AbortSignal } = {},
+  ): Promise<ControlJobToolsPage> => {
+    jobIdentity(job);
+    const query: string[] = [];
+    if (settings.after !== undefined && settings.after !== null) {
+      query.push(`after=${encodeURIComponent(settings.after)}`);
+    }
+    if (settings.limit !== undefined) {
+      if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
+        throw new ContractError("limit", "an integer from 1 to 100");
+      }
+      query.push(`limit=${settings.limit}`);
+    }
+    const suffix = query.length ? `?${query.join("&")}` : "";
+    const answer = await send("GET", `/api/v1/jobs/${job}/tools${suffix}`, { signal: settings.signal });
+    return decodeJobTools(answer.input, job);
+  };
+
   return {
     onProfilesChanged(listener: () => void) {
       profileListeners.add(listener);
@@ -449,6 +472,32 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const suffix = query.length ? `?${query.join("&")}` : "";
       const answer = await send("GET", `/api/v1/jobs/${job}/outputs${suffix}`, { signal: settings.signal });
       return decodeOutputsPage(answer.input, job);
+    },
+
+    /** One stored page of the Job's tool evidence. */
+    async readJobTools(
+      job: string,
+      settings: { after?: string; limit?: number; signal?: AbortSignal } = {},
+    ): Promise<ControlJobToolsPage> {
+      return readJobToolsInternal(job, settings);
+    },
+
+    /** All recorded tool calls for a Job, paging through until complete. */
+    async readAllJobTools(
+      job: string,
+      signal?: AbortSignal,
+    ): Promise<ControlToolCall[]> {
+      const tools: ControlToolCall[] = [];
+      let cursor: string | undefined = undefined;
+      for (let pageCount = 0; pageCount < 50; pageCount++) {
+        const page = await readJobToolsInternal(job, { after: cursor, limit: 100, signal });
+        tools.push(...page.tools);
+        if (!page.has_more || !page.next_after) {
+          break;
+        }
+        cursor = page.next_after;
+      }
+      return tools;
     },
 
     /**

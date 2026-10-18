@@ -15,6 +15,7 @@ import {
   ContractError,
   type ControlJob,
   type ControlOutput,
+  type ControlToolCall,
 } from "@/components/ocg/contracts";
 
 type StreamState = "loading" | "live" | "reconnecting" | "settled" | "stream_error" | "closed";
@@ -87,6 +88,7 @@ function JobWatchBody({
 }) {
   const [job, setJob] = useState<ControlJob | null>(null);
   const [outputs, setOutputs] = useState<ControlOutput[]>([]);
+  const [tools, setTools] = useState<ControlToolCall[]>([]);
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
   const [failure, setFailure] = useState<{ code: string; scope: "read" | "stream" } | null>(null);
@@ -115,6 +117,15 @@ function JobWatchBody({
       setStream("closed");
     };
 
+    const refreshTools = () => {
+      client.readAllJobTools(jobId).then(
+        (loaded) => {
+          if (alive) setTools(loaded);
+        },
+        () => {},
+      );
+    };
+
     const listener = (event: JobStreamEvent) => {
       if (!alive) return;
       // Anything the server sent proves the connection is back.
@@ -132,6 +143,7 @@ function JobWatchBody({
         if (event.output.seq <= processed) return;
         processed = event.output.seq;
         setOutputs((existing) => [...existing, event.output]);
+        refreshTools();
       } else if (event.type === "settlement") {
         setSettlement({
           state: event.settlement.state,
@@ -139,6 +151,7 @@ function JobWatchBody({
           stop_confirmed_at_us: event.stop_confirmed_at_us,
         });
         setStream("settled");
+        refreshTools();
       } else if (event.type === "stream_error") {
         setFailure({ code: event.error.code, scope: "stream" });
         setStream("stream_error");
@@ -200,6 +213,7 @@ function JobWatchBody({
           if (alive) setInput({ error: error instanceof ControlTransportError ? error.code : "unreachable" });
         },
       );
+      refreshTools();
       // The stored history first, in pages and in order; the stream then
       // continues after the last output this view processed.
       try {
@@ -368,7 +382,9 @@ function JobWatchBody({
           settlement,
           stream === "live" || stream === "reconnecting",
           input !== null && "attachments" in input ? input.attachments : undefined,
+          tools,
         )}
+        tools={tools}
         userLabel={presentation === "chat" ? "You" : "Objective"}
         attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
       />

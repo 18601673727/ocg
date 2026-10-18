@@ -314,6 +314,22 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
     );
     let outputs = outputs.body["outputs"].as_array().expect("outputs").clone();
     assert_eq!(outputs.last().expect("a result")["kind"], "result");
+    let tools = request(
+        address,
+        &format!("GET /api/v1/jobs/{failing}/tools"),
+        None,
+        None,
+    );
+    assert_eq!(tools.status, 200, "{}", tools.body);
+    assert_eq!(tools.body["tools"], json!([]));
+    assert_eq!(tools.body["has_more"], false);
+    let bad_tools = request(
+        address,
+        &format!("GET /api/v1/jobs/{failing}/tools?limit=0"),
+        None,
+        None,
+    );
+    assert_eq!(bad_tools.status, 400);
     // The same key and request name the same Job; another request is refused.
     let replay = submit(address, failing_key, &failing_body);
     assert_eq!((replay.status, admitted(&replay)), (200, failing.clone()));

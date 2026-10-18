@@ -293,6 +293,101 @@ export function decodeOutputsPage(input: unknown, jobId: string) {
   };
 }
 
+export type ControlToolOutcomeKind =
+  | "completed"
+  | "completed_withheld"
+  | "not_applied"
+  | "not_invoked"
+  | "uncertain";
+
+export type ControlToolCall = {
+  tool_call_id: string;
+  request: number;
+  index: number;
+  name: string;
+  decision: string;
+  outcome_kind: ControlToolOutcomeKind | null;
+  arguments: string | null;
+  arguments_cut: boolean;
+  result: string | null;
+  result_cut: boolean;
+};
+
+export type ControlJobToolsPage = {
+  job: string;
+  after: string | null;
+  tools: ControlToolCall[];
+  next_after: string | null;
+  has_more: boolean;
+};
+
+function toolOutcomeKind(value: unknown, path: string): ControlToolOutcomeKind | null {
+  if (value === null || value === undefined) return null;
+  if (
+    value === "completed" ||
+    value === "completed_withheld" ||
+    value === "not_applied" ||
+    value === "not_invoked" ||
+    value === "uncertain"
+  ) {
+    return value;
+  }
+  throw new ContractError(path, "a tool outcome kind or null");
+}
+
+function toolCallRecord(value: unknown, path: string): ControlToolCall {
+  const item = record(value, path);
+  return {
+    tool_call_id: string(item.tool_call_id, `${path}.tool_call_id`),
+    request: integer(item.request, `${path}.request`),
+    index: integer(item.index, `${path}.index`),
+    name: string(item.name, `${path}.name`),
+    decision: string(item.decision, `${path}.decision`),
+    outcome_kind: toolOutcomeKind(item.outcome_kind ?? item.outcome, `${path}.outcome_kind`),
+    arguments:
+      item.arguments === null || item.arguments === undefined
+        ? null
+        : string(item.arguments, `${path}.arguments`),
+    arguments_cut: boolean(
+      item.arguments_cut ?? item.arguments_truncated ?? false,
+      `${path}.arguments_cut`,
+    ),
+    result:
+      item.result === null || item.result === undefined
+        ? null
+        : string(item.result, `${path}.result`),
+    result_cut: boolean(
+      item.result_cut ?? item.result_truncated ?? false,
+      `${path}.result_cut`,
+    ),
+  };
+}
+
+/** One stored page of a Job's tool evidence. */
+export function decodeJobTools(input: unknown, jobId: string): ControlJobToolsPage {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
+  const after =
+    envelope.after === null || envelope.after === undefined
+      ? null
+      : string(envelope.after, "after");
+  const nextAfter =
+    envelope.next_after === null || envelope.next_after === undefined
+      ? null
+      : string(envelope.next_after, "next_after");
+  const listed = envelope.tools;
+  if (!Array.isArray(listed)) throw new ContractError("tools", "an array");
+  const tools = listed.map((tool, index) => toolCallRecord(tool, `tools[${index}]`));
+  return {
+    job: jobId,
+    after,
+    tools,
+    next_after: nextAfter,
+    has_more: boolean(envelope.has_more, "has_more"),
+  };
+}
+
 /** What one `Idempotency-Key` created, from submission or lookup. */
 export function decodeAdmission(input: unknown) {
   const envelope = record(input, "response");
