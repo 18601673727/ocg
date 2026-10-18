@@ -17,3 +17,6 @@ forward_to_gpt.md
 .vscode/
 *.swp
 .ocg/
+
+# Browser automation snapshots written by an MCP server
+/.playwright-mcp/
