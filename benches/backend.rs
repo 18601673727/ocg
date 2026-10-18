@@ -9,11 +9,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseHandle, DatabaseWorker};
 use ocg::persistence::{
-    ConfigBody, ConnectionConfig, ExecutionConfiguration, ExecutorId, FinalResult,
-    IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, LlmTransport, ModelConfig,
-    NewConfig, NewExecutor, NewJob, NewJobOutput,
+    CapabilitySet, ConfigBody, ConnectionConfig, DependencyCondition, ExecutionConfiguration,
+    ExecutionOperation, ExecutionPoolConfig, ExecutorId, FinalResult, IntermediateOutputKind,
+    JobFinalization, JobId, JobInputDraft, LlmTransport, ModelConfig, NewConfig, NewExecutionPool,
+    NewExecutor, NewJob, NewJobOutput,
 };
-use serde_json::{Value, json};
+use redb::{Database, TableDefinition};
+use serde_json::{json, Value};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -63,6 +65,7 @@ struct Options {
     clients: Vec<usize>,
     payloads: Vec<usize>,
     outputs: Vec<usize>,
+    scheduler_jobs: Vec<usize>,
 }
 
 /// One comma-separated list of positive sizes, as `--clients 1,8` carries.
@@ -91,6 +94,7 @@ impl Options {
             clients: vec![1, 8],
             payloads: vec![1_024, 65_536],
             outputs: vec![3],
+            scheduler_jobs: vec![1_000, 10_000, 100_000, 1_000_000],
         };
         let mut arguments = std::env::args().skip(1);
         let mut section_seen = false;
@@ -100,7 +104,7 @@ impl Options {
                 "--help" | "-h" => {
                     println!(
                         "cargo bench --bench backend -- \
-                         [all|jobs|reads|search|search_scale|mixed|maintenance] \
+                         [all|jobs|scheduler|reads|search|search_scale|mixed|maintenance] \
                          [--iterations N] [--jobs N] [--files N] \
                          [--clients 1,8] [--payloads 1024,65536] [--outputs 3]\n\
                          Defaults: all, 50 iterations per client, 1000 read-fixture jobs, \
@@ -109,6 +113,8 @@ impl Options {
                          JSONL on stdout; setup/warmup excluded. Errors abort the run.\n\
                          Jobs: create+claim, N progress outputs, finalize; closed loop, one \
                          measurement per command stage and one for the whole lifecycle.\n\
+                         Scheduler: 1k, 10k, 100k, 1m Jobs spread over 4 Pools with 16 slots total;\n\
+                         T1 admission, claim_batch + finalize loop, dependency settlement, and unclean reopen.\n\
                          Reads: warm point/page/output reads at 100 and N jobs.\n\
                          Mixed: job lifecycles written while readers poll the Job views.\n\
                          Search (Unix): 5 fresh index builds over cached files, warm queries, \
@@ -123,16 +129,21 @@ impl Options {
                     );
                     return Ok(None);
                 }
-                "--iterations" | "--jobs" | "--files" => {
+                "--iterations" | "--files" => {
                     let value: usize = arguments.next().ok_or("missing option value")?.parse()?;
                     if value == 0 {
                         return Err("benchmark sizes must be positive".into());
                     }
                     match argument.as_str() {
                         "--iterations" => options.iterations = value,
-                        "--jobs" => options.jobs = value,
                         _ => options.files = value,
                     }
+                }
+                "--jobs" => {
+                    let val_str = arguments.next().ok_or("missing option value")?;
+                    let values = sizes(&val_str)?;
+                    options.jobs = *values.first().unwrap();
+                    options.scheduler_jobs = values;
                 }
                 "--clients" | "--payloads" | "--outputs" => {
                     let value = sizes(&arguments.next().ok_or("missing option value")?)?;
@@ -142,7 +153,8 @@ impl Options {
                         _ => options.outputs = value,
                     }
                 }
-                "all" | "jobs" | "reads" | "search" | "search_scale" | "mixed" | "maintenance"
+                "all" | "jobs" | "scheduler" | "reads" | "search" | "search_scale" | "mixed"
+                | "maintenance"
                     if !section_seen =>
                 {
                     options.section = argument;
@@ -151,7 +163,7 @@ impl Options {
                 _ => return Err(format!("unknown argument: {argument}; use --help").into()),
             }
         }
-        if options.jobs > 4_000 || options.files > 4_000 {
+        if options.section != "scheduler" && (options.jobs > 4_000 || options.files > 4_000) {
             return Err("--jobs and --files must be at most 4000 (production limits)".into());
         }
         Ok(Some(options))
@@ -427,6 +439,289 @@ fn jobs(options: &Options) -> Result<()> {
                 })?;
             }
         }
+    }
+    Ok(())
+}
+
+fn setup_scheduler_pools(handle: &DatabaseHandle) -> Result<Target> {
+    let connection = block_on(handle.create_config(NewConfig {
+        name: "benchmark connection".into(),
+        body: ConfigBody::Connection(ConnectionConfig {
+            protocol: LlmTransport::OpenAiChatCompletions,
+            endpoint: None,
+            credential_ref: None,
+        }),
+    }))?;
+    let model = block_on(handle.create_config(NewConfig {
+        name: "benchmark model".into(),
+        body: ConfigBody::Model(ModelConfig {
+            connection_id: connection,
+            model: "benchmark".into(),
+            parameters: Default::default(),
+            declared_capabilities: Default::default(),
+        }),
+    }))?;
+    let executor = block_on(handle.create_executor(NewExecutor {
+        name: "benchmark".into(),
+        concurrency_limit: NonZeroU32::new(16).ok_or("invalid concurrency")?,
+        llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+    }))?;
+    for i in 0..4 {
+        block_on(handle.create_execution_pool(NewExecutionPool {
+            name: format!("benchmark-pool-{i}"),
+            config: ExecutionPoolConfig {
+                concurrency_limit: NonZeroU32::new(4).ok_or("invalid concurrency")?,
+                capabilities: CapabilitySet {
+                    operations: BTreeSet::from([ExecutionOperation::LlmRequest]),
+                    llm_protocols: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+                },
+            },
+            enabled: true,
+        }))?;
+    }
+    Ok(Target {
+        executor,
+        configuration: ExecutionConfiguration {
+            agent_profile: None,
+            llm_profile: model.into(),
+        },
+    })
+}
+
+fn admit_jobs(
+    handle: &DatabaseHandle,
+    target: Target,
+    count: usize,
+    with_dependencies: bool,
+) -> Result<(Vec<JobId>, Vec<Duration>, Duration)> {
+    let mut job_ids = Vec::with_capacity(count);
+    let mut samples = Vec::with_capacity(count);
+    let started = Instant::now();
+    for i in 0..count {
+        let spec = if with_dependencies && i % 2 == 1 {
+            let prereq = job_ids[i - 1];
+            NewJob {
+                name: Some("benchmark".into()),
+                eligible_at: None,
+                parent: handle.genesis(),
+                projects: Vec::new(),
+                dependencies: vec![(prereq, DependencyCondition::Success)],
+                input: JobInputDraft {
+                    objective: Some("measure scheduler overhead".into()),
+                    ..JobInputDraft::default()
+                },
+                configuration: Some(target.configuration),
+                previous: None,
+            }
+        } else {
+            job(handle, target)
+        };
+        let began = Instant::now();
+        let id = block_on(handle.create_job(spec))?;
+        samples.push(began.elapsed());
+        job_ids.push(id);
+    }
+    let elapsed = started.elapsed();
+    Ok((job_ids, samples, elapsed))
+}
+
+fn claim_and_finalize(
+    handle: &DatabaseHandle,
+    count: usize,
+) -> Result<(Vec<Duration>, Vec<Duration>, Duration)> {
+    let mut claim_batch_samples = Vec::new();
+    let mut finalize_samples = Vec::with_capacity(count);
+    let mut completed = 0;
+    let started = Instant::now();
+    while completed < count {
+        let began = Instant::now();
+        let claimed = block_on(handle.claim_batch())?;
+        claim_batch_samples.push(began.elapsed());
+        if claimed.is_empty() {
+            return Err(format!(
+                "claim_batch returned empty before all jobs ran ({completed}/{count} completed)"
+            )
+            .into());
+        }
+        for id in claimed {
+            let began = Instant::now();
+            finish(handle, id)?;
+            finalize_samples.push(began.elapsed());
+            completed += 1;
+        }
+    }
+    let elapsed = started.elapsed();
+    Ok((claim_batch_samples, finalize_samples, elapsed))
+}
+
+fn stop_unclean_and_reopen(
+    directory: &DataDirectory,
+    worker: DatabaseWorker,
+) -> Result<(Duration, u64)> {
+    worker.shutdown()?;
+    let db_path = directory.database_path().join("ocg.redb");
+    {
+        let db = Database::open(&db_path)?;
+        let tx = db.begin_write()?;
+        {
+            let table: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+            let mut meta = tx.open_table(table)?;
+            meta.insert("clean_shutdown", [0u8].as_slice())?;
+        }
+        tx.commit()?;
+    }
+    let file_size = database_bytes(directory)?;
+    let began = Instant::now();
+    let reopened = DatabaseWorker::start(directory)?;
+    let duration = began.elapsed();
+    reopened.shutdown()?;
+    Ok((duration, file_size))
+}
+
+fn scheduler(options: &Options) -> Result<()> {
+    let sizes = if options.section == "scheduler" {
+        options.scheduler_jobs.clone()
+    } else {
+        vec![options.jobs]
+    };
+
+    let mut prev_time: Option<Duration> = None;
+    let mut prev_size: Option<u64> = None;
+
+    for count in sizes {
+        if count >= 1_000_000 {
+            if let (Some(t_prev), Some(s_prev)) = (prev_time, prev_size) {
+                let estimated_time: Duration = t_prev.saturating_mul(10);
+                let estimated_bytes: u64 = s_prev.saturating_mul(10);
+                let max_time = Duration::from_secs(30 * 60);
+                let max_bytes = 20 * 1024 * 1024 * 1024; // 20 GB
+                if estimated_time > max_time || estimated_bytes > max_bytes {
+                    eprintln!(
+                        "Skipping {} jobs: estimated time ({:.1}m) or disk ({:.1} GB) exceeds 30m / 20GB",
+                        count,
+                        estimated_time.as_secs_f64() / 60.0,
+                        estimated_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                    );
+                    println!(
+                        "{}",
+                        json!({
+                            "type": "skip",
+                            "name": "scheduler.scale_limit",
+                            "jobs": count,
+                            "estimated_time_s": estimated_time.as_secs_f64(),
+                            "estimated_bytes": estimated_bytes,
+                            "reason": "estimated time > 30 minutes or disk > 20 GB",
+                        })
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let run_started = Instant::now();
+
+        // 1 & 2: Admit independent jobs, claim and finalize
+        let root = TemporaryRoot::new()?;
+        let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
+        let worker = DatabaseWorker::start(&directory)?;
+        let handle = worker.handle();
+        let target = setup_scheduler_pools(&handle)?;
+
+        let (_job_ids, admit_samples, elapsed_admit) = admit_jobs(&handle, target, count, false)?;
+        let parameters_independent = json!({
+            "jobs": count,
+            "dependencies": false,
+            "pools": 4,
+            "slots": 16,
+        });
+        report(
+            "scheduler.admit",
+            &parameters_independent,
+            admit_samples,
+            Some(elapsed_admit),
+        );
+
+        let (claim_samples, finalize_samples, elapsed_claim) = claim_and_finalize(&handle, count)?;
+        report(
+            "scheduler.claim_batch",
+            &parameters_independent,
+            claim_samples,
+            Some(elapsed_claim),
+        );
+        report(
+            "scheduler.finalize",
+            &parameters_independent,
+            finalize_samples,
+            Some(elapsed_claim),
+        );
+        worker.shutdown()?;
+        drop(root);
+
+        // 3: Repeat once with half the Jobs depending on an earlier Job
+        let root = TemporaryRoot::new()?;
+        let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
+        let worker = DatabaseWorker::start(&directory)?;
+        let handle = worker.handle();
+        let target = setup_scheduler_pools(&handle)?;
+
+        let (_dep_ids, dep_admit_samples, elapsed_dep_admit) =
+            admit_jobs(&handle, target, count, true)?;
+        let parameters_dependent = json!({
+            "jobs": count,
+            "dependencies": true,
+            "pools": 4,
+            "slots": 16,
+        });
+        report(
+            "scheduler.admit",
+            &parameters_dependent,
+            dep_admit_samples,
+            Some(elapsed_dep_admit),
+        );
+
+        let (dep_claim_samples, dep_finalize_samples, elapsed_dep_claim) =
+            claim_and_finalize(&handle, count)?;
+        report(
+            "scheduler.claim_batch",
+            &parameters_dependent,
+            dep_claim_samples,
+            Some(elapsed_dep_claim),
+        );
+        report(
+            "scheduler.finalize",
+            &parameters_dependent,
+            dep_finalize_samples,
+            Some(elapsed_dep_claim),
+        );
+
+        // 4: Stop without clean shutdown and reopen it
+        let (reopen_duration, file_size) = stop_unclean_and_reopen(&directory, worker)?;
+        let reopen_params = json!({
+            "jobs": count,
+            "dependencies": true,
+            "database_file_bytes": file_size,
+        });
+        report(
+            "scheduler.unclean_open",
+            &reopen_params,
+            vec![reopen_duration],
+            Some(reopen_duration),
+        );
+        println!(
+            "{}",
+            json!({
+                "type": "fixture",
+                "name": "scheduler.reopen",
+                "jobs": count,
+                "database_file_bytes": file_size,
+                "duration_ms": reopen_duration.as_secs_f64() * 1000.0,
+            })
+        );
+        drop(root);
+
+        let total_run_time = run_started.elapsed();
+        prev_time = Some(total_run_time);
+        prev_size = Some(file_size);
     }
     Ok(())
 }
@@ -1027,6 +1322,9 @@ fn main() -> Result<()> {
     );
     if options.selected("jobs") {
         jobs(&options)?;
+    }
+    if options.selected("scheduler") {
+        scheduler(&options)?;
     }
     if options.selected("reads") {
         reads(&options)?;
