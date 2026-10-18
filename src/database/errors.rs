@@ -14,6 +14,7 @@ use super::*;
 ///   A commit error is not a rollback. Do not retry the command; recover
 ///   storage with [`DatabaseHandle::recover_storage`], which reconciles it,
 ///   or call [`DatabaseHandle::reconcile_operation`] after reopening.
+///
 /// Read errors are separate and say nothing about any command.
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {

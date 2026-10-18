@@ -92,10 +92,7 @@ impl Permit {
                 } else {
                     "too many tool operations are running"
                 };
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    message,
-                ));
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message));
             }
             let category = match kind {
                 Kind::Command => counts.commands < COMMANDS,
@@ -460,10 +457,13 @@ fn prove_empty(pid: Pid, sentinel: &OwnedFd) -> std::io::Result<()> {
 fn prove_empty_timeout(pid: Pid, sentinel: &OwnedFd, timeout: Duration) -> std::io::Result<()> {
     #[cfg(test)]
     {
-        if let Some(hook) = PROOF_HOOK.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
-            if let Some(result) = hook(pid, sentinel) {
-                return result;
-            }
+        if let Some(hook) = PROOF_HOOK
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            && let Some(result) = hook(pid, sentinel)
+        {
+            return result;
         }
     }
     let deadline = Instant::now() + timeout;
@@ -543,6 +543,62 @@ fn read_process_stat(path: &std::path::Path) -> std::io::Result<Option<String>> 
     }
 }
 
+#[cfg(target_os = "macos")]
+fn live_group_members(group: Pid) -> std::io::Result<bool> {
+    // `PROC_ALL_PIDS` is not exposed by every libc crate release; it is the
+    // documented value for the `proc_listpids` type argument.
+    const PROC_ALL_PIDS: u32 = 1;
+    let count = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut pids = vec![0i32; count as usize];
+    let bytes = unsafe {
+        libc::proc_listpids(
+            PROC_ALL_PIDS,
+            0,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * std::mem::size_of::<i32>()) as i32,
+        )
+    };
+    if bytes < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for pid in pids
+        .into_iter()
+        .take(bytes as usize / std::mem::size_of::<i32>())
+    {
+        if pid <= 0 {
+            continue;
+        }
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                std::mem::size_of::<libc::proc_bsdinfo>() as i32,
+            )
+        };
+        if read as usize == std::mem::size_of::<libc::proc_bsdinfo>()
+            && info.pbi_pgid as i32 == group.as_raw_pid()
+            && info.pbi_status != libc::SZOMB
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn live_group_members(_: Pid) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process-group membership scanning is unsupported on this platform",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -615,60 +671,4 @@ mod tests {
         );
         std::fs::remove_dir(directory).expect("remove the fixture");
     }
-}
-
-#[cfg(target_os = "macos")]
-fn live_group_members(group: Pid) -> std::io::Result<bool> {
-    // `PROC_ALL_PIDS` is not exposed by every libc crate release; it is the
-    // documented value for the `proc_listpids` type argument.
-    const PROC_ALL_PIDS: u32 = 1;
-    let count = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-    if count <= 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut pids = vec![0i32; count as usize];
-    let bytes = unsafe {
-        libc::proc_listpids(
-            PROC_ALL_PIDS,
-            0,
-            pids.as_mut_ptr().cast(),
-            (pids.len() * std::mem::size_of::<i32>()) as i32,
-        )
-    };
-    if bytes < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    for pid in pids
-        .into_iter()
-        .take(bytes as usize / std::mem::size_of::<i32>())
-    {
-        if pid <= 0 {
-            continue;
-        }
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
-                std::mem::size_of::<libc::proc_bsdinfo>() as i32,
-            )
-        };
-        if read as usize == std::mem::size_of::<libc::proc_bsdinfo>()
-            && info.pbi_pgid as i32 == group.as_raw_pid()
-            && info.pbi_status != libc::SZOMB
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn live_group_members(_: Pid) -> std::io::Result<bool> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "process-group membership scanning is unsupported on this platform",
-    ))
 }

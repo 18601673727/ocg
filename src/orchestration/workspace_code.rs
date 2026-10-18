@@ -575,10 +575,11 @@ fn call_of(arguments: Value) -> Result<Call, ToolFailure> {
         return Err(refused("expected 1 to 8 queries"));
     }
     for question in &call.queries {
-        if let Some(path) = &question.path {
-            if path != "." && !(matches!(question.op, Op::Errors) && path == "changed") {
-                components(path).map_err(refused)?;
-            }
+        if let Some(path) = &question.path
+            && path != "."
+            && !(matches!(question.op, Op::Errors) && path == "changed")
+        {
+            components(path).map_err(refused)?;
         }
         if matches!(question.op, Op::Find | Op::Refs)
             && question.name.as_ref().is_none_or(|name| name.is_empty())
@@ -1189,7 +1190,7 @@ fn answer(
                 });
             match extracted {
                 Ok(positions) => {
-                    for (error, positions) in errors.iter().zip(positions.chunks_exact(2)) {
+                    for (error, positions) in errors.iter().zip(positions.as_chunks::<2>().0) {
                         let (line, column) = positions[0];
                         let kind = error
                             .expected
@@ -1341,11 +1342,10 @@ fn render(sections: &[Section], report: &str, budget: usize) -> (String, Vec<Val
     for section in sections {
         text.push_str(&section.heading);
         text.push('\n');
-        let share = if weight == 0 {
-            0
-        } else {
-            available.saturating_mul(section.demand_bytes) / weight
-        };
+        let share = available
+            .saturating_mul(section.demand_bytes)
+            .checked_div(weight)
+            .unwrap_or(0);
         let start = text.len();
         let mut shown = 0;
         let mut last_path: Option<&str> = None;

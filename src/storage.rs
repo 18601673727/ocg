@@ -70,7 +70,7 @@ use codec::{
     TAG_PROJECT, TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL,
 };
 #[cfg(test)]
-pub(crate) use derived::{relationship_inconsistencies, remove_job_row};
+pub(crate) use derived::relationship_inconsistencies;
 pub(crate) use observations::{
     read_availability_stats, read_job_availability, read_job_metrics, read_metrics,
     read_observed_models,

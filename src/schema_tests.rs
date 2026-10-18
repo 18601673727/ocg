@@ -330,7 +330,7 @@ fn configured_child(handle: &DatabaseHandle, agent: ProfileId, llm: ProfileId) -
         handle,
         NewJob {
             configuration: configuration(agent, llm),
-            ..new_job(&handle, "model request", handle.genesis(), Vec::new())
+            ..new_job(handle, "model request", handle.genesis(), Vec::new())
         },
     )
 }
@@ -370,7 +370,7 @@ fn llm_job(handle: &DatabaseHandle, llm: ProfileId) -> JobId {
         handle,
         NewJob {
             configuration: llm_only(llm),
-            ..new_job(&handle, "request", handle.genesis(), Vec::new())
+            ..new_job(handle, "request", handle.genesis(), Vec::new())
         },
     )
 }
@@ -429,7 +429,7 @@ fn nodes_and_relationships_round_trip_through_reopening() {
             ..new_job(&handle, "chat check", genesis, Vec::new())
         },
     );
-    wait(handle.claim_fixture(check, executor.into())).expect("start check");
+    wait(handle.claim_fixture(check, executor)).expect("start check");
     wait(handle.finalize_job(
         check,
         JobFinalization::Completed(FinalResult {
@@ -833,7 +833,7 @@ fn settled(
         handle,
         NewJob {
             configuration: configuration(agent, targeted),
-            ..new_job(&handle, "model request", handle.genesis(), Vec::new())
+            ..new_job(handle, "model request", handle.genesis(), Vec::new())
         },
     );
     let input = wait(handle.job(job))
@@ -1724,7 +1724,7 @@ struct TokenRun {
 fn token_run(handle: &DatabaseHandle, llm: ProfileId) -> TokenRun {
     let executor = executor(handle, "llm worker", &[OPENAI]).expect("register Executor");
     let job = llm_job(handle, llm);
-    wait(handle.claim_fixture(job, test_executor(&handle))).expect("start job");
+    wait(handle.claim_fixture(job, test_executor(handle))).expect("start job");
     let input = wait(handle.job(job))
         .expect("read job")
         .expect("job exists")
@@ -3143,7 +3143,7 @@ mod control_plane {
             let (_provider, llm) = llm_setup(handle, "model-a");
             let submitted = llm_job(handle, llm);
             let running = llm_job(handle, llm);
-            wait(handle.claim_fixture(running, test_executor(&handle))).expect("start");
+            wait(handle.claim_fixture(running, test_executor(handle))).expect("start");
             let mut settled = Vec::new();
             for finalization in [
                 JobFinalization::Completed(result("done")),
@@ -3151,19 +3151,19 @@ mod control_plane {
                 JobFinalization::Cancelled(result("cancelled")),
             ] {
                 let job = llm_job(handle, llm);
-                wait(handle.claim_fixture(job, test_executor(&handle))).expect("start");
+                wait(handle.claim_fixture(job, test_executor(handle))).expect("start");
                 wait(handle.finalize_job(job, finalization)).expect("settle");
                 settled.push(job);
             }
             // Unknown, its local execution confirmed stopped.
             let confirmed = llm_job(handle, llm);
-            wait(handle.claim_fixture(confirmed, test_executor(&handle))).expect("start");
+            wait(handle.claim_fixture(confirmed, test_executor(handle))).expect("start");
             progress(handle, confirmed, "partial answer");
             wait(handle.finalize_job(confirmed, JobFinalization::Unknown)).expect("unknown");
             let _ = wait(handle.confirm_job_stopped(confirmed));
             // Unknown, its stop never confirmed.
             let unconfirmed = llm_job(handle, llm);
-            wait(handle.claim_fixture(unconfirmed, test_executor(&handle))).expect("start");
+            wait(handle.claim_fixture(unconfirmed, test_executor(handle))).expect("start");
             wait(handle.finalize_job(unconfirmed, JobFinalization::Unknown)).expect("unknown");
             [
                 submitted,
@@ -3583,7 +3583,7 @@ mod control_plane {
         let (job, empty, large) = seeded(&directory, |handle| {
             let (_provider, llm) = llm_setup(handle, "model-a");
             let job = llm_job(handle, llm);
-            wait(handle.claim_fixture(job, test_executor(&handle))).expect("start");
+            wait(handle.claim_fixture(job, test_executor(handle))).expect("start");
             for index in 0..7 {
                 progress(handle, job, &format!("chunk {index} \"quoted\" ünïcødé\n"));
             }
@@ -3591,7 +3591,7 @@ mod control_plane {
                 .expect("complete");
             let empty = llm_job(handle, llm);
             let large = llm_job(handle, llm);
-            wait(handle.claim_fixture(large, test_executor(&handle))).expect("start");
+            wait(handle.claim_fixture(large, test_executor(handle))).expect("start");
             progress(handle, large, "small");
             progress(handle, large, &"L".repeat(4_000));
             (job, empty, large)
@@ -3791,7 +3791,7 @@ mod lifecycle_closure {
     /// A configured Job that this process started as its own execution.
     fn local_child(handle: &DatabaseHandle, agent: ProfileId, llm: ProfileId) -> JobId {
         let job = configured_child(handle, agent, llm);
-        wait(handle.claim_fixture(job, test_executor(&handle))).expect("start the Job locally");
+        wait(handle.claim_fixture(job, test_executor(handle))).expect("start the Job locally");
         job
     }
 
@@ -4054,7 +4054,7 @@ mod lifecycle_closure {
             },
             job: NewJob {
                 configuration: llm_only(setup.llm),
-                ..new_job(&handle, "provider request", handle.genesis(), Vec::new())
+                ..new_job(handle, "provider request", handle.genesis(), Vec::new())
             },
             credential_resolver: Arc::new(EnvironmentCredentialResolver),
             provider_config: ProviderExecutionConfig {
@@ -4187,8 +4187,8 @@ mod lifecycle_closure {
 
     /// A started Job settled with `finalization`.
     fn settled_job(handle: &DatabaseHandle, name: &str, finalization: JobFinalization) -> JobId {
-        let job = create_job(handle, new_job(&handle, name, handle.genesis(), Vec::new()));
-        wait(handle.claim_fixture(job, test_executor(&handle))).expect("start");
+        let job = create_job(handle, new_job(handle, name, handle.genesis(), Vec::new()));
+        wait(handle.claim_fixture(job, test_executor(handle))).expect("start");
         wait(handle.finalize_job(job, finalization)).expect("settle");
         job
     }
@@ -4471,8 +4471,8 @@ mod token_eligibility_at_ingest {
 
 // ---- aggregation liveness ----------------------------------------------------------
 
-/// A loop that exits is never reported running, a known rollback is retried
-/// from committed progress, and an unknown commit is resolved, not replayed.
+// A loop that exits is never reported running, a known rollback is retried
+// from committed progress, and an unknown commit is resolved, not replayed.
 
 // ---- settlement, dependencies and retries --------------------------------------
 
@@ -4512,7 +4512,7 @@ mod settlement {
             handle,
             NewJob {
                 configuration: llm_only(llm),
-                ..new_job(&handle, name, JobId::new(0), Vec::new())
+                ..new_job(handle, name, JobId::new(0), Vec::new())
             },
         )
     }
@@ -4529,7 +4529,7 @@ mod settlement {
             NewJob {
                 configuration: llm_only(llm),
                 dependencies: vec![(prerequisite, condition)],
-                ..new_job(&handle, name, JobId::new(0), Vec::new())
+                ..new_job(handle, name, JobId::new(0), Vec::new())
             },
         )
     }
@@ -5163,7 +5163,7 @@ mod requests_and_tool_loop {
     fn local_run(handle: &DatabaseHandle, llm: ProfileId) -> TokenRun {
         let executor = executor(handle, "llm worker", &[OPENAI]).expect("register");
         let job = llm_job(handle, llm);
-        wait(handle.claim_fixture(job, test_executor(&handle))).expect("start the Job locally");
+        wait(handle.claim_fixture(job, test_executor(handle))).expect("start the Job locally");
         let input = wait(handle.job(job)).expect("read").expect("job").input;
         TokenRun {
             executor,
@@ -10809,7 +10809,7 @@ mod requests_and_tool_loop {
                 },
                 job: NewJob {
                     configuration: llm_only(target.llm),
-                    ..new_job(&handle, name, handle.genesis(), Vec::new())
+                    ..new_job(handle, name, handle.genesis(), Vec::new())
                 },
                 credential_resolver: Arc::new(EnvironmentCredentialResolver),
                 provider_config: ProviderExecutionConfig::default(),
@@ -14052,7 +14052,7 @@ mod requests_and_tool_loop {
             wait(handle.create_claimed_fixture(
                 NewJob {
                     configuration: llm_only(llm),
-                    ..new_job(&handle, "history fixture", handle.genesis(), Vec::new())
+                    ..new_job(handle, "history fixture", handle.genesis(), Vec::new())
                 },
                 test_executor(handle),
             ))
@@ -15289,7 +15289,7 @@ mod requests_and_tool_loop {
                         attachments,
                         ..JobInputDraft::default()
                     },
-                    ..new_job(&handle, "vision", handle.genesis(), Vec::new())
+                    ..new_job(handle, "vision", handle.genesis(), Vec::new())
                 },
                 test_executor(handle),
             ))

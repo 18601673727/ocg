@@ -667,32 +667,32 @@ fn scheduler(options: &Options) -> Result<()> {
     let mut prev_size: Option<u64> = None;
 
     for count in sizes {
-        if count >= 1_000_000 {
-            if let (Some(t_prev), Some(s_prev)) = (prev_time, prev_size) {
-                let estimated_time: Duration = t_prev.saturating_mul(10);
-                let estimated_bytes: u64 = s_prev.saturating_mul(10);
-                let max_time = Duration::from_secs(30 * 60);
-                let max_bytes = 20 * 1024 * 1024 * 1024; // 20 GB
-                if estimated_time > max_time || estimated_bytes > max_bytes {
-                    eprintln!(
-                        "Skipping {} jobs: estimated time ({:.1}m) or disk ({:.1} GB) exceeds 30m / 20GB",
-                        count,
-                        estimated_time.as_secs_f64() / 60.0,
-                        estimated_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                    );
-                    println!(
-                        "{}",
-                        json!({
-                            "type": "skip",
-                            "name": "scheduler.scale_limit",
-                            "jobs": count,
-                            "estimated_time_s": estimated_time.as_secs_f64(),
-                            "estimated_bytes": estimated_bytes,
-                            "reason": "estimated time > 30 minutes or disk > 20 GB",
-                        })
-                    );
-                    continue;
-                }
+        if count >= 1_000_000
+            && let (Some(t_prev), Some(s_prev)) = (prev_time, prev_size)
+        {
+            let estimated_time: Duration = t_prev.saturating_mul(10);
+            let estimated_bytes: u64 = s_prev.saturating_mul(10);
+            let max_time = Duration::from_secs(30 * 60);
+            let max_bytes = 20 * 1024 * 1024 * 1024; // 20 GB
+            if estimated_time > max_time || estimated_bytes > max_bytes {
+                eprintln!(
+                    "Skipping {} jobs: estimated time ({:.1}m) or disk ({:.1} GB) exceeds 30m / 20GB",
+                    count,
+                    estimated_time.as_secs_f64() / 60.0,
+                    estimated_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+                println!(
+                    "{}",
+                    json!({
+                        "type": "skip",
+                        "name": "scheduler.scale_limit",
+                        "jobs": count,
+                        "estimated_time_s": estimated_time.as_secs_f64(),
+                        "estimated_bytes": estimated_bytes,
+                        "reason": "estimated time > 30 minutes or disk > 20 GB",
+                    })
+                );
+                continue;
             }
         }
 

@@ -817,10 +817,10 @@ pub(crate) fn read_conversations(
             turn_count += 1;
         }
         let tip_job = JobId::new(tip);
-        if let Some(before_id) = before {
-            if tip_job >= before_id {
-                continue;
-            }
+        if let Some(before_id) = before
+            && tip_job >= before_id
+        {
+            continue;
         }
         threads.push(ThreadInfo {
             root_job,
@@ -831,7 +831,7 @@ pub(crate) fn read_conversations(
     }
 
     // Newest activity first: sort descending by tip_job
-    threads.sort_by(|a, b| b.tip_job.cmp(&a.tip_job));
+    threads.sort_by_key(|thread| std::cmp::Reverse(thread.tip_job));
 
     let limit = limit.clamp(1, 100);
     let has_more = threads.len() > limit;

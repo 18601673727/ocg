@@ -598,13 +598,12 @@ pub(super) async fn save_profile(
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
 
-            if let Some(secret_value) = secret {
-                if secret_value.len() > 4096
+            if let Some(secret_value) = secret
+                && (secret_value.len() > 4096
                     || ntex::http::header::HeaderValue::try_from(format!("Bearer {secret_value}"))
-                        .is_err()
-                {
-                    return Err(INVALID_CREDENTIAL);
-                }
+                        .is_err())
+            {
+                return Err(INVALID_CREDENTIAL);
             }
 
             let resolved_credential_ref = if clear_credential {

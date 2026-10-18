@@ -59,6 +59,10 @@ pub(crate) struct BatchOutcome<T> {
 }
 
 impl<T> BatchOutcome<T> {
+    fn failed_storage(error: StorageError) -> Self {
+        Self::failed(BatchFailure::NotCommitted(error.clone()), Some(error))
+    }
+
     fn failed(failure: BatchFailure, storage_failure: Option<StorageError>) -> Self {
         Self {
             result: Err(failure),
@@ -93,10 +97,8 @@ pub(crate) enum Commit {
     Staged,
 }
 
-fn begin(database: &Database, epoch: u64, commit: Commit) -> Result<Batch, BatchOutcome<()>> {
-    let mut tx = database
-        .begin_write()
-        .map_err(|error| BatchOutcome::failed_storage(error.into()))?;
+fn begin(database: &Database, epoch: u64, commit: Commit) -> Result<Batch, StorageError> {
+    let mut tx = database.begin_write()?;
     let durability = match commit {
         Commit::Durable => Durability::Immediate,
         Commit::Staged => Durability::None,
@@ -105,28 +107,9 @@ fn begin(database: &Database, epoch: u64, commit: Commit) -> Result<Batch, Batch
         let error = StorageError::from(error);
         let abort = tx.abort();
         drop(abort);
-        return Err(BatchOutcome::failed_storage(error));
+        return Err(error);
     }
     Ok(Batch::new(tx, epoch))
-}
-
-impl BatchOutcome<()> {
-    fn failed_storage(error: StorageError) -> Self {
-        Self::failed(BatchFailure::NotCommitted(error.clone()), Some(error))
-    }
-
-    fn cast<T>(self) -> BatchOutcome<T> {
-        BatchOutcome {
-            result: match self.result {
-                Ok(()) => unreachable!("only failures are cast"),
-                Err(failure) => Err(failure),
-            },
-            storage_failure: self.storage_failure,
-            scheduling_wake: self.scheduling_wake,
-            capacity_freed: self.capacity_freed,
-            probe: self.probe,
-        }
-    }
 }
 
 pub(crate) fn run_batch_with<T>(
@@ -137,7 +120,7 @@ pub(crate) fn run_batch_with<T>(
 ) -> BatchOutcome<T> {
     let mut batch = match begin(database, epoch, commit) {
         Ok(batch) => batch,
-        Err(outcome) => return outcome.cast(),
+        Err(error) => return BatchOutcome::failed_storage(error),
     };
     let value = match (body(&mut batch), batch.failed.take()) {
         (_, Some(failure)) | (Err(BatchError(failure)), None) => {
@@ -163,7 +146,7 @@ pub(crate) fn run_batch_declinable<T>(
 ) -> BatchOutcome<Option<T>> {
     let mut batch = match begin(database, epoch, commit) {
         Ok(batch) => batch,
-        Err(outcome) => return outcome.cast(),
+        Err(error) => return BatchOutcome::failed_storage(error),
     };
     let value = match (body(&mut batch), batch.failed.take()) {
         (_, Some(failure)) | (Err(BatchError(failure)), None) => {

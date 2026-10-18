@@ -285,12 +285,3 @@ pub(crate) fn relationship_inconsistencies(
         .map(|table| format!("{table} differs from its definition"))
         .collect())
 }
-
-/// Test fault: removes a Job's spec while its derived rows still name it.
-#[cfg(test)]
-pub(crate) fn remove_job_row(database: &Database, job: JobId) -> Result<(), StorageError> {
-    let tx = database.begin_write()?;
-    tx.open_table(JOBS)?.remove(job.get())?;
-    tx.commit()?;
-    Ok(())
-}

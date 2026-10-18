@@ -1286,16 +1286,15 @@ impl WriteWorker {
     /// Closes admission for good, releases the database, and answers every
     /// queued command and pending request, so no caller is left waiting.
     pub(super) fn exit(self) -> Result<(), DatabaseError> {
-        if self.storage_failure.is_none() {
-            if let Some(opened) = self
+        if self.storage_failure.is_none()
+            && let Some(opened) = self
                 .shared
                 .database
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_ref()
-            {
-                let _ = crate::storage::record_clean_shutdown(&opened.database);
-            }
+        {
+            let _ = crate::storage::record_clean_shutdown(&opened.database);
         }
         {
             let mut admission = self

@@ -48,7 +48,8 @@ pub(super) const TOOL_CALL_IDS: TableDefinition<(u64, &str), (u32, u32)> =
 pub(super) const RETRIES: TableDefinition<(u64, u64), ()> = TableDefinition::new("retry");
 pub(super) const ATTACHMENT_REFS: TableDefinition<(u64, u64), ()> =
     TableDefinition::new("attachment_ref");
-pub(super) const REQUEST_SCOPES: TableDefinition<(u64, [u8; 32], i64, u64, u32, u32), ()> =
+type RequestScopeKey = (u64, [u8; 32], i64, u64, u32, u32);
+pub(super) const REQUEST_SCOPES: TableDefinition<RequestScopeKey, ()> =
     TableDefinition::new("request_scope");
 pub(super) const JOB_PROJECTS: TableDefinition<(u64, u64), ()> =
     TableDefinition::new("job_project");

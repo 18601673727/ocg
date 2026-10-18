@@ -629,11 +629,11 @@ fn entry(directory: &std::fs::File, name: &str) -> Entry {
         FileType::RegularFile => Entry::File {
             stamp: FileStamp {
                 bytes: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
-                seconds: stat.st_mtime as i64,
+                seconds: stat.st_mtime,
                 nanos: stat.st_mtime_nsec as u32,
-                ctime_seconds: stat.st_ctime as i64,
+                ctime_seconds: stat.st_ctime,
                 ctime_nanos: stat.st_ctime_nsec as u32,
-                inode: stat.st_ino as u64,
+                inode: stat.st_ino,
             },
         },
         FileType::Directory => Entry::Directory,

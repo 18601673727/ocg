@@ -523,7 +523,7 @@ impl WorkspaceTools {
         #[cfg(unix)]
         {
             use crate::orchestration::workspace_read;
-            let workspace = self.workspace.clone().ok_or_else(|| {
+            let workspace = self.workspace.clone().ok_or({
                 ExecutionRuntimeError::Database(DatabaseError::Rejected(
                     Violation::WorkspaceNotConfigured,
                 ))
