@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { HttpCanonicalControlClient } from "../runtime/canonical-client";
 import { useControlPage } from "../runtime/use-control-page";
@@ -21,15 +21,28 @@ export function ObservationsSurface({ client, kind, health, onJob }: {
   const [days, setDays] = useState(1);
   const [windowEnd, setWindowEnd] = useState(() => Date.now() * 1000);
   const load = useCallback(async (after: string | undefined, signal: AbortSignal) => {
-    const settings = { fromUs: windowEnd - days * 86400_000_000, untilUs: windowEnd, after, limit: 50, signal };
-    if (kind === "usage") {
-      const page = await client.readUsage(settings);
-      return { items: page.observations as (Usage | Availability)[], next: page.next_after };
+    let currentAfter = after;
+    while (!signal.aborted) {
+      const settings = { fromUs: windowEnd - days * 86400_000_000, untilUs: windowEnd, after: currentAfter, limit: 50, signal };
+      const page = kind === "usage"
+        ? await client.readUsage(settings)
+        : await client.readAvailability(settings);
+      const items = page.observations as (Usage | Availability)[];
+      if (items.length > 0 || !page.next_after) {
+        return { items, next: page.next_after };
+      }
+      currentAfter = page.next_after;
     }
-    const page = await client.readAvailability(settings);
-    return { items: page.observations as (Usage | Availability)[], next: page.next_after };
+    return { items: [], next: null };
   }, [client, days, windowEnd, kind]);
   const page = useControlPage(load);
+
+  const { ready, items, next, loading, loadMore } = page;
+  useEffect(() => {
+    if (ready && items.length === 0 && next && !loading) {
+      loadMore();
+    }
+  }, [ready, items.length, next, loading, loadMore]);
 
   return (
     <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-4 py-6 sm:px-6">
@@ -60,8 +73,8 @@ export function ObservationsSurface({ client, kind, health, onJob }: {
             : "Recorded response evidence, grouped by provider and model. These are individual observations, not a current uptime rate or a provider probe."}
         </p>
         {page.error ? <p role="alert" className="mb-3 text-sm text-destructive">{page.error}</p> : null}
-        {!page.ready && page.loading ? <p role="status">Loading observations…</p> : null}
-        {page.ready && page.items.length === 0 ? <p className="py-4 text-sm text-muted-foreground">No observations in this time range.</p> : null}
+        {page.items.length === 0 && !page.error && (!page.ready || page.next || page.loading) ? <p role="status">Loading observations…</p> : null}
+        {page.ready && page.items.length === 0 && !page.next && !page.loading && !page.error ? <p className="py-4 text-sm text-muted-foreground">No observations in this time range.</p> : null}
         {page.items.length > 0 ? <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead className="border-b border-border text-xs text-muted-foreground"><tr>

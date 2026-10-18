@@ -88,6 +88,7 @@ export type ControlProfileWriteRequest =
       kind: "agent";
       name: string;
       instructions?: string | null;
+      behavior?: "chat" | "general" | null;
       llm_targets: string[];
     };
 

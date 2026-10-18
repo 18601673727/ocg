@@ -476,6 +476,7 @@ pub(super) async fn save_profile(
 ) -> Result<Reply, Refusal> {
     let request: WireProfileRequest =
         serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
+    let mut credential_to_save: Option<(String, String)> = None;
     let new_config = match request {
         WireProfileRequest::Llm {
             name,
@@ -584,15 +585,50 @@ pub(super) async fn save_profile(
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
 
+            if let Some(secret_value) = secret {
+                if secret_value.len() > 4096
+                    || ntex::http::header::HeaderValue::try_from(format!("Bearer {secret_value}"))
+                        .is_err()
+                {
+                    return Err(INVALID_CREDENTIAL);
+                }
+            }
+
             let resolved_credential_ref = if clear_credential {
                 None
             } else if let Some(secret_value) = secret {
-                let target_ref = explicit_ref
-                    .or(prior_credential_ref)
-                    .unwrap_or_else(|| default_credential_ref(name.trim()));
-                database
-                    .set_credential(&target_ref, secret_value)
-                    .map_err(|_| INVALID_CREDENTIAL)?;
+                let target_ref = match explicit_ref.or(prior_credential_ref) {
+                    Some(reference) => reference,
+                    None => {
+                        let base = default_credential_ref(name.trim());
+                        let existing_connections = database
+                            .configs(Some(ConfigKind::Connection), None, PROFILE_SCAN_LIMIT)
+                            .await?;
+                        let is_in_use = |r: &str| {
+                            existing_connections.iter().any(|record| {
+                                if let ConfigBody::Connection(conn) = &record.body {
+                                    conn.credential_ref.as_deref() == Some(r)
+                                } else {
+                                    false
+                                }
+                            })
+                        };
+                        let mut candidate = base.clone();
+                        if is_in_use(&candidate) {
+                            let mut suffix = 2;
+                            loop {
+                                let suffixed = format!("{base}_{suffix}");
+                                if !is_in_use(&suffixed) {
+                                    candidate = suffixed;
+                                    break;
+                                }
+                                suffix += 1;
+                            }
+                        }
+                        candidate
+                    }
+                };
+                credential_to_save = Some((target_ref.clone(), secret_value.to_owned()));
                 Some(target_ref)
             } else {
                 explicit_ref.or(prior_credential_ref)
@@ -703,6 +739,11 @@ pub(super) async fn save_profile(
             (StatusCode::OK, id)
         }
     };
+    if let Some((target_ref, secret_value)) = credential_to_save {
+        database
+            .set_credential(&target_ref, &secret_value)
+            .map_err(|_| INVALID_CREDENTIAL)?;
+    }
     let snapshot = build_profiles_snapshot(database, Some(profile_id)).await?;
     Ok(Reply::new(status, snapshot))
 }

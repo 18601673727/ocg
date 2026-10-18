@@ -352,7 +352,6 @@ where
             // it is not the bearer token and reveals none of it. Each run
             // prints its own, and only that one signs a browser in.
             if let Some(pairing) = listener.as_ref().and_then(ControlPlane::pairing_code) {
-                log::info!("local browser pairing code: {pairing}");
                 eprintln!("OCG local browser pairing code: {pairing}");
             }
             eprintln!("OCG host running");

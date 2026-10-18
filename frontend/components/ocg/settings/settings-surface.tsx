@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { PageSurface, Pill } from "@/components/ocg/primitives";
 import type {
+  ControlAgentBehavior,
   ControlCapability,
   ControlLlmProfile,
   ControlManagedAgentProfile,
@@ -169,6 +170,7 @@ export function SettingsSurface({
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
   const [agentName, setAgentName] = useState("");
   const [agentInstructions, setAgentInstructions] = useState("");
+  const [agentBehavior, setAgentBehavior] = useState<ControlAgentBehavior>("chat");
   const [agentTargets, setAgentTargets] = useState<string[]>([]);
   const [agentSaving, setAgentSaving] = useState(false);
   const [agentError, setAgentError] = useState<string | null>(null);
@@ -329,6 +331,7 @@ export function SettingsSurface({
     setEditingAgentId(null);
     setAgentName("");
     setAgentInstructions("");
+    setAgentBehavior("chat");
     setAgentTargets([]);
     setAgentError(null);
   }
@@ -337,6 +340,7 @@ export function SettingsSurface({
     setEditingAgentId(agent.id);
     setAgentName(agent.name);
     setAgentInstructions(agent.instructions ?? "");
+    setAgentBehavior(agent.behavior);
     setAgentTargets([...agent.llm_targets]);
     setAgentError(null);
     setAgentNotice(null);
@@ -372,6 +376,7 @@ export function SettingsSurface({
         kind: "agent" as const,
         name: trimmedName,
         instructions: agentInstructions.trim() ? agentInstructions.trim() : null,
+        behavior: agentBehavior,
         llm_targets: agentTargets,
       };
       const updated = editingAgentId
@@ -636,6 +641,7 @@ export function SettingsSurface({
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-sm font-semibold">{agent.name}</span>
                           <Pill tone="slate" className="text-xs normal-case">{agent.id}</Pill>
+                          <Pill tone="sky" className="text-xs capitalize">{agent.behavior}</Pill>
                           {!agent.editable ? (
                             <Pill tone="amber" className="text-xs normal-case">
                               Locked ({agent.blocking_jobs.join(", ")})
@@ -689,6 +695,18 @@ export function SettingsSurface({
                     spellCheck={false}
                   />
                 </label>
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">Behavior</span>
+                  <ChoiceGroup
+                    label="Agent Behavior"
+                    value={agentBehavior}
+                    onChange={setAgentBehavior}
+                    options={[
+                      { value: "chat", label: "Chat" },
+                      { value: "general", label: "General" },
+                    ]}
+                  />
+                </div>
                 <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
                   System Instructions (optional)
                   <Textarea

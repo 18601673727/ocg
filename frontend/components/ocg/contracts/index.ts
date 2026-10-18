@@ -523,10 +523,15 @@ export function decodeProfiles(input: unknown) {
     }),
     agent_profiles: listOf(envelope.agent_profiles, "agent_profiles", (entry, path) => {
       const agent = record(entry, path);
+      const rawBehavior = string(agent.behavior, `${path}.behavior`);
+      if (rawBehavior !== "chat" && rawBehavior !== "general") {
+        throw new ContractError(`${path}.behavior`, "chat or general");
+      }
       return {
         id: identity(agent.id, `${path}.id`, "profile:"),
         name: string(agent.name, `${path}.name`),
         instructions: optionalString(agent.instructions, `${path}.instructions`),
+        behavior: rawBehavior as ControlAgentBehavior,
         llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`,
           (target, targetPath) => identity(target, targetPath, "profile:")),
         editable: boolean(agent.editable, `${path}.editable`),
@@ -557,6 +562,7 @@ export function decodeProfiles(input: unknown) {
   };
 }
 
+export type ControlAgentBehavior = "chat" | "general";
 export type ControlProfilesSnapshot = ReturnType<typeof decodeProfiles>;
 export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
 export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];

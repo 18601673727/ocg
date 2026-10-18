@@ -2,6 +2,7 @@
 //! `request_scope` index: events by Connection and model.
 
 use std::collections::HashMap;
+use std::ops::Bound;
 
 use super::rows::decode_request_event;
 use super::*;
@@ -223,52 +224,111 @@ fn walk_scope(
     mut visit: impl FnMut(ScopeKey) -> Result<bool, StorageError>,
 ) -> Result<Option<ScopeKey>, StorageError> {
     let table = rx.open_table(REQUEST_SCOPES)?;
+    let from_micros = filter.observed.from.as_unix_micros();
+    let until_micros = filter.observed.until.as_unix_micros();
+    if from_micros >= until_micros || max_scan == 0 {
+        return Ok(None);
+    }
+
     let model = filter.model.as_deref().map(model_hash);
-    let low = (
-        filter.provider.map_or(0, |provider| provider.get()),
-        model.unwrap_or([0; 32]),
-        filter.observed.from.as_unix_micros(),
-        0,
-        0,
-        0,
-    );
+    let min_provider = filter.provider.map_or(0, |provider| provider.get());
+    let max_provider = filter.provider.map_or(u64::MAX, |provider| provider.get());
     let high = (
-        filter.provider.map_or(u64::MAX, |provider| provider.get()),
+        max_provider,
         model.unwrap_or([0xff; 32]),
         i64::MAX,
         u64::MAX,
         u32::MAX,
         u32::MAX,
     );
-    let start = match after {
-        Some(after) => {
-            let key = cursor_key(after);
-            if key >= low { key } else { low }
+
+    let after_key = after.map(cursor_key);
+    let mut next_bound: Bound<ScopeKey> = match after_key {
+        Some(ak) => {
+            if ak >= high {
+                return Ok(None);
+            }
+            if ak.0 < min_provider {
+                Bound::Included((min_provider, model.unwrap_or([0; 32]), from_micros, 0, 0, 0))
+            } else if ak.2 < from_micros {
+                Bound::Included((ak.0, ak.1, from_micros, 0, 0, 0))
+            } else if ak.2 >= until_micros {
+                Bound::Excluded((ak.0, ak.1, i64::MAX, u64::MAX, u32::MAX, u32::MAX))
+            } else {
+                Bound::Excluded(ak)
+            }
         }
-        None => low,
+        None => Bound::Included((min_provider, model.unwrap_or([0; 32]), from_micros, 0, 0, 0)),
     };
+
     let mut examined = 0usize;
-    let mut last = None;
-    for entry in table.range(start..=high)? {
-        let key = entry?.0.value();
-        if after.is_some_and(|after| key <= cursor_key(after)) {
-            continue;
+
+    'outer: loop {
+        match next_bound {
+            Bound::Included(k) if k > high => break 'outer,
+            Bound::Excluded(k) if k >= high => break 'outer,
+            _ => {}
         }
-        if examined >= max_scan {
-            return Ok(last);
-        }
-        examined += 1;
-        last = Some(key);
-        let (_, _, observed_at, ..) = key;
-        if observed_at >= filter.observed.until.as_unix_micros()
-            || observed_at < filter.observed.from.as_unix_micros()
-        {
-            continue;
-        }
-        if !visit(key)? {
-            return Ok(last);
+
+        let mut range = table.range((next_bound, Bound::Included(high)))?;
+        let Some(first_entry) = range.next() else {
+            break;
+        };
+        let mut key = first_entry?.0.value();
+
+        loop {
+            if filter.provider.is_some_and(|p| key.0 != p.get()) {
+                if key.0 > max_provider {
+                    break 'outer;
+                }
+                next_bound = Bound::Included((min_provider, model.unwrap_or([0; 32]), from_micros, 0, 0, 0));
+                break;
+            }
+
+            if let Some(target_hash) = model {
+                if key.1 < target_hash {
+                    next_bound = Bound::Included((key.0, target_hash, from_micros, 0, 0, 0));
+                    break;
+                } else if key.1 > target_hash {
+                    let next_p = match key.0.checked_add(1) {
+                        Some(p) => p,
+                        None => break 'outer,
+                    };
+                    if next_p > max_provider {
+                        break 'outer;
+                    }
+                    next_bound = Bound::Included((next_p, target_hash, from_micros, 0, 0, 0));
+                    break;
+                }
+            }
+
+            let observed_at = key.2;
+            if observed_at < from_micros {
+                next_bound = Bound::Included((key.0, key.1, from_micros, 0, 0, 0));
+                break;
+            }
+
+            if observed_at >= until_micros {
+                next_bound = Bound::Excluded((key.0, key.1, i64::MAX, u64::MAX, u32::MAX, u32::MAX));
+                break;
+            }
+
+            examined += 1;
+            if !visit(key)? || examined >= max_scan {
+                return Ok(Some(key));
+            }
+
+            match range.next() {
+                Some(next_entry) => {
+                    key = next_entry?.0.value();
+                }
+                None => {
+                    break 'outer;
+                }
+            }
         }
     }
+
     Ok(None)
 }
 
